@@ -35,15 +35,22 @@ Verified on `pgvector/pgvector:pg18` = Postgres 18.4, pgvector 0.8.6.
 ## Layout
 
 ```
-migrations/   001..015, applied in filename order
+migrations/   001..016, applied in filename order
 tests/
   _harness.sql   schema t, table t.results, expect_raise / expect_ok / expect_true
   seed.sql       one realistic program plus the fixtures the checks need
   checks_a.sql   41 constraint and trigger checks (group A)
+  checks_b.sql   21 purge, replica-mode and integrity-checker checks (group B)
   scheduler.sql  scheduler fixture plus rank_pass() and claim_one()
 apply.sh      apply every migration, one transaction per file, ON_ERROR_STOP
-run_all.sh    fresh container, fresh database, apply, seed, run group A
+run_all.sh    fresh container, fresh database, apply, seed, run groups A and B
 ```
+
+`016_ticket07_fixes.sql` closes the divergences ticket 32 charged to ticket 07 —
+D2, D3, D5, plus D1, which ticket 32 charged to ticket 08 but which is ticket
+07's function — and one divergence ticket 32 did not find: every trigger in the
+schema is skipped by `SET session_replication_role = 'replica'`, and every
+foreign key with them.
 
 `015_ticket06_fixes.sql` closes the five divergences ticket 32 charged to ticket
 06 — D4, D6, D7, D8, D9 — and lands the schema debt tickets 08 and 09 left on
@@ -70,7 +77,7 @@ CT=other DB=other ./apply.sh # apply only, against an existing container
 ```
 
 `run_all.sh` drops and recreates the database, so it is the from-empty check.
-Group A prints as a table and ends with a `0 failing of 41` line.
+Groups A and B print as one table and end with a `0 failing of 62` line.
 
 To confirm the migrations are not accidentally idempotent, run `./apply.sh`
 twice without dropping the database. The second run must fail, and does:
@@ -127,9 +134,32 @@ first run found (C23, C27, C28) were ticket 06's and are now assertions.
 | C40 | the same transition accepted once the profile is satisfied |
 | C41 | registering an `evidence_profile` with no predicate function raises |
 
-Group B (purge, integrity checker, resume) and group C (ranking determinism,
-concurrent claim, HNSW) are probes rather than assertions — they were run by
-hand against the same database and their results are in the ticket 32 answer.
+Group B, `tests/checks_b.sql`, 21 checks, all passing — ticket 07's
+re-resolution. B01–B14 run inside rolled-back subtransactions like group A;
+B20–B26 need writes committed in one transaction to be visible to a check in the
+next, so they run at top level on a throwaway program that B25 purges.
+
+| Check | What it pins |
+| --- | --- |
+| B01 | every non-internal trigger in `public` is `tgenabled='A'` |
+| B02 | under `session_replication_role='replica'`, a write still emits and still gets a label |
+| B03–B05 | replica mode does not defeat immutability, the causal `status` hinge, or the `events` envelope |
+| B06 | the runtime role cannot `DISABLE TRIGGER` — `must be owner of table entities` |
+| B07 | the runtime role cannot `SET session_replication_role` |
+| B08 | the runtime role's ordinary write still emits, so the split costs nothing |
+| B09–B12 | no single `entities`, `agent_runs`, `tasks` or `findings` row can be deleted, even under `app.purging` |
+| B13 | no FK outside `purge_cascade_edges` has a delete action — the invariant a later migration would otherwise break silently |
+| B14 | `reject_mutation()` no longer exists (D1) |
+| B20 | `check_event_log_integrity()` is silent on honest state |
+| B21, B22 | an ignored-column write is recorded in `suppressed_writes` and is not a false positive |
+| B23 | a mutation made with the emitter disabled is caught by `xmin` accounting |
+| B24 | a row created and deleted inside the same disabled window is **not** caught — stated as a test, closed by B06/B07 rather than by detection |
+| B25 | `DELETE FROM programs` still takes everything, under the new all-`NO ACTION` rules |
+| B26 | the checker is silent again afterwards |
+
+Group C (ranking determinism, concurrent claim, HNSW) is probes rather than
+assertions — run by hand against the same database, results in the ticket 32
+answer.
 `tests/scheduler.sql` holds the fixture and the two functions those probes need:
 
 - `rank_pass(program)` — the ranking pass from ticket 08, as far as it can be
@@ -146,17 +176,17 @@ hand against the same database and their results are in the ticket 32 answer.
 
 Short list; the full one with tickets named is in the ticket 32 answer.
 
-- A program holding any `hypothesis_near_matches` row can never be purged.
-  Ticket 08 attaches the old `reject_mutation()`, which ticket 07 replaced.
-- Deleting a single `agent_runs` row is impossible even under `app.purging`,
-  because `ON DELETE SET NULL` fires an UPDATE into immutable `observations`.
-- `events.task_id ON DELETE CASCADE` destroys unrelated history, and whether a
-  task can be deleted at all depends on whether the runtime happened to set
-  `app.task_id` when unrelated rows were written.
-- `check_event_log_integrity()` reads `pg_trigger` existence but not
-  `tgenabled`, so a disabled event trigger passes green.
 - HNSW at 1536 dimensions outgrows the default 64MB `maintenance_work_mem` at
-  9752 tuples. No ticket mentions a server setting.
+  9752 tuples. No ticket mentions a server setting. Ticket 33's.
+- Cross-program citation is unconstrained (C24–C26). Ticket 35's.
+
+Fixed by `016`, kept here so the diff is readable: a program holding any
+`hypothesis_near_matches` row could never be purged, because ticket 08 attached
+the old `reject_mutation()`; deleting a single `agent_runs` row was impossible
+because `ON DELETE SET NULL` fired an UPDATE into immutable `observations`;
+`events.task_id ON DELETE CASCADE` destroyed unrelated history;
+`check_event_log_integrity()` read `pg_trigger` existence but not `tgenabled`,
+so a disabled event trigger passed green.
 
 Fixed by `015`, kept here so the diff is readable: `guard_status_cache()` gated
 on `pg_trigger_depth() < 2`, so any trigger could write `status` with no

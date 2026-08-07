@@ -27,8 +27,11 @@ psql_f() {
 psql_f "$HERE/tests/seed.sql"
 echo "seeded"
 
+# Not --single-transaction: group B's last checks need writes committed in one
+# transaction to be visible to an integrity check in the next.
 docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
-    < <(cat "$HERE/tests/_harness.sql" "$HERE/tests/checks_a.sql") > /dev/null
+    < <(cat "$HERE/tests/_harness.sql" "$HERE/tests/checks_a.sql" \
+            "$HERE/tests/checks_b.sql") > /dev/null
 docker exec -i "$CT" psql -U postgres -d "$DB" -P pager=off -c \
     "SELECT id, CASE WHEN pass THEN 'ok' ELSE 'FAIL' END AS r, left(note,80) AS note
        FROM t.results ORDER BY ord"
