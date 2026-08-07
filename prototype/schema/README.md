@@ -1,19 +1,22 @@
-# Throwaway schema prototype — ticket 32
+# Throwaway schema prototype — tickets 32 and 33
 
-The 1337 lines of SQL that tickets 06, 07 and 08 decided on, executed against a
-real Postgres for the first time. Everything under `migrations/` is verbatim
-from those tickets except where a comment says otherwise; everything under
-`tests/` is new and exists only to push on the claims those tickets make.
+Ticket 32 executed the 1337 lines of SQL tickets 06, 07 and 08 decided on.
+Ticket 33 turned the fourteen migrations that fourteen sibling tickets each
+wrote in isolation into one corpus that applies from empty, in one order, on one
+server, with every standing check silent.
 
-This is a prototype. It is not the migration set the build will ship. It is the
-evidence that the decisions in tickets 06, 07 and 08 do or do not survive
-contact with the database — see the divergence list in the ticket 32 answer.
+This is still a prototype. It is not the migration set the build will ship. It
+is the evidence that the decisions survive contact with the database, and — from
+ticket 33 — that they survive contact with **each other**.
+
+Headline: **31 migrations, 81 managed tables, 15 standing checks, 0 problems.**
+`./run_all.sh` is that claim, executed.
 
 ## Postgres major: 18
 
-Pinned by `uuidv7()`, which is a `pg_catalog` builtin only from 18. Nothing in
-the three tickets ever said so. Proof: `pgvector/pgvector:pg17` fails on the
-very first table with
+Pinned by `uuidv7()`, a `pg_catalog` builtin only from 18. Nothing in the source
+tickets ever said so. Proof: `pgvector/pgvector:pg17` fails on the very first
+table with
 
 ```
 ERROR:  function uuidv7() does not exist
@@ -35,64 +38,128 @@ Verified on `pgvector/pgvector:pg18` = Postgres 18.4, pgvector 0.8.6.
 ## Layout
 
 ```
-migrations/   001..016, applied in filename order
+migrate.sh          the runner: provision | up | status | verify | lint
+new_migration.sh    prints the one legal filename for a new migration
+restore.sh          the decided restore procedure, and what a restore may be forgiven
+measure_hnsw.sh     the maintenance_work_mem measurement the settings migration cites
+prove_holes.sh      43 adversarial checks: every guard shown going from silent to raising
+run_all.sh          ten passes; the whole ticket, executed, one container
+migrations/         001..016 frozen, then YYYYMMDDTHHMMSSZ__slug.sql
 tests/
-  _harness.sql   schema t, table t.results, expect_raise / expect_ok / expect_true
-  seed.sql       one realistic program plus the fixtures the checks need
-  checks_a.sql   41 constraint and trigger checks (group A)
-  checks_b.sql   21 purge, replica-mode and integrity-checker checks (group B)
-  scheduler.sql  scheduler fixture plus rank_pass() and claim_one()
-apply.sh      apply every migration, one transaction per file, ON_ERROR_STOP
-run_all.sh    fresh container, fresh database, apply, seed, run groups A and B
+  _harness.sql        schema t, table t.results, expect_raise / expect_ok / expect_true
+  seed.sql            the canonical fixture: two programs, scope policy, receipts
+  checks_a.sql        constraint and trigger checks (group A)
+  checks_b.sql        purge, replica-mode and integrity-checker checks (group B)
+  checks_c.sql        ticket 33's 19 corpus checks (M01–M19)
+  scheduler.sql       scheduler fixture plus rank_pass() and claim_one()
+  ticket07_checker.sql  ticket 07's event checker under a second name, for prove_holes
+  999_drift_probe.sql   the migration nobody should write, written on purpose
 ```
 
-`016_ticket07_fixes.sql` closes the divergences ticket 32 charged to ticket 07 —
-D2, D3, D5, plus D1, which ticket 32 charged to ticket 08 but which is ticket
-07's function — and one divergence ticket 32 did not find: every trigger in the
-schema is skipped by `SET session_replication_role = 'replica'`, and every
-foreign key with them.
+## The numbering rule
 
-`015_ticket06_fixes.sql` closes the five divergences ticket 32 charged to ticket
-06 — D4, D6, D7, D8, D9 — and lands the schema debt tickets 08 and 09 left on
-06's tables. It is the only migration written after the divergence list, and it
-is where the reopened ticket 06 decisions actually execute. D10 and the
-cross-program holes are ticket 35's, and are still open here.
+Two filename forms, and `migrate.sh lint` refuses everything else:
 
-`014_scheduler_event_deltas.sql` is the only migration that is not verbatim from
-a ticket. It applies the two deltas ticket 08 owes ticket 07 — the
-`scheduler.idle` event type and `lease_expires_at` in the `tasks` ignored
-columns — and then re-runs `attach_event_triggers()`. Ticket 08 names both
-deltas in prose and ships neither as SQL.
+```
+NNN_slug.sql                  frozen baseline, NNN <= 016
+YYYYMMDDTHHMMSSZ__slug.sql    every migration authored after it
+```
 
-Migration numbering is mine, not the tickets'. Ticket 06 ends at `011` and
-ticket 08 also calls its file `011`; ticket 07 calls its file `012`. Order here
-is 06 (001–011), then 08 (012), then 07 (013), because `attach_event_triggers()`
-has to run after the last table exists.
+Identity is the filename minus `.sql`; order is that identity ascending in C
+collation, where `'0' < '2'` puts every legacy file before every timestamped one.
+The freeze is at 016 because that is what branch `prototype/schema` contains at
+`cfdc26e` and every sibling branch was cut from it. Past that, numbers are not
+assignable: ticket 06 and ticket 08 both wrote an `011` and ticket 07 wrote a
+`012` without either of them being wrong. A UTC timestamp is collision-free
+without anyone having to look at what anyone else picked.
+
+Enforced, not documented. `lint` refuses:
+
+- a numeric name above 016, printing the `git mv` that fixes it;
+- two files claiming one legacy number (different ids, so the duplicate-identity
+  test cannot see it — the 011/011 collision, exactly);
+- a name matching neither form;
+- `BEGIN`/`COMMIT` inside a migration (apply and record are one transaction, and
+  a migration that commits its own leaves the bookkeeping in a second one);
+- `CREATE`/`ALTER`/`DROP`/`COMMENT ON ROLE` (roles are cluster-global and
+  provisioning, and `rk2_migrate` deliberately has no `CREATEROLE`).
+
+Ticket 32's ordering constraint survives it: `attach_event_triggers()` still has
+to run after the last table exists, and now does so on **every** run, from the
+runner, rather than from whichever migration happened to be last.
+
+## The runner
+
+`rk2_meta.schema_migrations` holds id, sha256, applied_at, applied_by and the
+runner version. `migrate.sh up`:
+
+1. `lint`;
+2. takes advisory lock `8158253941`, so two runners cannot interleave;
+3. `precheck` — refuses if an applied file's checksum changed, or if a pending
+   file sorts before one already applied (a merge from a parallel branch);
+4. applies each pending file and writes its version row **in one transaction**,
+   so there is no half-applied state to design a repair for;
+5. runs the finalizers;
+6. `verify`, which exits non-zero if anything is not true.
+
+Finalizers, unconditional, in this order: `apply_server_settings()`,
+`attach_event_triggers()`, `enforce_always_triggers()`, `apply_state_rls()`,
+`apply_state_grants()`, `enforce_fk_fire_order()`. They exist because the
+alternative is asking every future migration author to remember six things; the
+finalizer makes the class of drift impossible rather than fixed once per
+migration. This is why the drift probe's missing RLS is silently healed while
+its four other defects fail the run.
+
+## Standing checks
+
+`standing_checks` is a table, `run_standing_checks()` runs every row, and
+`assert_standing_checks()` raises. 15 checks. `check_check_registration()` is
+the one that closes the loop: a `check_%` function in `public` with no
+`standing_checks` row is itself a problem. Nine of the twelve checkers the
+corpus inherited had no caller at all after their own migration committed, which
+is why four of the five defects this ticket was given were live.
+
+## Roles, settings, restore
+
+Six roles: `rk2_owner` (owns everything), `rk2_migrate` (applies migrations, no
+`CREATEROLE`), `rk2_runtime` (the write connection), `rk2_state` (the agent read
+connection, column-level grants only), `rk2_human` (membership is the only thing
+authorising `actor_kind='human'`), `rk2_restore`.
+
+Settings ship as `ALTER DATABASE ... SET` and are asserted with their source, so
+a session `SET` cannot satisfy them. `maintenance_work_mem = 256MB` is measured,
+not guessed — see `measure_hnsw.sh` and the table in the settings migration.
+Postmaster-context GUCs (`wal_level`, `shared_buffers`, `max_connections`)
+cannot ship as a migration at all and are asserted instead; that is also the
+answer to the full-history-auditing question, which needs `wal_level=logical` or
+pgaudit and is therefore an image decision, not a schema one.
+
+`restore.sh` is the decided restore procedure. Data-only restore into a
+populated schema is not supported. A full restore into a freshly provisioned
+database needs no trigger manipulation, and `migrate.sh up` afterwards is not
+decoration: `pg_dump` does not carry `ALTER DATABASE ... SET`, and `pg_restore`
+recreates foreign keys in dump order, which puts 8 parent/child pairs in an
+order where a purge raises instead of cascading. One check tolerance exists and
+is named: after a restore, `row_last_write_unaccounted` is false for every row
+by construction, because `xmin` is now the restore's transaction.
 
 ## Running it
 
 ```sh
-./run_all.sh                 # container rk2-schema, database rk2, image pgvector/pgvector:pg18
-CT=other DB=other ./apply.sh # apply only, against an existing container
+./run_all.sh                    # everything: container rk2-mig-db, database rk2
+./prove_holes.sh                # the adversarial suite, on its own database
+CT=x DB=y ./migrate.sh up       # against an existing container
+./migrate.sh status | verify | lint
 ```
 
-`run_all.sh` drops and recreates the database, so it is the from-empty check.
-Groups A and B print as one table and end with a `0 failing of 62` line.
-
-To confirm the migrations are not accidentally idempotent, run `./apply.sh`
-twice without dropping the database. The second run must fail, and does:
-
-```
-ERROR:  relation "programs" already exists
-```
+`run_all.sh` has ten passes and ends `run_all: everything passed`. Groups A, B
+and C print as one table and end with a `56 checks, 0 failing` line.
 
 ## Check inventory
 
-Group A, `tests/checks_a.sql`, 41 checks, all passing. Three of them (C24–C26)
-assert a **hole** — they pass because the database permits something the tickets
-say should not happen. Each is commented as such in the file. All three are
-cross-program citation, which is ticket 35's scope; the other three holes the
-first run found (C23, C27, C28) were ticket 06's and are now assertions.
+Group A, `tests/checks_a.sql`. Ticket 32 shipped three of these (C24–C26) as
+assertions that a **hole** was open; ticket 35's migration closed all three and
+they are now `expect_raise` naming the constraint that refuses.
 
 | Check | What it pins |
 | --- | --- |
@@ -114,11 +181,12 @@ first run found (C23, C27, C28) were ticket 06's and are now assertions.
 | C17 | `scheduler_weights_one_active` refuses a second active row |
 | C18 | a second inactive weights row is allowed |
 | C19 | one lane per `(program_id, kind)` |
-| C20 | `identities_slot_idx` refuses a duplicate slot name |
+| C20 | the same slot name in two programs is legal (ticket 35 scoped the index) |
+| C20b | `identities_slot_idx` still refuses a duplicate slot within one program |
 | C21 | composite FK refuses an endpoint on an entity of the wrong type |
 | C22 | `identity_leases_exclusive_idx` refuses an overlapping lease |
 | C23 | a transition may not cite a `proxy_internal` receipt |
-| C24–C26 | holes, ticket 35: a transition may cite another program's receipt or a `program_id` that disagrees with its hypothesis; a hypothesis may point at another program's entity |
+| C24–C26 | closed by ticket 35: a transition may not cite another program's receipt or hypothesis, and a hypothesis may not point at another program's entity |
 | C27 | `validated_by_test_run_id` must be a run of a test of one of the finding's own hypotheses |
 | C28 | that run's `outcome` must be `holds`, enforced by composite FK |
 | C29, C30 | a trigger cannot forge `status` on either table — the D6 payload |
@@ -134,10 +202,10 @@ first run found (C23, C27, C28) were ticket 06's and are now assertions.
 | C40 | the same transition accepted once the profile is satisfied |
 | C41 | registering an `evidence_profile` with no predicate function raises |
 
-Group B, `tests/checks_b.sql`, 21 checks, all passing — ticket 07's
-re-resolution. B01–B14 run inside rolled-back subtransactions like group A;
-B20–B26 need writes committed in one transaction to be visible to a check in the
-next, so they run at top level on a throwaway program that B25 purges.
+Group B, `tests/checks_b.sql` — ticket 07's re-resolution. B01–B14 run inside
+rolled-back subtransactions like group A; B20–B26 need writes committed in one
+transaction to be visible to a check in the next, so they run at top level on a
+throwaway program that B25 purges.
 
 | Check | What it pins |
 | --- | --- |
@@ -148,7 +216,7 @@ next, so they run at top level on a throwaway program that B25 purges.
 | B07 | the runtime role cannot `SET session_replication_role` |
 | B08 | the runtime role's ordinary write still emits, so the split costs nothing |
 | B09–B12 | no single `entities`, `agent_runs`, `tasks` or `findings` row can be deleted, even under `app.purging` |
-| B13 | no FK outside `purge_cascade_edges` has a delete action — the invariant a later migration would otherwise break silently |
+| B13 | no FK outside `purge_cascade_edges` has a delete action |
 | B14 | `reject_mutation()` no longer exists (D1) |
 | B20 | `check_event_log_integrity()` is silent on honest state |
 | B21, B22 | an ignored-column write is recorded in `suppressed_writes` and is not a false positive |
@@ -157,39 +225,15 @@ next, so they run at top level on a throwaway program that B25 purges.
 | B25 | `DELETE FROM programs` still takes everything, under the new all-`NO ACTION` rules |
 | B26 | the checker is silent again afterwards |
 
-Group C (ranking determinism, concurrent claim, HNSW) is probes rather than
-assertions — run by hand against the same database, results in the ticket 32
-answer.
-`tests/scheduler.sql` holds the fixture and the two functions those probes need:
+Group M, `tests/checks_c.sql`, 19 checks — ticket 33's, on the corpus rather
+than on any one migration: the vocabularies and the fixture agree, scope policy
+is published before a receipt can name it, a purge runs to completion with 021's
+immutability guard installed, `resume_program()` no longer deletes a curated
+emitter's rows, `rk2_state` holds no relation-level grant, and every checker in
+the corpus is registered.
 
-- `rank_pass(program)` — the ranking pass from ticket 08, as far as it can be
-  written. `novelty_for`, `cost_for` and `confidence_for` are stand-ins; each
-  carries a comment naming the input ticket 08 does not supply
-  (`|vocabulary|`, the observation `kind` list, `N` in "last N runs", the
-  role-to-kind mapping, the `required_skills` registry).
-- `claim_one(program, label)` — `FOR UPDATE SKIP LOCKED` against
-  `scheduler_lanes`. Run four sessions against it: no double-claim, but lane
-  caps are **not** held unless the caller also takes
-  `pg_advisory_xact_lock`. That contradicts ticket 08's claim protocol.
-
-## Known live defects the tests reproduce
-
-Short list; the full one with tickets named is in the ticket 32 answer.
-
-- HNSW at 1536 dimensions outgrows the default 64MB `maintenance_work_mem` at
-  9752 tuples. No ticket mentions a server setting. Ticket 33's.
-- Cross-program citation is unconstrained (C24–C26). Ticket 35's.
-
-Fixed by `016`, kept here so the diff is readable: a program holding any
-`hypothesis_near_matches` row could never be purged, because ticket 08 attached
-the old `reject_mutation()`; deleting a single `agent_runs` row was impossible
-because `ON DELETE SET NULL` fired an UPDATE into immutable `observations`;
-`events.task_id ON DELETE CASCADE` destroyed unrelated history;
-`check_event_log_integrity()` read `pg_trigger` existence but not `tgenabled`,
-so a disabled event trigger passed green.
-
-Fixed by `015`, kept here so the diff is readable: `guard_status_cache()` gated
-on `pg_trigger_depth() < 2`, so any trigger could write `status` with no
-transition row; labels were wired to nothing, so a second unlabelled row in one
-program hit `entities_program_id_label_key`; `RAISE EXCEPTION 'illegal transition
-%s -> %s'` printed `testables -> supporteds`.
+`prove_holes.sh` is the adversarial half: 43 cases, each run twice against the
+same database at the same moment — once through ticket 07's checker and once
+through the corpus's — so the interesting result is where the old one says
+nothing. It also covers the runner: checksum drift, out-of-order arrival, both
+numbering refusals, the settings assertion, and the restore entitlement.

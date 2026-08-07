@@ -20,8 +20,13 @@ BEGIN
         EXECUTE format('SET ROLE %I', p_role);
     END IF;
     PERFORM set_config('app.actor_kind', 'runtime', true);
-    INSERT INTO entities (program_id, type, dedup_key)
-    VALUES ('11111111-1111-7111-8111-111111111111', 'host', p_key)
+    -- ticket 33: 021 made a selector mandatory on every addressable type, so
+    -- the helper carries one. A host entity with no selector is a row the
+    -- scope grammar cannot decide, which is what the constraint refuses.
+    INSERT INTO entities (program_id, type, dedup_key,
+                          scope_selector_kind, scope_selector)
+    VALUES ('11111111-1111-7111-8111-111111111111', 'host', p_key,
+            'host', 'acme.test')
     RETURNING id INTO v_id;
     SELECT count(*) INTO n FROM events WHERE subject_id = v_id;
     SELECT label INTO lbl FROM entities WHERE id = v_id;

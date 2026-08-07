@@ -187,19 +187,33 @@ SELECT t.expect_ok('C18 second inactive scheduler_weights row',
             interval '30 minutes', 3, false)$$);
 
 SELECT t.expect_raise('C19 second default lane for one kind',
-  $$INSERT INTO scheduler_lanes (program_id, kind, min_slots, max_slots)
-    VALUES (NULL, 'recon', 0, 9)$$,
+  $$INSERT INTO scheduler_lanes (program_id, kind, min_slots)
+    VALUES (NULL, 'recon', 0)$$,
   'scheduler_lanes_program_id_kind_key');
 
 -- ---- surface uniqueness --------------------------------------------------
 
-SELECT t.expect_raise('C20 identity slot name reused by another program',
+-- ticket 33: this check asserted the OPPOSITE until 017. `identities_slot_idx`
+-- was UNIQUE (slot_name) across the whole install, so program B could not have
+-- a slot named `userA` because program A did -- 017 rekeyed it to
+-- (program_id, slot_name). Both halves are now asserted: across programs is
+-- allowed, within one program is not.
+SELECT t.expect_ok('C20 identity slot name reused by ANOTHER program is fine',
   $$INSERT INTO entities (id, program_id, type, label, dedup_key)
       VALUES ('aaaaaaaa-0000-7000-8000-0000000000b2',
               '22222222-2222-7222-8222-222222222222', 'identity', 'ID1',
               'identity:userA');
     INSERT INTO identities (entity_id, slot_name, class, secret_ref)
       VALUES ('aaaaaaaa-0000-7000-8000-0000000000b2', 'userA', 'user',
+              'op://x/y/z')$$);
+
+SELECT t.expect_raise('C20b identity slot name reused within one program',
+  $$INSERT INTO entities (id, program_id, type, label, dedup_key)
+      VALUES ('aaaaaaaa-0000-7000-8000-0000000000b3',
+              '11111111-1111-7111-8111-111111111111', 'identity', 'ID9',
+              'identity:userA-again');
+    INSERT INTO identities (entity_id, slot_name, class, secret_ref)
+      VALUES ('aaaaaaaa-0000-7000-8000-0000000000b3', 'userA', 'user',
               'op://x/y/z')$$,
   'identities_slot_idx');
 
@@ -229,31 +243,38 @@ SELECT t.expect_raise('C23 transition may not cite a proxy_internal receipt',
             'dddddddd-0000-7000-8000-000000000009')$$,
   'lane proxy_internal and cannot back a transition');
 
--- ---- claims the schema does NOT make: these pass, and each one is a hole --
--- All three are cross-program citation, which is ticket 35's scope.
+-- ---- the three holes ticket 35 closed --------------------------------------
+-- These three used to be expect_ok with HOLE in the name: cross-program
+-- citation was accepted by every one of them. 017 added the composite
+-- (program_id, id) foreign keys that refuse it, so the checks now assert the
+-- refusal. The names keep their numbers so the ticket-32 report still resolves.
 
-SELECT t.expect_ok('C24 HOLE transition may cite another program''s receipt',
+SELECT t.expect_raise('C24 transition may not cite another program''s receipt',
   $$INSERT INTO hypothesis_transitions
       (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id)
     VALUES ('11111111-1111-7111-8111-111111111111',
             'bbbbbbbb-0000-7000-8000-000000000002',
             'testable', 'testing', 'runtime',
-            'dddddddd-0000-7000-8000-0000000000b1')$$);
+            'dddddddd-0000-7000-8000-0000000000b1')$$,
+  'hypothesis_transitions_receipt_id_fkey');
 
-SELECT t.expect_ok('C25 HOLE transition program_id may disagree with its hypothesis',
+SELECT t.expect_raise('C25 transition program_id may not disagree with its hypothesis',
   $$INSERT INTO hypothesis_transitions
       (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id)
     VALUES ('22222222-2222-7222-8222-222222222222',
             'bbbbbbbb-0000-7000-8000-000000000002',
             'testable', 'testing', 'runtime',
-            'dddddddd-0000-7000-8000-000000000001')$$);
+            'dddddddd-0000-7000-8000-000000000001')$$,
+  'hypothesis_transitions_hypothesis_id_fkey');
 
-SELECT t.expect_ok('C26 HOLE hypothesis may point at another program''s entity',
+SELECT t.expect_raise('C26 hypothesis may not point at another program''s entity',
   $$INSERT INTO hypotheses (program_id, label, subject_entity_id, property_class,
                             statement)
     VALUES ('11111111-1111-7111-8111-111111111111', 'HX',
-            'aaaaaaaa-0000-7000-8000-0000000000b1', 'authz.horizontal',
-            'cross-program subject')$$);
+            'aaaaaaaa-0000-7000-8000-0000000000b1',
+            'authorization.object_ownership',
+            'cross-program subject')$$,
+  'hypotheses_subject_entity_id_fkey');
 
 SELECT t.expect_raise('C27 validated may not cite a test run of an unrelated test',
   $$INSERT INTO finding_evidence (finding_id, observation_id, ordinal)
@@ -378,11 +399,14 @@ SELECT t.expect_raise('C35 a cited test run cannot be deleted',
 -- D9. Both inserts omit the label. The seed already took EP1 and EP2 by hand, so
 -- passing means the collision loop advanced past both.
 SELECT t.expect_ok('C36 unlabelled rows get distinct DB-assigned labels',
-  $$INSERT INTO entities (id, program_id, type, dedup_key)
+  $$INSERT INTO entities (id, program_id, type, dedup_key,
+                         scope_selector_kind, scope_selector)
       VALUES ('aaaaaaaa-0000-7000-8000-0000000000e1',
-              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/a'),
+              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/a',
+              'host', 'acme.test'),
              ('aaaaaaaa-0000-7000-8000-0000000000e2',
-              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/b');
+              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/b',
+              'host', 'acme.test');
     DO $c36$
     DECLARE n integer; ok boolean;
     BEGIN
@@ -412,8 +436,10 @@ SELECT t.expect_true('C37 the seed''s unlabelled rows were labelled',
 
 SELECT t.expect_raise('C38 an entity type with no registered prefix',
   $$DELETE FROM label_prefixes WHERE kind = 'host';
-    INSERT INTO entities (program_id, type, dedup_key)
-    VALUES ('11111111-1111-7111-8111-111111111111', 'host', '10.0.0.1')$$,
+    INSERT INTO entities (program_id, type, dedup_key,
+                         scope_selector_kind, scope_selector)
+    VALUES ('11111111-1111-7111-8111-111111111111', 'host', '10.0.0.1',
+            'host', '10.0.0.1')$$,
   'no label prefix registered for kind host');
 
 -- Ticket 09. The profile is stricter than transition_rules, so the transition
@@ -430,7 +456,7 @@ SELECT t.expect_raise('C39 a declared evidence profile is consulted',
                             mission_packet)
       VALUES ('ffffffff-0000-7000-8000-0000000000f1',
               '11111111-1111-7111-8111-111111111111',
-              'eeeeeeee-0000-7000-8000-0000000000f1', 'hunter', 'claude-opus-5',
+              'eeeeeeee-0000-7000-8000-0000000000f1', 'web_hunter', 'claude-opus-5',
               'high', '{}');
     INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
       VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
@@ -461,7 +487,7 @@ SELECT t.expect_ok('C40 the same transition once the profile is satisfied',
                             mission_packet)
       VALUES ('ffffffff-0000-7000-8000-0000000000f1',
               '11111111-1111-7111-8111-111111111111',
-              'eeeeeeee-0000-7000-8000-0000000000f1', 'hunter', 'claude-opus-5',
+              'eeeeeeee-0000-7000-8000-0000000000f1', 'web_hunter', 'claude-opus-5',
               'high', '{}');
     INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
       VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
