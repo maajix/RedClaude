@@ -28,12 +28,12 @@ SELECT set_config('app.actor_kind', 'runtime', false);
 SELECT t.expect_raise('C01 hypotheses.status direct write',
   $$UPDATE hypotheses SET status = 'refuted'
      WHERE id = 'bbbbbbbb-0000-7000-8000-000000000001'$$,
-  'maintained by the transition table');
+  'maintained by hypothesis_transitions');
 
 SELECT t.expect_raise('C02 findings.status direct write',
   $$UPDATE findings SET status = 'rejected'
      WHERE id = '55555555-0000-7000-8000-000000000001'$$,
-  'maintained by the transition table');
+  'maintained by finding_transitions');
 
 -- ---- the provenance hinge: testable -> testing ---------------------------
 
@@ -129,7 +129,7 @@ SELECT t.expect_raise('C11 finding cannot be validated with no test run',
               '55555555-0000-7000-8000-000000000002',
               'validating', 'validated', 'runtime',
               'dddddddd-0000-7000-8000-000000000001')$$,
-  'findings_check');
+  'requires validated_by_test_run_id to be set first');
 
 -- ---- observations --------------------------------------------------------
 
@@ -218,15 +218,19 @@ SELECT t.expect_raise('C22 second live lease on one identity',
             now() + interval '5 minutes')$$,
   'identity_leases_exclusive_idx');
 
--- ---- claims the schema does NOT make: these pass, and each one is a hole --
+-- ---- closed by 015 (were C23/C27/C28 holes) ------------------------------
 
-SELECT t.expect_ok('C23 HOLE transition may cite a proxy_internal receipt',
+SELECT t.expect_raise('C23 transition may not cite a proxy_internal receipt',
   $$INSERT INTO hypothesis_transitions
       (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id)
     VALUES ('11111111-1111-7111-8111-111111111111',
             'bbbbbbbb-0000-7000-8000-000000000002',
             'testable', 'testing', 'runtime',
-            'dddddddd-0000-7000-8000-000000000009')$$);
+            'dddddddd-0000-7000-8000-000000000009')$$,
+  'lane proxy_internal and cannot back a transition');
+
+-- ---- claims the schema does NOT make: these pass, and each one is a hole --
+-- All three are cross-program citation, which is ticket 35's scope.
 
 SELECT t.expect_ok('C24 HOLE transition may cite another program''s receipt',
   $$INSERT INTO hypothesis_transitions
@@ -251,7 +255,7 @@ SELECT t.expect_ok('C26 HOLE hypothesis may point at another program''s entity',
             'aaaaaaaa-0000-7000-8000-0000000000b1', 'authz.horizontal',
             'cross-program subject')$$);
 
-SELECT t.expect_ok('C27 HOLE validated may cite a test run of an unrelated test',
+SELECT t.expect_raise('C27 validated may not cite a test run of an unrelated test',
   $$INSERT INTO finding_evidence (finding_id, observation_id, ordinal)
       VALUES ('55555555-0000-7000-8000-000000000002',
               '99999999-0000-7000-8000-000000000001', 1),
@@ -270,9 +274,10 @@ SELECT t.expect_ok('C27 HOLE validated may cite a test run of an unrelated test'
       VALUES ('11111111-1111-7111-8111-111111111111',
               '55555555-0000-7000-8000-000000000002',
               'validating', 'validated', 'runtime',
-              'dddddddd-0000-7000-8000-000000000001')$$);
+              'dddddddd-0000-7000-8000-000000000001')$$,
+  'is not a run of a test of any hypothesis of finding');
 
-SELECT t.expect_ok('C28 HOLE a failing test run can still validate a finding',
+SELECT t.expect_raise('C28 a failing test run cannot validate a finding',
   $$INSERT INTO test_runs (id, program_id, test_id, agent_run_id, lane, outcome,
                            assertion_results)
       VALUES ('66666666-0000-7000-8000-000000000002',
@@ -281,4 +286,202 @@ SELECT t.expect_ok('C28 HOLE a failing test run can still validate a finding',
               'ffffffff-0000-7000-8000-000000000001', 'replay', 'fails', '{}');
     UPDATE findings
        SET validated_by_test_run_id = '66666666-0000-7000-8000-000000000002'
-     WHERE id = '55555555-0000-7000-8000-000000000001'$$);
+     WHERE id = '55555555-0000-7000-8000-000000000001'$$,
+  'findings_validated_run_holds_fk');
+
+-- ---- 015: what the reopened decisions now enforce -------------------------
+
+-- D6. The old guard gated on pg_trigger_depth(), so this exact payload set H1 to
+-- `refuted` with no transition row. The new guard is causal, so the forged write
+-- is refused however deep the stack is.
+SELECT t.expect_raise('C29 a trigger cannot forge hypotheses.status',
+  $$CREATE FUNCTION forge_status() RETURNS trigger LANGUAGE plpgsql AS
+      'BEGIN UPDATE hypotheses SET status = ''refuted''
+              WHERE id = ''bbbbbbbb-0000-7000-8000-000000000001'';
+        RETURN NEW; END';
+    CREATE TRIGGER programs_forge AFTER UPDATE ON programs
+      FOR EACH ROW EXECUTE FUNCTION forge_status();
+    UPDATE programs SET name = 'Acme BB 2'
+     WHERE id = '11111111-1111-7111-8111-111111111111'$$,
+  'maintained by hypothesis_transitions');
+
+SELECT t.expect_raise('C30 a trigger cannot forge findings.status',
+  $$CREATE FUNCTION forge_fstatus() RETURNS trigger LANGUAGE plpgsql AS
+      'BEGIN UPDATE findings SET status = ''rejected''
+              WHERE id = ''55555555-0000-7000-8000-000000000001'';
+        RETURN NEW; END';
+    CREATE TRIGGER programs_forge_f AFTER UPDATE ON programs
+      FOR EACH ROW EXECUTE FUNCTION forge_fstatus();
+    UPDATE programs SET name = 'Acme BB 2'
+     WHERE id = '11111111-1111-7111-8111-111111111111'$$,
+  'maintained by finding_transitions');
+
+-- The other half of D6: a legitimate transition still moves the cache, now from
+-- an AFTER trigger. The seed walked H1 to `supported` and stranded H3 at
+-- `testing`; if the cache had stopped being written, both would read `proposed`.
+SELECT t.expect_true('C31 a transition still updates the status cache',
+  $$SELECT (SELECT status FROM hypotheses
+             WHERE id = 'bbbbbbbb-0000-7000-8000-000000000001') = 'supported'
+       AND (SELECT status FROM hypotheses
+             WHERE id = 'bbbbbbbb-0000-7000-8000-000000000003') = 'testing'
+       AND (SELECT status FROM findings
+             WHERE id = '55555555-0000-7000-8000-000000000001') = 'validated'$$);
+
+-- The stronger form of the provenance hinge: a conclusion must cite a receipt
+-- that this hypothesis's own test run produced. R2 is a real agent receipt in
+-- the same program, and it is still not admissible here.
+SELECT t.expect_raise('C32 testing->supported citing a receipt from no test run',
+  $$INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
+      VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000001', 'supports', 'baseline'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000003', 'supports', 'variant'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000002', 'supports', 'control');
+    INSERT INTO hypothesis_transitions
+      (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id)
+    VALUES ('11111111-1111-7111-8111-111111111111',
+            'bbbbbbbb-0000-7000-8000-000000000003',
+            'testing', 'supported', 'runtime',
+            'dddddddd-0000-7000-8000-000000000002')$$,
+  'must cite a receipt produced by a test run of hypothesis');
+
+SELECT t.expect_ok('C33 testing->supported citing its own test run''s receipt',
+  $$INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
+      VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000001', 'supports', 'baseline'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000003', 'supports', 'variant'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000002', 'supports', 'control');
+    INSERT INTO hypothesis_transitions
+      (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id)
+    VALUES ('11111111-1111-7111-8111-111111111111',
+            'bbbbbbbb-0000-7000-8000-000000000003',
+            'testing', 'supported', 'runtime',
+            'dddddddd-0000-7000-8000-000000000001')$$);
+
+-- C28's other half: the outcome cannot be rewritten after the fact either.
+SELECT t.expect_raise('C34 test_runs are immutable',
+  $$UPDATE test_runs SET outcome = 'fails'
+     WHERE id = '66666666-0000-7000-8000-000000000001'$$,
+  'test_runs rows are immutable');
+
+-- D4. There is no narrow delete: the unit of deletion is one whole program
+-- (purge_program) or one artifact blob. RESTRICT is that statement, not an
+-- oversight, and it holds even with the purge flag set.
+SELECT t.expect_raise('C35 a cited test run cannot be deleted',
+  $$SELECT set_config('app.purging', 'on', true);
+    DELETE FROM test_runs WHERE id = '66666666-0000-7000-8000-000000000001'$$,
+  'findings_validated_run_holds_fk');
+
+-- D9. Both inserts omit the label. The seed already took EP1 and EP2 by hand, so
+-- passing means the collision loop advanced past both.
+SELECT t.expect_ok('C36 unlabelled rows get distinct DB-assigned labels',
+  $$INSERT INTO entities (id, program_id, type, dedup_key)
+      VALUES ('aaaaaaaa-0000-7000-8000-0000000000e1',
+              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/a'),
+             ('aaaaaaaa-0000-7000-8000-0000000000e2',
+              '11111111-1111-7111-8111-111111111111', 'endpoint', 'GET /api/b');
+    DO $c36$
+    DECLARE n integer; ok boolean;
+    BEGIN
+        SELECT count(DISTINCT label),
+               bool_and(label ~ '^EP[0-9]+$' AND label NOT IN ('EP1','EP2'))
+          INTO n, ok
+          FROM entities
+         WHERE id IN ('aaaaaaaa-0000-7000-8000-0000000000e1',
+                      'aaaaaaaa-0000-7000-8000-0000000000e2');
+        IF n <> 2 THEN
+            RAISE EXCEPTION 'labels collided';
+        END IF;
+        IF NOT ok THEN
+            RAISE EXCEPTION 'wrong prefix or reused a taken label';
+        END IF;
+    END $c36$;
+  $$);
+
+SELECT t.expect_true('C37 the seed''s unlabelled rows were labelled',
+  $$SELECT (SELECT count(*) FROM entities
+             WHERE id IN ('aaaaaaaa-0000-7000-8000-0000000000c1',
+                          'aaaaaaaa-0000-7000-8000-0000000000c2')
+               AND label ~ '^TEC[0-9]+$') = 2
+       AND (SELECT next_val FROM label_counters
+             WHERE program_id = '11111111-1111-7111-8111-111111111111'
+               AND prefix = 'TEC') = 3$$);
+
+SELECT t.expect_raise('C38 an entity type with no registered prefix',
+  $$DELETE FROM label_prefixes WHERE kind = 'host';
+    INSERT INTO entities (program_id, type, dedup_key)
+    VALUES ('11111111-1111-7111-8111-111111111111', 'host', '10.0.0.1')$$,
+  'no label prefix registered for kind host');
+
+-- Ticket 09. The profile is stricter than transition_rules, so the transition
+-- that C33 accepts is refused once the skill that ran declares strict_four.
+SELECT t.expect_raise('C39 a declared evidence profile is consulted',
+  $$INSERT INTO tasks (id, program_id, kind, subject_entity_id, hypothesis_id,
+                       skill_name, skill_sha256, evidence_profile_id)
+      VALUES ('eeeeeeee-0000-7000-8000-0000000000f1',
+              '11111111-1111-7111-8111-111111111111', 'hunt',
+              'aaaaaaaa-0000-7000-8000-000000000005',
+              'bbbbbbbb-0000-7000-8000-000000000003',
+              'bb:test-sqli', repeat('7', 64), 'strict_four');
+    INSERT INTO agent_runs (id, program_id, task_id, role, model, effort,
+                            mission_packet)
+      VALUES ('ffffffff-0000-7000-8000-0000000000f1',
+              '11111111-1111-7111-8111-111111111111',
+              'eeeeeeee-0000-7000-8000-0000000000f1', 'hunter', 'claude-opus-5',
+              'high', '{}');
+    INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
+      VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000001', 'supports', 'baseline'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000003', 'supports', 'variant'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000002', 'supports', 'control');
+    INSERT INTO hypothesis_transitions
+      (program_id, hypothesis_id, from_status, to_status, actor_kind,
+       agent_run_id, receipt_id)
+    VALUES ('11111111-1111-7111-8111-111111111111',
+            'bbbbbbbb-0000-7000-8000-000000000003',
+            'testing', 'supported', 'runtime',
+            'ffffffff-0000-7000-8000-0000000000f1',
+            'dddddddd-0000-7000-8000-000000000001')$$,
+  'evidence profile strict_four is not satisfied');
+
+SELECT t.expect_ok('C40 the same transition once the profile is satisfied',
+  $$INSERT INTO tasks (id, program_id, kind, subject_entity_id, hypothesis_id,
+                       skill_name, skill_sha256, evidence_profile_id)
+      VALUES ('eeeeeeee-0000-7000-8000-0000000000f1',
+              '11111111-1111-7111-8111-111111111111', 'hunt',
+              'aaaaaaaa-0000-7000-8000-000000000005',
+              'bbbbbbbb-0000-7000-8000-000000000003',
+              'bb:test-sqli', repeat('7', 64), 'strict_four');
+    INSERT INTO agent_runs (id, program_id, task_id, role, model, effort,
+                            mission_packet)
+      VALUES ('ffffffff-0000-7000-8000-0000000000f1',
+              '11111111-1111-7111-8111-111111111111',
+              'eeeeeeee-0000-7000-8000-0000000000f1', 'hunter', 'claude-opus-5',
+              'high', '{}');
+    INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)
+      VALUES ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000001', 'supports', 'baseline'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000003', 'supports', 'variant'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000002', 'supports', 'control'),
+             ('bbbbbbbb-0000-7000-8000-000000000003',
+              '99999999-0000-7000-8000-000000000001', 'supports', 'context');
+    INSERT INTO hypothesis_transitions
+      (program_id, hypothesis_id, from_status, to_status, actor_kind,
+       agent_run_id, receipt_id)
+    VALUES ('11111111-1111-7111-8111-111111111111',
+            'bbbbbbbb-0000-7000-8000-000000000003',
+            'testing', 'supported', 'runtime',
+            'ffffffff-0000-7000-8000-0000000000f1',
+            'dddddddd-0000-7000-8000-000000000001')$$);
+
+SELECT t.expect_raise('C41 an evidence profile with no function',
+  $$INSERT INTO evidence_profiles (id, description)
+    VALUES ('never_written', 'a profile whose predicate was never shipped')$$,
+  'needs a function evidence_profile_never_written(uuid)');

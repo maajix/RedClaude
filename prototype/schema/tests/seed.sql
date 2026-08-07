@@ -91,13 +91,8 @@ INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role) 
     ('bbbbbbbb-0000-7000-8000-000000000001','99999999-0000-7000-8000-000000000003','supports','variant'),
     ('bbbbbbbb-0000-7000-8000-000000000001','99999999-0000-7000-8000-000000000002','supports','control');
 
--- proposed -> testable -> testing -> supported
-INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind) VALUES
-    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','proposed','testable','llm');
-INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id) VALUES
-    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','testable','testing','runtime','dddddddd-0000-7000-8000-000000000001'),
-    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','testing','supported','runtime','dddddddd-0000-7000-8000-000000000003');
-
+-- The test and its run come before the conclusion, because `testing -> supported`
+-- now requires the cited receipt to be one the run produced.
 INSERT INTO tests (id, program_id, label, hypothesis_id, spec, spec_sha256, created_by_run_id) VALUES
     ('77777777-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','TS1',
      'bbbbbbbb-0000-7000-8000-000000000001','{"steps":[]}', repeat('c',64),
@@ -107,6 +102,22 @@ INSERT INTO test_runs (id, program_id, test_id, agent_run_id, lane, outcome, ass
     ('66666666-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111',
      '77777777-0000-7000-8000-000000000001','ffffffff-0000-7000-8000-000000000001',
      'replay','holds','{"all":true}');
+
+INSERT INTO test_run_receipts (test_run_id, receipt_id, ordinal) VALUES
+    ('66666666-0000-7000-8000-000000000001','dddddddd-0000-7000-8000-000000000001',1),
+    ('66666666-0000-7000-8000-000000000001','dddddddd-0000-7000-8000-000000000003',2);
+
+-- proposed -> testable -> testing -> supported
+INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind) VALUES
+    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','proposed','testable','llm');
+-- One statement per transition: the status cache is written by an AFTER ROW
+-- trigger, which fires at end of statement, so two chained transitions in one
+-- INSERT would see a stale from_status. Each transition is its own commit point
+-- in the runtime anyway.
+INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id) VALUES
+    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','testable','testing','runtime','dddddddd-0000-7000-8000-000000000001');
+INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id) VALUES
+    ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000001','testing','supported','runtime','dddddddd-0000-7000-8000-000000000003');
 
 -- ---- finding -------------------------------------------------------------
 INSERT INTO findings (id, program_id, label, subject_entity_id, class_id, title, severity) VALUES
@@ -142,7 +153,8 @@ INSERT INTO hypotheses (id, program_id, label, subject_entity_id,
 INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind) VALUES
     ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000002','proposed','testable','llm');
 
--- H3: left at `testing`, which is what a crash strands.
+-- H3: left at `testing`, which is what a crash strands. Its test ran to
+-- completion and the conclusion was never written, so the run exists.
 INSERT INTO hypotheses (id, program_id, label, subject_entity_id, property_class, statement) VALUES
     ('bbbbbbbb-0000-7000-8000-000000000003','11111111-1111-7111-8111-111111111111','H3',
      'aaaaaaaa-0000-7000-8000-000000000005','injection.sql','id parameter concatenated into SQL');
@@ -150,6 +162,17 @@ INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_s
     ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000003','proposed','testable','llm');
 INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status, to_status, actor_kind, receipt_id) VALUES
     ('11111111-1111-7111-8111-111111111111','bbbbbbbb-0000-7000-8000-000000000003','testable','testing','runtime','dddddddd-0000-7000-8000-000000000001');
+
+INSERT INTO tests (id, program_id, label, hypothesis_id, spec, spec_sha256, created_by_run_id) VALUES
+    ('77777777-0000-7000-8000-000000000002','11111111-1111-7111-8111-111111111111','TS2',
+     'bbbbbbbb-0000-7000-8000-000000000003','{"steps":[]}', repeat('d',64),
+     'ffffffff-0000-7000-8000-000000000001');
+INSERT INTO test_runs (id, program_id, test_id, agent_run_id, lane, outcome, assertion_results) VALUES
+    ('66666666-0000-7000-8000-000000000003','11111111-1111-7111-8111-111111111111',
+     '77777777-0000-7000-8000-000000000002','ffffffff-0000-7000-8000-000000000001',
+     'replay','holds','{"all":true}');
+INSERT INTO test_run_receipts (test_run_id, receipt_id, ordinal) VALUES
+    ('66666666-0000-7000-8000-000000000003','dddddddd-0000-7000-8000-000000000001',1);
 
 -- F2: a candidate finding with no evidence.
 INSERT INTO findings (id, program_id, label, subject_entity_id, class_id, title, severity) VALUES
@@ -163,3 +186,21 @@ INSERT INTO applications (entity_id, base_url, kind) VALUES
     ('aaaaaaaa-0000-7000-8000-0000000000b1','https://other.test','web');
 INSERT INTO receipts (id, program_id, label, lane, decision, reason, ts_arrival) VALUES
     ('dddddddd-0000-7000-8000-0000000000b1','22222222-2222-7222-8222-222222222222','R1','agent','allowed','in scope', now());
+
+-- ---- D9: rows inserted with no label get one from the database ------------
+-- Every label above is explicit, which is how the seed reads as documentation.
+-- These two are not, because that is the path the runtime actually uses.
+INSERT INTO entities (id, program_id, type, dedup_key) VALUES
+    ('aaaaaaaa-0000-7000-8000-0000000000c1','11111111-1111-7111-8111-111111111111','technology','nginx/1.25.3'),
+    ('aaaaaaaa-0000-7000-8000-0000000000c2','11111111-1111-7111-8111-111111111111','technology','express/4.18.2');
+
+-- ---- ticket 09: an evidence profile a skill could ship --------------------
+-- Stricter than the transition_rules default of 2 supporting + 1 control, which
+-- is the only direction a profile is allowed to move.
+CREATE FUNCTION evidence_profile_strict_four(p_hypothesis uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT count(*) >= 4 FROM hypothesis_evidence WHERE hypothesis_id = p_hypothesis
+$$;
+
+INSERT INTO evidence_profiles (id, description) VALUES
+    ('strict_four', 'four evidence rows on the hypothesis, not two plus a control');

@@ -35,15 +35,21 @@ Verified on `pgvector/pgvector:pg18` = Postgres 18.4, pgvector 0.8.6.
 ## Layout
 
 ```
-migrations/   001..014, applied in filename order
+migrations/   001..015, applied in filename order
 tests/
   _harness.sql   schema t, table t.results, expect_raise / expect_ok / expect_true
   seed.sql       one realistic program plus the fixtures the checks need
-  checks_a.sql   28 constraint and trigger checks (group A)
+  checks_a.sql   41 constraint and trigger checks (group A)
   scheduler.sql  scheduler fixture plus rank_pass() and claim_one()
 apply.sh      apply every migration, one transaction per file, ON_ERROR_STOP
 run_all.sh    fresh container, fresh database, apply, seed, run group A
 ```
+
+`015_ticket06_fixes.sql` closes the five divergences ticket 32 charged to ticket
+06 — D4, D6, D7, D8, D9 — and lands the schema debt tickets 08 and 09 left on
+06's tables. It is the only migration written after the divergence list, and it
+is where the reopened ticket 06 decisions actually execute. D10 and the
+cross-program holes are ticket 35's, and are still open here.
 
 `014_scheduler_event_deltas.sql` is the only migration that is not verbatim from
 a ticket. It applies the two deltas ticket 08 owes ticket 07 — the
@@ -64,7 +70,7 @@ CT=other DB=other ./apply.sh # apply only, against an existing container
 ```
 
 `run_all.sh` drops and recreates the database, so it is the from-empty check.
-Group A prints as a table and ends with a `0 failing of 28` line.
+Group A prints as a table and ends with a `0 failing of 41` line.
 
 To confirm the migrations are not accidentally idempotent, run `./apply.sh`
 twice without dropping the database. The second run must fail, and does:
@@ -75,9 +81,11 @@ ERROR:  relation "programs" already exists
 
 ## Check inventory
 
-Group A, `tests/checks_a.sql`, 28 checks, all passing. Six of them (C23–C28)
+Group A, `tests/checks_a.sql`, 41 checks, all passing. Three of them (C24–C26)
 assert a **hole** — they pass because the database permits something the tickets
-say should not happen. Each is commented as such in the file.
+say should not happen. Each is commented as such in the file. All three are
+cross-program citation, which is ticket 35's scope; the other three holes the
+first run found (C23, C27, C28) were ticket 06's and are now assertions.
 
 | Check | What it pins |
 | --- | --- |
@@ -90,7 +98,7 @@ say should not happen. Each is commented as such in the file.
 | C08 | `proposed -> supported` refused below the evidence count |
 | C09 | `supported` refused without control evidence |
 | C10 | `validated -> reported` refused without a human actor |
-| C11 | `findings_check` refuses `validated` with no `validated_by_test_run_id` |
+| C11 | `validated` refused with no `validated_by_test_run_id` |
 | C12 | receipt with `actor_kind='proxy_internal'` refused for a transition |
 | C13 | `observations` immutable — UPDATE raises |
 | C14 | any row trigger raises when `app.actor_kind` is unset |
@@ -102,7 +110,22 @@ say should not happen. Each is commented as such in the file.
 | C20 | `identities_slot_idx` refuses a duplicate slot name |
 | C21 | composite FK refuses an endpoint on an entity of the wrong type |
 | C22 | `identity_leases_exclusive_idx` refuses an overlapping lease |
-| C23–C28 | holes: a transition may cite a `proxy_internal` receipt, another program's receipt, or a `program_id` that disagrees with its hypothesis; a hypothesis may point at another program's entity; `validated_by_test_run_id` may cite a test run of an unrelated test, or one whose `outcome` is `fails` |
+| C23 | a transition may not cite a `proxy_internal` receipt |
+| C24–C26 | holes, ticket 35: a transition may cite another program's receipt or a `program_id` that disagrees with its hypothesis; a hypothesis may point at another program's entity |
+| C27 | `validated_by_test_run_id` must be a run of a test of one of the finding's own hypotheses |
+| C28 | that run's `outcome` must be `holds`, enforced by composite FK |
+| C29, C30 | a trigger cannot forge `status` on either table — the D6 payload |
+| C31 | a legitimate transition still writes the `status` cache |
+| C32 | `testing -> supported` refused citing a receipt no test run of that hypothesis produced |
+| C33 | the same transition accepted citing its own test run's receipt |
+| C34 | `test_runs` immutable — the pinned outcome cannot be rewritten |
+| C35 | a cited `test_run` cannot be deleted, even under `app.purging` (D4, intended) |
+| C36 | two unlabelled rows get distinct labels, past the labels the seed took |
+| C37 | the seed's unlabelled rows were labelled and `label_counters` advanced |
+| C38 | an entity type with no registered prefix raises |
+| C39 | a skill's declared `evidence_profile` is consulted and can refuse |
+| C40 | the same transition accepted once the profile is satisfied |
+| C41 | registering an `evidence_profile` with no predicate function raises |
 
 Group B (purge, integrity checker, resume) and group C (ranking determinism,
 concurrent claim, HNSW) are probes rather than assertions — they were run by
@@ -132,7 +155,11 @@ Short list; the full one with tickets named is in the ticket 32 answer.
   `app.task_id` when unrelated rows were written.
 - `check_event_log_integrity()` reads `pg_trigger` existence but not
   `tgenabled`, so a disabled event trigger passes green.
-- `guard_status_cache()` gates on `pg_trigger_depth() < 2`, so any trigger can
-  write `status` directly with no transition row.
 - HNSW at 1536 dimensions outgrows the default 64MB `maintenance_work_mem` at
   9752 tuples. No ticket mentions a server setting.
+
+Fixed by `015`, kept here so the diff is readable: `guard_status_cache()` gated
+on `pg_trigger_depth() < 2`, so any trigger could write `status` with no
+transition row; labels were wired to nothing, so a second unlabelled row in one
+program hit `entities_program_id_label_key`; `RAISE EXCEPTION 'illegal transition
+%s -> %s'` printed `testables -> supporteds`.
