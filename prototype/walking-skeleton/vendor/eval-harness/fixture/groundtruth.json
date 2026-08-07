@@ -1,0 +1,53 @@
+{
+  "fixture": "notes-idor",
+  "app": "fixture/app.py",
+  "identities": ["userA", "userB"],
+  "comment": "Ground truth is not prose. Each entry carries the executable spec that demonstrates it, so 'did the system find this' is answered by replay, not by string matching a title.",
+
+  "vulns": [
+    {
+      "id": "gt-1",
+      "class": "idor",
+      "object_ref": "note:1",
+      "severity": "medium",
+      "title": "userB can read userA's note by id",
+      "spec": {
+        "preconditions": [
+          {"kind": "identity", "identity": "userA"},
+          {"kind": "identity", "identity": "userB"}
+        ],
+        "setup": [],
+        "actions": [
+          {"id": "victim", "identity": "userA", "method": "GET", "path": "/api/notes/1"},
+          {"id": "attacker", "identity": "userB", "method": "GET", "path": "/api/notes/1"}
+        ],
+        "assertions": [
+          {"kind": "status", "action": "attacker", "equals": 200},
+          {"kind": "body_contains", "action": "attacker", "value": "ALPHA-SECRET-0001"},
+          {"kind": "differential", "action_a": "attacker", "action_b": "victim", "field": "body", "same": true}
+        ],
+        "cleanup": []
+      }
+    }
+  ],
+
+  "comparability": {
+    "comment": "Requests that MUST be byte-identical across the two variants, and the requests that MUST differ. A fixture pair is only usable if both halves hold: no accidental divergence, and the intended divergence actually present.",
+    "identical": [
+      {"identity": null,    "method": "GET", "path": "/health"},
+      {"identity": null,    "method": "GET", "path": "/nope"},
+      {"identity": "userA", "method": "GET", "path": "/api/profile"},
+      {"identity": "userB", "method": "GET", "path": "/api/profile"},
+      {"identity": "userA", "method": "GET", "path": "/api/notes"},
+      {"identity": "userB", "method": "GET", "path": "/api/notes"},
+      {"identity": "userA", "method": "GET", "path": "/api/notes/1"},
+      {"identity": "userB", "method": "GET", "path": "/api/notes/2"},
+      {"identity": "userA", "method": "GET", "path": "/api/notes/999"},
+      {"identity": "userA", "method": "GET", "path": "/api/notes/abc"}
+    ],
+    "declared_divergence": [
+      {"identity": "userB", "method": "GET", "path": "/api/notes/1", "gt": "gt-1"},
+      {"identity": "userA", "method": "GET", "path": "/api/notes/2", "gt": "gt-1"}
+    ]
+  }
+}
