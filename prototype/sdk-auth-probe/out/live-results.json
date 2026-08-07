@@ -1,0 +1,764 @@
+[
+  {
+    "id": "live_baseline",
+    "result": {
+      "error": null,
+      "text": "PROBE_OK",
+      "result_subtype": "success",
+      "is_error": false,
+      "total_cost_usd": 0.000525,
+      "init_keys": [
+        "agents",
+        "analytics_disabled",
+        "apiKeySource",
+        "capabilities",
+        "claude_code_version",
+        "cwd",
+        "fast_mode_disabled_reason",
+        "fast_mode_state",
+        "mcp_servers",
+        "memory_paths",
+        "messaging_socket_path",
+        "model",
+        "output_style",
+        "permissionMode",
+        "plugins",
+        "product_feedback_disabled",
+        "session_id",
+        "skills",
+        "slash_commands",
+        "subtype",
+        "tools",
+        "type",
+        "uuid"
+      ],
+      "auth_fields": {
+        "apiKeySource": "none"
+      },
+      "stderr_tail": []
+    },
+    "raw": {
+      "elapsed_s": 2.54,
+      "messages": [
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "init",
+            "data": {
+              "type": "system",
+              "subtype": "init",
+              "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+              "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920",
+              "tools": [],
+              "mcp_servers": [],
+              "model": "claude-haiku-4-5-20251001",
+              "permissionMode": "default",
+              "slash_commands": [
+                "deep-research",
+                "design-sync",
+                "dataviz",
+                "update-config",
+                "verify",
+                "debug",
+                "code-review",
+                "simplify",
+                "batch",
+                "fewer-permission-prompts",
+                "doctor",
+                "loop",
+                "schedule",
+                "claude-api",
+                "run",
+                "run-skill-generator",
+                "agents",
+                "autocompact",
+                "clear",
+                "color",
+                "compact",
+                "config",
+                "context",
+                "effort",
+                "fast",
+                "heapdump",
+                "init",
+                "mcp",
+                "import",
+                "model",
+                "__remote-workflow",
+                "workflow-launch-exec",
+                "reload-skills",
+                "rename",
+                "security-review",
+                "usage-credits",
+                "extra-usage",
+                "usage",
+                "insights",
+                "recap",
+                "goal",
+                "design",
+                "design-consent",
+                "design-revoke",
+                "list-agents",
+                "team-onboarding"
+              ],
+              "apiKeySource": "none",
+              "claude_code_version": "2.1.224",
+              "output_style": "default",
+              "agents": [
+                "claude",
+                "Explore",
+                "general-purpose",
+                "Plan",
+                "statusline-setup"
+              ],
+              "skills": [
+                "deep-research",
+                "design-sync",
+                "dataviz",
+                "update-config",
+                "verify",
+                "debug",
+                "code-review",
+                "simplify",
+                "batch",
+                "fewer-permission-prompts",
+                "doctor",
+                "loop",
+                "schedule",
+                "claude-api",
+                "run",
+                "run-skill-generator"
+              ],
+              "plugins": [],
+              "capabilities": [
+                "interrupt_receipt_v1",
+                "interrupt_cancel_queued_v1",
+                "msg_lifecycle_v1"
+              ],
+              "analytics_disabled": false,
+              "product_feedback_disabled": false,
+              "uuid": "e0c33c96-1cb5-4e4e-a0e3-eeaccbd296aa",
+              "memory_paths": {
+                "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+              },
+              "messaging_socket_path": "/run/user/1000/cc-socks/1458914.sock",
+              "fast_mode_state": "off",
+              "fast_mode_disabled_reason": "sdk_opt_in_required"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "thinking_tokens",
+            "data": {
+              "type": "system",
+              "subtype": "thinking_tokens",
+              "estimated_tokens": 3,
+              "estimated_tokens_delta": 3,
+              "uuid": "79896f8e-4b62-48a3-b531-32b7d45e3fc5",
+              "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "thinking_tokens",
+            "data": {
+              "type": "system",
+              "subtype": "thinking_tokens",
+              "estimated_tokens": 44,
+              "estimated_tokens_delta": 41,
+              "uuid": "52c44f5d-9a11-4487-8f74-b44e263016e9",
+              "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "thinking_tokens",
+            "data": {
+              "type": "system",
+              "subtype": "thinking_tokens",
+              "estimated_tokens": 68,
+              "estimated_tokens_delta": 24,
+              "uuid": "59a9cd33-2a88-4bff-af0c-92bbab2d2538",
+              "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "thinking_tokens",
+            "data": {
+              "type": "system",
+              "subtype": "thinking_tokens",
+              "estimated_tokens": 131,
+              "estimated_tokens_delta": 63,
+              "uuid": "bc972d22-c546-4d1d-94ff-00293c0e1c4a",
+              "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920"
+            }
+          }
+        },
+        {
+          "class": "AssistantMessage",
+          "value": {
+            "content": [
+              {
+                "thinking": "The user is asking me to reply with exactly \"PROBE_OK\". This is a straightforward request. The system reminder provides context about user email and current date, but those are not relevant to this simple task.\n\nI should reply with exactly what was requested: PROBE_OK",
+                "signature": "EoMECpMBCBAYAipA6BXW3JkAusPSqUOTJiA37xGrbGaQ/w3GNOtBJRU2MUltZVcaWsol2YDw//HTMNBwQLm2Zrcng1RELrv6L0yOvTIZY2xhdWRlLWhhaWt1LTQtNS0yMDI1MTAwMTgAQgh0aGlua2luZ1okZDZhYTMzNjctNmY5Ny00NjRiLWFmODctNTNmNDhlZjRlZjQ1EgxZwNv8LtNOO+mYVhYaDP5wNfRsoqTESaU6oiIwwwqDwXmwOHl5pkjUvFVesuWviJH4TeiPXICYwyPxFeCgGtbJuK29wsLGHP8YQdVQKpwC1c7yFFX43/vtNHH9/aipdWedIOlE8B+lmvUKpqyiCJBrEikihZ6OtSQi1xEvta6v1XQzH4QfYHIJzHonrcncWiuqenQdU3hs06AowLkTEH1t+dwrV/a0h1ubETWhdbDrZo52vUsMEn4+yjsEvbSUE/UBjtsUVGL/lslc4XhFX8K8QRmTU96YQEM5Uz2T14TahG7bNsmxU39Z0E3LWZpplIliuTSqU4chkkMkpEy/zkgqyKrNV/LNwS9YLysWbfVA7f6s1njbFsVj7j52Y3YsOAFJxW3ng25Bwkijn14/AAQVFzzKz3RLgqcRC7ATNGoossiqcglRJfy2kiFQcn4RVDs30r7LoZSqoOmRhpKhRXZ9XKs88o01LUqkKNUYAQ=="
+              }
+            ],
+            "model": "claude-haiku-4-5-20251001",
+            "parent_tool_use_id": null,
+            "error": null,
+            "usage": {
+              "input_tokens": 160,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+              },
+              "output_tokens": 3,
+              "service_tier": "standard",
+              "inference_geo": "not_available"
+            },
+            "message_id": "msg_011CdoSR4nPbnd2iLrK6N1MN",
+            "stop_reason": null,
+            "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920",
+            "uuid": "84ea764b-cf85-4990-a548-428957f6302b"
+          }
+        },
+        {
+          "class": "AssistantMessage",
+          "value": {
+            "content": [
+              {
+                "text": "PROBE_OK"
+              }
+            ],
+            "model": "claude-haiku-4-5-20251001",
+            "parent_tool_use_id": null,
+            "error": null,
+            "usage": {
+              "input_tokens": 160,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+              },
+              "output_tokens": 3,
+              "service_tier": "standard",
+              "inference_geo": "not_available"
+            },
+            "message_id": "msg_011CdoSR4nPbnd2iLrK6N1MN",
+            "stop_reason": null,
+            "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920",
+            "uuid": "171bec97-4cc5-4a4c-80b0-d037fe6900f8"
+          }
+        },
+        {
+          "class": "RateLimitEvent",
+          "value": {
+            "rate_limit_info": {
+              "status": "allowed",
+              "resets_at": 1786122000,
+              "rate_limit_type": "five_hour",
+              "utilization": null,
+              "overage_status": "rejected",
+              "overage_resets_at": null,
+              "overage_disabled_reason": "org_level_disabled",
+              "raw": {
+                "status": "allowed",
+                "resetsAt": 1786122000,
+                "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+                "overageDisabledReason": "org_level_disabled",
+                "isUsingOverage": false
+              }
+            },
+            "uuid": "1c7bbd9b-e73a-4af4-8f68-848fef171311",
+            "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920"
+          }
+        },
+        {
+          "class": "ResultMessage",
+          "value": {
+            "subtype": "success",
+            "duration_ms": 1476,
+            "duration_api_ms": 1460,
+            "is_error": false,
+            "num_turns": 1,
+            "session_id": "763a8c26-7671-49a3-8d23-8be4bcf21920",
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.000525,
+            "usage": {
+              "input_tokens": 160,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "output_tokens": 73,
+              "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0
+              },
+              "service_tier": "standard",
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 0
+              },
+              "inference_geo": "not_available",
+              "iterations": [
+                {
+                  "input_tokens": 160,
+                  "output_tokens": 73,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0,
+                  "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                  },
+                  "type": "message"
+                }
+              ],
+              "speed": "standard"
+            },
+            "result": "PROBE_OK",
+            "structured_output": null,
+            "model_usage": {
+              "claude-haiku-4-5-20251001": {
+                "inputTokens": 160,
+                "outputTokens": 73,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "webSearchRequests": 0,
+                "costUSD": 0.000525,
+                "contextWindow": 200000,
+                "maxOutputTokens": 32000,
+                "canonicalModel": "claude-haiku-4-5",
+                "provider": "firstParty"
+              }
+            },
+            "permission_denials": [],
+            "deferred_tool_use": null,
+            "errors": null,
+            "api_error_status": null,
+            "uuid": "57c00a96-dbe6-4ac6-9e99-90880a22e531",
+            "terminal_reason": "completed"
+          }
+        }
+      ],
+      "stderr": [],
+      "error": null,
+      "fd_number": null
+    }
+  },
+  {
+    "id": "live_api_key",
+    "result": {
+      "error": {
+        "class": "Exception",
+        "message": "Claude Code returned an error result: success"
+      },
+      "text": "Failed to authenticate. API Error: 401 API key is invalid.",
+      "result_subtype": "success",
+      "is_error": true,
+      "total_cost_usd": 0,
+      "init_keys": [
+        "agents",
+        "analytics_disabled",
+        "apiKeySource",
+        "capabilities",
+        "claude_code_version",
+        "cwd",
+        "fast_mode_disabled_reason",
+        "fast_mode_state",
+        "mcp_servers",
+        "memory_paths",
+        "messaging_socket_path",
+        "model",
+        "output_style",
+        "permissionMode",
+        "plugins",
+        "product_feedback_disabled",
+        "session_id",
+        "skills",
+        "slash_commands",
+        "subtype",
+        "tools",
+        "type",
+        "uuid"
+      ],
+      "auth_fields": {
+        "apiKeySource": "ANTHROPIC_API_KEY"
+      },
+      "stderr_tail": [
+        "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+      ]
+    },
+    "raw": {
+      "elapsed_s": 189.89,
+      "messages": [
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "init",
+            "data": {
+              "type": "system",
+              "subtype": "init",
+              "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "tools": [],
+              "mcp_servers": [],
+              "model": "claude-haiku-4-5-20251001",
+              "permissionMode": "default",
+              "slash_commands": [
+                "deep-research",
+                "design-sync",
+                "dataviz",
+                "update-config",
+                "verify",
+                "debug",
+                "code-review",
+                "simplify",
+                "batch",
+                "fewer-permission-prompts",
+                "doctor",
+                "loop",
+                "claude-api",
+                "run",
+                "run-skill-generator",
+                "agents",
+                "autocompact",
+                "clear",
+                "color",
+                "compact",
+                "config",
+                "context",
+                "effort",
+                "fast",
+                "init",
+                "mcp",
+                "import",
+                "model",
+                "__remote-workflow",
+                "workflow-launch-exec",
+                "reload-skills",
+                "rename",
+                "security-review",
+                "usage",
+                "insights",
+                "recap",
+                "goal",
+                "design",
+                "design-consent",
+                "design-revoke",
+                "list-agents",
+                "team-onboarding"
+              ],
+              "apiKeySource": "ANTHROPIC_API_KEY",
+              "claude_code_version": "2.1.224",
+              "output_style": "default",
+              "agents": [
+                "claude",
+                "Explore",
+                "general-purpose",
+                "Plan",
+                "statusline-setup"
+              ],
+              "skills": [
+                "deep-research",
+                "design-sync",
+                "dataviz",
+                "update-config",
+                "verify",
+                "debug",
+                "code-review",
+                "simplify",
+                "batch",
+                "fewer-permission-prompts",
+                "doctor",
+                "loop",
+                "claude-api",
+                "run",
+                "run-skill-generator"
+              ],
+              "plugins": [],
+              "capabilities": [
+                "interrupt_receipt_v1",
+                "interrupt_cancel_queued_v1",
+                "msg_lifecycle_v1"
+              ],
+              "analytics_disabled": false,
+              "product_feedback_disabled": true,
+              "uuid": "b1836f1e-930d-4863-9198-2c7260b4ea87",
+              "memory_paths": {
+                "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+              },
+              "messaging_socket_path": "/run/user/1000/cc-socks/1459716.sock",
+              "fast_mode_state": "off",
+              "fast_mode_disabled_reason": "sdk_opt_in_required"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 1,
+              "max_retries": 10,
+              "retry_delay_ms": 564,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "c4e2611d-4a06-42ce-9dbc-dae125875957"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 2,
+              "max_retries": 10,
+              "retry_delay_ms": 1213,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "6d7ed59b-82c3-425b-b57e-2ccc75b3e265"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 3,
+              "max_retries": 10,
+              "retry_delay_ms": 2344,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "3dd8018a-89fe-40f0-b82b-f76bf07bc372"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 4,
+              "max_retries": 10,
+              "retry_delay_ms": 4852,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "89a7f3a6-e9c2-4a5a-80c1-06db904b1a3d"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 5,
+              "max_retries": 10,
+              "retry_delay_ms": 8214,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "2189f9eb-689c-4008-9cdb-032086f6d15f"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 6,
+              "max_retries": 10,
+              "retry_delay_ms": 19878,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "260db26f-2ae6-4653-b945-d81544b3dea3"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 7,
+              "max_retries": 10,
+              "retry_delay_ms": 38781,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "b701e490-1fbf-4654-86ca-2486656c7b9d"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 8,
+              "max_retries": 10,
+              "retry_delay_ms": 37835,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "f1f08993-b09a-45a3-ac93-c5b52446671f"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 9,
+              "max_retries": 10,
+              "retry_delay_ms": 39204,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "4463de1d-5ddb-4f4e-9557-0d97d585a004"
+            }
+          }
+        },
+        {
+          "class": "SystemMessage",
+          "value": {
+            "subtype": "api_retry",
+            "data": {
+              "type": "system",
+              "subtype": "api_retry",
+              "attempt": 10,
+              "max_retries": 10,
+              "retry_delay_ms": 34165,
+              "error_status": 401,
+              "error": "authentication_failed",
+              "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+              "uuid": "4a57ea36-5b3a-448d-a5b6-c2bc0f1f76d0"
+            }
+          }
+        },
+        {
+          "class": "AssistantMessage",
+          "value": {
+            "content": [
+              {
+                "text": "Failed to authenticate. API Error: 401 API key is invalid."
+              }
+            ],
+            "model": "<synthetic>",
+            "parent_tool_use_id": null,
+            "error": "authentication_failed",
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0
+              },
+              "service_tier": null,
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 0
+              },
+              "inference_geo": null,
+              "iterations": null,
+              "speed": null
+            },
+            "message_id": "b95844ba-6d42-45c4-8d52-9e3382e7eee0",
+            "stop_reason": "stop_sequence",
+            "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+            "uuid": "1721b14b-38ff-4d51-9526-50b266d94a9b"
+          }
+        },
+        {
+          "class": "ResultMessage",
+          "value": {
+            "subtype": "success",
+            "duration_ms": 188952,
+            "duration_api_ms": 0,
+            "is_error": true,
+            "num_turns": 1,
+            "session_id": "7664df8a-c8af-4136-bcf8-77cc37c1511e",
+            "stop_reason": "stop_sequence",
+            "total_cost_usd": 0,
+            "usage": {
+              "input_tokens": 0,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0,
+              "output_tokens": 0,
+              "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0
+              },
+              "service_tier": "standard",
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 0
+              },
+              "inference_geo": "",
+              "iterations": [],
+              "speed": "standard"
+            },
+            "result": "Failed to authenticate. API Error: 401 API key is invalid.",
+            "structured_output": null,
+            "model_usage": {},
+            "permission_denials": [],
+            "deferred_tool_use": null,
+            "errors": null,
+            "api_error_status": 401,
+            "uuid": "87ad2236-0bb5-459d-94f8-7b5993d2a7e5",
+            "terminal_reason": "api_error"
+          }
+        }
+      ],
+      "stderr": [
+        "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+      ],
+      "error": {
+        "class": "Exception",
+        "message": "Claude Code returned an error result: success"
+      },
+      "fd_number": null
+    }
+  }
+]

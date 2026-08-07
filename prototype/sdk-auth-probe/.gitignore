@@ -1,0 +1,9 @@
+# out/mitm-conf holds the run CA -- including mitmproxy-ca.pem, which contains
+# the PRIVATE KEY. That key can forge a certificate for any host a client
+# trusting it talks to. Generated fresh per run; must never reach a commit.
+out/mitm-conf/
+.venv/
+__pycache__/
+# sandbox stubs at the prototype root, not the projdir fixture under out/
+/.claude/
+/.mcp.json

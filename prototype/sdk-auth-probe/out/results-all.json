@@ -1,0 +1,2981 @@
+{
+  "sdk_version": "0.2.132",
+  "bundled_cli_version": "2.1.224",
+  "results": [
+    {
+      "id": "baseline",
+      "env_keys": [],
+      "settings": false,
+      "fd": false,
+      "wall_s": 0.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          }
+        ],
+        "requests": 11
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": []
+      },
+      "raw": {
+        "elapsed_s": 0.4,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "2bc98093-f104-48c2-8908-55bc4a8d7850",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "schedule",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "ultrareview",
+                  "security-review",
+                  "usage-credits",
+                  "extra-usage",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "schedule",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": false,
+                "uuid": "df7b42d9-6507-44ad-a48e-e173779853ff",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "RateLimitEvent",
+            "value": {
+              "rate_limit_info": {
+                "status": "allowed",
+                "resets_at": null,
+                "rate_limit_type": null,
+                "utilization": null,
+                "overage_status": null,
+                "overage_resets_at": null,
+                "overage_disabled_reason": null,
+                "raw": {
+                  "status": "allowed",
+                  "isUsingOverage": false
+                }
+              },
+              "uuid": "2a705bb5-148d-4fdd-96ec-41acc29d27d1",
+              "session_id": "2bc98093-f104-48c2-8908-55bc4a8d7850"
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "2bc98093-f104-48c2-8908-55bc4a8d7850",
+              "uuid": "468f6123-0481-4598-96a8-069a6a83810f"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 23,
+              "duration_api_ms": 32,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "2bc98093-f104-48c2-8908-55bc4a8d7850",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "ea310e2c-2de3-47bb-9d42-d07616873275",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "api_key",
+      "env_keys": [
+        "ANTHROPIC_API_KEY"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 5.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "x-api-key",
+            "scheme": null,
+            "credential": "env_api_key"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          }
+        ],
+        "requests": 15
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "ANTHROPIC_API_KEY"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 5.4,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "60ddc781-fdec-4991-a772-54b83e45cece",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": true,
+                "uuid": "bf2725c8-90b1-4f59-b05a-6957ce44dba7",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "60ddc781-fdec-4991-a772-54b83e45cece",
+              "uuid": "473f8361-a053-4e27-877d-b61eb8c6e768"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 30,
+              "duration_api_ms": 35,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "60ddc781-fdec-4991-a772-54b83e45cece",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "22db3f0d-7231-41f5-9290-fb4000e6fae6",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "auth_token",
+      "env_keys": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 0.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "env_auth_token"
+          }
+        ],
+        "requests": 7
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 0.38,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "9773d660-4e3b-4a6f-9968-b4ee08da0122",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": false,
+                "uuid": "b08f642b-e2f0-4dc8-be5c-9b16942382b9",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "9773d660-4e3b-4a6f-9968-b4ee08da0122",
+              "uuid": "e669394c-c70e-4f0f-8829-f6d57b68fa81"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 38,
+              "duration_api_ms": 49,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "9773d660-4e3b-4a6f-9968-b4ee08da0122",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "2ec22e40-5a84-4c7b-b5bf-0222f0dd0fac",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "api_key_helper",
+      "env_keys": [],
+      "settings": true,
+      "fd": false,
+      "wall_s": 0.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "helper_key"
+          },
+          {
+            "header": "x-api-key",
+            "scheme": null,
+            "credential": "helper_key"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          }
+        ],
+        "requests": 9
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "apiKeyHelper"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 0.39,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "eda1abec-0a2f-4fbd-9da5-e843bb40a7ad",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "apiKeyHelper",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": false,
+                "uuid": "69b02302-a9a8-4d7f-815d-23db564526e9",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "eda1abec-0a2f-4fbd-9da5-e843bb40a7ad",
+              "uuid": "c43648f8-e535-416a-ae9d-e6c326535d72"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 37,
+              "duration_api_ms": 34,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "eda1abec-0a2f-4fbd-9da5-e843bb40a7ad",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "8f360af4-c2d8-41c0-98f1-bc1e36f81c58",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "fd",
+      "env_keys": [],
+      "settings": false,
+      "fd": true,
+      "wall_s": 0.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          }
+        ],
+        "requests": 5
+      },
+      "result": {
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "text": "Not logged in \u00b7 Please run /login",
+        "result_subtype": "success",
+        "is_error": true,
+        "total_cost_usd": 0,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 0.39,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "08ddb0c1-ee78-4fa3-b913-cb68fc08e54d",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": false,
+                "uuid": "272aa855-e51f-4b43-bde7-17759b3626fe",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "Not logged in \u00b7 Please run /login"
+                }
+              ],
+              "model": "<synthetic>",
+              "parent_tool_use_id": null,
+              "error": "authentication_failed",
+              "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": null,
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": null,
+                "iterations": null,
+                "speed": null
+              },
+              "message_id": "17e2e783-a782-4d21-9ea5-d915938ba359",
+              "stop_reason": "stop_sequence",
+              "session_id": "08ddb0c1-ee78-4fa3-b913-cb68fc08e54d",
+              "uuid": "4bbb69f0-6405-4d6b-862a-5075a75547bd"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 38,
+              "duration_api_ms": 0,
+              "is_error": true,
+              "num_turns": 1,
+              "session_id": "08ddb0c1-ee78-4fa3-b913-cb68fc08e54d",
+              "stop_reason": "stop_sequence",
+              "total_cost_usd": 0,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "Not logged in \u00b7 Please run /login",
+              "structured_output": null,
+              "model_usage": {},
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "bb2cd5f7-c81b-4c3c-aa0d-19dd8afa78a2",
+              "terminal_reason": "api_error"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "fd_number": 3
+      }
+    },
+    {
+      "id": "bedrock",
+      "env_keys": [
+        "CLAUDE_CODE_USE_BEDROCK"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 2.3,
+      "observed": {
+        "hosts": [],
+        "credentials": [],
+        "requests": 0
+      },
+      "result": {
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "text": "API Error: Could not load credentials from any providers",
+        "result_subtype": "success",
+        "is_error": true,
+        "total_cost_usd": 0,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": []
+      },
+      "raw": {
+        "elapsed_s": 1.88,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "dcb9f63f-6c24-45b9-8603-27f812b3a514",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "us.anthropic.claude-opus-5",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": true,
+                "product_feedback_disabled": false,
+                "uuid": "dcc83891-3002-4dcb-aa23-68e2bdcc8e30",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "not_first_party"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "API Error: Could not load credentials from any providers"
+                }
+              ],
+              "model": "<synthetic>",
+              "parent_tool_use_id": null,
+              "error": "unknown",
+              "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": null,
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": null,
+                "iterations": null,
+                "speed": null
+              },
+              "message_id": "5f8e3fb2-c794-4f2d-afff-8afea046fb0c",
+              "stop_reason": "stop_sequence",
+              "session_id": "dcb9f63f-6c24-45b9-8603-27f812b3a514",
+              "uuid": "500cc859-0fa3-4367-b6f5-1d77fe3ed283"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 1574,
+              "duration_api_ms": 0,
+              "is_error": true,
+              "num_turns": 1,
+              "session_id": "dcb9f63f-6c24-45b9-8603-27f812b3a514",
+              "stop_reason": "stop_sequence",
+              "total_cost_usd": 0,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "API Error: Could not load credentials from any providers",
+              "structured_output": null,
+              "model_usage": {},
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "6bec9621-2306-4b55-8101-63e84e576cee",
+              "terminal_reason": "api_error"
+            }
+          }
+        ],
+        "stderr": [],
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "fd_number": null
+      }
+    },
+    {
+      "id": "vertex",
+      "env_keys": [
+        "CLAUDE_CODE_USE_VERTEX"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 50.5,
+      "observed": {
+        "hosts": [
+          "169.254.169.254",
+          "metadata.google.internal."
+        ],
+        "credentials": [],
+        "requests": 2
+      },
+      "result": {
+        "error": {
+          "class": "TimeoutError",
+          "message": ""
+        },
+        "text": "",
+        "result_subtype": null,
+        "is_error": null,
+        "total_cost_usd": null,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": []
+      },
+      "raw": {
+        "elapsed_s": 50.07,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "25343291-82ef-4968-966a-3546af4bdc5a",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": true,
+                "product_feedback_disabled": false,
+                "uuid": "f367f71e-52c6-412b-bc3a-7755753df9e1",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "not_first_party"
+              }
+            }
+          }
+        ],
+        "stderr": [],
+        "error": {
+          "class": "TimeoutError",
+          "message": ""
+        },
+        "fd_number": null
+      }
+    },
+    {
+      "id": "foundry",
+      "env_keys": [
+        "CLAUDE_CODE_USE_FOUNDRY"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 0.7,
+      "observed": {
+        "hosts": [],
+        "credentials": [],
+        "requests": 0
+      },
+      "result": {
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "text": "API Error: Must provide one of the `baseURL` or `resource` arguments, or the `ANTHROPIC_FOUNDRY_RESOURCE` environment variable",
+        "result_subtype": "success",
+        "is_error": true,
+        "total_cost_usd": 0,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "none"
+        },
+        "stderr_tail": []
+      },
+      "raw": {
+        "elapsed_s": 0.32,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "bc6da3fc-bc66-4ca1-a08d-f51d0bc0babd",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-sonnet-4-5",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "none",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": true,
+                "product_feedback_disabled": false,
+                "uuid": "f5832eb5-8b46-4c44-9ff8-fb5307029e7c",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "not_first_party"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "API Error: Must provide one of the `baseURL` or `resource` arguments, or the `ANTHROPIC_FOUNDRY_RESOURCE` environment variable"
+                }
+              ],
+              "model": "<synthetic>",
+              "parent_tool_use_id": null,
+              "error": "unknown",
+              "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": null,
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": null,
+                "iterations": null,
+                "speed": null
+              },
+              "message_id": "3f7f48ca-acbf-4c06-be5b-1663ea18e3d2",
+              "stop_reason": "stop_sequence",
+              "session_id": "bc6da3fc-bc66-4ca1-a08d-f51d0bc0babd",
+              "uuid": "5cfeffbb-0de1-4997-803b-acaee9e56dcc"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 33,
+              "duration_api_ms": 0,
+              "is_error": true,
+              "num_turns": 1,
+              "session_id": "bc6da3fc-bc66-4ca1-a08d-f51d0bc0babd",
+              "stop_reason": "stop_sequence",
+              "total_cost_usd": 0,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "API Error: Must provide one of the `baseURL` or `resource` arguments, or the `ANTHROPIC_FOUNDRY_RESOURCE` environment variable",
+              "structured_output": null,
+              "model_usage": {},
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "4edcce28-d4fc-4550-bb37-aca04d3fcd04",
+              "terminal_reason": "api_error"
+            }
+          }
+        ],
+        "stderr": [],
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "fd_number": null
+      }
+    },
+    {
+      "id": "prec_key_vs_token",
+      "env_keys": [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 5.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "x-api-key",
+            "scheme": null,
+            "credential": "env_api_key"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "env_auth_token"
+          }
+        ],
+        "requests": 15
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "ANTHROPIC_API_KEY"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 5.41,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "a54145ef-a28c-4dbc-9e08-241bf3a5a7a5",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": true,
+                "uuid": "7a63dfad-6f84-42c2-950c-a1058ff7e4bf",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "a54145ef-a28c-4dbc-9e08-241bf3a5a7a5",
+              "uuid": "1e34fea2-0fb0-4fb8-9e35-004501f9c059"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 28,
+              "duration_api_ms": 32,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "a54145ef-a28c-4dbc-9e08-241bf3a5a7a5",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "0cbce6df-f379-4ae1-9221-6c4c31b05f87",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "prec_key_vs_helper",
+      "env_keys": [
+        "ANTHROPIC_API_KEY"
+      ],
+      "settings": true,
+      "fd": false,
+      "wall_s": 5.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "x-api-key",
+            "scheme": null,
+            "credential": "env_api_key"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "helper_key"
+          }
+        ],
+        "requests": 15
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "ANTHROPIC_API_KEY"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 5.4,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "654fd7f3-6732-4841-9047-01c5bab0adfc",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": true,
+                "uuid": "d0bb08f8-8d97-4c8e-b8f6-f312037b3aad",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "654fd7f3-6732-4841-9047-01c5bab0adfc",
+              "uuid": "f81cb382-c246-4336-8dc9-4c084b764ecc"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 32,
+              "duration_api_ms": 37,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "654fd7f3-6732-4841-9047-01c5bab0adfc",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "7494ff8d-fddd-48d6-a5ed-a7a5e962e91a",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "prec_token_vs_helper",
+      "env_keys": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "settings": true,
+      "fd": false,
+      "wall_s": 0.8,
+      "observed": {
+        "hosts": [
+          "api.anthropic.com",
+          "http-intake.logs.us5.datadoghq.com"
+        ],
+        "credentials": [
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "oauth_accessToken"
+          },
+          {
+            "header": "Authorization",
+            "scheme": "Bearer",
+            "credential": "env_auth_token"
+          },
+          {
+            "header": "x-api-key",
+            "scheme": null,
+            "credential": "helper_key"
+          }
+        ],
+        "requests": 9
+      },
+      "result": {
+        "error": null,
+        "text": "PROBE_OK",
+        "result_subtype": "success",
+        "is_error": false,
+        "total_cost_usd": 3.5999999999999994e-05,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "apiKeyHelper"
+        },
+        "stderr_tail": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ]
+      },
+      "raw": {
+        "elapsed_s": 0.39,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "f7067de7-218e-46cb-a6ce-07b7c0fbfdbd",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "claude-opus-5[1m]",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "import",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "design",
+                  "design-consent",
+                  "design-revoke",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "apiKeyHelper",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "design-sync",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": false,
+                "product_feedback_disabled": false,
+                "uuid": "c5eaa152-8638-41bb-8824-fd1065aaa689",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "PROBE_OK"
+                }
+              ],
+              "model": "probe-model",
+              "parent_tool_use_id": null,
+              "error": null,
+              "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+              },
+              "message_id": "msg_probe",
+              "stop_reason": null,
+              "session_id": "f7067de7-218e-46cb-a6ce-07b7c0fbfdbd",
+              "uuid": "6b7ffa4d-dfce-44b4-b190-a526713b29b5"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 39,
+              "duration_api_ms": 29,
+              "is_error": false,
+              "num_turns": 1,
+              "session_id": "f7067de7-218e-46cb-a6ce-07b7c0fbfdbd",
+              "stop_reason": "end_turn",
+              "total_cost_usd": 3.5999999999999994e-05,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "PROBE_OK",
+              "structured_output": null,
+              "model_usage": {
+                "claude-haiku-4-5-20251001": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 5.999999999999999e-06,
+                  "contextWindow": 200000,
+                  "maxOutputTokens": 32000,
+                  "canonicalModel": "claude-haiku-4-5",
+                  "provider": "firstParty"
+                },
+                "claude-opus-5[1m]": {
+                  "inputTokens": 1,
+                  "outputTokens": 1,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "webSearchRequests": 0,
+                  "costUSD": 2.9999999999999997e-05,
+                  "contextWindow": 1000000,
+                  "maxOutputTokens": 64000,
+                  "canonicalModel": "claude-opus-5",
+                  "provider": "firstParty"
+                }
+              },
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "f2ef112a-5c64-4f50-afd7-e1d21a265efe",
+              "terminal_reason": "completed"
+            }
+          }
+        ],
+        "stderr": [
+          "\u26a0 claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login \u00b7 Unset it to load your organization's connectors"
+        ],
+        "error": null,
+        "fd_number": null
+      }
+    },
+    {
+      "id": "prec_key_vs_bedrock",
+      "env_keys": [
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK"
+      ],
+      "settings": false,
+      "fd": false,
+      "wall_s": 2.4,
+      "observed": {
+        "hosts": [],
+        "credentials": [],
+        "requests": 0
+      },
+      "result": {
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "text": "API Error: Could not load credentials from any providers",
+        "result_subtype": "success",
+        "is_error": true,
+        "total_cost_usd": 0,
+        "init_keys": [
+          "agents",
+          "analytics_disabled",
+          "apiKeySource",
+          "capabilities",
+          "claude_code_version",
+          "cwd",
+          "fast_mode_disabled_reason",
+          "fast_mode_state",
+          "mcp_servers",
+          "memory_paths",
+          "model",
+          "output_style",
+          "permissionMode",
+          "plugins",
+          "product_feedback_disabled",
+          "session_id",
+          "skills",
+          "slash_commands",
+          "subtype",
+          "tools",
+          "type",
+          "uuid"
+        ],
+        "auth_fields": {
+          "apiKeySource": "ANTHROPIC_API_KEY"
+        },
+        "stderr_tail": []
+      },
+      "raw": {
+        "elapsed_s": 1.97,
+        "messages": [
+          {
+            "class": "SystemMessage",
+            "value": {
+              "subtype": "init",
+              "data": {
+                "type": "system",
+                "subtype": "init",
+                "cwd": "/home/majix/redKrakenV2/prototype/sdk-auth-probe",
+                "session_id": "a30c2bc5-2fe9-4c11-8e0b-67a3fd0bfe5e",
+                "tools": [],
+                "mcp_servers": [],
+                "model": "us.anthropic.claude-opus-5",
+                "permissionMode": "default",
+                "slash_commands": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator",
+                  "agents",
+                  "autocompact",
+                  "clear",
+                  "color",
+                  "compact",
+                  "config",
+                  "context",
+                  "effort",
+                  "fast",
+                  "heapdump",
+                  "init",
+                  "mcp",
+                  "model",
+                  "__remote-workflow",
+                  "workflow-launch-exec",
+                  "reload-skills",
+                  "rename",
+                  "security-review",
+                  "usage",
+                  "insights",
+                  "recap",
+                  "goal",
+                  "team-onboarding"
+                ],
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "claude_code_version": "2.1.224",
+                "output_style": "default",
+                "agents": [
+                  "claude",
+                  "Explore",
+                  "general-purpose",
+                  "Plan",
+                  "statusline-setup"
+                ],
+                "skills": [
+                  "deep-research",
+                  "dataviz",
+                  "update-config",
+                  "verify",
+                  "debug",
+                  "code-review",
+                  "simplify",
+                  "batch",
+                  "fewer-permission-prompts",
+                  "doctor",
+                  "loop",
+                  "claude-api",
+                  "run",
+                  "run-skill-generator"
+                ],
+                "plugins": [],
+                "capabilities": [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ],
+                "analytics_disabled": true,
+                "product_feedback_disabled": false,
+                "uuid": "907c304e-96a5-40fc-bc06-0f12b12b05e2",
+                "memory_paths": {
+                  "auto": "/home/majix/.claude/projects/-home-majix-redKrakenV2/memory/"
+                },
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "not_first_party"
+              }
+            }
+          },
+          {
+            "class": "AssistantMessage",
+            "value": {
+              "content": [
+                {
+                  "text": "API Error: Could not load credentials from any providers"
+                }
+              ],
+              "model": "<synthetic>",
+              "parent_tool_use_id": null,
+              "error": "unknown",
+              "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": null,
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": null,
+                "iterations": null,
+                "speed": null
+              },
+              "message_id": "846d16a9-a592-4168-bb80-64318d8a8d62",
+              "stop_reason": "stop_sequence",
+              "session_id": "a30c2bc5-2fe9-4c11-8e0b-67a3fd0bfe5e",
+              "uuid": "45a836d6-048e-4fa8-889e-c99af656d927"
+            }
+          },
+          {
+            "class": "ResultMessage",
+            "value": {
+              "subtype": "success",
+              "duration_ms": 1663,
+              "duration_api_ms": 0,
+              "is_error": true,
+              "num_turns": 1,
+              "session_id": "a30c2bc5-2fe9-4c11-8e0b-67a3fd0bfe5e",
+              "stop_reason": "stop_sequence",
+              "total_cost_usd": 0,
+              "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "server_tool_use": {
+                  "web_search_requests": 0,
+                  "web_fetch_requests": 0
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "inference_geo": "",
+                "iterations": [],
+                "speed": "standard"
+              },
+              "result": "API Error: Could not load credentials from any providers",
+              "structured_output": null,
+              "model_usage": {},
+              "permission_denials": [],
+              "deferred_tool_use": null,
+              "errors": null,
+              "api_error_status": null,
+              "uuid": "bf9d6c9b-c3cb-471d-9be4-21e9284bbbc3",
+              "terminal_reason": "api_error"
+            }
+          }
+        ],
+        "stderr": [],
+        "error": {
+          "class": "Exception",
+          "message": "Claude Code returned an error result: success"
+        },
+        "fd_number": null
+      }
+    }
+  ]
+}
