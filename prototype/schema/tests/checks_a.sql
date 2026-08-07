@@ -186,10 +186,18 @@ SELECT t.expect_ok('C18 second inactive scheduler_weights row',
     VALUES (2, 0.5, 0.5, 200000, 0.01, '{}', 0.5, 5, 0.9, 0.8, 5,
             interval '30 minutes', 3, false)$$);
 
+-- Ticket 30 superseded the case this check used to make. Migration 023 (ticket
+-- 08) left `scheduler_lanes` writable and relied on
+-- `scheduler_lanes_program_id_kind_key` to refuse a second default lane; ticket
+-- 30 closed the whole unversioned write path -- INSERT as well as UPDATE --
+-- because a per-program lane row is a quota move with no version, no signal
+-- vector and no event. The unique index is still there and still the reason two
+-- default lanes cannot exist; it is now unreachable, because the trigger fires
+-- first. The refusal is what the corpus asserts, and it is strictly stronger.
 SELECT t.expect_raise('C19 second default lane for one kind',
   $$INSERT INTO scheduler_lanes (program_id, kind, min_slots)
     VALUES (NULL, 'recon', 0)$$,
-  'scheduler_lanes_program_id_kind_key');
+  'scheduler_lanes is immutable');
 
 -- ---- surface uniqueness --------------------------------------------------
 

@@ -19,8 +19,12 @@ INSERT INTO programs (id, slug, name, platform) VALUES
     ('11111111-1111-7111-8111-111111111111', 'acme', 'Acme BB', 'hackerone'),
     ('22222222-2222-7222-8222-222222222222', 'other', 'Other BB', 'bugcrowd');
 
-INSERT INTO vulnerability_classes (id, cwe_id, name) VALUES
-    ('idor', 'CWE-639', 'Insecure direct object reference');
+-- `vulnerability_classes` is no longer seeded here. 009 created it empty and
+-- said "seed set: ticket 19"; until ticket 19's migration existed the fixture
+-- had to supply the one row it cites, and `idor` was it. Ticket 19 now seeds
+-- the whole vocabulary -- including `idor`, with the CVSS and remediation
+-- columns the fixture never had -- so a second INSERT here is a duplicate key,
+-- not a fixture.
 
 -- ticket 33: from migration 021 on, a program's scope is a versioned document
 -- and a compiled rule set, and every non-control receipt names the version that
