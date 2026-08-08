@@ -26,6 +26,29 @@ does not recognise.
 No working API key is used anywhere. Every credential the probe sets is a
 fabricated `sk-ant-...PROBE...` string that cannot authenticate.
 
+The checked-in CI replay is narrower and needs neither the SDK, network nor
+credentials:
+
+```sh
+python3 auth_resolution.py
+python3 -m unittest -v test_auth_resolution.py
+```
+
+After an operator reruns the probe for a version bump, emit a new immutable,
+sanitised manifest instead of replacing the previous version's file:
+
+```sh
+probe_commit="$(git rev-parse HEAD)"
+python3 normalise_manifest.py \
+  --probe-commit "$probe_commit" \
+  --batch out/results-all.json out/capture-all.jsonl \
+  > evidence/auth-resolution-sdk-NEW-cli-NEW.json
+```
+
+`--batch RESULTS CAPTURE` is repeatable for a probe run split into explicit
+batches. The normaliser refuses missing or duplicate cases and prints only
+symbolic inputs plus normalised wire facts; raw captures stay operator-retained.
+
 ## Instrument
 
 `mitmdump` runs as a **fake upstream**, not a passthrough: an addon answers
