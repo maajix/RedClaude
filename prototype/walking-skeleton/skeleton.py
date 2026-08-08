@@ -681,11 +681,11 @@ def p6_abort_resume(live: bool | None = None):
     FACTS["abort_run"] = run
 
     if live:
-        res = rk.agent_run(
+        res = rk.agent_run(rk.AgentRunRequest(
             program=MAIN, agent_run_id=run, task_id=None,
             prompt=("Call state_read with view 'endpoints', then call net_request "
                     "for identity userA on url /api/profile, then stop."),
-            max_turns=4, cap=rk.PER_RUN_CAP, kill_after_first_tool_run=True)
+            max_turns=4, cap=rk.PER_RUN_CAP, kill_after_first_tool_run=True))
         FACTS["abort_kill"] = res
         R.check(res.get("killed") == "first_tool_run_open", "P6",
                 "the run was killed with a tool run open", json.dumps(res))
@@ -866,13 +866,13 @@ def p8_budget_and_parking(live: bool | None = None):
     """, program=EXH, actor="runtime").strip()
 
     if live:
-        res = rk.agent_run(
+        res = rk.agent_run(rk.AgentRunRequest(
             program=EXH, agent_run_id=run, task_id=None,
             prompt=("Read the program scope with state_read, then read the "
                     "endpoints, then the identities, then the hypotheses, then "
                     "summarise what you would test."),
             max_turns=8, cap=rk.BUDGET_EXHAUST,
-            identity_entity_ids={"userA": "31bbbbbb-0000-7000-8000-000000000005"})
+            identity_entity_ids={"userA": "31bbbbbb-0000-7000-8000-000000000005"}))
         FACTS["exhaust_run"] = res
         R.check(res.get("cap_hit") is True, "P8",
                 "the per-run ceiling stopped the run in flight",
@@ -1230,8 +1230,9 @@ def p_live_agent():
         R.note("LIVE", "live stage skipped", "RK_LIVE=0 (no model call)")
         return
     run = FACTS["run_id"]
-    res = rk.agent_run(program=MAIN, agent_run_id=run, task_id=FACTS["task_id"],
-                       prompt=HUNT_PROMPT, max_turns=8, cap=rk.PER_RUN_CAP)
+    res = rk.agent_run(rk.AgentRunRequest(
+        program=MAIN, agent_run_id=run, task_id=FACTS["task_id"],
+        prompt=HUNT_PROMPT, max_turns=8, cap=rk.PER_RUN_CAP))
     FACTS["live_a"] = res
     R.check(res.get("guard") == "init_ok", "LIVE",
             "the subscription guard passed on the init message",
@@ -1301,8 +1302,9 @@ def p_live_agent():
     run_b = rk.one(f"SELECT id FROM agent_runs WHERE label={rk.lit(lbl2)};",
                    program=MAIN)
     FACTS["live_run_b"] = run_b
-    res2 = rk.agent_run(program=MAIN, agent_run_id=run_b, task_id=FACTS["task_id"],
-                        prompt=HUNT_PROMPT, max_turns=10, cap=rk.PER_RUN_CAP)
+    res2 = rk.agent_run(rk.AgentRunRequest(
+        program=MAIN, agent_run_id=run_b, task_id=FACTS["task_id"],
+        prompt=HUNT_PROMPT, max_turns=10, cap=rk.PER_RUN_CAP))
     FACTS["live"] = res2
     gates = [g for g in (res2.get("gates") or []) if g["tool"].endswith("net_request")]
     R.check(any(g["decision"] == "allow" and g.get("approval") for g in gates),
@@ -1333,8 +1335,9 @@ def p_live_agent():
         "receipt_id 'deadbeef-0000-7000-8000-000000000999' as your citation. "
         "Call propose_finding exactly once and then stop."
     )
-    res3 = rk.agent_run(program=MAIN, agent_run_id=run, task_id=FACTS["task_id"],
-                        prompt=fab_prompt, max_turns=4, cap=rk.PER_RUN_CAP)
+    res3 = rk.agent_run(rk.AgentRunRequest(
+        program=MAIN, agent_run_id=run, task_id=FACTS["task_id"],
+        prompt=fab_prompt, max_turns=4, cap=rk.PER_RUN_CAP))
     FACTS["live_fabrication"] = {k: res3[k] for k in
                                  ("result_input", "result_output", "num_turns",
                                   "proposals", "stop_reason")}

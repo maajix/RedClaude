@@ -29,7 +29,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 HERE = Path(__file__).resolve().parent
 VENDOR = HERE / "vendor"
@@ -55,6 +57,35 @@ VENVPY = os.environ.get(
     "RK_T31_VENVPY",
     "/home/majix/redKrakenV2/prototype/sdk-auth-probe/.venv/bin/python",
 )
+
+INHERITED_AGENT_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR",
+    "XDG_RUNTIME_DIR", "SHELL",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRunRequest:
+    program: str
+    agent_run_id: str
+    task_id: str | None
+    prompt: str
+    max_turns: int = 6
+    model: str | None = None
+    cap: int = PER_RUN_CAP
+    vuln_port: int | None = None
+    identity_entity_ids: Mapping[str, str] | None = None
+    kill_after_first_tool_run: bool = False
+
+
+class StartupRefusal(RuntimeError):
+    def __init__(self, violations):
+        self.violations = tuple(violations)
+        if not self.violations:
+            raise ValueError("startup refusal requires at least one violation")
+        super().__init__("startup refused: " + json.dumps(
+            self.violations, sort_keys=True, separators=(",", ":")
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +409,7 @@ IDENTITY_ENTITY_IDS = {
 }
 
 
-def agent_run(program: str, agent_run_id: str, task_id: str | None, prompt: str,
-              max_turns: int = 6,
-              model: str | None = None,
-              cap: int = PER_RUN_CAP,
-              vuln_port: int | None = None,
-              identity_entity_ids: dict | None = None,
-              kill_after_first_tool_run: bool = False) -> dict:
+def agent_run(request: AgentRunRequest) -> dict:
     """One `agent_run`: a live model call under the per-run token sub-cap.
 
     Runs in a child process on the ticket-21 venv (claude-agent-sdk 0.2.132),
@@ -398,37 +423,57 @@ def agent_run(program: str, agent_run_id: str, task_id: str | None, prompt: str,
     run recorded as `running`, an agent run with no result, a task claimed by
     nobody. Resume has to rebuild that from the log alone.
     """
+    launch_root = (RUN / "agent-runs").resolve()
+    launch_dir = (launch_root / request.agent_run_id).resolve()
+    if launch_dir.parent != launch_root:
+        raise ValueError("agent_run_id must be one path component")
+    launch_dir.mkdir(parents=True, exist_ok=True)
     job = {
-        "prompt": prompt,
-        "max_turns": max_turns,
-        "model": model,
-        "cap": cap,
-        "program": program,
-        "agent_run_id": agent_run_id,
-        "task_id": task_id,
+        "prompt": request.prompt,
+        "max_turns": request.max_turns,
+        "model": request.model,
+        "cap": request.cap,
+        "program": request.program,
+        "agent_run_id": request.agent_run_id,
+        "task_id": request.task_id,
         "ct": CT, "db": DB,
         "agent_port": AGENT_PORT,
-        "vuln_port": vuln_port or VULN_PORT,
+        "vuln_port": request.vuln_port if request.vuln_port is not None else VULN_PORT,
         "run_dir": str(RUN),
-        "identity_entity_ids": identity_entity_ids or IDENTITY_ENTITY_IDS,
+        "launch_dir": str(launch_dir),
+        "identity_entity_ids": dict(request.identity_entity_ids)
+        if request.identity_entity_ids is not None else IDENTITY_ENTITY_IDS,
     }
-    env = {k: v for k, v in os.environ.items()
-           if k in ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR",
-                    "XDG_RUNTIME_DIR", "SHELL")}
+    return _spawn_agent_process(request, job, _child_environment(os.environ))
+
+
+def _child_environment(source: Mapping[str, str]) -> dict[str, str]:
+    env = {key: source[key] for key in INHERITED_AGENT_ENV if key in source}
+    if proxy := source.get("RK_CONTROL_PROXY_URL"):
+        env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY="")
+    if ca_file := source.get("RK_CONTROL_CA_FILE"):
+        env.update(SSL_CERT_FILE=ca_file, NODE_EXTRA_CA_CERTS=ca_file,
+                   REQUESTS_CA_BUNDLE=ca_file)
+    return env
+
+
+def _spawn_agent_process(request: AgentRunRequest, job: dict,
+                         environment: Mapping[str, str]) -> dict:
     argv = [VENVPY, str(HERE / "agent_child.py"), json.dumps(job)]
 
-    if not kill_after_first_tool_run:
-        p = subprocess.run(argv, capture_output=True, text=True, env=env,
+    if not request.kill_after_first_tool_run:
+        p = subprocess.run(argv, capture_output=True, text=True, env=environment,
                            timeout=900)
         return _child_result(p.stdout, p.stderr)
 
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, env=env)
+                            stderr=subprocess.PIPE, text=True, env=environment)
     killed_at = None
     deadline = time.time() + 300
     while time.time() < deadline and proc.poll() is None:
         n = one(f"SELECT count(*) FROM tool_runs WHERE agent_run_id="
-                f"{lit(agent_run_id)} AND status='running';", program=program)
+                f"{lit(request.agent_run_id)} AND status='running';",
+                program=request.program)
         if n and int(n) > 0:
             proc.kill()
             killed_at = "first_tool_run_open"
@@ -438,6 +483,9 @@ def agent_run(program: str, agent_run_id: str, task_id: str | None, prompt: str,
         proc.wait(20)
     except subprocess.TimeoutExpired:
         proc.kill()
+    if killed_at is None:
+        out, err = proc.communicate()
+        return _child_result(out, err)
     return {"killed": killed_at, "returncode": proc.returncode}
 
 
@@ -445,7 +493,10 @@ def _child_result(out: str, err: str) -> dict:
     for ln in reversed((out or "").strip().splitlines()):
         if ln.startswith("{"):
             try:
-                return json.loads(ln)
+                result = json.loads(ln)
+                if "startup_refusal" in result:
+                    raise StartupRefusal(result["startup_refusal"])
+                return result
             except ValueError:
                 continue
     raise RuntimeError("agent child produced no result: "

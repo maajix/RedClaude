@@ -16,6 +16,7 @@ decides whether that proposal becomes state. LLM proposes, runtime commits.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import sys
@@ -24,12 +25,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "vendor" / "sdk-auth-probe"))
+sys.path.insert(0, str(HERE.parent / "sdk-auth-probe"))
 
+import auth_resolution                       # noqa: E402
 import rk                                    # noqa: E402
 import subscription_guard as guard           # noqa: E402
 
 import anyio                                 # noqa: E402
+import claude_agent_sdk                      # noqa: E402
 from claude_agent_sdk import (                # noqa: E402
     AssistantMessage, ClaudeAgentOptions, HookMatcher, ResultMessage,
     SystemMessage, create_sdk_mcp_server, query, tool,
@@ -43,6 +46,138 @@ STATE: dict = {
     "denied": [], "gates": [], "parked": [], "must_stop": None,
 }
 RT: rk.Runtime | None = None
+MANAGED_SETTINGS = tuple(Path(path) for path in guard.MANAGED_SETTINGS)
+
+
+def _violation(code: str, source: str) -> dict:
+    return {"code": code, "vector": None, "source": source,
+            "effect": "unverifiable"}
+
+
+def _runtime_facts() -> dict:
+    facts = {"sdk_version": None, "cli_version": None, "cli_path": None}
+    try:
+        facts["sdk_version"] = importlib.metadata.version("claude-agent-sdk")
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        pass
+    try:
+        from claude_agent_sdk import _cli_version
+        facts["cli_version"] = _cli_version.__cli_version__
+    except (AttributeError, ImportError):
+        pass
+    package_file = getattr(claude_agent_sdk, "__file__", None)
+    try:
+        if package_file:
+            facts["cli_path"] = (
+                Path(package_file).resolve().parent / "_bundled" / "claude"
+            )
+    except (OSError, TypeError, ValueError):
+        pass
+    return facts
+
+
+def _read_settings(path: Path, kind: str):
+    source = f"settings:{kind}:{path}#document"
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, _violation("settings_unreadable", source)
+    if not isinstance(document, dict) or not isinstance(document.get("env", {}), dict):
+        return None, _violation("settings_unreadable", source)
+    return {"kind": kind, "path": str(path), "document": document}, None
+
+
+def _assess_launch(options, environment, runtime, *, managed_settings=None,
+                   runtime_dir: Path | None = None) -> tuple[dict, ...]:
+    runtime_dir = Path(
+        runtime_dir or JOB.get("launch_dir") or getattr(options, "cwd", "")
+    ).resolve()
+    managed_settings = MANAGED_SETTINGS if managed_settings is None else managed_settings
+    other = []
+
+    pair = (runtime.get("sdk_version"), runtime.get("cli_version"))
+    runtime_unmeasured = pair not in guard.KNOWN_RUNTIMES
+
+    runtime_cli = runtime.get("cli_path")
+    try:
+        expected_cli = Path(runtime_cli).resolve() if runtime_cli is not None else None
+    except (OSError, TypeError, ValueError):
+        expected_cli = None
+    if (expected_cli is None or not expected_cli.is_file()
+            or not os.access(expected_cli, os.X_OK)):
+        runtime_unmeasured = True
+    if runtime_unmeasured:
+        other.append(_violation("unmeasured_runtime", "runtime:sdk-cli"))
+
+    checks = {
+        "env": getattr(options, "env", None) == {},
+        "setting_sources": getattr(options, "setting_sources", None) == [],
+        "sandbox": getattr(options, "sandbox", "missing") is None,
+        "cwd": getattr(options, "cwd", None) == str(runtime_dir),
+        "cli_path": expected_cli is not None
+        and getattr(options, "cli_path", None) == str(expected_cli),
+    }
+    if not runtime_dir.is_dir():
+        checks["cwd"] = False
+    for field, valid in checks.items():
+        if not valid:
+            other.append(_violation(
+                "invalid_launch", f"launch:{field}"
+            ))
+
+    symbolic_settings = []
+    for raw_path in managed_settings:
+        path = Path(raw_path).resolve()
+        if not path.exists():
+            continue
+        setting, violation = _read_settings(path, "managed")
+        if violation:
+            other.append(violation)
+        else:
+            symbolic_settings.append(setting)
+
+    settings = getattr(options, "settings", None)
+    if settings is not None:
+        try:
+            path = Path(settings)
+        except TypeError:
+            path = None
+        canonical = runtime_dir / "settings.json"
+        if path is None or not path.is_absolute():
+            other.append(_violation(
+                "invalid_launch", "launch:settings"
+            ))
+        else:
+            path = path.resolve()
+            if path != canonical:
+                other.append(_violation(
+                    "invalid_launch", "launch:settings"
+                ))
+            if path.parent == runtime_dir:
+                setting, violation = _read_settings(path, "explicit")
+                if violation:
+                    other.append(violation)
+                else:
+                    symbolic_settings.append(setting)
+
+    if not isinstance(environment, dict):
+        other.append(_violation(
+            "invalid_launch", "launch:env"
+        ))
+        environment = {}
+    try:
+        credentials = auth_resolution.evaluate_inputs({
+            "environment": environment,
+            "settings": symbolic_settings,
+            "setting_sources": [],
+        })["violations"]
+    except auth_resolution.ManifestError:
+        credentials = []
+        other.append(_violation(
+            "invalid_launch", "launch:env"
+        ))
+    other.sort(key=lambda item: (item["code"], item["source"]))
+    return tuple(credentials + other)
 
 
 def _uuid(seed: str) -> str:
@@ -319,7 +454,11 @@ async def t_propose_finding(args):
 
 # ---------------------------------------------------------------------------
 
-async def run() -> dict:
+async def _run(environment=None, runtime=None, options_type=ClaudeAgentOptions,
+               transport=query) -> dict:
+    environment = dict(os.environ) if environment is None else environment
+    runtime = _runtime_facts() if runtime is None else runtime
+    runtime_dir = Path(JOB["launch_dir"]).resolve()
     server = create_sdk_mcp_server(
         # The name is load-bearing, not cosmetic: `tool_risk_classes`
         # enumerates `mcp__rk2__*` -> constrained, and everything it does not
@@ -328,7 +467,9 @@ async def run() -> dict:
         name="rk2", version="0.1.0",
         tools=[t_state_read, t_net_request, t_propose_finding])
 
-    options = ClaudeAgentOptions(
+    runtime_cli = runtime.get("cli_path")
+    cli_path = str(Path(runtime_cli).resolve()) if runtime_cli is not None else None
+    options = options_type(
         model=JOB.get("model") or None,
         max_turns=JOB.get("max_turns", 6),
         tools=[],                       # no built-in tools: no Bash, no Read.
@@ -341,17 +482,26 @@ async def run() -> dict:
             "PreToolUse": [HookMatcher(hooks=[pre_tool])],
             "PostToolUse": [HookMatcher(hooks=[post_tool])],
         },
-        cwd=str(HERE),
+        cwd=str(runtime_dir),
         env={},
+        sandbox=None,
+        settings=None,
+        cli_path=cli_path,
     )
+    violations = _assess_launch(
+        options, environment, runtime,
+        managed_settings=MANAGED_SETTINGS, runtime_dir=runtime_dir,
+    )
+    if violations:
+        raise rk.StartupRefusal(violations)
 
     cap = JOB.get("cap", rk.PER_RUN_CAP)
     result = None
     started = time.monotonic()
-    async for msg in query(prompt=JOB["prompt"], options=options):
+    async for msg in transport(prompt=JOB["prompt"], options=options):
         if STATE["must_stop"]:
             break
-        if isinstance(msg, SystemMessage) and msg.subtype == "init":
+        if isinstance(msg, SystemMessage) and getattr(msg, "subtype", None) == "init":
             STATE["api_key_source"] = msg.data.get("apiKeySource")
             try:
                 guard.assert_init_message(msg.data)
@@ -409,17 +559,14 @@ def main() -> None:
     RT = rk.Runtime()
     RT.proxy_out = Path(JOB["run_dir"]) / "proxy-out"
 
-    import importlib.metadata as md
-    from claude_agent_sdk import _cli_version
-    sdk_v = md.version("claude-agent-sdk")
-    cli_v = _cli_version.__cli_version__
-
-    # Phases 1 and 2 of the ticket-21 guard, before a single byte is sent.
-    guard.assert_runtime_known(sdk_v, cli_v)
-    guard.assert_environment(cwd=HERE, setting_sources=[])
-
-    out = anyio.run(run)
-    out["sdk_version"], out["cli_version"] = sdk_v, cli_v
+    runtime = _runtime_facts()
+    try:
+        out = anyio.run(_run, None, runtime)
+    except rk.StartupRefusal as exc:
+        print(json.dumps({"startup_refusal": exc.violations}))
+        raise SystemExit(78) from None
+    out["sdk_version"] = runtime["sdk_version"]
+    out["cli_version"] = runtime["cli_version"]
     print(json.dumps(out))
 
 
