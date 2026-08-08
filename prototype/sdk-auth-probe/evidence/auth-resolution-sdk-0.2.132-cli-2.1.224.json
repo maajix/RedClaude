@@ -1,0 +1,350 @@
+{
+  "cases": [
+    {
+      "id": "baseline",
+      "inputs": {
+        "environment": {},
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "subscription_oauth",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "api_key",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_API_KEY": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "auth_token",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_AUTH_TOKEN": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "other_bearer",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "api_key_empty",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_API_KEY": ""
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "subscription_oauth",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "base_url",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_BASE_URL": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "subscription_oauth",
+        "destination_class": "loopback",
+        "request_count": 2,
+        "route": "other"
+      }
+    },
+    {
+      "id": "api_key_helper",
+      "inputs": {
+        "environment": {},
+        "setting_sources": [],
+        "settings": [
+          {
+            "document": {
+              "apiKeyHelper": "synthetic_helper"
+            },
+            "kind": "explicit",
+            "path": "/fixture/runtime/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "apiKeyHelper",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "fd",
+      "inputs": {
+        "environment": {
+          "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "none",
+        "destination_class": "none",
+        "request_count": 0,
+        "route": "none"
+      }
+    },
+    {
+      "id": "bedrock",
+      "inputs": {
+        "environment": {
+          "CLAUDE_CODE_USE_BEDROCK": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "none",
+        "destination_class": "none",
+        "request_count": 0,
+        "route": "none"
+      }
+    },
+    {
+      "id": "vertex",
+      "inputs": {
+        "environment": {
+          "CLAUDE_CODE_USE_VERTEX": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "none",
+        "destination_class": "gcp_metadata",
+        "request_count": 2,
+        "route": "other"
+      }
+    },
+    {
+      "id": "foundry",
+      "inputs": {
+        "environment": {
+          "CLAUDE_CODE_USE_FOUNDRY": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "none",
+        "destination_class": "none",
+        "request_count": 0,
+        "route": "none"
+      }
+    },
+    {
+      "id": "settings_env_key",
+      "inputs": {
+        "environment": {},
+        "setting_sources": [],
+        "settings": [
+          {
+            "document": {
+              "env": {
+                "ANTHROPIC_API_KEY": "synthetic_nonempty"
+              }
+            },
+            "kind": "explicit",
+            "path": "/fixture/runtime/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "proj_helper_isolated",
+      "inputs": {
+        "environment": {},
+        "setting_sources": [],
+        "settings": [
+          {
+            "document": {
+              "apiKeyHelper": "synthetic_helper"
+            },
+            "kind": "project",
+            "path": "/fixture/project/.claude/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "none",
+        "auth_class": "subscription_oauth",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "proj_helper_loaded",
+      "inputs": {
+        "environment": {},
+        "setting_sources": [
+          "project"
+        ],
+        "settings": [
+          {
+            "document": {
+              "apiKeyHelper": "synthetic_helper"
+            },
+            "kind": "project",
+            "path": "/fixture/project/.claude/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "apiKeyHelper",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "prec_key_vs_token",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_API_KEY": "synthetic_nonempty",
+          "ANTHROPIC_AUTH_TOKEN": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "prec_key_vs_helper",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_API_KEY": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": [
+          {
+            "document": {
+              "apiKeyHelper": "synthetic_helper"
+            },
+            "kind": "explicit",
+            "path": "/fixture/runtime/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "prec_token_vs_helper",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_AUTH_TOKEN": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": [
+          {
+            "document": {
+              "apiKeyHelper": "synthetic_helper"
+            },
+            "kind": "explicit",
+            "path": "/fixture/runtime/settings.json"
+          }
+        ]
+      },
+      "wire": {
+        "api_key_source": "apiKeyHelper",
+        "auth_class": "api_key",
+        "destination_class": "anthropic_api",
+        "request_count": 2,
+        "route": "anthropic_first_party"
+      }
+    },
+    {
+      "id": "prec_key_vs_bedrock",
+      "inputs": {
+        "environment": {
+          "ANTHROPIC_API_KEY": "synthetic_nonempty",
+          "CLAUDE_CODE_USE_BEDROCK": "synthetic_nonempty"
+        },
+        "setting_sources": [],
+        "settings": []
+      },
+      "wire": {
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "auth_class": "none",
+        "destination_class": "none",
+        "request_count": 0,
+        "route": "none"
+      }
+    }
+  ],
+  "probe": {
+    "commit": "9d5b97e68dddc7d28672dcd14100de00553a3c92",
+    "retained_capture": {
+      "algorithm": "sha256",
+      "digest": "93a093d06935604340149b120fa17acc3f7a92ca7c988698b72dd254d4cbd3fd",
+      "members": 4
+    }
+  },
+  "runtime": {
+    "bundled_cli_version": "2.1.224",
+    "sdk_version": "0.2.132"
+  },
+  "schema_version": 1
+}
