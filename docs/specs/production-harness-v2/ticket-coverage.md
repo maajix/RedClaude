@@ -1,0 +1,160 @@
+# Production harness v2 — ticket coverage audit
+
+Status: ticket-plan coverage complete; implementation not started
+
+This audit answers whether the approved ticket plan covers the production Spec
+and ends in a runnable first-hunt release candidate. It does not claim that any
+ticket has been implemented.
+
+## Structural validation
+
+| Check | Result |
+| --- | --- |
+| Ticket files | 65, numbered continuously 01–65 |
+| Ticket status | 65/65 `ready-for-agent` |
+| Acceptance criteria | 391 unchecked criteria |
+| Blocking edges | 124 exact title-and-number references |
+| Dependency graph | Acyclic |
+| Initial frontier | Ticket 01 only |
+| Release reachability | Every ticket has a dependency path to ticket 65 |
+| Absolute, scratch or issue-file paths in tickets | 0 |
+
+## User-story coverage
+
+Every numbered User Story is covered by at least one implementation slice and a
+later release verification slice.
+
+| Spec stories | Primary tickets |
+| --- | --- |
+| 1–25 — Program and operator control | 02, 04, 05, 08, 13, 14, 29, 59, 60, 62, 65 |
+| 26–45 — Durable truth and provenance | 03–07, 09, 17, 20, 24, 33, 35, 37, 40, 43, 58, 61, 63 |
+| 46–70 — Scheduling, budgets and long sessions | 22–29, 34, 41, 61 |
+| 71–99 — Agent runtime and authority | 15–20, 27, 28, 30–32, 37, 42, 44, 48 |
+| 100–125 — Egress, Identities and Artifacts | 07–14, 24, 31 |
+| 126–150 — Surface, Hypotheses, Tests and Findings | 20–22, 30, 32–38 |
+| 151–164 — Kill chains and dependency evaluation | 39–43 |
+| 165–194 — Skills, Playbooks and v1 migration | 44–58 |
+| 195–210 — Validation, reporting and visibility | 37, 40, 42, 43, 59, 60 |
+| 211–230 — Installation, security and release | 01–03, 07, 10, 11, 15–18, 30, 31, 44–48, 57, 61–65 |
+
+The implementation-time per-story evidence matrix is itself release-blocking in
+ticket 63; range coverage here prevents a planning omission, while ticket 63
+prevents a prose-only completion claim.
+
+## Implementation-decision coverage
+
+| Spec decision | Primary tickets |
+| --- | --- |
+| 1 — Product boundary and status vocabulary | 01, 02, 63, 64 |
+| 2 — Highest external seam | 02, 04, 20, 59, 65 |
+| 3 — Production runtime and packaging | 02, 03, 59, 62 |
+| 4 — Program configuration and scope | 04, 08, 13, 14, 58 |
+| 5 — Canonical state and transactions | 03–05, 17, 20, 24, 61 |
+| 6 — Artifact storage and secrecy | 06, 07, 43 |
+| 7 — Egress and Receipt authority | 09–14, 31 |
+| 8 — Identities and target sessions | 12, 24 |
+| 9 — Agent runtime and startup assertion | 15–17 |
+| 10 — Role roster and tool contracts | 18, 19, 27, 30–32, 37, 42, 48 |
+| 11 — Token-efficient context and session rotation | 19, 20, 28, 61 |
+| 12 — Scheduler and lifecycle | 23–29, 41 |
+| 13 — Surface and epistemic pipeline | 20–38 |
+| 14 — Kill-chain model | 39–42 |
+| 15 — Skills and Playbooks | 44–56 |
+| 16 — Complete v1 corpus disposition | 01, 47–58 |
+| 17 — Validation and reporting | 37, 42, 43 |
+| 18 — Operator CLI and local UI | 02, 04, 05, 29, 59, 60 |
+| 19 — Delivery phases and exit gates | 01–65, enforced by 63–65 |
+
+## Testing-decision coverage
+
+| Test obligation | Tickets |
+| --- | --- |
+| Highest `rk run` seam | 20, 61, 65 |
+| Database, migration and negative controls | 03–07, 17, 20, 24, 35–40, 62 |
+| Real HTTP/HTTPS/container boundary | 09–13, 16, 17, 31, 62 |
+| Auth evidence and startup matrix | 15–17 |
+| Scheduler, budgets, Leases and recovery | 23–29, 41, 61 |
+| Bounded context and session rotation | 19, 28, 61 |
+| Epistemic and kill-chain shortcuts | 33–43 |
+| Skill and Playbook quality | 44–57 |
+| Safe legacy import | 58 |
+| Deterministic report and export | 42, 43 |
+| Secret, restore, performance and clean-install gates | 01, 07, 43, 62 |
+| Independent final review | 63, 64 |
+| Full first-hunt dress rehearsal | 65 |
+
+## Out-of-scope enforcement
+
+| Constraint | Enforcing tickets |
+| --- | --- |
+| Android remains a visible future milestone, not a silent omission | 47, 57 |
+| No unconfigured adjacent-host or infrastructure discovery | 08, 11, 14 |
+| No ungranted destructive, availability or third-party impact | 13, 29, 38 |
+| No automatic external submission | 42, 59 |
+| No API-key or alternate-provider billing path | 15–17 |
+| Local-first rather than distributed SaaS/multi-tenant operation | 02, 05, 62 |
+| Rows remain authoritative; no event-sourced reconstruction | 03, 04, 61 |
+| No automatic promotion of legacy terminal labels | 58 |
+| No production generation or imports from prototypes | 01, 02, 62, 64 |
+
+## Known prototype-regression coverage
+
+| Regression | Tickets |
+| --- | --- |
+| HTTPS could bypass the capability proxy | 10, 11 |
+| Replay traffic was labeled as agent traffic | 03, 35 |
+| Credential-bearing wire material was plaintext | 07, 43 |
+| Actor context was session-wide rather than transaction-local | 03, 04 |
+| The composed startup proof mocked the claimed process seam | 16, 17, 20 |
+| Startup refusal did not latch the supervisor | 17 |
+
+## v1 corpus reconciliation
+
+| v1 inventory | Planned disposition tickets | Required total |
+| --- | --- | --- |
+| Agent definitions | 18, 48, 57 | 11 |
+| Skill directories | 44, 48, 57 | 28 |
+| In-scope Playbooks | 45, 46, 49–57 | 49 |
+| Android Playbooks | 57 | 10 explicit retirements |
+| Absorbed Playbook topic | 57 | 1 reference disposition |
+| Operator references | 48, 57 | 112 linked references |
+| Sink packs | 48, 57 | 9 linked packs |
+| Reserved files | 47, 57 | 3 explicit dispositions |
+| Legacy engagement state | 58 | unverified or retest-required unless exact provenance survives |
+
+The eight Playbook batches reconcile to all 49 in-scope topics:
+
+| Ticket | Topics |
+| --- | ---: |
+| 49 — Recon/API/protocol | 7 |
+| 50 — Authentication/Identity | 8 |
+| 51 — Authorization/business logic | 4 |
+| 52 — Browser/client side | 8 |
+| 53 — Injection | 7 |
+| 54 — Server/file/disclosure | 7 |
+| 55 — Platform/supply chain | 5 |
+| 56 — HTTP integrity/parsing | 3 |
+| **Total** | **49** |
+
+## First-hunt readiness
+
+Ticket 65 is not a documentation-only finish. Its acceptance path starts from a
+fresh installation and must exercise scoped recon, production Skill and Playbook
+selection, a meaningful negative result, a real fixture Finding through replay
+and blind validation, a sound and an intentionally unsound chain, restart/resume,
+deterministic reporting and standalone evidence verification.
+
+Ticket 65 is blocked by the remediated final review, which is blocked by the
+230-story implementation audit, hardening gates, full operator product,
+long-campaign recovery and every upstream implementation slice. Therefore a
+green ticket 65 implies a runnable harness suitable for configuring the first
+authorized live test hunt; it cannot be reached by completing only prototypes,
+schema work or catalogue files.
+
+## Verdict
+
+**PASS at ticket-plan level.** The approved dependency graph covers the complete
+production Spec, the complete planned v1 knowledge migration and an end-to-end
+first-hunt release outcome. Runtime functionality remains unimplemented until
+the tickets are executed and ticket 63 proves implementation evidence for every
+story.
