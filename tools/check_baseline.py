@@ -10,6 +10,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tokenize
 from collections import Counter
 from pathlib import Path
 
@@ -108,14 +109,31 @@ def collect_v1(v1: Path) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
 
     for name, path in sorted(relative.items()):
-        if name.startswith(".claude/agents/") and path.parent == v1 / ".claude/agents" and path.suffix == ".md":
+        if (
+            name.startswith(".claude/agents/")
+            and path.parent == v1 / ".claude/agents"
+            and path.suffix == ".md"
+        ):
             lines, digest = file_facts(path)
-            rows.append({"kind": "agent_definition", "source": name, "lines": str(lines), "sha256": digest})
+            rows.append({
+                "kind": "agent_definition",
+                "source": name,
+                "lines": str(lines),
+                "sha256": digest,
+            })
 
-    skill_roots = sorted({Path(name).parts[2] for name in relative if name.startswith(".claude/skills/")})
+    skill_roots = sorted({
+        Path(name).parts[2]
+        for name in relative
+        if name.startswith(".claude/skills/")
+    })
     for skill in skill_roots:
         root = v1 / ".claude/skills" / skill
-        sources = sorted(path for name, path in relative.items() if name.startswith(f".claude/skills/{skill}/"))
+        sources = sorted(
+            path
+            for name, path in relative.items()
+            if name.startswith(f".claude/skills/{skill}/")
+        )
         lines, digest = directory_facts(root, sources)
         rows.append({
             "kind": "skill_directory",
@@ -154,10 +172,17 @@ def read_manifest(path: Path = MANIFEST) -> list[dict[str, str]]:
         raise BaselineError("duplicate manifest source: " + ", ".join(duplicates))
     counts = Counter(row["kind"] for row in rows)
     if counts != Counter(EXPECTED_COUNTS):
-        raise BaselineError(f"manifest counts differ: expected {EXPECTED_COUNTS}, found {dict(counts)}")
+        raise BaselineError(
+            f"manifest counts differ: expected {EXPECTED_COUNTS}, found {dict(counts)}"
+        )
     for row in rows:
         source = Path(row["source"])
-        if not source.parts or source.is_absolute() or ".." in source.parts or source.parts[0] not in {".claude", "playbooks"}:
+        if (
+            not source.parts
+            or source.is_absolute()
+            or ".." in source.parts
+            or source.parts[0] not in {".claude", "playbooks"}
+        ):
             raise BaselineError(f"unsafe manifest source: {row['source']}")
         if not row["lines"].isdigit() or len(row["sha256"]) != 64:
             raise BaselineError(f"invalid manifest facts: {row['source']}")
@@ -186,8 +211,15 @@ def read_status() -> dict:
         if not (CHECKOUT / entry["path"]).exists():
             raise BaselineError(f"classified path does not exist: {entry['path']}")
 
+    prototype_source = status.get("prototype_root")
+    if not isinstance(prototype_source, str):
+        raise BaselineError("status registry needs a prototype_root")
+    prototype_path = Path(prototype_source)
+    if prototype_path.is_absolute() or ".." in prototype_path.parts:
+        raise BaselineError(f"unsafe prototype root: {prototype_source}")
+
     classified = set(paths)
-    prototype_root = CHECKOUT / "docs/prototype"
+    prototype_root = CHECKOUT / prototype_path
     prototypes = {
         path.relative_to(CHECKOUT).as_posix()
         for path in prototype_root.iterdir()
@@ -207,6 +239,15 @@ def read_status() -> dict:
         if not path.parts or path.is_absolute() or ".." in path.parts:
             raise BaselineError(f"unsafe production root: {root}")
 
+    forbidden_roots = status.get("forbidden_dependency_roots", [])
+    if (
+        not isinstance(forbidden_roots, list)
+        or len(forbidden_roots) != 4
+        or len(forbidden_roots) != len(set(forbidden_roots))
+        or not all(isinstance(root, str) and root for root in forbidden_roots)
+    ):
+        raise BaselineError("status registry needs four unique forbidden dependency roots")
+
     regressions = status.get("regressions", [])
     regression_ids = [entry.get("id") for entry in regressions]
     if len(regression_ids) != len(set(regression_ids)):
@@ -224,35 +265,45 @@ def read_status() -> dict:
     return status
 
 
-def forbidden_reference(value: str) -> bool:
+def forbidden_reference(value: str, forbidden_roots: list[str]) -> bool:
     value = value.replace("\\", "/").strip()
-    return (
-        value in {"docs", "prototype", ".scratch", "/tmp"}
-        or value.startswith(
-            (
-                "docs/",
-                "docs.",
-                "./docs/",
-                "../docs/",
-                "prototype/",
-                "prototype.",
-                "./prototype/",
-                "../prototype/",
-                ".scratch/",
-                "/tmp/",
-            )
+    prefixes = (" ", "\"", "'", "=", "(", "[", ",")
+    for root in forbidden_roots:
+        root = root.replace("\\", "/").rstrip("/")
+        variants = (root, root + "/") if root.startswith("/") else (
+            root,
+            root + "/",
+            root + ".",
+            "./" + root + "/",
+            "../" + root + "/",
         )
-        or (value.startswith("/") and "/docs/" in value)
-        or any(fragment in value for fragment in (" docs/", " docs.", " prototype/", " prototype.", " .scratch/", " /tmp/"))
-    )
+        if value == root or value.startswith(variants[1:]):
+            return True
+        if any(prefix + variant in value for prefix in prefixes for variant in variants[1:]):
+            return True
+    return False
 
 
-def forbidden_python_dependencies(path: Path, source: str) -> list[str]:
+def forbidden_python_dependencies(
+    path: Path,
+    source: str,
+    forbidden_roots: list[str],
+) -> list[str]:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as error:
         return [f"{path}: cannot inspect invalid Python: {error.msg}"]
     errors = []
+    forbidden_modules = {root for root in forbidden_roots if root.isidentifier()}
+    docstrings = {
+        id(owner.body[0].value)
+        for owner in ast.walk(tree)
+        if isinstance(owner, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and owner.body
+        and isinstance(owner.body[0], ast.Expr)
+        and isinstance(owner.body[0].value, ast.Constant)
+        and isinstance(owner.body[0].value.value, str)
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules = [alias.name for alias in node.names]
@@ -261,34 +312,15 @@ def forbidden_python_dependencies(path: Path, source: str) -> list[str]:
         else:
             modules = []
         for module in modules:
-            if module.split(".", 1)[0] in {"docs", "prototype", "scratch"}:
+            if module.split(".", 1)[0] in forbidden_modules:
                 errors.append(f"{path}: forbidden import {module}")
-        if isinstance(node, ast.Call):
-            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
-            if name in {
-                "__import__",
-                "import_module",
-                "run_module",
-                "run_path",
-                "run",
-                "Popen",
-                "call",
-                "check_call",
-                "check_output",
-                "system",
-                "execl",
-                "execle",
-                "execlp",
-                "execlpe",
-                "execv",
-                "execve",
-                "execvp",
-                "execvpe",
-            }:
-                for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
-                    for value in ast.walk(argument):
-                        if isinstance(value, ast.Constant) and isinstance(value.value, str) and forbidden_reference(value.value):
-                            errors.append(f"{path}: forbidden execution dependency {value.value}")
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+            and forbidden_reference(node.value, forbidden_roots)
+        ):
+            errors.append(f"{path}: forbidden tree reference {node.value}")
     return errors
 
 
@@ -296,6 +328,7 @@ def production_boundary_errors(
     repo: Path,
     production_roots: list[str],
     production_paths: list[str],
+    forbidden_roots: list[str],
 ) -> list[str]:
     errors: list[str] = []
     targets = dict.fromkeys([*production_roots, *production_paths])
@@ -305,6 +338,8 @@ def production_boundary_errors(
             continue
         paths = [root] if root.is_file() or root.is_symlink() else sorted(root.rglob("*"))
         for path in paths:
+            if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
             if path.is_symlink():
                 relative = path.relative_to(repo)
                 errors.append(f"{relative}: forbidden symlink target")
@@ -312,35 +347,46 @@ def production_boundary_errors(
             if not path.is_file():
                 continue
             relative = path.relative_to(repo)
-            try:
-                source = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+            data = path.read_bytes()
+            first_line = data.splitlines()[0].lower() if data.splitlines() else b""
+            is_python = path.suffix == ".py" or first_line.startswith(b"#!") and b"python" in first_line
+            if is_python:
+                try:
+                    with tokenize.open(path) as handle:
+                        source = handle.read()
+                except (SyntaxError, UnicodeError) as error:
+                    errors.append(f"{relative}: cannot decode Python source: {error}")
+                    continue
+                errors.extend(forbidden_python_dependencies(relative, source, forbidden_roots))
                 continue
-            if path.suffix == ".py" or source.startswith("#!") and "python" in source.splitlines()[0].lower():
-                errors.extend(forbidden_python_dependencies(relative, source))
+            try:
+                source = data.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"{relative}: non-UTF-8 production file")
                 continue
             for line_number, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if not stripped or stripped.startswith(("#", "//", "--")):
                     continue
-                if forbidden_reference(stripped):
+                if forbidden_reference(stripped, forbidden_roots):
                     errors.append(f"{relative}:{line_number}: forbidden tree dependency")
     return errors
 
 
-def implementation_claim_errors(classifications: list[dict]) -> list[str]:
+def implementation_claim_errors(repo: Path, classifications: list[dict]) -> list[str]:
     errors = []
     for entry in classifications:
         if entry["classification"] == "production":
             continue
-        root = CHECKOUT / entry["path"]
+        root = repo / entry["path"]
         sources = [root] if root.is_file() else root.rglob("*.md")
         for source in sources:
-            for line_number, line in enumerate(source.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line_number, line in enumerate(lines, 1):
                 status = line.strip().replace("**", "").lower()
                 if status in {"status: implemented", "status: production", "status: shipping"}:
                     errors.append(
-                        f"{source.relative_to(CHECKOUT)}:{line_number}: "
+                        f"{source.relative_to(repo)}:{line_number}: "
                         "non-production work claims shipping status"
                     )
     return errors
@@ -349,8 +395,14 @@ def implementation_claim_errors(classifications: list[dict]) -> list[str]:
 def compare_manifest(expected: list[dict[str, str]], actual: list[dict[str, str]]) -> list[str]:
     expected_by_source = {row["source"]: row for row in expected}
     actual_by_source = {row["source"]: row for row in actual}
-    errors = [f"missing v1 artifact: {source}" for source in sorted(expected_by_source.keys() - actual_by_source.keys())]
-    errors.extend(f"added v1 artifact: {source}" for source in sorted(actual_by_source.keys() - expected_by_source.keys()))
+    errors = [
+        f"missing v1 artifact: {source}"
+        for source in sorted(expected_by_source.keys() - actual_by_source.keys())
+    ]
+    errors.extend(
+        f"added v1 artifact: {source}"
+        for source in sorted(actual_by_source.keys() - expected_by_source.keys())
+    )
     for source in sorted(expected_by_source.keys() & actual_by_source.keys()):
         if expected_by_source[source] != actual_by_source[source]:
             errors.append(f"changed v1 artifact: {source}")
@@ -376,12 +428,13 @@ def main(argv: list[str] | None = None) -> int:
             for entry in status["classifications"]
             if entry["classification"] == "production"
         ]
-        errors = implementation_claim_errors(status["classifications"])
+        errors = implementation_claim_errors(CHECKOUT, status["classifications"])
         errors.extend(
             production_boundary_errors(
                 arguments.repo.resolve(),
                 status["production_roots"],
                 production_paths,
+                status["forbidden_dependency_roots"],
             )
         )
         if arguments.v1:

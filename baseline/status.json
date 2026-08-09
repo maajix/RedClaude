@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "prototype_root": "docs/prototype",
+  "forbidden_dependency_roots": ["docs", "prototype", ".scratch", "/tmp"],
   "production_roots": [
     "pyproject.toml",
     "src",
