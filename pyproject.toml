@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redkraken"
+description = "A local-first bug-bounty hunting harness for web and API targets"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dynamic = ["version"]
+
+# The runtime is standard library only. Every entry added here is an exact pin,
+# and `rk doctor` verifies the same table at startup.
+dependencies = []
+
+[project.scripts]
+rk = "redkraken.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "redkraken.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

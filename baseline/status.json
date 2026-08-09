@@ -10,6 +10,11 @@
   ],
   "classifications": [
     {
+      "path": "src",
+      "classification": "production",
+      "claim": "The installable RedKraken application and its operator command line"
+    },
+    {
       "path": "tools",
       "classification": "production",
       "claim": "Production repository checks"
