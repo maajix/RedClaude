@@ -1,0 +1,617 @@
+"""`rk run`: open a Program from a configuration, or resume the one it opened.
+
+The command is the boundary between a file an operator edits and a Program the
+database owns. Everything downstream — a Task, a Receipt, a Finding — cites a
+Program and, through it, the policy that authorised the work. So the whole of
+this module is one question asked carefully: is this the same Program running
+the same policy, or is it something else wearing the same name?
+
+Three properties make the answer trustworthy, and each one is a refusal rather
+than a convention:
+
+* Identity is the slug, and it is read, decided on and written under one lock
+  in one transaction, so two runs starting together cannot both create it.
+* Policy is the canonical hash. A changed policy is refused, not adopted: the
+  operator says so explicitly and gets a new revision, because a Finding citing
+  revision 1 has to keep meaning what it meant.
+* Nothing is written until the database has said it is ready. The integrity
+  gate runs first, on the runtime's own connection, so a refusal leaves the
+  database exactly as it was found.
+
+There is no execution loop here yet. The command opens or resumes the Program,
+reports what is durable and stops, which is what `stop_reason` says.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from redkraken import config, integrity, migrate, pg
+from redkraken.outcome import (
+    DATABASE_UNREACHABLE,
+    INTEGRITY_FAILED,
+    INVALID_CONFIGURATION,
+    SCHEMA_DRIFT,
+    Ledger,
+    Report,
+    report,
+)
+
+
+COMMAND = "run"
+
+#: Who the database records as having written. A run is a runtime actor: there
+#: is no model in the loop yet, and the operator is not writing these rows by
+#: hand. `events` carries the kind and not the identifier, so no row this
+#: command writes holds the string below today; it is passed because
+#: `set_actor` otherwise defaults `app.actor_id` to the login role, and the
+#: first table that does record one should read `rk run` rather than
+#: `rk2_runtime`, which is every connection the runtime opens.
+ACTOR = "rk run"
+
+#: The four answers `decide` can give, and the whole vocabulary of what one run
+#: does to a Program.
+CREATE = "create"
+RESUME = "resume"
+REVISE = "revise"
+REFUSE = "refuse"
+
+#: Why the command stopped. `nothing_to_execute` is the honest answer while the
+#: execution loop is owed by a later ticket: the Program is open and ready and
+#: this command has nothing more to do with it.
+STOPPED_REFUSED = "refused"
+STOPPED_AWAITING_DECISION = "awaiting_decision"
+STOPPED_NOTHING_TO_EXECUTE = "nothing_to_execute"
+
+#: Everything the command reports, and the reason the list is written down: a
+#: run answers with durable identifiers, what state the Program is in, why it
+#: stopped, what a human is being asked and whether the database still holds.
+#: Anything else — a host, a header, a slot reference — is the operator's own
+#: file being read back to them out of a log that other connections can see.
+FACTS = (
+    "program_id",
+    "program_slug",
+    "configuration",
+    "lifecycle",
+    "stop_reason",
+    "pending_decisions",
+    "integrity",
+)
+
+#: The advisory lock a run holds while it decides. The two-integer key space is
+#: disjoint from the single-bigint one `migrate.LOCK_KEY` uses, so a run and a
+#: migration cannot collide on a key by accident; the class id below is
+#: arbitrary and only has to stay fixed.
+LOCK_CLASS = 20260809
+
+#: The runtime's own startup assertion, and the one the corpus wrote for it:
+#: eight properties of this connection, defaulting to whoever is asking.
+RUNTIME_ASSERTION = "check_runtime_connection(text)"
+
+#: What a resume writes into its event, so a reader can tell an idle restart
+#: from one that swept a Program clean.
+RESUME_EVENT = "run.resumed"
+EVENT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Revision:
+    """One configuration revision as the database holds it."""
+
+    revision: int
+    schema_version: int
+    source_sha256: str
+    canonical_sha256: str
+
+    def summary(self) -> dict:
+        return {
+            "revision": self.revision,
+            "schema_version": self.schema_version,
+            "source_sha256": self.source_sha256,
+            "canonical_sha256": self.canonical_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class Program:
+    """The root row and the newest policy recorded against it."""
+
+    id: str
+    slug: str
+    closed_at: str | None
+    purge_after: str | None
+    revision: Revision | None
+
+    @property
+    def lifecycle(self) -> str:
+        return lifecycle(self.closed_at, self.purge_after)
+
+
+class _Refused(Exception):
+    """Leaves the transaction without committing what it was about to write."""
+
+
+def decide(
+    current: Revision | None, configuration: config.Configuration, *, accept_change: bool
+) -> str:
+    """What this run does to the Program, given what is already recorded.
+
+    The comparison is over the canonical hash, never the source hash: reflowing
+    the file, reordering its tables or adding a comment produces different bytes
+    and the same policy, and a revision recorded for that would claim a change
+    that did not happen. `accept_change` is the operator saying, in the command
+    line, that the change is theirs — without it a changed policy is refused,
+    because silently adopting one rewrites what every earlier Finding cites.
+    """
+    if current is None:
+        return CREATE
+    if current.canonical_sha256 == configuration.canonical_sha256:
+        return RESUME
+    return REVISE if accept_change else REFUSE
+
+
+def lifecycle(closed_at: str | None, purge_after: str | None) -> str:
+    """The Program's state in one word, from the two timestamps that say it."""
+    if purge_after is not None:
+        return "retired"
+    if closed_at is not None:
+        return "closed"
+    return "open"
+
+
+def run(
+    settings: pg.Settings,
+    configuration_path: Path,
+    *,
+    accept_change: bool = False,
+    corpus: Path = migrate.CORPUS,
+) -> Report:
+    """Create or resume the Program this configuration names."""
+    ledger = Ledger()
+    state = _State()
+
+    configuration, refusals = config.load(Path(configuration_path))
+    if configuration is None:
+        ledger.refuse("configuration", f"refused by {len(refusals)} violation(s)", refusals)
+        return _report(ledger, state)
+    state.configuration = configuration
+    slug = configuration.document["program"]["name"]
+    state.slug = slug
+    ledger.hold(
+        "configuration",
+        f"{slug}, schema {configuration.schema_version}, "
+        f"policy {_short(configuration.canonical_sha256)}",
+    )
+
+    migrations, corpus_refusals = migrate.load(corpus)
+    if corpus_refusals:
+        ledger.refuse("corpus", f"{len(corpus_refusals)} refused migration file(s)", corpus_refusals)
+        return _report(ledger, state)
+    ledger.hold("corpus", f"{len(migrations)} migration file(s)")
+
+    connection = migrate.open_connection(ledger, settings)
+    if connection is None:
+        return _report(ledger, state)
+
+    with connection:
+        _assert_runtime_connection(ledger, connection)
+        if ledger.violations:
+            return _report(ledger, state)
+
+        # Before anything is written, and on this connection rather than a
+        # privileged one: a run that cannot see the database it is about to
+        # write to is not ready, whatever a migration run concluded earlier.
+        # Two families, not three: the role catalogue is the runner's, and a
+        # runtime command that asked for it would depend on the privilege
+        # ticket 66 exists to take away.
+        gate = integrity.verify(
+            connection,
+            expected=[item.identity for item in migrations],
+            families=integrity.RUNTIME_FAMILIES,
+        )
+        state.integrity = dict(gate.facts)
+        if gate.violations:
+            ledger.refuse(
+                "integrity",
+                f"{len(gate.facts.get('failed', ()))} of {gate.facts.get('checks', 0)} check(s) "
+                "failed; nothing was written",
+                gate.violations,
+            )
+            return _report(ledger, state)
+        ledger.hold(
+            "integrity",
+            f"{gate.facts['checks']} check(s) across "
+            f"{len(gate.facts['families'])} families hold",
+        )
+
+        try:
+            _open_program(ledger, connection, state, accept_change=accept_change)
+        except _Refused:
+            return _report(ledger, state)
+
+        # Past here the rows are committed. Every remaining failure is reported
+        # against a Program that exists, so the identifiers stay in the answer.
+        _read_durable_state(ledger, connection, state)
+
+    return _report(ledger, state)
+
+
+@dataclass
+class _State:
+    """What the command has established so far, in report terms.
+
+    Carried rather than returned so that a refusal at any depth answers with
+    the same keys a completed run answers with: an operator parses one document
+    whether the run reached a Program or not.
+    """
+
+    slug: str | None = None
+    configuration: config.Configuration | None = None
+    program_id: str | None = None
+    revision: Revision | None = None
+    lifecycle: str | None = None
+    pending: list[dict] | None = None
+    integrity: dict | None = None
+
+
+def _report(ledger: Ledger, state: _State) -> Report:
+    pending = state.pending or []
+    if ledger.violations:
+        stop_reason = STOPPED_REFUSED
+    elif pending:
+        stop_reason = STOPPED_AWAITING_DECISION
+    else:
+        stop_reason = STOPPED_NOTHING_TO_EXECUTE
+    return report(
+        COMMAND,
+        ledger,
+        program_id=state.program_id,
+        program_slug=state.slug,
+        configuration=state.revision.summary() if state.revision else None,
+        lifecycle=state.lifecycle,
+        stop_reason=stop_reason,
+        pending_decisions=pending,
+        integrity=state.integrity,
+    )
+
+
+def _assert_runtime_connection(ledger: Ledger, connection: pg.Connection) -> None:
+    """Refuse the wrong connection string before the gate, let alone a write.
+
+    The corpus wrote this assertion for exactly this caller — eight properties
+    of the connection rather than of the schema, defaulting to whoever asks — so
+    running as the owner, as a superuser or as a role that can turn triggers off
+    is a refusal here instead of a surprise later.
+    """
+    if not connection.execute(
+        "SELECT to_regprocedure($1) IS NOT NULL", (RUNTIME_ASSERTION,)
+    ).scalar():
+        ledger.fail(
+            "runtime_connection",
+            "this database carries no runtime connection assertion; run `rk db migrate`",
+            code=SCHEMA_DRIFT,
+            source="database",
+        )
+        return
+
+    user = connection.execute("SELECT current_user").scalar()
+    failed = [
+        (str(name), str(detail))
+        for name, ok, detail in connection.execute(
+            "SELECT check_name, ok, detail FROM check_runtime_connection()"
+        ).rows
+        if not ok
+    ]
+    if failed:
+        ledger.fail(
+            "runtime_connection",
+            f"connected as {user}, which is not the runtime connection: "
+            + "; ".join(f"{name} ({detail})" for name, detail in failed),
+            code=INVALID_CONFIGURATION,
+            source="database",
+        )
+        return
+    ledger.hold("runtime_connection", f"connected as {user}")
+
+
+def _open_program(
+    ledger: Ledger, connection: pg.Connection, state: _State, *, accept_change: bool
+) -> None:
+    """Read, decide and write, once, under one lock.
+
+    The lock covers the deciding and not merely the writing. Two runs of the
+    same command starting together would otherwise both read no Program and
+    both insert one, and only the unique index on the slug would notice — after
+    one of them had already emitted an event for a Program that does not
+    survive its own transaction.
+    """
+    configuration = state.configuration
+    assert configuration is not None  # established by the caller
+    slug = str(state.slug)
+
+    with connection.transaction():
+        connection.execute("SELECT pg_advisory_xact_lock($1::int4, hashtext($2))", (LOCK_CLASS, slug))
+        existing = _existing(connection, slug)
+        if existing is not None:
+            state.program_id = existing.id
+            state.revision = existing.revision
+            state.lifecycle = existing.lifecycle
+            if existing.lifecycle != "open":
+                ledger.fail(
+                    "program",
+                    f"{slug} is {existing.lifecycle} and is not resumed; a closed Program's "
+                    "rows are the record of work that finished",
+                    code=INVALID_CONFIGURATION,
+                    source="database",
+                )
+                raise _Refused
+            if existing.revision is None:
+                # The gate refuses this first — `program_without_configuration`
+                # is a standing check — so reaching it means the row appeared
+                # between the gate and this lock. Named rather than left to the
+                # unique index, which would report it as a duplicate slug.
+                ledger.fail(
+                    "program",
+                    f"{slug} exists with no configuration revision, so nothing records the "
+                    "policy it runs under; `rk db verify` names it",
+                    code=INTEGRITY_FAILED,
+                    source="database",
+                )
+                raise _Refused
+
+        current = existing.revision if existing else None
+        answer = decide(current, configuration, accept_change=accept_change)
+        if answer == REFUSE:
+            assert current is not None  # `decide` only refuses against a revision
+            ledger.fail(
+                "program",
+                f"{slug} runs under configuration revision {current.revision} "
+                f"({_short(current.canonical_sha256)}), and this file is a different policy "
+                f"({_short(configuration.canonical_sha256)}); rerun with --accept-change to "
+                f"record revision {current.revision + 1}",
+                code=INVALID_CONFIGURATION,
+                source="config",
+            )
+            raise _Refused
+
+        connection.execute("SELECT set_actor('runtime', $1)", (ACTOR,))
+
+        if answer == CREATE:
+            state.program_id = _create(connection, configuration, slug)
+            state.lifecycle = "open"
+            reason = "program opened"
+        elif answer == REVISE:
+            _revise(connection, configuration, str(state.program_id))
+            reason = f"policy change accepted by {ACTOR}"
+        else:
+            reason = ""
+
+        next_revision = 1 if current is None else current.revision + 1
+        if answer in (CREATE, REVISE):
+            state.revision = _record(
+                connection,
+                configuration,
+                str(state.program_id),
+                revision=next_revision,
+                reason=reason,
+            )
+
+        if answer in (RESUME, REVISE):
+            counts = _resume(connection, str(state.program_id), state.revision)
+            detail = ", ".join(f"{name} {value}" for name, value in sorted(counts.items()))
+            ledger.hold("program", f"resumed {slug}: {detail}")
+        else:
+            ledger.hold("program", f"created {slug}")
+
+    if answer == REVISE:
+        ledger.hold("configuration_revision", f"recorded revision {next_revision} for {slug}")
+
+
+def _existing(connection: pg.Connection, slug: str) -> Program | None:
+    """The Program this slug names and the newest policy recorded against it."""
+    rows = connection.execute(
+        "SELECT p.id::text, p.closed_at::text, p.purge_after::text,"
+        "       c.revision, c.schema_version, c.source_sha256, c.canonical_sha256"
+        "  FROM programs p"
+        "  LEFT JOIN LATERAL ("
+        "        SELECT revision, schema_version, source_sha256, canonical_sha256"
+        "          FROM program_configurations"
+        "         WHERE program_id = p.id"
+        "         ORDER BY revision DESC"
+        "         LIMIT 1) c ON true"
+        " WHERE p.slug = $1",
+        (slug,),
+    ).rows
+    if not rows:
+        return None
+    identity, closed_at, purge_after, revision, schema_version, source, canonical = rows[0]
+    return Program(
+        id=str(identity),
+        slug=slug,
+        closed_at=None if closed_at is None else str(closed_at),
+        purge_after=None if purge_after is None else str(purge_after),
+        revision=(
+            None
+            if revision is None
+            else Revision(
+                revision=int(revision),
+                schema_version=int(schema_version),
+                source_sha256=str(source),
+                canonical_sha256=str(canonical),
+            )
+        ),
+    )
+
+
+def _policy(configuration: config.Configuration) -> tuple[str | None, int]:
+    """The two values the root `programs` row carries as columns of its own.
+
+    Read in one place because they are written in three -- the row, the row's
+    update and the revision that records both -- and three readings of the same
+    document are three chances for them to stop being the same two values.
+    """
+    document = configuration.document
+    return document["program"]["platform"], document["budgets"]["tokens"]
+
+
+def _create(connection: pg.Connection, configuration: config.Configuration, slug: str) -> str:
+    """The root row. The slug is the identity; the rest is policy it carries."""
+    platform, token_budget = _policy(configuration)
+    return str(
+        connection.execute(
+            "INSERT INTO programs (slug, name, platform, token_budget)"
+            " VALUES ($1, $2, $3, $4) RETURNING id::text",
+            (slug, slug, platform, token_budget),
+        ).scalar()
+    )
+
+
+def _revise(connection: pg.Connection, configuration: config.Configuration, program_id: str) -> None:
+    """Bring the root row's own policy columns to the accepted configuration.
+
+    The slug is not among them: it is the identity, and a file naming a
+    different one is a different Program rather than a revision of this one.
+
+    `programs` emits no event, so this update is invisible in the log on its
+    own. What makes it auditable is that the revision recorded in the same
+    transaction states the same two values, and `check_program_configuration()`
+    fails the gate when the row and the newest revision disagree.
+    """
+    platform, token_budget = _policy(configuration)
+    connection.execute(
+        "UPDATE programs SET platform = $2, token_budget = $3 WHERE id = $1::uuid",
+        (program_id, platform, token_budget),
+    )
+
+
+def _record(
+    connection: pg.Connection,
+    configuration: config.Configuration,
+    program_id: str,
+    *,
+    revision: int,
+    reason: str,
+) -> Revision:
+    """Append the configuration revision. The insert is what emits the event.
+
+    The document is sent in the encoding its canonical hash was taken over, but
+    `jsonb` normalises what it stores: key order and whitespace do not survive
+    the column, so hashing `document::text` back out would not reproduce
+    `canonical_sha256`. A reader that wants to re-derive the hash parses the
+    document and canonicalises it again -- which is the check worth making
+    anyway, since it re-runs the rule rather than trusting a stored string.
+
+    `platform` and `token_budget` are restated out of the document because they
+    are the two values also written onto the `programs` row, and stating them
+    here is what puts that projection in the event log.
+    """
+    platform, token_budget = _policy(configuration)
+    connection.execute(
+        "INSERT INTO program_configurations"
+        " (program_id, revision, schema_version, source_path,"
+        "  source_sha256, canonical_sha256, document, platform, token_budget, reason)"
+        " VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)",
+        (
+            program_id,
+            revision,
+            configuration.schema_version,
+            configuration.path,
+            configuration.source_sha256,
+            configuration.canonical_sha256,
+            config.canonical_bytes(configuration.document).decode("utf-8"),
+            platform,
+            token_budget,
+            reason,
+        ),
+    )
+    return Revision(
+        revision=revision,
+        schema_version=configuration.schema_version,
+        source_sha256=configuration.source_sha256,
+        canonical_sha256=configuration.canonical_sha256,
+    )
+
+
+def _resume(connection: pg.Connection, program_id: str, revision: Revision | None) -> dict:
+    """The reconciliation sweep, and the one event that records it happened.
+
+    `resume_program()` is the corpus's single path for every abort — a crash, a
+    rate limit, an operator stop — and it returns what it swept without saying
+    anywhere that it ran. The event is written here because a restart that
+    changed nothing is still a fact about the Program: it is how a reader tells
+    an idle restart from one that unclaimed twelve tasks.
+    """
+    counts = json.loads(str(connection.execute(
+        "SELECT resume_program($1::uuid)", (program_id,)
+    ).scalar()))
+    payload = {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "configuration_revision": revision.revision if revision else None,
+        "canonical_sha256": revision.canonical_sha256 if revision else None,
+        "counts": counts,
+    }
+    connection.execute(
+        "INSERT INTO events (program_id, type, actor_kind, payload)"
+        " VALUES ($1::uuid, $2, 'runtime', $3::jsonb)",
+        (program_id, RESUME_EVENT, json.dumps(payload, sort_keys=True, separators=(",", ":"))),
+    )
+    return counts
+
+
+def _read_durable_state(ledger: Ledger, connection: pg.Connection, state: _State) -> None:
+    """What the Program is, read back from the database that now holds it.
+
+    Read after the commit rather than assembled from what was just written, so
+    the answer is the durable one. A failure here is reported against a Program
+    that exists: the identifiers stay in the report, and the assertion says
+    where to look, because the alternative is an operator who cannot tell a
+    Program that was never created from one they cannot currently see.
+    """
+    program_id = str(state.program_id)
+    try:
+        closed_at, purge_after = connection.execute(
+            "SELECT closed_at::text, purge_after::text FROM programs WHERE id = $1::uuid",
+            (program_id,),
+        ).rows[0]
+        state.lifecycle = lifecycle(
+            None if closed_at is None else str(closed_at),
+            None if purge_after is None else str(purge_after),
+        )
+        state.pending = [
+            {
+                "id": str(row["id"]),
+                "question_code": str(row["question_code"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in connection.execute(
+                "SELECT id::text AS id, question_code, created_at::text AS created_at"
+                "  FROM pending_decisions"
+                " WHERE program_id = $1::uuid AND answered_at IS NULL"
+                " ORDER BY created_at, id",
+                (program_id,),
+            ).dicts()
+        ]
+    except (pg.DatabaseError, pg.ConnectionError_) as error:
+        ledger.fail(
+            "durable_state",
+            f"the Program was written and committed as {program_id}, and reading it back "
+            f"failed: {error}. Its rows are durable; `rk db verify` inspects them",
+            code=(
+                DATABASE_UNREACHABLE
+                if isinstance(error, pg.ConnectionError_)
+                else INTEGRITY_FAILED
+            ),
+            source="database",
+        )
+        return
+    ledger.hold(
+        "durable_state",
+        f"{state.lifecycle}, {len(state.pending)} pending decision(s)",
+    )
+
+
+def _short(digest: str) -> str:
+    """Enough of a hash to read in a refusal, never enough to mistake for one."""
+    return digest[:12]

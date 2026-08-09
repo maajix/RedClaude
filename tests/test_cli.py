@@ -246,6 +246,73 @@ class DatabaseCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_USAGE, run("db", "restore").returncode)
 
 
+class RunCommandTest(unittest.TestCase):
+    """`rk run`, up to the point where a database is needed.
+
+    The command's own connection string, because it is the runtime's: the role
+    that opens a Program is the one the model's tool calls run through, and it
+    is not the role that migrated the schema.
+    """
+
+    def test_a_missing_connection_string_names_the_variable_that_holds_it(self):
+        result = run("run", "--config", str(write(VALID)))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("run", report["command"])
+        self.assertEqual(
+            [("invalid_configuration", "environment:RK_DATABASE_URL")],
+            [(item["code"], item["source"]) for item in report["violations"]],
+        )
+
+    def test_a_run_without_a_configuration_is_a_usage_error(self):
+        result = run("run", "--url", "postgresql://rk2_runtime@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--config", result.stderr)
+
+    def test_a_refused_configuration_is_reported_in_the_run_shape(self):
+        source = write(VALID.replace("[budgets]\n", "[budgets]\nspend = 1\n"))
+
+        result = run("run", "--config", str(source), "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["program_id"])
+        self.assertEqual("refused", report["stop_reason"])
+        self.assertEqual(["config:budgets.spend"], [item["source"] for item in report["violations"]])
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(
+            "run", "--config", str(write(VALID)), "--url", "postgresql://rk2@127.0.0.1:1/rk2"
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("run", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            "run",
+            "--config", str(write(VALID)),
+            "--url", "postgresql://rk2:s3cr3t-sentinel@127.0.0.1:1/rk2",
+        )
+
+        self.assertNotIn("s3cr3t-sentinel", result.stdout)
+        self.assertNotIn("s3cr3t-sentinel", result.stderr)
+
+    def test_a_refused_configuration_reaches_no_database_at_all(self):
+        # Criterion 5, at the CLI: a run refused by the operator's own file
+        # cannot have changed a database, because it never opened a socket.
+        source = write(VALID.replace("requests = 5000", "requests = 0"))
+
+        observed = observe(
+            "run", "--config", str(source), "--url", "postgresql://rk2@127.0.0.1:1/rk2"
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

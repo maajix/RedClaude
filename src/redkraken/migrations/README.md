@@ -1,6 +1,6 @@
 # The schema corpus
 
-Forty-two files that build the production database, applied in filename order by
+Forty-three files that build the production database, applied in filename order by
 `rk db migrate`. Nothing else applies them: there is no shell script, no
 `docker exec psql`, and no ordering that lives in someone's head.
 
@@ -50,9 +50,10 @@ apply_state_rls        apply_state_grants     enforce_fk_fire_order
 They exist because four of the earlier corpus's invariants were established by
 sweeping the tables that existed when a migration ran, so every table added
 afterwards silently missed them. A finalizer is an end-of-run invariant instead:
-migration 0043 gets its RLS policy and its purge order without asking, and the
-gate fails the run if it did not. They are also what makes a restored database
-repairable by the same command that built it — `pg_dump` carries neither
+the next migration written gets its RLS policy and its purge order without
+asking, and the gate fails the run if it did not. They are also what makes a
+restored database repairable by the same command that built it — `pg_dump`
+carries neither
 `ALTER DATABASE ... SET` nor the order foreign keys fire in, so `rk db restore`
 runs the same six.
 

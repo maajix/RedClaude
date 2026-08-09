@@ -13,18 +13,32 @@ registered check runs through one gate, and that each of those checks actually
 fails when the thing it describes is broken. The last one is why the negative
 controls exist: a check nobody has seen fail is a check nobody knows is wired
 up, and a gate of those is a green light with nothing behind it.
+
+`ProgramRunTest` asks a fifth, about an operation rather than about the schema:
+that `rk run` opens one Program and afterwards resumes that one. It is the only
+case here that commits, because what survives the transaction is its subject.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
+import shutil
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
+from unittest import mock
 
-from redkraken import backup, integrity, migrate, pg
-from redkraken.outcome import EXIT_INTEGRITY_FAILED, EXIT_INVALID_CONFIGURATION, EXIT_OK
-from tests.fixtures import scratch
+from redkraken import backup, integrity, migrate, pg, program
+from redkraken.outcome import (
+    EXIT_DATABASE_UNREACHABLE,
+    EXIT_INTEGRITY_FAILED,
+    EXIT_INVALID_CONFIGURATION,
+    EXIT_OK,
+    Report,
+)
+from tests.fixtures import VALID, scratch, write
 
 
 SUPERUSER_URL = os.environ.get("RK_TEST_SUPERUSER_URL", "")
@@ -64,6 +78,11 @@ class Harness:
     superuser: pg.Settings
     migrate: pg.Settings
     restore: pg.Settings
+    #: What `RK_DATABASE_URL` names in production: no DDL, no ownership, and
+    #: row level security in force. `rk run` is tested through this one because
+    #: running it as the owner would prove nothing about the connection an
+    #: operator actually points at the database.
+    runtime: pg.Settings
     passwords: dict[str, str]
     migrations: tuple[migrate.Migration, ...]
     created: object = None
@@ -115,6 +134,9 @@ def _build() -> Harness:
         ),
         restore=admin.replace(
             database=DATABASE, user="rk2_restore", password=passwords["rk2_restore"]
+        ),
+        runtime=admin.replace(
+            database=DATABASE, user="rk2_runtime", password=passwords["rk2_runtime"]
         ),
         passwords=passwords,
         migrations=migrations,
@@ -537,6 +559,33 @@ CONTROLS = (
     Control("standing:state_grants", "GRANT SELECT ON entities TO rk2_state"),
     Control("standing:capability_receipt_fence", "GRANT INSERT ON receipts TO rk2_proxy"),
     Control("standing:program_isolation", "CREATE TABLE public.orphan_table (id uuid PRIMARY KEY)"),
+    Control(
+        # A Program opened by hand around `rk run`, which is what the check is
+        # for: the root row is legal on its own, and nothing then records the
+        # policy every Finding written under it would claim to have been
+        # authorised by.
+        "standing:program_configuration",
+        "INSERT INTO programs (slug, name) VALUES ('unconfigured-selftest', 'Self test')",
+    ),
+    Control(
+        # The other half of the same check: the Program has a policy on record
+        # and is not running it. `programs` emits no event, so an update that
+        # moved the budget without a revision behind it would leave the log
+        # saying one thing and the scheduler reading another.
+        "standing:program_configuration",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name, platform, token_budget)"
+        "        VALUES ('misapplied-selftest', 'Self test', 'hackerone', 1000)"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO program_configurations"
+        "        (program_id, revision, schema_version, source_path, source_sha256,"
+        "         canonical_sha256, document, platform, token_budget, reason)"
+        "        VALUES (p, 1, 1, 'selftest', repeat('a', 64), repeat('b', 64),"
+        "                '{}'::jsonb, 'hackerone', 2000, 'a policy the Program does not run');"
+        " END $ctl$",
+    ),
     # --- the registry, and the catalogue it describes ------------------------
     Control(
         "standing:check_registration",
@@ -804,6 +853,299 @@ class NegativeControlTest(DatabaseCase):
     def test_the_database_is_unchanged_afterwards(self):
         # Every control above rolls back. If one did not, the gate says so here.
         self.assertEqual([], self.run_gate(self.connection))
+
+
+#: What every Program these tests open is called, so the cleanup can find all of
+#: them by prefix and each test can still have one nobody else touches.
+RUN_SLUG = "selftest-run"
+
+
+class ProgramRunTest(DatabaseCase):
+    """PH2-04: `rk run` opens a Program once and resumes that one afterwards.
+
+    The only tests in this module that commit. Everything else writes inside a
+    transaction it rolls back, because the gate and the archive want an empty
+    database to look at; this operation's entire subject is what survives the
+    transaction, so it cannot be asked that way. The rows go at the end, down
+    the path a purge takes.
+
+    They also run as `rk2_runtime` rather than as the owner, which is the point
+    of asking a real server at all: row level security is in force, no DDL is
+    reachable, and the readiness assertion the command makes about its own
+    connection is being made about the connection production uses.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def tearDownClass(cls):
+        # `DELETE FROM programs` is the purge, and every table cascades from it.
+        # `app.purging` is what the immutability triggers read; without it the
+        # configuration revisions and the events refuse to go, which is the
+        # property they exist for.
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{RUN_SLUG}-%",))
+        super().tearDownClass()
+
+    def configuration(self, slug: str, text: str = VALID) -> Path:
+        """The fixture, renamed to a Program of this test's own.
+
+        Each call writes into a directory of its own, so a second run of the
+        same policy arrives at a different path. That is deliberate: the source
+        path is provenance, and resuming has to key on the policy instead.
+        """
+        return write(text.replace('name = "acme-web"', f'name = "{slug}"'))
+
+    def run_for(self, slug: str, text: str = VALID, **options: object) -> Report:
+        return program.run(self.harness.runtime, self.configuration(slug, text), **options)
+
+    def programs(self, slug: str) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT count(*) FROM programs WHERE slug = $1", (slug,)
+            ).scalar()
+        )
+
+    def revisions(self, program_id: str) -> list[tuple]:
+        return [
+            tuple(row)
+            for row in self.connection.execute(
+                "SELECT revision, reason, canonical_sha256 FROM program_configurations"
+                " WHERE program_id = $1::uuid ORDER BY revision",
+                (program_id,),
+            ).rows
+        ]
+
+    def events(self, program_id: str) -> list[tuple]:
+        return [
+            tuple(row)
+            for row in self.connection.execute(
+                "SELECT type, subject_table, actor_kind, payload::text FROM events"
+                " WHERE program_id = $1::uuid ORDER BY seq",
+                (program_id,),
+            ).rows
+        ]
+
+    def test_the_first_run_opens_the_program_and_records_its_policy(self):
+        # Criterion 1: one Program, one revision, one transaction, one actor.
+        slug = f"{RUN_SLUG}-open"
+
+        result = self.run_for(slug)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(EXIT_OK, result.exit_code)
+        self.assertEqual(slug, result.facts["program_slug"])
+        self.assertEqual("open", result.facts["lifecycle"])
+        self.assertEqual(program.STOPPED_NOTHING_TO_EXECUTE, result.facts["stop_reason"])
+        self.assertEqual(1, result.facts["configuration"]["revision"])
+        # Readiness, as the runtime is entitled to ask it: the role catalogue is
+        # the runner's, so this connection never sends that query.
+        self.assertEqual(["baseline", "standing"], result.facts["integrity"]["families"])
+        self.assertEqual(
+            [(result.facts["program_id"], "hackerone", 2000000)],
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    "SELECT id::text, platform, token_budget FROM programs WHERE slug = $1",
+                    (slug,),
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            [(1, "program opened", result.facts["configuration"]["canonical_sha256"])],
+            self.revisions(result.facts["program_id"]),
+        )
+
+    def test_the_same_command_resumes_rather_than_opening_a_second_program(self):
+        # Criterion 2: the identity is the slug and the policy is the canonical
+        # hash, so the second run is the same Program even from a different path.
+        slug = f"{RUN_SLUG}-again"
+
+        first = self.run_for(slug)
+        second = self.run_for(slug)
+
+        self.assertTrue(second.ok, second.violations)
+        self.assertEqual(first.facts["program_id"], second.facts["program_id"])
+        self.assertEqual(1, second.facts["configuration"]["revision"])
+        self.assertEqual(1, self.programs(slug))
+        self.assertEqual([1], [revision for revision, _, _ in self.revisions(first.facts["program_id"])])
+
+    def test_opening_and_resuming_each_emit_exactly_one_event(self):
+        # Criterion 4. The first is trigger-authored, from the row write; the
+        # second is written by the command, because a sweep that changed nothing
+        # is still a fact about the Program and no trigger can observe it.
+        slug = f"{RUN_SLUG}-events"
+
+        opened = self.run_for(slug)
+        program_id = opened.facts["program_id"]
+        after_open = self.events(program_id)
+        self.run_for(slug)
+        after_resume = self.events(program_id)
+
+        self.assertEqual(
+            [("program.configured", "program_configurations", "runtime")],
+            [event[:3] for event in after_open],
+        )
+        self.assertEqual(2, len(after_resume))
+        self.assertEqual(("run.resumed", None, "runtime"), after_resume[1][:3])
+        payload = json.loads(after_resume[1][3])
+        self.assertEqual(1, payload["configuration_revision"])
+        self.assertEqual(0, payload["counts"]["tasks_unclaimed"])
+
+    def test_the_event_a_revision_writes_carries_no_value_out_of_the_policy(self):
+        # Criterion 4's other half. `events` is read by connections that are not
+        # allowed the configuration itself, so the document is redacted and the
+        # hashes are what say which policy the event is about.
+        slug = f"{RUN_SLUG}-redacted"
+
+        result = self.run_for(slug)
+
+        payload = json.loads(self.events(result.facts["program_id"])[0][3])
+        self.assertEqual("[redacted]", payload["after"]["document"])
+        self.assertEqual(
+            result.facts["configuration"]["canonical_sha256"], payload["after"]["canonical_sha256"]
+        )
+        # What the revision put on the `programs` row is not redacted: that row
+        # emits no event of its own, so this is where the projection is legible.
+        self.assertEqual(2000000, payload["after"]["token_budget"])
+        self.assertEqual("hackerone", payload["after"]["platform"])
+        for value in ("app.example.com", "slot://identity/member", "X-Bounty-Id", "oob.example.net"):
+            self.assertNotIn(value, json.dumps(payload))
+
+    def test_a_changed_policy_is_refused_and_leaves_the_program_as_it_was(self):
+        # Criterion 3: drift is detected before execution, and the refusal names
+        # both policies and the flag that would adopt the new one.
+        slug = f"{RUN_SLUG}-drift"
+        opened = self.run_for(slug)
+        program_id = opened.facts["program_id"]
+
+        changed = self.run_for(slug, VALID.replace("requests = 5000", "requests = 50000"))
+
+        self.assertFalse(changed.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, changed.exit_code)
+        self.assertIn("--accept-change", changed.violations[0].detail)
+        self.assertEqual(program.STOPPED_REFUSED, changed.facts["stop_reason"])
+        self.assertEqual(1, changed.facts["configuration"]["revision"])
+        self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
+        self.assertEqual(1, len(self.events(program_id)))
+
+    def test_a_change_the_operator_accepts_becomes_the_next_revision(self):
+        # The other side of criterion 3: an explicit revision, never a silent
+        # replacement. Revision 1 is still readable and still says what it said.
+        slug = f"{RUN_SLUG}-accepted"
+        opened = self.run_for(slug)
+        program_id = opened.facts["program_id"]
+
+        accepted = self.run_for(
+            slug, VALID.replace("tokens = 2000000", "tokens = 3000000"), accept_change=True
+        )
+
+        self.assertTrue(accepted.ok, accepted.violations)
+        self.assertEqual(program_id, accepted.facts["program_id"])
+        self.assertEqual(2, accepted.facts["configuration"]["revision"])
+        revisions = self.revisions(program_id)
+        self.assertEqual([1, 2], [revision for revision, _, _ in revisions])
+        self.assertNotEqual(revisions[0][2], revisions[1][2])
+        self.assertEqual(
+            3000000,
+            self.connection.execute(
+                "SELECT token_budget FROM programs WHERE id = $1::uuid", (program_id,)
+            ).scalar(),
+        )
+        # A policy change and a resume both happened, and the log says both.
+        events = self.events(program_id)
+        self.assertEqual(
+            ["program.configured", "program.configured", "run.resumed"],
+            [event[0] for event in events],
+        )
+        # And the budget the Program now runs under is readable as a before and
+        # an after, which is the only place it is: the `UPDATE programs` that
+        # applied it writes no event.
+        self.assertEqual(
+            [2000000, 3000000],
+            [
+                json.loads(event[3])["after"]["token_budget"]
+                for event in events
+                if event[0] == "program.configured"
+            ],
+        )
+
+    def test_a_retired_program_is_reported_rather_than_resumed(self):
+        # Its rows are the record of work that finished and are scheduled to go;
+        # resuming into them would attach new work to a purge already ordered.
+        slug = f"{RUN_SLUG}-retired"
+        opened = self.run_for(slug)
+        program_id = opened.facts["program_id"]
+        self.connection.execute("SELECT retire_program($1::uuid)", (program_id,))
+
+        result = self.run_for(slug)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual("retired", result.facts["lifecycle"])
+        self.assertEqual(program_id, result.facts["program_id"])
+        self.assertEqual(1, len(self.events(program_id)))
+
+    def test_a_database_that_is_not_ready_is_refused_before_anything_is_written(self):
+        # Criterion 5, the first half, at the last point it can still be true:
+        # the gate runs on this connection, and a corpus the database has not
+        # caught up with is a refusal rather than a Program opened against the
+        # wrong schema. It is also what proves the runtime can read the
+        # migration ledger at all -- without that grant the whole baseline
+        # family raises instead of answering.
+        slug = f"{RUN_SLUG}-unready"
+        corpus = scratch() / "migrations"
+        shutil.copytree(migrate.CORPUS, corpus)
+        (corpus / "20991231T235959Z__selftest_pending.sql").write_text(
+            "-- a migration this database has never seen\n", encoding="utf-8"
+        )
+
+        result = program.run(self.harness.runtime, self.configuration(slug), corpus=corpus)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertIsNone(result.facts["program_id"])
+        self.assertEqual(["baseline:no_pending_migrations"], result.facts["integrity"]["failed"])
+        self.assertEqual(0, self.programs(slug))
+
+    def test_a_failure_after_the_commit_still_leaves_a_durable_program(self):
+        # Criterion 5, the second half. The read-back is the seam: it happens
+        # after the transaction commits, so failing it is the shape of every
+        # loss of the connection at the worst moment. The Program exists, the
+        # report says which one, and the operator is told where to look.
+        slug = f"{RUN_SLUG}-durable"
+        execute = pg.Connection.execute
+
+        def fail_on_read_back(self, sql, parameters=()):
+            if sql.startswith("SELECT closed_at"):
+                raise pg.ConnectionError_("the connection was closed by the server")
+            return execute(self, sql, parameters)
+
+        with mock.patch.object(pg.Connection, "execute", fail_on_read_back):
+            result = program.run(self.harness.runtime, self.configuration(slug))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.exit_code)
+        self.assertIn("rk db verify", result.violations[0].detail)
+        program_id = result.facts["program_id"]
+        self.assertIsNotNone(program_id)
+        self.assertEqual(1, self.programs(slug))
+        self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
+
+    def test_the_gate_still_holds_over_the_programs_these_tests_opened(self):
+        # The rows above are the first this module leaves committed, and the
+        # standing check the migration registered is about exactly them.
+        #
+        # The whole gate, on the runner's connection: `rk run` asks for two of
+        # the three families because the role catalogue is not the runtime's to
+        # run, and this is where the third one is answered about the same rows.
+        self.run_for(f"{RUN_SLUG}-gate")
+
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected)
+
+        self.assertTrue(result.ok, result.violations)
 
 
 class ArchiveTest(DatabaseCase):

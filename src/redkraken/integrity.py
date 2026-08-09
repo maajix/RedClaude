@@ -12,10 +12,16 @@ is the right server, running the right corpus, with the right settings. The role
 catalogue asks whether the separation between the connections still holds. The
 standing checks ask whether the rows themselves still satisfy what the schema
 claims about them.
+
+A caller may run fewer than three, because which families a connection is
+entitled to run is part of what the role split means. What it may not do is run
+fewer and report as though it ran all of them, so the families that ran are a
+fact in the report rather than an assumption in the reader.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from redkraken import pg
@@ -36,6 +42,18 @@ BASELINE = "check_server_baseline"
 ROLE_CATALOGUE = "check_role_catalogue"
 STANDING = "run_standing_checks"
 
+#: The families by name, and the subset a runtime connection asks for. The role
+#: catalogue is the runner's: `0029_roles_and_grants.sql` revokes it from PUBLIC
+#: for that reason, and ticket 66 closes the default-privilege grant that
+#: currently leaves it executable by `rk2_runtime` regardless. A command that
+#: runs as the runtime therefore asks for the other two, so closing 66 narrows
+#: the role rather than breaking the command.
+BASELINE_FAMILY = "baseline"
+ROLES_FAMILY = "roles"
+STANDING_FAMILY = "standing"
+ALL_FAMILIES = (BASELINE_FAMILY, ROLES_FAMILY, STANDING_FAMILY)
+RUNTIME_FAMILIES = (BASELINE_FAMILY, STANDING_FAMILY)
+
 
 @dataclass(frozen=True)
 class Check:
@@ -51,44 +69,55 @@ class Check:
         return f"{self.family}:{self.name}"
 
 
-def run(connection: pg.Connection, expected: list[str] | None = None) -> tuple[Check, ...]:
-    """Every registered check, in one pass, in the order an operator reads them."""
+def run(
+    connection: pg.Connection,
+    expected: list[str] | None = None,
+    families: Sequence[str] = ALL_FAMILIES,
+) -> tuple[Check, ...]:
+    """Every registered check in the named families, in the order an operator reads them."""
     checks: list[Check] = []
 
-    if expected is None:
-        baseline = connection.execute(
-            f"SELECT check_name, ok, detail FROM {BASELINE}(NULL)"
-        )
-    else:
-        baseline = connection.execute(
-            f"SELECT check_name, ok, detail FROM {BASELINE}($1::text[])",
-            (pg.quote_array(expected),),
-        )
-    for name, ok, detail in baseline.rows:
-        checks.append(Check("baseline", str(name), bool(ok), str(detail)))
-
-    for name, ok, detail in connection.execute(
-        f"SELECT check_name, ok, detail FROM {ROLE_CATALOGUE}()"
-    ).rows:
-        checks.append(Check("roles", str(name), bool(ok), str(detail)))
-
-    for name, problems, detail in connection.execute(
-        f"SELECT name, problems, detail FROM {STANDING}()"
-    ).rows:
-        count = int(problems)
-        checks.append(
-            Check(
-                "standing",
-                str(name),
-                count == 0,
-                f"{count} problem(s)" + (f": {detail}" if count and detail else ""),
+    if BASELINE_FAMILY in families:
+        if expected is None:
+            baseline = connection.execute(
+                f"SELECT check_name, ok, detail FROM {BASELINE}(NULL)"
             )
-        )
+        else:
+            baseline = connection.execute(
+                f"SELECT check_name, ok, detail FROM {BASELINE}($1::text[])",
+                (pg.quote_array(expected),),
+            )
+        for name, ok, detail in baseline.rows:
+            checks.append(Check(BASELINE_FAMILY, str(name), bool(ok), str(detail)))
+
+    if ROLES_FAMILY in families:
+        for name, ok, detail in connection.execute(
+            f"SELECT check_name, ok, detail FROM {ROLE_CATALOGUE}()"
+        ).rows:
+            checks.append(Check(ROLES_FAMILY, str(name), bool(ok), str(detail)))
+
+    if STANDING_FAMILY in families:
+        for name, problems, detail in connection.execute(
+            f"SELECT name, problems, detail FROM {STANDING}()"
+        ).rows:
+            count = int(problems)
+            checks.append(
+                Check(
+                    STANDING_FAMILY,
+                    str(name),
+                    count == 0,
+                    f"{count} problem(s)" + (f": {detail}" if count and detail else ""),
+                )
+            )
 
     return tuple(checks)
 
 
-def verify(connection: pg.Connection, expected: list[str] | None = None) -> Report:
+def verify(
+    connection: pg.Connection,
+    expected: list[str] | None = None,
+    families: Sequence[str] = ALL_FAMILIES,
+) -> Report:
     """Run the gate and report it.
 
     A database that has no gate to run is reported as drift rather than as an
@@ -106,7 +135,7 @@ def verify(connection: pg.Connection, expected: list[str] | None = None) -> Repo
         return report("db verify", ledger, checks=0)
 
     try:
-        checks = run(connection, expected)
+        checks = run(connection, expected, families)
     except pg.DatabaseError as error:
         # A registered check that raises is itself a failure of the gate: the
         # invariant it names is unanswered, which is not the same as satisfied.

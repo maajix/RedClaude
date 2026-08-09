@@ -13,7 +13,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from redkraken import __version__, backup, doctor, migrate, pg
+from redkraken import __version__, backup, doctor, migrate, pg, program
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
     INVALID_CONFIGURATION,
@@ -29,6 +29,7 @@ from redkraken.outcome import (
 SUPERUSER_URL = "RK_SUPERUSER_URL"
 MIGRATE_URL = "RK_MIGRATE_URL"
 RESTORE_URL = "RK_RESTORE_URL"
+DATABASE_URL = "RK_DATABASE_URL"
 
 DEFAULT_DATABASE = "rk2"
 
@@ -52,6 +53,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="a Program configuration file to validate",
     )
     diagnose.set_defaults(run=_doctor)
+
+    runner = commands.add_parser(
+        "run",
+        help=f"create or resume the Program a configuration names (${DATABASE_URL})",
+    )
+    _add_url(runner, DATABASE_URL)
+    runner.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the Program configuration to run under",
+    )
+    runner.add_argument(
+        "--accept-change",
+        action="store_true",
+        help=(
+            "record a new configuration revision when the policy has changed; "
+            "without it a changed policy is refused rather than adopted"
+        ),
+    )
+    runner.set_defaults(run=_run)
 
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
@@ -120,6 +143,16 @@ def _doctor(arguments: argparse.Namespace) -> int:
     diagnosis = doctor.diagnose(arguments.config)
     print(json.dumps(diagnosis.as_dict(), indent=2))
     return diagnosis.exit_code
+
+
+def _run(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        program.COMMAND,
+        lambda settings: program.run(
+            settings, arguments.config, accept_change=arguments.accept_change
+        ),
+    )
 
 
 def _provision(arguments: argparse.Namespace) -> int:

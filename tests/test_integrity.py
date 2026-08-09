@@ -2,9 +2,10 @@
 
 What each check means is the corpus's business and is exercised against a real
 server in `test_database`. What is tested here is the thing the gate adds: that
-every family is run in one pass, that a failure is reported as a refusal rather
-than as a number nobody reads, and that a database with no checks in it is not
-mistaken for a database that passed them.
+every family is run in one pass, that a caller asking for fewer says which ones
+it ran, that a failure is reported as a refusal rather than as a number nobody
+reads, and that a database with no checks in it is not mistaken for a database
+that passed them.
 """
 
 import unittest
@@ -68,6 +69,22 @@ class RunTest(unittest.TestCase):
 
         self.assertIn(("{\"0001_first\",\"0002_second\"}",), connection.parameters)
 
+    def test_a_caller_may_run_fewer_families_than_the_gate_holds(self):
+        # The role catalogue is the runner's, so a command that connects as the
+        # runtime asks for the other two. The point of asserting the statement
+        # rather than the answer is that the privilege is only not needed if the
+        # query is never sent.
+        connection = FakeConnection(
+            baseline=(("server_major", True, "18.4"),),
+            roles=(("role_catalogue", True, "seven roles"),),
+            standing=(("causal_attribution", 0, ""),),
+        )
+
+        checks = integrity.run(connection, None, integrity.RUNTIME_FAMILIES)
+
+        self.assertEqual(["baseline", "standing"], [check.family for check in checks])
+        self.assertFalse([sql for sql in connection.statements if integrity.ROLE_CATALOGUE in sql])
+
     def test_a_standing_check_reports_the_rows_it_found(self):
         connection = FakeConnection(standing=(("rls_coverage", 2, "receipts; findings"),))
 
@@ -117,6 +134,22 @@ class VerifyTest(unittest.TestCase):
             [("baseline:server_major", True, "server_version = 18.4")],
             [(a.name, a.ok, a.detail) for a in result.assertions],
         )
+
+    def test_the_report_names_the_families_that_ran(self):
+        # A subset that reported as though it were the whole gate would be worse
+        # than not running: the reader would count an unasked question as
+        # answered.
+        connection = FakeConnection(
+            baseline=(("server_major", True, "18.4"),),
+            roles=(("role_catalogue", False, "seven roles"),),
+            standing=(("causal_attribution", 0, ""),),
+        )
+
+        result = integrity.verify(connection, None, integrity.RUNTIME_FAMILIES)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(["baseline", "standing"], result.as_dict()["families"])
+        self.assertEqual(2, result.as_dict()["checks"])
 
     def test_a_database_with_no_gate_is_drift_rather_than_a_pass(self):
         result = integrity.verify(FakeConnection(installed=False))
