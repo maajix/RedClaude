@@ -8,6 +8,7 @@ import ast
 import csv
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tokenize
@@ -292,6 +293,13 @@ def forbidden_reference(
             return True
         if any(prefix + variant in value for prefix in prefixes for variant in variants[1:]):
             return True
+        if not root.startswith("/") and (
+            f"/{root}/" in value
+            or value.endswith(f"/{root}")
+            or f".{root}." in value
+            or value.endswith(f".{root}")
+        ):
+            return True
         if root in words:
             return True
     return False
@@ -327,13 +335,13 @@ def forbidden_python_dependencies(
         for module in modules:
             if module.split(".", 1)[0] in forbidden_modules:
                 errors.append(f"{path}: forbidden import {module}")
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstrings
-            and forbidden_reference(node.value, forbidden_roots)
-        ):
-            errors.append(f"{path}: forbidden tree reference {node.value}")
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            value = os.fsdecode(node.value)
+            if (
+                id(node) not in docstrings
+                and forbidden_reference(value, forbidden_roots)
+            ):
+                errors.append(f"{path}: forbidden tree reference {value}")
     return errors
 
 

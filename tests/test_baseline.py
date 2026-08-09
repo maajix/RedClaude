@@ -95,6 +95,35 @@ class BaselineCliTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("src/loader.py: forbidden tree reference", result.stderr)
 
+    def test_absolute_prototype_path_is_rejected(self):
+        result = run_source(
+            "src/loader.py",
+            "import subprocess\n"
+            "subprocess.run(['/opt/redkraken/docs/prototype/runtime.py'])\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("src/loader.py: forbidden tree reference", result.stderr)
+
+    def test_multi_parent_prototype_path_is_rejected(self):
+        result = run_source(
+            "src/loader.py",
+            "from pathlib import Path\n"
+            "LEGACY = Path('../../docs/prototype/runtime.py')\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("src/loader.py: forbidden tree reference", result.stderr)
+
+    def test_bytes_prototype_path_is_rejected(self):
+        result = run_source(
+            "src/loader.py",
+            "exec(open(b'docs/prototype/runtime.py').read())\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("src/loader.py: forbidden tree reference", result.stderr)
+
     def test_pyproject_entry_point_into_docs_is_rejected(self):
         result = run_source(
             "pyproject.toml",
