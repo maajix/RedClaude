@@ -1,62 +1,10 @@
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 from redkraken import config
 from redkraken.outcome import INVALID_CONFIGURATION, UNSUPPORTED_VERSION
-
-
-VALID = """\
-schema_version = 1
-
-[program]
-name = "acme-web"
-platform = "hackerone"
-
-[engagement]
-mutation = true
-
-[budgets]
-requests = 5000
-tokens = 2000000
-concurrency = 2
-window_seconds = 3600
-
-[[scope.include]]
-host = "app.example.com"
-ports = [443]
-protocols = ["https"]
-paths = ["/api/"]
-
-[[scope.exclude]]
-host = "admin.example.com"
-ports = [443]
-protocols = ["https"]
-paths = ["/"]
-
-[[identity]]
-name = "member"
-credential_ref = "slot://identity/member"
-
-[[required_header]]
-name = "X-Bounty-Id"
-value_ref = "slot://header/bounty-id"
-
-[[callback]]
-name = "oob-dns"
-kind = "dns"
-host = "oob.example.net"
-"""
-
-
-def write(text: str, name: str = "program.toml") -> Path:
-    directory = Path(tempfile.mkdtemp())
-    source = directory / name
-    source.write_text(text, encoding="utf-8")
-    return source
+from tests.fixtures import VALID, write
 
 
 def violations(text: str) -> list[tuple[str, str, str]]:
@@ -98,7 +46,7 @@ class ValidConfigurationTest(unittest.TestCase):
                 "pivoting": False,
                 "sensitive_data_access": False,
             },
-            configuration.document["engagement"],
+            configuration.document["rules_of_engagement"],
         )
         self.assertEqual([], configuration.document["identity"])
         self.assertIsNone(configuration.document["program"]["platform"])
@@ -241,17 +189,55 @@ class ScopeTest(unittest.TestCase):
 
         self.assertEqual((), found)
 
+    def test_wildcard_host_is_accepted(self):
+        _, found = config.load(write(VALID.replace('host = "app.example.com"', 'host = "*.example.com"')))
+
+        self.assertEqual((), found)
+
+    def test_wildcard_may_not_reach_a_whole_public_suffix(self):
+        self.assertEqual(
+            ["config:scope.include[0].host"],
+            sources(VALID.replace('host = "app.example.com"', 'host = "*.com"')),
+        )
+
+
+class ReferenceTest(unittest.TestCase):
+    def test_a_credential_bearing_url_is_not_a_reference(self):
+        found = violations(VALID.replace(
+            'slot_ref = "slot://identity/member"',
+            'slot_ref = "https://admin:hunter2@app.example.com/login"',
+        ))
+
+        self.assertEqual(["config:identity[0].slot_ref"], [source for _, source, _ in found])
+        self.assertNotIn("hunter2", found[0][2])
+
+    def test_a_header_reference_must_name_a_slot_too(self):
+        self.assertEqual(
+            ["config:required_header[0].value_ref"],
+            sources(VALID.replace("slot://header/bounty-id", "file:///etc/rk/bounty-id")),
+        )
+
+    def test_a_slot_reference_names_a_store_and_a_key_within_it(self):
+        self.assertEqual(
+            ["config:identity[0].slot_ref"],
+            sources(VALID.replace("slot://identity/member", "slot://member")),
+        )
+
 
 class ControlsTest(unittest.TestCase):
-    def test_engagement_controls_are_closed_and_boolean(self):
+    def test_rules_of_engagement_are_closed_and_boolean(self):
         self.assertEqual(
             [
-                (INVALID_CONFIGURATION, "config:engagement.exfiltration", "unknown key"),
-                (INVALID_CONFIGURATION, "config:engagement.mutation", "must be true or false"),
+                (INVALID_CONFIGURATION, "config:rules_of_engagement.exfiltration", "unknown key"),
+                (
+                    INVALID_CONFIGURATION,
+                    "config:rules_of_engagement.mutation",
+                    "must be true or false",
+                ),
             ],
             sorted(violations(VALID.replace(
-                "[engagement]\nmutation = true",
-                '[engagement]\nmutation = "yes"\nexfiltration = true',
+                "[rules_of_engagement]\nmutation = true",
+                '[rules_of_engagement]\nmutation = "yes"\nexfiltration = true',
             ))),
         )
 

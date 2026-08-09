@@ -1,14 +1,24 @@
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
+import redkraken
 from redkraken import doctor
+from tests import ROOT
+from tests.fixtures import VALID, write
 
 
-ROOT = Path(__file__).resolve().parents[1]
+def environment() -> dict[str, str]:
+    """A clean environment, so an installed command cannot reach the checkout."""
+    keep = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+    return {name: os.environ[name] for name in keep if name in os.environ}
 
 
 class PackagingTest(unittest.TestCase):
@@ -33,7 +43,7 @@ class PackagingTest(unittest.TestCase):
 
     def test_production_dependencies_are_declared_as_exact_pins(self):
         self.assertEqual(
-            [f"{name}=={version}" for name, version in doctor.REQUIRED_DISTRIBUTIONS],
+            [f"{name}=={version}" for name, version in doctor.REQUIREMENTS.distributions],
             self.pyproject["project"]["dependencies"],
         )
 
@@ -43,6 +53,72 @@ class PackagingTest(unittest.TestCase):
         self.assertTrue(requirements)
         for requirement in requirements:
             self.assertIn("==", requirement, f"{requirement} is not an exact pin")
+
+
+class InstallationTest(unittest.TestCase):
+    """The documented installation path, run against a pristine copy.
+
+    Everything else drives the command line from the source tree, which proves
+    the code but not the packaging. This installs the application the way the
+    README tells an operator to and then runs the shipped `rk` script.
+    """
+
+    def test_the_installed_command_reports_its_version_and_diagnoses(self):
+        for module in ("ensurepip", "setuptools"):
+            if importlib.util.find_spec(module) is None:
+                self.skipTest(f"the documented installation path needs {module}")
+
+        checkout = Path(tempfile.mkdtemp()) / "checkout"
+        checkout.mkdir()
+        for name in ("pyproject.toml", "README.md"):
+            shutil.copy(ROOT / name, checkout / name)
+        shutil.copytree(
+            ROOT / "src", checkout / "src", ignore=shutil.ignore_patterns("__pycache__")
+        )
+        venv = checkout / ".venv"
+
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            env=environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, created.returncode, created.stderr)
+
+        installed = subprocess.run(
+            [
+                str(venv / "bin" / "pip"),
+                "install",
+                "--no-build-isolation",
+                "--check-build-dependencies",
+                "--no-index",
+                "--no-cache-dir",
+                ".",
+            ],
+            cwd=str(checkout),
+            env=environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, installed.returncode, installed.stdout + installed.stderr)
+
+        rk = str(venv / "bin" / "rk")
+        version = subprocess.run(
+            [rk, "--version"], env=environment(), text=True, capture_output=True, check=False
+        )
+        self.assertEqual(f"rk {redkraken.__version__}\n", version.stdout)
+
+        report = subprocess.run(
+            [rk, "doctor", "--config", str(write(VALID))],
+            env=environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, report.returncode, report.stderr)
+        self.assertTrue(json.loads(report.stdout)["ok"])
 
 
 if __name__ == "__main__":

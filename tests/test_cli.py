@@ -6,8 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 import redkraken
 from redkraken.outcome import (
     EXIT_INVALID_CONFIGURATION,
@@ -15,11 +13,9 @@ from redkraken.outcome import (
     EXIT_UNSUPPORTED_VERSION,
     EXIT_USAGE,
 )
-from tests.test_config import VALID
+from tests import ROOT, SOURCE
+from tests.fixtures import VALID, write
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src"
 
 #: Records the effects `rk doctor` promises never to have, rather than raising
 #: inside the hook, so a failure names the event that happened.
@@ -86,12 +82,6 @@ def observe(*arguments: str) -> dict:
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stderr)
-
-
-def write(text: str, name: str = "program.toml") -> Path:
-    source = Path(tempfile.mkdtemp()) / name
-    source.write_text(text, encoding="utf-8")
-    return source
 
 
 class VersionTest(unittest.TestCase):

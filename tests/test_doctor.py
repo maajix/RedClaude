@@ -5,16 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 from redkraken import doctor
+from redkraken.doctor import Requirements
 from redkraken.outcome import (
     EXIT_INVALID_CONFIGURATION,
     EXIT_MISSING_DEPENDENCY,
     EXIT_OK,
     EXIT_UNSUPPORTED_VERSION,
 )
-from tests.test_config import VALID, write
+from tests.fixtures import VALID, write
 
 
 def installed_distribution() -> tuple[str, str] | None:
@@ -32,7 +31,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(diagnosis.ok)
         self.assertEqual(EXIT_OK, diagnosis.exit_code)
         self.assertEqual((), diagnosis.violations)
-        self.assertTrue(all(check.ok for check in diagnosis.checks))
+        self.assertTrue(all(assertion.ok for assertion in diagnosis.assertions))
         self.assertEqual("acme-web", diagnosis.as_dict()["configuration"]["program_name"])
 
     def test_readiness_is_reported_without_a_configuration(self):
@@ -40,7 +39,7 @@ class ReadinessTest(unittest.TestCase):
 
         self.assertTrue(diagnosis.ok)
         self.assertIsNone(diagnosis.as_dict()["configuration"])
-        self.assertIn("configuration", [check.name for check in diagnosis.checks])
+        self.assertIn("configuration", [assertion.name for assertion in diagnosis.assertions])
 
     def test_result_names_versions_and_is_serialisable(self):
         report = doctor.diagnose(write(VALID)).as_dict()
@@ -87,7 +86,9 @@ class DistinctOutcomeTest(unittest.TestCase):
         self.assertEqual(EXIT_UNSUPPORTED_VERSION, diagnosis.exit_code)
 
     def test_missing_runtime_module_is_its_own_outcome(self):
-        diagnosis = doctor.diagnose(None, modules=("redkraken_absent_module",))
+        diagnosis = doctor.diagnose(
+            None, requirements=Requirements(modules=("redkraken_absent_module",))
+        )
 
         self.assertEqual(EXIT_MISSING_DEPENDENCY, diagnosis.exit_code)
         self.assertEqual(
@@ -96,7 +97,9 @@ class DistinctOutcomeTest(unittest.TestCase):
         )
 
     def test_missing_declared_distribution_is_its_own_outcome(self):
-        diagnosis = doctor.diagnose(None, distributions=(("redkraken-absent", "1.0.0"),))
+        diagnosis = doctor.diagnose(
+            None, requirements=Requirements(distributions=(("redkraken-absent", "1.0.0"),))
+        )
 
         self.assertEqual(EXIT_MISSING_DEPENDENCY, diagnosis.exit_code)
         self.assertEqual(
@@ -111,7 +114,9 @@ class DistinctOutcomeTest(unittest.TestCase):
             self.skipTest("no installed distribution to compare against")
         name, version = installed
 
-        diagnosis = doctor.diagnose(None, distributions=((name, "0.0.0"),))
+        diagnosis = doctor.diagnose(
+            None, requirements=Requirements(distributions=((name, "0.0.0"),))
+        )
 
         self.assertEqual(EXIT_MISSING_DEPENDENCY, diagnosis.exit_code)
         self.assertIn("0.0.0", diagnosis.violations[0].detail)
@@ -122,7 +127,7 @@ class DistinctOutcomeTest(unittest.TestCase):
         if installed is None:
             self.skipTest("no installed distribution to compare against")
 
-        diagnosis = doctor.diagnose(None, distributions=(installed,))
+        diagnosis = doctor.diagnose(None, requirements=Requirements(distributions=(installed,)))
 
         self.assertEqual(EXIT_OK, diagnosis.exit_code)
 
@@ -140,15 +145,17 @@ class AggregationTest(unittest.TestCase):
             sorted(item.source for item in diagnosis.violations),
         )
 
-    def test_failed_checks_accompany_their_violations(self):
-        diagnosis = doctor.diagnose(None, modules=("redkraken_absent_module", "json"))
+    def test_a_failed_assertion_accompanies_every_violation(self):
+        diagnosis = doctor.diagnose(
+            None, requirements=Requirements(modules=("redkraken_absent_module", "json"))
+        )
 
         self.assertEqual(
             {"module:json": True, "module:redkraken_absent_module": False},
             {
-                check.name: check.ok
-                for check in diagnosis.checks
-                if check.name.startswith("module:")
+                assertion.name: assertion.ok
+                for assertion in diagnosis.assertions
+                if assertion.name.startswith("module:")
             },
         )
 

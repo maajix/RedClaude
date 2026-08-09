@@ -25,15 +25,17 @@ SUPPORTED_SCHEMA_VERSIONS = (1,)
 TOP_LEVEL = (
     "budgets",
     "callback",
-    "engagement",
     "identity",
     "program",
     "required_header",
+    "rules_of_engagement",
     "schema_version",
     "scope",
 )
 PROGRAM_KEYS = ("name", "platform")
-ENGAGEMENT_CONTROLS = (
+
+#: The Rules of Engagement, as typed controls. An absent control is a denial.
+RULES_OF_ENGAGEMENT = (
     "availability_impact",
     "credential_use",
     "mutation",
@@ -43,7 +45,7 @@ ENGAGEMENT_CONTROLS = (
 BUDGET_LIMITS = ("concurrency", "requests", "tokens", "window_seconds")
 SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
-IDENTITY_KEYS = ("credential_ref", "name")
+IDENTITY_KEYS = ("name", "slot_ref")
 HEADER_KEYS = ("name", "value_ref")
 CALLBACK_KEYS = ("host", "kind", "name")
 PROTOCOLS = ("http", "https")
@@ -63,19 +65,28 @@ SECRET_KEYS = (
 )
 
 _SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
-_HOSTNAME = re.compile(
-    r"(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*"
-)
+_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(rf"{_LABEL}(\.{_LABEL})*")
+
+#: A wildcard must name at least two labels of its own, so an inclusion cannot
+#: reach a whole public suffix by writing `*.com`.
+_WILDCARD = re.compile(rf"\*\.{_LABEL}(\.{_LABEL})+")
+_HOST_SHAPE = "must be a hostname, a wildcard such as *.example.com, or an address"
+
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
-_REFERENCE = re.compile(r"[a-z][a-z0-9+.-]*://[A-Za-z0-9._~/%:@-]{1,480}")
-_REFERENCE_SHAPE = "a secret reference such as slot://identity/name"
+
+#: A reference names a runtime-owned slot and nothing else. Any other scheme
+#: would let a configuration carry its own credential material — a URL with
+#: userinfo, for one — which is the leak the reference exists to prevent.
+_REFERENCE = re.compile(r"slot://[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+")
+_REFERENCE_SHAPE = "a runtime-owned reference such as slot://identity/name"
 
 
 @dataclass(frozen=True)
 class Configuration:
     """A validated Program configuration and the hashes that identify it."""
 
-    source: str
+    path: str
     schema_version: int
     document: dict
     source_sha256: str
@@ -89,13 +100,13 @@ class Configuration:
         """
         scope = self.document["scope"]
         return {
-            "source": self.source,
+            "path": self.path,
             "schema_version": self.schema_version,
             "source_sha256": self.source_sha256,
             "canonical_sha256": self.canonical_sha256,
             "program_name": self.document["program"]["name"],
             "program_platform": self.document["program"]["platform"],
-            "engagement": dict(self.document["engagement"]),
+            "rules_of_engagement": dict(self.document["rules_of_engagement"]),
             "budgets": dict(self.document["budgets"]),
             "scope": {"include": len(scope["include"]), "exclude": len(scope["exclude"])},
             "identities": [entry["name"] for entry in self.document["identity"]],
@@ -106,9 +117,9 @@ class Configuration:
 
 def load(path: Path) -> tuple[Configuration | None, tuple[Violation, ...]]:
     """Read, validate and hash the configuration at `path`."""
-    source = Path(path)
+    file = Path(path)
     try:
-        data = source.read_bytes()
+        data = file.read_bytes()
     except OSError as error:
         return None, (_refusal(f"cannot read configuration: {error.strerror}"),)
     try:
@@ -127,7 +138,7 @@ def load(path: Path) -> tuple[Configuration | None, tuple[Violation, ...]]:
         return None, violations
     return (
         Configuration(
-            source=str(source.resolve()),
+            path=str(file.resolve()),
             schema_version=normalized["schema_version"],
             document=normalized,
             source_sha256=hashlib.sha256(data).hexdigest(),
@@ -147,7 +158,7 @@ def validate(document: object) -> tuple[dict | None, tuple[Violation, ...]]:
     normalized = {
         "schema_version": _schema_version(reader, root),
         "program": _program(reader, root),
-        "engagement": _engagement(reader, root),
+        "rules_of_engagement": _rules_of_engagement(reader, root),
         "budgets": _budgets(reader, root),
         "scope": _scope(reader, root),
         "identity": _entries(reader, root, "identity", IDENTITY_KEYS, _identity),
@@ -241,12 +252,12 @@ class _Reader:
         if not isinstance(value, str):
             self.fail(source, "must be text")
             return None
-        if _HOSTNAME.fullmatch(value):
+        if _HOSTNAME.fullmatch(value) or _WILDCARD.fullmatch(value):
             return value
         try:
             ipaddress.ip_address(value)
         except ValueError:
-            self.fail(source, "must be a hostname or an address")
+            self.fail(source, _HOST_SHAPE)
             return None
         return value
 
@@ -286,15 +297,16 @@ def _program(reader: _Reader, root: dict) -> dict | None:
     return {"name": name, "platform": platform}
 
 
-def _engagement(reader: _Reader, root: dict) -> dict:
-    """Rules of Engagement are typed controls; an absent control is a denial."""
-    controls = dict.fromkeys(ENGAGEMENT_CONTROLS, False)
-    table = reader.table(root.get("engagement", {}), "engagement", ENGAGEMENT_CONTROLS)
+def _rules_of_engagement(reader: _Reader, root: dict) -> dict:
+    """Typed controls only; an absent control is a denial rather than a default."""
+    controls = dict.fromkeys(RULES_OF_ENGAGEMENT, False)
+    source = "rules_of_engagement"
+    table = reader.table(root.get(source, {}), source, RULES_OF_ENGAGEMENT)
     if table is None:
         return controls
-    for control in ENGAGEMENT_CONTROLS:
+    for control in RULES_OF_ENGAGEMENT:
         if control in table:
-            controls[control] = bool(reader.boolean(table[control], f"engagement.{control}"))
+            controls[control] = bool(reader.boolean(table[control], f"{source}.{control}"))
     return controls
 
 
@@ -345,52 +357,38 @@ def _rule(reader: _Reader, entry: object, source: str) -> dict | None:
         host = reader.host(raw, f"{source}.host")
     return {
         "host": host,
-        "paths": _paths(reader, table, source),
-        "ports": _ports(reader, table, source),
-        "protocols": _protocols(reader, table, source),
+        "paths": _members(reader, table, source, "paths", _is_path, "must begin with a forward slash"),
+        "ports": _members(reader, table, source, "ports", _is_port, "must be between 1 and 65535"),
+        "protocols": _members(
+            reader, table, source, "protocols", _is_protocol, "must be one of: " + ", ".join(PROTOCOLS)
+        ),
     }
 
 
-def _ports(reader: _Reader, table: dict, source: str) -> list[int]:
-    entries = _members(reader, table, source, "ports")
-    ports = []
-    for index, port in enumerate(entries):
-        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-            reader.fail(f"{source}.ports[{index}]", "must be between 1 and 65535")
-            continue
-        ports.append(port)
-    return sorted(set(ports))
-
-
-def _protocols(reader: _Reader, table: dict, source: str) -> list[str]:
-    entries = _members(reader, table, source, "protocols")
-    protocols = []
-    for index, protocol in enumerate(entries):
-        if protocol not in PROTOCOLS:
-            reader.fail(
-                f"{source}.protocols[{index}]", "must be one of: " + ", ".join(PROTOCOLS)
-            )
-            continue
-        protocols.append(protocol)
-    return sorted(set(protocols))
-
-
-def _paths(reader: _Reader, table: dict, source: str) -> list[str]:
-    entries = _members(reader, table, source, "paths")
-    paths = []
-    for index, path in enumerate(entries):
-        if not isinstance(path, str) or not path.startswith("/"):
-            reader.fail(f"{source}.paths[{index}]", "must begin with a forward slash")
-            continue
-        paths.append(path)
-    return sorted(set(paths))
-
-
-def _members(reader: _Reader, table: dict, source: str, key: str) -> list:
+def _members(reader: _Reader, table: dict, source: str, key: str, accept, shape: str) -> list:
+    """The accepted members of one required array, deduplicated and ordered."""
     raw = reader.required(table, source, key)
     if raw is None:
         return []
-    return reader.array(raw, f"{source}.{key}") or []
+    accepted = []
+    for index, member in enumerate(reader.array(raw, f"{source}.{key}") or []):
+        if accept(member):
+            accepted.append(member)
+        else:
+            reader.fail(f"{source}.{key}[{index}]", shape)
+    return sorted(set(accepted))
+
+
+def _is_port(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and 1 <= value <= 65535
+
+
+def _is_protocol(value: object) -> bool:
+    return value in PROTOCOLS
+
+
+def _is_path(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("/")
 
 
 def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build) -> list[dict]:
@@ -423,11 +421,11 @@ def _identity(reader: _Reader, table: dict, source: str) -> dict | None:
     if name is None:
         return None
     reference = None
-    if "credential_ref" in table:
+    if "slot_ref" in table:
         reference = reader.text(
-            table["credential_ref"], f"{source}.credential_ref", _REFERENCE, _REFERENCE_SHAPE
+            table["slot_ref"], f"{source}.slot_ref", _REFERENCE, _REFERENCE_SHAPE
         )
-    return {"credential_ref": reference, "name": name}
+    return {"name": name, "slot_ref": reference}
 
 
 def _header(reader: _Reader, table: dict, source: str) -> dict | None:

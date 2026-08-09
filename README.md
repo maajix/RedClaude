@@ -30,8 +30,11 @@ of a downloaded one:
 
 ```sh
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install --no-build-isolation .
+.venv/bin/pip install --no-build-isolation --check-build-dependencies .
 ```
+
+`--check-build-dependencies` keeps the pinned build requirement enforced on
+this path too; without it, skipping build isolation also skips the check.
 
 `rk` is then on the virtual environment's `PATH`. `python3 -m redkraken` runs
 the identical command line from a source checkout, with `src` on `PYTHONPATH`.
@@ -45,7 +48,8 @@ rk doctor
 `rk doctor` reports whether this machine can be trusted to run a Program. It
 reads; it creates no state, sends no traffic and starts no run. Its result is
 JSON on stdout: the application version, the interpreter version and the
-supported range, one entry per check, and every violation it found.
+supported range, one entry per readiness assertion, and every violation it
+found.
 
 Give it a Program configuration to validate that too:
 
@@ -57,7 +61,7 @@ rk doctor --config program.toml
 
 A configuration is versioned and declarative. The schema is closed: an
 unrecognised key is a refusal, not an ignored line. Absent permission is
-denial, so an engagement control that is not set is off.
+denial, so a rule of engagement that is not set is off.
 
 ```toml
 schema_version = 1
@@ -66,7 +70,7 @@ schema_version = 1
 name = "acme-web"
 platform = "hackerone"
 
-[engagement]
+[rules_of_engagement]
 mutation = true
 
 [budgets]
@@ -89,7 +93,7 @@ paths = ["/"]
 
 [[identity]]
 name = "member"
-credential_ref = "slot://identity/member"
+slot_ref = "slot://identity/member"
 
 [[required_header]]
 name = "X-Bounty-Id"
@@ -101,10 +105,14 @@ kind = "dns"
 host = "oob.example.net"
 ```
 
+A scope inclusion may name a wildcard host such as `*.example.com`, but not
+one that would reach a whole public suffix: `*.com` is refused.
+
 Secret material is never written into a configuration. An identity carries a
-`credential_ref` and a required header carries a `value_ref`: references the
-runtime resolves elsewhere and injects at the proxy. A key that would hold a
-secret inline is refused by name.
+`slot_ref` and a required header carries a `value_ref`. Both name a
+runtime-owned slot — the `slot://` scheme and nothing else, so a configuration
+cannot smuggle its own credential in a URL — which the runtime resolves and the
+proxy injects. A key that would hold a secret inline is refused by name.
 
 Diagnostic output follows the same rule. It reports names, counts, controls,
 versions and the two hashes that identify a configuration — `source_sha256`
