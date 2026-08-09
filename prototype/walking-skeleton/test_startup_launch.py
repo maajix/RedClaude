@@ -200,6 +200,39 @@ class ChildLaunchContractTest(unittest.TestCase):
         cli.chmod(0o755)
         return _runtime(cli)
 
+    def test_tool_capability_stays_out_of_serialized_state(self):
+        capability = "ab" * 32
+        sql = []
+        queries = []
+
+        def execute(statement, *_args, **_kwargs):
+            sql.append(statement)
+
+        def one(statement, *_args, **_kwargs):
+            queries.append(statement)
+            return json.dumps({
+                "decision": "allow", "risk_class": "constrained",
+                "rule": "tool_risk_classes", "approval": None,
+                "capability": capability,
+            })
+
+        self.child.JOB = _job(Path("/tmp/unused"))
+        with patch.object(self.child, "_sql", side_effect=execute), patch.object(
+            self.child, "_one", side_effect=one
+        ):
+            result = asyncio.run(self.child.pre_tool({
+                "tool_name": "mcp__rk2__state_read",
+                "tool_input": {"view": "scope"},
+                "tool_use_id": "toolu-capability",
+            }, None, None))
+
+        self.assertEqual({}, result)
+        self.assertIn("authorize_tool_run", queries[0])
+        self.assertNotIn("gate_tool_call", queries[0])
+        self.assertEqual([capability], list(self.child.CAPABILITIES.values()))
+        self.assertNotIn(capability, json.dumps(self.child.STATE))
+        self.assertNotIn(capability, "".join(sql))
+
     def test_clean_run_assesses_and_transports_the_same_options_once(self):
         calls = []
         assessed = []

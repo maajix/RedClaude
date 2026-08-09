@@ -18,6 +18,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export CT="${CT:-rk2-t31-pg}"
 export DB="${DB:-rk2}"
+export RK_T31_CT="${RK_T31_CT:-$CT}"
+export RK_T31_DB="${RK_T31_DB:-$DB}"
 
 "$HERE/reset.sh"
 exec python3 "$HERE/skeleton.py" "$@"

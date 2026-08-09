@@ -150,9 +150,13 @@ INSERT INTO programs (id, slug, name, platform)
 VALUES ('33333333-3333-7333-8333-333333333333', 'b-probe', 'B probe', 'hackerone');
 
 SELECT set_config('app.actor_kind', 'runtime', false);
-INSERT INTO entities (program_id, type, dedup_key)
-VALUES ('33333333-3333-7333-8333-333333333333', 'host', 'b20-lost-mutation'),
-       ('33333333-3333-7333-8333-333333333333', 'host', 'b21-suppressed');
+INSERT INTO entities
+    (program_id, type, dedup_key, scope_selector_kind, scope_selector)
+VALUES
+    ('33333333-3333-7333-8333-333333333333', 'host', 'b20-lost-mutation',
+     'host', 'b20.test'),
+    ('33333333-3333-7333-8333-333333333333', 'host', 'b21-suppressed',
+     'host', 'b21.test');
 
 INSERT INTO t.results (id, kind, pass, note)
 SELECT 'B20 checker is silent on honest state', 'probe',
@@ -195,8 +199,10 @@ ALTER TABLE entities DISABLE TRIGGER entities_emit_event;
 BEGIN;
 SET LOCAL app.actor_kind = 'runtime';
 SET LOCAL app.purging = 'on';
-INSERT INTO entities (program_id, type, dedup_key)
-VALUES ('33333333-3333-7333-8333-333333333333', 'host', 'b24-ghost');
+INSERT INTO entities
+    (program_id, type, dedup_key, scope_selector_kind, scope_selector)
+VALUES ('33333333-3333-7333-8333-333333333333', 'host', 'b24-ghost',
+        'host', 'b24.test');
 DELETE FROM entities WHERE dedup_key = 'b24-ghost';
 COMMIT;
 ALTER TABLE entities ENABLE ALWAYS TRIGGER entities_emit_event;

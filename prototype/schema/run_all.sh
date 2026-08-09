@@ -6,7 +6,7 @@
 #   1  the corpus applies from empty, in one order, on one server
 #   2  running it again is a no-op and still verifies
 #   3  the canonical fixture applies on top of the full corpus, and the check
-#      suite (groups A, B and ticket 33's group C) runs against it
+#      suite (groups A, B, C and capability group K) runs against it
 #   4  the numbering rule is a check, not a comment: break it, watch it fire
 #   5  a migration that raises leaves nothing recorded
 #   6  a migration that arrives out of order is refused
@@ -72,12 +72,17 @@ docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
     || bad "fixture did not apply"
 docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
     < <(cat "$HERE/tests/_harness.sql" "$HERE/tests/checks_a.sql" \
-            "$HERE/tests/checks_b.sql" "$HERE/tests/checks_c.sql") > /dev/null 2>&1
+            "$HERE/tests/checks_b.sql" "$HERE/tests/checks_c.sql") > /dev/null 2>&1 \
+    || bad "existing check suite did not execute"
+docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
+    < "$HERE/tests/capability_receipts.sql" > /dev/null 2>&1 \
+    || bad "capability receipt checks did not execute"
 docker exec -i "$CT" psql -U postgres -d "$DB" -P pager=off \
     -c "SELECT id, CASE WHEN pass THEN 'ok' ELSE 'FAIL' END AS r, left(note,60) AS note
-          FROM t.results WHERE id LIKE 'M%' ORDER BY ord"
+          FROM t.results WHERE id LIKE 'M%' OR NOT pass ORDER BY ord"
 tot=$(psqlq "SELECT count(*) FROM t.results")
 fail=$(psqlq "SELECT count(*) FROM t.results WHERE NOT pass")
+[[ "$tot" == "86" ]] || bad "expected 86 checks, got $tot"
 [[ "$fail" == "0" ]] && ok "$tot checks, 0 failing" || bad "$fail of $tot failing"
 
 # ---- 4 ---------------------------------------------------------------------

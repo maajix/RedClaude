@@ -246,14 +246,16 @@ def p2_claim_protocol():
     # DIVERGENCE D-12/33-STATE-NOCONNECT, measured live rather than asserted
     # from the migration text: revoke what reset.sh granted, watch the
     # agent-facing connection die, put it back.
-    rk.psql("SET ROLE rk2_owner; REVOKE CONNECT ON DATABASE rk2 FROM rk2_state;",
-            role="rk2_migrate")
+    rk.psql("SET ROLE rk2_owner; DO $$ BEGIN EXECUTE format("
+            "'REVOKE CONNECT ON DATABASE %I FROM rk2_state', current_database()); "
+            "END $$;", role="rk2_migrate")
     e = rk.raises("SELECT 1;", role="rk2_state")
     R.check(e is not None and "CONNECT privilege" in e, "P2",
             "without ticket 33's grant the agent-facing role cannot connect",
             (e or "CONNECTED ANYWAY").splitlines()[-1][:120])
-    rk.psql("SET ROLE rk2_owner; GRANT CONNECT ON DATABASE rk2 TO rk2_state;",
-            role="rk2_migrate")
+    rk.psql("SET ROLE rk2_owner; DO $$ BEGIN EXECUTE format("
+            "'GRANT CONNECT ON DATABASE %I TO rk2_state', current_database()); "
+            "END $$;", role="rk2_migrate")
     grants = subprocess.run(
         ["grep", "-rlE", r"GRANT CONNECT[^;]*rk2_state", str(MIGRATIONS)],
         capture_output=True, text=True).stdout.strip()
@@ -469,13 +471,17 @@ def p4_validation_by_replay():
     tr = "31eeeeff-0000-7000-8000-000000000001"
     rk.psql(f"""
     INSERT INTO tool_runs (id, program_id, label, agent_run_id, task_id, tool, args,
-                           started_at, finished_at, status, transport, risk_class,
-                           decision, decision_reason, closed_by)
+                           started_at, status, transport)
     VALUES ({rk.lit(tr)}, rk2_program(), 'tr-replay', {rk.lit(run)},
-            {rk.lit(FACTS['task_id'])}, 'replay_spec', '{{}}'::jsonb, now(), now(),
-            'success', 'runtime', 'constrained', 'allow', 'validation replay', NULL)
+            {rk.lit(FACTS['task_id'])}, 'replay_spec', '{{}}'::jsonb, now(),
+            'running', 'runtime')
     ON CONFLICT (id) DO NOTHING;
     """, program=MAIN, actor="runtime")
+    decision = rk.one(
+        f"SELECT authorize_tool_run({rk.lit(tr)}) ->> 'decision';",
+        program=MAIN, actor="runtime")
+    if decision != "allow":
+        raise RuntimeError(f"validation replay was not authorized: {decision}")
 
     pg_ids = []
     for proxy_rid in r_v["receipts"]:
@@ -483,6 +489,9 @@ def p4_validation_by_replay():
             continue
         ident = "31aaaaaa-0000-7000-8000-000000000005"
         pg_ids.append(rk.mirror_receipt(RT, MAIN, proxy_rid, tr, ident))
+    rk.psql(f"UPDATE tool_runs SET status='success', finished_at=now(), "
+            f"closed_by='PostToolUse' WHERE id={rk.lit(tr)};",
+            program=MAIN, actor="runtime")
     R.check(len(pg_ids) == len(IDOR_SPEC["actions"]), "P4",
             "every replay action produced a receipt in the corpus",
             f"{len(pg_ids)} receipts")
@@ -678,11 +687,13 @@ def p6_abort_resume(live: bool | None = None):
     FACTS["p6_live"] = live
     lbl = rk.one("SELECT claim_task('T_RECON');", program=MAIN, actor="runtime").strip()
     run = rk.one(f"SELECT id FROM agent_runs WHERE label={rk.lit(lbl)};", program=MAIN)
+    task = rk.one("SELECT id FROM tasks WHERE label='T_RECON' "
+                  "AND program_id=rk2_program();", program=MAIN)
     FACTS["abort_run"] = run
 
     if live:
         res = rk.agent_run(rk.AgentRunRequest(
-            program=MAIN, agent_run_id=run, task_id=None,
+            program=MAIN, agent_run_id=run, task_id=task,
             prompt=("Call state_read with view 'endpoints', then call net_request "
                     "for identity userA on url /api/profile, then stop."),
             max_turns=4, cap=rk.PER_RUN_CAP, kill_after_first_tool_run=True))
@@ -691,16 +702,18 @@ def p6_abort_resume(live: bool | None = None):
                 "the run was killed with a tool run open", json.dumps(res))
     else:
         rk.psql(f"""
-        INSERT INTO tool_runs (id, program_id, label, agent_run_id, tool, args,
-                               started_at, status, transport, risk_class, decision,
-                               tool_use_id, decision_reason)
-        VALUES (uuidv7(), rk2_program(), 'tr-abort', {rk.lit(run)},
+        INSERT INTO tool_runs (id, program_id, label, agent_run_id, task_id, tool, args,
+                               started_at, status, transport, tool_use_id)
+        VALUES (uuidv7(), rk2_program(), 'tr-abort', {rk.lit(run)}, {rk.lit(task)},
                 'mcp__rk2__net_request',
                 '{{"url":"http://127.0.0.1:18831/api/profile","method":"GET",
                    "identity_slot":""}}'::jsonb,
-                now(), 'running', 'mcp', 'constrained', 'allow',
-                'toolu_abort', 'allowlisted');
+                now(), 'running', 'mcp', 'toolu_abort')
+        RETURNING id;
         """, program=MAIN, actor="runtime")
+        rk.one("SELECT authorize_tool_run(id) ->> 'decision' "
+               "FROM tool_runs WHERE label='tr-abort' "
+               "AND program_id=rk2_program();", program=MAIN, actor="runtime")
 
     open_before = rk.one("SELECT count(*) FROM tool_runs WHERE program_id=rk2_program() "
                          f"AND agent_run_id={rk.lit(run)} AND status='running';",
@@ -867,7 +880,8 @@ def p8_budget_and_parking(live: bool | None = None):
 
     if live:
         res = rk.agent_run(rk.AgentRunRequest(
-            program=EXH, agent_run_id=run, task_id=None,
+            program=EXH, agent_run_id=run,
+            task_id="31eeeeee-0000-7000-8000-000000000001",
             prompt=("Read the program scope with state_read, then read the "
                     "endpoints, then the identities, then the hypotheses, then "
                     "summarise what you would test."),
@@ -920,8 +934,7 @@ def p8_budget_and_parking(live: bool | None = None):
                    "AND program_id=rk2_program();", program=MAIN)
     tr = rk.one(f"""
     INSERT INTO tool_runs (id, program_id, label, agent_run_id, task_id, tool, args,
-                           started_at, status, transport, tool_use_id, risk_class,
-                           decision, decision_reason)
+                           started_at, status, transport, tool_use_id)
     VALUES (uuidv7(), rk2_program(), 'tr-park', {rk.lit(run2)}, {rk.lit(task2)},
             -- The tool name and the three argument names are not decoration.
             -- `park_for_human` re-derives the class from `canonical_request` and
@@ -934,8 +947,7 @@ def p8_budget_and_parking(live: bool | None = None):
             'mcp__rk2__net_request',
             '{{"url":"http://127.0.0.1:18831/api/notes","method":"POST",
                "identity_slot":"userA"}}'::jsonb, now(),
-            'running', 'mcp', 'toolu_park', 'approval_required', 'ask',
-            'state-changing verb needs a human')
+            'running', 'mcp', 'toolu_park')
     RETURNING id;
     """, program=MAIN, actor="runtime").strip()
     dlabel = rk.one(f"SELECT park_for_human({rk.lit(tr)}, interval '30 minutes');",
@@ -985,19 +997,25 @@ def p8_budget_and_parking(live: bool | None = None):
 
     # And the answer is worth something: an identical request now gates to
     # `allow` on the grant the human just created, rather than parking again.
+    rk.psql("SELECT rank_pass('human-grant'); SELECT offer_slate();",
+            program=MAIN, actor="runtime")
+    lbl3 = rk.one("SELECT claim_task('T_RECON2');",
+                  program=MAIN, actor="runtime").strip()
+    run3 = rk.one(f"SELECT id FROM agent_runs WHERE label={rk.lit(lbl3)};",
+                  program=MAIN)
     tr2 = rk.one(f"""
     INSERT INTO tool_runs (id, program_id, label, agent_run_id, task_id, tool, args,
-                           started_at, status, transport, tool_use_id, risk_class,
-                           decision, decision_reason)
-    VALUES (uuidv7(), rk2_program(), 'tr-regrant', {rk.lit(run2)}, {rk.lit(task2)},
+                           started_at, status, transport, tool_use_id)
+    VALUES (uuidv7(), rk2_program(), 'tr-regrant', {rk.lit(run3)}, {rk.lit(task2)},
             'mcp__rk2__net_request',
             '{{"url":"http://127.0.0.1:18831/api/notes","method":"POST",
                "identity_slot":"userA"}}'::jsonb, now(),
-            'running', 'mcp', 'toolu_regrant', 'approval_required', 'ask',
-            'same request, after the answer')
+            'running', 'mcp', 'toolu_regrant')
     RETURNING id;
     """, program=MAIN, actor="runtime").strip()
-    g = json.loads(rk.one(f"SELECT gate_tool_call({rk.lit(tr2)});",
+    g = json.loads(rk.one(
+        f"SELECT authorize_tool_run({rk.lit(tr2)}) - 'capability' "
+        "- 'capability_expires_at';",
                           program=MAIN, actor="runtime"))
     R.check(g.get("decision") == "allow" and g.get("approval") == dlabel, "P8",
             "the same request now runs on the human's grant instead of asking again",

@@ -45,6 +45,7 @@ STATE: dict = {
     "guard": None, "api_key_source": None, "cap_hit": False,
     "denied": [], "gates": [], "parked": [], "must_stop": None,
 }
+CAPABILITIES: dict[str, str] = {}
 RT: rk.Runtime | None = None
 MANAGED_SETTINGS = tuple(Path(path) for path in guard.MANAGED_SETTINGS)
 
@@ -204,23 +205,6 @@ async def pre_tool(data, tool_use_id, context):
     tr_id = _uuid(f"tr:{JOB['agent_run_id']}:{tuid}")
     args_blob = json.dumps(args, sort_keys=True)
     args_sha = hashlib.sha256(args_blob.encode()).hexdigest()
-    # MEASURED, not chosen. `tool_risk_classes` carries exactly one row that can
-    # match a first-party tool -- `mcp__rk2__*` -> constrained -- so every tool
-    # this agent can call is floored at `constrained`, including a read-only
-    # named view. Writing `autonomous` here is not a stricter opinion, it is an
-    # error:
-    #   ERROR: risk_class autonomous is below the constrained floor
-    #          tool_risk_classes gives mcp__rk2__state_read
-    # `assert_risk_class_monotone` refuses anything below the floor, and
-    # `autonomous` in the shipped roster belongs to built-ins (Read, Grep, Glob)
-    # that this design does not hand to an agent at all.
-    risk = "constrained"
-    decision = "allow"
-    reason = "allowlisted"
-    # The allowlist is enforced here as well as in `allowed_tools`, because the
-    # allowlist is the SDK's opinion and this is the runtime's.
-    if name.split("__")[-1] not in ("state_read", "net_request", "propose_finding"):
-        decision, reason = "deny", "not_in_roster_allowlist"
     try:
         # `tool_runs.args_sha256` and `.result_sha256` both FK into `artifacts`,
         # so the blob registry must know the digest before the tool run may cite
@@ -235,19 +219,18 @@ async def pre_tool(data, tool_use_id, context):
         INSERT INTO tool_runs (id, program_id, label, agent_run_id, task_id, tool,
                                args, started_at, status, tool_use_id, session_id,
                                sdk_agent_id, sdk_agent_type, transport, mcp_server,
-                               risk_class, decision, decision_reason, args_sha256)
+                               args_sha256)
         VALUES ({rk.lit(tr_id)}, {rk.lit(JOB['program'])},
                 {rk.lit('tr-' + tuid[:40])}, {rk.lit(JOB['agent_run_id'])},
                 {rk.lit(JOB.get('task_id'))}, {rk.lit(name)},
                 {rk.jlit(args)}, now(), 'running', {rk.lit(tuid)},
                 {rk.lit(data.get('session_id'))},
                 {rk.lit(data.get('agent_id'))}, {rk.lit(data.get('agent_type'))},
-                'mcp', 'rk2', {rk.lit(risk)}, {rk.lit(decision)},
-                {rk.lit(reason)}, {rk.lit(args_sha)})
+                'mcp', 'rk2', {rk.lit(args_sha)})
         ON CONFLICT (id) DO NOTHING;
         """)
         STATE["tool_runs"].append({"id": tr_id, "tool": name, "tool_use_id": tuid,
-                                   "decision": decision})
+                                   "decision": None})
     except rk.SqlError as e:
         # A hook that cannot record the tool run must not let the tool proceed:
         # an unrecorded call is exactly the thing receipts exist to prevent.
@@ -255,33 +238,38 @@ async def pre_tool(data, tool_use_id, context):
                                        "permissionDecision": "deny",
                                        "permissionDecisionReason":
                                            f"tool_run not recorded: {str(e)[:120]}"}}
-    if decision == "deny":
-        STATE["denied"].append(name)
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                       "permissionDecision": "deny",
-                                       "permissionDecisionReason": reason}}
-
-    # The gate. `gate_tool_call` is the runtime's decision, not the hook's
-    # opinion: it canonicalises the call, resolves the host against ticket 26's
-    # scope projection, applies `call_risk_rules`, and looks for a live grant.
-    # The hook's job is to obey it. Anything else makes the risk tables
-    # decoration.
+    # The database evaluates and stamps the gate. Only an active allow returns
+    # a capability; it stays process-private until the network adapter consumes
+    # it in ticket 04.
     try:
-        g = json.loads(_one(f"SELECT gate_tool_call({rk.lit(tr_id)});"))
+        g = json.loads(_one(f"SELECT authorize_tool_run({rk.lit(tr_id)});"))
     except Exception as exc:                      # noqa: BLE001
+        _sql(f"UPDATE tool_runs SET status='denied', closed_by='PreToolUse', "
+             f"finished_at=now(), hook_error='gate failed' "
+             f"WHERE id={rk.lit(tr_id)} AND status='running';")
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                        "permissionDecision": "deny",
                                        "permissionDecisionReason":
                                            f"gate failed: {str(exc)[:120]}"}}
+    capability = g.pop("capability", None)
+    STATE["tool_runs"][-1]["decision"] = g.get("decision")
     STATE["gates"].append({"tool": name, "decision": g.get("decision"),
                            "risk_class": g.get("risk_class"),
                            "rule": g.get("rule"), "approval": g.get("approval")})
     if g.get("decision") == "allow":
+        if not capability:
+            _sql(f"UPDATE tool_runs SET status='denied', closed_by='PreToolUse', "
+                 f"finished_at=now(), hook_error='capability missing' "
+                 f"WHERE id={rk.lit(tr_id)} AND status='running';")
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                           "permissionDecision": "deny",
+                                           "permissionDecisionReason":
+                                               "gate returned no capability"}}
+        CAPABILITIES[tr_id] = capability
         return {}
     if g.get("decision") == "deny":
-        _sql(f"UPDATE tool_runs SET status='denied', decision='deny', "
-             f"decision_reason={rk.lit(str(g.get('rule'))[:80])}, "
-             f"closed_by='PreToolUse', finished_at=now() "
+        _sql(f"UPDATE tool_runs SET status='denied', closed_by='PreToolUse', "
+             f"finished_at=now() "
              f"WHERE id={rk.lit(tr_id)};")
         STATE["denied"].append(name)
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
@@ -294,8 +282,6 @@ async def pre_tool(data, tool_use_id, context):
     # comment in the function itself. A hook that parked and then let the model
     # keep talking would be contradicting the row it just wrote, so the flag
     # here stops the query loop at the next message.
-    _sql(f"UPDATE tool_runs SET risk_class='approval_required', decision='ask' "
-         f"WHERE id={rk.lit(tr_id)};")
     dl = _one(f"SELECT park_for_human({rk.lit(tr_id)}, interval '30 minutes');").strip()
     STATE["parked"].append({"tool": name, "decision_label": dl})
     STATE["must_stop"] = "parked"
@@ -322,6 +308,7 @@ async def post_tool(data, tool_use_id, context):
            result_sha256={rk.lit(res_sha)}, closed_by='PostToolUse'
      WHERE id={rk.lit(match[0]['id'])} AND status='running';
     """)
+    CAPABILITIES.pop(match[0]["id"], None)
     return {}
 
 

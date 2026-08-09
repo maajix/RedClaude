@@ -9,7 +9,7 @@ This is still a prototype. It is not the migration set the build will ship. It
 is the evidence that the decisions survive contact with the database, and — from
 ticket 33 — that they survive contact with **each other**.
 
-Headline: **31 migrations, 81 managed tables, 15 standing checks, 0 problems.**
+Headline: **38 migrations, 113 managed tables, 19 standing checks, 0 problems.**
 `./run_all.sh` is that claim, executed.
 
 ## Postgres major: 18
@@ -51,6 +51,7 @@ tests/
   checks_a.sql        constraint and trigger checks (group A)
   checks_b.sql        purge, replica-mode and integrity-checker checks (group B)
   checks_c.sql        ticket 33's 19 corpus checks (M01–M19)
+  capability_receipts.sql  capability-backed receipt checks (K01–K04)
   scheduler.sql       scheduler fixture plus rank_pass() and claim_one()
   ticket07_checker.sql  ticket 07's event checker under a second name, for prove_holes
   999_drift_probe.sql   the migration nobody should write, written on purpose
@@ -113,7 +114,7 @@ its four other defects fail the run.
 ## Standing checks
 
 `standing_checks` is a table, `run_standing_checks()` runs every row, and
-`assert_standing_checks()` raises. 15 checks. `check_check_registration()` is
+`assert_standing_checks()` raises. 19 checks. `check_check_registration()` is
 the one that closes the loop: a `check_%` function in `public` with no
 `standing_checks` row is itself a problem. Nine of the twelve checkers the
 corpus inherited had no caller at all after their own migration committed, which
@@ -152,8 +153,8 @@ CT=x DB=y ./migrate.sh up       # against an existing container
 ./migrate.sh status | verify | lint
 ```
 
-`run_all.sh` has ten passes and ends `run_all: everything passed`. Groups A, B
-and C print as one table and end with a `56 checks, 0 failing` line.
+`run_all.sh` has ten passes and ends `run_all: everything passed`. Groups A, B,
+C and K end with an `86 checks, 0 failing` line.
 
 ## Check inventory
 
@@ -231,6 +232,10 @@ is published before a receipt can name it, a purge runs to completion with 021's
 immutability guard installed, `resume_program()` no longer deletes a curated
 emitter's rows, `rk2_state` holds no relation-level grant, and every checker in
 the corpus is registered.
+
+Group K, `tests/capability_receipts.sql`, proves that only an active database
+gate can mint a capability, allowed receipts derive their authority from it,
+and cross-program, fabricated, expired or closed-run capabilities do not resolve.
 
 `prove_holes.sh` is the adversarial half: 43 cases, each run twice against the
 same database at the same moment — once through ticket 07's checker and once
