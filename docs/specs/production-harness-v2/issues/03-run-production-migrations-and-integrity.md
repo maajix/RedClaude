@@ -61,3 +61,49 @@ One limit worth naming: the live suite skips unless `RK_TEST_SUPERUSER_URL` is
 set, and the repository has no CI, so nothing forces it to run. Until there is
 one, the offline suite and `tools/check_baseline.py` are what a clean checkout
 actually enforces.
+
+### Review remediation, 2026-08-09
+
+`/code-review` against the merge base raised 15 findings. Two were
+self-refuted in the reviewer's own report and one is filed as ticket 66 rather
+than fixed here; the rest are closed.
+
+The wire client was the substance of it. `pg.Connection` had no notion of a
+stream it could no longer parse: an unknown message tag was skipped silently,
+so a `CopyInResponse` left the client waiting for a `ReadyForQuery` the server
+would never send, and the next statement on that connection read the previous
+one's bytes. It now refuses the stream, names COPY separately from an unknown
+tag, marks the connection unusable and says so on the next statement instead of
+answering from a desynchronised buffer. `close()` no longer writes Terminate
+into a stream it knows is broken, the connect timeout is cleared once the
+connection is up so a long migration is not cut off at the connect budget, a
+literal IP address no longer travels as an SNI server name, and a password
+SASLprep rejects is a refusal rather than a `ValueError` out of the client.
+
+The advisory lock covered one migration at a time, which serialized the writing
+and left the deciding unguarded: two runners reading an empty
+`schema_migrations` in the same moment both planned every file. `exclusive` now
+holds a session lock across the plan, the apply loop, the finalizers and the
+gate. `rk db verify` and `rk db status` refuse the wrong connection string the
+way `migrate` already did, the gate's own counts reach the `migrate` and
+`restore` reports rather than being dropped on the floor, a failed `pg_dump` no
+longer leaves a partial archive that makes the retry fail as "already exists",
+`PGCONNECT_TIMEOUT` never truncates a sub-second budget to `0`, which libpq
+reads as no budget at all, and a connection that drops mid-command is rendered
+as a report rather than a traceback.
+
+Two live tests could not fail and now can:
+`test_the_restore_repairs_what_the_archive_could_not_carry` asserted only that a
+ledger key existed and now reads `pg_db_role_setting` back against the migrated
+database, and `test_the_restored_database_still_authors_its_own_events` counted
+triggers against the config rows that declare them and now writes a row and
+reads the Event it authored. The live suite is 39 tests, and
+`tests/test_backup.py` covers offline what the archive tests cannot reach.
+
+Ticket 66 is the one finding left open. `rk2_runtime` can execute
+`answer_decision`, `register_proxy_artifacts` and `write_blocked_receipt`,
+which the corpus gates to `rk2_human` and `rk2_proxy`, because those three were
+revoked `FROM PUBLIC` rather than from the role that `ALTER DEFAULT PRIVILEGES`
+had already granted them to. Fixing it means changing promoted schema and
+deciding what the runtime's privilege surface is, which is not what a ticket
+about running migrations gets to decide silently.

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import socket
 import struct
 import unittest
 
@@ -168,6 +169,16 @@ class ScramTest(unittest.TestCase):
             pg._saslprep("pencil")
 
 
+class PreparedPasswordTest(unittest.TestCase):
+    def test_a_password_saslprep_prohibits_refuses_the_connection(self):
+        # Reached during authentication, where a bare ValueError is a traceback:
+        # every other refusal this module raises is one a caller classifies.
+        with self.assertRaises(ConnectionError_) as refusal:
+            pg._Scram("pen\x07cil")
+
+        self.assertIn("SASLprep", str(refusal.exception))
+
+
 class VerifierTest(unittest.TestCase):
     """The stored form of a password, so provisioning never sends the password."""
 
@@ -288,6 +299,108 @@ class WireTest(unittest.TestCase):
         self.assertEqual(({"n": 1},), result.dicts())
         with self.assertRaises(ValueError):
             pg.Result(columns=("n",), rows=((1,), (2,))).scalar()
+
+
+def _message(tag: bytes, body: bytes = b"") -> bytes:
+    return tag + struct.pack("!i", len(body) + 4) + body
+
+
+#: An ordinary end of cycle: one command tag, then idle.
+_DONE = _message(b"C", b"SELECT 1\x00") + _message(b"Z", b"I")
+
+
+class MessageLoopTest(unittest.TestCase):
+    """What the client does with what the server sends, over a socket pair.
+
+    A pair rather than a server because the cases that matter are the ones a
+    healthy server never produces: a message this client does not implement, a
+    COPY it cannot speak, and a peer that has gone away mid-statement.
+    """
+
+    def connection(self) -> tuple[pg.Connection, socket.socket]:
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        connection = pg.Connection(Settings(host="/run/postgresql", database="rk2", user="rk2_migrate"))
+        connection._socket = ours
+        # A client that waits for a message the server is never going to send
+        # hangs the whole suite rather than failing one case. The deadline is
+        # the harness's, not the client's: nothing here is slow.
+        ours.settimeout(5)
+        return connection, theirs
+
+    def test_a_message_this_client_does_not_implement_is_refused_by_name(self):
+        # FunctionCallResponse. Dropping it silently leaves the next statement
+        # reading this cycle's remainder, which is worse than saying so.
+        connection, server = self.connection()
+        server.sendall(_message(b"V", b"\x00\x00\x00\x00") + _DONE)
+
+        with self.assertRaises(ConnectionError_) as refusal:
+            connection.execute("SELECT 1")
+
+        self.assertIn("V", str(refusal.exception))
+
+    def test_a_copy_the_server_starts_is_refused_rather_than_waited_on(self):
+        # The backend blocks for CopyData that this client will never send, so
+        # absorbing CopyInResponse would hang the migration holding the lock.
+        connection, server = self.connection()
+        server.sendall(_message(b"G", b"\x00\x00\x00"))
+
+        with self.assertRaises(ConnectionError_) as refusal:
+            connection.execute("COPY t FROM stdin")
+
+        self.assertIn("COPY", str(refusal.exception))
+
+    def test_a_connection_that_lost_the_stream_refuses_the_next_statement(self):
+        connection, server = self.connection()
+        server.sendall(_message(b"V") + _DONE)
+        with self.assertRaises(ConnectionError_):
+            connection.execute("SELECT 1")
+
+        with self.assertRaises(ConnectionError_) as refusal:
+            connection.execute("SELECT 2")
+
+        self.assertIn("no longer usable", str(refusal.exception))
+
+    def test_an_asynchronous_notice_does_not_end_the_cycle(self):
+        connection, server = self.connection()
+        server.sendall(_message(b"N", b"SNOTICE\x00Mrelation exists\x00\x00") + _DONE)
+
+        result = connection.execute("SELECT 1")
+
+        self.assertEqual("SELECT 1", result.tag)
+        self.assertEqual([{"S": "NOTICE", "M": "relation exists"}], connection.notices)
+
+    def test_a_peer_that_went_away_does_not_turn_closing_into_a_traceback(self):
+        # The path where a report has just been built and is about to be lost:
+        # `__exit__` closes, and the Terminate cannot be sent.
+        connection, server = self.connection()
+        server.close()
+
+        connection.close()
+
+        self.assertIsNone(connection._socket)
+
+    def test_the_connect_budget_is_cleared_once_the_session_is_open(self):
+        # A migration is unbounded -- an index build is allowed to be slow -- so
+        # the deadline for reaching a server must not become one per statement.
+        connection, _ = self.connection()
+        connection._socket.settimeout(pg.DEFAULT_CONNECT_TIMEOUT)
+
+        connection._clear_connect_timeout()
+
+        self.assertIsNone(connection._socket.gettimeout())
+
+
+class ServerNameTest(unittest.TestCase):
+    def test_a_hostname_is_sent_as_the_server_name(self):
+        # libpq has sent SNI since PostgreSQL 14, and an SNI-routed endpoint
+        # rejects or misroutes a handshake without it.
+        self.assertEqual("db.internal", pg._sni_hostname("db.internal"))
+
+    def test_an_address_carries_no_server_name(self):
+        self.assertIsNone(pg._sni_hostname("10.0.0.5"))
+        self.assertIsNone(pg._sni_hostname("::1"))
 
 
 if __name__ == "__main__":

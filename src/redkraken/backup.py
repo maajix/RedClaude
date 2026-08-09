@@ -17,6 +17,7 @@ which a restore recreates in dump order rather than in purge order.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import shutil
 import subprocess
@@ -99,9 +100,11 @@ def dump(settings: pg.Settings, destination: Path, *, timeout: float = DEFAULT_T
         timeout,
     )
     if isinstance(completed, str):
+        _discard(ledger, target)
         ledger.fail("dump", completed, code=BACKUP_FAILED, source="pg_dump")
         return report("db dump", ledger, target=settings.describe(), archive=str(target))
     if completed.returncode != 0:
+        _discard(ledger, target)
         ledger.fail(
             "dump",
             f"{DUMP} exited {completed.returncode}: {_tail(completed.stderr)}",
@@ -193,21 +196,27 @@ def restore(
     connection = migrate.open_connection(ledger, settings)
     if connection is None:
         return report("db restore", ledger, target=settings.describe(), archive=str(source))
+    facts: dict[str, object] = {}
     with connection:
-        try:
-            finalized = migrate.finalize(connection)
-        except pg.DatabaseError as error:
-            ledger.fail(
-                "finalize",
-                f"the restored database could not be finalized: {error}",
-                code=BACKUP_FAILED,
-                source="database",
-            )
-            return report("db restore", ledger, target=settings.describe(), archive=str(source))
-        for name, answer in finalized.items():
-            ledger.hold(f"finalize:{name}", str(answer))
+        # The same lock a migration run holds. The finalizers drop and recreate
+        # every event trigger and rebuild the foreign keys, so two of them at
+        # once collide on the same tables whichever command started them.
+        with migrate.exclusive(connection):
+            try:
+                finalized = migrate.finalize(connection)
+            except pg.DatabaseError as error:
+                ledger.fail(
+                    "finalize",
+                    f"the restored database could not be finalized: {error}",
+                    code=BACKUP_FAILED,
+                    source="database",
+                )
+                return report("db restore", ledger, target=settings.describe(), archive=str(source))
+            for name, answer in finalized.items():
+                ledger.hold(f"finalize:{name}", str(answer))
 
-    migrate.gate_on_a_fresh_connection(ledger, settings, migrations)
+            facts = migrate.gate_on_a_fresh_connection(ledger, settings, migrations)
+
     return report(
         "db restore",
         ledger,
@@ -215,6 +224,7 @@ def restore(
         archive=str(source),
         bytes=size,
         sha256=digest,
+        **facts,
     )
 
 
@@ -256,6 +266,21 @@ def _assert_empty(ledger: Ledger, settings: pg.Settings) -> bool:
         return False
     ledger.hold("target", f"{settings.database} is provisioned and empty")
     return True
+
+
+def _discard(ledger: Ledger, target: Path) -> None:
+    """Take back the file a failed dump left behind.
+
+    `pg_dump` creates its output before it connects, so a run that fails for any
+    reason still leaves something at the destination. Nothing above will
+    overwrite an archive, so leaving the remains in place would refuse every
+    later dump to that path with "already exists" -- naming the wrong problem
+    forever after one transient failure.
+    """
+    try:
+        target.unlink(missing_ok=True)
+    except OSError as error:
+        ledger.hold("archive", f"{target} could not be removed: {error.strerror or error}")
 
 
 def _binary(ledger: Ledger, name: str) -> str | None:
@@ -302,7 +327,9 @@ def _environment(settings: pg.Settings) -> dict[str, str]:
     else:
         environment.pop("PGPASSWORD", None)
     environment["PGSSLMODE"] = settings.sslmode
-    environment["PGCONNECT_TIMEOUT"] = str(int(settings.connect_timeout))
+    # Rounded up, never down: libpq reads `PGCONNECT_TIMEOUT=0` as "wait forever",
+    # so truncating a sub-second budget would invert it into no budget at all.
+    environment["PGCONNECT_TIMEOUT"] = str(math.ceil(settings.connect_timeout))
     environment["PGAPPNAME"] = settings.application_name
     return environment
 

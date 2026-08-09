@@ -15,6 +15,7 @@ from pathlib import Path
 
 from redkraken import __version__, backup, doctor, migrate, pg
 from redkraken.outcome import (
+    DATABASE_UNREACHABLE,
     INVALID_CONFIGURATION,
     Ledger,
     Report,
@@ -167,11 +168,30 @@ def _with_settings(
     A connection string that cannot be read is reported in the same shape as
     everything else rather than as a traceback: an operator scripting these
     commands parses one document whether the run reached the database or not.
+
+    The same promise covers a database that stops answering part-way. Each
+    operation classifies the failures it goes looking for; this is the boundary
+    for the ones nobody can enumerate — a backend restart, a pooler dropping an
+    idle socket — which arrive at whichever statement happened to be next.
     """
     settings, resolution = _settings(arguments, command)
-    result = resolution if settings is None else operation(settings)
+    if settings is None:
+        result = resolution
+    else:
+        try:
+            result = operation(settings)
+        except pg.ConnectionError_ as error:
+            result = _refusal(command, "connection", str(error), DATABASE_UNREACHABLE)
+        except pg.DatabaseError as error:
+            result = _refusal(command, "database", str(error), INVALID_CONFIGURATION)
     print(json.dumps(result.as_dict(), indent=2))
     return result.exit_code
+
+
+def _refusal(command: str, name: str, detail: str, code: str) -> Report:
+    ledger = Ledger()
+    ledger.fail(name, f"the command stopped part-way: {detail}", code=code, source="database")
+    return report(command, ledger)
 
 
 def _settings(arguments: argparse.Namespace, command: str) -> tuple[pg.Settings | None, Report]:

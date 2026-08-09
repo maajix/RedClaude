@@ -203,6 +203,85 @@ class CleanCreationTest(DatabaseCase):
         self.assertTrue(settings["hnsw_iterative_scan"])
         self.assertTrue(settings["hnsw_max_scan_tuples"])
 
+    def test_the_migrate_report_says_how_much_of_the_gate_ran(self):
+        # "The gate passed" is worth nothing without the number of checks behind
+        # it: a gate that ran none of them passes too.
+        created = self.harness.created
+
+        self.assertEqual([], created.facts["failed"])
+        self.assertEqual(["baseline", "roles", "standing"], created.facts["families"])
+        self.assertEqual(len(integrity.run(self.connection, self.harness.expected)),
+                         created.facts["checks"])
+
+
+class ExclusiveRunTest(DatabaseCase):
+    """One runner at a time, from reading the plan to finishing the finalizers.
+
+    Two runners that read an empty `schema_migrations` in the same moment both
+    plan every file, so the span that has to be exclusive starts before the plan
+    and not at the first `CREATE TABLE`.
+    """
+
+    def held(self, connection: pg.Connection) -> bool:
+        # `pg_advisory_lock` splits a bigint key across classid and objid.
+        return not connection.execute(
+            "SELECT pg_try_advisory_lock($1)", (migrate.LOCK_KEY,)
+        ).scalar()
+
+    def test_no_second_runner_can_start_while_one_holds_the_corpus(self):
+        with migrate.exclusive(self.connection):
+            with pg.connect(self.harness.migrate) as other:
+                self.assertTrue(self.held(other))
+
+    def test_the_lock_is_given_back_when_the_run_ends(self):
+        with migrate.exclusive(self.connection):
+            pass
+
+        with pg.connect(self.harness.migrate) as other:
+            self.assertFalse(self.held(other))
+
+    def test_a_finished_migration_leaves_no_lock_behind(self):
+        # The two runs in `setUpModule` are finished, and their connections are
+        # closed; a lock still held here would be one the runner never released.
+        outstanding = self.connection.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+            "   AND ((classid::bigint << 32) | objid::bigint) = $1",
+            (migrate.LOCK_KEY,),
+        ).scalar()
+
+        self.assertEqual(0, outstanding)
+
+
+class ConnectionGuardTest(DatabaseCase):
+    """Which connection string each database command will not run on.
+
+    A superuser URL is the dangerous one: it succeeds, and leaves every object
+    owned by the wrong role, which nothing downstream notices until the runtime
+    cannot read its own tables.
+    """
+
+    def wrong(self, settings: pg.Settings) -> list[tuple[str, str]]:
+        observed = []
+        for name, operation in (("status", migrate.status), ("verify", migrate.verify)):
+            result = operation(settings)
+            self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code, result.facts)
+            observed.append((name, result.violations[0].detail))
+        return observed
+
+    def test_a_runtime_connection_is_refused_rather_than_run_until_it_breaks(self):
+        runtime = self.harness.admin.replace(
+            database=DATABASE, user="rk2_runtime", password=self.harness.passwords["rk2_runtime"]
+        )
+
+        for name, detail in self.wrong(runtime):
+            with self.subTest(name):
+                self.assertIn("not a member of rk2_owner", detail)
+
+    def test_a_superuser_connection_is_refused_rather_than_silently_accepted(self):
+        for name, detail in self.wrong(self.harness.superuser):
+            with self.subTest(name):
+                self.assertIn("connected as the superuser", detail)
+
 
 class LaneVocabularyTest(DatabaseCase):
     """Criterion 2: one Lane vocabulary, and metadata that is not a Lane."""
@@ -779,11 +858,36 @@ class ArchiveTest(DatabaseCase):
         self.assertIn("finalize:apply_server_settings", repaired)
         self.assertGreater(int(repaired["finalize:enforce_fk_fire_order"]), 0)
 
+        # Read back from the catalogue `ALTER DATABASE ... SET` writes into,
+        # rather than from `current_setting`, which cannot tell a setting this
+        # database carries from a server default that happens to match. Compared
+        # against the migrated database rather than a pinned list, because the
+        # claim is that the two are the same database.
+        self.assertNotEqual("", self.carried(DATABASE))
+        self.assertEqual(self.carried(DATABASE), self.carried(RESTORED))
+
+    def carried(self, database: str) -> str:
+        return self.connection.execute(
+            "SELECT coalesce(array_to_string(s.setconfig, '|'), '') FROM pg_database d"
+            " LEFT JOIN pg_db_role_setting s ON s.setdatabase = d.oid AND s.setrole = 0"
+            " WHERE d.datname = $1",
+            (database,),
+        ).scalar()
+
     def test_the_restored_database_holds_on_its_own(self):
         result = migrate.verify(self.target)
 
         self.assertTrue(result.ok, result.violations)
         self.assertEqual([], result.facts["failed"])
+
+    def test_the_restore_report_says_how_much_of_the_gate_ran(self):
+        # A restore reports its own gate for the same reason a migration does:
+        # an operator reading "ok" needs the count that makes it mean something.
+        self.assertEqual([], self.read.facts["failed"])
+        self.assertEqual(["baseline", "roles", "standing"], self.read.facts["families"])
+        self.assertEqual(
+            migrate.verify(self.target).facts["checks"], self.read.facts["checks"]
+        )
 
     def test_the_restored_database_carries_the_same_corpus(self):
         state = migrate.status(self.target)
@@ -793,15 +897,39 @@ class ArchiveTest(DatabaseCase):
 
     def test_the_restored_database_still_authors_its_own_events(self):
         # The archive creates the triggers after the data, so nothing re-emits
-        # during the copy -- and the triggers are there afterwards.
+        # during the copy. Asked by writing a row rather than by counting
+        # triggers: a trigger that exists and a trigger that fires are different
+        # claims, and only the second one is what the restored database is for.
         with pg.connect(self.target) as connection:
-            attached = connection.execute(
-                "SELECT count(*) FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid"
-                " WHERE p.proname = 'emit_event' AND t.tgenabled = 'A'"
-            ).scalar()
-            configured = connection.execute("SELECT count(*) FROM event_table_config").scalar()
+            try:
+                with connection.transaction():
+                    connection.execute("SET LOCAL ROLE rk2_owner")
+                    connection.execute("SELECT set_actor('runtime', 'selftest')")
+                    program = connection.execute(PROGRAM, ("restored-selftest",)).scalar()
+                    entity = connection.execute(ENTITY, (program,)).scalar()
+                    events = connection.execute(
+                        "SELECT type, subject_table, subject_id::text, actor_kind FROM events"
+                    ).rows
 
-        self.assertEqual(configured, attached)
+                    self.assertEqual(
+                        [("entity.created", "entities", str(entity), "runtime")], list(events)
+                    )
+                    raise Rollback
+            except Rollback:
+                pass
+
+    def test_the_restored_database_refuses_a_write_that_says_nobody_wrote_it(self):
+        # The guard travels with the schema, so it is on the restored database
+        # too: an archive that carried the tables but not their discipline would
+        # be a database that accepts anonymous rows.
+        with pg.connect(self.target) as connection:
+            with self.assertRaises(pg.DatabaseError) as refusal:
+                with connection.transaction():
+                    connection.execute("SET LOCAL ROLE rk2_owner")
+                    program = connection.execute(PROGRAM, ("anonymous-selftest",)).scalar()
+                    connection.execute(ENTITY, (program,))
+
+        self.assertIn("app.actor_kind is unset", refusal.exception.primary)
 
 
 if __name__ == "__main__":

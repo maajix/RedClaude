@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import redkraken
+from redkraken import pg
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -183,8 +185,9 @@ class DatabaseCommandTest(unittest.TestCase):
         # Separate variables because they are separate roles: the role split is
         # lost if one exported URL can run every command.
         observed = {}
-        for operation in ("provision", "migrate", "verify", "status"):
-            report = json.loads(run("db", operation).stdout)
+        moving = {"dump": ("--to", "/x/archive.dump"), "restore": ("--from", "/x/archive.dump")}
+        for operation in ("provision", "migrate", "verify", "status", "dump", "restore"):
+            report = json.loads(run("db", operation, *moving.get(operation, ())).stdout)
             observed[operation] = report["violations"][0]["source"]
 
         self.assertEqual(
@@ -193,6 +196,8 @@ class DatabaseCommandTest(unittest.TestCase):
                 "migrate": "environment:RK_MIGRATE_URL",
                 "verify": "environment:RK_MIGRATE_URL",
                 "status": "environment:RK_MIGRATE_URL",
+                "dump": "environment:RK_MIGRATE_URL",
+                "restore": "environment:RK_RESTORE_URL",
             },
             observed,
         )
@@ -239,6 +244,39 @@ class DatabaseCommandTest(unittest.TestCase):
     def test_moving_an_archive_requires_being_told_where(self):
         self.assertEqual(EXIT_USAGE, run("db", "dump").returncode)
         self.assertEqual(EXIT_USAGE, run("db", "restore").returncode)
+
+
+class InterruptedCommandTest(unittest.TestCase):
+    """A database that stops answering after the command has started.
+
+    In process rather than through `run`, because the failure being tested is
+    one no reachable server produces on demand: the operation is made to raise
+    what a backend restart or a dropped idle socket raises.
+    """
+
+    def command(self, error: Exception) -> tuple[int, dict]:
+        from unittest import mock
+
+        from redkraken import cli
+
+        with mock.patch.object(cli.migrate, "status", side_effect=error):
+            with mock.patch("sys.stdout", new=io.StringIO()) as rendered:
+                code = cli.main(["db", "status", "--url", "postgresql://rk2_migrate@127.0.0.1/rk2"])
+        return code, json.loads(rendered.getvalue())
+
+    def test_a_connection_lost_mid_command_is_reported_rather_than_raised(self):
+        code, report = self.command(pg.ConnectionError_("127.0.0.1:5432/rk2 closed the connection"))
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, code)
+        self.assertEqual("db status", report["command"])
+        self.assertEqual(["database_unreachable"], [item["code"] for item in report["violations"]])
+        self.assertIn("closed the connection", report["violations"][0]["detail"])
+
+    def test_a_server_error_nobody_classified_is_reported_rather_than_raised(self):
+        code, report = self.command(pg.DatabaseError({"C": "42501", "M": "permission denied"}))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, code)
+        self.assertIn("permission denied", report["violations"][0]["detail"])
 
 
 class ContainmentTest(unittest.TestCase):

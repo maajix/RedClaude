@@ -20,6 +20,7 @@ import base64
 import dataclasses
 import hashlib
 import hmac
+import ipaddress
 import os
 import secrets
 import socket
@@ -42,7 +43,9 @@ SSL_REQUEST = 80877103
 DEFAULT_PORT = 5432
 
 #: How long a connection attempt may take. A migration itself is unbounded —
-#: an index build is allowed to be slow — but reaching a server is not.
+#: an index build is allowed to be slow — but reaching a server is not. The
+#: budget covers the handshake and is cleared once the session is open, because
+#: a socket left in timeout mode turns this into a deadline per statement.
 DEFAULT_CONNECT_TIMEOUT = 10.0
 
 #: Result columns are decoded by type, not guessed from their text. Anything
@@ -51,6 +54,15 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 _BOOLEAN = 16
 _INTEGERS = (20, 21, 23, 26)
 _FLOATS = (700, 701)
+
+#: Backend messages that carry nothing this client acts on, and can be dropped
+#: without losing the reader's place: the cancellation key, the extended-protocol
+#: acknowledgements, and an asynchronous notification nobody listened for.
+_IGNORED_MESSAGES = frozenset({b"K", b"1", b"2", b"3", b"n", b"t", b"s", b"c", b"A"})
+
+#: The three ways a server announces a COPY. This client speaks none of them, and
+#: after any of them the backend is waiting on the client rather than the reverse.
+_COPY_MESSAGES = frozenset({b"G", b"H", b"W"})
 
 _SASL_SCRAM_SHA_256 = "SCRAM-SHA-256"
 
@@ -282,6 +294,10 @@ class Connection:
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
         self._transaction_status = b"I"
+        #: Set when the message stream stopped being one this client can follow.
+        #: A statement issued afterwards would read some earlier statement's
+        #: answer, so the connection refuses instead of guessing where it is.
+        self._broken = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -292,11 +308,19 @@ class Connection:
         return connection
 
     def close(self) -> None:
+        """Say goodbye if that is still possible, and let go of the socket either way.
+
+        Closing runs on the way out of `with connection:`, which is also the way
+        out of every command that has just built a report. A Terminate that
+        cannot be sent must therefore not raise: the failure it would announce
+        is the one the report already describes.
+        """
         if self._socket is None:
             return
         try:
-            self._send(b"X", b"")
-        except OSError:
+            if not self._broken:
+                self._send(b"X", b"")
+        except (ConnectionError_, OSError):
             pass
         finally:
             self._socket.close()
@@ -326,6 +350,7 @@ class Connection:
         is the only way to send a migration: a file is many statements, and they
         must reach the server as they were written.
         """
+        self._assert_usable()
         if parameters:
             return self._extended(sql, parameters)
         results = self._simple(sql)
@@ -333,7 +358,17 @@ class Connection:
 
     def execute_script(self, sql: str) -> tuple[Result, ...]:
         """Run a multi-statement script, returning every statement's answer."""
+        self._assert_usable()
         return self._simple(sql)
+
+    def _assert_usable(self) -> None:
+        if self._broken:
+            raise ConnectionError_(f"this connection is no longer usable: {self._broken}")
+
+    def _lose_the_stream(self, reason: str) -> ConnectionError_:
+        """Record that the stream cannot be followed, and say why."""
+        self._broken = self._broken or reason
+        return ConnectionError_(reason)
 
     @contextmanager
     def transaction(self) -> Iterator[Connection]:
@@ -348,11 +383,15 @@ class Connection:
         try:
             yield self
         except BaseException:
-            if self._socket is not None:
+            # Only on a stream this client can still follow. After a lost cycle
+            # -- a KeyboardInterrupt mid-statement, a message that could not be
+            # read -- a ROLLBACK would consume the previous statement's reply and
+            # report success, leaving an open transaction behind a clean return.
+            if self._socket is not None and not self._broken:
                 try:
                     self.execute("ROLLBACK")
-                except (DatabaseError, ConnectionError_, OSError):
-                    pass
+                except (DatabaseError, ConnectionError_, OSError) as error:
+                    self._broken = self._broken or f"the transaction could not be rolled back: {error}"
             raise
         else:
             self.execute("COMMIT")
@@ -380,6 +419,18 @@ class Connection:
         body += b"\x00"
         self._send(None, bytes(body))
         self._authenticate()
+        self._clear_connect_timeout()
+
+    def _clear_connect_timeout(self) -> None:
+        """Hand the session back to blocking mode now that the server answered.
+
+        `connect_timeout` is a budget for reaching a server, and the socket it
+        was set on is the same socket every later statement is read from. Left
+        in place it becomes a deadline no statement asked for, and the first
+        thing it kills is the index build in the middle of a migration.
+        """
+        if self._socket is not None:
+            self._socket.settimeout(None)
 
     def _request_tls(self) -> None:
         assert self._socket is not None
@@ -387,10 +438,16 @@ class Connection:
         answer = self._read_exactly(1)
         if answer == b"S":
             context = _tls_context(self.settings)
-            self._socket = context.wrap_socket(
-                self._socket,
-                server_hostname=self.settings.host if context.check_hostname else None,
-            )
+            try:
+                self._socket = context.wrap_socket(
+                    self._socket, server_hostname=_sni_hostname(self.settings.host)
+                )
+            except ssl.SSLError as error:
+                # Including verification: a certificate this client will not
+                # accept is an operator-facing refusal, not a traceback.
+                raise ConnectionError_(
+                    f"the TLS handshake with {self.settings.describe()} failed: {error}"
+                ) from error
             return
         if answer != b"N":
             raise ConnectionError_("server answered the TLS request with neither S nor N")
@@ -510,7 +567,13 @@ class Connection:
                 self._absorb(tag, body)
 
     def _absorb(self, tag: bytes, body: bytes) -> None:
-        """Handle the messages that can arrive at any point in any cycle."""
+        """Handle the messages that can arrive at any point in any cycle.
+
+        A tag with no branch here is a refusal rather than a silent skip. The
+        client would otherwise keep reading for a reply the backend is not
+        sending — it is waiting on this client — and the statement after it
+        would read whatever arrived in the meantime.
+        """
         if tag == b"S":
             key, _, rest = body.partition(b"\x00")
             self.parameters[key.decode("utf-8", "replace")] = _cstring(rest)
@@ -518,8 +581,18 @@ class Connection:
             self.notices.append(_fields(body))
         elif tag == b"E":
             raise DatabaseError(_fields(body))
-        elif tag in {b"K", b"1", b"2", b"3", b"n", b"t", b"s", b"c"}:
+        elif tag in _IGNORED_MESSAGES:
             return
+        elif tag in _COPY_MESSAGES:
+            raise self._lose_the_stream(
+                "the server started a COPY, which this client does not implement; "
+                "a migration loads data with INSERT"
+            )
+        else:
+            raise self._lose_the_stream(
+                f"the server sent a {tag.decode('ascii', 'replace')!r} message, "
+                "which this client does not implement"
+            )
 
     # -- framing -----------------------------------------------------------
 
@@ -531,14 +604,16 @@ class Connection:
         try:
             self._socket.sendall(packet)
         except OSError as error:
-            raise ConnectionError_(f"sending to {self.settings.describe()} failed: {error}") from error
+            raise self._lose_the_stream(
+                f"sending to {self.settings.describe()} failed: {error}"
+            ) from error
 
     def _receive(self) -> tuple[bytes, bytes]:
         header = self._read_exactly(5)
         tag = header[:1]
         length = struct.unpack("!i", header[1:])[0]
         if length < 4:
-            raise ConnectionError_(f"server sent a message of impossible length {length}")
+            raise self._lose_the_stream(f"server sent a message of impossible length {length}")
         return tag, self._read_exactly(length - 4)
 
     def _read_exactly(self, count: int) -> bytes:
@@ -548,11 +623,11 @@ class Connection:
             try:
                 chunk = self._socket.recv(65536)
             except OSError as error:
-                raise ConnectionError_(
+                raise self._lose_the_stream(
                     f"reading from {self.settings.describe()} failed: {error}"
                 ) from error
             if not chunk:
-                raise ConnectionError_(f"{self.settings.describe()} closed the connection")
+                raise self._lose_the_stream(f"{self.settings.describe()} closed the connection")
             self._buffer += chunk
         taken = bytes(self._buffer[:count])
         del self._buffer[:count]
@@ -582,6 +657,21 @@ def _open_socket(settings: Settings) -> socket.socket:
         raise ConnectionError_(f"cannot reach {settings.describe()}: {error}") from error
     endpoint.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return endpoint
+
+
+def _sni_hostname(host: str) -> str | None:
+    """The name to put in the ClientHello, or nothing when there is no name.
+
+    Sent in every mode, as libpq has done since PostgreSQL 14: an endpoint that
+    routes on SNI answers a nameless handshake with a refusal or with the wrong
+    backend, and the connection string that fails there is byte-identical to one
+    `psql` accepts. An address is not a name, and TLS has no extension for one.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return None
 
 
 def _tls_context(settings: Settings) -> ssl.SSLContext:
@@ -672,7 +762,12 @@ class _Scram:
     """
 
     def __init__(self, password: str, *, username: str = "", nonce: str | None = None) -> None:
-        self._password = _saslprep(password)
+        try:
+            self._password = _saslprep(password)
+        except ValueError as error:
+            # Raised while authenticating, where every other refusal is one this
+            # module names and a caller classifies.
+            raise ConnectionError_(f"the password cannot be used: {error}") from error
         # The server already knows who is connecting: the startup packet named
         # the user, and RFC 5802 says this field is then empty. It is a
         # parameter only so the published test vectors, which carry a username,

@@ -21,6 +21,8 @@ import hashlib
 import os
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,8 +47,8 @@ CORPUS = Path(__file__).resolve().parent / "migrations"
 #: is applied changes, not when a migration is added.
 RUNNER_VERSION = "2"
 
-#: Held for the length of each migration's transaction, so two runners started
-#: at once apply in sequence instead of racing for the same file.
+#: Held for the length of a whole run, so two runners started at once take turns
+#: at the corpus instead of both acting on the plan they read before either began.
 LOCK_KEY = 8158253941
 
 OWNER_ROLE = "rk2_owner"
@@ -332,6 +334,16 @@ def provision(
                     f"OWNER {pg.quote_identifier(OWNER_ROLE)}"
                 )
             ledger.hold(f"database:{database}", "present" if existed else "created")
+        except ValueError as error:
+            # A password the SCRAM profile cannot prepare, from the environment.
+            # Named without quoting it: the value is the credential.
+            ledger.fail(
+                "role_password",
+                f"a supplied role password cannot be used: {error}",
+                code=INVALID_CONFIGURATION,
+                source="environment",
+            )
+            return report("db provision", ledger, target=settings.describe(), database=database)
         except pg.DatabaseError as error:
             ledger.fail(
                 "provision",
@@ -389,37 +401,58 @@ def migrate(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
         return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
 
     applied: list[dict] = []
+    facts: dict[str, object] = {}
     with connection:
         _assert_migrate_connection(ledger, connection)
         if ledger.violations:
             return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
 
-        try:
-            _bootstrap(connection)
-        except pg.DatabaseError as error:
-            ledger.fail(
-                "bootstrap",
-                f"the version table could not be created: {error}",
-                code=SCHEMA_DRIFT,
-                source="database",
-            )
-            return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
-
-        recorded = _recorded(connection)
-        pending = plan(ledger, migrations, recorded)
-        if ledger.violations:
-            return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
-        ledger.hold("plan", f"{len(pending)} pending, {len(recorded)} already applied")
-
-        for migration in pending:
+        with exclusive(connection):
             try:
-                elapsed = _apply(connection, migration)
+                _bootstrap(connection)
             except pg.DatabaseError as error:
                 ledger.fail(
-                    f"migration:{migration.identity}",
-                    f"refused by the server: {error}",
+                    "bootstrap",
+                    f"the version table could not be created: {error}",
                     code=SCHEMA_DRIFT,
-                    source=f"migration:{migration.identity}",
+                    source="database",
+                )
+                return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
+
+            recorded = _recorded(connection)
+            pending = plan(ledger, migrations, recorded)
+            if ledger.violations:
+                return report("db migrate", ledger, target=settings.describe(), corpus=len(migrations))
+            ledger.hold("plan", f"{len(pending)} pending, {len(recorded)} already applied")
+
+            for migration in pending:
+                try:
+                    elapsed = _apply(connection, migration)
+                except pg.DatabaseError as error:
+                    ledger.fail(
+                        f"migration:{migration.identity}",
+                        f"refused by the server: {error}",
+                        code=SCHEMA_DRIFT,
+                        source=f"migration:{migration.identity}",
+                    )
+                    return report(
+                        "db migrate",
+                        ledger,
+                        target=settings.describe(),
+                        corpus=len(migrations),
+                        applied=applied,
+                    )
+                applied.append({"id": migration.identity, "execution_ms": elapsed})
+                ledger.hold(f"migration:{migration.identity}", f"applied in {elapsed} ms")
+
+            try:
+                finalized = finalize(connection)
+            except pg.DatabaseError as error:
+                ledger.fail(
+                    "finalize",
+                    f"an end-of-run invariant could not be applied: {error}",
+                    code=SCHEMA_DRIFT,
+                    source="database",
                 )
                 return report(
                     "db migrate",
@@ -428,35 +461,21 @@ def migrate(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
                     corpus=len(migrations),
                     applied=applied,
                 )
-            applied.append({"id": migration.identity, "execution_ms": elapsed})
-            ledger.hold(f"migration:{migration.identity}", f"applied in {elapsed} ms")
+            for name, answer in finalized.items():
+                ledger.hold(f"finalize:{name}", str(answer))
 
-        try:
-            finalized = finalize(connection)
-        except pg.DatabaseError as error:
-            ledger.fail(
-                "finalize",
-                f"an end-of-run invariant could not be applied: {error}",
-                code=SCHEMA_DRIFT,
-                source="database",
-            )
-            return report(
-                "db migrate",
-                ledger,
-                target=settings.describe(),
-                corpus=len(migrations),
-                applied=applied,
-            )
-        for name, answer in finalized.items():
-            ledger.hold(f"finalize:{name}", str(answer))
+            # Inside the lock, on a connection of its own: a gate that ran after
+            # letting go would be answering for a database another runner may
+            # already be changing.
+            facts = gate_on_a_fresh_connection(ledger, settings, migrations)
 
-    gate_on_a_fresh_connection(ledger, settings, migrations)
     return report(
         "db migrate",
         ledger,
         target=settings.describe(),
         corpus=len(migrations),
         applied=applied,
+        **facts,
     )
 
 
@@ -473,6 +492,9 @@ def status(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
         return report("db status", ledger, target=settings.describe())
 
     with connection:
+        _assert_migrate_connection(ledger, connection)
+        if ledger.violations:
+            return report("db status", ledger, target=settings.describe(), corpus=len(migrations))
         present = connection.execute(
             "SELECT to_regclass($1) IS NOT NULL", (f"{META_SCHEMA}.schema_migrations",)
         ).scalar()
@@ -517,6 +539,13 @@ def verify(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
     if connection is None:
         return report("db verify", ledger, target=settings.describe(), checks=0)
     with connection:
+        # The same guard `migrate` applies, for the same reason: the gate on the
+        # wrong connection either answers about privileges it happens to have, or
+        # fails on one it does not and reports that as an invariant no longer
+        # holding. Which connection asked is part of what the answer means.
+        _assert_migrate_connection(ledger, connection)
+        if ledger.violations:
+            return report("db verify", ledger, target=settings.describe(), checks=0)
         gate = integrity.verify(connection, expected=[item.identity for item in migrations])
     ledger.assertions.extend(gate.assertions)
     ledger.violations.extend(gate.violations)
@@ -525,21 +554,49 @@ def verify(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
 
 def gate_on_a_fresh_connection(
     ledger: Ledger, settings: pg.Settings, migrations: tuple[Migration, ...]
-) -> None:
+) -> dict[str, object]:
     """Run the integrity gate the way the next connection will see the database.
 
     `apply_server_settings` issues `ALTER DATABASE ... SET`, which reaches
     sessions opened after it and not the one that issued it. Verifying on the
     connection that just finalized would therefore report the settings the run
     started with, so the gate gets a connection of its own.
+
+    The gate's own answers are returned rather than folded into the ledger,
+    because how many checks ran is the number that says whether "the gate
+    passed" means anything.
     """
     connection = open_connection(ledger, settings)
     if connection is None:
-        return
+        return {}
     with connection:
         gate = integrity.verify(connection, expected=[item.identity for item in migrations])
     ledger.assertions.extend(gate.assertions)
     ledger.violations.extend(gate.violations)
+    return dict(gate.facts)
+
+
+@contextmanager
+def exclusive(connection: pg.Connection) -> Iterator[None]:
+    """Hold the corpus lock for a whole run rather than for one file of it.
+
+    A lock taken per migration serializes the writing and leaves the deciding
+    unguarded: two runners that read an empty `schema_migrations` in the same
+    moment both plan every file, and the second one then re-applies what the
+    first has already committed. The span that has to be exclusive is the one
+    from reading what is applied to finishing the finalizers, so the lock is
+    session-scoped and covers it whole.
+    """
+    connection.execute("SELECT pg_advisory_lock($1)", (LOCK_KEY,))
+    try:
+        yield
+    finally:
+        try:
+            connection.execute("SELECT pg_advisory_unlock($1)", (LOCK_KEY,))
+        except (pg.DatabaseError, pg.ConnectionError_):
+            # Politeness, not correctness: the server releases a session lock
+            # when the session ends, and this one is ending either way.
+            pass
 
 
 def finalize(connection: pg.Connection) -> dict[str, object]:
@@ -560,9 +617,12 @@ def _apply(connection: pg.Connection, migration: Migration) -> int:
     refuses a write it cannot attribute. The migration is a runtime actor —
     there is no model in the loop — and the context is bound to this
     transaction, so it cannot outlive the work it describes.
+
+    Called under `exclusive`, which is where the corpus lock is now held: taking
+    a transaction-scoped one here as well would be released at each commit and
+    would say nothing about the plan this loop is working from.
     """
     with connection.transaction():
-        connection.execute("SELECT pg_advisory_xact_lock($1)", (LOCK_KEY,))
         # Every object a migration creates is owned by rk2_owner, whichever login
         # applied it: ALTER DEFAULT PRIVILEGES is keyed to the creating role, so
         # without this a second admin account would create tables the runtime
