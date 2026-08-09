@@ -104,6 +104,15 @@ class BaselineCliTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("pyproject.toml:2: forbidden tree dependency", result.stderr)
 
+    def test_container_build_cannot_copy_documentation_tree(self):
+        result = run_source(
+            "deploy/Dockerfile",
+            "FROM python:3\nCOPY docs /app/docs\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("deploy/Dockerfile:2: forbidden tree dependency", result.stderr)
+
     def test_python_encoding_cookie_does_not_bypass_boundary(self):
         result = run_source(
             "src/latin1.py",

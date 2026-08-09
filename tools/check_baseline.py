@@ -265,9 +265,20 @@ def read_status() -> dict:
     return status
 
 
-def forbidden_reference(value: str, forbidden_roots: list[str]) -> bool:
+def forbidden_reference(
+    value: str,
+    forbidden_roots: list[str],
+    scan_bare_tokens: bool = False,
+) -> bool:
     value = value.replace("\\", "/").strip()
     prefixes = (" ", "\"", "'", "=", "(", "[", ",")
+    words = (
+        value.translate(
+            str.maketrans({character: " " for character in "\"'()[]{}=,:"})
+        ).split()
+        if scan_bare_tokens
+        else []
+    )
     for root in forbidden_roots:
         root = root.replace("\\", "/").rstrip("/")
         variants = (root, root + "/") if root.startswith("/") else (
@@ -280,6 +291,8 @@ def forbidden_reference(value: str, forbidden_roots: list[str]) -> bool:
         if value == root or value.startswith(variants[1:]):
             return True
         if any(prefix + variant in value for prefix in prefixes for variant in variants[1:]):
+            return True
+        if root in words:
             return True
     return False
 
@@ -338,7 +351,7 @@ def production_boundary_errors(
             continue
         paths = [root] if root.is_file() or root.is_symlink() else sorted(root.rglob("*"))
         for path in paths:
-            if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            if "__pycache__" in path.parts:
                 continue
             if path.is_symlink():
                 relative = path.relative_to(repo)
@@ -368,7 +381,7 @@ def production_boundary_errors(
                 stripped = line.strip()
                 if not stripped or stripped.startswith(("#", "//", "--")):
                     continue
-                if forbidden_reference(stripped, forbidden_roots):
+                if forbidden_reference(stripped, forbidden_roots, scan_bare_tokens=True):
                     errors.append(f"{relative}:{line_number}: forbidden tree dependency")
     return errors
 
