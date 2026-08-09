@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "production_roots": [
+    "src",
+    "deploy",
+    "migrations"
+  ],
+  "classifications": [
+    {
+      "path": "tools/check_baseline.py",
+      "classification": "production",
+      "claim": "Read-only repository baseline validator"
+    },
+    {
+      "path": "docs/prototype/eval-harness",
+      "classification": "validated_prototype",
+      "claim": "Synthetic evaluation behavior only"
+    },
+    {
+      "path": "docs/prototype/schema",
+      "classification": "falsified_prototype",
+      "claim": "Schema experiments with known Lane and actor-context defects",
+      "regressions": ["RK-REG-002", "RK-REG-004"]
+    },
+    {
+      "path": "docs/prototype/scope-proxy",
+      "classification": "falsified_prototype",
+      "claim": "Proxy experiments with known HTTPS and wire-secrecy defects",
+      "regressions": ["RK-REG-001", "RK-REG-003"]
+    },
+    {
+      "path": "docs/prototype/sdk-auth-probe",
+      "classification": "validated_prototype",
+      "claim": "Version-bound offline authentication-resolution evidence only"
+    },
+    {
+      "path": "docs/prototype/skill-format",
+      "classification": "validated_prototype",
+      "claim": "Skill-format experiment only"
+    },
+    {
+      "path": "docs/prototype/walking-skeleton",
+      "classification": "falsified_prototype",
+      "claim": "Composed experiment with a mocked process seam and non-latching refusal",
+      "regressions": ["RK-REG-005", "RK-REG-006"]
+    },
+    {
+      "path": "docs/specs/startup-assertion",
+      "classification": "documentation",
+      "claim": "Historical specification and ticket record, not a shipping runtime"
+    },
+    {
+      "path": "docs/specs/production-harness-v2",
+      "classification": "documentation",
+      "claim": "Production specification and ticket plan"
+    }
+  ],
+  "regressions": [
+    {
+      "id": "RK-REG-001",
+      "area": "proxy",
+      "description": "HTTPS could bypass the capability proxy",
+      "required_tickets": [10, 11]
+    },
+    {
+      "id": "RK-REG-002",
+      "area": "receipt_lane",
+      "description": "Replay traffic was labeled as agent traffic",
+      "required_tickets": [3, 35]
+    },
+    {
+      "id": "RK-REG-003",
+      "area": "artifact_encryption",
+      "description": "Credential-bearing wire material was plaintext",
+      "required_tickets": [7, 43]
+    },
+    {
+      "id": "RK-REG-004",
+      "area": "actor_context",
+      "description": "Actor context was session-wide rather than transaction-local",
+      "required_tickets": [3, 4]
+    },
+    {
+      "id": "RK-REG-005",
+      "area": "startup_process_seam",
+      "description": "The composed startup proof mocked the claimed process seam",
+      "required_tickets": [16, 17, 20]
+    },
+    {
+      "id": "RK-REG-006",
+      "area": "startup_supervisor",
+      "description": "Startup refusal did not latch the supervisor",
+      "required_tickets": [17]
+    }
+  ]
+}

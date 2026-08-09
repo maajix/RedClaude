@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Every existing implementation claim is classified as production, validated prototype, falsified prototype or documentation, and no prototype is described as a shipping runtime.
 - [ ] A generated manifest records exactly 223 v1 artifacts with kind, relative source identity, line count and SHA-256: 11 Agent definitions, 28 Skill directories, 60 Playbook topics, 112 operator references, 9 sink packs and 3 reserved files.
