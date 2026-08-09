@@ -77,12 +77,15 @@ docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
 docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
     < "$HERE/tests/capability_receipts.sql" > /dev/null 2>&1 \
     || bad "capability receipt checks did not execute"
+docker exec -i "$CT" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 \
+    < "$HERE/tests/startup_refusal.sql" > /dev/null 2>&1 \
+    || bad "startup refusal checks did not execute"
 docker exec -i "$CT" psql -U postgres -d "$DB" -P pager=off \
     -c "SELECT id, CASE WHEN pass THEN 'ok' ELSE 'FAIL' END AS r, left(note,60) AS note
           FROM t.results WHERE id LIKE 'M%' OR NOT pass ORDER BY ord"
 tot=$(psqlq "SELECT count(*) FROM t.results")
 fail=$(psqlq "SELECT count(*) FROM t.results WHERE NOT pass")
-[[ "$tot" == "86" ]] || bad "expected 86 checks, got $tot"
+[[ "$tot" == "97" ]] || bad "expected 97 checks, got $tot"
 [[ "$fail" == "0" ]] && ok "$tot checks, 0 failing" || bad "$fail of $tot failing"
 
 # ---- 4 ---------------------------------------------------------------------

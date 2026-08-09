@@ -75,9 +75,29 @@ INSERT INTO artifacts (sha256, byte_size, visibility, encrypted) VALUES
     (repeat('a',64), 100, 'agent_visible', false),
     (repeat('b',64), 100, 'credential_bearing', true);
 
-INSERT INTO tool_runs (id, program_id, label, tool, status) VALUES
-    ('cccccccc-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','TR1','js_analyze','success'),
-    ('cccccccc-0000-7000-8000-0000000000b1','22222222-2222-7222-8222-222222222222','TR1','js_analyze','success');
+-- The receipt fence checks active state at INSERT time. Build that real state,
+-- load the historical exchanges, then close it; the earlier fixture inserted
+-- three allowed agent receipts beside an undecided, already-finished tool run.
+INSERT INTO tasks (id, program_id, label, kind, subject_entity_id,
+                   expected_information_gain, potential_impact, status,
+                   claimed_at, lease_expires_at) VALUES
+    ('eeeeeeee-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','T1','recon',
+     'aaaaaaaa-0000-7000-8000-000000000001', 0.8, 0.1, 'running', now(),
+     now() + interval '30 minutes');
+
+INSERT INTO agent_runs (id, program_id, label, task_id, role, model, effort,
+                        mission_packet) VALUES
+    ('ffffffff-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','A1',
+     'eeeeeeee-0000-7000-8000-000000000001','recon','claude-opus-5','high','{"goal":"map"}');
+
+INSERT INTO tool_runs
+       (id, program_id, label, agent_run_id, task_id, tool, status, transport,
+        risk_class, decision, decision_reason, egress_token_sha256,
+        egress_token_expires_at) VALUES
+    ('cccccccc-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','TR1',
+     'ffffffff-0000-7000-8000-000000000001','eeeeeeee-0000-7000-8000-000000000001',
+     'mcp__rk2__state_read','running','runtime','constrained','allow','fixture gate',
+     repeat('9',64), now() + interval '5 minutes');
 
 INSERT INTO receipts (id, program_id, label, lane, decision, reason, ts_arrival,
                       identity_entity_id, method, host, path, status_code,
@@ -92,17 +112,13 @@ INSERT INTO receipts (id, program_id, label, lane, decision, reason, ts_arrival,
     ('dddddddd-0000-7000-8000-000000000009','11111111-1111-7111-8111-111111111111','R9','proxy_internal','allowed','csrf fetch', now(),
      NULL,'GET','acme.test','/login',200, repeat('a',64), repeat('a',64), 1, 'target', 'cccccccc-0000-7000-8000-000000000001');
 
--- ---- tasks and runs ------------------------------------------------------
-INSERT INTO tasks (id, program_id, label, kind, subject_entity_id,
-                   expected_information_gain, potential_impact) VALUES
-    ('eeeeeeee-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','T1','recon',
-     'aaaaaaaa-0000-7000-8000-000000000001', 0.8, 0.1);
-
-INSERT INTO agent_runs (id, program_id, label, task_id, role, model, effort, mission_packet,
-                        input_tokens, output_tokens, stop_reason, finished_at) VALUES
-    ('ffffffff-0000-7000-8000-000000000001','11111111-1111-7111-8111-111111111111','A1',
-     'eeeeeeee-0000-7000-8000-000000000001','recon','claude-opus-5','high','{"goal":"map"}',
-     1000, 500, 'completed', now());
+UPDATE tool_runs SET status='success', finished_at=now(), closed_by='PostToolUse'
+ WHERE id='cccccccc-0000-7000-8000-000000000001';
+UPDATE agent_runs SET input_tokens=1000, output_tokens=500,
+                      stop_reason='completed', finished_at=now()
+ WHERE id='ffffffff-0000-7000-8000-000000000001';
+UPDATE tasks SET status='pending', claimed_at=NULL, lease_expires_at=NULL
+ WHERE id='eeeeeeee-0000-7000-8000-000000000001';
 
 INSERT INTO identity_leases (program_id, identity_entity_id, holder_agent_run_id, expires_at) VALUES
     ('11111111-1111-7111-8111-111111111111','aaaaaaaa-0000-7000-8000-000000000004',
@@ -230,9 +246,33 @@ INSERT INTO applications (entity_id, base_url, kind) VALUES
     ('aaaaaaaa-0000-7000-8000-0000000000b1','https://other.test','web');
 -- ticket 33: 022 forbids a SERVED agent-lane receipt that names no tool run,
 -- so program B gets its own tool run rather than an exemption.
+INSERT INTO tasks(id,program_id,label,kind,subject_entity_id,status,claimed_at,
+                  lease_expires_at)
+VALUES('eeeeeeee-0000-7000-8000-0000000000b1',
+       '22222222-2222-7222-8222-222222222222','T1','recon',
+       'aaaaaaaa-0000-7000-8000-0000000000b1','running',now(),
+       now() + interval '30 minutes');
+INSERT INTO agent_runs(id,program_id,label,task_id,role,model,effort,mission_packet)
+VALUES('ffffffff-0000-7000-8000-0000000000b1',
+       '22222222-2222-7222-8222-222222222222','A1',
+       'eeeeeeee-0000-7000-8000-0000000000b1','recon','claude-opus-5','high','{}');
+INSERT INTO tool_runs(id,program_id,label,agent_run_id,task_id,tool,status,transport,
+                      risk_class,decision,decision_reason,egress_token_sha256,
+                      egress_token_expires_at)
+VALUES('cccccccc-0000-7000-8000-0000000000b1',
+       '22222222-2222-7222-8222-222222222222','TR1',
+       'ffffffff-0000-7000-8000-0000000000b1','eeeeeeee-0000-7000-8000-0000000000b1',
+       'mcp__rk2__state_read','running','runtime','constrained','allow','fixture gate',
+       repeat('8',64),now() + interval '5 minutes');
 INSERT INTO receipts (id, program_id, label, lane, decision, reason, ts_arrival,
                       scope_version, scope_class, tool_run_id) VALUES
     ('dddddddd-0000-7000-8000-0000000000b1','22222222-2222-7222-8222-222222222222','R1','agent','allowed','in scope', now(), 1, 'target', 'cccccccc-0000-7000-8000-0000000000b1');
+UPDATE tool_runs SET status='success',finished_at=now(),closed_by='PostToolUse'
+ WHERE id='cccccccc-0000-7000-8000-0000000000b1';
+UPDATE agent_runs SET stop_reason='completed',finished_at=now()
+ WHERE id='ffffffff-0000-7000-8000-0000000000b1';
+UPDATE tasks SET status='pending',claimed_at=NULL,lease_expires_at=NULL
+ WHERE id='eeeeeeee-0000-7000-8000-0000000000b1';
 
 -- ---- D9: rows inserted with no label get one from the database ------------
 -- Every label above is explicit, which is how the seed reads as documentation.

@@ -30,8 +30,10 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
+from uuid import UUID
 
 HERE = Path(__file__).resolve().parent
 VENDOR = HERE / "vendor"
@@ -44,6 +46,7 @@ VULN_PORT = int(os.environ.get("RK_T31_VULN_PORT", "18831"))
 SECURE_PORT = int(os.environ.get("RK_T31_SECURE_PORT", "18832"))
 AGENT_PORT = int(os.environ.get("RK_AGENT_PORT", "18830"))
 PROVISION_PORT = int(os.environ.get("RK_PROVISION_PORT", "18833"))
+CONTROL_PORT = int(os.environ.get("RK_CONTROL_PORT", "18834"))
 
 # The three ceilings the operator set for this ticket. Hard, not guidance.
 BUDGET_MAIN = 200_000
@@ -79,10 +82,18 @@ class AgentRunRequest:
 
 
 class StartupRefusal(RuntimeError):
-    def __init__(self, violations):
+    def __init__(self, violations, phase: str = "pre_spawn",
+                 sdk_version: str | None = None, cli_version: str | None = None):
         self.violations = tuple(violations)
-        if not self.violations:
-            raise ValueError("startup refusal requires at least one violation")
+        self.phase = phase
+        self.sdk_version = sdk_version
+        self.cli_version = cli_version
+        if phase not in {"pre_spawn", "init"} or not self.violations:
+            raise ValueError("invalid startup refusal")
+        keys = {"code", "vector", "source", "effect"}
+        if any(not isinstance(item, Mapping) or set(item) != keys
+               for item in self.violations):
+            raise ValueError("invalid startup refusal violation")
         super().__init__("startup refused: " + json.dumps(
             self.violations, sort_keys=True, separators=(",", ":")
         ))
@@ -202,6 +213,7 @@ class Runtime:
             self.procs[name] = subprocess.Popen(
                 [sys.executable, str(app), str(port)],
                 env=env, stdout=log, stderr=log)
+            log.close()
             if not _wait_port(port):
                 raise RuntimeError(f"{name} did not come up on {port}")
 
@@ -215,9 +227,11 @@ class Runtime:
         """
         d = RUN / "proxy"
         d.mkdir(parents=True, exist_ok=True)
-        for mod in ("addon.py", "policy.py", "identity.py", "receipts.py",
-                    "budget.py"):
+        for mod in ("policy.py", "identity.py", "receipts.py", "budget.py"):
             shutil.copy2(VENDOR / "scope-proxy" / mod, d / mod)
+        shutil.copy2(VENDOR / "scope-proxy" / "addon.py", d / "scope_addon.py")
+        shutil.copy2(HERE / "capability_addon.py", d / "addon.py")
+        shutil.copy2(HERE / "rk.py", d / "rk.py")
         shutil.copy2(HERE / "proxy_config.py", d / "config.py")
         return d
 
@@ -227,16 +241,21 @@ class Runtime:
         env = dict(os.environ,
                    RK_OUT=str(self.proxy_out),
                    RK_AGENT_PORT=str(AGENT_PORT),
-                   RK_PROVISION_PORT=str(PROVISION_PORT))
+                   RK_PROVISION_PORT=str(PROVISION_PORT),
+                   RK_CONTROL_PORT=str(CONTROL_PORT))
         log = (self.logdir / "proxy.log").open("a")
         self.procs["proxy"] = subprocess.Popen(
             ["mitmdump", "-q", "-s", str(d / "addon.py"),
              "--mode", f"regular@127.0.0.1:{AGENT_PORT}",
              "--mode", f"regular@127.0.0.1:{PROVISION_PORT}",
+             "--mode", f"regular@127.0.0.1:{CONTROL_PORT}",
              "--set", "connection_strategy=lazy",
              "--set", f"confdir={self.proxy_out}/ca"],
             cwd=str(d), env=env, stdout=log, stderr=log)
-        if not _wait_port(AGENT_PORT, 40) or not _wait_port(PROVISION_PORT, 40):
+        log.close()
+        if (not _wait_port(AGENT_PORT, 40)
+                or not _wait_port(PROVISION_PORT, 40)
+                or not _wait_port(CONTROL_PORT, 40)):
             raise RuntimeError("proxy did not come up")
 
     def stop(self, *names: str) -> None:
@@ -253,25 +272,38 @@ class Runtime:
     def request(self, url: str, identity: str | None = None,
                 lane: str = "agent", method: str = "GET",
                 body: bytes | None = None,
-                headers: dict[str, str] | None = None) -> dict:
+                headers: dict[str, str] | None = None,
+                capability: str | None = None,
+                program: str | None = None) -> dict:
         """Every outbound byte in this prototype goes through here.
 
         Returns the proxy's own receipt id, the status, and the agent-visible
         body. The credential is never in this function: the proxy holds it.
         """
-        port = AGENT_PORT if lane == "agent" else PROVISION_PORT
+        ports = {"agent": AGENT_PORT, "provisioning": PROVISION_PORT,
+                 "control": CONTROL_PORT}
+        if lane not in ports:
+            raise ValueError(f"unknown proxy lane: {lane}")
+        port = ports[lane]
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}"}))
         req = urllib.request.Request(url, data=body, method=method)
         if identity:
             req.add_header("X-RedKraken-Identity", identity)
+        if capability:
+            req.add_header("Proxy-Authorization", f"RedKraken {capability}")
+        if program:
+            req.add_header("X-RedKraken-Program", program)
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         try:
             with opener.open(req, timeout=30) as r:
                 raw, status, hdrs = r.read(), r.status, dict(r.headers)
         except urllib.error.HTTPError as e:
-            raw, status, hdrs = e.read(), e.code, dict(e.headers)
+            try:
+                raw, status, hdrs = e.read(), e.code, dict(e.headers)
+            finally:
+                e.close()
         return {
             "receipt_id": hdrs.get("X-RedKraken-Receipt"),
             "status": status,
@@ -323,25 +355,12 @@ class Runtime:
 
 
 # ---------------------------------------------------------------------------
-# receipt mirroring: proxy SQLite -> Postgres
+# capability-backed proxy receipt writer
 # ---------------------------------------------------------------------------
 
-def mirror_receipt(rt: Runtime, program: str, receipt_id: str,
-                   tool_run_id: str | None,
-                   identity_entity_id: str | None) -> str:
-    """Write the proxy's receipt into the corpus as a `receipts` row.
-
-    DIVERGENCE (see the answer, D-04/13): ticket 13 reconciles a receipt to its
-    tool run through `resolve_egress_token()` — the runtime mints a token, the
-    proxy presents its hash. Ticket 04's proxy has no egress token at all: it
-    predates ticket 13 and never learned the header. So the correlation here is
-    "the runtime made this call, therefore it knows the tool run", which is
-    weaker: it works only because the runtime is the HTTP client. An agent with
-    its own socket would produce a receipt this function could not attribute.
-    """
-    pr = rt.proxy_receipt(receipt_id)
-    if pr is None:
-        raise RuntimeError(f"proxy has no receipt {receipt_id}")
+def write_capability_receipt(program: str, capability: str, receipt: dict,
+                             identity_entity_id: str | None) -> str:
+    """Persist proxy facts; authority fields come only from the capability."""
     # `receipts` FKs all four hash columns into `artifacts`, so the blob
     # registry has to know a hash before a receipt may cite it. This is where
     # ticket 13's dual hashing stops being a naming convention and becomes a
@@ -354,49 +373,45 @@ def mirror_receipt(rt: Runtime, program: str, receipt_id: str,
     # stores hashes and never stores or measures the bodies, so `byte_size` is
     # recorded as 0 here. A registry whose sizes are all zero cannot answer
     # "how much have we retained", which ticket 20's retention pass needs.
-    seen = []
-    for col, vis in (("request_agent_sha", "agent_visible"),
-                     ("response_agent_sha", "agent_visible"),
-                     ("request_wire_sha", "credential_bearing"),
-                     ("response_wire_sha", "credential_bearing")):
-        h = pr.get(col)
-        if h:
-            seen.append(
-                "(%s, 0, NULL, %s, %s)"
-                % (lit(h), lit(vis), "true" if vis == "credential_bearing" else "false"))
-    if seen:
-        psql("INSERT INTO artifacts (sha256, byte_size, content_type, visibility, "
-             "encrypted) VALUES " + ", ".join(seen) +
-             " ON CONFLICT (sha256) DO NOTHING;", program=program, actor="runtime")
+    hashes = [receipt.get(name) or None for name in (
+        "request_agent_sha", "request_wire_sha",
+        "response_agent_sha", "response_wire_sha")]
+    psql("SELECT register_proxy_artifacts("
+         + ", ".join(lit(value) for value in [capability, *hashes]) + ");",
+         role="rk2_proxy", program=program, actor="runtime")
 
-    uid = "31" + hashlib.sha256(receipt_id.encode()).hexdigest()[:6]
-    rid = f"{uid[:8]}-0000-7000-8000-{hashlib.sha256(receipt_id.encode()).hexdigest()[:12]}"
-    psql(
-        f"""
-        INSERT INTO receipts (id, program_id, tool_run_id, lane, decision, reason,
-                              identity_entity_id, method, scheme, host, port, path,
-                              query_sha256, pinned_ips, status_code,
-                              ts_arrival, ts_egress, waited_ms,
-                              request_agent_sha, request_wire_sha,
-                              response_agent_sha, response_wire_sha, notes,
-                              scope_version, scope_class)
-        VALUES ({lit(rid)}, {lit(program)}, {lit(tool_run_id)},
-                {lit(pr['lane'] if pr['lane'] != 'proxy-internal' else 'proxy_internal')},
-                {lit(pr['decision'])}, {lit(pr['reason'] or '')},
-                {lit(identity_entity_id)}, {lit(pr['method'])}, {lit(pr['scheme'])},
-                {lit(pr['host'])}, {lit(pr['port'])}, {lit(pr['path'])},
-                {lit(pr['query_sha256'] or None)}, {lit(pr['pinned_ips'] or None)},
-                {lit(pr['status_code'])},
-                to_timestamp({pr['ts_arrival']}),
-                {('to_timestamp(%s)' % pr['ts_egress']) if pr['ts_egress'] else 'NULL'},
-                {lit(pr['waited_ms'])},
-                {lit(pr['request_agent_sha'])}, {lit(pr['request_wire_sha'] or None)},
-                {lit(pr['response_agent_sha'])}, {lit(pr['response_wire_sha'] or None)},
-                {lit(pr['notes'])}, 1, 'target')
-        ON CONFLICT (id) DO NOTHING;
-        """,
-        program=program, actor="runtime")
-    return rid
+    stamp = lambda value: (datetime.fromtimestamp(value, timezone.utc).isoformat()
+                           if value else None)
+    payload = {
+        "reason": receipt.get("reason") or "",
+        "identity_entity_id": identity_entity_id,
+        "method": receipt.get("method"), "scheme": receipt.get("scheme"),
+        "host": receipt.get("host"), "port": receipt.get("port"),
+        "path": receipt.get("path"),
+        "query_sha256": receipt.get("query_sha256") or None,
+        "pinned_ips": receipt.get("pinned_ips") or None,
+        "status_code": receipt.get("status_code"),
+        "ts_arrival": stamp(receipt.get("ts_arrival")),
+        "ts_egress": stamp(receipt.get("ts_egress")),
+        "waited_ms": receipt.get("waited_ms"),
+        "request_agent_sha": receipt.get("request_agent_sha") or None,
+        "request_wire_sha": receipt.get("request_wire_sha") or None,
+        "response_agent_sha": receipt.get("response_agent_sha") or None,
+        "response_wire_sha": receipt.get("response_wire_sha") or None,
+        "notes": receipt.get("notes") or "{}", "scope_class": "target",
+    }
+    return one(
+        f"SELECT write_allowed_receipt({lit(capability)}, {jlit(payload)});",
+        role="rk2_proxy", program=program, actor="runtime")
+
+
+def write_blocked_receipt(program: str, receipt: dict,
+                          capability: str | None = None) -> str:
+    """Persist a refusal through the writer that cannot create an allow."""
+    return one(
+        f"SELECT write_blocked_receipt({lit(program)}, {jlit(receipt)}, "
+        f"{lit(capability)});",
+        role="rk2_proxy", program=program, actor="runtime")
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +459,28 @@ def agent_run(request: AgentRunRequest) -> dict:
         "identity_entity_ids": dict(request.identity_entity_ids)
         if request.identity_entity_ids is not None else IDENTITY_ENTITY_IDS,
     }
-    return _spawn_agent_process(request, job, _child_environment(os.environ))
+    try:
+        return _spawn_agent_process(request, job, _child_environment(os.environ))
+    except StartupRefusal as refusal:
+        _close_startup_refusal(request, refusal)
+        raise
+
+
+def _close_startup_refusal(request: AgentRunRequest,
+                           refusal: StartupRefusal) -> None:
+    """Commit the one durable refusal outcome when canonical rows exist."""
+    try:
+        UUID(request.program)
+        UUID(request.agent_run_id)
+    except ValueError:
+        return
+    one(
+        "SELECT close_startup_refusal("
+        f"{lit(request.agent_run_id)}, {lit(refusal.phase)}, "
+        f"{lit(refusal.sdk_version)}, {lit(refusal.cli_version)}, "
+        f"{jlit(refusal.violations)});",
+        program=request.program, actor="runtime",
+    )
 
 
 def _child_environment(source: Mapping[str, str]) -> dict[str, str]:
@@ -490,12 +526,34 @@ def _spawn_agent_process(request: AgentRunRequest, job: dict,
 
 
 def _child_result(out: str, err: str) -> dict:
+    for ln in reversed((err or "").strip().splitlines()):
+        if not ln.startswith("{"):
+            continue
+        try:
+            result = json.loads(ln)
+        except ValueError:
+            continue
+        if set(result) == {"startup_refusal"}:
+            refusal = result["startup_refusal"]
+            if isinstance(refusal, dict) and set(refusal) == {
+                "phase", "sdk_version", "cli_version", "violations"
+            }:
+                raise StartupRefusal(
+                    refusal["violations"], refusal["phase"],
+                    refusal["sdk_version"], refusal["cli_version"],
+                )
     for ln in reversed((out or "").strip().splitlines()):
         if ln.startswith("{"):
             try:
                 result = json.loads(ln)
                 if "startup_refusal" in result:
-                    raise StartupRefusal(result["startup_refusal"])
+                    refusal = result["startup_refusal"]
+                    if isinstance(refusal, dict):
+                        raise StartupRefusal(
+                            refusal["violations"], refusal["phase"],
+                            refusal.get("sdk_version"), refusal.get("cli_version"),
+                        )
+                    raise StartupRefusal(refusal)
                 return result
             except ValueError:
                 continue

@@ -46,6 +46,7 @@ STATE: dict = {
     "denied": [], "gates": [], "parked": [], "must_stop": None,
 }
 CAPABILITIES: dict[str, str] = {}
+INIT_CORROBORATED = False
 RT: rk.Runtime | None = None
 MANAGED_SETTINGS = tuple(Path(path) for path in guard.MANAGED_SETTINGS)
 
@@ -199,6 +200,11 @@ def _one(script: str, role: str = "rk2_runtime", actor: str = "runtime") -> str:
 # ---------------------------------------------------------------------------
 
 async def pre_tool(data, tool_use_id, context):
+    if not INIT_CORROBORATED:
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                       "permissionDecision": "deny",
+                                       "permissionDecisionReason":
+                                           "startup init not corroborated"}}
     name = data.get("tool_name", "")
     args = data.get("tool_input", {}) or {}
     tuid = data.get("tool_use_id") or tool_use_id or f"anon-{len(STATE['tool_runs'])}"
@@ -377,33 +383,27 @@ async def t_state_read(args):
 # emit an argument the runtime could not judge. Absolute only.
 @tool("net_request", "Make a request to the target as an identity. `url` must "
                      "be absolute: scheme://host:port/path, exactly as "
-                     "state_read view='endpoints' reports base_url. "
+                     "state_read view='endpoints' reports base_url. Use an "
+                     "empty identity_slot for a public request. "
                      "You never see or supply the credential.",
       {"identity_slot": str, "url": str, "method": str})
 async def t_net_request(args):
-    ident = args.get("identity_slot") or "userA"
+    ident = (args.get("identity_slot") or "").strip()
     url = args.get("url") or "/"
     path = "/" + url.split("://", 1)[-1].split("/", 1)[-1] if "://" in url else url
     tr = [t for t in STATE["tool_runs"] if t["tool"].endswith("net_request")]
     tr_id = tr[-1]["id"] if tr else None
     try:
-        r = RT.request(url, identity=ident, lane="agent")
+        r = RT.request(url, identity=ident or None, lane="agent",
+                       method=(args.get("method") or "GET").upper(),
+                       capability=CAPABILITIES.get(tr_id), program=JOB["program"])
     except Exception as exc:
         return {"content": [{"type": "text", "text": f"request failed: {exc}"}],
                 "is_error": True}
-    ent = JOB["identity_entity_ids"].get(ident)
-    pg_id = None
+    pg_id = r["receipt_id"]
     if r["receipt_id"]:
-        try:
-            pg_id = rk.mirror_receipt(RT, JOB["program"], r["receipt_id"],
-                                      tr_id, ent)
-            STATE["receipts"].append({"proxy": r["receipt_id"], "pg": pg_id,
-                                      "path": path, "identity": ident,
-                                      "status": r["status"]})
-        except Exception as exc:
-            return {"content": [{"type": "text",
-                                 "text": f"receipt not recorded, call void: {exc}"}],
-                    "is_error": True}
+        STATE["receipts"].append({"pg": pg_id, "path": path,
+                                  "identity": ident, "status": r["status"]})
     body = r["body"][:1200]
     return {"content": [{"type": "text", "text": json.dumps({
         "receipt_id": pg_id, "status": r["status"], "body": body})}]}
@@ -443,6 +443,8 @@ async def t_propose_finding(args):
 
 async def _run(environment=None, runtime=None, options_type=ClaudeAgentOptions,
                transport=query) -> dict:
+    global INIT_CORROBORATED
+    INIT_CORROBORATED = False
     environment = dict(os.environ) if environment is None else environment
     runtime = _runtime_facts() if runtime is None else runtime
     runtime_dir = Path(JOB["launch_dir"]).resolve()
@@ -485,17 +487,29 @@ async def _run(environment=None, runtime=None, options_type=ClaudeAgentOptions,
     cap = JOB.get("cap", rk.PER_RUN_CAP)
     result = None
     started = time.monotonic()
-    async for msg in transport(prompt=JOB["prompt"], options=options):
+    messages = transport(prompt=JOB["prompt"], options=options)
+    try:
+        first = await anext(messages)
+    except StopAsyncIteration:
+        first = None
+    valid_init = (isinstance(first, SystemMessage)
+                  and getattr(first, "subtype", None) == "init"
+                  and getattr(first, "data", {}).get("apiKeySource") == "none")
+    if not valid_init:
+        close = getattr(messages, "aclose", None)
+        if close:
+            await close()
+        raise rk.StartupRefusal(({
+            "code": "auth_source_unexpected", "vector": None,
+            "source": "init:apiKeySource", "effect": "unverifiable",
+        },), phase="init")
+    STATE["api_key_source"] = "none"
+    STATE["guard"] = "init_ok"
+    INIT_CORROBORATED = True
+
+    async for msg in messages:
         if STATE["must_stop"]:
             break
-        if isinstance(msg, SystemMessage) and getattr(msg, "subtype", None) == "init":
-            STATE["api_key_source"] = msg.data.get("apiKeySource")
-            try:
-                guard.assert_init_message(msg.data)
-                STATE["guard"] = "init_ok"
-            except guard.SubscriptionViolation as e:
-                STATE["guard"] = f"init_violation: {e}"
-                break
         if isinstance(msg, AssistantMessage):
             u = msg.usage or {}
             STATE["turns"] += 1
@@ -550,7 +564,12 @@ def main() -> None:
     try:
         out = anyio.run(_run, None, runtime)
     except rk.StartupRefusal as exc:
-        print(json.dumps({"startup_refusal": exc.violations}))
+        print(json.dumps({"startup_refusal": {
+            "phase": exc.phase,
+            "sdk_version": runtime["sdk_version"],
+            "cli_version": runtime["cli_version"],
+            "violations": exc.violations,
+        }}), file=sys.stderr)
         raise SystemExit(78) from None
     out["sdk_version"] = runtime["sdk_version"]
     out["cli_version"] = runtime["cli_version"]

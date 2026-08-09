@@ -60,8 +60,9 @@ class SpecRuntime:
     produces a receipt the proxy wrote, not one the test wrote about itself.
     """
 
-    def __init__(self, rt: rk.Runtime, port: int):
+    def __init__(self, rt: rk.Runtime, port: int, capability: str, program: str):
         self.rt, self.port = rt, port
+        self.capability, self.program = capability, program
         # Names only. The proxy holds the passwords; this dict exists because
         # `spec.replay` checks a precondition against it.
         self._secrets = {"userA": True, "userB": True}
@@ -69,7 +70,8 @@ class SpecRuntime:
     def request(self, lane, identity, method, path, body=None):
         r = self.rt.request(f"http://127.0.0.1:{self.port}{path}",
                             identity=identity, lane="agent", method=method,
-                            body=body.encode() if isinstance(body, str) else body)
+                            body=body.encode() if isinstance(body, str) else body,
+                            capability=self.capability, program=self.program)
         return _Resp(r["receipt_id"], r["status"], r["body"])
 
 
@@ -117,8 +119,24 @@ def outcome_digest(out: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def p0_digest_stability():
-    v = SpecRuntime(RT, rk.VULN_PORT)
-    s = SpecRuntime(RT, rk.SECURE_PORT)
+    rk.psql("""
+    INSERT INTO tool_risk_classes (tool_pattern, risk_class, rationale) VALUES
+      ('replay_spec', 'constrained', 'runtime validation replay through scope proxy')
+    ON CONFLICT (tool_pattern) DO NOTHING;
+    """, role="rk2_migrate", actor="runtime")
+    tr = rk.one(f"""
+    INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args,
+                           status, transport)
+    VALUES (rk2_program(), {rk.lit(FACTS['run_id'])}, {rk.lit(FACTS['task_id'])},
+            'replay_spec', '{{}}', 'running', 'runtime') RETURNING id;
+    """, program=MAIN, actor="runtime")
+    gate = json.loads(rk.one(f"SELECT authorize_tool_run({rk.lit(tr)});",
+                             program=MAIN, actor="runtime"))
+    capability = gate.get("capability")
+    if not capability:
+        raise RuntimeError(f"digest replay was not authorized: {gate.get('decision')}")
+    v = SpecRuntime(RT, rk.VULN_PORT, capability, MAIN)
+    s = SpecRuntime(RT, rk.SECURE_PORT, capability, MAIN)
     r1 = evalspec.replay(IDOR_SPEC, v)
     r2 = evalspec.replay(IDOR_SPEC, v)
     r3 = evalspec.replay(IDOR_SPEC, s)
@@ -133,6 +151,9 @@ def p0_digest_stability():
             "spec is a test, not a recording",
             f"vuln holds={r1['holds']} secure holds={r3['holds']}")
     FACTS["p0_r1"], FACTS["p0_r3"] = r1, r3
+    rk.psql(f"UPDATE tool_runs SET status='success', finished_at=now(), "
+            f"closed_by='PostToolUse' WHERE id={rk.lit(tr)};",
+            program=MAIN, actor="runtime")
 
 
 # ---------------------------------------------------------------------------
@@ -439,14 +460,6 @@ def p3_provenance_hinge():
 
 def p4_validation_by_replay():
     run = FACTS["run_id"]
-    v = SpecRuntime(RT, rk.VULN_PORT)
-    s = SpecRuntime(RT, rk.SECURE_PORT)
-    r_v = evalspec.replay(IDOR_SPEC, v)
-    r_s = evalspec.replay(IDOR_SPEC, s)
-    R.check(r_v["holds"], "P4", "the spec holds against the vulnerable twin",
-            json.dumps([c["ok"] for c in r_v["assertions"]]))
-    R.check(not r_s["holds"], "P4", "the same spec fails against the secure twin",
-            json.dumps([c["ok"] for c in r_s["assertions"]]))
 
     # Every action's receipt goes into the corpus, attributed to a tool run the
     # runtime opened for the replay. A test run that cannot name its receipts is
@@ -477,21 +490,23 @@ def p4_validation_by_replay():
             'running', 'runtime')
     ON CONFLICT (id) DO NOTHING;
     """, program=MAIN, actor="runtime")
-    decision = rk.one(
-        f"SELECT authorize_tool_run({rk.lit(tr)}) ->> 'decision';",
-        program=MAIN, actor="runtime")
-    if decision != "allow":
-        raise RuntimeError(f"validation replay was not authorized: {decision}")
+    gate = json.loads(rk.one(
+        f"SELECT authorize_tool_run({rk.lit(tr)});",
+        program=MAIN, actor="runtime"))
+    capability = gate.get("capability")
+    if not capability:
+        raise RuntimeError(f"validation replay was not authorized: {gate.get('decision')}")
 
-    pg_ids = []
-    for proxy_rid in r_v["receipts"]:
-        if not proxy_rid:
-            continue
-        ident = "31aaaaaa-0000-7000-8000-000000000005"
-        pg_ids.append(rk.mirror_receipt(RT, MAIN, proxy_rid, tr, ident))
-    rk.psql(f"UPDATE tool_runs SET status='success', finished_at=now(), "
-            f"closed_by='PostToolUse' WHERE id={rk.lit(tr)};",
-            program=MAIN, actor="runtime")
+    v = SpecRuntime(RT, rk.VULN_PORT, capability, MAIN)
+    s = SpecRuntime(RT, rk.SECURE_PORT, capability, MAIN)
+    r_v = evalspec.replay(IDOR_SPEC, v)
+    r_s = evalspec.replay(IDOR_SPEC, s)
+    R.check(r_v["holds"], "P4", "the spec holds against the vulnerable twin",
+            json.dumps([c["ok"] for c in r_v["assertions"]]))
+    R.check(not r_s["holds"], "P4", "the same spec fails against the secure twin",
+            json.dumps([c["ok"] for c in r_s["assertions"]]))
+
+    pg_ids = [receipt for receipt in r_v["receipts"] if receipt]
     R.check(len(pg_ids) == len(IDOR_SPEC["actions"]), "P4",
             "every replay action produced a receipt in the corpus",
             f"{len(pg_ids)} receipts")
@@ -537,8 +552,10 @@ def p4_validation_by_replay():
     # control here is the same request against the secure twin, where the same
     # identity gets 403 on the same object. Ticket 05's fixture pair exists
     # precisely so this observation can be made rather than argued.
-    ctrl_ids = [rk.mirror_receipt(RT, MAIN, r, tr, "31aaaaaa-0000-7000-8000-000000000005")
-                for r in r_s["receipts"] if r]
+    ctrl_ids = [receipt for receipt in r_s["receipts"] if receipt]
+    rk.psql(f"UPDATE tool_runs SET status='success', finished_at=now(), "
+            f"closed_by='PostToolUse' WHERE id={rk.lit(tr)};",
+            program=MAIN, actor="runtime")
     rk.psql(f"""
     INSERT INTO observations (id, program_id, label, agent_run_id,
                               subject_entity_id, kind, summary,
@@ -1185,7 +1202,7 @@ def p10_billing():
     r = RT.request("http://api.anthropic.com/api/oauth/claude_cli/create_api_key",
                    lane="agent", method="POST", body=b"{}")
     pr = RT.proxy_receipt(r["receipt_id"]) if r["receipt_id"] else None
-    blocked = (r["status"] == 403) or (pr and pr["decision"] == "blocked")
+    blocked = (r["status"] in (403, 407)) or (pr and pr["decision"] == "blocked")
     R.check(bool(blocked), "P10",
             "create_api_key is refused at the proxy, with a receipt",
             f"status={r['status']} decision={(pr or {}).get('decision')} "
@@ -1395,9 +1412,9 @@ def p_live_agent():
 # ---------------------------------------------------------------------------
 
 STAGES = {
-    "p0": p0_digest_stability,
     "p1": p1_cold_start,
     "p2": p2_claim_protocol,
+    "p0": p0_digest_stability,
     "live": p_live_agent,
     "p3": p3_provenance_hinge,
     "p4": p4_validation_by_replay,

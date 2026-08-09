@@ -57,6 +57,7 @@ RESTORE_ROLE=${RESTORE_ROLE:-rk2_restore}
 # runtime can step back over at will.
 STATE_ROLE=${STATE_ROLE:-rk2_state}
 HUMAN_ROLE=${HUMAN_ROLE:-rk2_human}
+PROXY_ROLE=${PROXY_ROLE:-rk2_proxy}
 
 psql()  { docker exec -i "$CT" psql -U "$MIGRATE_ROLE" -d "$DB" -v ON_ERROR_STOP=1 "$@"; }
 psql1() { psql -At "$@"; }
@@ -102,8 +103,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$HUMAN_ROLE') THEN
         EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '$HUMAN_ROLE');
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$PROXY_ROLE') THEN
+        EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '$PROXY_ROLE');
+    END IF;
     EXECUTE format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', '$STATE_ROLE');
     EXECUTE format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', '$HUMAN_ROLE');
+    EXECUTE format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', '$PROXY_ROLE');
 END \$\$;
 
 -- The one grant that lets enforcement be turned off, on the one role that never
@@ -111,7 +116,7 @@ END \$\$;
 -- "run the restore as a role allowed to turn the triggers off" a real sentence
 -- and not "become superuser".
 GRANT SET ON PARAMETER session_replication_role TO $RESTORE_ROLE;
-REVOKE SET ON PARAMETER session_replication_role FROM $MIGRATE_ROLE, $RUNTIME_ROLE, $STATE_ROLE, $HUMAN_ROLE;
+REVOKE SET ON PARAMETER session_replication_role FROM $MIGRATE_ROLE, $RUNTIME_ROLE, $STATE_ROLE, $HUMAN_ROLE, $PROXY_ROLE;
 
 -- Ticket 28's words, kept where the role is now made. COMMENT ON ROLE needs
 -- CREATEROLE + ADMIN, so it is superuser work like the CREATE itself.
@@ -121,6 +126,8 @@ COMMENT ON ROLE $STATE_ROLE IS
     'the agent-facing read connection (ticket 12). SELECT on an enumerated surface, no write privilege anywhere.';
 COMMENT ON ROLE $RUNTIME_ROLE IS
     'RK2_DATABASE_URL. DML plus EXECUTE, no DDL, no ownership, no TRUNCATE, no session_replication_role.';
+COMMENT ON ROLE $PROXY_ROLE IS
+    'The egress proxy. EXECUTE on capability receipt writers, no direct receipt DML.';
 COMMENT ON ROLE $MIGRATE_ROLE IS
     'RK2_MIGRATE_URL. Held by ./migrate.sh and nothing else.';
 SQL

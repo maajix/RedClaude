@@ -1,5 +1,7 @@
 import ast
 import asyncio
+import contextlib
+import io
 import json
 import os
 import sys
@@ -37,7 +39,18 @@ class FakeMessage:
     pass
 
 
-class FakeResultMessage(FakeMessage):
+class FakeSystemMessage:
+    def __init__(self, source="none", *, subtype="init", include_source=True):
+        self.subtype = subtype
+        self.data = {"apiKeySource": source} if include_source else {}
+
+
+class FakeAssistantMessage:
+    def __init__(self):
+        self.usage = {}
+
+
+class FakeResultMessage:
     def __init__(self):
         self.usage = {}
         self.num_turns = 0
@@ -64,11 +77,11 @@ def _fake_sdk() -> types.ModuleType:
         if False:
             yield None
 
-    sdk.AssistantMessage = FakeMessage
+    sdk.AssistantMessage = FakeAssistantMessage
     sdk.ClaudeAgentOptions = FakeOptions
     sdk.HookMatcher = HookMatcher
     sdk.ResultMessage = FakeResultMessage
-    sdk.SystemMessage = FakeMessage
+    sdk.SystemMessage = FakeSystemMessage
     sdk.create_sdk_mcp_server = create_sdk_mcp_server
     sdk.query = query
     sdk.tool = tool
@@ -184,8 +197,49 @@ class ParentLaunchContractTest(unittest.TestCase):
             "source": "launch:env", "effect": "unverifiable",
         }
         with self.assertRaises(rk.StartupRefusal) as caught:
-            rk._child_result(json.dumps({"startup_refusal": [violation]}), "")
+            rk._child_result("", json.dumps({"startup_refusal": {
+                "phase": "init", "sdk_version": "0.2.132",
+                "cli_version": "2.1.224", "violations": [violation],
+            }}))
         self.assertEqual((violation,), caught.exception.violations)
+        self.assertEqual("init", caught.exception.phase)
+        self.assertEqual("0.2.132", caught.exception.sdk_version)
+        self.assertEqual("2.1.224", caught.exception.cli_version)
+
+    def test_agent_run_closes_only_structured_startup_refusals(self):
+        violation = {
+            "code": "invalid_launch", "vector": None,
+            "source": "launch:env", "effect": "unverifiable",
+        }
+        request = rk.AgentRunRequest(
+            program="11111111-1111-7111-8111-111111111111",
+            agent_run_id="07000000-0000-7000-8000-000000000002",
+            task_id="07000000-0000-7000-8000-000000000001",
+            prompt="fixture prompt",
+        )
+        refusal = rk.StartupRefusal(
+            [violation], "pre_spawn", "0.2.132", "2.1.224"
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            rk, "RUN", Path(temporary)
+        ), patch.object(
+            rk, "_spawn_agent_process", side_effect=refusal
+        ), patch.object(rk, "one", return_value="t") as sql:
+            with self.assertRaises(rk.StartupRefusal):
+                rk.agent_run(request)
+        statement = sql.call_args.args[0]
+        self.assertIn("close_startup_refusal", statement)
+        self.assertIn("pre_spawn", statement)
+        self.assertNotIn("fixture prompt", statement)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            rk, "RUN", Path(temporary)
+        ), patch.object(
+            rk, "_spawn_agent_process", side_effect=RuntimeError("plain stderr")
+        ), patch.object(rk, "one") as sql:
+            with self.assertRaises(RuntimeError):
+                rk.agent_run(request)
+        sql.assert_not_called()
 
 
 class ChildLaunchContractTest(unittest.TestCase):
@@ -217,6 +271,7 @@ class ChildLaunchContractTest(unittest.TestCase):
             })
 
         self.child.JOB = _job(Path("/tmp/unused"))
+        self.child.INIT_CORROBORATED = True
         with patch.object(self.child, "_sql", side_effect=execute), patch.object(
             self.child, "_one", side_effect=one
         ):
@@ -239,6 +294,7 @@ class ChildLaunchContractTest(unittest.TestCase):
 
         async def transport(*, prompt, options):
             calls.append((prompt, options))
+            yield FakeSystemMessage()
             yield FakeResultMessage()
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -281,8 +337,7 @@ class ChildLaunchContractTest(unittest.TestCase):
 
         async def transport(**_kwargs):
             calls.append(True)
-            if False:
-                yield None
+            yield FakeSystemMessage()
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime_dir = Path(temporary) / "run"
@@ -309,8 +364,7 @@ class ChildLaunchContractTest(unittest.TestCase):
 
         async def transport(**_kwargs):
             calls.append(True)
-            if False:
-                yield None
+            yield FakeSystemMessage()
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime_dir = Path(temporary) / "run"
@@ -334,6 +388,140 @@ class ChildLaunchContractTest(unittest.TestCase):
                         )
                     )
         self.assertEqual([True], calls)
+
+    def test_pre_tool_is_closed_until_init_is_corroborated(self):
+        self.child.JOB = _job(Path("/tmp/unused"))
+        with patch.object(self.child, "_sql") as sql:
+            result = asyncio.run(self.child.pre_tool({
+                "tool_name": "mcp__rk2__net_request",
+                "tool_input": {"url": "http://fixture.invalid/"},
+                "tool_use_id": "before-init",
+            }, None, None))
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        sql.assert_not_called()
+
+    def test_init_must_be_first_and_exact_before_any_tool_run(self):
+        cases = {
+            "absent": [],
+            "wrong_first": [FakeResultMessage()],
+            "missing_source": [FakeSystemMessage(include_source=False)],
+            "other_source": [FakeSystemMessage("apiKeyHelper")],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "run"
+            runtime_dir.mkdir()
+            self.child.JOB = _job(runtime_dir)
+            runtime = self._clean_runtime(temporary)
+            for name, stream in cases.items():
+                closed = []
+
+                async def transport(**_kwargs):
+                    try:
+                        for message in stream:
+                            yield message
+                    finally:
+                        closed.append(True)
+
+                with self.subTest(name=name), patch.object(
+                    self.child, "MANAGED_SETTINGS", ()
+                ), patch.object(self.child, "_sql") as sql:
+                    with self.assertRaises(rk.StartupRefusal) as caught:
+                        asyncio.run(self.child._run(
+                            environment={}, runtime=runtime,
+                            options_type=FakeOptions, transport=transport,
+                        ))
+                    self.assertEqual("init", caught.exception.phase)
+                    self.assertEqual({
+                        "code": "auth_source_unexpected", "vector": None,
+                        "source": "init:apiKeySource", "effect": "unverifiable",
+                    }, caught.exception.violations[0])
+                    self.assertFalse(self.child.INIT_CORROBORATED)
+                    sql.assert_not_called()
+                    self.assertTrue(closed)
+
+    def test_all_watched_vectors_and_helper_refuse_before_transport(self):
+        vectors = {
+            "ANTHROPIC_API_KEY": "off_subscription_auth",
+            "ANTHROPIC_AUTH_TOKEN": "off_subscription_auth",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR": "startup_denial",
+            "CLAUDE_CODE_USE_BEDROCK": "provider_reroute",
+            "CLAUDE_CODE_USE_VERTEX": "provider_reroute",
+            "CLAUDE_CODE_USE_FOUNDRY": "provider_reroute",
+            "ANTHROPIC_BASE_URL": "destination_override",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "run"
+            runtime_dir.mkdir()
+            self.child.JOB = _job(runtime_dir)
+            runtime = self._clean_runtime(temporary)
+            for vector, effect in vectors.items():
+                called = []
+
+                async def transport(**_kwargs):
+                    called.append(True)
+                    yield FakeSystemMessage()
+
+                with self.subTest(vector=vector), patch.object(
+                    self.child, "MANAGED_SETTINGS", ()
+                ), self.assertRaises(rk.StartupRefusal) as caught:
+                    asyncio.run(self.child._run(
+                        environment={vector: "synthetic"}, runtime=runtime,
+                        options_type=FakeOptions, transport=transport,
+                    ))
+                self.assertEqual("pre_spawn", caught.exception.phase)
+                self.assertEqual([], called)
+                self.assertEqual({
+                    "code": "credential_vector", "vector": vector,
+                    "source": f"env:{vector}", "effect": effect,
+                }, caught.exception.violations[0])
+
+            managed = Path(temporary) / "managed.json"
+            managed.write_text('{"apiKeyHelper":"synthetic-helper"}')
+            called = []
+
+            async def transport(**_kwargs):
+                called.append(True)
+                yield FakeSystemMessage()
+
+            with patch.object(self.child, "MANAGED_SETTINGS", (managed,)), \
+                 self.assertRaises(rk.StartupRefusal) as caught:
+                asyncio.run(self.child._run(
+                    environment={}, runtime=runtime,
+                    options_type=FakeOptions, transport=transport,
+                ))
+            self.assertEqual([], called)
+            self.assertEqual({
+                "code": "credential_vector", "vector": "apiKeyHelper",
+                "source": f"settings:managed:{managed.resolve()}#apiKeyHelper",
+                "effect": "off_subscription_auth",
+            }, caught.exception.violations[0])
+
+    def test_main_renders_refusal_only_to_stderr_and_exits_78(self):
+        violation = {
+            "code": "unmeasured_runtime", "vector": None,
+            "source": "runtime:sdk-cli", "effect": "unverifiable",
+        }
+        runtime = {"sdk_version": None, "cli_version": None, "cli_path": None}
+        with tempfile.TemporaryDirectory() as temporary:
+            job = _job(Path(temporary))
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", ["agent_child.py", json.dumps(job)]), \
+                 patch.object(self.child, "_runtime_facts", return_value=runtime), \
+                 patch.object(
+                     self.child.anyio, "run",
+                     side_effect=rk.StartupRefusal([violation]),
+                 ), contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    self.child.main()
+
+        self.assertEqual(78, caught.exception.code)
+        self.assertEqual("", stdout.getvalue())
+        rendered = json.loads(stderr.getvalue())
+        self.assertEqual({
+            "phase": "pre_spawn", "sdk_version": None, "cli_version": None,
+            "violations": [violation],
+        }, rendered["startup_refusal"])
 
     def test_settings_fail_closed_and_sources_stay_fixed(self):
         with tempfile.TemporaryDirectory() as temporary:

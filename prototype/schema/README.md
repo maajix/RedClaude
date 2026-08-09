@@ -9,7 +9,7 @@ This is still a prototype. It is not the migration set the build will ship. It
 is the evidence that the decisions survive contact with the database, and — from
 ticket 33 — that they survive contact with **each other**.
 
-Headline: **38 migrations, 113 managed tables, 19 standing checks, 0 problems.**
+Headline: **41 migrations, 113 managed tables, 20 standing checks, 0 problems.**
 `./run_all.sh` is that claim, executed.
 
 ## Postgres major: 18
@@ -51,7 +51,8 @@ tests/
   checks_a.sql        constraint and trigger checks (group A)
   checks_b.sql        purge, replica-mode and integrity-checker checks (group B)
   checks_c.sql        ticket 33's 19 corpus checks (M01–M19)
-  capability_receipts.sql  capability-backed receipt checks (K01–K04)
+  capability_receipts.sql  capability-backed receipt checks (K01–K10)
+  startup_refusal.sql  durable startup-refusal checks (L01–L05)
   scheduler.sql       scheduler fixture plus rank_pass() and claim_one()
   ticket07_checker.sql  ticket 07's event checker under a second name, for prove_holes
   999_drift_probe.sql   the migration nobody should write, written on purpose
@@ -114,7 +115,7 @@ its four other defects fail the run.
 ## Standing checks
 
 `standing_checks` is a table, `run_standing_checks()` runs every row, and
-`assert_standing_checks()` raises. 19 checks. `check_check_registration()` is
+`assert_standing_checks()` raises. 20 checks. `check_check_registration()` is
 the one that closes the loop: a `check_%` function in `public` with no
 `standing_checks` row is itself a problem. Nine of the twelve checkers the
 corpus inherited had no caller at all after their own migration committed, which
@@ -122,10 +123,10 @@ is why four of the five defects this ticket was given were live.
 
 ## Roles, settings, restore
 
-Six roles: `rk2_owner` (owns everything), `rk2_migrate` (applies migrations, no
+Seven roles: `rk2_owner` (owns everything), `rk2_migrate` (applies migrations, no
 `CREATEROLE`), `rk2_runtime` (the write connection), `rk2_state` (the agent read
 connection, column-level grants only), `rk2_human` (membership is the only thing
-authorising `actor_kind='human'`), `rk2_restore`.
+authorising `actor_kind='human'`), `rk2_proxy` (receipt writers only), `rk2_restore`.
 
 Settings ship as `ALTER DATABASE ... SET` and are asserted with their source, so
 a session `SET` cannot satisfy them. `maintenance_work_mem = 256MB` is measured,
@@ -154,7 +155,7 @@ CT=x DB=y ./migrate.sh up       # against an existing container
 ```
 
 `run_all.sh` has ten passes and ends `run_all: everything passed`. Groups A, B,
-C and K end with an `86 checks, 0 failing` line.
+C, K and L end with a `97 checks, 0 failing` line.
 
 ## Check inventory
 

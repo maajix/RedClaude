@@ -50,11 +50,13 @@ TARGETS = [
 IDENTITIES = {
     "userA": {
         "target": "t31",
+        "entity_id": "31aaaaaa-0000-7000-8000-000000000005",
         "secrets": {"user": "userA", "password": "pw-a"},
         "static_headers": {},
     },
     "userB": {
         "target": "t31",
+        "entity_id": "31aaaaaa-0000-7000-8000-000000000006",
         "secrets": {"user": "userB", "password": "pw-b"},
         "static_headers": {},
     },
@@ -62,6 +64,8 @@ IDENTITIES = {
 
 AGENT_PORT = int(os.environ.get("RK_AGENT_PORT", "18830"))
 PROVISION_PORT = int(os.environ.get("RK_PROVISION_PORT", "18833"))
+CONTROL_PORT = int(os.environ.get("RK_CONTROL_PORT", "18834"))
+CONTROL_AUTHORIZATION = os.environ.get("RK_CONTROL_AUTHORIZATION")
 
 IDENTITY_HEADER = "X-RedKraken-Identity"
 CSRF_RAW_HEADER = "X-RedKraken-Csrf-Raw"
