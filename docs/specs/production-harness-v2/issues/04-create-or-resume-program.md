@@ -49,13 +49,18 @@ force and the readiness assertion is made about the connection production uses.
 `tearDownClass` purges its Programs through `app.purging`, which is also what
 proves the immutability triggers release for a purge and hold for anything else.
 
-**These ten have never been executed.** No PostgreSQL 18 with pgvector is
-reachable from this machine: `RK_TEST_SUPERUSER_URL` is unset, there is no
-container, the local server carries no `vector` extension, and no host on the
-network answers on 5432. Ticket 03 records the same limit for the same reason —
-the live suite skips unless that variable is set, and there is no CI to force
-it. Criteria 1, 2 and 4, and the second half of 3 and 5, rest on tests that are
-written and unrun. They should be run before this is treated as proven.
+Run on 2026-08-10 against `pgvector/pgvector:pg18` — PostgreSQL 18.4 with
+pgvector 0.8.6, the pairing ticket 03 was verified on. All ten pass, including
+the negative controls for both branches of the new standing check.
+`tests/test_database.py` is 49 live tests; the whole suite with the server
+present is 272, one skip (`test_packaging`, which needs `setuptools==82.0.1`).
+
+The commit predates that run: the code is `4662e2a`, unchanged by it.
+
+The limit ticket 03 named still stands — the live suite skips unless
+`RK_TEST_SUPERUSER_URL` is set and there is no CI, so nothing forces the run.
+What a clean checkout enforces on its own is the 223-test offline suite and
+`tools/check_baseline.py`.
 
 ### Decisions worth naming
 
