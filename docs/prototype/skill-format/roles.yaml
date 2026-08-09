@@ -1,0 +1,12 @@
+# Stand-in roster. Ticket 11 owns the real one; this file exists only so the
+# validator's R6/R7 have something to check against.
+#
+# `tools` is the security boundary (AgentDefinition.tools). A skill's
+# `allowed-tools` may narrow this set and may never widen it (Q3).
+roles:
+  hunter:
+    tools: [Read, Bash, Glob, Grep]
+    skills: [probe-alpha, probe-beta]
+  validator:
+    tools: [Read, Grep]
+    skills: [probe-alpha]

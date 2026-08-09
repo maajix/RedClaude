@@ -1,0 +1,7 @@
+# Raw probe output. The initialize response carries an `account` block, so the
+# artifacts stay local; README.md records the findings instead.
+artifacts/
+__pycache__/
+
+# Device nodes the agent sandbox masks into every working directory.
+.claude/

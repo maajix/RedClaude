@@ -1,0 +1,85 @@
+# Ticket 31's copy of ticket 04 phase B (`prototype/scope-proxy` `5e5ca2e`,
+# `docs/prototype/scope-proxy/phase-b/compose.yaml`).
+#
+# Three edits, all of them addressing, none of them behaviour:
+#
+#   * `name:` carries the `rk2-t31-` prefix, so every container this file
+#     creates is attributable to this ticket and cannot collide with the
+#     session that owns `rk2-schema` / `rk2-probe`.
+#   * the volume mounts point one level deeper, because this file sits in
+#     `walking-skeleton/phaseb/` and the addon it mounts lives under
+#     `walking-skeleton/vendor/scope-proxy/`.
+#   * nothing else. The subnet is unchanged at 172.31.250.0/24 — verified free
+#     on this host — precisely so that `provision_b.py` and `probe_b.py` run
+#     from `vendor/` byte-for-byte. Changing the subnet would have meant
+#     editing a vendored file to match, and a containment proof that had to
+#     edit the thing it is proving is not a containment proof.
+#
+# The shape is the claim: agent and fixture share no network, so "the agent
+# must go through the proxy" is a routing fact, not a convention.
+
+name: rk2-t31-phase-b
+
+networks:
+  agent-lane:
+    internal: true
+  target-lane:
+    internal: true
+  egress:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+services:
+  fixture:
+    image: python:3.13-alpine
+    networks: [target-lane]
+    environment:
+      RK_FIXTURE_BIND: "0.0.0.0"
+    volumes:
+      - ../vendor/scope-proxy/fixture_app.py:/app/fixture_app.py:ro
+    command: ["python3", "/app/fixture_app.py", "18099"]
+
+  proxy:
+    image: mitmproxy/mitmproxy:12.2.3
+    networks:
+      agent-lane: {}
+      target-lane: {}
+      egress:
+        ipv4_address: 172.31.250.10
+    environment:
+      RK_OUT: /out
+      RK_FIXTURE_PORT: "18099"
+    volumes:
+      - ../vendor/scope-proxy:/addon:ro
+      - ./out:/out
+    command: >
+      mitmdump -q -s /addon/addon.py
+      --mode regular@0.0.0.0:18080
+      --mode regular@172.31.250.10:18081
+      --set connection_strategy=lazy
+      --set confdir=/out/ca
+      --set termlog_verbosity=info
+
+  agent:
+    image: python:3.13-alpine
+    networks: [agent-lane]
+    environment:
+      RK_LABEL: "agent (docker default DNS)"
+      RK_DNS_EXPECT: "open"
+    volumes:
+      - ../vendor/scope-proxy/phase-b/probe_b.py:/probe_b.py:ro
+      - ./out:/out:ro
+    command: ["sleep", "infinity"]
+
+  agent-hardened:
+    image: python:3.13-alpine
+    networks: [agent-lane]
+    dns: ["127.0.0.1"]
+    environment:
+      RK_LABEL: "agent-hardened (DNS upstream blackholed)"
+      RK_DNS_EXPECT: "closed"
+    volumes:
+      - ../vendor/scope-proxy/phase-b/probe_b.py:/probe_b.py:ro
+      - ./out:/out:ro
+    command: ["sleep", "infinity"]

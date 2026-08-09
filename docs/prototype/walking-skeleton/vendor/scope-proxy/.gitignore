@@ -1,0 +1,7 @@
+# out/ holds the run CA -- including mitmproxy-ca.pem, which contains the
+# PRIVATE KEY. That key can forge a certificate for any host a client trusting
+# it talks to. It is generated fresh per run and deleted by `rm -rf out`; it
+# must never reach a commit.
+out/
+__pycache__/
+.claude/

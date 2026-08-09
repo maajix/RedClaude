@@ -1,0 +1,7 @@
+# Roster for the negative fixture only. Lists `widens-tools` so R6 (a skill
+# granting itself a tool its role lacks) is exercised instead of being masked
+# by R7 (no role loads it at all).
+roles:
+  hunter:
+    tools: [Read, Bash]
+    skills: [widens-tools]

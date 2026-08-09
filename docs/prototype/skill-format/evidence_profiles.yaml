@@ -1,0 +1,14 @@
+# Stand-in predicate registry. In the real system each id is a SQL function
+# `evidence_profile_<id>(hypothesis_id) returns boolean` defined in a migration
+# plus a row in `evidence_profiles`, so admissibility stays a database
+# invariant rather than a second copy in YAML (Q4).
+#
+# A skill may only ever be *stricter* than the default; the default applies
+# when a skill declares no profile, or when no skill was recorded for the task.
+profiles:
+  default:
+    description: Every observation points at a provenance record that exists.
+  two_identity_receipts:
+    description: >
+      Default, plus at least two proxy receipts under distinct identities
+      against the same endpoint.

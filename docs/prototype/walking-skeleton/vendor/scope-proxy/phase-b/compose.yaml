@@ -1,0 +1,92 @@
+# PROTOTYPE Phase B: the container topology, made real enough to attack.
+#
+# Phase A proved the proxy enforces scope when the client cooperates by using
+# it. That is not a containment claim -- a client that simply ignores the proxy
+# would have walked straight out. This file is the other half: the agent is
+# placed somewhere that HAS no other way out, and the probe tries to find one.
+#
+# Three networks, not one:
+#
+#   agent-lane   internal. agent + proxy. No NAT, so no internet.
+#   target-lane  internal. proxy + fixture. The agent is NOT on it, so it cannot
+#                reach the target except through the proxy.
+#   egress       the only network with NAT. proxy only.
+#
+# The interesting property is the SHAPE: agent and fixture share no network, so
+# "the agent must go through the proxy" is a routing fact rather than a
+# convention the agent could decline to follow.
+
+name: rk-scope-proxy-phase-b
+
+networks:
+  agent-lane:
+    internal: true
+  target-lane:
+    internal: true
+  egress:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+services:
+  fixture:
+    image: python:3.13-alpine
+    networks: [target-lane]
+    environment:
+      RK_FIXTURE_BIND: "0.0.0.0"
+    volumes:
+      - ../fixture_app.py:/app/fixture_app.py:ro
+    command: ["python3", "/app/fixture_app.py", "18099"]
+
+  proxy:
+    image: mitmproxy/mitmproxy:12.2.3
+    networks:
+      agent-lane: {}
+      target-lane: {}
+      egress:
+        ipv4_address: 172.31.250.10
+    environment:
+      RK_OUT: /out
+      RK_FIXTURE_PORT: "18099"
+    volumes:
+      - ..:/addon:ro
+      - ./out:/out
+    # The two lanes are bound to DIFFERENT addresses on purpose. `0.0.0.0` for
+    # both would put the provisioning listener -- the one that lets a client
+    # send a real password and harvest the session -- on the agent's own network
+    # segment. Binding it to the egress address means the agent gets connection
+    # refused; only the host-side runtime can reach it.
+    command: >
+      mitmdump -q -s /addon/addon.py
+      --mode regular@0.0.0.0:18080
+      --mode regular@172.31.250.10:18081
+      --set connection_strategy=lazy
+      --set confdir=/out/ca
+      --set termlog_verbosity=info
+
+  # Two agents, same network position, different DNS. The pair exists to show
+  # that network isolation alone leaves DNS as an egress channel.
+  agent:
+    image: python:3.13-alpine
+    networks: [agent-lane]
+    environment:
+      RK_LABEL: "agent (docker default DNS)"
+      RK_DNS_EXPECT: "open"
+    volumes:
+      - ./probe_b.py:/probe_b.py:ro
+      - ./out:/out:ro
+    command: ["sleep", "infinity"]
+
+  agent-hardened:
+    image: python:3.13-alpine
+    networks: [agent-lane]
+    # Docker's embedded resolver still answers container names; anything it
+    # cannot answer is forwarded to this upstream, which is nothing at all.
+    dns: ["127.0.0.1"]
+    environment:
+      RK_LABEL: "agent-hardened (DNS upstream blackholed)"
+      RK_DNS_EXPECT: "closed"
+    volumes:
+      - ./probe_b.py:/probe_b.py:ro
+      - ./out:/out:ro
+    command: ["sleep", "infinity"]
