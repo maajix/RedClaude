@@ -7,6 +7,7 @@ from pathlib import Path
 
 import redkraken
 from redkraken.outcome import (
+    EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
     EXIT_OK,
     EXIT_UNSUPPORTED_VERSION,
@@ -158,6 +159,86 @@ class DoctorCommandTest(unittest.TestCase):
         result = run("hunt")
 
         self.assertEqual(EXIT_USAGE, result.returncode)
+
+
+class DatabaseCommandTest(unittest.TestCase):
+    """The database commands, up to the point where a database is needed.
+
+    `run` supplies an environment with no `RK_*` variables in it, so every case
+    here is one an operator meets before anything is opened.
+    """
+
+    def test_a_missing_connection_string_names_the_variable_that_holds_it(self):
+        result = run("db", "migrate")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("db migrate", report["command"])
+        self.assertEqual(
+            [("invalid_configuration", "environment:RK_MIGRATE_URL")],
+            [(item["code"], item["source"]) for item in report["violations"]],
+        )
+
+    def test_each_command_reads_the_variable_for_its_own_role(self):
+        # Separate variables because they are separate roles: the role split is
+        # lost if one exported URL can run every command.
+        observed = {}
+        for operation in ("provision", "migrate", "verify", "status"):
+            report = json.loads(run("db", operation).stdout)
+            observed[operation] = report["violations"][0]["source"]
+
+        self.assertEqual(
+            {
+                "provision": "environment:RK_SUPERUSER_URL",
+                "migrate": "environment:RK_MIGRATE_URL",
+                "verify": "environment:RK_MIGRATE_URL",
+                "status": "environment:RK_MIGRATE_URL",
+            },
+            observed,
+        )
+
+    def test_a_connection_string_this_client_cannot_honour_is_refused(self):
+        result = run("db", "status", "--url", "mysql://rk2@localhost/rk2")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("argument:--url", report["violations"][0]["source"])
+        self.assertIn("must be postgresql://", report["violations"][0]["detail"])
+
+    def test_an_unsupported_connection_parameter_is_refused_rather_than_ignored(self):
+        # A silently dropped sslmode is a downgrade, so an unknown one is a stop.
+        result = run("db", "status", "--url", "postgresql://rk2@localhost/rk2?sslcert=/x")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertIn("unsupported connection parameter", result.stdout)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        # Port 1 is not a PostgreSQL server on any machine this runs on.
+        result = run("db", "status", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual(
+            ["database_unreachable"],
+            [item["code"] for item in json.loads(result.stdout)["violations"]],
+        )
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        url = "postgresql://rk2:s3cr3t-sentinel@127.0.0.1:1/rk2"
+
+        result = run("db", "status", "--url", url)
+
+        self.assertNotIn("s3cr3t-sentinel", result.stdout)
+        self.assertNotIn("s3cr3t-sentinel", result.stderr)
+
+    def test_a_database_command_without_an_operation_is_a_usage_error(self):
+        result = run("db")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("usage: rk db", result.stderr)
+
+    def test_moving_an_archive_requires_being_told_where(self):
+        self.assertEqual(EXIT_USAGE, run("db", "dump").returncode)
+        self.assertEqual(EXIT_USAGE, run("db", "restore").returncode)
 
 
 class ContainmentTest(unittest.TestCase):

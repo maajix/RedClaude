@@ -25,3 +25,9 @@ where = ["src"]
 # Named rather than discovered, so anything that later appears beside the
 # application under `src` has to be shipped on purpose.
 include = ["redkraken*"]
+
+# The schema corpus is part of the application, not a document beside it: `rk db
+# migrate` applies the migrations it was installed with rather than whatever is
+# in the working directory, so they have to be in the wheel.
+[tool.setuptools.package-data]
+redkraken = ["migrations/*.sql"]

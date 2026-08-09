@@ -1,0 +1,171 @@
+-- ---------------------------------------------------------------------------
+-- 20260807T191100Z__server_settings.sql   (ticket 33)
+--
+-- Settings are part of the schema, so they ship as a migration.
+--
+-- WHERE they live: ALTER DATABASE ... SET, i.e. pg_db_role_setting, applied by
+-- the same runner in the same transaction as any other DDL and recorded in
+-- schema_migrations with a checksum. Rejected alternatives:
+--
+--   image / Dockerfile        the value stops being visible to anyone reading
+--                             the schema, and a plain `docker run
+--                             pgvector/pgvector:pg18` silently loses it
+--   postgresql.conf fragment  needs a bind mount plus an initdb hook (the hook
+--                             only fires on an empty PGDATA), so an existing
+--                             container cannot be brought into compliance
+--   ALTER SYSTEM              lands in postgresql.auto.conf, which is not in
+--                             git and applies to every database on the server
+--   per-session SET           invisible, and every caller has to remember; the
+--                             one that forgets gets the slow build or the wrong
+--                             answer with no error
+--
+-- ALTER DATABASE is the only one of the five that is versioned, checksummed,
+-- scoped to this database, applied from empty, and readable back with a source
+-- the assertion can check (pg_settings.source = 'database' — a session-level
+-- SET reports 'session', so the assertion can tell the two apart).
+--
+-- Runs inside the runner's per-migration transaction: ALTER DATABASE ... SET is
+-- transactional, unlike CREATE DATABASE.
+-- MEASURED, AND THE REASON THIS IS A FUNCTION AND NOT A SCRIPT:
+-- `pg_dump` does not dump `ALTER DATABASE ... SET`. Those values live in
+-- pg_db_role_setting, which is a cluster-level catalog only `pg_dumpall` emits.
+-- A database restored from a custom-format dump therefore comes back with
+-- maintenance_work_mem = 64MB and hnsw.iterative_scan = off, with no error
+-- anywhere -- and schema_migrations says this migration is applied, so a runner
+-- that treats migrations as one-shot will never put them back.
+--
+-- So settings are not a one-shot. They are an end-of-run invariant, like
+-- attach_event_triggers(): ./migrate.sh re-executes apply_server_settings() on
+-- every run, and check_server_baseline() asserts the result. `migrate.sh up`
+-- against a freshly restored database applies zero migrations and still repairs
+-- the settings.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION apply_server_settings() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    -- MEASURED, and not obvious: without this line the next two statements fail
+    -- with `permission denied to set parameter "hnsw.iterative_scan"` when the
+    -- migration runs as the database owner rather than as superuser. Until the
+    -- pgvector library is loaded into the backend, `hnsw.*` is an undefined
+    -- custom GUC -- a placeholder -- and defining one is superuser-only. One
+    -- vector cast loads the library, at which point pg_settings reports the four
+    -- hnsw GUCs with context 'user' and the owner may set them.
+    --
+    -- CREATE EXTENSION does NOT load the library; only using a type from it
+    -- does. So this is not a redundant assertion, it is the precondition.
+    PERFORM '[1]'::vector;
+
+    -- ---------------------------------------------------------------------
+    -- maintenance_work_mem = 256MB
+    --
+    -- Measured by ./measure_hnsw.sh on this image, 20 000 rows of vector(1536)
+    -- (the shape of hypothesis_embeddings), 20 000 distinct vectors:
+    --
+    --      setting  spilled  at tuples  build     index
+    --       32MB    yes       4879       74.0 s   156 MB
+    --       64MB    yes       9751       54.6 s   156 MB   <- pgvector default
+    --      128MB    yes      19505       15.6 s   156 MB
+    --      256MB    no          -        12.7 s   156 MB   <- shipped
+    --
+    -- verbatim at the default:
+    --   NOTICE:  hnsw graph no longer fits into maintenance_work_mem after
+    --            9759 tuples
+    --   DETAIL:  Building will take significantly more time.
+    --
+    -- The spill point moves a little run to run on identical data (9751 in the
+    -- sweep, 9759 on the re-run) because the build is parallel; the order of
+    -- magnitude is the finding, not the digits. 5.8x slower, and the default
+    -- gives out around 9 750 rows -- a size one program's suppression path
+    -- reaches inside a single run.
+    --
+    -- Spilling is a slowdown, not an error: no query returns a wrong answer at
+    -- 64MB. That is precisely why it needs a shipped setting and an assertion
+    -- rather than a bug report — nothing fails, it just gets quietly worse.
+    --
+    -- 256MB is the smallest power-of-two step that clears 20 000 rows. Above
+    -- 20 000 rows it stops being sufficient, which is what the hnsw_headroom
+    -- check in check_server_baseline() is for: the number is asserted against
+    -- the actual row count, not trusted.
+    --
+    -- Applies to autovacuum workers on this database too (autovacuum_work_mem
+    -- defaults to -1 = maintenance_work_mem). At three workers that is 768MB
+    -- worst case on a local single-database host: accepted.
+    -- ---------------------------------------------------------------------
+    EXECUTE format('ALTER DATABASE %I SET maintenance_work_mem = %L',
+                   current_database(), '256MB');
+
+    -- ---------------------------------------------------------------------
+    -- hnsw.iterative_scan = relaxed_order
+    --
+    -- This one is not a performance setting. With the pgvector default (off),
+    -- an HNSW scan returns ef_search candidates and *then* applies the WHERE
+    -- clause, so a filtered nearest-neighbour query silently returns fewer rows
+    -- than asked for. Ticket 08's stage-2 suppression query is exactly that
+    -- shape: k nearest hypotheses WITHIN one program.
+    --
+    -- Measured by ./measure_hnsw.sh, 20 000 rows over 20 programs, LIMIT 10
+    -- filtered to one program, planner forced onto the index (enable_seqscan
+    -- = off):
+    --
+    --     off (default)   1 row returned for LIMIT 10
+    --     relaxed_order  10 rows returned for LIMIT 10
+    --
+    -- One near-match instead of ten is not an error; it reads as "almost
+    -- nothing similar", so stage-2 suppression would pass nine duplicate
+    -- hypotheses out of ten through and leave no trace that it had failed to
+    -- look. The wrong answer is silent and plausible, which is the worst shape
+    -- a default can have.
+    --
+    -- At 20 000 rows the planner in fact prefers a sequential scan for this
+    -- query and the bug is dormant — it wakes up when the index looks cheaper.
+    -- That is the argument for setting it now rather than when it bites.
+    --
+    -- relaxed_order over strict_order: strict_order refuses to over-fetch and
+    -- keeps exact ordering at the cost of more scanning; the suppression stage
+    -- wants candidates, and ranking happens afterwards in SQL.
+    -- ---------------------------------------------------------------------
+    EXECUTE format('ALTER DATABASE %I SET hnsw.iterative_scan = %L',
+                   current_database(), 'relaxed_order');
+
+    -- Ceiling on the iterative scan. Default 20000 = the whole test corpus, so
+    -- it would stop early once a program's embedding count grows. 40000 keeps
+    -- the bound meaningful at the sizes measured; it is a bound, not a target.
+    EXECUTE format('ALTER DATABASE %I SET hnsw.max_scan_tuples = %L',
+                   current_database(), '40000');
+END $$;
+
+SELECT apply_server_settings();
+
+-- Settings NOT shipped, on purpose, each because the assertion tests it instead:
+--
+--   session_replication_role     'origin' is the default and must stay it;
+--                                'replica' turns every event trigger off. It is
+--                                asserted, never set.
+--   default_transaction_isolation 'read committed' is the default and is what
+--                                FOR UPDATE SKIP LOCKED needs. Asserted.
+--   hnsw.ef_search               a recall/latency knob, and no measurement here
+--                                justifies moving it off 40. Ticket 08 owns the
+--                                recall requirement; when it states one, the
+--                                number belongs in a migration next to this one.
+--   shared_buffers, work_mem     postmaster/unmeasured. Shipping an unmeasured
+--                                number is the thing this ticket is against.
+--
+-- And settings that CANNOT ship this way at all, measured rather than assumed:
+--
+--   ALTER DATABASE rk2 SET wal_level      = 'logical' -> ERROR:  parameter
+--   ALTER DATABASE rk2 SET shared_buffers = '512MB'   ->   "..." cannot be
+--   ALTER DATABASE rk2 SET max_connections= '200'     ->   changed without
+--                                                          restarting the server
+--
+-- Postmaster-context GUCs have no per-database scope, so they belong to the
+-- image/command line and a migration can only ASSERT them. check_server_baseline()
+-- does exactly that for server_version_num and pgvector.
+--
+-- This is also the answer to the full-history-auditing question ticket 07
+-- handed over: logical decoding needs wal_level = 'logical', which the line
+-- above shows cannot be turned on from a migration, and pgaudit is not in this
+-- image at all -- pg_available_extensions on pgvector/pgvector:pg18 offers
+-- pg_stat_statements and vector, and no audit extension.
+-- Both are image decisions, not schema decisions. The event log plus 016's
+-- suppressed_writes table is what this schema offers; anything stronger changes
+-- how the container is built and is out of this ticket's scope.

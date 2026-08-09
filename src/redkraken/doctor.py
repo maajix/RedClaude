@@ -12,14 +12,19 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import __version__, config, outcome
-from redkraken.outcome import MISSING_DEPENDENCY, UNSUPPORTED_VERSION, Violation
+from redkraken.outcome import (
+    MISSING_DEPENDENCY,
+    RESULT_SCHEMA_VERSION,
+    UNSUPPORTED_VERSION,
+    Assertion,
+    Ledger,
+    Violation,
+)
 
-
-RESULT_SCHEMA_VERSION = 1
 
 #: The interpreter range this runtime is exercised against, as an inclusive
 #: minimum and an exclusive maximum. `pyproject.toml` declares the same range.
@@ -47,18 +52,6 @@ class Requirements:
 
 #: The requirements this application declares. Operator commands use these.
 REQUIREMENTS = Requirements()
-
-
-@dataclass(frozen=True)
-class Assertion:
-    """One readiness statement and whether it holds on this machine."""
-
-    name: str
-    ok: bool
-    detail: str
-
-    def as_dict(self) -> dict:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail}
 
 
 @dataclass(frozen=True)
@@ -113,7 +106,7 @@ def diagnose(
     corrupting the running interpreter. Operator commands supply neither.
     """
     version = tuple(python_version) if python_version is not None else tuple(sys.version_info[:3])
-    ledger = _Ledger()
+    ledger = Ledger()
 
     _assert_python(ledger, version)
     _assert_modules(ledger, requirements.modules)
@@ -129,35 +122,11 @@ def diagnose(
     )
 
 
-@dataclass
-class _Ledger:
-    """Collects every assertion, and a violation for each one that fails.
-
-    Recording both together is what keeps a refusal explicable: an operator
-    reading the result can always find the assertion behind a violation.
-    """
-
-    assertions: list[Assertion] = field(default_factory=list)
-    violations: list[Violation] = field(default_factory=list)
-
-    def hold(self, name: str, detail: str) -> None:
-        self.assertions.append(Assertion(name=name, ok=True, detail=detail))
-
-    def fail(self, name: str, detail: str, *, code: str, source: str) -> None:
-        self.assertions.append(Assertion(name=name, ok=False, detail=detail))
-        self.violations.append(Violation(code=code, source=source, detail=detail))
-
-    def refuse(self, name: str, detail: str, refusals: tuple[Violation, ...]) -> None:
-        """Record an assertion refused by violations raised elsewhere."""
-        self.assertions.append(Assertion(name=name, ok=False, detail=detail))
-        self.violations.extend(refusals)
-
-
 def _version(parts: tuple[int, ...]) -> str:
     return ".".join(str(part) for part in parts)
 
 
-def _assert_python(ledger: _Ledger, version: tuple[int, ...]) -> None:
+def _assert_python(ledger: Ledger, version: tuple[int, ...]) -> None:
     minimum, below = SUPPORTED_PYTHON
     rendered = _version(version)
     if minimum <= tuple(version[:2]) < below:
@@ -171,7 +140,7 @@ def _assert_python(ledger: _Ledger, version: tuple[int, ...]) -> None:
     )
 
 
-def _assert_modules(ledger: _Ledger, modules: tuple[str, ...]) -> None:
+def _assert_modules(ledger: Ledger, modules: tuple[str, ...]) -> None:
     for name in sorted(modules):
         try:
             importlib.import_module(name)
@@ -189,7 +158,7 @@ def _assert_modules(ledger: _Ledger, modules: tuple[str, ...]) -> None:
             ledger.hold(f"module:{name}", "importable")
 
 
-def _assert_distributions(ledger: _Ledger, distributions: tuple[tuple[str, str], ...]) -> None:
+def _assert_distributions(ledger: Ledger, distributions: tuple[tuple[str, str], ...]) -> None:
     for name, pinned in sorted(distributions):
         try:
             installed = importlib.metadata.version(name)
@@ -208,7 +177,7 @@ def _assert_distributions(ledger: _Ledger, distributions: tuple[tuple[str, str],
         )
 
 
-def _assert_configuration(ledger: _Ledger, path: Path | None) -> dict | None:
+def _assert_configuration(ledger: Ledger, path: Path | None) -> dict | None:
     if path is None:
         ledger.hold("configuration", "no configuration supplied")
         return None
