@@ -7,6 +7,7 @@ outcome class without parsing prose.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -15,13 +16,14 @@ MISSING_DEPENDENCY = "missing_dependency"
 UNSUPPORTED_VERSION = "unsupported_version"
 
 EXIT_OK = 0
+EXIT_UNCLASSIFIED = 1
 EXIT_USAGE = 2
 EXIT_INVALID_CONFIGURATION = 3
 EXIT_UNSUPPORTED_VERSION = 4
 EXIT_MISSING_DEPENDENCY = 5
 
-#: Reported first-to-last when several classes are observed at once. An
-#: unsupported runtime outranks a missing dependency, which outranks operator
+#: Reported and exited first-to-last when several classes are observed at once.
+#: An unsupported runtime outranks a missing dependency, which outranks operator
 #: configuration, because the earlier fact explains the later ones.
 PRECEDENCE = (
     (UNSUPPORTED_VERSION, EXIT_UNSUPPORTED_VERSION),
@@ -43,8 +45,25 @@ class Violation:
 
 
 def exit_code(violations: tuple[Violation, ...]) -> int:
+    """The status a caller acts on: the most fundamental class observed.
+
+    A violation whose class this table does not know still exits non-zero. The
+    alternative — reporting a refusal and exiting `0` — would let a caller read
+    a refused configuration as a ready one, which is the one failure this
+    function exists to prevent.
+    """
+    if not violations:
+        return EXIT_OK
     codes = {violation.code for violation in violations}
     for code, status in PRECEDENCE:
         if code in codes:
             return status
-    return EXIT_OK
+    return EXIT_UNCLASSIFIED
+
+
+def ordered(violations: Iterable[Violation]) -> tuple[Violation, ...]:
+    """Violations in precedence order, then by where they were observed."""
+    ranks = {code: rank for rank, (code, _) in enumerate(PRECEDENCE)}
+    return tuple(
+        sorted(violations, key=lambda item: (ranks.get(item.code, len(ranks)), item.source, item.detail))
+    )

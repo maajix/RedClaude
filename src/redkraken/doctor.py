@@ -112,7 +112,7 @@ def diagnose(
     parameters so that the negative outcomes stay reachable from tests without
     corrupting the running interpreter. Operator commands supply neither.
     """
-    version = tuple(python_version) if python_version else tuple(sys.version_info[:3])
+    version = tuple(python_version) if python_version is not None else tuple(sys.version_info[:3])
     ledger = _Ledger()
 
     _assert_python(ledger, version)
@@ -125,7 +125,7 @@ def diagnose(
         python_version=_version(version),
         assertions=tuple(ledger.assertions),
         configuration=summary,
-        violations=tuple(sorted(ledger.violations)),
+        violations=outcome.ordered(ledger.violations),
     )
 
 
@@ -175,7 +175,10 @@ def _assert_modules(ledger: _Ledger, modules: tuple[str, ...]) -> None:
     for name in sorted(modules):
         try:
             importlib.import_module(name)
-        except ImportError:
+        except (ImportError, ValueError):
+            # ValueError covers an empty or malformed name: a broken
+            # requirement table rather than a module this machine lacks.
+            # Either way the requirement is not satisfied here.
             ledger.fail(
                 f"module:{name}",
                 f"required interpreter module {name} cannot be imported",

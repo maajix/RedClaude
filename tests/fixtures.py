@@ -1,5 +1,7 @@
 """The Program configuration the runtime tests are written against."""
 
+import atexit
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -47,9 +49,18 @@ host = "oob.example.net"
 """
 
 
+def scratch() -> Path:
+    """A directory of this run's own, removed when the run ends."""
+    return Path(tempfile.mkdtemp(dir=_ROOT))
+
+
 def write(text: str, name: str = "program.toml") -> Path:
     """Put one configuration in a directory of its own, so writes are visible."""
-    directory = Path(tempfile.mkdtemp())
-    source = directory / name
+    source = scratch() / name
     source.write_text(text, encoding="utf-8")
     return source
+
+
+#: One root for everything the suite writes, so a run leaves nothing behind.
+_ROOT = tempfile.mkdtemp(prefix="redkraken-tests-")
+atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)

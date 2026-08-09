@@ -13,11 +13,17 @@ import hashlib
 import ipaddress
 import json
 import re
-import tomllib
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken.outcome import INVALID_CONFIGURATION, UNSUPPORTED_VERSION, Violation
+from redkraken.outcome import (
+    INVALID_CONFIGURATION,
+    MISSING_DEPENDENCY,
+    UNSUPPORTED_VERSION,
+    Violation,
+    ordered,
+)
 
 
 SUPPORTED_SCHEMA_VERSIONS = (1,)
@@ -64,21 +70,38 @@ SECRET_KEYS = (
     "value",
 )
 
+#: A configuration is policy, not data: anything larger is not one.
+MAXIMUM_BYTES = 1 << 20
+
 _SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-_HOSTNAME = re.compile(rf"{_LABEL}(\.{_LABEL})*")
 
-#: A wildcard must name at least two labels of its own, so an inclusion cannot
-#: reach a whole public suffix by writing `*.com`.
-_WILDCARD = re.compile(rf"\*\.{_LABEL}(\.{_LABEL})+")
+#: A final label begins with a letter, so a dotted number is read as an address
+#: or refused rather than accepted as a name, and a name carries at least two
+#: labels, so a bare `com` cannot put a whole registry in scope.
+_TOP_LABEL = r"[a-z]([a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(rf"({_LABEL}\.)+{_TOP_LABEL}")
+
+#: An inclusion's wildcard must name at least two labels of its own. It is a
+#: floor, not a public-suffix rule: `*.co.uk` still passes, and how wide an
+#: inclusion may be remains the operator's judgement against the Program.
+_WILDCARD = re.compile(rf"\*\.({_LABEL}\.)+{_TOP_LABEL}")
+
+#: An exclusion may be as wide as the operator likes, down to a single label.
+#: Breadth here withdraws authority rather than claiming it, so the inclusion
+#: floor would be on the wrong side of the rule.
+_BROAD_HOST = re.compile(rf"(\*\.)?({_LABEL}\.)*{_TOP_LABEL}")
 _HOST_SHAPE = "must be a hostname, a wildcard such as *.example.com, or an address"
 
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
+_PATH_SHAPE = (
+    "must be a path prefix beginning with one forward slash, printable and free of .. segments"
+)
 
 #: A reference names a runtime-owned slot and nothing else. Any other scheme
 #: would let a configuration carry its own credential material — a URL with
 #: userinfo, for one — which is the leak the reference exists to prevent.
-_REFERENCE = re.compile(r"slot://[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+")
+_REFERENCE = re.compile(r"slot://[a-z0-9][a-z0-9._-]{0,62}(/[a-z0-9][a-z0-9._-]{0,62}){1,8}")
 _REFERENCE_SHAPE = "a runtime-owned reference such as slot://identity/name"
 
 
@@ -106,8 +129,11 @@ class Configuration:
             "canonical_sha256": self.canonical_sha256,
             "program_name": self.document["program"]["name"],
             "program_platform": self.document["program"]["platform"],
-            "rules_of_engagement": dict(self.document["rules_of_engagement"]),
-            "budgets": dict(self.document["budgets"]),
+            "rules_of_engagement": {
+                control: self.document["rules_of_engagement"][control]
+                for control in RULES_OF_ENGAGEMENT
+            },
+            "budgets": {limit: self.document["budgets"][limit] for limit in BUDGET_LIMITS},
             "scope": {"include": len(scope["include"]), "exclude": len(scope["exclude"])},
             "identities": [entry["name"] for entry in self.document["identity"]],
             "required_headers": [entry["name"] for entry in self.document["required_header"]],
@@ -116,19 +142,51 @@ class Configuration:
 
 
 def load(path: Path) -> tuple[Configuration | None, tuple[Violation, ...]]:
-    """Read, validate and hash the configuration at `path`."""
+    """Read, validate and hash the configuration at `path`.
+
+    Every way this can fail is a violation the caller can report. A file that
+    cannot be read, is not a file at all, is too large to be policy, or cannot
+    be parsed all leave by the same door as a schema refusal, because an
+    operator scripting `rk doctor` has to be able to parse the answer.
+    """
+    # Imported here rather than at module scope so that an interpreter built
+    # without it is reported as a missing dependency instead of a traceback.
+    try:
+        import tomllib
+    except ImportError:
+        return None, (
+            Violation(
+                code=MISSING_DEPENDENCY,
+                source="runtime:module:tomllib",
+                detail="required interpreter module tomllib cannot be imported",
+            ),
+        )
+
     file = Path(path)
     try:
+        status = file.stat()
+    except (OSError, ValueError) as error:
+        return None, (_refusal(f"cannot read configuration: {_reason(error)}"),)
+    if not stat.S_ISREG(status.st_mode):
+        return None, (_refusal("cannot read configuration: not a regular file"),)
+    if status.st_size > MAXIMUM_BYTES:
+        return None, (
+            _refusal(f"cannot read configuration: larger than {MAXIMUM_BYTES} bytes"),
+        )
+    try:
         data = file.read_bytes()
-    except OSError as error:
-        return None, (_refusal(f"cannot read configuration: {error.strerror}"),)
+    except (OSError, ValueError) as error:
+        return None, (_refusal(f"cannot read configuration: {_reason(error)}"),)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return None, (_refusal("cannot read configuration: not UTF-8 text"),)
     try:
         document = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
+    except RecursionError:
+        return None, (_refusal("cannot parse configuration: nesting is too deep"),)
+    except ValueError as error:
+        # Never the parser's own message: a malformed line may hold a secret.
         line = getattr(error, "lineno", None)
         where = f" at line {line}" if isinstance(line, int) else ""
         return None, (_refusal(f"cannot parse configuration{where}"),)
@@ -151,12 +209,20 @@ def load(path: Path) -> tuple[Configuration | None, tuple[Violation, ...]]:
 def validate(document: object) -> tuple[dict | None, tuple[Violation, ...]]:
     """Check one parsed document, returning its normalised form or violations."""
     reader = _Reader()
-    root = reader.table(document, "", TOP_LEVEL)
-    if root is None:
-        return None, tuple(sorted(reader.violations))
+    if not isinstance(document, dict):
+        reader.fail("", "must be a table")
+        return None, ordered(reader.violations)
 
+    # The version is settled before anything else is read. A document written
+    # for a schema this build does not know would otherwise be reported as a
+    # pile of unknown keys instead of as the single fact that explains them.
+    version = _schema_version(reader, document)
+    if version is None:
+        return None, ordered(reader.violations)
+
+    root = reader.table(document, "", TOP_LEVEL)
     normalized = {
-        "schema_version": _schema_version(reader, root),
+        "schema_version": version,
         "program": _program(reader, root),
         "rules_of_engagement": _rules_of_engagement(reader, root),
         "budgets": _budgets(reader, root),
@@ -166,7 +232,7 @@ def validate(document: object) -> tuple[dict | None, tuple[Violation, ...]]:
         "callback": _entries(reader, root, "callback", CALLBACK_KEYS, _callback),
     }
     if reader.violations:
-        return None, tuple(sorted(reader.violations))
+        return None, ordered(reader.violations)
     return normalized, ()
 
 
@@ -179,6 +245,12 @@ def canonical_bytes(document: dict) -> bytes:
 
 def _refusal(detail: str) -> Violation:
     return Violation(code=INVALID_CONFIGURATION, source="config", detail=detail)
+
+
+def _reason(error: Exception) -> str:
+    """Why a read failed, in the operating system's words and nothing more."""
+    strerror = getattr(error, "strerror", None)
+    return strerror if isinstance(strerror, str) and strerror else type(error).__name__
 
 
 def _join(source: str, key: str) -> str:
@@ -248,18 +320,27 @@ class _Reader:
             return None
         return value
 
-    def host(self, value: object, source: str) -> str | None:
+    def host(self, value: object, source: str, broad: bool = False) -> str | None:
+        """One host, normalised so that two spellings of it hash alike.
+
+        An address is read first, so a dotted number is never mistaken for a
+        name; a name is lowercased and its root dot dropped. `broad` relaxes
+        the wildcard floor for an exclusion, where breadth withdraws authority
+        instead of claiming it.
+        """
         if not isinstance(value, str):
             self.fail(source, "must be text")
             return None
-        if _HOSTNAME.fullmatch(value) or _WILDCARD.fullmatch(value):
-            return value
         try:
-            ipaddress.ip_address(value)
+            return str(ipaddress.ip_address(value))
         except ValueError:
-            self.fail(source, _HOST_SHAPE)
-            return None
-        return value
+            pass
+        name = value[:-1].lower() if value.endswith(".") else value.lower()
+        patterns = (_BROAD_HOST,) if broad else (_HOSTNAME, _WILDCARD)
+        if any(pattern.fullmatch(name) for pattern in patterns):
+            return name
+        self.fail(source, _HOST_SHAPE)
+        return None
 
 
 def _schema_version(reader: _Reader, root: dict) -> int | None:
@@ -330,11 +411,16 @@ def _scope(reader: _Reader, root: dict) -> dict | None:
         return None
     return {
         "include": _rules(reader, table, "include", required=True),
-        "exclude": _rules(reader, table, "exclude", required=False),
+        "exclude": _rules(reader, table, "exclude", required=False, broad=True),
     }
 
 
-def _rules(reader: _Reader, scope: dict, key: str, required: bool) -> list[dict]:
+def _rules(reader: _Reader, scope: dict, key: str, required: bool, broad: bool = False) -> list[dict]:
+    """The rules under one side of the scope, deduplicated and ordered.
+
+    Two entries that say the same thing are one rule, so a configuration that
+    repeats itself hashes the same as the one that does not.
+    """
     source = f"scope.{key}"
     if key not in scope:
         if required:
@@ -343,21 +429,24 @@ def _rules(reader: _Reader, scope: dict, key: str, required: bool) -> list[dict]
     entries = reader.array(scope[key], source, minimum=1 if required else 0)
     if entries is None:
         return []
-    rules = [_rule(reader, entry, f"{source}[{index}]") for index, entry in enumerate(entries)]
-    return sorted((rule for rule in rules if rule is not None), key=canonical_bytes)
+    rules = [
+        _rule(reader, entry, f"{source}[{index}]", broad) for index, entry in enumerate(entries)
+    ]
+    unique = {canonical_bytes(rule): rule for rule in rules if rule is not None}
+    return [unique[encoded] for encoded in sorted(unique)]
 
 
-def _rule(reader: _Reader, entry: object, source: str) -> dict | None:
+def _rule(reader: _Reader, entry: object, source: str, broad: bool = False) -> dict | None:
     table = reader.table(entry, source, RULE_KEYS)
     if table is None:
         return None
     host = None
     raw = reader.required(table, source, "host")
     if raw is not None:
-        host = reader.host(raw, f"{source}.host")
+        host = reader.host(raw, f"{source}.host", broad)
     return {
         "host": host,
-        "paths": _members(reader, table, source, "paths", _is_path, "must begin with a forward slash"),
+        "paths": _members(reader, table, source, "paths", _is_path, _PATH_SHAPE),
         "ports": _members(reader, table, source, "ports", _is_port, "must be between 1 and 65535"),
         "protocols": _members(
             reader, table, source, "protocols", _is_protocol, "must be one of: " + ", ".join(PROTOCOLS)
@@ -388,7 +477,18 @@ def _is_protocol(value: object) -> bool:
 
 
 def _is_path(value: object) -> bool:
-    return isinstance(value, str) and value.startswith("/")
+    """A path prefix on the host that names it, and nothing wider.
+
+    `//elsewhere.example/x` is a protocol-relative URL that would carry the
+    prefix to another origin; a `..` segment walks out of the prefix it appears
+    to name; a control or format character makes the printed rule disagree with
+    the matched one.
+    """
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+        return False
+    if not value.isprintable():
+        return False
+    return ".." not in value.split("/")
 
 
 def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build) -> list[dict]:
@@ -417,14 +517,20 @@ def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build
 
 
 def _identity(reader: _Reader, table: dict, source: str) -> dict | None:
+    """Both fields are read before the entry is dropped.
+
+    Leaving on a bad name would hide the `slot_ref` violation behind it, and
+    that field is the one deciding whether a configuration carries credential
+    material of its own.
+    """
     name = _name(reader, table, source, _SLUG, _SLUG.pattern)
-    if name is None:
-        return None
     reference = None
     if "slot_ref" in table:
         reference = reader.text(
             table["slot_ref"], f"{source}.slot_ref", _REFERENCE, _REFERENCE_SHAPE
         )
+    if name is None:
+        return None
     return {"name": name, "slot_ref": reference}
 
 

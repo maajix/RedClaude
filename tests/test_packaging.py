@@ -1,18 +1,17 @@
+import importlib.metadata
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import tomllib
 import unittest
-from pathlib import Path
 
 import redkraken
 from redkraken import doctor
 from tests import ROOT
-from tests.fixtures import VALID, write
+from tests.fixtures import VALID, scratch, write
 
 
 def environment() -> dict[str, str]:
@@ -30,6 +29,11 @@ class PackagingTest(unittest.TestCase):
         self.assertEqual("redkraken", self.pyproject["project"]["name"])
         self.assertEqual({"rk": "redkraken.cli:main"}, self.pyproject["project"]["scripts"])
         self.assertEqual(["src"], self.pyproject["tool"]["setuptools"]["packages"]["find"]["where"])
+
+    def test_only_the_application_is_shipped(self):
+        self.assertEqual(
+            ["redkraken*"], self.pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+        )
 
     def test_the_version_has_one_source(self):
         self.assertEqual(
@@ -63,12 +67,29 @@ class InstallationTest(unittest.TestCase):
     README tells an operator to and then runs the shipped `rk` script.
     """
 
-    def test_the_installed_command_reports_its_version_and_diagnoses(self):
-        for module in ("ensurepip", "setuptools"):
-            if importlib.util.find_spec(module) is None:
-                self.skipTest(f"the documented installation path needs {module}")
+    def buildable(self) -> None:
+        """Skip unless this machine can build offline against the pinned backend.
 
-        checkout = Path(tempfile.mkdtemp()) / "checkout"
+        Without network access the build uses the interpreter's own setuptools,
+        so a machine carrying a different one cannot satisfy the pin. That is a
+        fact about the machine, not about the packaging under test.
+        """
+        if importlib.util.find_spec("ensurepip") is None:
+            self.skipTest("the documented installation path needs ensurepip")
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        for requirement in pyproject["build-system"]["requires"]:
+            name, _, pinned = requirement.partition("==")
+            try:
+                installed = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                self.skipTest(f"the offline installation path needs {requirement}")
+            if installed != pinned:
+                self.skipTest(f"the offline installation path needs {requirement}, not {installed}")
+
+    def test_the_installed_command_reports_its_version_and_diagnoses(self):
+        self.buildable()
+
+        checkout = scratch() / "checkout"
         checkout.mkdir()
         for name in ("pyproject.toml", "README.md"):
             shutil.copy(ROOT / name, checkout / name)
@@ -76,10 +97,13 @@ class InstallationTest(unittest.TestCase):
             ROOT / "src", checkout / "src", ignore=shutil.ignore_patterns("__pycache__")
         )
         venv = checkout / ".venv"
+        # A home of its own, so an operator's pip configuration cannot decide
+        # what this test installs or where it looks for it.
+        installer = environment() | {"HOME": str(scratch()), "PIP_CONFIG_FILE": os.devnull}
 
         created = subprocess.run(
             [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
-            env=environment(),
+            env=installer,
             text=True,
             capture_output=True,
             check=False,
@@ -97,7 +121,7 @@ class InstallationTest(unittest.TestCase):
                 ".",
             ],
             cwd=str(checkout),
-            env=environment(),
+            env=installer,
             text=True,
             capture_output=True,
             check=False,

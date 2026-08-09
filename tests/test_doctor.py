@@ -1,9 +1,7 @@
 import importlib.metadata
 import json
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 
 from redkraken import doctor
 from redkraken.doctor import Requirements
@@ -13,7 +11,7 @@ from redkraken.outcome import (
     EXIT_OK,
     EXIT_UNSUPPORTED_VERSION,
 )
-from tests.fixtures import VALID, write
+from tests.fixtures import VALID, scratch, write
 
 
 def installed_distribution() -> tuple[str, str] | None:
@@ -82,6 +80,12 @@ class DistinctOutcomeTest(unittest.TestCase):
 
     def test_interpreter_below_the_supported_range_is_refused(self):
         diagnosis = doctor.diagnose(None, python_version=(3, 13, 9))
+
+        self.assertEqual(EXIT_UNSUPPORTED_VERSION, diagnosis.exit_code)
+
+    def test_a_version_that_says_nothing_is_refused_rather_than_ignored(self):
+        """An empty version is a stated fact about the interpreter, not an absent one."""
+        diagnosis = doctor.diagnose(None, python_version=())
 
         self.assertEqual(EXIT_UNSUPPORTED_VERSION, diagnosis.exit_code)
 
@@ -162,7 +166,7 @@ class AggregationTest(unittest.TestCase):
 
 class NoSideEffectTest(unittest.TestCase):
     def test_diagnosis_writes_nothing_beside_the_configuration(self):
-        directory = Path(tempfile.mkdtemp())
+        directory = scratch()
         source = directory / "program.toml"
         source.write_text(VALID, encoding="utf-8")
         before = source.read_bytes()

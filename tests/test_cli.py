@@ -2,7 +2,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,7 +13,7 @@ from redkraken.outcome import (
     EXIT_USAGE,
 )
 from tests import ROOT, SOURCE
-from tests.fixtures import VALID, write
+from tests.fixtures import VALID, scratch, write
 
 
 #: Records the effects `rk doctor` promises never to have, rather than raising
@@ -25,11 +24,21 @@ import json, os, sys
 observed = []
 
 
+REACHING_OUT = (
+    "socket.", "urllib.", "http.client", "ftplib.", "smtplib.",
+    "subprocess.", "os.exec", "os.system", "os.spawn", "os.posix_spawn", "os.fork",
+)
+
+#: Ways to change the file system that never open anything, so the `open`
+#: branch below would not see them.
+CHANGING = (
+    "os.mkdir", "os.remove", "os.rename", "os.rmdir", "os.chmod", "os.chown",
+    "os.symlink", "os.link", "os.truncate", "os.utime",
+)
+
+
 def hook(event, arguments):
-    if event.startswith((
-        "socket.", "urllib.", "http.client", "ftplib.", "smtplib.",
-        "subprocess.", "os.exec", "os.system", "os.spawn", "os.fork",
-    )):
+    if event.startswith(REACHING_OUT) or event in CHANGING:
         observed.append(event)
     elif event == "open":
         mode, flags = arguments[1], arguments[2]
@@ -120,9 +129,15 @@ class DoctorCommandTest(unittest.TestCase):
         )
 
     def test_absent_configuration_file_exits_three(self):
-        result = run("doctor", "--config", str(Path(tempfile.mkdtemp()) / "absent.toml"))
+        result = run("doctor", "--config", str(scratch() / "absent.toml"))
 
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+
+    def test_a_directory_is_not_a_configuration(self):
+        result = run("doctor", "--config", str(scratch()))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertIn("not a regular file", result.stdout)
 
     def test_unsupported_configuration_version_exits_four(self):
         result = run("doctor", "--config", str(write(VALID.replace("schema_version = 1", "schema_version = 9"))))

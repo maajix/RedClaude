@@ -1,10 +1,17 @@
-import tempfile
+import sys
 import unittest
-from pathlib import Path
+from unittest import mock
 
 from redkraken import config
-from redkraken.outcome import INVALID_CONFIGURATION, UNSUPPORTED_VERSION
-from tests.fixtures import VALID, write
+from redkraken.outcome import INVALID_CONFIGURATION, MISSING_DEPENDENCY, UNSUPPORTED_VERSION
+from tests.fixtures import VALID, scratch, write
+
+
+#: The operator-visible wording of a refused path, written out here so that
+#: changing it is a decision rather than a side effect.
+PATH_SHAPE = (
+    "must be a path prefix beginning with one forward slash, printable and free of .. segments"
+)
 
 
 def violations(text: str) -> list[tuple[str, str, str]]:
@@ -167,7 +174,7 @@ class ScopeTest(unittest.TestCase):
     def test_port_range_protocol_and_path_shapes_are_checked(self):
         self.assertEqual(
             [
-                (INVALID_CONFIGURATION, "config:scope.include[0].paths[0]", "must begin with a forward slash"),
+                (INVALID_CONFIGURATION, "config:scope.include[0].paths[0]", PATH_SHAPE),
                 (INVALID_CONFIGURATION, "config:scope.include[0].ports[0]", "must be between 1 and 65535"),
                 (INVALID_CONFIGURATION, "config:scope.include[0].protocols[0]", "must be one of: http, https"),
             ],
@@ -194,11 +201,69 @@ class ScopeTest(unittest.TestCase):
 
         self.assertEqual((), found)
 
-    def test_wildcard_may_not_reach_a_whole_public_suffix(self):
-        self.assertEqual(
-            ["config:scope.include[0].host"],
-            sources(VALID.replace('host = "app.example.com"', 'host = "*.com"')),
+    def test_an_inclusion_host_is_a_name_an_address_or_a_wildcard_over_two_labels(self):
+        accepted = ("app.example.com", "*.example.com", "*.co.uk", "203.0.113.10", "2001:db8::1")
+        refused = (
+            "*.com",  # a whole registry
+            "localhost",  # not a name this Program can be reached at
+            "999.999.999.999",  # neither an address nor a plausible name
+            "010.0.0.1",  # an address with a leading zero is not one here
+            "app.example.com:443",  # a port belongs in `ports`
+            "app example com",
+            "",
         )
+
+        for host in accepted:
+            with self.subTest(host=host):
+                self.assertEqual([], sources(VALID.replace("app.example.com", host, 1)))
+        for host in refused:
+            with self.subTest(host=host):
+                self.assertEqual(
+                    ["config:scope.include[0].host"],
+                    sources(VALID.replace("app.example.com", host, 1)),
+                )
+
+    def test_a_host_is_normalised_so_two_spellings_are_one_policy(self):
+        original, _ = config.load(write(VALID))
+        respelled, found = config.load(write(VALID.replace("app.example.com", "APP.Example.Com.", 1)))
+
+        self.assertEqual((), found)
+        self.assertEqual(original.canonical_sha256, respelled.canonical_sha256)
+
+    def test_an_exclusion_may_be_as_wide_as_the_operator_likes(self):
+        """Breadth withdraws authority here, so the inclusion floor does not apply."""
+        for host in ("*.com", "localhost", "*.example.com"):
+            with self.subTest(host=host):
+                _, found = config.load(write(VALID.replace("admin.example.com", host, 1)))
+                self.assertEqual((), found)
+
+    def test_a_path_names_a_prefix_on_its_own_host(self):
+        refused = (
+            "//elsewhere.example/x",  # a protocol-relative URL, not a path
+            "/api/../../etc",
+            "/..",
+            "/api\tX-Injected: 1",  # a control character TOML happens to allow
+            "/api\u202e",  # a right-to-left override hides what follows it
+            "api/",
+        )
+
+        for path in refused:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    [(INVALID_CONFIGURATION, "config:scope.include[0].paths[0]", PATH_SHAPE)],
+                    violations(VALID.replace("/api/", path, 1)),
+                )
+
+    def test_a_repeated_rule_is_one_rule(self):
+        original, _ = config.load(write(VALID))
+        repeated, found = config.load(write(
+            VALID + '\n[[scope.include]]\nhost = "app.example.com"\n'
+            'ports = [443]\nprotocols = ["https"]\npaths = ["/api/"]\n'
+        ))
+
+        self.assertEqual((), found)
+        self.assertEqual(1, len(repeated.document["scope"]["include"]))
+        self.assertEqual(original.canonical_sha256, repeated.canonical_sha256)
 
 
 class ReferenceTest(unittest.TestCase):
@@ -280,16 +345,42 @@ class ControlsTest(unittest.TestCase):
 
 
 class SourceTest(unittest.TestCase):
-    def test_unreadable_configuration_is_invalid(self):
-        directory = Path(tempfile.mkdtemp())
-
-        configuration, found = config.load(directory / "absent.toml")
+    def refusal(self, path) -> str:
+        configuration, found = config.load(path)
 
         self.assertIsNone(configuration)
         self.assertEqual(1, len(found))
         self.assertEqual(INVALID_CONFIGURATION, found[0].code)
         self.assertEqual("config", found[0].source)
-        self.assertIn("cannot read", found[0].detail)
+        return found[0].detail
+
+    def test_unreadable_configuration_is_invalid(self):
+        self.assertIn("cannot read", self.refusal(scratch() / "absent.toml"))
+
+    def test_a_directory_is_not_a_configuration(self):
+        self.assertIn("not a regular file", self.refusal(scratch()))
+
+    def test_a_configuration_larger_than_policy_is_refused_unread(self):
+        oversized = scratch() / "program.toml"
+        oversized.write_bytes(b"# " + b"a" * config.MAXIMUM_BYTES)
+
+        self.assertIn("larger than", self.refusal(oversized))
+
+    def test_a_path_that_is_not_one_is_refused_rather_than_raised(self):
+        self.assertIn("cannot read", self.refusal("program\x00.toml"))
+
+    def test_an_interpreter_without_a_toml_parser_is_a_missing_dependency(self):
+        """The parser ships with CPython, but a minimal build may leave it out."""
+        source = write(VALID)
+
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            configuration, found = config.load(source)
+
+        self.assertIsNone(configuration)
+        self.assertEqual(
+            [(MISSING_DEPENDENCY, "runtime:module:tomllib")],
+            [(item.code, item.source) for item in found],
+        )
 
     def test_unparsable_configuration_is_invalid(self):
         self.assertEqual(
@@ -316,6 +407,29 @@ class AggregationTest(unittest.TestCase):
                 (INVALID_CONFIGURATION, "config:program.name", "must match [a-z0-9][a-z0-9-]{0,62}"),
             ],
             found,
+        )
+
+    def test_a_reference_is_still_checked_when_its_entry_is_named_badly(self):
+        """A bad name must not hide the field that decides whether a secret is inline."""
+        self.assertEqual(
+            [
+                "config:identity[0].name",
+                "config:identity[0].slot_ref",
+            ],
+            sources(VALID.replace(
+                'name = "member"\nslot_ref = "slot://identity/member"',
+                'name = "MEMBER ONE"\nslot_ref = "https://admin:hunter2@app.example.com/login"',
+            )),
+        )
+
+    def test_an_unsupported_version_is_reported_alone(self):
+        """The version explains every other refusal, so reporting them would mislead."""
+        self.assertEqual(
+            [(UNSUPPORTED_VERSION, "config:schema_version", "unsupported schema version 2; supported: 1")],
+            violations(
+                VALID.replace("schema_version = 1", "schema_version = 2")
+                + '\n[telemetry]\nendpoint = "https://collector.example"\n'
+            ),
         )
 
 

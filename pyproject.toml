@@ -21,3 +21,7 @@ version = { attr = "redkraken.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Named rather than discovered, so anything that later appears beside the
+# application under `src` has to be shipped on purpose.
+include = ["redkraken*"]

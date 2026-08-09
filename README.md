@@ -105,8 +105,20 @@ kind = "dns"
 host = "oob.example.net"
 ```
 
-A scope inclusion may name a wildcard host such as `*.example.com`, but not
-one that would reach a whole public suffix: `*.com` is refused.
+A scope entry names a hostname, an address, or a wildcard such as
+`*.example.com`. An inclusion's wildcard must name at least two labels of its
+own, so `*.com` is refused. That is a floor, not a public-suffix rule: `*.co.uk`
+passes it, and how wide an inclusion may be remains the operator's judgement
+against the Program. An exclusion has no floor, because breadth there withdraws
+authority rather than claiming it. Hosts are compared in one spelling —
+lowercased, without a trailing root dot, addresses in canonical form — so two
+ways of writing the same Program produce the same hash, and a repeated rule
+counts once.
+
+A path names a prefix on the host that carries it. It begins with a single
+forward slash, so the protocol-relative `//elsewhere.example/admin` is refused;
+it holds no `..` segment and no unprintable character, so what is printed is
+what was matched.
 
 Secret material is never written into a configuration. An identity carries a
 `slot_ref` and a required header carries a `value_ref`. Both name a
@@ -123,11 +135,14 @@ header value.
 ## Outcomes
 
 `rk doctor` aggregates: it reports every violation it found, not the first, and
-exits on the most fundamental one.
+exits on the most fundamental one. A schema version this build cannot read is
+the one exception, reported alone because it explains every other refusal such
+a document would draw.
 
 | Exit | Meaning |
 | ---- | ------- |
 | `0` | Ready. |
+| `1` | A refusal this build cannot classify. |
 | `2` | The command line could not be understood. |
 | `3` | `invalid_configuration`: the configuration was refused. |
 | `4` | `unsupported_version`: an interpreter or schema version is out of range. |
