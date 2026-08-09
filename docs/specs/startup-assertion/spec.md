@@ -1,6 +1,6 @@
 # Startup assertion: refuse to begin an agent run off the subscription
 
-Status: implemented
+Status: validated prototype
 Next: tickets 01-08 under `issues/` are resolved; their comments record the
 implementation commits and validation evidence. This artifact remains the
 behaviour and acceptance contract.

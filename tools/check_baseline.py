@@ -211,8 +211,8 @@ def read_status() -> dict:
     regression_ids = [entry.get("id") for entry in regressions]
     if len(regression_ids) != len(set(regression_ids)):
         raise BaselineError("status registry contains duplicate regression ids")
-    if set(regression_ids) != {f"RK-REG-{number:03d}" for number in range(1, 7)}:
-        raise BaselineError("status registry must contain RK-REG-001 through RK-REG-006")
+    if set(regression_ids) != {f"RK-REG-{number:03d}" for number in range(1, 8)}:
+        raise BaselineError("status registry must contain RK-REG-001 through RK-REG-007")
     for entry in regressions:
         if not entry.get("description") or not entry.get("required_tickets"):
             raise BaselineError(f"incomplete regression: {entry.get('id')}")
@@ -222,6 +222,29 @@ def read_status() -> dict:
         if unknown:
             raise BaselineError(f"unknown regression on {entry['path']}: {', '.join(sorted(unknown))}")
     return status
+
+
+def forbidden_reference(value: str) -> bool:
+    value = value.replace("\\", "/").strip()
+    return (
+        value in {"docs", "prototype", ".scratch", "/tmp"}
+        or value.startswith(
+            (
+                "docs/",
+                "docs.",
+                "./docs/",
+                "../docs/",
+                "prototype/",
+                "prototype.",
+                "./prototype/",
+                "../prototype/",
+                ".scratch/",
+                "/tmp/",
+            )
+        )
+        or (value.startswith("/") and "/docs/" in value)
+        or any(fragment in value for fragment in (" docs/", " docs.", " prototype/", " prototype.", " .scratch/", " /tmp/"))
+    )
 
 
 def forbidden_python_dependencies(path: Path, source: str) -> list[str]:
@@ -240,37 +263,86 @@ def forbidden_python_dependencies(path: Path, source: str) -> list[str]:
         for module in modules:
             if module.split(".", 1)[0] in {"docs", "prototype", "scratch"}:
                 errors.append(f"{path}: forbidden import {module}")
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            value = node.value.replace("\\", "/")
-            if value in {"docs", "prototype", ".scratch", "/tmp"} or value.startswith(
-                ("docs/", "docs.", "./docs/", "../docs/", "prototype/", "prototype.", "./prototype/", "../prototype/", ".scratch/", "/tmp/")
-            ) or (value.startswith("/") and "/docs/" in value) or " docs/" in value:
-                errors.append(f"{path}: forbidden tree dependency {node.value}")
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            if name in {
+                "__import__",
+                "import_module",
+                "run_module",
+                "run_path",
+                "run",
+                "Popen",
+                "call",
+                "check_call",
+                "check_output",
+                "system",
+                "execl",
+                "execle",
+                "execlp",
+                "execlpe",
+                "execv",
+                "execve",
+                "execvp",
+                "execvpe",
+            }:
+                for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                    for value in ast.walk(argument):
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str) and forbidden_reference(value.value):
+                            errors.append(f"{path}: forbidden execution dependency {value.value}")
     return errors
 
 
-def production_boundary_errors(repo: Path, production_roots: list[str]) -> list[str]:
+def production_boundary_errors(
+    repo: Path,
+    production_roots: list[str],
+    production_paths: list[str],
+) -> list[str]:
     errors: list[str] = []
-    for relative_root in production_roots:
-        root = repo / relative_root
-        if not root.exists():
+    targets = dict.fromkeys([*production_roots, *production_paths])
+    for relative_target in targets:
+        root = repo / relative_target
+        if not root.exists() and not root.is_symlink():
             continue
-        for path in sorted(source for source in root.rglob("*") if source.is_file()):
+        paths = [root] if root.is_file() or root.is_symlink() else sorted(root.rglob("*"))
+        for path in paths:
+            if path.is_symlink():
+                relative = path.relative_to(repo)
+                errors.append(f"{relative}: forbidden symlink target")
+                continue
+            if not path.is_file():
+                continue
             relative = path.relative_to(repo)
             try:
                 source = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
-            if path.suffix == ".py":
+            if path.suffix == ".py" or source.startswith("#!") and "python" in source.splitlines()[0].lower():
                 errors.extend(forbidden_python_dependencies(relative, source))
                 continue
             for line_number, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if not stripped or stripped.startswith(("#", "//", "--")):
                     continue
-                normalized = stripped.replace("\\", "/")
-                if any(fragment in normalized for fragment in ("docs/", "prototype/", ".scratch/", "/tmp/")):
+                if forbidden_reference(stripped):
                     errors.append(f"{relative}:{line_number}: forbidden tree dependency")
+    return errors
+
+
+def implementation_claim_errors(classifications: list[dict]) -> list[str]:
+    errors = []
+    for entry in classifications:
+        if entry["classification"] == "production":
+            continue
+        root = CHECKOUT / entry["path"]
+        sources = [root] if root.is_file() else root.rglob("*.md")
+        for source in sources:
+            for line_number, line in enumerate(source.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                status = line.strip().replace("**", "").lower()
+                if status in {"status: implemented", "status: production", "status: shipping"}:
+                    errors.append(
+                        f"{source.relative_to(CHECKOUT)}:{line_number}: "
+                        "non-production work claims shipping status"
+                    )
     return errors
 
 
@@ -299,7 +371,19 @@ def main(argv: list[str] | None = None) -> int:
             raise BaselineError("baseline directory may contain only status.json and v1-manifest.tsv")
         status = read_status()
         manifest = read_manifest()
-        errors = production_boundary_errors(arguments.repo.resolve(), status["production_roots"])
+        production_paths = [
+            entry["path"]
+            for entry in status["classifications"]
+            if entry["classification"] == "production"
+        ]
+        errors = implementation_claim_errors(status["classifications"])
+        errors.extend(
+            production_boundary_errors(
+                arguments.repo.resolve(),
+                status["production_roots"],
+                production_paths,
+            )
+        )
         if arguments.v1:
             try:
                 drift = compare_manifest(manifest, collect_v1(arguments.v1.resolve()))

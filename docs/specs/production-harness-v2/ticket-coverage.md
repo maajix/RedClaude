@@ -103,6 +103,7 @@ prevents a prose-only completion claim.
 | --- | --- |
 | HTTPS could bypass the capability proxy | 10, 11 |
 | Replay traffic was labeled as agent traffic | 03, 35 |
+| Prototype components used noncanonical Lane values | 03, 35 |
 | Credential-bearing wire material was plaintext | 07, 43 |
 | Actor context was session-wide rather than transaction-local | 03, 04 |
 | The composed startup proof mocked the claimed process seam | 16, 17, 20 |

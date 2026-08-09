@@ -30,7 +30,7 @@ class BaselineCliTest(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(
-            "baseline ok: classifications=9 regressions=6 artifacts=223\n",
+            "baseline ok: classifications=9 regressions=7 artifacts=223\n",
             result.stdout,
         )
 
@@ -45,6 +45,49 @@ class BaselineCliTest(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("src/bad.py: forbidden import docs.prototype", result.stderr)
+
+    def test_classified_production_tool_is_scanned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            source = repo / "tools" / "bad.py"
+            source.parent.mkdir()
+            source.write_text("from docs.prototype import runtime\n", encoding="utf-8")
+
+            result = run_check(repo=repo)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("tools/bad.py: forbidden import docs.prototype", result.stderr)
+
+    def test_extensionless_python_import_from_docs_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            runner = repo / "deploy" / "runner"
+            runner.parent.mkdir()
+            runner.write_text(
+                "#!/usr/bin/env python3\nfrom docs.prototype import runtime\n",
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
+
+            result = run_check(repo=repo)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("deploy/runner: forbidden import docs.prototype", result.stderr)
+
+    def test_production_symlink_into_prototype_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            prototype = repo / "docs" / "prototype" / "runtime.py"
+            prototype.parent.mkdir(parents=True)
+            prototype.write_text("VALUE = 1\n", encoding="utf-8")
+            source = repo / "src" / "runtime.py"
+            source.parent.mkdir()
+            source.symlink_to(prototype)
+
+            result = run_check(repo=repo)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("src/runtime.py: forbidden symlink target", result.stderr)
 
     def test_missing_v1_corpus_fails_without_rewriting_manifest(self):
         before = MANIFEST.read_bytes()

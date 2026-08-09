@@ -1,32 +1,34 @@
 {
   "schema": 1,
   "production_roots": [
+    "pyproject.toml",
     "src",
     "deploy",
     "migrations"
   ],
   "classifications": [
     {
-      "path": "tools/check_baseline.py",
+      "path": "tools",
       "classification": "production",
-      "claim": "Read-only repository baseline validator"
+      "claim": "Production repository checks"
     },
     {
       "path": "docs/prototype/eval-harness",
-      "classification": "validated_prototype",
-      "claim": "Synthetic evaluation behavior only"
+      "classification": "falsified_prototype",
+      "claim": "Synthetic evaluation behavior with noncanonical Lane values",
+      "regressions": ["RK-REG-007"]
     },
     {
       "path": "docs/prototype/schema",
       "classification": "falsified_prototype",
-      "claim": "Schema experiments with known Lane and actor-context defects",
-      "regressions": ["RK-REG-002", "RK-REG-004"]
+      "claim": "Schema experiments with known Lane-vocabulary and actor-context defects",
+      "regressions": ["RK-REG-004", "RK-REG-007"]
     },
     {
       "path": "docs/prototype/scope-proxy",
       "classification": "falsified_prototype",
-      "claim": "Proxy experiments with known HTTPS and wire-secrecy defects",
-      "regressions": ["RK-REG-001", "RK-REG-003"]
+      "claim": "Proxy experiments with known wire-secrecy and Lane-vocabulary defects",
+      "regressions": ["RK-REG-003", "RK-REG-007"]
     },
     {
       "path": "docs/prototype/sdk-auth-probe",
@@ -41,8 +43,8 @@
     {
       "path": "docs/prototype/walking-skeleton",
       "classification": "falsified_prototype",
-      "claim": "Composed experiment with a mocked process seam and non-latching refusal",
-      "regressions": ["RK-REG-005", "RK-REG-006"]
+      "claim": "Composed experiment with proxy, Receipt, process-seam and refusal defects",
+      "regressions": ["RK-REG-001", "RK-REG-002", "RK-REG-005", "RK-REG-006"]
     },
     {
       "path": "docs/specs/startup-assertion",
@@ -91,6 +93,12 @@
       "area": "startup_supervisor",
       "description": "Startup refusal did not latch the supervisor",
       "required_tickets": [17]
+    },
+    {
+      "id": "RK-REG-007",
+      "area": "lane_vocabulary",
+      "description": "Prototype components used control, transport, proxy-internal or runtime-internal as Lane values",
+      "required_tickets": [3, 35]
     }
   ]
 }
