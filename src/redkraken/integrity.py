@@ -25,6 +25,14 @@ only way it can be answered: by reading the bytes. Optional because the store is
 not part of the database and a caller may not have it -- but a caller who names
 one and gets a pass has been told something `run_standing_checks()` alone cannot
 say.
+
+Sealed wire artifacts are held against their bytes here too, and the gate holds
+no key while it does it. That is a property of how they are filed: the envelope
+is stored under the hash of the envelope, so "are these the bytes the row names"
+is the same arithmetic for a ciphertext as for anything else. What the gate adds
+for a seal is that the algorithm and nonce recorded in the row are the ones in
+the envelope's own header -- a row describing a ciphertext other than the one on
+disk is a broken record even when both halves are individually intact.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import pg
+from redkraken import pg, seal
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     SCHEMA_DRIFT,
@@ -41,7 +49,7 @@ from redkraken.outcome import (
     Report,
     report,
 )
-from redkraken.store import Store
+from redkraken.store import Corrupt, Missing, Store
 
 
 #: The registered surface, and what a caller has to supply to run it. The
@@ -68,6 +76,14 @@ RUNTIME_FAMILIES = (BASELINE_FAMILY, STANDING_FAMILY)
 #: No Program in the query: this is the gate, which asks whether the record as a
 #: whole is still true, not what any one Program may reach.
 REFERENCES = "SELECT label, sha256 FROM artifact_references ORDER BY label"
+
+#: The other recorded claim about the store, and the one no reference names. A
+#: sealed wire artifact has no label -- a label is an agent-reachable name and
+#: that is the point -- so the gate reaches it through the seal itself.
+SEALS = (
+    "SELECT sha256, ciphertext_sha256, alg, encode(nonce, 'hex')"
+    "  FROM artifact_seal ORDER BY sha256"
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +223,7 @@ def artifacts(ledger: Ledger, connection: pg.Connection, root: Path) -> dict:
 
     try:
         rows = connection.execute(REFERENCES).rows
+        sealed = connection.execute(SEALS).rows if _records_seals(connection) else []
     except pg.DatabaseError as error:
         ledger.fail(
             "artifact_store",
@@ -217,8 +234,16 @@ def artifacts(ledger: Ledger, connection: pg.Connection, root: Path) -> dict:
         return {"sound": False, "verified": 0, "broken": [], "root": str(root)}
 
     named = [{"label": str(label), "sha256": str(sha256)} for label, sha256 in rows]
-    answer = Store(root).verify(named)
+    named += [
+        {"label": f"seal {str(plaintext_sha)[:12]}", "sha256": str(ciphertext_sha)}
+        for plaintext_sha, ciphertext_sha, _, _ in sealed
+    ]
+    keep = Store(root)
+    answer = keep.verify(named)
     broken = answer["broken"]
+    broken.extend(_headers(keep, sealed, {item["label"] for item in broken}))
+    answer["verified"] = len(named) - len(broken)
+    answer["sound"] = not broken
     if broken:
         ledger.fail(
             "artifact_store",
@@ -230,9 +255,60 @@ def artifacts(ledger: Ledger, connection: pg.Connection, root: Path) -> dict:
     else:
         ledger.hold(
             "artifact_store",
-            f"{len(named)} recorded artifact(s) hash to the identifier recorded for them",
+            f"{len(named)} recorded artifact(s) hash to the identifier recorded for them"
+            + (f", {len(sealed)} of them sealed" if sealed else ""),
         )
     return answer
+
+
+def _records_seals(connection: pg.Connection) -> bool:
+    """Whether this database has reached the migration that seals wire artifacts.
+
+    Asked rather than assumed, because the gate has to run against a database
+    mid-way through a corpus it is about to be told is out of date. The other
+    families report that as drift; this one would report it as a missing table.
+    """
+    return bool(
+        connection.execute(
+            "SELECT to_regclass('artifact_seal') IS NOT NULL"
+            "   AND EXISTS (SELECT 1 FROM information_schema.columns"
+            "                WHERE table_schema = 'public' AND table_name = 'artifact_seal'"
+            "                  AND column_name = 'ciphertext_sha256')"
+        ).scalar()
+    )
+
+
+def _headers(keep: Store, sealed: Sequence[Sequence[object]], already: set[str]) -> list[dict]:
+    """Hold each seal's recorded description against the envelope's own header.
+
+    Key-free, and deliberately so: this asks whether the row and the file agree
+    about which ciphertext this is, not whether the ciphertext still decrypts.
+    The second question needs the root secret, and a gate that needed the root
+    secret would be a gate an operator could only run while holding it.
+    """
+    broken = []
+    for plaintext_sha, ciphertext_sha, alg, nonce in sealed:
+        label = f"seal {str(plaintext_sha)[:12]}"
+        if label in already:
+            # The bytes are already reported missing or misfiled. A second
+            # complaint about their header would be the same fault twice.
+            continue
+        try:
+            envelope = seal.Sealed.decode(keep.load(str(ciphertext_sha)))
+        except (Missing, Corrupt, seal.Tampered) as error:
+            broken.append({"label": label, "detail": f"the sealed bytes are unreadable: {error}"})
+            continue
+        if not envelope.describes(alg, nonce):
+            broken.append(
+                {
+                    "label": label,
+                    "detail": (
+                        f"recorded as {alg} under nonce {str(nonce)[:16]} and sealed as "
+                        f"{envelope.alg} under nonce {envelope.nonce.hex()[:16]}"
+                    ),
+                }
+            )
+    return broken
 
 
 def _installed(connection: pg.Connection) -> bool:

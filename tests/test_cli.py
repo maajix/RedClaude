@@ -518,6 +518,155 @@ class ArtifactCommandTest(unittest.TestCase):
         self.assertFalse(root.exists())
 
 
+class SealCommandTest(unittest.TestCase):
+    """`rk artifact seal` and `rk artifact open`, up to the database.
+
+    A fourth input, and it is the one that matters: the key file. It is named the
+    way the store is named -- a flag, or a variable behind it, and a refusal when
+    neither -- because an operator who moved the artifacts has not thereby moved
+    the key, and the sealed half is worth exactly what that separation is worth.
+    """
+
+    def files(self) -> tuple[Path, Path, Path]:
+        home = scratch()
+        wire = home / "wire.txt"
+        wire.write_bytes(b"Authorization: Bearer sk-live-not-in-a-log\r\n")
+        redacted = home / "redacted.txt"
+        redacted.write_bytes(b"Authorization: [redacted]\r\n")
+        key = home / "artifact.key"
+        key.write_bytes(bytes(range(32)))
+        key.chmod(0o600)
+        return wire, redacted, key
+
+    def test_the_key_is_named_alongside_the_store_and_the_connection(self):
+        wire, redacted, _ = self.files()
+
+        result = run(
+            "artifact",
+            "seal",
+            "--config", str(write(VALID)),
+            "--wire", str(wire),
+            "--redacted", str(redacted),
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("artifact seal", report["command"])
+        self.assertEqual(
+            [
+                "environment:RK_ARTIFACT_KEY",
+                "environment:RK_ARTIFACT_ROOT",
+                "environment:RK_DATABASE_URL",
+            ],
+            sorted(item["source"] for item in report["violations"]),
+        )
+
+    def test_sealing_needs_both_views_named(self):
+        wire, _, key = self.files()
+
+        result = run(
+            "artifact",
+            "seal",
+            "--config", str(write(VALID)),
+            "--wire", str(wire),
+            "--artifacts", str(scratch()),
+            "--key", str(key),
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--redacted", result.stderr)
+
+    def test_there_is_no_way_to_open_an_artifact_by_hash(self):
+        _, _, key = self.files()
+
+        result = run(
+            "artifact",
+            "open",
+            "--config", str(write(VALID)),
+            "--label", "AF1",
+            "--sha256", "0" * 64,
+            "--into", str(scratch() / "opened.bin"),
+            "--artifacts", str(scratch()),
+            "--key", str(key),
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--sha256", result.stderr)
+
+    def test_opening_needs_somewhere_to_put_what_it_opened(self):
+        # There is no "print it" form of this command, so `--into` is required
+        # rather than defaulted to standard output.
+        _, _, key = self.files()
+
+        result = run(
+            "artifact",
+            "open",
+            "--config", str(write(VALID)),
+            "--label", "AF1",
+            "--artifacts", str(scratch()),
+            "--key", str(key),
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--into", result.stderr)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        wire, redacted, key = self.files()
+
+        result = run(
+            "artifact",
+            "seal",
+            "--config", str(write(VALID)),
+            "--wire", str(wire),
+            "--redacted", str(redacted),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+            "--key", str(key),
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("artifact seal", json.loads(result.stdout)["command"])
+
+    def test_neither_the_wire_bytes_nor_the_connection_string_are_echoed_back(self):
+        wire, redacted, key = self.files()
+
+        result = run(
+            "artifact",
+            "seal",
+            "--config", str(write(VALID)),
+            "--wire", str(wire),
+            "--redacted", str(redacted),
+            "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+            "--key", str(key),
+        )
+
+        for secret in ("s3cr3t-runtime", "sk-live-not-in-a-log"):
+            with self.subTest(secret):
+                self.assertNotIn(secret, result.stdout)
+                self.assertNotIn(secret, result.stderr)
+
+    def test_a_refused_configuration_reaches_no_database_and_writes_nothing(self):
+        wire, redacted, key = self.files()
+        source = write(VALID.replace("requests = 5000", "requests = 0"))
+        root = scratch() / "artifacts"
+
+        observed = observe(
+            "artifact",
+            "seal",
+            "--config", str(source),
+            "--wire", str(wire),
+            "--redacted", str(redacted),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(root),
+            "--key", str(key),
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+        self.assertFalse(root.exists())
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

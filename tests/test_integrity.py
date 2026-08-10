@@ -17,7 +17,7 @@ store that is named must be able to fail the gate.
 import unittest
 from pathlib import Path
 
-from redkraken import integrity, pg, store
+from redkraken import integrity, pg, seal, store
 from redkraken.outcome import EXIT_INTEGRITY_FAILED, EXIT_OK, EXIT_SCHEMA_DRIFT, INTEGRITY_FAILED
 from tests.fixtures import scratch
 
@@ -36,6 +36,8 @@ class FakeConnection:
         references=(),
         records_references=True,
         references_error=None,
+        seals=(),
+        records_seals=True,
     ):
         self.baseline = baseline
         self.roles = roles
@@ -45,6 +47,8 @@ class FakeConnection:
         self.references = references
         self.records_references = records_references
         self.references_error = references_error
+        self.seals = seals
+        self.records_seals = records_seals
         self.statements: list[str] = []
         self.parameters: list[tuple] = []
 
@@ -53,6 +57,8 @@ class FakeConnection:
         self.parameters.append(tuple(parameters))
         if "to_regprocedure" in sql:
             return pg.Result(columns=("ok",), rows=((self.installed,),))
+        if "artifact_seal" in sql and "to_regclass" in sql:
+            return pg.Result(columns=("ok",), rows=((self.records_seals,),))
         if "to_regclass" in sql:
             return pg.Result(columns=("ok",), rows=((self.records_references,),))
         if self.error is not None:
@@ -67,6 +73,12 @@ class FakeConnection:
             if self.references_error is not None:
                 raise self.references_error
             return pg.Result(columns=("label", "sha256"), rows=tuple(self.references))
+        if "FROM artifact_seal" in sql:
+            if self.references_error is not None:
+                raise self.references_error
+            return pg.Result(
+                columns=("sha256", "ciphertext_sha256", "alg", "nonce"), rows=tuple(self.seals)
+            )
         raise AssertionError(f"unexpected statement: {sql}")
 
 
@@ -306,6 +318,122 @@ class StoreVerificationTest(unittest.TestCase):
             [(item.code, item.source) for item in result.violations],
         )
         self.assertFalse(result.as_dict()["artifacts"]["sound"])
+
+
+class SealedStoreVerificationTest(unittest.TestCase):
+    """PH2-07: the gate checks sealed wire artifacts, and holds no key while it does.
+
+    A sealed artifact has no reference -- that is the whole point of it -- so the
+    query that finds every reference finds none of them. Left there, the store
+    would have a half nothing ever reads, which is the same unsoundness ticket 06
+    named and worse: the bytes nobody checks are the ones nobody may look at.
+    """
+
+    ROOT = bytes(range(32))
+    PROGRAM = "3f4c9c62-6f3b-4f0e-9b60-5a8a7d5b2e11"
+    WIRE = b"Authorization: Bearer sk-live-do-not-log\r\n\r\n{}\n"
+
+    def keep(self, plaintext: bytes = WIRE) -> tuple[Path, list[tuple[str, str, str, str]]]:
+        """A store holding one envelope, and the row `artifact_seal` would carry."""
+        root = scratch() / "sealed"
+        deposit = store.Store(root)
+        sha256 = store.digest(plaintext)
+        sealed = seal.seal(
+            self.ROOT,
+            plaintext,
+            aad=seal.associated_data(program_id=self.PROGRAM, sha256=sha256, generation=1),
+        )
+        ciphertext_sha256 = deposit.put(sealed.encode())[0]
+        return root, [(sha256, ciphertext_sha256, sealed.alg, sealed.nonce.hex())]
+
+    def gate(self, **arguments) -> FakeConnection:
+        return FakeConnection(
+            baseline=(("server_major", True, "18.4"),),
+            standing=(("wire_artifact_secrecy", 0, ""),),
+            **arguments,
+        )
+
+    def test_a_sealed_artifact_is_verified_without_the_key_that_opens_it(self):
+        # The envelope is filed under the hash of the envelope, so this is the
+        # same arithmetic as any other artifact. Nothing here has the root
+        # secret, and the sealed bytes are still held against the record.
+        root, seals = self.keep()
+
+        result = integrity.verify(self.gate(seals=seals), store=root)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(
+            {"sound": True, "verified": 1, "broken": [], "root": str(root)},
+            result.as_dict()["artifacts"],
+        )
+        self.assertIn("1 of them sealed", result.assertions[-1].detail)
+
+    def test_a_sealed_artifact_whose_bytes_are_gone_fails_the_gate(self):
+        root, seals = self.keep()
+        store.path_for(root, seals[0][1]).unlink()
+
+        result = integrity.verify(self.gate(seals=seals), store=root)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(
+            [f"seal {seals[0][0][:12]}"],
+            [item["label"] for item in result.as_dict()["artifacts"]["broken"]],
+        )
+        self.assertNotIn("Bearer", result.violations[0].detail)
+
+    def test_a_record_describing_a_different_ciphertext_fails_the_gate(self):
+        # Both halves intact and disagreeing: the file is the file it is filed
+        # as, and the row says it was sealed under a nonce it was not. One of the
+        # two has been swapped, and neither is trustworthy afterwards.
+        root, seals = self.keep()
+        sha256, ciphertext_sha256, alg, _ = seals[0]
+
+        result = integrity.verify(
+            self.gate(seals=[(sha256, ciphertext_sha256, alg, "00" * seal.NONCE_BYTES)]),
+            store=root,
+        )
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        broken = result.as_dict()["artifacts"]["broken"]
+        self.assertEqual([f"seal {sha256[:12]}"], [item["label"] for item in broken])
+        self.assertIn("recorded as", broken[0]["detail"])
+        self.assertEqual(0, result.as_dict()["artifacts"]["verified"])
+
+    def test_bytes_that_are_not_an_envelope_at_all_fail_the_gate(self):
+        root, seals = self.keep()
+        sha256 = store.digest(b"not an envelope\n")
+        store.Store(root).put(b"not an envelope\n")
+
+        result = integrity.verify(
+            self.gate(seals=[(seals[0][0], sha256, seals[0][2], seals[0][3])]), store=root
+        )
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertIn("unreadable", result.as_dict()["artifacts"]["broken"][0]["detail"])
+
+    def test_missing_bytes_are_reported_once_rather_than_as_two_faults(self):
+        # The hash check and the header check both fail on a file that is gone.
+        # Reporting both would make one missing file look like two problems and
+        # would count the same artifact twice in what was verified.
+        root, seals = self.keep()
+        store.path_for(root, seals[0][1]).unlink()
+
+        result = integrity.verify(self.gate(seals=seals), store=root)
+
+        self.assertEqual(1, len(result.as_dict()["artifacts"]["broken"]))
+        self.assertEqual(0, result.as_dict()["artifacts"]["verified"])
+
+    def test_a_corpus_without_the_sealing_migration_is_not_asked_about_seals(self):
+        # The gate runs against a database that is mid-corpus, which the baseline
+        # reports as drift. Asking a table that does not exist yet would turn
+        # that into an error from the store instead.
+        root, _ = self.keep()
+
+        connection = self.gate(references=(), records_seals=False)
+        result = integrity.verify(connection, store=root)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertFalse([sql for sql in connection.statements if "FROM artifact_seal" in sql])
 
 
 if __name__ == "__main__":

@@ -62,6 +62,12 @@ AGENT = _Source("state_connection_string", "--state-url", STATE_URL)
 #: operator who moved the database has not moved the bytes.
 ARTIFACTS = _Source("artifact_root", "--artifacts", artifact.ROOT_VARIABLE)
 
+#: And the third thing that is not in the database: the key file. Separate from
+#: the store for the reason the store is separate from the connection string --
+#: an operator who copied the bytes somewhere has not thereby copied the key,
+#: and the sealed artifacts are worth exactly as much as that stays true.
+KEYS = _Source("artifact_key", "--key", artifact.KEY_VARIABLE)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -260,6 +266,94 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.set_defaults(run=_artifact_audit)
 
+    close = verbs.add_parser(
+        "seal",
+        help=(
+            "store one exchange as a redacted artifact and an encrypted wire "
+            f"artifact (${DATABASE_URL})"
+        ),
+    )
+    _add_url(close, RUNTIME)
+    _add_root(close)
+    _add_key(close)
+    close.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program that will hold both views",
+    )
+    close.add_argument(
+        "--wire",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the file whose bytes went over the wire; stored only encrypted",
+    )
+    close.add_argument(
+        "--redacted",
+        type=Path,
+        required=True,
+        metavar="path",
+        help=(
+            "the file the agent may see; stored as an ordinary artifact and the "
+            "only one of the two that gets a label"
+        ),
+    )
+    close.add_argument(
+        "--content-type",
+        dest="content_type",
+        metavar="type",
+        help="what the bytes are, recorded beside them and never inferred from them",
+    )
+    close.set_defaults(run=_artifact_seal)
+
+    release = verbs.add_parser(
+        "open",
+        help=(
+            "decrypt one wire artifact to a file, deliberately and audited "
+            f"(${DATABASE_URL})"
+        ),
+    )
+    _add_url(release, RUNTIME)
+    _add_root(release)
+    _add_key(release)
+    release.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program whose wire artifact is opened",
+    )
+    release.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help=(
+            "the agent-visible label of the pair; the wire view has no label of "
+            "its own and there is no way to ask for one by hash"
+        ),
+    )
+    release.add_argument(
+        "--into",
+        type=Path,
+        required=True,
+        metavar="path",
+        help=(
+            "where the plaintext is written, created for this user alone; an "
+            "existing file is refused rather than overwritten"
+        ),
+    )
+    release.add_argument(
+        "--authorize",
+        metavar="reason",
+        help=(
+            "why this is being opened, recorded in the audit log; without it the "
+            "command refuses before it reads any key material"
+        ),
+    )
+    release.set_defaults(run=_artifact_open)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -336,6 +430,19 @@ def _add_root(parser: argparse.ArgumentParser, help: str | None = None) -> None:
         type=Path,
         metavar="dir",
         help=help or f"where the artifact bytes live (default: ${ARTIFACTS.variable})",
+    )
+
+
+def _add_key(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        KEYS.flag,
+        dest="key",
+        type=Path,
+        metavar="path",
+        help=(
+            "the file holding the root secret, readable by its owner alone and "
+            f"kept outside the database (default: ${KEYS.variable})"
+        ),
     )
 
 
@@ -448,6 +555,58 @@ def _artifact_audit(arguments: argparse.Namespace) -> int:
     )
 
 
+def _artifact_seal(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, artifact.SEAL)
+    root = _root(ledger, arguments.artifacts)
+    key = _key(ledger, arguments.key)
+    if runtime is None or root is None or key is None:
+        return _render(report(artifact.SEAL, ledger))
+    return _render(
+        _guarded(
+            artifact.SEAL,
+            lambda: artifact.seal_wire(
+                runtime,
+                arguments.config,
+                arguments.wire,
+                arguments.redacted,
+                root=root,
+                key=key,
+                content_type=arguments.content_type,
+            ),
+        )
+    )
+
+
+def _artifact_open(arguments: argparse.Namespace) -> int:
+    """The one adapter that hands a report back without the thing it produced.
+
+    What was decrypted is in the file `--into` names. The report says its path,
+    its length and its hash, which is what an operator needs to find it and what
+    a log may carry.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, artifact.OPEN)
+    root = _root(ledger, arguments.artifacts)
+    key = _key(ledger, arguments.key)
+    if runtime is None or root is None or key is None:
+        return _render(report(artifact.OPEN, ledger))
+    return _render(
+        _guarded(
+            artifact.OPEN,
+            lambda: artifact.open_wire(
+                runtime,
+                arguments.config,
+                root=root,
+                key=key,
+                label=arguments.label,
+                into=arguments.into,
+                authorize=arguments.authorize,
+            ),
+        )
+    )
+
+
 def _provision(arguments: argparse.Namespace) -> int:
     return _with_settings(
         arguments,
@@ -551,6 +710,26 @@ def _root(ledger: Ledger, given: Path | None) -> Path | None:
             source=f"environment:{ARTIFACTS.variable}",
         )
     return root
+
+
+def _key(ledger: Ledger, given: Path | None) -> Path | None:
+    """The key file, from the argument or from the variable behind it.
+
+    Refused rather than defaulted, and for a sharper version of the store's
+    reason: a default would be a key material path this installation did not
+    choose, which either does not exist or belongs to something else. Whether the
+    file is one this process will use is `seal.load_root`'s question; this only
+    establishes that an operator named one.
+    """
+    key = artifact.key_from_environment(given)
+    if key is None:
+        ledger.fail(
+            KEYS.fact,
+            f"no key material: pass {KEYS.flag} or set {KEYS.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{KEYS.variable}",
+        )
+    return key
 
 
 def _url(

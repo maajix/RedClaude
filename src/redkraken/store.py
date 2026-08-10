@@ -143,6 +143,24 @@ class Store:
         pending.replace(path)
         return sha256, True
 
+    def discard(self, sha256: str) -> bool:
+        """Remove bytes this process wrote that nothing can have referenced.
+
+        Not a general delete, and it is not the way an artifact is retired --
+        that is a purge, and it goes through the database. This is for the one
+        case `put` creates and cannot resolve: bytes written on the way into a
+        transaction that then rolled back. Deleting those is safe only where no
+        other writer could have arrived at the same hash, which is true of a
+        ciphertext -- its nonce is fresh, so its hash is unreachable to anyone
+        else -- and false of plaintext, where another Program may already have
+        committed a reference to exactly those bytes.
+        """
+        try:
+            path_for(self.root, sha256).unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
     def load(self, sha256: str) -> bytes:
         """The whole plaintext, verified against the name it is filed under."""
         path = path_for(self.root, sha256)

@@ -20,8 +20,11 @@ asks a sixth, about the connection the model reads through: that one Program
 cannot name, infer or mutate another's rows. `ArtifactStoreTest` asks a seventh,
 about the half of the state that is not in the database: that bytes shared by
 content hash stay one row and two claims, and that a hash on its own opens
-nothing. All three commit, because what survives the transaction is their
-subject.
+nothing. `SealedWireArtifactTest` asks an eighth, about the half of an exchange
+nobody may read: that the wire view is kept whole, kept encrypted under key
+material the database never holds, and reachable only through an authorized
+operation that is audited whatever becomes of it. All four commit, because what
+survives the transaction is their subject.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-from redkraken import artifact, backup, integrity, migrate, pg, program, state
+from redkraken import artifact, backup, integrity, migrate, pg, program, seal, state
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
@@ -507,6 +510,40 @@ class Control:
     on: str = "owner"
 
 
+def repeat(character: str) -> str:
+    """One artifact identifier, written the way the controls above write them."""
+    return f"repeat('{character}', 64)"
+
+
+#: One sealed pair, assembled by hand, with three holes to break it through.
+#: `sealed` is the artifact the seal describes, `reference` is whether the
+#: Program holds the agent-visible half by name, and `extra` is anything else the
+#: control needs. Written once because a seal has four foreign keys behind it --
+#: the two artifacts, the algorithm and the key generation -- and repeating that
+#: per control would bury which one line is the falsification.
+SEAL_CONTROL = (
+    "DO $ctl$ DECLARE p uuid;"
+    " BEGIN"
+    "   PERFORM set_actor('runtime', 'selftest');"
+    "   INSERT INTO programs (slug, name) VALUES ('sealed-selftest', 'Self test')"
+    "     RETURNING id INTO p;"
+    "   INSERT INTO secret_kek (gen, salt, root_check)"
+    "        VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'));"
+    "   INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
+    "        VALUES {sealed};"
+    "   INSERT INTO artifacts (sha256, byte_size, visibility)"
+    "        VALUES (repeat('f', 64), 9, 'agent_visible');"
+    "   {reference}"
+    "   INSERT INTO artifact_seal (sha256, scope_kind, scope_id, visibility, byte_size,"
+    "                              alg, nonce, kek_gen, ciphertext_sha256, agent_sha256)"
+    "        VALUES (repeat('e', 64), 'program', p, 'credential_bearing', 9,"
+    "                'rk-hkdf-sha256-ctr-hmac-v1', decode(repeat('00', 32), 'hex'), 1,"
+    "                repeat('1', 64), repeat('f', 64));"
+    "   {extra}"
+    " END $ctl$"
+)
+
+
 #: Every check the gate runs, and the edit that makes it fail. Each runs in a
 #: transaction that is rolled back, so the database is unchanged afterwards --
 #: `test_the_database_is_unchanged_afterwards` is what says so.
@@ -721,6 +758,73 @@ CONTROLS = (
         # would satisfy the policy on `artifacts` from any session.
         "standing:artifact_reachability",
         "ALTER VIEW artifact_refs SET (security_invoker = false)",
+    ),
+    # --- wire artifacts, and the key arrangement behind them ------------------
+    Control(
+        # Rule 2, and the one that matters most: credential-bearing bytes with no
+        # seal describing them. This is the state ticket 07 exists to prevent --
+        # the artifact store holding a plaintext capability under an ordinary
+        # hash, which every later reader treats as ordinary.
+        "standing:wire_artifact_secrecy",
+        "INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
+        " VALUES (" + repeat("e") + ", 41, 'credential_bearing', true)",
+    ),
+    Control(
+        # Rule 1 from the other side: a seal over bytes that are not sealed. The
+        # row would say the material is protected and the artifact would say
+        # anyone may read it.
+        "standing:wire_artifact_secrecy",
+        SEAL_CONTROL.format(
+            sealed=f"({repeat('e')}, 9, 'agent_visible', false)",
+            reference=f"INSERT INTO artifact_references (program_id, sha256, kind)"
+            f" VALUES (p, {repeat('f')}, 'runtime');",
+            extra="",
+        ),
+    ),
+    Control(
+        # Rule 5: the redacted view exists and no Program names it. Criterion 4
+        # asks for two references describing what each party saw; an agent view
+        # nothing can cite is one reference and a file.
+        "standing:wire_artifact_secrecy",
+        SEAL_CONTROL.format(
+            sealed=f"({repeat('e')}, 9, 'credential_bearing', true)",
+            reference="",
+            extra="",
+        ),
+    ),
+    Control(
+        # Rule 6: the envelope registered as an artifact of its own. Nothing in
+        # the pair is wrong; what is wrong is the second, unsealed name for the
+        # same material, which rule 2 cannot see because a ciphertext row is not
+        # marked encrypted.
+        "standing:wire_artifact_secrecy",
+        SEAL_CONTROL.format(
+            sealed=f"({repeat('e')}, 9, 'credential_bearing', true)",
+            reference=f"INSERT INTO artifact_references (program_id, sha256, kind)"
+            f" VALUES (p, {repeat('f')}, 'runtime');",
+            extra="INSERT INTO artifacts (sha256, byte_size, visibility)"
+            f" VALUES ({repeat('1')}, 200, 'agent_visible');",
+        ),
+    ),
+    Control(
+        # Rule 7: the agent connection reaching the seal record. It carries no
+        # key material and it does carry the nonce, the generation and the exact
+        # size of every wire message -- and, through `agent_sha256`, a hash the
+        # session can join back to its own artifacts.
+        "standing:wire_artifact_secrecy",
+        "GRANT SELECT (nonce) ON artifact_seal TO rk2_state",
+    ),
+    Control(
+        # Rule 8: a wrapped data key in the database. The prototype's design
+        # stored one per scope; this runtime derives the Program's key from a
+        # root secret the database never sees, so a row here means something is
+        # keeping key material where the dumps go.
+        "standing:wire_artifact_secrecy",
+        "INSERT INTO secret_kek (gen, salt, root_check)"
+        " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'));"
+        " INSERT INTO secret_dek (scope_kind, scope_id, dek_gen, kek_gen, wrapped)"
+        " VALUES ('program', '00000000-0000-4000-8000-000000000001'::uuid, 1, 1,"
+        "         decode(repeat('63', 60), 'hex'))",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -2069,6 +2173,567 @@ class ArtifactStoreTest(DatabaseCase):
         )
         self.assertIn("hashes to", seeing.violations[0].detail)
         self.assertEqual(blind.facts["checks"], seeing.facts["checks"], "not a registered check")
+
+
+SEAL_SLUG = "selftest-sealed"
+
+#: A credential that never existed, so that finding it anywhere is unambiguous.
+#: Distinctive enough that no column, index or serialisation could hold it by
+#: coincidence, and synthetic so that the search itself is safe to run.
+MARKER = "rk2-selftest-credential-8f3a1c7d"
+
+#: The exchange, in the two views the two parties saw. Byte-for-byte identical
+#: apart from the one header, which is the case that matters: a redaction that
+#: rewrote more than the credential would make the pair prove less than it says.
+WIRE = (
+    "GET /admin/export HTTP/1.1\r\n"
+    "Host: target.example\r\n"
+    f"Authorization: Bearer {MARKER}\r\n"
+    "Accept: application/json\r\n"
+    "\r\n"
+).encode()
+REDACTED = (
+    "GET /admin/export HTTP/1.1\r\n"
+    "Host: target.example\r\n"
+    "Authorization: Bearer [redacted]\r\n"
+    "Accept: application/json\r\n"
+    "\r\n"
+).encode()
+
+#: The root secret for this run, and one that is not it. Fixed rather than
+#: random so a failure is reproducible; never written anywhere but the key file.
+SECRET = bytes(range(32, 64))
+OTHER_SECRET = bytes(range(64, 96))
+
+
+class SealedWireArtifactTest(DatabaseCase):
+    """PH2-07: the wire view kept whole, kept encrypted, and kept out of reach.
+
+    One exchange, stored twice: the redacted view as an ordinary agent-visible
+    artifact with a label, and the wire view sealed under a key derived from a
+    file this process holds and the database does not. Everything runs through
+    the roles an operator points at the database, because the claim being made
+    is about what each connection can reach.
+
+    The absence in criterion 3 is asked of the database directly, through
+    `find_in_database`, rather than by grepping an archive: `rk db dump` writes
+    a compressed custom-format file, so a grep over one would pass whether the
+    marker were in it or not. A value in no column of any table is a value in no
+    serialisation of them, and this asks that question about every column there
+    is.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = scratch() / "sealed"
+        cls.key = cls.keyfile("root.key", SECRET)
+        cls.wrong = cls.keyfile("other.key", OTHER_SECRET)
+
+        cls.configurations = {}
+        cls.identifiers = {}
+        for name in ("a", "b"):
+            slug = f"{SEAL_SLUG}-{name}"
+            path = write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.wire = scratch() / "exchange.wire"
+        cls.wire.write_bytes(WIRE)
+        cls.redacted = scratch() / "exchange.redacted"
+        cls.redacted.write_bytes(REDACTED)
+
+        cls.sealed = cls.sealing("a", content_type="message/http")
+        assert cls.sealed.ok, cls.sealed.violations
+        cls.ciphertext = cls.sealed.facts["seals"][0]["ciphertext_sha256"]
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SEAL_SLUG}-%",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE sha256 = $1", (artifact.digest(WIRE),)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                ("{" + ",".join((artifact.digest(WIRE), artifact.digest(REDACTED))) + "}",),
+            )
+            cls.connection.execute("DELETE FROM secret_access_log")
+            cls.connection.execute("DELETE FROM secret_kek")
+        super().tearDownClass()
+
+    @classmethod
+    def keyfile(cls, name: str, secret: bytes) -> Path:
+        """Key material as `seal.load_root` insists on holding it: a file, owner-only."""
+        path = scratch() / name
+        path.write_bytes(secret)
+        path.chmod(0o600)
+        return path
+
+    @classmethod
+    def sealing(cls, name: str, **options: object) -> Report:
+        return artifact.seal_wire(
+            cls.harness.runtime,
+            cls.configurations[name],
+            cls.wire,
+            cls.redacted,
+            root=cls.root,
+            key=cls.key,
+            **options,
+        )
+
+    def opening(self, name: str, into: str, **options: object) -> tuple[Report, Path]:
+        target = scratch() / into
+        return (
+            artifact.open_wire(
+                self.harness.runtime,
+                self.configurations[name],
+                root=self.root,
+                key=self.key,
+                into=target,
+                **options,
+            ),
+            target,
+        )
+
+    def trail(self, **columns: object) -> list[tuple]:
+        """The audit rows matching an exact set of column values, oldest first."""
+        where = " AND ".join(f"{name} = ${number}" for number, name in enumerate(columns, 1))
+        return [
+            (str(row[0]), str(row[1]), row[2], row[3], str(row[4]))
+            for row in self.connection.execute(
+                "SELECT verb, outcome, value_len, encode(value_fpr, 'hex'), detail"
+                "  FROM secret_access_log"
+                f" WHERE {where} ORDER BY at, id",
+                tuple(columns.values()),
+            ).rows
+        ]
+
+    def bound(self, name: str) -> pg.Connection:
+        """An agent session bound to one Program, as `rk artifact get` binds it."""
+        session = pg.connect(self.harness.state)
+        session.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers[name],)
+        )
+        return session
+
+    def stored(self) -> set[Path]:
+        """Every file the store holds, so a refusal can be held against it."""
+        return {path for path in self.root.rglob("*") if path.is_file()}
+
+    def test_the_store_holds_a_ciphertext_and_never_the_wire_plaintext(self):
+        # Criterion 1. The wire artifact has an identifier in the database and no
+        # file under it: what is on disk is the envelope, filed under its own
+        # hash, which is what lets the gate check it while holding no key.
+        wire_sha = artifact.digest(WIRE)
+        envelope = artifact.path_for(self.root, self.ciphertext)
+
+        self.assertFalse(artifact.path_for(self.root, wire_sha).exists())
+        self.assertTrue(envelope.exists())
+        self.assertEqual(self.ciphertext, artifact.digest(envelope.read_bytes()))
+        self.assertNotIn(MARKER.encode(), envelope.read_bytes())
+        self.assertEqual(REDACTED, artifact.path_for(self.root, artifact.digest(REDACTED)).read_bytes())
+
+    def test_the_database_holds_a_salt_and_a_check_and_no_key(self):
+        # The other half of criterion 1. Keys are derived from the file, every
+        # time, so there is nothing wrapped to steal: the two values beside the
+        # generation are a random salt and 16 bytes of an HMAC output, and
+        # neither is the secret they were derived with.
+        row = self.connection.execute(
+            "SELECT encode(salt, 'hex'), encode(root_check, 'hex') FROM secret_kek WHERE gen = 1"
+        ).rows[0]
+        salt, check = (bytes.fromhex(str(value)) for value in row)
+
+        self.assertEqual((32, 16), (len(salt), len(check)))
+        self.assertNotIn(salt, SECRET)
+        self.assertNotIn(check, SECRET)
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM secret_dek").scalar())
+
+    def test_the_key_is_named_by_the_operator_and_not_by_the_configuration(self):
+        # And the rest of it: "outside Agent-visible configuration" means the
+        # file the model can read does not say where the key is, let alone what
+        # it is. The key reaches the command through its own argument.
+        configuration = self.configurations["a"].read_text()
+
+        self.assertNotIn(str(self.key), configuration)
+        self.assertNotIn(artifact.KEY_VARIABLE, configuration)
+        self.assertNotIn("key", configuration.lower())
+
+    def test_the_seal_records_the_algorithm_the_nonce_and_the_plaintext_hash(self):
+        # Criterion 2, read back from the row rather than from the report that
+        # wrote it. Every field needed to open the envelope is here except the
+        # one that must not be: the key.
+        row = self.connection.execute(
+            "SELECT alg, octet_length(nonce), encode(nonce, 'hex'), kek_gen,"
+            "       ciphertext_sha256, agent_sha256, byte_size, visibility"
+            "  FROM artifact_seal WHERE sha256 = $1",
+            (artifact.digest(WIRE),),
+        ).rows[0]
+        alg, nonce_size, nonce, generation, ciphertext, agent, byte_size, visibility = row
+
+        self.assertEqual(seal.ALG, str(alg))
+        self.assertEqual(seal.NONCE_BYTES, int(nonce_size))
+        self.assertEqual(1, int(generation))
+        self.assertEqual(self.ciphertext, str(ciphertext))
+        self.assertEqual(artifact.digest(REDACTED), str(agent))
+        self.assertEqual(len(WIRE), int(byte_size))
+        self.assertEqual("credential_bearing", str(visibility))
+        self.assertEqual(
+            seal.Sealed.decode(artifact.path_for(self.root, self.ciphertext).read_bytes()).nonce.hex(),
+            str(nonce),
+            "the recorded nonce is the one the envelope carries",
+        )
+
+    def test_the_wire_artifact_row_says_credential_bearing_and_encrypted(self):
+        # The wire view is an artifact like any other, and the two columns that
+        # make it unlike any other are stated rather than defaulted.
+        row = self.connection.execute(
+            "SELECT visibility, encrypted, byte_size, content_type FROM artifacts WHERE sha256 = $1",
+            (artifact.digest(WIRE),),
+        ).rows[0]
+
+        self.assertEqual(("credential_bearing", True), (str(row[0]), bool(row[1])))
+        self.assertEqual((len(WIRE), "message/http"), (int(row[2]), str(row[3])))
+
+    def test_the_marker_is_in_no_column_of_any_table(self):
+        # Criterion 3, asked of every column of every table at once -- rows,
+        # Events, the audit trail and the diagnostics registry included, because
+        # all of them are tables. The positive control is the point: the same
+        # question about a value that *is* in the database answers, so the
+        # absence is an answer rather than a query that matches nothing.
+        found = self.connection.execute(
+            "SELECT relation, attribute FROM find_in_database($1)", (MARKER,)
+        ).rows
+        control = self.connection.execute(
+            "SELECT relation, attribute FROM find_in_database($1)", (f"{SEAL_SLUG}-a",)
+        ).rows
+
+        self.assertEqual([], [(str(row[0]), str(row[1])) for row in found])
+        self.assertIn(("programs", "slug"), [(str(row[0]), str(row[1])) for row in control])
+
+    def test_the_marker_is_in_no_byte_of_the_store(self):
+        # The half of criterion 3 that no SQL statement can answer.
+        for path in sorted(self.root.rglob("*")):
+            if path.is_file():
+                with self.subTest(path.name):
+                    self.assertNotIn(MARKER.encode(), path.read_bytes())
+
+    def test_the_marker_is_in_neither_the_report_nor_what_the_agent_reads(self):
+        # And the two surfaces an operator and a model actually look at. The
+        # agent read returns the redacted view because that is the only view it
+        # has a label for.
+        read = artifact.get(
+            self.harness.runtime,
+            self.harness.state,
+            self.configurations["a"],
+            root=self.root,
+            label="AF1",
+        )
+
+        self.assertTrue(read.ok, read.violations)
+        self.assertEqual(REDACTED, base64.b64decode(read.facts["content"]["data"]))
+        for name, rendered in (
+            ("seal", json.dumps(self.sealed.as_dict())),
+            ("get", json.dumps(read.as_dict())),
+        ):
+            with self.subTest(name):
+                self.assertNotIn(MARKER, rendered)
+                self.assertNotIn("Bearer sk", rendered)
+
+    def test_two_views_are_two_artifacts_and_only_one_has_a_label(self):
+        # Criterion 4. Both hashes describe exactly the bytes their party saw,
+        # and the wire view deliberately has no reference: a label is the name a
+        # Program reads an artifact by, so giving the wire view one would undo
+        # everything the seal is for.
+        agent_sha, wire_sha = artifact.digest(REDACTED), artifact.digest(WIRE)
+        labelled = self.connection.execute(
+            "SELECT label, sha256 FROM artifact_references WHERE program_id = $1::uuid ORDER BY label",
+            (self.identifiers["a"],),
+        ).rows
+
+        self.assertNotEqual(agent_sha, wire_sha)
+        self.assertEqual([("AF1", agent_sha)], [(str(row[0]), str(row[1])) for row in labelled])
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT count(*) FROM artifact_references WHERE sha256 = ANY($1)",
+                ("{" + ",".join((wire_sha, self.ciphertext)) + "}",),
+            ).scalar(),
+        )
+        self.assertEqual(
+            2,
+            self.connection.execute(
+                "SELECT count(*) FROM artifacts WHERE sha256 = ANY($1)",
+                ("{" + ",".join((agent_sha, wire_sha)) + "}",),
+            ).scalar(),
+        )
+
+    def test_neither_the_seal_nor_the_reference_can_be_edited_afterwards(self):
+        # The immutability half of criterion 4, from the connection that wrote
+        # them. A seal whose nonce could be edited would describe a ciphertext it
+        # no longer opens.
+        for table, statement in (
+            ("artifact_seal", "UPDATE artifact_seal SET kek_gen = 1 WHERE sha256 = $1"),
+            (
+                "artifact_references",
+                "UPDATE artifact_references SET label = 'AF9' WHERE sha256 = $1",
+            ),
+        ):
+            with self.subTest(table), self.assertRaises(pg.DatabaseError) as refused:
+                with self.connection.transaction():
+                    self.connection.execute(
+                        statement,
+                        (artifact.digest(WIRE if table == "artifact_seal" else REDACTED),),
+                    )
+
+            self.assertIn("immutable", str(refused.exception).lower())
+
+    def test_opening_without_authorization_is_refused_and_recorded(self):
+        # Criterion 5. The refusal happens before the lookup, so it is also the
+        # answer for a label that has no seal -- and it is in the trail, because
+        # an audit that only records the opens cannot answer who tried.
+        result, target = self.opening("a", "unauthorized.txt", label="AF1")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(["argument:--authorize"], [item.source for item in result.violations])
+        self.assertFalse(target.exists())
+        self.assertIsNone(result.facts["released"])
+        self.assertEqual(
+            [("open", "denied", None, None, "no authorization given for AF1")],
+            self.trail(scope_id=self.identifiers["a"], outcome="denied", verb="open"),
+        )
+
+    def test_a_release_that_cannot_land_is_still_on_the_record(self):
+        # The ordering half of criterion 5. The audit row goes down before the
+        # bytes do, so the one state that cannot arise is plaintext on disk that
+        # the trail does not account for; the other one can, and this is it. An
+        # `--into` that already exists is refused rather than obeyed -- clobbering
+        # it would destroy evidence -- and what the operator reads afterwards is
+        # an open that was authorized and a release that did not land.
+        target = scratch() / "occupied.wire"
+        target.write_bytes(b"an earlier release nobody may overwrite")
+
+        result = artifact.open_wire(
+            self.harness.runtime,
+            self.configurations["a"],
+            root=self.root,
+            key=self.key,
+            label="AF1",
+            into=target,
+            authorize="checking the release path",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(["argument:--into"], [item.source for item in result.violations])
+        self.assertEqual(b"an earlier release nobody may overwrite", target.read_bytes())
+        self.assertIsNone(result.facts["released"])
+        self.assertNotIn(MARKER, json.dumps(result.as_dict()))
+
+        opened, refused = self.trail(scope_id=self.identifiers["a"], verb="open")[-2:]
+        self.assertEqual(("ok", "error"), (opened[1], refused[1]))
+        self.assertEqual(len(WIRE), int(opened[2]))
+        self.assertIn("checking the release path", opened[4])
+        self.assertIn("could not be written out", refused[4])
+
+    def test_an_authorized_open_writes_the_bytes_to_a_file_and_audits_it(self):
+        # The rest of criterion 5. The plaintext leaves through the file and
+        # never through the report, the file is readable by nobody else, and the
+        # trail carries a length and a keyed fingerprint in place of the value.
+        result, target = self.opening(
+            "a", "opened.wire", label="AF1", authorize="incident review 2026-08-10"
+        )
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(WIRE, target.read_bytes())
+        self.assertEqual(0o600, target.stat().st_mode & 0o777)
+        self.assertEqual(str(target), result.facts["released"]["path"])
+        self.assertEqual(artifact.digest(WIRE), result.facts["released"]["sha256"])
+        self.assertNotIn(MARKER, json.dumps(result.as_dict()))
+
+        # By the reason, because it is the operator's own words and no other
+        # open in this case carries them: authorized opens accumulate in the
+        # trail, which is the point of keeping one.
+        recorded = [
+            row
+            for row in self.trail(scope_id=self.identifiers["a"], outcome="ok", verb="open")
+            if "incident review 2026-08-10" in row[4]
+        ]
+        self.assertEqual(1, len(recorded))
+        verb, outcome, length, fingerprint, detail = recorded[0]
+        self.assertEqual(len(WIRE), int(length))
+        self.assertEqual(4, len(bytes.fromhex(str(fingerprint))))
+        self.assertIn("incident review 2026-08-10", detail)
+        self.assertNotIn(MARKER, detail)
+
+    def test_the_agent_connection_reaches_neither_the_seal_nor_the_trail(self):
+        # Which is what makes the audit trail an audit trail: a surface the
+        # subject of the audit could read is a surface it could learn from.
+        for statement in (
+            "SELECT count(*) FROM artifact_seal",
+            "SELECT count(*) FROM secret_kek",
+            "SELECT count(*) FROM secret_access_log",
+            "SELECT count(*) FROM find_in_database('x')",
+        ):
+            with self.subTest(statement), self.bound("a") as session:
+                with self.assertRaises(pg.DatabaseError) as refused:
+                    session.execute(statement)
+
+                self.assertEqual("42501", refused.exception.sqlstate)
+
+    def test_a_ciphertext_that_was_edited_fails_closed(self):
+        # Criterion 6. The store files the envelope under its own hash, so an
+        # edited ciphertext is caught before any key material is used at all --
+        # and nothing partial is written out on the way to saying so.
+        path = artifact.path_for(self.root, self.ciphertext)
+        kept = path.read_bytes()
+        path.write_bytes(kept[:-1] + bytes([kept[-1] ^ 0xFF]))
+        try:
+            result, target = self.opening(
+                "a", "tampered.wire", label="AF1", authorize="checking the tamper path"
+            )
+        finally:
+            path.write_bytes(kept)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertFalse(target.exists())
+        self.assertIsNone(result.facts["released"])
+        self.assertFalse(result.facts["integrity"]["sound"])
+        self.assertIn(
+            "the sealed bytes cannot be read",
+            [row[4] for row in self.trail(scope_id=self.identifiers["a"], outcome="error")][0],
+        )
+
+    def test_the_wrong_key_file_is_refused_before_anything_is_decrypted(self):
+        # The second way it fails closed, and the one that reads as what it is.
+        # The check value exists so that a wrong key file is a configuration
+        # problem here rather than an authentication failure that looks like
+        # corruption three steps later.
+        result = artifact.open_wire(
+            self.harness.runtime,
+            self.configurations["a"],
+            root=self.root,
+            key=self.wrong,
+            label="AF1",
+            into=scratch() / "wrong-key.wire",
+            authorize="checking the wrong-key path",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(["argument:--key"], [item.source for item in result.violations])
+        self.assertFalse((scratch() / "wrong-key.wire").exists())
+        self.assertIsNone(result.facts["released"])
+        self.assertIn(
+            "key material does not match",
+            " ".join(row[4] for row in self.trail(scope_id=self.identifiers["a"], outcome="error")),
+        )
+
+    def test_another_programs_label_opens_nothing_and_says_nothing(self):
+        # The third: the seal is scoped, the query says so twice, and the answer
+        # from the Program that does not hold it is the answer for a label that
+        # does not exist. The attempt is still recorded, against the Program that
+        # made it.
+        result, target = self.opening(
+            "b", "cross-program.wire", label="AF1", authorize="reaching for another Program"
+        )
+
+        self.assertEqual(EXIT_OK, result.exit_code)
+        self.assertEqual({"label": "AF1", "present": False}, result.facts["artifact"])
+        self.assertFalse(target.exists())
+        self.assertIsNone(result.facts["released"])
+        self.assertEqual(
+            [("open", "denied", None, None, "AF1 names no sealed artifact of this Program")],
+            self.trail(scope_id=self.identifiers["b"], verb="open"),
+        )
+
+    def test_sealing_the_same_wire_bytes_twice_is_refused(self):
+        # A seal is immutable and a second one would carry a fresh nonce, so the
+        # row would describe a ciphertext that is not the one on disk. Refused on
+        # the way in, from either Program, and recorded -- and the envelope the
+        # refused attempt had already written is taken back up again, because a
+        # fresh nonce puts its hash beyond every other writer's reach and no row
+        # will ever name it.
+        held = self.stored()
+
+        result = self.sealing("b")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(["argument:--wire"], [item.source for item in result.violations])
+        self.assertEqual(held, self.stored())
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT count(*) FROM artifact_seal WHERE sha256 = $1", (artifact.digest(WIRE),)
+            ).scalar(),
+        )
+        self.assertIn(
+            "already carries a seal",
+            " ".join(
+                row[4] for row in self.trail(scope_id=self.identifiers["b"], verb="seal")
+            ),
+        )
+
+    def test_the_audit_names_the_seal_without_opening_it(self):
+        # `rk artifact audit` is the operator's view of the pair: the label, the
+        # algorithm, the generation, and both hashes. It holds the envelope
+        # against its bytes and never decrypts it, so it needs no key.
+        result = artifact.audit(self.harness.runtime, self.configurations["a"], root=self.root)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(
+            [
+                {
+                    "label": "AF1",
+                    "sha256": artifact.digest(WIRE),
+                    "alg": seal.ALG,
+                    "kek_gen": 1,
+                    "ciphertext_sha256": self.ciphertext,
+                    "byte_size": len(WIRE),
+                }
+            ],
+            result.facts["seals"],
+        )
+        self.assertEqual(2, result.facts["integrity"]["verified"], "the label, and the envelope")
+        self.assertNotIn(MARKER, json.dumps(result.as_dict()))
+
+    def test_the_gate_holds_the_sealed_store_while_holding_no_key(self):
+        # And the check every command ends by running. A sealed artifact is
+        # reachable through no reference, so a gate that only followed labels
+        # would pass a database whose ciphertext was gone.
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected, store=self.root)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual([], result.facts["artifacts"]["broken"])
+        self.assertTrue(result.facts["artifacts"]["sound"])
+        self.assertGreaterEqual(result.facts["artifacts"]["verified"], 2)
+
+    def test_a_missing_envelope_fails_the_gate_that_holds_no_key(self):
+        # The negative control for it, and the reason the seal is verified at
+        # all: every registered check still passes with the ciphertext gone,
+        # because no statement in the database can open a file.
+        path = artifact.path_for(self.root, self.ciphertext)
+        kept = path.read_bytes()
+        path.unlink()
+        try:
+            with pg.connect(self.harness.migrate) as connection:
+                blind = integrity.verify(connection, self.harness.expected)
+                seeing = integrity.verify(connection, self.harness.expected, store=self.root)
+        finally:
+            path.write_bytes(kept)
+
+        self.assertTrue(blind.ok, "no registered check can open a file")
+        self.assertEqual(EXIT_INTEGRITY_FAILED, seeing.exit_code)
+        self.assertEqual(["artifact_store"], [item.source for item in seeing.violations])
+        self.assertIn("not in the store", seeing.violations[0].detail)
 
 
 class ArchiveTest(DatabaseCase):
