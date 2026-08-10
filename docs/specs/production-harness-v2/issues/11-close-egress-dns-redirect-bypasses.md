@@ -37,7 +37,7 @@ separately for TLS and for the `Host` header.
 
 ### What is asserted, and by what
 
-`tests/test_proxy.py` grows from 41 to 63.
+`tests/test_proxy.py` grows from 41 to 65.
 
 `AddressTest` is the seven that need neither socket nor decision. Fourteen
 addresses named one refusal class at a time -- unspecified, loopback, both
@@ -55,13 +55,15 @@ answering with nothing is `target unresolved` with nothing pinned, and two that 
 `/v1/%2e%2e/admin` both become `http://a.example.test/admin` -- or recorded as
 nothing at all when it is a scheme this fence cannot follow.
 
-`RedirectTest` and `CrossHostRedirectTest` are three tests run twice, once
-against a target that redirects to a path on itself and once against a second
-target on another port, because a redirect that leaves the host is the case where
-"the client comes back through the door" stops being obvious. A followed redirect
-is two exchanges with two Receipts, the parent's `notes` names where it pointed,
-and a capability that stopped resolving between the two hops stops the second one
-with the second target's `seen` list empty.
+`Redirected` is a fixture and no tests: a door, a target that redirects, and the
+two-hop `fetch` both redirect suites need. `RedirectTest` and
+`CrossHostRedirectTest` are three each on top of it, the first against a target
+that redirects to a path on itself and the second against a target on another
+port, because a redirect that leaves the host is the case where "the client comes
+back through the door" stops being obvious. A followed redirect is two exchanges
+with two Receipts, the parent's `notes` names where it pointed, and a capability
+that stopped resolving between the two hops stops the second one with the second
+target's `seen` list empty.
 
 `RefusalTest` is three on which of two things the second decision refused. That
 decision resolves the capability again before it looks at an address, so a Tool
@@ -78,22 +80,24 @@ explain -- a name resolving off the public internet opens no socket, a name
 resolving to nothing is refused with no address named, and an address the Program
 withdrew is refused between the two acts with the target's count still zero.
 
-`ProxyEgressTest` in `tests/test_database.py` grows from 20 to 25, and the fence
+`ProxyEgressTest` in `tests/test_database.py` grows from 20 to 26, and the fence
 in them is the real `rk2_proxy` against a real PostgreSQL. Setup resolves every
 name to `93.184.216.34` and dials the loopback port the fixture listens on, so
 the address that was decided and the socket that was opened are visibly two
-facts. The five are: the allowed row names the resolved address; an address
+facts. The six are: the allowed row names the resolved address; an address
 `SCOPED` withdraws is refused with nothing dialled; a name answering `127.0.0.1`
 or `169.254.169.254` is refused by the door in both cases; four exchanges on one
 capability leave four Receipts under one Tool run, two allowed and two blocked,
-which is criterion 4 read out of the rows; and a task lease that lapses between
-two requests stops the second before contact.
+which is criterion 4 read out of the rows; a task lease that lapses between two
+requests stops the second before contact; and `cafe`, `1.2.3` and
+`app.example.com` are all names rather than addresses, so a request for one of
+them is not held to naming the address it was pinned to.
 
 `tests/test_cli.py` moves one number: the address exclusion added to `SCOPED`
 compiles to four more rules, two ports by two protocols.
 
-Offline the suite is 522 tests green with 14 skipped, up from 500; against the
-scratch PostgreSQL 18 cluster it is **662 tests, green, nothing skipped**, up
+Offline the suite is 524 tests green with 14 skipped, up from 500; against the
+scratch PostgreSQL 18 cluster it is **665 tests, green, nothing skipped**, up
 from 635, and `python3 -m compileall -q src/redkraken tests` is clean.
 
 ### Decisions worth naming
@@ -169,6 +173,86 @@ truth and the `reason` column, which is the one an auditor filters on, did not.
 asserts both directions plus the detail surviving either way.
 
 Spec found the two unticked criteria below and no scope creep.
+
+### A second review pass, over the committed work
+
+Both axes run again against `a26eebf`, over `096196e` and `c44f982`, this time as
+the two parallel sub-agents the skill describes. Eleven findings were real and
+are fixed; four are declined, and the reason for each is below.
+
+**One of them was a bug, and it was in the new migration.** The shape that
+separates an address from a name was written `^([0-9.]+|[0-9a-f:]+)$` -- twice,
+once for the pinned address and once for the requested host -- and that shape
+says `cafe` is an address, because `cafe` is four hexadecimal digits, and says
+`1.2.3` is one, because it is digits and dots. Both are legal hostnames.
+A request for either would have reached the second branch, been held to naming
+the address it was pinned to, and been refused for as long as the name kept
+resolving to anything but itself: a permanent refusal of a legitimate target,
+with a Receipt saying the destination "is not the address the request named".
+It was measured before it was fixed -- `SELECT 'cafe' ~ <old>, 'cafe' ~ <new>`
+answers `t, f` -- and the fix is `v_shape`, a `constant text` declared once and
+used at both sites, requiring four dotted decimal groups or at least one colon,
+which is the pair of shapes `scope_normalize_host` already uses to decide the
+same question. The live test walks `cafe`, `1.2.3` and `app.example.com` through
+`authorize_address` against a pin none of them spell, and then asserts that a
+host that really is an address literal still gets refused when the pin disagrees
+with it, so the arm that catches a lying proxy is not what was loosened.
+
+**`Refused.pinned` was a string that was sometimes a list.** `destination` raised
+with every address joined by commas, `_exchange` raised with the one it dialled,
+and `_refuse` wrote whichever it got straight into a column. Two shapes in one
+field, and the join spelled in three places. It is now a `tuple[str, ...]` at
+every raise site and `pinned_ips` is the one function that turns it into the
+column, so a refusal knowing one address and a refusal knowing four are the same
+kind of value on the way to the Receipt.
+
+**`routable` was named for the question and answered the opposite.** It returns
+the refusal sentence for an address that must not be dialled and `None` for one
+that may, so `if routable(address)` read as true exactly where it meant refuse.
+Renamed `unroutable`, with the reason in its docstring.
+
+Three more were about what the code says about itself. `_refusal` had been
+dropped into the run of `#:`-documented SQL constants, where a reader scanning
+for the next query finds a function; it now sits with `_object`, above the
+`Fence` it serves. The module docstring said direct egress "is a channel out of
+this machine that no Receipt names", and `CONTEXT.md` lists **Channel** under
+Lane's _Avoid_; it is a packet now. And the `pinned_ips` comment claimed the
+policy had been asked about every address, which is not what happens -- the
+first is decided, the rest are held to being routable and recorded -- so the
+comment now says that, and `_pin` says why.
+
+Four were in the tests. `PINNED` and `WITHDRAWN` were declared once in
+`tests/test_proxy.py` and again in `tests/test_database.py`, where the second
+copy has to agree with `SCOPED` or the live suite asserts nothing; both now come
+from `tests/fixtures.py`, next to two module-level `assert`s that `SCOPED`
+excludes the one and says nothing about the other. `Redirecting.do_GET` was a
+copy of `Target.do_GET` for the non-redirecting path and now calls `super()`.
+`CrossHostRedirectTest` inherited `RedirectTest` and overrode almost all of it,
+which is the Refused Bequest; `Redirected` is now the fixture and both suites are
+siblings on it. And the multi-hop test asserted that the capabilities in a list
+were the capability in that list -- true whatever the door did -- which is
+replaced by the set of capabilities the fence was asked about and the
+`(path, status_code)` pairs of the two Receipts, with a comment saying the
+Tool-run half of criterion 4 is the database's to assert and is asserted there.
+
+The last is coverage: nothing pinned an address inside a CONNECT tunnel, so
+criterion 2 held for HTTPS only by reading the code and seeing one `_pin` on both
+paths. `TunnelTest` gained a resolver seam and a dialled-address list, and two
+tests: an address the Program withdrew is refused inside a tunnel like anywhere
+else, and a name that answers off the public internet opens no socket to the
+target.
+
+Four are declined. **The address recheck still refuses only on `excluded`**, for
+the reason in "Decisions worth naming": a policy written in names answers
+`unlisted` about every address, so anything stricter denies everything.
+**The door still does not scope-check the `Location` it canonicalises**, because
+the client is what follows it and the client comes back through this fence; the
+case that makes this matter is a client that ignores the proxy, which is
+criterion 1 and is not enforceable from here. **Only the address that will be
+dialled goes to the second decision**, which is the section below and unchanged.
+**Criterion 1 is still unticked and its home is still unstated** -- ticket 16
+does not claim it either -- which is a maintainer's call and is written down
+rather than made here.
 
 ### Raised by review and deliberately not built here
 
