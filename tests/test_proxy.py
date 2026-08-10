@@ -35,13 +35,12 @@ import json
 import threading
 import unittest
 from email.message import Message
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from redkraken import proxy, scope
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
 from redkraken.store import Store
-from tests.fixtures import Target, scratch
+from tests.fixtures import counterparty, scratch
 
 
 #: A capability the way the runtime mints one: 32 random bytes in lowercase hex.
@@ -131,12 +130,33 @@ class HeaderTest(unittest.TestCase):
             [
                 (proxy.AUTHORIZATION, f"RedKraken {CAPABILITY}"),
                 (proxy.AUTHORIZATION, f"RedKraken {OTHER}"),
+                (proxy.PROGRAM, "11111111-1111-1111-1111-111111111111"),
             ]
         )
 
-        with self.assertRaises(proxy.Refused):
-            proxy.take_control(headers)
+        control = proxy.take_control(headers)
+
+        self.assertTrue(control.ambiguous)
+        self.assertIsNone(control.capability)
         self.assertIsNone(headers.get(proxy.AUTHORIZATION))
+        # The Program was named once and unambiguously, and it survives the
+        # refusal: it is what the record of this attempt is filed under.
+        self.assertEqual("11111111-1111-1111-1111-111111111111", control.program)
+
+    def test_a_program_given_twice_leaves_nothing_to_file_the_attempt_under(self):
+        headers = message(
+            [
+                (proxy.AUTHORIZATION, f"RedKraken {CAPABILITY}"),
+                (proxy.PROGRAM, "11111111-1111-1111-1111-111111111111"),
+                (proxy.PROGRAM, "22222222-2222-2222-2222-222222222222"),
+            ]
+        )
+
+        control = proxy.take_control(headers)
+
+        self.assertTrue(control.ambiguous)
+        self.assertIsNone(control.program)
+        self.assertIsNone(headers.get(proxy.PROGRAM))
 
     def test_a_capability_that_is_not_the_minted_shape_resolves_to_nothing(self):
         for value in (
@@ -195,11 +215,7 @@ class ExchangeTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
-        cls.target.seen = []
-        cls.target.daemon_threads = True
-        cls.thread = threading.Thread(target=cls.target.serve_forever, daemon=True)
-        cls.thread.start()
+        cls.target, cls.thread = counterparty()
         cls.target_port = cls.target.server_address[1]
         cls.root = scratch() / "proxy-store"
         cls.root.mkdir(parents=True, exist_ok=True)
@@ -456,18 +472,73 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(proxy.AMBIGUOUS, response.headers[proxy.DECISION])
         self.assertEqual([], self.target.seen)
 
+    def test_a_capability_sent_twice_is_refused_and_still_recorded(self):
+        # The refusal is not in question; the record is. A caller who could make
+        # their own attempt unrecorded by sending one header twice would have
+        # found the cheapest way past this fence there is -- refused, and
+        # invisible to whoever reads the Receipts afterwards.
+        response = self.through(
+            "http://target.example.test/v1/notes",
+            headers=[(proxy.AUTHORIZATION, f"RedKraken {OTHER}")],
+        )
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual(proxy.AMBIGUOUS, response.headers[proxy.DECISION])
+        self.assertEqual([], self.target.seen)
+        self.assertEqual(1, len(self.fence.blocked))
+        filed = self.fence.blocked[0]
+        self.assertEqual("11111111-1111-1111-1111-111111111111", filed["program_id"])
+        self.assertEqual("ambiguous control headers", filed["receipt"]["reason"])
+
+    def test_two_program_headers_leave_nothing_to_file_the_attempt_under(self):
+        # The other half of the same take. Here the ambiguous header is the one
+        # that would have said whose audit trail this belongs in, and filing it
+        # under a guess would put a stranger's row in somebody's Program.
+        response = self.through(
+            "http://target.example.test/v1/notes",
+            headers=[(proxy.PROGRAM, "99999999-9999-9999-9999-999999999999")],
+        )
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual(proxy.AMBIGUOUS, response.headers[proxy.DECISION])
+        self.assertEqual([], self.target.seen)
+        self.assertEqual([], self.fence.blocked)
+
     def test_a_receipt_that_cannot_be_written_is_not_reported_as_an_allowed_request(self):
         # The target has already answered by this point, so the bytes are spent.
         # What must not happen is the caller reading a 200 for an exchange with
-        # no Receipt behind it.
+        # no Receipt behind it -- and what must still happen is a record, because
+        # bytes crossed. It cannot be the allowed one, so it is the blocked one,
+        # and it carries the two facts that say the request left: the moment of
+        # egress and the status the target answered with.
         self.fence.fail = True
 
         response = self.through("http://target.example.test/v1/notes")
         body = response.read()
 
         self.assertEqual(502, response.status)
+        self.assertEqual(proxy.RECEIPT_REFUSED, response.headers[proxy.DECISION])
         self.assertNotIn(b"target answered", body)
         self.assertEqual([], self.fence.allowed)
+        self.assertEqual(1, len(self.fence.blocked))
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("receipt write refused", filed["reason"])
+        self.assertEqual(200, filed["status_code"])
+        self.assertIn("ts_egress", filed)
+
+    def test_a_refusal_before_contact_records_no_moment_of_egress(self):
+        # The falsification for the row above: if every blocked Receipt carried
+        # an egress time, the one that carries it would say nothing.
+        response = self.through("http://target.example.test/v1/notes", capability=OTHER)
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.target.seen)
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertNotIn("ts_egress", filed)
+        self.assertNotIn("status_code", filed)
 
 
 class RuntimeTest(unittest.TestCase):
@@ -486,6 +557,21 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(
             ["proxy_endpoint"], [item.name for item in result.assertions if not item.ok]
         )
+
+    def test_the_door_refuses_to_listen_anywhere_a_stranger_could_reach_it(self):
+        # The mirror of the assertion above. A capability that may only be sent
+        # to a local proxy is worth nothing if the proxy binds an interface the
+        # network can reach: what arrives there is bearer material, spendable by
+        # whoever got to the port first.
+        for host in ("0.0.0.0", "::", "10.0.0.5"):
+            with self.subTest(host=host):
+                result = proxy.serve(None, root=scratch(), host=host, port=0)
+
+                self.assertFalse(result.ok)
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+                self.assertEqual(
+                    ["listener"], [item.name for item in result.assertions if not item.ok]
+                )
 
     def test_the_loopback_endpoints_are_the_ones_it_accepts(self):
         for url, expected in (

@@ -237,6 +237,16 @@ BEGIN
         RAISE EXCEPTION 'egress identity does not match authorized tool run'
             USING ERRCODE = '23514';
     END IF;
+    -- The method the Tool run declared binds every request that could change
+    -- something, and only those. §7 has subresources and redirects sharing one
+    -- capability, and both arrive as GET whatever the declared method was: a
+    -- page authorized as a POST pulls its scripts with GETs, and a 303 turns the
+    -- POST itself into one. Refusing those would make the sharing unusable while
+    -- protecting nothing, because a safe method is the one thing a caller who
+    -- already holds the capability gains nothing by substituting. Anything
+    -- outside the safe set is matched exactly. CONNECT is exempt for a different
+    -- reason: no tunnel is opened at all (ticket 10), so there is no request for
+    -- the declared method to describe.
     IF upper(coalesce(p_method, 'GET')) NOT IN ('GET', 'HEAD', 'OPTIONS', 'CONNECT')
        AND upper(coalesce(v_args ->> 'method', 'GET')) IS DISTINCT FROM
            upper(coalesce(p_method, 'GET')) THEN

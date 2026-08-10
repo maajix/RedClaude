@@ -459,9 +459,9 @@ def build_parser() -> argparse.ArgumentParser:
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
-    hops = door.add_subparsers(dest="operation", required=True, metavar="operation")
+    operations = door.add_subparsers(dest="operation", required=True, metavar="operation")
 
-    listener = hops.add_parser(
+    listener = operations.add_parser(
         "serve",
         help=(
             "run the egress fence until it is interrupted, as the proxy role "
@@ -481,8 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROXY_HOST,
         metavar="address",
         help=(
-            "the interface to listen on; a capability is bearer material, so the "
-            f"default is loopback alone (default: {DEFAULT_PROXY_HOST})"
+            "which loopback interface to listen on; a capability is bearer "
+            "material, so a routable one is refused rather than bound "
+            f"(default: {DEFAULT_PROXY_HOST})"
         ),
     )
     listener.add_argument(
@@ -494,7 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     listener.set_defaults(run=_proxy_serve)
 
-    spend = hops.add_parser(
+    spend = operations.add_parser(
         "request",
         help=(
             "open one Tool run, mint its capability and spend it on one request "

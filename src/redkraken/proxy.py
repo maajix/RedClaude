@@ -84,6 +84,7 @@ __all__ = [
     "Refused",
     "Server",
     "capability_of",
+    "describes_this_hop",
     "endpoint",
     "forwardable",
     "listen",
@@ -125,6 +126,11 @@ AMBIGUOUS = "control-headers-refused"
 NO_PROGRAM = "no-program"
 RECEIPT_REFUSED = "receipt-refused"
 TUNNEL = "tunnel-refused"
+
+#: What an ambiguous take says, in one place because two paths report it and a
+#: caller comparing the two would otherwise be reading a difference that means
+#: nothing.
+TWO_HEADERS = "the request carries two of one control header"
 
 #: The minted shape, pinned: `authorize_tool_run` emits 32 random bytes as
 #: lowercase hex and nothing else is a capability. Anchored on both ends, so a
@@ -188,11 +194,23 @@ class Refused(Exception):
     apart from a refused one.
     """
 
-    def __init__(self, reason: str, detail: str = "", *, status: int = 407) -> None:
+    def __init__(
+        self,
+        reason: str,
+        detail: str = "",
+        *,
+        status: int = 407,
+        target_status: int | None = None,
+    ) -> None:
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail or reason
         self.status = status
+        #: What the target answered, on the refusals that happen after it did.
+        #: `status` is this fence's answer and is never the target's; the two
+        #: live on one object because a Receipt records both facts about the
+        #: same refusal, and a refusal before contact has only the first.
+        self.target_status = target_status
 
 
 @dataclass(frozen=True)
@@ -201,6 +219,9 @@ class Control:
 
     capability: str | None
     program: str | None
+    #: Whether one of the two names carried two values. Reported rather than
+    #: raised: see `take_control`.
+    ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,18 +268,37 @@ def take_control(headers: Message) -> Control:
 
     Two values under one name is refused rather than resolved. Taking the first
     would let a caller hide a second capability behind one the proxy accepts, and
-    taking the last would do the same in the other direction.
+    taking the last would do the same in the other direction. The duplicated name
+    resolves to nothing at all here, so no later line can pick a side.
+
+    Reported rather than raised, because the caller who duplicates a header is
+    exactly the caller who most needs a row. A request carrying two
+    `Proxy-Authorization` lines can still have named its Program unambiguously,
+    and that is enough to file the attempt against; raising from here was how
+    sending one header twice bought a refusal that nothing recorded.
     """
     offered = headers.get_all(AUTHORIZATION) or []
     claimed = headers.get_all(PROGRAM) or []
     del headers[AUTHORIZATION]
     del headers[PROGRAM]
-    if len(offered) > 1 or len(claimed) > 1:
-        raise Refused("ambiguous control headers", "the request carries two of one control header")
     return Control(
-        capability=capability_of(offered[0] if offered else None),
-        program=(claimed[0].strip() if claimed else None) or None,
+        capability=capability_of(offered[0]) if len(offered) == 1 else None,
+        program=(claimed[0].strip() or None) if len(claimed) == 1 else None,
+        ambiguous=len(offered) > 1 or len(claimed) > 1,
     )
+
+
+def describes_this_hop(name: str, named: frozenset[str] | set[str] = frozenset()) -> bool:
+    """Whether one header is about this connection rather than the message on it.
+
+    One predicate, because the request going out and the answer coming back are
+    filtered by the same rule and a copy of it would be a rule that could drift
+    on one side only -- which for the internal prefix would mean a control header
+    reaching a target, and for hop-by-hop would mean a length this process did
+    not measure.
+    """
+    lowered = name.lower()
+    return lowered in HOP_BY_HOP or lowered in named or lowered.startswith(INTERNAL)
 
 
 def forwardable(headers: Message) -> list[tuple[str, str]]:
@@ -276,11 +316,7 @@ def forwardable(headers: Message) -> list[tuple[str, str]]:
         if item.strip()
     }
     return [
-        (name, value)
-        for name, value in headers.items()
-        if name.lower() not in HOP_BY_HOP
-        and name.lower() not in named
-        and not name.lower().startswith(INTERNAL)
+        (name, value) for name, value in headers.items() if not describes_this_hop(name, named)
     ]
 
 
@@ -390,6 +426,16 @@ BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)::text"
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 
 
+def _object(answer: object) -> dict:
+    """One `jsonb` answer as a mapping, whichever shape the driver returned it in.
+
+    Both sides of this module read a function that answers with an object, and a
+    second spelling of the same two-branch decode is a second place for the two
+    to disagree about what an answer with no rows looks like.
+    """
+    return json.loads(answer) if isinstance(answer, str) else dict(answer)
+
+
 class Fence:
     """The decision and the record, on the connection that owns neither.
 
@@ -438,7 +484,7 @@ class Fence:
             except pg.DatabaseError as error:
                 raise Refused("capability refused", str(error)) from error
         if not rows:
-            raise Refused("capability refused", "no grant was returned")
+            raise Refused("capability refused", "no capability resolved")
         found, tool_run, version, klass = rows[0]
         return Authorization(
             program_id=str(found),
@@ -468,7 +514,7 @@ class Fence:
                 ).scalar()
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
-        return json.loads(answer) if isinstance(answer, str) else dict(answer)
+        return _object(answer)
 
     def blocked_receipt(self, program_id: str, capability: str | None, receipt: dict) -> str:
         with self._lock:
@@ -530,18 +576,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve(self) -> None:
         arrival = datetime.now(timezone.utc)
-        try:
-            control = take_control(self.headers)
-        except Refused as refusal:
-            # No Program is known at this point -- the header that would have
-            # named one is part of what was ambiguous -- so there is nowhere to
-            # file the record. Refusing without one is the honest answer;
-            # guessing a Program would put a stranger's row in somebody's audit.
-            return self._answer(refusal.status, AMBIGUOUS, detail=refusal.detail, body=b"")
-
+        control = take_control(self.headers)
         program_id = _identifier(control.program)
         if program_id is None:
-            return self._answer(407, NO_PROGRAM, body=b"")
+            # Either nothing named a Program or two headers did, and the one
+            # that would have said which is part of what was ambiguous. There is
+            # nowhere to file the record either way; guessing a Program would put
+            # a stranger's row in somebody's audit.
+            return self._answer(407, AMBIGUOUS if control.ambiguous else NO_PROGRAM, body=b"")
+
+        if control.ambiguous:
+            # The Program is unambiguous, so the attempt does have somewhere to
+            # go -- and it goes there. A refusal that filed nothing would make
+            # duplicating one's own capability header the cheapest way through
+            # this fence there is: refused, but unrecorded.
+            return self._refuse(
+                program_id,
+                None,
+                Refused("ambiguous control headers", TWO_HEADERS),
+                arrival,
+                url=self.path,
+                decision=AMBIGUOUS,
+            )
 
         try:
             request = self._request()
@@ -567,14 +623,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_CONNECT(self) -> None:
         """Refuse the tunnel. Ticket 10 is where HTTPS gets one.
 
-        The take is still guarded: a tunnel request carrying two capabilities is
-        refused for that before it is refused for being a tunnel, and letting
-        that refusal out of the handler would answer nothing at all.
+        The take still happens, and an ambiguous one is still the refusal
+        reported: a caller has to be able to tell which of the two things was
+        wrong with their request.
+
+        Nothing is filed on this path, ambiguous or not, and that is not the hole
+        `_serve` closes. There a record was suppressible by duplicating a header;
+        here no tunnel produces a record at all, because no tunnel is opened --
+        the row this ticket could write about a CONNECT would be a Receipt about
+        an exchange that never happened.
         """
-        try:
-            take_control(self.headers)
-        except Refused as refusal:
-            return self._answer(refusal.status, AMBIGUOUS, detail=refusal.detail, body=b"")
+        control = take_control(self.headers)
+        if control.ambiguous:
+            return self._answer(407, AMBIGUOUS, detail=TWO_HEADERS, body=b"")
         self._answer(405, TUNNEL, body=b"")
 
     def _request(self) -> scope.Request:
@@ -611,28 +672,19 @@ class Handler(BaseHTTPRequestHandler):
             raise Refused("unsupported framing", f"a request body over {CEILING} bytes")
         return self.rfile.read(length) if length else b""
 
-    def _forward(
+    def _exchange(
         self,
-        authorization: Authorization,
-        capability: str,
         request: scope.Request,
+        target: str,
+        headers: list[tuple[str, str]],
         body: bytes,
-        arrival: datetime,
-    ) -> None:
-        """Send the authorized request, record the exchange, answer the caller."""
-        authority = _authority(request.host, request.port, request.protocol)
-        headers = [("Host", authority), *forwardable(self.headers)]
-        if body:
-            headers.append(("Content-Length", str(len(body))))
-        if not any(name.lower() == "accept-encoding" for name, _ in headers):
-            # `http.client` adds this one when the caller does not, and a
-            # transcript that omitted it would be a hash of bytes that differ
-            # from the ones the socket carried.
-            headers.append(("Accept-Encoding", "identity"))
-        target = origin_form(self.path)
-        line = f"{self.command} {target} HTTP/1.1"
+    ) -> tuple[int, str, list[tuple[str, str]], bytes]:
+        """Contact the authorized target and read what it answered, or refuse.
 
-        egress = datetime.now(timezone.utc)
+        Every refusal from here is one that happened after the socket was opened,
+        which is why they are raised together: the caller of this method knows the
+        request left the machine and records that on all of them.
+        """
         try:
             connection = self.server.connector(
                 request.host, request.port, self.server.target_timeout
@@ -660,22 +712,48 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 connection.close()
         except (OSError, http.client.HTTPException) as error:
-            return self._refuse(
-                authorization.program_id,
-                capability,
-                Refused("target unreachable", str(error)),
-                arrival,
-                url=self.path,
-                authorization=authorization,
-            )
+            raise Refused("target unreachable", str(error)) from error
         if len(returned) > CEILING:
+            raise Refused(
+                "response too large",
+                f"the target answered with over {CEILING} bytes",
+                target_status=status,
+            )
+        return status, reason, back, returned
+
+    def _forward(
+        self,
+        authorization: Authorization,
+        capability: str,
+        request: scope.Request,
+        body: bytes,
+        arrival: datetime,
+    ) -> None:
+        """Send the authorized request, record the exchange, answer the caller."""
+        authority = _authority(request.host, request.port, request.protocol)
+        headers = [("Host", authority), *forwardable(self.headers)]
+        if body:
+            headers.append(("Content-Length", str(len(body))))
+        if not any(name.lower() == "accept-encoding" for name, _ in headers):
+            # `http.client` adds this one when the caller does not, and a
+            # transcript that omitted it would be a hash of bytes that differ
+            # from the ones the socket carried.
+            headers.append(("Accept-Encoding", "identity"))
+        target = origin_form(self.path)
+        line = f"{self.command} {target} HTTP/1.1"
+
+        egress = datetime.now(timezone.utc)
+        try:
+            status, reason, back, returned = self._exchange(request, target, headers, body)
+        except Refused as refusal:
             return self._refuse(
                 authorization.program_id,
                 capability,
-                Refused("response too large", f"the target answered with over {CEILING} bytes"),
+                refusal,
                 arrival,
                 url=self.path,
                 authorization=authorization,
+                egress=egress,
             )
 
         sent = transcript(line, headers, body)
@@ -720,14 +798,33 @@ class Handler(BaseHTTPRequestHandler):
             )
         except Refused as refusal:
             # The bytes are spent: the target has answered and cannot be asked to
-            # forget. What must not happen is the caller reading a 200 for an
-            # exchange with no Receipt behind it, so the answer is discarded and
-            # the failure is the caller's to see.
+            # forget. Two things follow from that, and only one of them was here
+            # before. The caller must not read a 200 for an exchange with no
+            # Receipt behind it -- and the exchange must not vanish either, so the
+            # record that can still be written is written: a blocked Receipt
+            # naming the target, the status it answered with and the moment of
+            # egress. It cannot name the transcripts, because registering them is
+            # precisely what failed, and bytes no row can reach are discarded
+            # rather than left in the store for nobody.
             if request_new:
                 store.discard(request_sha)
             if response_new:
                 store.discard(response_sha)
-            return self._answer(502, RECEIPT_REFUSED, detail=refusal.reason, body=b"")
+            return self._refuse(
+                authorization.program_id,
+                capability,
+                Refused(
+                    refusal.reason,
+                    refusal.detail,
+                    status=502,
+                    target_status=status,
+                ),
+                arrival,
+                url=self.path,
+                authorization=authorization,
+                egress=egress,
+                decision=RECEIPT_REFUSED,
+            )
 
         label = str(written.get("label") or written.get("receipt_id") or "")
         self._answer(status, None, body=returned, headers=back, receipt=label, reason=reason)
@@ -741,12 +838,19 @@ class Handler(BaseHTTPRequestHandler):
         *,
         url: str,
         authorization: Authorization | None = None,
+        egress: datetime | None = None,
+        decision: str = REFUSED,
     ) -> None:
-        """Record the attempt under the Program it named, and answer 407.
+        """Record the attempt under the Program it named, and answer the refusal.
 
         The record is written before the answer, so a caller cannot learn the
         verdict earlier than the audit trail does. A record that itself fails to
         write does not become a served request: the answer is still a refusal.
+
+        `egress` is what separates a refusal from a refusal-after-contact. Without
+        it, "the target never answered" and "the target answered and the record
+        would not write" are the same row shape, and an auditor reading the second
+        one has no way to know that bytes left this machine.
 
         The one way that write legitimately fails is a Program header naming a
         Program that does not exist -- there is no row to file the attempt
@@ -772,11 +876,18 @@ class Handler(BaseHTTPRequestHandler):
             "scope_class": authorization.scope_class if authorization else "denied",
             "intercepted": True,
         }
+        if egress is not None:
+            receipt["ts_egress"] = egress.isoformat()
+            receipt["waited_ms"] = int(
+                (datetime.now(timezone.utc) - egress).total_seconds() * 1000
+            )
+        if refusal.target_status is not None:
+            receipt["status_code"] = refusal.target_status
         try:
             self.server.fence.blocked_receipt(program_id, capability, receipt)
         except (pg.DatabaseError, OSError, Refused) as error:
             self.log_error("no blocked receipt for %s: %s", program_id, error)
-        self._answer(refusal.status, REFUSED, detail=refusal.reason, body=b"")
+        self._answer(refusal.status, decision, detail=refusal.reason, body=b"")
 
     def _answer(
         self,
@@ -793,7 +904,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.send_response(status, reason)
         for name, value in headers or []:
-            if name.lower() not in HOP_BY_HOP and not name.lower().startswith(INTERNAL):
+            if not describes_this_hop(name):
                 self.send_header(name, value)
         if decision:
             self.send_header(DECISION, decision)
@@ -875,8 +986,21 @@ def serve(settings: pg.Settings, *, root: Path, host: str = "127.0.0.1", port: i
     Binds before it connects, so an operator who named a port something else
     holds learns that from the report rather than after a database session has
     been opened for a process that cannot listen.
+
+    And it binds nowhere but this machine. `endpoint` refuses to send a
+    capability to a proxy that is not local; a listener on a routable interface
+    is the same hole from the other side, because what arrives at it is bearer
+    material that anybody who can reach the port may spend.
     """
     ledger = Ledger()
+    if not _loopback(host):
+        ledger.fail(
+            "listener",
+            f"{host} is not a loopback interface, and a capability is bearer material",
+            code=INVALID_CONFIGURATION,
+            source="argument:--host",
+        )
+        return report(SERVE, ledger, endpoint=None)
     try:
         server = listen((host, port), fence=None, store=Store(Path(root)))
     except OSError as error:
@@ -1016,7 +1140,7 @@ def _spend(
     program_id: str,
     url: str,
     method: str,
-    proxy: tuple[str, int],
+    listener: tuple[str, int],
     timeout: float,
 ) -> None:
     """One Agent run, one Tool run, one capability, and its revocation.
@@ -1028,7 +1152,7 @@ def _spend(
     did. `set_actor` is transaction-local by construction, so each of them
     declares its actor again -- a session-wide actor is exactly what 013 refuses.
     """
-    connection.execute("SELECT set_config('rk2.program_id', $1, false)", (program_id,))
+    connection.execute(BIND, (program_id,))
     with connection.transaction():
         connection.execute("SELECT set_actor('runtime', $1)", (f"rk {REQUEST}",))
         run = connection.execute(
@@ -1048,8 +1172,7 @@ def _spend(
 
     outcome = "error"
     try:
-        answer = connection.execute(AUTHORIZE_TOOL_RUN, (tool_run_id,)).scalar()
-        gate = json.loads(answer) if isinstance(answer, str) else dict(answer)
+        gate = _object(connection.execute(AUTHORIZE_TOOL_RUN, (tool_run_id,)).scalar())
         capability = gate.get("capability")
         if not capability:
             ledger.fail(
@@ -1064,7 +1187,7 @@ def _spend(
             "authorization",
             f"{label} is {gate.get('risk_class')}/{gate.get('decision')} by {gate.get('rule')}",
         )
-        status, body, receipt = _through(proxy, url, method, capability, program_id, timeout)
+        status, body, receipt = _through(listener, url, method, capability, program_id, timeout)
         facts["response"] = {"status": status, "byte_size": len(body)}
         facts["receipt"] = receipt
         if receipt is None:
@@ -1097,7 +1220,7 @@ def _spend(
 
 
 def _through(
-    proxy: tuple[str, int],
+    listener: tuple[str, int],
     url: str,
     method: str,
     capability: str,
@@ -1105,7 +1228,8 @@ def _through(
     timeout: float,
 ) -> tuple[int, bytes, str | None]:
     """The request itself, in absolute form, with the capability on this hop."""
-    client = http.client.HTTPConnection(proxy[0], proxy[1], timeout=timeout)
+    host, port = listener
+    client = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         client.request(
             method.upper(),

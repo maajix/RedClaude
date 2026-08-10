@@ -3,7 +3,8 @@
 import atexit
 import shutil
 import tempfile
-from http.server import BaseHTTPRequestHandler
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -217,6 +218,24 @@ class Target(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *arguments: object) -> None:
         return
+
+
+def counterparty(
+    handler: type[BaseHTTPRequestHandler] = Target,
+) -> tuple[ThreadingHTTPServer, threading.Thread]:
+    """One target, on a port of its own, already serving and already recording.
+
+    The `seen` list has to exist before the first request arrives and the port
+    has to be bound before it is named in a URL, so the four lines that arrange
+    that live here rather than in each suite's setup: a copy that forgot `seen`
+    fails inside a handler thread, where the failure is a log line and not a test.
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.seen = []
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 
 def scratch() -> Path:

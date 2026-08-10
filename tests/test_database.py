@@ -38,7 +38,6 @@ import shutil
 import threading
 import unittest
 from dataclasses import dataclass
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -69,6 +68,7 @@ from tests.fixtures import (
     SCOPED,
     VALID,
     Target,
+    counterparty,
     scratch,
     write,
 )
@@ -3193,10 +3193,7 @@ class ProxyEgressTest(DatabaseCase):
             cls.configurations[name] = path
             cls.identifiers[name] = opened.facts["program_id"]
 
-        cls.target = ThreadingHTTPServer(("127.0.0.1", 0), LiveTarget)
-        cls.target.seen = []
-        cls.target.daemon_threads = True
-        threading.Thread(target=cls.target.serve_forever, daemon=True).start()
+        cls.target, _ = counterparty(LiveTarget)
 
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
         cls.server = proxy.listen(
@@ -3477,6 +3474,36 @@ class ProxyEgressTest(DatabaseCase):
         record = self.refused("a", "c" * 64, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+
+    def test_a_capability_offered_twice_is_refused_and_the_database_holds_the_row(self):
+        # A caller who sent one header twice used to get a refusal that left no
+        # row at all, which made duplicating your own capability the quietest way
+        # to probe this fence. The Program was never the ambiguous part: it is
+        # named once, it is a real Program, and the attempt belongs in its audit.
+        before = len(self.receipts("a"))
+        seen = len(self.target.seen)
+        client = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
+        )
+        try:
+            client.putrequest("GET", URL)
+            client.putheader(proxy.AUTHORIZATION, "RedKraken " + "c" * 64)
+            client.putheader(proxy.AUTHORIZATION, "RedKraken " + "d" * 64)
+            client.putheader(proxy.PROGRAM, self.identifiers["a"])
+            client.endheaders()
+            answer = client.getresponse()
+            answer.read()
+            status, decision = answer.status, answer.headers.get(proxy.DECISION)
+        finally:
+            client.close()
+        after = self.receipts("a")
+
+        self.assertEqual(407, status)
+        self.assertEqual(proxy.AMBIGUOUS, decision)
+        self.assertEqual(seen, len(self.target.seen), "the target was contacted")
+        self.assertEqual(before + 1, len(after))
+        self.assertEqual(("agent", "blocked", "ambiguous control headers"), after[-1][:3])
+        self.assertIsNone(after[-1][3], "no capability resolved, so no Tool run is named")
 
     def test_a_capability_offered_under_another_program_resolves_to_nothing(self):
         # Third arm, and the one the header cannot decide: the Program header is
