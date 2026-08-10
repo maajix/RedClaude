@@ -252,6 +252,80 @@ class CanonicalFormTest(unittest.TestCase):
                     scope.path_variants(given)
                 self.assertEqual("malformed_path", refusal.exception.reason)
 
+    def test_a_traversal_encoded_twice_over_is_decoded_before_it_is_normalised(self):
+        # One decoding pass turns `%252e%252e` into `%2e%2e`, which holds no dot
+        # segment for `normpath` to collapse. A target that decodes twice -- a
+        # proxy in front of an application is the ordinary case -- would then
+        # serve the excluded path while the receipt cited the inclusion.
+        self.assertEqual(
+            ("/x/%252e%252e/internal/secrets", "/internal/secrets"),
+            scope.path_variants("/x/%252e%252e/internal/secrets"),
+        )
+
+    def test_a_path_encoded_further_than_that_is_refused_rather_than_unwrapped(self):
+        # Four layers is the limit, and one more is a refusal rather than a fifth
+        # pass: nothing legitimate wraps a dot segment that deeply, and a loop
+        # with no bound is a loop an input decides the length of.
+        self.assertEqual("/y", scope.path_variants("/x/%" + "25" * 3 + "2e%" + "25" * 3 + "2e/y")[1])
+        with self.assertRaises(scope.PolicyError) as refusal:
+            scope.path_variants("/x/%" + "25" * 5 + "2e/y")
+        self.assertEqual("malformed_path", refusal.exception.reason)
+
+    def test_a_doubled_leading_slash_is_one_slash(self):
+        # POSIX reserves exactly two leading slashes and `normpath` preserves
+        # them, so `//internal/x` would not be under a `/internal/` exclusion.
+        # Web servers serve it as `/internal/x`.
+        self.assertEqual(("//internal/x", "/internal/x"), scope.path_variants("//internal/x"))
+        self.assertEqual(("///internal", "/internal"), scope.path_variants("///internal"))
+
+    def test_a_prefix_covers_its_own_subtree_and_never_a_sibling(self):
+        for path, prefix, under in (
+            ("/v1", "/v1", True),
+            ("/v1/x", "/v1", True),
+            ("/v1/x", "/v1/", True),
+            ("/v1-internal/dump", "/v1", False),
+            ("/v10/x", "/v1", False),
+            ("/v1x", "/v1/", False),
+            ("/anything", "/", True),
+        ):
+            with self.subTest(f"{path} under {prefix}"):
+                self.assertEqual(under, scope.path_under(path, prefix))
+
+    def test_a_host_padded_with_what_postgresql_does_not_trim_is_refused(self):
+        # `btrim` trims spaces; `str.strip()` also trims U+00A0. Trimming more
+        # than SQL trims would make this host a name here and malformed there.
+        with self.assertRaises(scope.PolicyError) as refusal:
+            scope.normalize_host(" app.example.com")
+        self.assertEqual("malformed_host", refusal.exception.reason)
+
+    def test_an_address_the_two_worlds_spell_differently_is_refused(self):
+        # Left accepted, each of these would carry a match key that depends on
+        # which implementation canonicalised it: `host()` renders the
+        # IPv4-compatible range as `::1.2.3.4` and Python as `::102:304`, and
+        # `inet` reads a leading-zero octet as decimal where Python refuses it.
+        for given in ("::102:304", "::1.2.3.4", "093.184.216.34", "::0.0.1.2"):
+            with self.subTest(given):
+                with self.assertRaises(scope.PolicyError) as refusal:
+                    scope.normalize_host(given)
+                self.assertEqual("malformed_host", refusal.exception.reason)
+
+    def test_a_single_label_name_out_of_the_hex_alphabet_is_a_name(self):
+        # `db`, `cafe` and `ec2` are spelled out of `[0-9a-f]`, and a pre-filter
+        # with no colon in it read them as addresses that then failed to parse:
+        # an ordinary name reported as a malformed address.
+        for given in ("db", "cafe", "ec2", "beef"):
+            with self.subTest(given):
+                self.assertEqual(given, scope.normalize_host(given))
+
+    def test_a_port_whose_digits_are_not_the_ones_int_reads_is_refused(self):
+        # `str.isdigit()` is true of both: `int` reads the first as 443 and
+        # raises a bare ValueError on the second, which no caller here handles.
+        for given in ("٤٤٣", "²"):
+            with self.subTest(given):
+                with self.assertRaises(scope.PolicyError) as refusal:
+                    scope.normalize_port(given, "https")
+                self.assertEqual("malformed_port", refusal.exception.reason)
+
     def test_a_url_carrying_a_credential_is_refused(self):
         for url in (
             "https://user:secret@app.example.com/",
@@ -416,6 +490,46 @@ class VerdictTest(unittest.TestCase):
                 verdict = scope.decide(self.policy, url)
                 self.assertEqual(scope.DENIED, verdict.scope_class)
                 self.assertEqual(reason, verdict.reason)
+
+    def test_an_inclusion_path_authorises_its_subtree_and_not_its_siblings(self):
+        # The fixture writes `/v1/`, and the trailing slash hides the whole
+        # class: an operator who writes `/v1` means the v1 API and would also
+        # have authorised `/v1-internal/dump` under a bare prefix test.
+        policy = compiled(SCOPED.replace('paths = ["/v1/"]', 'paths = ["/v1"]'))
+
+        for url, scope_class in (
+            ("https://api.example.net/v1", "target"),
+            ("https://api.example.net/v1/users", "target"),
+            ("https://api.example.net/v1-internal/dump", scope.DENIED),
+            ("https://api.example.net/v10/users", scope.DENIED),
+        ):
+            with self.subTest(url):
+                self.assertEqual(scope_class, scope.decide(policy, url).scope_class)
+
+    def test_an_exclusion_written_in_a_spelling_nobody_types_still_fires(self):
+        # The prefix is canonicalised at compile time for the same reason a
+        # request's path is: stored verbatim, `/%69nternal/` withdraws nothing an
+        # operator can ask for, and the withdrawal reads as if it were in force.
+        policy = compiled(SCOPED.replace('paths = ["/internal/"]', 'paths = ["/%69nternal/"]'))
+
+        verdict = scope.decide(policy, "https://app.example.com/internal/secrets")
+
+        self.assertEqual(scope.DENIED, verdict.scope_class)
+        self.assertEqual("excluded", verdict.reason)
+
+    def test_a_question_this_grammar_has_no_word_for_is_refused(self):
+        # The two coverage polarities are the wide readings, so a caller that
+        # mistyped `request` must not be answered under one of them.
+        with self.assertRaises(scope.PolicyError) as refusal:
+            scope.Request(
+                protocol="https",
+                host="api.example.net",
+                port=443,
+                path_raw="/",
+                path_norm="/",
+                question="requst",
+            )
+        self.assertEqual("not_addressable", refusal.exception.reason)
 
     def test_every_entity_in_the_matrix_is_projected_as_the_matrix_says(self):
         for kind, selector, port, path, scope_class, reason in SCOPE_ENTITIES:

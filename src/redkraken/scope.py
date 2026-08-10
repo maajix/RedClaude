@@ -146,9 +146,18 @@ REASONS = (
 #: matched before anything is parsed, so Python and SQL agree on which strings
 #: are even considered addresses -- the disagreement that would otherwise let
 #: `1.2.3` be a name on one side and the address `1.2.0.3` on the other.
+#: The colon is required, or every hostname spelled out of the hex alphabet --
+#: `db`, `cafe`, `ec2` -- would be read as an address, fail to parse, and be
+#: refused as malformed rather than matched as the name it is.
 _IPV4 = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
-_IPV6 = re.compile(r"[0-9a-f:]+")
+_IPV6 = re.compile(r"[0-9a-f]*:[0-9a-f:]*")
 _MAPPED = re.compile(r"::ffff:[0-9]{1,3}(\.[0-9]{1,3}){3}")
+
+#: The deprecated IPv4-compatible range, `::a.b.c.b`. Refused rather than
+#: canonicalised, because Python and PostgreSQL render it differently --
+#: `::102:304` here and `::1.2.3.4` there -- and a match key that depends on
+#: which side normalised it is a rule that covers a host in one world only.
+_V4_COMPATIBLE = ipaddress.ip_network("::/96")
 
 #: One DNS label as the matcher accepts it. Wider than the configuration's own
 #: pattern on purpose: this reads hosts off the wire, where an underscore label
@@ -157,6 +166,9 @@ _MAPPED = re.compile(r"::ffff:[0-9]{1,3}(\.[0-9]{1,3}){3}")
 _LABEL = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?")
 
 _MAXIMUM_HOST = 253
+
+#: How many times a path may be percent-encoded before it is refused.
+_DECODE_PASSES = 4
 
 
 class PolicyError(Exception):
@@ -189,6 +201,15 @@ def canonical_address(value: str) -> str:
     except ValueError as error:
         raise PolicyError("malformed_host", f"{value} is not an address") from error
     mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is None and address.version == 6 and address in _V4_COMPATIBLE:
+        # `::` and `::1` are in the same /96 and are not this: they are the
+        # unspecified and loopback addresses, refused a step later for being
+        # unroutable rather than here for being ambiguously spelled.
+        if not (address.is_unspecified or address.is_loopback):
+            raise PolicyError(
+                "malformed_host",
+                f"{value} is in the deprecated IPv4-compatible range; write the address itself",
+            )
     return (mapped or address).compressed
 
 
@@ -201,7 +222,10 @@ def normalize_host(raw: object) -> str:
     """
     if not isinstance(raw, str):
         raise PolicyError("malformed_host", "a host must be text")
-    value = raw.strip().lower().rstrip(".")
+    # Spaces only, because `btrim` trims spaces only. `str.strip()` also removes
+    # U+00A0, so a host padded with one would be a name here and malformed in
+    # SQL -- the exact class of disagreement this pairing exists to prevent.
+    value = raw.strip(" ").lower().rstrip(".")
     if value.startswith("[") and value.endswith("]"):
         value = value[1:-1]
     if not value:
@@ -231,7 +255,12 @@ def normalize_port(value: object, protocol: str) -> int:
     if value is None or value == "":
         return DEFAULT_PORTS[protocol]
     if isinstance(value, str):
-        if not value.isdigit() or (len(value) > 1 and value.startswith("0")):
+        # `isdigit` alone is true of Arabic-Indic digits, which `int` reads as a
+        # port the operator never typed, and of superscripts, which `int` refuses
+        # with a bare ValueError no caller of this module handles.
+        if not (value.isascii() and value.isdigit()) or (
+            len(value) > 1 and value.startswith("0")
+        ):
             raise PolicyError("malformed_port", f"{value!r} is not a decimal port number")
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -257,7 +286,21 @@ def path_variants(path: object) -> tuple[str, str]:
         raw = "/" + raw
     if not raw.isprintable():
         raise PolicyError("malformed_path", "the path holds a character that does not print")
-    decoded = unquote(raw)
+    # To a fixpoint, not once. One pass turns `%252e%252e` into `%2e%2e`, which
+    # holds no dot segment for `normpath` to collapse, so a doubly-encoded
+    # traversal would walk out of an exclusion while the receipt cited the
+    # inclusion. A path that is still changing after this many passes is refused
+    # rather than decoded further: nothing legitimate encodes that deeply.
+    decoded = raw
+    for _ in range(_DECODE_PASSES + 1):  # the last pass is the one that confirms
+        once = unquote(decoded)
+        if once == decoded:
+            break
+        decoded = once
+    else:
+        raise PolicyError(
+            "malformed_path", f"the path is encoded more than {_DECODE_PASSES} times over"
+        )
     if not decoded.isprintable():
         raise PolicyError(
             "malformed_path", "the path decodes to a character that does not print"
@@ -265,9 +308,25 @@ def path_variants(path: object) -> tuple[str, str]:
     normed = posixpath.normpath(decoded.replace("\\", "/"))
     if decoded.endswith("/") and not normed.endswith("/"):
         normed += "/"
-    if not normed.startswith("/"):
-        normed = "/" + normed.lstrip("/")
+    # `normpath` preserves exactly two leading slashes, POSIX having reserved
+    # them, so `//admin` would not be under a `/admin` exclusion while most web
+    # servers serve it as one.
+    normed = "/" + normed.lstrip("/")
     return raw, normed
+
+
+def path_under(path: str, prefix: str) -> bool:
+    """Whether `path` is at or below `prefix`, ending on a segment boundary.
+
+    A bare `startswith` would make the prefix `/v1` authorise `/v1-internal/dump`
+    and `/v10/anything`, which share four characters with it and nothing else. A
+    prefix names a subtree, so it covers itself and what is under the separator,
+    and never a sibling that merely begins the same way. Mirrors
+    `scope_path_under`.
+    """
+    if not path.startswith(prefix):
+        return False
+    return prefix.endswith("/") or len(path) == len(prefix) or path[len(prefix)] == "/"
 
 
 def host_candidates(host: str) -> tuple[str, ...]:
@@ -314,6 +373,17 @@ class Request:
     path_raw: str
     path_norm: str
     question: str = QUESTION_REQUEST
+
+    def __post_init__(self) -> None:
+        # An unknown word raises here rather than being matched, because the two
+        # coverage polarities are the wide ones: a caller that mistyped
+        # `request` would otherwise be answered under the widest reading of the
+        # policy and read it as an authorisation.
+        if self.question not in QUESTIONS:
+            raise PolicyError(
+                "not_addressable",
+                f"unknown scope question {self.question!r}; known: " + ", ".join(QUESTIONS),
+            )
 
     def summary(self) -> dict:
         return {
@@ -445,7 +515,7 @@ def parse_pattern(raw: str) -> Pattern:
     """
     if not isinstance(raw, str):
         raise PolicyError("malformed_host", "a host pattern must be text")
-    text = raw.strip().lower().rstrip(".")
+    text = raw.strip(" ").lower().rstrip(".")
     if text.startswith("*."):
         suffix = normalize_host(text[2:])
         if "*" in suffix:
@@ -511,15 +581,15 @@ class Rule:
         if not covers:
             return False
         if self.effect == EXCLUDE:
-            return request.path_raw.startswith(self.path_prefix) or request.path_norm.startswith(
-                self.path_prefix
+            return path_under(request.path_raw, self.path_prefix) or path_under(
+                request.path_norm, self.path_prefix
             )
         if request.question == QUESTION_REQUEST:
-            return request.path_raw.startswith(self.path_prefix) and request.path_norm.startswith(
-                self.path_prefix
+            return path_under(request.path_raw, self.path_prefix) and path_under(
+                request.path_norm, self.path_prefix
             )
-        return request.path_raw.startswith(self.path_prefix) or self.path_prefix.startswith(
-            request.path_raw
+        return path_under(request.path_raw, self.path_prefix) or path_under(
+            self.path_prefix, request.path_raw
         )
 
     def row(self) -> dict:
@@ -706,9 +776,21 @@ def compile_policy(
                 )
             )
             return
+        # The stored prefix is canonicalised the same way a request's path is,
+        # because the two are compared. Left verbatim, an exclusion written
+        # `/adm%69n/` would fire on nothing an operator can type, and an
+        # inclusion written `/a/../v1/` would match neither spelling and quietly
+        # authorise nothing at all.
+        prefixes: list[str] = []
+        for path in paths:
+            try:
+                prefixes.append(path_variants(path)[1])
+            except PolicyError as error:
+                refusals.append(_refusal(f"{source}.paths", error.detail))
+                return
         for protocol in protocols:
             for port in ports:
-                for path in paths:
+                for path in prefixes:
                     key = (effect, pattern.text, protocol, port, path)
                     compiled.setdefault(
                         key,

@@ -665,10 +665,12 @@ CONTROLS = (
         " END $ctl$",
     ),
     Control(
-        # A Program that stated a scope and runs under none. Every entity of it
-        # projects to denied, which is safe and is indistinguishable from a
+        # A Program that compiled a policy and runs under none. Every entity of
+        # it projects to denied, which is safe and is indistinguishable from a
         # policy that lists nothing -- so the operator sees an enforced scope
-        # where there is no compiled one.
+        # where there is no promoted one. The version is written and
+        # `set_scope_version` is never called, which is the one state no honest
+        # path produces: `_project_scope` writes and promotes in one transaction.
         "standing:scope_policy",
         "DO $ctl$ DECLARE p uuid;"
         " BEGIN"
@@ -681,6 +683,10 @@ CONTROLS = (
         "         canonical_sha256, document, platform, token_budget, reason)"
         "        VALUES (p, 1, 1, 'selftest', repeat('a', 64), repeat('b', 64),"
         "                '{}'::jsonb, 'hackerone', 1000, 'program opened');"
+        "   INSERT INTO program_scope_versions"
+        "        (program_id, version, policy, policy_sha256, configuration_revision)"
+        "        VALUES (p, 1, jsonb_build_object('configuration_sha256', repeat('b', 64)),"
+        "                repeat('c', 64), 1);"
         " END $ctl$",
     ),
     Control(
@@ -1437,8 +1443,11 @@ class ScopeEvaluatorTest(DatabaseCase):
         return write(text.replace('name = "matrix-web"', f'name = "{SCOPE_SLUG}-{name}"'))
 
     @classmethod
-    def compiled(cls, text: str = SCOPED) -> scope.Policy:
-        configuration, refusals = config.load(cls.written("compiled", text))
+    def compiled(cls, name: str = "matrix", text: str = SCOPED) -> scope.Policy:
+        # The name has to be the one the run opened: `Policy.document` carries
+        # the Program name, so compiling under a second slug produces a policy
+        # whose digest can never equal the digest the run wrote.
+        configuration, refusals = config.load(cls.written(name, text))
         assert configuration is not None, refusals
         policy, refused = scope.compile_policy(configuration)
         assert policy is not None, refused
@@ -1453,10 +1462,10 @@ class ScopeEvaluatorTest(DatabaseCase):
                     self.program_id,
                     self.version,
                     request.host,
-                    request.protocol,
                     request.port,
                     request.path_raw,
                     request.path_norm,
+                    request.protocol,
                     request.question,
                 ),
             ).rows[0]

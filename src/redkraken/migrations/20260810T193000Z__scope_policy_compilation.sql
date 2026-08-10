@@ -185,6 +185,99 @@ INSERT INTO state_read_surface (table_name, column_name, added_by) VALUES
 -- REPLACE cannot change one. Adding the arguments as a second overload would
 -- be worse than either -- two evaluators reachable by the same name, with the
 -- old one silently chosen by any caller that passes the old five.
+--
+-- The two new arguments go on the END of 021's list, and that placement is the
+-- whole of the compatibility story. `gate_tool_call` (026) and
+-- `authorize_egress_request` (039) both call the six-argument shape
+-- positionally, both are plpgsql, and PostgreSQL tracks no dependency through a
+-- plpgsql body: a signature that put `p_protocol` in the middle would drop out
+-- from under them, commit green, and fail at the first gated tool call with
+-- "function scope_class_of(uuid, integer, text, integer, text, text) does not
+-- exist" -- there being no implicit integer-to-text cast to resolve it against.
+-- Ordered this way their calls resolve to the first six parameters exactly, and
+-- the defaults answer for the rest: any protocol, and the request question.
+
+-- Whether a path is at or below a prefix, ending on a segment boundary.
+-- Mirrors scope.path_under. `starts_with` alone would make the prefix `/v1`
+-- authorise `/v1-internal/dump`.
+CREATE FUNCTION scope_path_under(p_path text, p_prefix text) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT starts_with(p_path, p_prefix)
+       AND (right(p_prefix, 1) = '/'
+            OR length(p_path) = length(p_prefix)
+            OR substr(p_path, length(p_prefix) + 1, 1) = '/')
+$$;
+
+-- The question vocabulary, asserted rather than assumed. Every other closed
+-- vocabulary in this system raises on a word it does not know, and this one has
+-- to as well: the two coverage polarities are the wide readings, so a caller
+-- that mistyped `request` would be answered under the widest one and read it as
+-- an authorisation. The matcher below also fails closed on an unknown word, so
+-- the two guards cover each other.
+CREATE FUNCTION scope_assert_question(p_question text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF p_question IS NULL OR p_question NOT IN ('request', 'coverage', 'subtree') THEN
+        RAISE EXCEPTION 'unknown scope question %', coalesce(p_question, '(null)');
+    END IF;
+    RETURN true;
+END $$;
+
+-- Three shapes 021 read as addresses and this file does not, each because
+-- PostgreSQL and Python disagreed about it:
+--
+--   * `db`, `cafe`, `ec2` matched `^[0-9a-f:]+$` with no colon in them, so an
+--     ordinary single-label name was cast to inet, refused, and reported as a
+--     malformed address. A colon is now required.
+--   * `093.184.216.34` is an address to inet, which reads the octet as decimal
+--     and returns 93.184.216.34; Python's ipaddress refuses a leading zero
+--     outright. Refused here too, so neither side canonicalises what the other
+--     rejects.
+--   * `::102:304` renders as `::1.2.3.4` through host() and as `::102:304`
+--     through Python. Same address, two match keys, so a rule compiled from one
+--     spelling covers nothing written in the other. The deprecated
+--     IPv4-compatible range is refused on both sides instead.
+CREATE OR REPLACE FUNCTION scope_normalize_host(raw text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v text;
+    lbl text;
+    a inet;
+BEGIN
+    IF raw IS NULL THEN RETURN NULL; END IF;
+    v := rtrim(lower(btrim(raw)), '.');
+    IF v LIKE '[%]' THEN v := substring(v from 2 for length(v) - 2); END IF;
+    IF v = '' THEN RETURN NULL; END IF;
+    IF v !~ '^[[:ascii:]]*$' THEN RETURN NULL; END IF;
+
+    IF v ~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' OR v ~ '^[0-9a-f]*:[0-9a-f:]*$'
+       OR v ~ '^::ffff:[0-9]{1,3}(\.[0-9]{1,3}){3}$' THEN
+        IF v ~ '(^|\.)0[0-9]' THEN
+            RETURN NULL;                       -- '093.184.216.34'
+        END IF;
+        BEGIN
+            a := v::inet;
+            IF family(a) = 6 AND host(a) LIKE '::ffff:%.%' THEN
+                RETURN split_part(host(a), ':', 4);
+            END IF;
+            IF family(a) = 6 AND a << inet '::/96'
+               AND host(a) NOT IN ('::', '::1') THEN
+                RETURN NULL;                   -- '::1.2.3.4', '::102:304'
+            END IF;
+            RETURN host(a);
+        EXCEPTION WHEN others THEN
+            RETURN NULL;
+        END;
+    END IF;
+
+    IF length(v) > 253 THEN RETURN NULL; END IF;
+    FOREACH lbl IN ARRAY string_to_array(v, '.') LOOP
+        IF lbl !~ '^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$' THEN
+            RETURN NULL;                       -- '.here.com', 'here..com', ...
+        END IF;
+    END LOOP;
+    RETURN v;
+END $$;
 
 -- Which refusal a host earned. `scope_normalize_host` returns NULL for both
 -- "there was no host" and "the host was malformed", and scope.py distinguishes
@@ -212,15 +305,16 @@ CREATE FUNCTION scope_class_of(
     -- request. 021 defaulted the port to 443, which answered a narrower
     -- question than the caller asked and denied every entity on a policy that
     -- also listed port 80.
-    p_protocol  text    DEFAULT NULL,
     p_port      integer DEFAULT NULL,
     p_path_raw  text    DEFAULT '/',
     p_path_norm text    DEFAULT '/',
+    p_protocol  text    DEFAULT NULL,
     -- 'request' | 'coverage' | 'subtree'. Mirrors scope.QUESTIONS.
     p_question  text    DEFAULT 'request')
 RETURNS TABLE(scope_class text, reason text, rule_ord integer, tier text)
 LANGUAGE sql STABLE AS $$
-    WITH nh AS (SELECT scope_normalize_host(p_host) AS h),
+    WITH nh AS (SELECT scope_normalize_host(p_host) AS h,
+                       scope_assert_question(p_question) AS asked),
     m AS (
         SELECT r.ord, r.effect, r.effect_rank, r.spec_kind, r.spec_len, r.tier
           FROM program_scope_rules r, nh
@@ -230,11 +324,19 @@ LANGUAGE sql STABLE AS $$
                 -- A subtree question asks whether a whole domain is covered,
                 -- and only a wildcard rule can cover one: an exact rule stores
                 -- a bare host, and no candidate here is bare.
-                CASE WHEN p_question = 'subtree'
+                -- No ELSE that matches: an unknown question matches nothing and
+                -- is denied, rather than falling into the widest polarity.
+                CASE p_question
+                     WHEN 'subtree'
                      THEN r.match_key IN (SELECT c.match_key
                                             FROM scope_wildcard_candidates(nh.h) c)
-                     ELSE r.match_key IN (SELECT c.match_key
+                     WHEN 'request'
+                     THEN r.match_key IN (SELECT c.match_key
                                             FROM scope_host_candidates(nh.h) c)
+                     WHEN 'coverage'
+                     THEN r.match_key IN (SELECT c.match_key
+                                            FROM scope_host_candidates(nh.h) c)
+                     ELSE false
                      END
              OR (p_question <> 'subtree' AND r.pattern_kind = 'cidr'
                  AND r.net >>= (CASE WHEN nh.h ~ '^([0-9.]+|[0-9a-f:]+)$'
@@ -252,13 +354,15 @@ LANGUAGE sql STABLE AS $$
            --                overlap at all, not whether one request is inside
            AND (r.path_prefix IS NULL
                 OR CASE WHEN r.effect = 'exclude'
-                        THEN starts_with(p_path_raw,  r.path_prefix)
-                          OR starts_with(p_path_norm, r.path_prefix)
+                        THEN scope_path_under(p_path_raw,  r.path_prefix)
+                          OR scope_path_under(p_path_norm, r.path_prefix)
                         WHEN p_question = 'request'
-                        THEN starts_with(p_path_raw,  r.path_prefix)
-                         AND starts_with(p_path_norm, r.path_prefix)
-                        ELSE starts_with(p_path_raw,  r.path_prefix)
-                          OR starts_with(r.path_prefix, p_path_raw)
+                        THEN scope_path_under(p_path_raw,  r.path_prefix)
+                         AND scope_path_under(p_path_norm, r.path_prefix)
+                        WHEN p_question IN ('coverage', 'subtree')
+                        THEN scope_path_under(p_path_raw,  r.path_prefix)
+                          OR scope_path_under(r.path_prefix, p_path_raw)
+                        ELSE false
                    END)
     ),
     -- min(effect_rank) over EVERY match: document order is not a semantic.
@@ -299,7 +403,7 @@ LANGUAGE sql STABLE AS $$
       FROM (VALUES (1)) AS d(x) LEFT JOIN win w ON true
 $$;
 
-COMMENT ON FUNCTION scope_class_of(uuid, integer, text, text, integer, text, text, text) IS
+COMMENT ON FUNCTION scope_class_of(uuid, integer, text, integer, text, text, text, text) IS
   'The verdict for one address question. Deny by default, lowest effect rank wins over every match, and specificity picks only which rule is cited.';
 
 -- The verdict for a stored ENTITY. Both selector kinds now delegate: the
@@ -333,8 +437,8 @@ BEGIN
     -- asks whether ANY listed protocol reaches it, which is what "is this host
     -- in scope" means.
     RETURN QUERY SELECT * FROM scope_class_of(
-        p_program, p_version, p_selector, NULL, p_port,
-        p_path_raw, p_path_norm,
+        p_program, p_version, p_selector, p_port,
+        p_path_raw, p_path_norm, NULL,
         CASE WHEN p_kind = 'host' THEN 'coverage' ELSE 'subtree' END);
 END $$;
 
@@ -349,15 +453,27 @@ COMMENT ON FUNCTION scope_class_of_entity(uuid, integer, text, text, integer, te
 CREATE FUNCTION check_scope_policy()
 RETURNS TABLE (problem text, object text, detail text)
 LANGUAGE sql STABLE AS $$
-    -- 1. A Program that stated a policy and runs under none. Every entity
+    -- 1. A Program that compiled a policy and is running none. Every entity
     --    projects to denied, which is safe and is also indistinguishable from
     --    a policy that lists nothing -- the operator wrote a scope and the
     --    harness is not enforcing it.
-    SELECT 'program_without_scope_version', p.slug,
-           'the Program has a configuration but programs.scope_version is NULL; nothing was compiled and every entity is denied'
+    --
+    --    Deliberately NOT "has a configuration and has no version". That reads
+    --    like the stronger invariant and is a deadlock: a database written
+    --    before this file exists holds configured Programs with no scope
+    --    version, `rk run` gates on the standing family before it writes
+    --    anything, and the only code that can compile a policy runs after the
+    --    gate. The check would refuse the run that would satisfy it, and the
+    --    terminal assertion in this file would refuse the migration too. What
+    --    is asserted instead is a state nothing honest produces: a version was
+    --    written and never promoted. A legacy Program enters the invariant the
+    --    first time it is resumed, because every answer that keeps a Program
+    --    open now compiles and promotes.
+    SELECT 'scope_version_not_promoted', p.slug,
+           'the Program has compiled scope versions but programs.scope_version is NULL; every entity is denied'
       FROM programs p
      WHERE p.scope_version IS NULL
-       AND EXISTS (SELECT 1 FROM program_configurations c WHERE c.program_id = p.id)
+       AND EXISTS (SELECT 1 FROM program_scope_versions sv WHERE sv.program_id = p.id)
   UNION ALL
     -- 2. The live version was compiled from a revision that is no longer the
     --    newest. The operator changed the file, the revision was recorded, and
@@ -412,7 +528,7 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 COMMENT ON FUNCTION check_scope_policy() IS
-  'Every Program that stated a policy runs the compiled form of its newest revision, the compiled form names the bytes it came from and has rules, and no required-header value is readable by the agent.';
+  'Every Program that compiled a policy runs the compiled form of its newest revision, the compiled form names the bytes it came from and has rules, and no required-header value is readable by the agent.';
 
 INSERT INTO standing_checks (name, query, owner_ticket, note) VALUES
     ('scope_policy', 'SELECT * FROM check_scope_policy()', 'ph2-08',
