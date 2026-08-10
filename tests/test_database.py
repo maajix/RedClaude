@@ -35,6 +35,8 @@ import json
 import os
 import secrets
 import shutil
+import socket
+import ssl
 import threading
 import unittest
 from dataclasses import dataclass
@@ -53,6 +55,7 @@ from redkraken import (
     scope,
     seal,
     state,
+    tls,
 )
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
@@ -70,6 +73,7 @@ from tests.fixtures import (
     Target,
     counterparty,
     scratch,
+    tls_counterparty,
     write,
 )
 
@@ -3150,6 +3154,11 @@ ANSWER = b'{"note":"the target answered the proxy","items":[1,2,3,4,5,6,7,8]}'
 #: the socket actually goes.
 URL = "http://app.example.com/notes"
 
+#: The same name over the protocol the door has to open a tunnel for. In scope
+#: under `SCOPED` on 443 as well, so what differs between this and the row above
+#: is the transport and nothing about the decision.
+SECURE = "https://app.example.com/notes"
+
 
 class LiveTarget(Target):
     """The shared recording counterparty, answering this suite's own body."""
@@ -3158,12 +3167,18 @@ class LiveTarget(Target):
 
 
 class ProxyEgressTest(DatabaseCase):
-    """PH2-09: one request through the door, and five that never reach it.
+    """PH2-09 and PH2-10: two requests through the door, and ten that fail at it.
 
-    The half of ticket 09 only a server can answer. `tests/test_proxy.py` holds
-    the other half -- what the door does with the bytes -- against a stub; here
-    the fence is `rk2_proxy` on a real connection, the capability is minted by
-    `authorize_tool_run`, and every refusal is a row somebody can read afterwards.
+    The half of tickets 09 and 10 only a server can answer. `tests/test_proxy.py`
+    holds the other half -- what the door does with the bytes -- against a stub;
+    here the fence is `rk2_proxy` on a real connection, the capability is minted
+    by `authorize_tool_run`, and every refusal is a row somebody can read
+    afterwards.
+
+    The two exchanges differ only in protocol, and that is the claim ticket 10
+    makes: the https one opens a tunnel this door terminates, and everything
+    after the handshake -- the authorization, the writer, the row -- is the code
+    the http one ran.
 
     Three things make this a test of the production path rather than of a
     rehearsal of it. The runtime half is `proxy.send`, the same function
@@ -3194,6 +3209,8 @@ class ProxyEgressTest(DatabaseCase):
             cls.identifiers[name] = opened.facts["program_id"]
 
         cls.target, _ = counterparty(LiveTarget)
+        cls.secure_target, _, cls.target_ca = tls_counterparty(LiveTarget)
+        cls.authority = tls.authority(scratch() / "door-authority")
 
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
         cls.server = proxy.listen(
@@ -3201,6 +3218,7 @@ class ProxyEgressTest(DatabaseCase):
             fence=cls.fence,
             store=Store(cls.root),
             connector=cls.dial,
+            authority=cls.authority,
         )
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -3211,6 +3229,16 @@ class ProxyEgressTest(DatabaseCase):
         cls.sent = proxy.send(
             cls.harness.runtime, cls.configurations["a"], URL, proxy_url=cls.proxy_url
         )
+        # And the same request over the other protocol, through a tunnel this
+        # door terminates. Its Receipt is read beside the one above: two rows
+        # from one path is the claim ticket 10 makes.
+        cls.secured = proxy.send(
+            cls.harness.runtime,
+            cls.configurations["a"],
+            SECURE,
+            proxy_url=cls.proxy_url,
+            ca_file=cls.authority.certificate,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -3219,6 +3247,8 @@ class ProxyEgressTest(DatabaseCase):
         cls.fence.close()
         cls.target.shutdown()
         cls.target.server_close()
+        cls.secure_target.shutdown()
+        cls.secure_target.server_close()
         cls.runtime.close()
 
         stored = [
@@ -3242,8 +3272,22 @@ class ProxyEgressTest(DatabaseCase):
         super().tearDownClass()
 
     @classmethod
-    def dial(cls, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
-        """Every authorised name reaches the one target this machine is running."""
+    def dial(
+        cls, host: str, port: int, timeout: float, protocol: str
+    ) -> http.client.HTTPConnection:
+        """Every authorised name reaches the one target this machine is running.
+
+        One target per protocol, because the door's outbound side is not the same
+        socket for the two: an https target is verified by the door itself, which
+        is the half of interception the agent can no longer do for itself.
+        """
+        if protocol == "https":
+            return http.client.HTTPSConnection(
+                "127.0.0.1",
+                cls.secure_target.server_address[1],
+                timeout=timeout,
+                context=ssl.create_default_context(cafile=str(cls.target_ca)),
+            )
         return http.client.HTTPConnection(
             "127.0.0.1", cls.target.server_address[1], timeout=timeout
         )
@@ -3374,9 +3418,14 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(200, self.sent.facts["response"]["status"])
         self.assertEqual(len(ANSWER), self.sent.facts["response"]["byte_size"])
 
-        allowed = [row for row in self.receipts("a") if row[1] == "allowed"]
+        served = [row for row in self.receipts("a") if row[1] == "allowed"]
+        allowed = [row for row in served if row[3] == self.sent.facts["tool_run"]["id"]]
 
+        # One Receipt for this exchange, and one per exchange: the https run in
+        # setup is the other, and a path that recorded twice or not at all is a
+        # Receipt count that no longer equals the egress count.
         self.assertEqual(1, len(allowed))
+        self.assertEqual(2, len(served))
         # The lane is `agent` because a capability is the only thing that mints
         # one: 038's writer derives it rather than accepting it, the same way
         # 040 derives a blocked Receipt's lane from its purpose. A replay or a
@@ -3459,6 +3508,193 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("success", str(row[0]))
         self.assertIsNone(row[1])
         self.assertIsNone(row[2])
+
+    def test_the_same_request_over_https_crosses_the_same_capability_path(self):
+        # PH2-10, criterion 2. The door terminated a tunnel, the request inside
+        # it was decided by `authorize_egress_request` on the proxy's own session,
+        # and the row that resulted is the row an http request leaves with `https`
+        # in it. Nothing about this path is a second implementation: it is the
+        # same `send`, the same fence and the same writer.
+        self.assertTrue(self.secured.ok, self.secured.violations)
+        self.assertEqual(EXIT_OK, self.secured.exit_code)
+        self.assertEqual(200, self.secured.facts["response"]["status"])
+        self.assertEqual(len(ANSWER), self.secured.facts["response"]["byte_size"])
+
+        row = self.connection.execute(
+            "SELECT lane, decision, scheme, host, port, path, status_code, intercepted,"
+            "       label, request_wire_sha, response_wire_sha, scope_class"
+            "  FROM receipts WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+            (self.secured.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual(("agent", "allowed", "https"), (str(row[0]), str(row[1]), str(row[2])))
+        self.assertEqual(
+            ("app.example.com", 443, "/notes", 200),
+            (str(row[3]), int(row[4]), str(row[5]), int(row[6])),
+        )
+        self.assertEqual("target", str(row[11]))
+        self.assertTrue(row[7], "a terminated tunnel is an intercepted exchange")
+        self.assertEqual(self.secured.facts["receipt"], str(row[8]))
+        # And no wire view is claimed. What the door saw of the target's own
+        # connection is not what the agent read, and the row says so by leaving
+        # the two wire hashes null rather than by repeating the agent's.
+        self.assertIsNone(row[9])
+        self.assertIsNone(row[10])
+
+    def test_the_tunnelled_request_reached_the_target_with_no_control_header(self):
+        # PH2-10, criterion 5, against a target that actually ran behind TLS. The
+        # capability crossed on the CONNECT this time -- a hop `forwardable` never
+        # sees -- so this is not the http case restated.
+        method, path, headers = self.secure_target.seen[-1]
+        names = [name for name, _ in headers]
+
+        self.assertEqual(("GET", "/notes"), (method, path))
+        self.assertEqual(["app.example.com"], [value for name, value in headers if name == "host"])
+        self.assertNotIn(proxy.AUTHORIZATION.lower(), names)
+        self.assertNotIn(proxy.PROGRAM.lower(), names)
+        self.assertEqual([], [name for name in names if name.startswith(proxy.INTERNAL)])
+        for _, value in headers:
+            self.assertNotIn("RedKraken", value)
+
+    def test_an_out_of_scope_https_target_is_refused_before_the_target_is_contacted(self):
+        # PH2-10, criterion 4. The capability is real and the tunnel opens --
+        # refusing the CONNECT would answer "is this host in scope" without
+        # spending anything -- and the request inside it is decided against the
+        # current policy, which excludes `admin.example.com`. No socket towards
+        # the target is opened, and the identifier the caller is handed is the
+        # blocked row itself.
+        capability, _, _ = self.mint("a")
+        denied = "https://admin.example.com/notes"
+        seen = len(self.secure_target.seen)
+        before = len(self.receipts("a"))
+
+        answer = proxy._through(
+            self.server.server_address,
+            denied,
+            "GET",
+            capability,
+            self.identifiers["a"],
+            proxy.TIMEOUT,
+            scope.canonical_request(denied),
+            tls.trust(self.authority.certificate),
+        )
+        after = self.receipts("a")
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(b"", answer.body)
+        self.assertEqual(seen, len(self.secure_target.seen), "the target was contacted")
+        self.assertEqual(before + 1, len(after))
+        self.assertEqual(("agent", "blocked", "capability refused"), after[-1][:3])
+
+        row = self.connection.execute(
+            "SELECT scheme, host, port, path, ts_egress FROM receipts WHERE id = $1::uuid",
+            (answer.receipt,),
+        ).rows[0]
+
+        self.assertEqual(
+            ("https", "admin.example.com", 443, "/notes"),
+            (str(row[0]), str(row[1]), int(row[2]), str(row[3])),
+        )
+        self.assertIsNone(row[4], "a refusal before contact records no moment of egress")
+
+    def test_an_out_of_scope_https_request_never_mints_a_capability_at_all(self):
+        # The whole command rather than `_through`, and the refusal lands one
+        # step earlier than the one above: the gate authorizes a Tool run against
+        # its own arguments, so a request nobody may make never gets a capability
+        # to make it with. The door refusing the same URL is the second fence,
+        # not the first, and both are asserted because either one alone is a
+        # single point of failure.
+        denied = "https://admin.example.com/notes"
+        seen = len(self.secure_target.seen)
+
+        result = proxy.send(
+            self.harness.runtime,
+            self.configurations["a"],
+            denied,
+            proxy_url=self.proxy_url,
+            ca_file=self.authority.certificate,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIsNone(result.facts["response"], "a denied Tool run sent nothing")
+        self.assertIsNone(result.facts["receipt"])
+        self.assertEqual(seen, len(self.secure_target.seen), "the target was contacted")
+
+        row = self.connection.execute(
+            "SELECT status, egress_token_sha256 FROM tool_runs WHERE id = $1::uuid",
+            (result.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual("denied", str(row[0]))
+        self.assertIsNone(row[1], "a denied Tool run holds no capability to spend")
+
+    def test_a_refusal_at_the_door_is_reported_as_a_refusal_and_not_as_a_success(self):
+        # A door that refuses a request the gate authorized, which is the case
+        # the runtime has to read correctly: the Receipt it is handed is a
+        # blocked one. Naming it is what makes the refusal auditable, and reading
+        # that name as "served" would close the Tool run as success, exit 0, and
+        # tell an operator scripting this command that the request went out.
+        #
+        # The refusal is manufactured by pointing this door's outbound side at a
+        # port nothing listens on, because the two fences agree about everything
+        # else: an out-of-scope URL is stopped by the gate above before the door
+        # ever sees it.
+        with socket.socket() as spare:
+            spare.bind(("127.0.0.1", 0))
+            closed = spare.getsockname()[1]
+
+        fence = proxy.Fence(pg.connect(self.harness.proxy))
+        self.addCleanup(fence.close)
+        door = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=fence,
+            store=Store(self.root),
+            connector=lambda host, port, timeout, protocol: http.client.HTTPConnection(
+                "127.0.0.1", closed, timeout=timeout
+            ),
+            authority=self.authority,
+        )
+        thread = threading.Thread(target=door.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(door.server_close)
+        self.addCleanup(door.shutdown)
+
+        result = proxy.send(
+            self.harness.runtime,
+            self.configurations["a"],
+            SECURE,
+            proxy_url=f"http://127.0.0.1:{door.server_address[1]}",
+            ca_file=self.authority.certificate,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(407, result.facts["response"]["status"])
+        self.assertEqual(
+            ["egress"], [item.name for item in result.assertions if not item.ok]
+        )
+        # Cited, and closed as what it was. The capability is gone either way:
+        # the same close that says `denied` clears the digest.
+        self.assertIsNotNone(result.facts["receipt"])
+        row = self.connection.execute(
+            "SELECT status, egress_token_sha256 FROM tool_runs WHERE id = $1::uuid",
+            (result.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual("denied", str(row[0]))
+        self.assertIsNone(row[1])
+        blocked = self.connection.execute(
+            "SELECT decision, reason, host, ts_egress FROM receipts WHERE id = $1::uuid",
+            (result.facts["receipt"],),
+        ).rows[0]
+
+        self.assertEqual(
+            ("blocked", "target unreachable", "app.example.com"),
+            (str(blocked[0]), str(blocked[1]), str(blocked[2])),
+        )
+        self.assertIsNotNone(blocked[3], "the door had already tried the target")
 
     def test_a_missing_capability_is_blocked_and_recorded_under_its_program(self):
         # Criterion 5, first arm. A Program is named and nothing else, so there

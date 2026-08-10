@@ -2,10 +2,13 @@
 
 import atexit
 import shutil
+import ssl
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from redkraken import tls
 
 
 VALID = """\
@@ -222,6 +225,7 @@ class Target(BaseHTTPRequestHandler):
 
 def counterparty(
     handler: type[BaseHTTPRequestHandler] = Target,
+    context: ssl.SSLContext | None = None,
 ) -> tuple[ThreadingHTTPServer, threading.Thread]:
     """One target, on a port of its own, already serving and already recording.
 
@@ -229,13 +233,38 @@ def counterparty(
     has to be bound before it is named in a URL, so the four lines that arrange
     that live here rather than in each suite's setup: a copy that forgot `seen`
     fails inside a handler thread, where the failure is a log line and not a test.
+
+    With a `context` the listening socket is wrapped rather than each accepted
+    connection, so a handshake that fails -- which is what a client trusting the
+    wrong root looks like -- fails inside `get_request`, where `TCPServer`
+    already answers `OSError` by dropping the connection instead of printing a
+    traceback. It is wrapped before the thread starts, because a socket the
+    serving thread is already selecting on is not one to replace.
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.seen = []
     server.daemon_threads = True
+    if context is not None:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
+
+
+def tls_counterparty(
+    handler: type[BaseHTTPRequestHandler] = Target,
+) -> tuple[ThreadingHTTPServer, threading.Thread, Path]:
+    """The same target, behind TLS, under an authority that is not the run's.
+
+    Not the run's on purpose. The door's authority exists so the *agent* accepts
+    the door; a target that shared it would make a client trusting only the run
+    root succeed against the target directly, and the trust boundary this ticket
+    is about would be untested. So there are two roots here: one the agent is
+    given, and one only the door's own outbound side would have.
+    """
+    made = tls.authority(scratch() / "target-authority")
+    server, thread = counterparty(handler, made.context("127.0.0.1"))
+    return server, thread, made.certificate
 
 
 def scratch() -> Path:

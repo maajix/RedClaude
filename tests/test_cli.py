@@ -919,11 +919,13 @@ class ProxyCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
 
     def test_a_url_this_proxy_cannot_carry_is_refused_before_the_database(self):
-        # HTTPS through this door is ticket 10, and a URL that cannot be
-        # canonicalised has no scope answer at all. Both are the caller's to fix,
-        # and neither is worth a connection.
+        # A URL that cannot be canonicalised has no scope answer at all, and an
+        # https one with no trust root has no way to tell the door's certificate
+        # from anybody else's. Both are the caller's to fix, and neither is worth
+        # a connection: the refusal names the input to correct, and the https one
+        # names the variable rather than the URL, because the URL is fine.
         for url, expected in (
-            ("https://app.example.com/", "argument:--url"),
+            ("https://app.example.com/", "environment:RK_PROXY_CA_FILE"),
             ("ftp://app.example.com/", "argument:--url"),
             ("http://app..example.com/", "argument:--url"),
         ):
@@ -942,6 +944,63 @@ class ProxyCommandTest(unittest.TestCase):
                     [expected],
                     [item["source"] for item in json.loads(result.stdout)["violations"]],
                 )
+
+    def test_a_door_reports_the_certificate_an_agent_has_to_be_given(self):
+        # The two flags are one arrangement: `--authority` is where the door
+        # signs from, `--ca` is what the other side verifies against, and the
+        # path that joins them is a fact of the report rather than something an
+        # operator reconstructs. The database is unreachable here, which is after
+        # the authority is made and is why the certificate is on the wire anyway.
+        directory = scratch() / "authority"
+
+        result = run(
+            "proxy", "serve",
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+            "--authority", str(directory),
+            "--port", "0",
+        )
+        observed = json.loads(result.stdout)
+
+        self.assertEqual(str(directory / "ca.pem"), observed["certificate"])
+        self.assertIn("authority", [item["name"] for item in observed["assertions"]])
+        self.assertTrue((directory / "ca.pem").exists())
+        self.assertNotIn("PRIVATE KEY", result.stdout)
+
+    def test_a_door_says_which_of_the_two_certificate_inputs_it_cannot_use(self):
+        # Both refusals are the caller's to fix and neither is worth a
+        # connection, and they name different inputs because they are different
+        # mistakes: one is where the door signs, the other is what the runtime
+        # believes.
+        occupied = write("not a directory", "authority")
+        junk = write("not a certificate", "ca.pem")
+
+        serving = run(
+            "proxy", "serve",
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+            "--authority", str(occupied),
+            "--port", "0",
+        )
+        sending = run(
+            "proxy", "request",
+            "--config", str(write(SCOPED)),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--proxy", "http://127.0.0.1:1",
+            "--ca", str(junk),
+            "https://app.example.com/",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, serving.returncode)
+        self.assertEqual(
+            ["argument:--authority"],
+            [item["source"] for item in json.loads(serving.stdout)["violations"]],
+        )
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, sending.returncode)
+        self.assertEqual(
+            ["argument:--ca"],
+            [item["source"] for item in json.loads(sending.stdout)["violations"]],
+        )
 
     def test_neither_connection_string_nor_capability_material_is_echoed_back(self):
         result = run(

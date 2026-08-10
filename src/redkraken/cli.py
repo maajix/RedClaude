@@ -86,6 +86,13 @@ FENCE = _Source("connection_string", "--url", PROXY_DATABASE_URL)
 #: spelling of it that is not plain HTTP on the loopback interface.
 PROXY = _Source("proxy_url", "--proxy", proxy.PROXY_URL)
 
+#: The two halves of the trust that lets the door see inside a tunnel. The
+#: directory is the door's and holds a signing key; the file is the certificate
+#: out of it, and is the only part anything else is given. Two names because an
+#: installation that exported one for both would be exporting the key.
+AUTHORITY = _Source("authority", "--authority", proxy.AUTHORITY_VARIABLE)
+TRUST = _Source("ca_file", "--ca", proxy.CA_VARIABLE)
+
 #: The one input that is not a connection string and is resolved the same way.
 #: The artifact store is a directory, so it has a variable of its own: an
 #: operator who moved the database has not moved the bytes.
@@ -493,6 +500,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="port",
         help=f"the port to listen on (default: {DEFAULT_PROXY_PORT})",
     )
+    listener.add_argument(
+        AUTHORITY.flag,
+        dest="authority",
+        type=Path,
+        metavar="directory",
+        help=(
+            "where this run's certificate authority lives, which is what lets "
+            "the door read inside a tunnel; without one a CONNECT is refused "
+            f"rather than relayed (default: ${AUTHORITY.variable})"
+        ),
+    )
     listener.set_defaults(run=_proxy_serve)
 
     spend = operations.add_parser(
@@ -515,6 +533,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="proxy_url",
         metavar="http://127.0.0.1:port",
         help=f"where the door is listening (default: ${PROXY.variable})",
+    )
+    spend.add_argument(
+        TRUST.flag,
+        dest="ca_file",
+        type=Path,
+        metavar="path",
+        help=(
+            "the door's certificate, which an https target is verified against "
+            "and nothing else; the door reports it when it starts "
+            f"(default: ${TRUST.variable})"
+        ),
     )
     spend.add_argument(
         "--method",
@@ -812,11 +841,16 @@ def _proxy_serve(arguments: argparse.Namespace) -> int:
     root = _root(ledger, arguments.artifacts)
     if settings is None or root is None:
         return _render(report(proxy.SERVE, ledger))
+    authority = _path(AUTHORITY, arguments.authority)
     return _render(
         _guarded(
             proxy.SERVE,
             lambda: proxy.serve(
-                settings, root=root, host=arguments.host, port=arguments.port
+                settings,
+                root=root,
+                host=arguments.host,
+                port=arguments.port,
+                authority=authority,
             ),
         )
     )
@@ -828,6 +862,7 @@ def _proxy_request(arguments: argparse.Namespace) -> int:
     endpoint = _proxy(ledger, arguments.proxy_url)
     if runtime is None or endpoint is None:
         return _render(report(proxy.REQUEST, ledger))
+    ca_file = _path(TRUST, arguments.ca_file)
     return _render(
         _guarded(
             proxy.REQUEST,
@@ -837,6 +872,7 @@ def _proxy_request(arguments: argparse.Namespace) -> int:
                 arguments.target,
                 proxy_url=endpoint,
                 method=arguments.method,
+                ca_file=ca_file,
             ),
         )
     )
@@ -966,6 +1002,19 @@ def _proxy(ledger: Ledger, given: str | None) -> str | None:
         )
         return None
     return url
+
+
+def _path(source: _Source, given: Path | None) -> Path | None:
+    """One optional path, from the argument or from the variable behind it.
+
+    No ledger, because absence is not a refusal here: a door with no authority
+    refuses tunnels and says so, and a request that needs a trust root and has
+    none is refused by the operation that knows it needs one. Failing in this
+    function instead would make an operator name a certificate to send one plain
+    HTTP request.
+    """
+    value = given or os.environ.get(source.variable)
+    return Path(value) if value else None
 
 
 def _key(ledger: Ledger, given: Path | None) -> Path | None:

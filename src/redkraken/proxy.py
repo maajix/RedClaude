@@ -33,14 +33,29 @@ to the caller, never a 200: an exchange the record does not carry is an exchange
 that did not happen as far as the harness is concerned, and reporting it as
 successful would be the one lie the whole design exists to prevent.
 
-Three things are deliberately not here. HTTPS through CONNECT is ticket 10, and
-is refused rather than tunnelled, because a tunnel this process cannot see
-inside is egress with no Receipt. Address policy and pinning are ticket 11: the
-`connector` seam below is where they attach, and today it resolves a name the
-ordinary way. Credential injection is ticket 12, which is also when the wire
-view of an exchange first differs from the agent's -- until then there is one
-view, it is the agent's, and claiming two would be recording a difference that
-does not exist.
+HTTPS arrives through CONNECT and is *terminated here*, not relayed. A tunnel
+this process cannot see inside is egress with no Receipt, so the door answers
+the CONNECT itself, presents a certificate from the run's own authority
+(`tls`), and reads the request inside as a request -- decided, forwarded and
+recorded by the same three lines as a plain one. What that costs is written
+down: the agent's view of the target's certificate is this door's, so a TLS
+claim about the target is only true if this side made it, and `intercepted` is
+on every Receipt to say so.
+
+Two things are deliberately not here. Address policy and pinning are ticket 11:
+the `connector` seam below is where they attach, and today it resolves a name
+the ordinary way and verifies an https target against the system trust store.
+Credential injection is ticket 12, which is also when the wire view of an
+exchange first differs from the agent's -- until then there is one view, it is
+the agent's, and claiming two would be recording a difference that does not
+exist.
+
+Containment is not here either, and cannot be. Telling a child to use this door
+(`tls.agent_environment`) is a request; a client that ignores it reaches the
+network the same way it always would. What makes the door the only peer is a
+network namespace with no other route, which is ticket 11's, and until then the
+honest statement is that this module refuses everything it is asked and nothing
+it is not.
 """
 
 from __future__ import annotations
@@ -49,6 +64,8 @@ import http.client
 import ipaddress
 import json
 import re
+import socket
+import ssl
 import threading
 import uuid
 from collections.abc import Callable
@@ -59,10 +76,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from redkraken import config, migrate, pg, program, scope
+from redkraken import config, migrate, pg, program, scope, tls
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
+    MISSING_DEPENDENCY,
     Ledger,
     Report,
     report,
@@ -71,15 +89,20 @@ from redkraken.store import Store, digest
 
 
 __all__ = [
+    "AUTHORITY_VARIABLE",
     "AUTHORIZATION",
+    "CA_VARIABLE",
     "COMMAND",
     "DECISION",
+    "DETAIL",
     "PROGRAM",
     "PROXY_URL",
     "RECEIPT",
     "REQUEST",
     "SERVE",
+    "Answer",
     "Authorization",
+    "Control",
     "Fence",
     "Refused",
     "Server",
@@ -88,6 +111,7 @@ __all__ = [
     "endpoint",
     "forwardable",
     "listen",
+    "merge_control",
     "origin_form",
     "query_sha256",
     "send",
@@ -105,6 +129,17 @@ REQUEST = f"{COMMAND} request"
 #: `rk2_proxy`, so no single exported variable runs both sides of the fence.
 PROXY_URL = "RK_PROXY_URL"
 
+#: Where the door keeps the authority it signs intercepted connections with. A
+#: directory rather than a file, because it holds a private key as well as the
+#: certificate, and the two must not be handed out together.
+AUTHORITY_VARIABLE = "RK_PROXY_AUTHORITY"
+
+#: And the one file out of that directory a client is given: the certificate to
+#: trust for the length of the run. Named separately because the side that
+#: trusts it is not the side that holds the key, and an installation that
+#: exported one variable for both would be exporting the key.
+CA_VARIABLE = "RK_PROXY_CA_FILE"
+
 #: What the runtime sends and the proxy takes. `Proxy-Authorization` is the
 #: header HTTP already reserves for the hop rather than the origin: every client
 #: library strips it on forward, and this one removes it before it can forget to.
@@ -116,6 +151,11 @@ PROGRAM = "X-RedKraken-Program"
 #: fence and not the target that said no.
 RECEIPT = "X-RedKraken-Receipt"
 DECISION = "X-RedKraken-Decision"
+
+#: And where the sentence goes. Named beside the other two because the runtime
+#: puts it in its own report, so the string a refusal is explained by has to be
+#: the string the door sent and not a second wording of it.
+DETAIL = "X-RedKraken-Detail"
 
 #: Everything the decision header is allowed to say. Tokens rather than the
 #: refusal's own prose: a caller branches on this value, and a reason reworded in
@@ -131,6 +171,21 @@ TUNNEL = "tunnel-refused"
 #: caller comparing the two would otherwise be reading a difference that means
 #: nothing.
 TWO_HEADERS = "the request carries two of one control header"
+
+#: And what it says when the two are on different hops: the tunnel offered one
+#: capability and the request inside it another. Distinct prose because the
+#: caller who does it has made a different mistake from the one who sent the
+#: same header twice, and the fix is not the same either.
+TWO_HOPS = "the tunnel and the request inside it disagree about the control headers"
+
+#: The answer that opens a tunnel. Reason phrase and not a status alone, because
+#: it is the string every proxy has sent since RFC 2817 and clients match on it.
+ESTABLISHED = "Connection Established"
+
+#: Why a door with no authority still refuses one. An operator who did not name
+#: a certificate directory gets a refusal that says so, rather than a tunnel
+#: this process would have to relay blind.
+NO_AUTHORITY = f"this door was started without a certificate authority (${AUTHORITY_VARIABLE})"
 
 #: The minted shape, pinned: `authorize_tool_run` emits 32 random bytes as
 #: lowercase hex and nothing else is a capability. Anchored on both ends, so a
@@ -286,6 +341,37 @@ def take_control(headers: Message) -> Control:
         program=(claimed[0].strip() or None) if len(claimed) == 1 else None,
         ambiguous=len(offered) > 1 or len(claimed) > 1,
     )
+
+
+def merge_control(tunnel: Control, inner: Control) -> Control:
+    """One request's control, from the two hops a tunnelled one arrives on.
+
+    Not a preference for one hop: a merge, because no client puts everything on
+    the same hop. `urllib` moves `Proxy-Authorization` onto the CONNECT and
+    leaves every other header on the request inside, `curl --proxy-header` puts
+    both on the CONNECT, and a client that has never heard of this harness puts
+    the capability where HTTP says it goes and nothing else anywhere. Requiring
+    one shape would refuse the two of those three that are ordinary HTTP.
+
+    What is refused is disagreement. Two capabilities across two hops is the
+    same request meaning two things as two capabilities in one header, and the
+    reasoning `take_control` gives applies unchanged: resolving it in either
+    direction lets a caller hide one behind the other. Agreement is not
+    disagreement -- a client that repeats itself on both hops has said one thing
+    twice.
+    """
+    if tunnel.ambiguous or inner.ambiguous:
+        return Control(None, tunnel.program or inner.program, ambiguous=True)
+    capability, split = _agreed(tunnel.capability, inner.capability)
+    program, disputed = _agreed(tunnel.program, inner.program)
+    return Control(capability, program, ambiguous=split or disputed)
+
+
+def _agreed(tunnel: str | None, inner: str | None) -> tuple[str | None, bool]:
+    """One value from two hops, or nothing and the fact that they differed."""
+    if tunnel is not None and inner is not None and tunnel != inner:
+        return None, True
+    return (tunnel if tunnel is not None else inner), False
 
 
 def describes_this_hop(name: str, named: frozenset[str] | set[str] = frozenset()) -> bool:
@@ -530,17 +616,28 @@ class Fence:
 # ---------------------------------------------------------------------------
 
 
-Connector = Callable[[str, int, float], http.client.HTTPConnection]
+Connector = Callable[[str, int, float, str], http.client.HTTPConnection]
 
 
-def connect(host: str, port: int, timeout: float) -> http.client.HTTPConnection:
+def connect(host: str, port: int, timeout: float, protocol: str) -> http.client.HTTPConnection:
     """Open the connection to the target this request was authorized for.
 
     The seam ticket 11 attaches to. Today the name is resolved the ordinary way
     and whatever it resolves to is dialled; pinning the address that was decided
     against, and refusing one that moved between the decision and the socket, is
     that ticket's whole subject and is not simulated here.
+
+    An https target is verified against the system trust store, and this is the
+    only place in the harness where a real certificate is seen at all. The agent
+    is looking at this door's certificate by construction, so a claim about the
+    target's -- issuer, expiry, name, chain -- can only be made on this side of
+    the door. `intercepted` on the Receipt is what stops the agent's view from
+    being read as the target's.
     """
+    if protocol == "https":
+        return http.client.HTTPSConnection(
+            host, port, timeout=timeout, context=ssl.create_default_context()
+        )
     return http.client.HTTPConnection(host, port, timeout=timeout)
 
 
@@ -559,12 +656,18 @@ class Server(ThreadingHTTPServer):
         store: Store,
         connector: Connector,
         timeout: float = TIMEOUT,
+        authority: tls.Authority | None = None,
     ):
         super().__init__(address, handler)
         self.fence = fence
         self.store = store
         self.connector = connector
         self.target_timeout = timeout
+        #: What a tunnel is answered with, or nothing -- in which case CONNECT is
+        #: refused. Optional rather than required so that a door with no
+        #: certificate material is a door that says no to tunnels, not a door
+        #: that relays one it cannot read.
+        self.authority = authority
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -574,9 +677,22 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "redkraken"
     sys_version = ""
 
+    #: The target this connection was opened towards, once a CONNECT has been
+    #: answered and the socket is this door's TLS rather than the client's. Set
+    #: on the instance that serves the requests inside the tunnel, so everything
+    #: below can ask "which hop am I on" without a second code path.
+    tunnel: tuple[str, int] | None = None
+    tunnel_control: Control = Control(None, None)
+
     def _serve(self) -> None:
         arrival = datetime.now(timezone.utc)
         control = take_control(self.headers)
+        if self.tunnel is not None:
+            # The take still ran, so whatever this request carried is out of the
+            # message either way. What it said is merged with what the CONNECT
+            # said, because ordinary clients split the two across the hops.
+            control = merge_control(self.tunnel_control, control)
+        url = self._url()
         program_id = _identifier(control.program)
         if program_id is None:
             # Either nothing named a Program or two headers did, and the one
@@ -590,17 +706,23 @@ class Handler(BaseHTTPRequestHandler):
             # go -- and it goes there. A refusal that filed nothing would make
             # duplicating one's own capability header the cheapest way through
             # this fence there is: refused, but unrecorded.
+            said = TWO_HOPS if self.tunnel is not None else TWO_HEADERS
             return self._refuse(
                 program_id,
                 None,
-                Refused("ambiguous control headers", TWO_HEADERS),
+                Refused("ambiguous control headers", said),
                 arrival,
-                url=self.path,
+                url=url,
                 decision=AMBIGUOUS,
+                # Said out loud to the caller, unlike every other detail this
+                # method sends: it is this module's own prose about the caller's
+                # own headers, and the two ways to be ambiguous need different
+                # fixes from whoever sent them.
+                detail=said,
             )
 
         try:
-            request = self._request()
+            request = self._request(url)
             if control.capability is None:
                 raise Refused("capability refused", "no capability was offered")
             authorization = self.server.fence.authorize(
@@ -608,9 +730,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             body = self._body()
         except Refused as refusal:
-            return self._refuse(program_id, control.capability, refusal, arrival, url=self.path)
+            return self._refuse(program_id, control.capability, refusal, arrival, url=url)
 
-        self._forward(authorization, control.capability, request, body, arrival)
+        self._forward(authorization, control.capability, request, body, arrival, url)
 
     do_GET = _serve
     do_HEAD = _serve
@@ -621,37 +743,120 @@ class Handler(BaseHTTPRequestHandler):
     do_OPTIONS = _serve
 
     def do_CONNECT(self) -> None:
-        """Refuse the tunnel. Ticket 10 is where HTTPS gets one.
+        """Answer the tunnel, and then be the other end of it.
 
-        The take still happens, and an ambiguous one is still the refusal
-        reported: a caller has to be able to tell which of the two things was
-        wrong with their request.
+        The alternative -- relaying the bytes to the target unread -- is the one
+        thing section 7 does not allow: it is egress, it is unrecorded, and the
+        Receipt that would name it could say nothing about what crossed. So the
+        door terminates the TLS itself. Nothing is forwarded here at all; a
+        socket towards the target is opened later, by the request inside, and
+        only after the database has authorized that request.
 
-        Nothing is filed on this path, ambiguous or not, and that is not the hole
-        `_serve` closes. There a record was suppressible by duplicating a header;
-        here no tunnel produces a record at all, because no tunnel is opened --
-        the row this ticket could write about a CONNECT would be a Receipt about
-        an exchange that never happened.
+        No Receipt is written for the CONNECT, and that is not the hole `_serve`
+        closes. A CONNECT is not an exchange -- no bytes reach a target because
+        of one -- and the row it could write would name a request nobody has
+        made yet. The requests inside are each recorded, refused ones included.
+
+        What is refused here is only what makes a tunnel impossible: control
+        headers that mean two things, no authority to sign with, and an
+        authority-form that is not one. Scope is not consulted, because the
+        question a CONNECT asks -- "may I speak to this host at all" -- is
+        answered by refusing every request inside it, and answering it earlier
+        would tell a caller which hosts are in scope without spending anything.
         """
         control = take_control(self.headers)
         if control.ambiguous:
             return self._answer(407, AMBIGUOUS, detail=TWO_HEADERS, body=b"")
-        self._answer(405, TUNNEL, body=b"")
+        authority = self.server.authority
+        if authority is None:
+            return self._answer(405, TUNNEL, detail=NO_AUTHORITY, body=b"")
+        try:
+            host, port = _hostport(self.path)
+            context = authority.context(host)
+        except Refused as refusal:
+            return self._answer(refusal.status, TUNNEL, detail=refusal.detail, body=b"")
+        except tls.Unusable as error:
+            return self._answer(400, TUNNEL, detail=str(error), body=b"")
 
-    def _request(self) -> scope.Request:
+        self.send_response_only(200, ESTABLISHED)
+        self.end_headers()
+        self.wfile.flush()
+
+        self.connection.settimeout(self.server.target_timeout)
+        try:
+            secured = context.wrap_socket(self.connection, server_side=True)
+        except (OSError, ValueError) as error:
+            # A client that will not complete the handshake has been answered
+            # already and there is nothing further to say to it: the only place
+            # a message could go is a TLS session that does not exist.
+            self.log_error("no tunnel to %s: %s", self.path, error)
+            self.close_connection = True
+            return
+        # `wrap_socket` detaches the socket underneath, so from here the plain
+        # one is a dead file descriptor and every read and write in this handler
+        # has to be the TLS one -- including the ones `finish` makes.
+        self.connection = secured
+        self.rfile = secured.makefile("rb", self.rbufsize)
+        self.wfile = secured.makefile("wb")
+        self.tunnel = (host, port)
+        self.tunnel_control = control
+        self.close_connection = False
+        try:
+            while not self.close_connection:
+                self.handle_one_request()
+        except OSError as error:
+            # `log_message` and not `log_error`: a client that hangs up mid-tunnel
+            # is the ordinary end of a connection and leaves no gap in the record,
+            # which is the one thing stderr here is for.
+            self.log_message("tunnel to %s ended: %s", self.path, error)
+            self.close_connection = True
+        finally:
+            # `shutdown_request` will close the socket this handler was given,
+            # and that is no longer the one holding the descriptor: `wrap_socket`
+            # detached it. Nothing else refers to the TLS socket, so a door that
+            # left it to the collector would leak a descriptor per tunnel.
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            secured.close()
+
+    def _url(self) -> str:
+        """The absolute URL this request is about, whichever hop it arrived on.
+
+        Inside a tunnel the client sends an origin-form path and the host is the
+        one the CONNECT named -- not the `Host` header, which is the client's to
+        write and is not what this door issued a certificate for. Everything
+        downstream reads this one string, so the scope decision, the Receipt and
+        the certificate all describe the same target or none of them do.
+        """
+        if self.tunnel is None:
+            return self.path
+        host, port = self.tunnel
+        return f"https://{_authority(host, port, 'https')}{self.path}"
+
+    def _request(self, url: str) -> scope.Request:
         """The request line, canonicalised, or a refusal that never leaves."""
-        if not self.path.lower().startswith("http://"):
+        if self.tunnel is not None and not self.path.startswith("/"):
+            # Absolute form inside a tunnel would name a second target while the
+            # certificate on this socket names the first. There is no answer to
+            # give that is true of both.
+            raise Refused(
+                "not a proxy request",
+                f"{self.requestline} is not an origin form request",
+                status=400,
+            )
+        if not url.lower().startswith(("http://", "https://")):
             # Origin form means "you are the origin server". This fence has no
             # resource to serve, and answering one would be an unauthenticated
             # surface on the process holding every capability in flight.
-            # `https://` in absolute form is ticket 10's, through CONNECT.
             raise Refused(
                 "not a proxy request",
                 f"{self.requestline} is not an absolute form URL",
                 status=400,
             )
         try:
-            return scope.canonical_request(self.path)
+            return scope.canonical_request(url)
         except scope.PolicyError as error:
             raise Refused("malformed request", error.detail) from error
 
@@ -687,7 +892,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             connection = self.server.connector(
-                request.host, request.port, self.server.target_timeout
+                request.host, request.port, self.server.target_timeout, request.protocol
             )
             try:
                 # Header by header, in the order the transcript records, rather
@@ -728,6 +933,7 @@ class Handler(BaseHTTPRequestHandler):
         request: scope.Request,
         body: bytes,
         arrival: datetime,
+        url: str,
     ) -> None:
         """Send the authorized request, record the exchange, answer the caller."""
         authority = _authority(request.host, request.port, request.protocol)
@@ -739,7 +945,7 @@ class Handler(BaseHTTPRequestHandler):
             # transcript that omitted it would be a hash of bytes that differ
             # from the ones the socket carried.
             headers.append(("Accept-Encoding", "identity"))
-        target = origin_form(self.path)
+        target = origin_form(url)
         line = f"{self.command} {target} HTTP/1.1"
 
         egress = datetime.now(timezone.utc)
@@ -751,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
                 capability,
                 refusal,
                 arrival,
-                url=self.path,
+                url=url,
                 authorization=authorization,
                 egress=egress,
             )
@@ -775,7 +981,7 @@ class Handler(BaseHTTPRequestHandler):
             "host": request.host,
             "port": request.port,
             "path": request.path_raw,
-            "query_sha256": query_sha256(self.path),
+            "query_sha256": query_sha256(url),
             "status_code": status,
             "ts_arrival": arrival.isoformat(),
             "ts_egress": egress.isoformat(),
@@ -820,7 +1026,7 @@ class Handler(BaseHTTPRequestHandler):
                     target_status=status,
                 ),
                 arrival,
-                url=self.path,
+                url=url,
                 authorization=authorization,
                 egress=egress,
                 decision=RECEIPT_REFUSED,
@@ -840,6 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
         authorization: Authorization | None = None,
         egress: datetime | None = None,
         decision: str = REFUSED,
+        detail: str | None = None,
     ) -> None:
         """Record the attempt under the Program it named, and answer the refusal.
 
@@ -883,11 +1090,28 @@ class Handler(BaseHTTPRequestHandler):
             )
         if refusal.target_status is not None:
             receipt["status_code"] = refusal.target_status
+        written: str | None = None
         try:
-            self.server.fence.blocked_receipt(program_id, capability, receipt)
+            written = self.server.fence.blocked_receipt(program_id, capability, receipt)
         except (pg.DatabaseError, OSError, Refused) as error:
             self.log_error("no blocked receipt for %s: %s", program_id, error)
-        self._answer(refusal.status, decision, detail=refusal.reason, body=b"")
+        # The refusal names the row it just wrote, for the same reason the served
+        # path names its label: a caller that cannot cite the record cannot show
+        # that its request was refused rather than lost, and the runtime reads a
+        # missing name as an integrity failure -- which is what it should mean.
+        #
+        # What it does not carry is `refusal.detail`. That field holds whatever
+        # explained the refusal here, and for a fence refusal what explained it is
+        # the database's own error text -- SQLSTATE, message and the PL/pgSQL
+        # frame it was raised in. The caller is the thing being fenced. Prose it
+        # may read is passed in explicitly by the caller of this method.
+        self._answer(
+            refusal.status,
+            decision,
+            detail=detail or refusal.reason,
+            body=b"",
+            receipt=written,
+        )
 
     def _answer(
         self,
@@ -909,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
         if decision:
             self.send_header(DECISION, decision)
         if detail:
-            self.send_header("X-RedKraken-Detail", detail)
+            self.send_header(DETAIL, detail)
         if receipt:
             self.send_header(RECEIPT, receipt)
         self.send_header("Content-Length", str(len(body)))
@@ -950,6 +1174,35 @@ def _authority(host: str, port: int, protocol: str | None) -> str:
     return f"{literal}:{port}"
 
 
+def _hostport(authority: str) -> tuple[str, int]:
+    """The target of a CONNECT line, which is a host and a port and nothing else.
+
+    Parsed here rather than by `urlsplit`, because an authority-form request
+    target is not a URL: `urlsplit("target.example:443")` reads the host as a
+    scheme. A refusal is a 400 rather than a 407 for the same reason `_request`
+    uses one -- this was not a proxy request that was refused, it was not a
+    proxy request.
+    """
+    host, separator, port = authority.rpartition(":")
+    if not separator or not host:
+        raise Refused(
+            "not a tunnel request", f"{authority!r} is not host:port", status=400
+        )
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        number = int(port)
+    except ValueError as error:
+        raise Refused(
+            "not a tunnel request", f"{authority!r} has no readable port", status=400
+        ) from error
+    if not 0 < number < 65536:
+        raise Refused(
+            "not a tunnel request", f"{authority!r} names no port that exists", status=400
+        )
+    return host.lower(), number
+
+
 def _hostname(parts: SplitResult) -> str | None:
     """The host of a URL that may not have one. `urlsplit` defers the parse."""
     try:
@@ -959,11 +1212,21 @@ def _hostname(parts: SplitResult) -> str | None:
 
 
 def _port(parts: SplitResult) -> int | None:
-    """The port of a URL that may not have a readable one."""
+    """The port of a URL that may not have a readable one.
+
+    The scheme's default when the URL omits it, because a blocked Receipt is
+    read alongside the allowed ones, and those name a port the canonicaliser
+    filled in the same way. A row that said `null` for `https://host/path` and
+    `443` for `https://host:443/path` would make two spellings of one refusal
+    look like two different facts.
+    """
     try:
-        return parts.port
+        port = parts.port
     except ValueError:
         return None
+    if port is not None:
+        return port
+    return scope.DEFAULT_PORTS.get(parts.scheme.lower())
 
 
 def listen(
@@ -973,14 +1236,28 @@ def listen(
     store: Store,
     connector: Connector = connect,
     timeout: float = TIMEOUT,
+    authority: tls.Authority | None = None,
 ) -> Server:
     """Bind the listening socket without serving on it."""
     return Server(
-        address, Handler, fence=fence, store=store, connector=connector, timeout=timeout
+        address,
+        Handler,
+        fence=fence,
+        store=store,
+        connector=connector,
+        timeout=timeout,
+        authority=authority,
     )
 
 
-def serve(settings: pg.Settings, *, root: Path, host: str = "127.0.0.1", port: int = 0) -> Report:
+def serve(
+    settings: pg.Settings,
+    *,
+    root: Path,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    authority: Path | None = None,
+) -> Report:
     """Run the fence until it is interrupted.
 
     Binds before it connects, so an operator who named a port something else
@@ -1000,9 +1277,34 @@ def serve(settings: pg.Settings, *, root: Path, host: str = "127.0.0.1", port: i
             code=INVALID_CONFIGURATION,
             source="argument:--host",
         )
-        return report(SERVE, ledger, endpoint=None)
+        return report(SERVE, ledger, endpoint=None, certificate=None)
+
+    signing: tls.Authority | None = None
+    if authority is not None:
+        try:
+            signing = tls.authority(authority)
+        except tls.Missing as error:
+            ledger.fail(
+                "authority", str(error), code=MISSING_DEPENDENCY, source="runtime:program:openssl"
+            )
+            return report(SERVE, ledger, endpoint=None, certificate=None)
+        except tls.Unusable as error:
+            ledger.fail(
+                "authority", str(error), code=INVALID_CONFIGURATION, source="argument:--authority"
+            )
+            return report(SERVE, ledger, endpoint=None, certificate=None)
+        ledger.hold("authority", f"tunnels are intercepted under {signing.certificate}")
+    else:
+        # Said out loud rather than left to be discovered: a door with no
+        # authority answers CONNECT with a refusal, and an operator who expected
+        # HTTPS to work needs to read that here and not in an agent's logs.
+        ledger.hold("authority", NO_AUTHORITY + "; a tunnel is refused rather than relayed")
+    certificate = str(signing.certificate) if signing else None
+
     try:
-        server = listen((host, port), fence=None, store=Store(Path(root)))
+        server = listen(
+            (host, port), fence=None, store=Store(Path(root)), authority=signing
+        )
     except OSError as error:
         ledger.fail(
             "listener",
@@ -1010,13 +1312,13 @@ def serve(settings: pg.Settings, *, root: Path, host: str = "127.0.0.1", port: i
             code=INVALID_CONFIGURATION,
             source="argument:--port",
         )
-        return report(SERVE, ledger, endpoint=None)
+        return report(SERVE, ledger, endpoint=None, certificate=certificate)
     ledger.hold("listener", f"listening on {host}:{server.server_address[1]}")
 
     connection = migrate.open_connection(ledger, settings)
     if connection is None:
         server.server_close()
-        return report(SERVE, ledger, endpoint=None)
+        return report(SERVE, ledger, endpoint=None, certificate=certificate)
     server.fence = Fence(connection)
     try:
         server.serve_forever()
@@ -1025,7 +1327,12 @@ def serve(settings: pg.Settings, *, root: Path, host: str = "127.0.0.1", port: i
     finally:
         server.server_close()
         connection.close()
-    return report(SERVE, ledger, endpoint=f"http://{host}:{server.server_address[1]}")
+    return report(
+        SERVE,
+        ledger,
+        endpoint=f"http://{host}:{server.server_address[1]}",
+        certificate=certificate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1362,36 @@ CLOSE_TOOL_RUN = "UPDATE tool_runs SET status = $2, finished_at = now() WHERE id
 CLOSE_RUN = "UPDATE agent_runs SET finished_at = now(), stop_reason = $2 WHERE id = $1::uuid"
 
 
+@dataclass(frozen=True)
+class Answer:
+    """What the door said back, on whichever hop it said it on.
+
+    `decision` is the door's own token and is absent when the request was
+    served, which is the only reliable way to tell "this fence refused" from
+    "the target answered 407": both are a 407 on the wire, and only one of them
+    means no bytes reached the target. Branching on the status alone would make
+    a target's own refusal close a Tool run as denied and a fence refusal close
+    one as success, which is the same mistake in both directions.
+    """
+
+    status: int
+    body: bytes
+    receipt: str | None
+    decision: str | None
+    detail: str | None
+
+
+def _answered(answer: http.client.HTTPResponse) -> Answer:
+    """Read one response into the four facts the runtime decides on."""
+    return Answer(
+        status=answer.status,
+        body=answer.read(CEILING + 1),
+        receipt=answer.headers.get(RECEIPT),
+        decision=answer.headers.get(DECISION),
+        detail=answer.headers.get(DETAIL),
+    )
+
+
 def send(
     runtime: pg.Settings | None,
     configuration_path: Path,
@@ -1063,6 +1400,7 @@ def send(
     proxy_url: str,
     method: str = "GET",
     timeout: float = TIMEOUT,
+    ca_file: Path | None = None,
 ) -> Report:
     """Open one Tool run, mint its capability and spend it on one request.
 
@@ -1101,15 +1439,34 @@ def send(
             "request", error.detail, code=INVALID_CONFIGURATION, source="argument:--url"
         )
         return report(REQUEST, ledger, **facts)
-    if request.protocol != "http":
-        ledger.fail(
-            "request",
-            f"{request.protocol} through this proxy is ticket 10; this one speaks plain HTTP",
-            code=INVALID_CONFIGURATION,
-            source="argument:--url",
-        )
-        return report(REQUEST, ledger, **facts)
     ledger.hold("request", f"{method} {request.host}:{request.port}{request.path_norm}")
+
+    trust: ssl.SSLContext | None = None
+    if request.protocol == "https":
+        # The door is about to present a certificate for a host it does not own,
+        # which is what interception is. Verifying it against this run's root is
+        # the difference between that and any other machine on the path doing the
+        # same thing, so there is no default and no fallback to the system store:
+        # without the root the request is refused before a capability is minted.
+        if ca_file is None:
+            ledger.fail(
+                "trust_root",
+                f"an https target needs the door's certificate: pass --ca or set {CA_VARIABLE}",
+                code=INVALID_CONFIGURATION,
+                source=f"environment:{CA_VARIABLE}",
+            )
+            return report(REQUEST, ledger, **facts)
+        try:
+            trust = tls.trust(ca_file)
+        except (OSError, ssl.SSLError) as error:
+            ledger.fail(
+                "trust_root",
+                f"the door's certificate at {ca_file} cannot be used: {error}",
+                code=INVALID_CONFIGURATION,
+                source="argument:--ca",
+            )
+            return report(REQUEST, ledger, **facts)
+        ledger.hold("trust_root", f"the tunnel is verified against {ca_file} and nothing else")
 
     configuration, refusals = config.load(Path(configuration_path))
     if configuration is None:
@@ -1129,7 +1486,18 @@ def send(
         if program_id is None:
             return report(REQUEST, ledger, **facts)
         facts["program_id"] = program_id
-        _spend(ledger, facts, connection, program_id, url, method, (host, port), timeout)
+        _spend(
+            ledger,
+            facts,
+            connection,
+            program_id,
+            url,
+            method,
+            (host, port),
+            timeout,
+            request,
+            trust,
+        )
     return report(REQUEST, ledger, **facts)
 
 
@@ -1142,6 +1510,8 @@ def _spend(
     method: str,
     listener: tuple[str, int],
     timeout: float,
+    request: scope.Request,
+    trust: ssl.SSLContext | None,
 ) -> None:
     """One Agent run, one Tool run, one capability, and its revocation.
 
@@ -1187,18 +1557,37 @@ def _spend(
             "authorization",
             f"{label} is {gate.get('risk_class')}/{gate.get('decision')} by {gate.get('rule')}",
         )
-        status, body, receipt = _through(listener, url, method, capability, program_id, timeout)
-        facts["response"] = {"status": status, "byte_size": len(body)}
-        facts["receipt"] = receipt
-        if receipt is None:
+        answer = _through(
+            listener, url, method, capability, program_id, timeout, request, trust
+        )
+        facts["response"] = {"status": answer.status, "byte_size": len(answer.body)}
+        facts["receipt"] = answer.receipt
+        if answer.receipt is None:
             ledger.fail(
                 "receipt",
-                f"the proxy answered {status} without naming a Receipt",
+                f"the proxy answered {answer.status} without naming a Receipt",
                 code=INTEGRITY_FAILED,
                 source="proxy",
             )
             return
-        ledger.hold("receipt", f"the proxy wrote {receipt} for a {status} answer")
+        ledger.hold("receipt", f"the proxy wrote {answer.receipt} for a {answer.status} answer")
+        if answer.decision is not None:
+            # A refused request is a request that did not happen, and it is the
+            # blocked Receipt above that proves it. What it must not become is a
+            # Tool run closed as success: the row would say the capability was
+            # spent on an exchange, the command would exit 0, and an operator
+            # scripting `rk proxy request` would read "refused by the fence" as
+            # "served". The Receipt is named either way, because the refusal is
+            # as auditable as the exchange.
+            ledger.fail(
+                "egress",
+                f"the proxy refused this request as {answer.decision}: "
+                f"{answer.detail or 'no reason given'}",
+                code=INVALID_CONFIGURATION,
+                source="proxy",
+            )
+            outcome = "denied"
+            return
         outcome = "success"
     except (OSError, http.client.HTTPException) as error:
         ledger.fail(
@@ -1226,18 +1615,69 @@ def _through(
     capability: str,
     program_id: str,
     timeout: float,
-) -> tuple[int, bytes, str | None]:
-    """The request itself, in absolute form, with the capability on this hop."""
+    request: scope.Request,
+    trust: ssl.SSLContext | None,
+) -> Answer:
+    """The request itself, with the capability on the hop that reaches the door.
+
+    Two shapes, one for each protocol. Plain HTTP goes in absolute form, which
+    is what a proxy request is. HTTPS opens a tunnel first and then sends an
+    ordinary origin-form request inside it, which is what every client does --
+    and the control headers go on the CONNECT, because that is the hop the
+    capability is for and the one the door can read.
+    """
     host, port = listener
-    client = http.client.HTTPConnection(host, port, timeout=timeout)
+    control = {AUTHORIZATION: f"RedKraken {capability}", PROGRAM: program_id}
+    if trust is None:
+        client = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            client.request(method.upper(), url, headers=control)
+            return _answered(client.getresponse())
+        finally:
+            client.close()
+
+    raw = socket.create_connection((host, port), timeout=timeout)
     try:
-        client.request(
-            method.upper(),
-            url,
-            headers={AUTHORIZATION: f"RedKraken {capability}", PROGRAM: program_id},
-        )
-        answer = client.getresponse()
-        body = answer.read(CEILING + 1)
-        return answer.status, body, answer.headers.get(RECEIPT)
+        refusal = _tunnel(raw, request, control)
+        if refusal is not None:
+            return refusal
+        # `set_tunnel` would do all of the above in one call and raise `OSError`
+        # on a refusal, which is why it is not used: the door's answer to a
+        # CONNECT carries the decision and the name of the Receipt it wrote, and
+        # a client that turns that into "Tunnel connection failed" has thrown
+        # away the only evidence the refusal produced.
+        secured = trust.wrap_socket(raw, server_hostname=request.host)
+        client = http.client.HTTPConnection(request.host, request.port, timeout=timeout)
+        client.sock = secured
+        try:
+            client.request(method.upper(), origin_form(url))
+            return _answered(client.getresponse())
+        finally:
+            client.close()
     finally:
-        client.close()
+        raw.close()
+
+
+def _tunnel(
+    raw: socket.socket, request: scope.Request, control: dict[str, str]
+) -> Answer | None:
+    """Ask for the tunnel, and return the refusal if there was one.
+
+    `_authority` with no protocol is the authority form: a CONNECT target
+    always carries its port, including the default one, because there is no
+    scheme in the request line to imply it.
+    """
+    authority = _authority(request.host, request.port, None)
+    lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
+    lines += [f"{name}: {value}" for name, value in control.items()]
+    raw.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+    answer = http.client.HTTPResponse(raw, method="CONNECT")
+    try:
+        answer.begin()
+        if answer.status == 200:
+            return None
+        return _answered(answer)
+    finally:
+        # The header reader is closed either way; the socket under it is not,
+        # because on the accepted path it is about to carry a TLS session.
+        answer.close()
