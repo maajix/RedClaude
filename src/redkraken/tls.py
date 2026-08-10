@@ -26,7 +26,8 @@ asks a client to use the door. It does not stop one that ignores it, and the
 prototype's fifth finding is that containment is a routing fact rather than a
 policy -- a network namespace with no route but the door's. That is ticket 11's
 work, and this module's environment builder is the half of it that is honest
-today: both schemes named, nothing left to bypass, one trust root installed.
+today: both schemes named, nothing left to bypass, one trust root installed and
+no second store left to consult.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import scope
 
 #: The program that issues the certificates. It ships with every operating
 #: system this harness runs on, and is already the documented way to make the
@@ -88,9 +91,9 @@ BYPASS_VARIABLES = ("NO_PROXY", "no_proxy")
 #: Where the clients an agent actually runs look for a trust root. Four names
 #: for one file: OpenSSL's, Python's `requests`, `curl`'s own, and Node's.
 #:
-#: The first three replace the store they name; `NODE_EXTRA_CA_CERTS` adds to
+#: The first three replace the file they name; `NODE_EXTRA_CA_CERTS` adds to
 #: Node's bundled roots rather than replacing them, so a Node client here trusts
-#: this run *and* the public internet. That is not fixed by a fifth variable:
+#: this run *and* the public internet. That is not fixed by a further variable:
 #: what closes it is having no route to the public internet, which is ticket
 #: 11's, and the honest statement until then is that this list makes the door
 #: trusted everywhere and untrusts the internet only where a variable can.
@@ -100,6 +103,28 @@ TRUST_VARIABLES = (
     "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
 )
+
+#: And the half of OpenSSL's trust that is not a file. `SSL_CERT_FILE` names one
+#: certificate; the hashed directory beside it is a second lookup and an
+#: independent one, so a root sitting in the system's directory is still trusted
+#: by a child that was handed only this run's file. Held against a handshake
+#: rather than argued: in `tests/test_tls.py` a certificate that chains only
+#: through the directory verifies while the directory is named, and is refused
+#: once this list has emptied it.
+#:
+#: Emptied rather than pointed at this run's own directory, because an empty
+#: value means "look in no directory" rather than "fall back to the compiled-in
+#: default" -- which the same handshake shows, being the refusal it ends on.
+STORE_VARIABLES = ("SSL_CERT_DIR",)
+
+#: How many distinct hosts one run will certify. A CONNECT line is answered
+#: before any capability has been offered -- it has to be, because the
+#: capability arrives inside the tunnel -- so the host that reaches `context` is
+#: unauthenticated input, and each host that has not been seen before forks
+#: `openssl` twice and leaves a certificate in the door's directory. The ceiling
+#: is far above the number of hosts a run's scope can hold and far below what a
+#: client looping on fresh names would cost.
+HOSTS = 256
 
 #: The extensions on a leaf. A server certificate and nothing else: it cannot
 #: sign, so a leaf that leaked is one host's problem rather than the run's.
@@ -148,6 +173,11 @@ class Authority:
         with self._lock:
             found = self._contexts.get(name)
             if found is None:
+                if len(self._contexts) >= HOSTS:
+                    raise Unusable(
+                        f"this run has already certified {HOSTS} hosts and "
+                        f"{name!r} would be another"
+                    )
                 found = self._context(name)
                 self._contexts[name] = found
             return found
@@ -170,7 +200,14 @@ class Authority:
             raise Unusable(f"{host!r} is not a host this door can certify")
         key = self.directory / "leaf-key.pem"
         if not key.exists():
-            _run(_generate(key))
+            _run(
+                [
+                    OPENSSL, "genpkey",
+                    "-algorithm", "EC",
+                    "-pkeyopt", f"ec_paramgen_curve:{CURVE}",
+                    "-out", str(key),
+                ]
+            )
             _own(key)
         stamp = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
         certificate = self.directory / f"leaf-{stamp}.pem"
@@ -261,10 +298,12 @@ def agent_environment(
     """What a child is told about the door, over what it was already given.
 
     Three facts and no others. Where to send both schemes, that nothing is
-    exempt, and which certificate to believe. The signing key is not here and
-    has no variable: this mapping is handed to a process that is assumed to be
-    hostile, and the difference between an agent that can be intercepted and an
-    agent that can intercept is exactly one file.
+    exempt, and which certificate to believe -- that last one twice, because
+    trust is two lookups and a run root installed as the file leaves the
+    directory answering for everything it held before. The signing key is not
+    here and has no variable: this mapping is handed to a process that is
+    assumed to be hostile, and the difference between an agent that can be
+    intercepted and an agent that can intercept is exactly one file.
     """
     child = dict(source)
     for name in PROXY_VARIABLES:
@@ -273,6 +312,8 @@ def agent_environment(
         child[name] = ""
     for name in TRUST_VARIABLES:
         child[name] = str(certificate)
+    for name in STORE_VARIABLES:
+        child[name] = ""
     return child
 
 
@@ -283,20 +324,11 @@ def _san(host: str) -> str:
     against no client at all, and the failure arrives as a handshake error with
     nothing in it about the name.
     """
-    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    literal = scope.unbracket(host)
     try:
         return f"IP:{ipaddress.ip_address(literal)}"
     except ValueError:
         return f"DNS:{host}"
-
-
-def _generate(key: Path) -> list[str]:
-    return [
-        OPENSSL, "genpkey",
-        "-algorithm", "EC",
-        "-pkeyopt", f"ec_paramgen_curve:{CURVE}",
-        "-out", str(key),
-    ]
 
 
 def _own(path: Path) -> None:

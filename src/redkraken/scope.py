@@ -213,6 +213,20 @@ def canonical_address(value: str) -> str:
     return (mapped or address).compressed
 
 
+def unbracket(host: str) -> str:
+    """A host with the brackets a URL puts around an IPv6 address removed.
+
+    The brackets belong to the URL and not to the host: they are what keeps the
+    colons inside the address apart from the colon before the port. Every place
+    that has to recognise an address takes them off first -- the normalizer
+    below, the CONNECT line at the door, the name written into a certificate --
+    and three copies of two lines is three chances for one of them to drift.
+    """
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
 def normalize_host(raw: object) -> str:
     """One host in one spelling, or a refusal naming what is wrong with it.
 
@@ -225,9 +239,7 @@ def normalize_host(raw: object) -> str:
     # Spaces only, because `btrim` trims spaces only. `str.strip()` also removes
     # U+00A0, so a host padded with one would be a name here and malformed in
     # SQL -- the exact class of disagreement this pairing exists to prevent.
-    value = raw.strip(" ").lower().rstrip(".")
-    if value.startswith("[") and value.endswith("]"):
-        value = value[1:-1]
+    value = unbracket(raw.strip(" ").lower().rstrip("."))
     if not value:
         raise PolicyError("no_host", "no host was given")
     if not value.isascii():

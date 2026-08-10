@@ -61,12 +61,14 @@ DEFAULT_PROXY_PORT = 8080
 
 @dataclass(frozen=True)
 class _Source:
-    """Where one connection string comes from, in the three names it has.
+    """Where one input comes from, in the three names it has.
 
     The flag, the variable and the name a refusal is filed under always travel
     together, and an operator reading a refusal has to be able to act on it: a
     report that named the wrong variable would send them to edit an environment
-    the command never read.
+    the command never read. Which is also why `fact` is the name the operation
+    itself files under and not a spelling invented here -- a path resolved as
+    `ca_file` and refused as `trust_root` is one input under two names.
     """
 
     fact: str
@@ -91,15 +93,15 @@ PROXY = _Source("proxy_url", "--proxy", proxy.PROXY_URL)
 #: out of it, and is the only part anything else is given. Two names because an
 #: installation that exported one for both would be exporting the key.
 AUTHORITY = _Source("authority", "--authority", proxy.AUTHORITY_VARIABLE)
-TRUST = _Source("ca_file", "--ca", proxy.CA_VARIABLE)
+TRUST = _Source("trust_root", "--ca", proxy.CA_VARIABLE)
 
-#: The one input that is not a connection string and is resolved the same way.
-#: The artifact store is a directory, so it has a variable of its own: an
-#: operator who moved the database has not moved the bytes.
+#: Where the bytes an exchange produced are written, which is a directory and
+#: not a row. It has a variable of its own because an operator who moved the
+#: database has not thereby moved the bytes.
 ARTIFACTS = _Source("artifact_root", "--artifacts", artifact.ROOT_VARIABLE)
 
-#: And the third thing that is not in the database: the key file. Separate from
-#: the store for the reason the store is separate from the connection string --
+#: And the key those bytes are sealed with. Separate from the store for the
+#: reason the store is separate from the connection string --
 #: an operator who copied the bytes somewhere has not thereby copied the key,
 #: and the sealed artifacts are worth exactly as much as that stays true.
 KEYS = _Source("artifact_key", "--key", artifact.KEY_VARIABLE)

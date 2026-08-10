@@ -25,13 +25,21 @@ schemes, named in both spellings, because the prototype configured only `http`
 and the gap was not visible until something asked for `https`. And the trust
 root only: the private key's path is not in the environment at all, because a
 child that can read the signing key can mint the door's own certificate.
+
+Installing that root is two facts and not one, which is why the last test here
+is a handshake rather than a comparison of strings. `SSL_CERT_FILE` names a file
+and the hashed directory beside it is looked up independently, so an environment
+that set only the file would hand a child this run's root *and* leave every root
+the system installed exactly as trusted as it was.
 """
 
 from __future__ import annotations
 
+import os
 import socket
 import ssl
 import stat
+import subprocess
 import threading
 import unittest
 from pathlib import Path
@@ -140,6 +148,22 @@ class AuthorityTest(unittest.TestCase):
         self.assertIs(made.context("one.example"), made.context("one.example"))
         self.assertIsNot(made.context("one.example"), made.context("two.example"))
 
+    def test_a_run_stops_certifying_once_it_has_certified_enough_hosts(self):
+        # A CONNECT is answered before any capability has been offered, so the
+        # host in it is unauthenticated input, and each host not seen before
+        # forks `openssl` twice and leaves a file behind. The cache is filled
+        # rather than earned: minting the ceiling for real is a thousand forks to
+        # assert one refusal.
+        made = tls.authority(scratch() / "ca")
+        seen = made.context("seed.example")
+        made._contexts.update({f"{index}.example": seen for index in range(tls.HOSTS)})
+
+        with self.assertRaises(tls.Unusable):
+            made.context("one-more.example")
+        # A ceiling on new hosts and not on requests: what has been certified is
+        # still served, or a burst would take a target's own tunnels down with it.
+        self.assertIs(seen, made.context("0.example"))
+
     def test_a_host_that_could_rewrite_the_certificate_is_refused(self):
         made = tls.authority(scratch() / "ca")
 
@@ -174,6 +198,18 @@ class EnvironmentTest(unittest.TestCase):
             certificate=self.made.certificate,
         )
 
+    def client(self, environment: dict[str, str]) -> ssl.SSLContext:
+        """A verifying client that found its roots the way a child's would.
+
+        Through the environment and not through an argument: what is under test
+        is whether these variables leave anything else trusted, and a context
+        handed a `cafile` would answer a question nobody is asking.
+        """
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            context.set_default_verify_paths()
+        return context
+
     def test_both_proxy_schemes_are_named_in_both_spellings(self):
         child = self.environment()
 
@@ -191,6 +227,35 @@ class EnvironmentTest(unittest.TestCase):
 
         for name in tls.TRUST_VARIABLES:
             self.assertEqual(str(self.made.certificate), child[name], name)
+
+    def test_a_root_in_the_hashed_directory_is_not_a_store_the_child_still_reads(self):
+        # What `STORE_VARIABLES` is for, held against a handshake because no
+        # assertion about strings could show it: the directory is a lookup of its
+        # own, and a child told only about the file keeps every root in it.
+        directory = scratch() / "roots"
+        directory.mkdir()
+        hashed = subprocess.run(
+            [tls.OPENSSL, "x509", "-hash", "-noout", "-in", str(self.made.certificate)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        (directory / f"{hashed}.0").write_bytes(self.made.certificate.read_bytes())
+        server = self.made.context("target.example")
+        # The file names a leaf rather than the root, so the issuer being looked
+        # for is in the directory and nowhere else. With the root in both,
+        # OpenSSL answers out of the file and never reaches the directory -- a
+        # false negative that reads exactly like the fix below working.
+        leaf = next(self.made.directory.glob("leaf-*.pem"))
+
+        named = {"SSL_CERT_FILE": str(leaf), "SSL_CERT_DIR": str(directory)}
+        handshake(server, self.client(named), "target.example")
+
+        child = tls.agent_environment(
+            {"SSL_CERT_DIR": str(directory)}, proxy_url=PROXY, certificate=leaf
+        )
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            handshake(server, self.client(child), "target.example")
 
     def test_the_signing_key_is_not_in_the_child_environment(self):
         child = self.environment()

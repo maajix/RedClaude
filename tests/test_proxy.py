@@ -84,6 +84,12 @@ class Stub:
     `authorize` answers for one capability and refuses every other, which is the
     whole of what the handler is allowed to know about the decision: it does not
     inspect the authorization, it forwards or it does not.
+
+    It also refuses by host, through the same exception, because the real one
+    does: `authorize_egress_request` raises the same `DatabaseError` for a
+    capability that resolves to nothing and for a target outside the scope it
+    resolves to. A test about scope that reached for a wrong capability instead
+    would pass without the host ever being looked at.
     """
 
     def __init__(self, *, decided: proxy.Authorization | None = None, fail: bool = False):
@@ -94,6 +100,7 @@ class Stub:
             scope_class="target",
         )
         self.fail = fail
+        self.out_of_scope: set[str] = set()
         self.authorized: list[tuple] = []
         self.allowed: list[dict] = []
         self.blocked: list[dict] = []
@@ -102,7 +109,11 @@ class Stub:
         self, program_id: str, capability: str, method: str, request: scope.Request
     ) -> proxy.Authorization:
         self.authorized.append((program_id, capability, method, request))
-        if capability != CAPABILITY or program_id != self.decided.program_id:
+        if (
+            request.host in self.out_of_scope
+            or capability != CAPABILITY
+            or program_id != self.decided.program_id
+        ):
             # Shaped like the real one: `Fence.authorize` turns a `DatabaseError`
             # into this, and the detail is the server's own text down to the
             # PL/pgSQL frame the exception was raised in.
@@ -808,11 +819,15 @@ class TunnelTest(unittest.TestCase):
         self.assertEqual(["target.example.test"], [v for n, v in seen if n == "host"])
 
     def test_an_out_of_scope_https_target_is_refused_before_the_target_is_contacted(self):
-        # Criterion 4. The tunnel opens -- refusing the CONNECT would answer
-        # "is this host in scope" for free -- and the request inside it is refused
-        # before a socket towards the target exists, with the blocked Receipt
-        # naming the https target it was refused for.
-        answer = self.spend("https://admin.example.test/v1/notes", capability=OTHER)
+        # Criterion 4. The capability and the Program are the good ones, so the
+        # only thing left to refuse this request is the host it names. The tunnel
+        # still opens -- refusing the CONNECT would answer "is this host in
+        # scope" for free -- and the request inside it is refused before a socket
+        # towards the target exists, with the blocked Receipt naming the https
+        # target it was refused for.
+        self.fence.out_of_scope.add("admin.example.test")
+
+        answer = self.spend("https://admin.example.test/v1/notes")
 
         self.assertEqual(407, answer.status)
         self.assertEqual(b"", answer.body)
@@ -833,6 +848,39 @@ class TunnelTest(unittest.TestCase):
         self.assertEqual(443, filed["port"])
         self.assertEqual("/v1/notes", filed["path"])
         self.assertNotIn("ts_egress", filed)
+        # And the host is what the fence was asked about, not just what the row
+        # says afterwards.
+        self.assertEqual(
+            ["admin.example.test"], [asked.host for *_, asked in self.fence.authorized]
+        )
+
+    def test_the_agent_is_answered_without_the_capability_it_spent(self):
+        # Criterion 5 from the side the other two tests do not cover: the target
+        # sees a stripped request and the tunnel ends at the door, but neither
+        # says what came back. A door that echoed the authorization it was given,
+        # or named the transcripts it had just sealed, would leak on this hop and
+        # on no other.
+        answer = self.fetch("https://target.example.test/v1/notes")
+        returned = answer.read()
+        names = [name.lower() for name in answer.headers.keys()]
+        text = json.dumps(list(answer.headers.items()))
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual(b'{"note":"target answered"}', returned)
+        self.assertNotIn(proxy.AUTHORIZATION.lower(), names)
+        self.assertNotIn(proxy.PROGRAM.lower(), names)
+        # One control header comes back, and it is the Receipt's label. The
+        # decision and the detail are refusal-only, and this was not a refusal.
+        self.assertEqual(
+            [proxy.RECEIPT.lower()], [name for name in names if name.startswith("x-redkraken-")]
+        )
+        self.assertNotIn(CAPABILITY, text)
+        self.assertNotIn(CAPABILITY.encode(), returned)
+        # Wire-only material: the transcripts are registered against the Receipt
+        # and the agent is told none of their digests.
+        for artifact in self.fence.allowed[0]["artifacts"]:
+            self.assertNotIn(artifact["sha256"], text)
+            self.assertNotIn(artifact["sha256"].encode(), returned)
 
     def test_a_tunnel_and_the_request_inside_it_that_disagree_are_refused_and_recorded(self):
         # Two hops is two places to put a capability, and a door that let the

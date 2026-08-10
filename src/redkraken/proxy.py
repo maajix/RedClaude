@@ -1188,8 +1188,7 @@ def _hostport(authority: str) -> tuple[str, int]:
         raise Refused(
             "not a tunnel request", f"{authority!r} is not host:port", status=400
         )
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
+    host = scope.unbracket(host)
     try:
         number = int(port)
     except ValueError as error:
