@@ -314,3 +314,15 @@ refuses to listen on `0.0.0.0`, `::` or a routable address. The live suite gains
 the same duplicated-capability arm against the real database, where the row is
 `agent`/`blocked`/`ambiguous control headers` with no Tool run named. 596 tests,
 nothing skipped.
+
+### Changed afterwards, by ticket 10
+
+Naming a Receipt on refusals -- the second pass above -- had a consequence this
+ticket recorded the wrong way round. `_spend` branched on `receipt is not None`,
+so once a blocked request carried one, `rk proxy request` closed the Tool run
+**`success`** and exited **0** for a request the door had refused. Ticket 10
+fixed it: the branch is the decision token, a refused request closes `denied`,
+fails the `egress` assertion with the door's own detail and exits **2**, and it
+still names the Receipt. So the behaviour committed under this ticket -- a
+refusal reported as a served request -- is not the behaviour on the branch, and
+how a refusal is reported is read out of ticket 10 rather than out of this one.

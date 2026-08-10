@@ -6,7 +6,7 @@
 
 **Status:** needs-triage
 
-- [x] The runtime configures both HTTP and HTTPS proxy schemes explicitly and installs only the run-specific trust root needed by the agent environment.
+- [ ] The runtime configures both HTTP and HTTPS proxy schemes explicitly and installs only the run-specific trust root needed by the agent environment.
 - [x] A local TLS target is reached through the proxy and produces a capability-bound allowed Receipt.
 - [ ] Direct HTTPS from the agent network namespace fails even when a client ignores conventional proxy environment variables.
 - [x] An out-of-scope HTTPS target is refused before target contact with an auditable blocked Receipt.
@@ -16,9 +16,9 @@
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `9c2ba9b` on
-2026-08-10. **The third criterion is not ticked and this ticket is not resolved**,
-which is why the status is `needs-triage` rather than `resolved`: see the last
-section.
+2026-08-10. **The first and third criteria are not ticked and this ticket is not
+resolved**, which is why the status is `needs-triage` rather than `resolved`: see
+the last section.
 
 `src/redkraken/tls.py` is the run's certificate authority -- one per run, in a
 directory the door owns, issuing a leaf that names exactly one host -- and
@@ -43,21 +43,24 @@ the same URL is answered 200 with a Receipt.
 
 ### What is asserted, and by what
 
-`tests/test_tls.py` is 17 offline tests, eleven of them on the authority: that it survives
+`tests/test_tls.py` is 19 offline tests, twelve of them on the authority: that it survives
 a restart of the door rather than minting a second root the child was never
 given, that the signing key is `0600` in a `0700` directory, that a leaf is
 accepted by a client holding the run root and refused by one holding the
 system's, that it is refused for a host it does not name, that an address
-literal gets `IP:` and not `DNS:`, and that a host carrying a newline is refused
-before it can add an extension of its own. `EnvironmentTest` is the other half
-of criterion one: both schemes in both spellings, both bypass lists emptied, the
-trust root under all four names clients look for, and the signing key's path
-in nothing at all.
+literal gets `IP:` and not `DNS:`, that a host carrying a newline is refused
+before it can add an extension of its own, and that a run stops issuing once it
+has certified `HOSTS` of them. `EnvironmentTest` is the other half of criterion
+one: both schemes in both spellings, both bypass lists emptied, the trust root
+under all four names clients look for, the signing key's path in nothing at all,
+and a handshake showing that the hashed directory beside the trust file is no
+longer a store the child reads.
 
-`tests/test_proxy.py` grows from 28 to 40. `TunnelTest` is the ten that run a
+`tests/test_proxy.py` grows from 28 to 41. `TunnelTest` is the eleven that run a
 real handshake against the door: an https target reached through the tunnel and
 answered with a Receipt, the target's own record showing no control header and
-no `Proxy-Authorization`, an out-of-scope target refused before it is contacted,
+no `Proxy-Authorization`, the agent's answer showing the same and no transcript
+digest either, an out-of-scope target refused before it is contacted,
 a capability carried on either hop alone read as the capability, one carried on
 both hops with different values refused as `TWO_HOPS`, the two on what happens
 when the door is bypassed -- a client holding the run root cannot verify a
@@ -89,8 +92,8 @@ the certificate an agent has to be given and writes it before the database is
 reached, and the two certificate inputs are refused by name, because `--authority`
 being unusable and `--ca` being unusable are different mistakes.
 
-Offline the suite is 497 tests green with 14 skipped; against the scratch
-PostgreSQL 18 cluster it is **632 tests, green, nothing skipped**, and
+Offline the suite is 500 tests green with 14 skipped; against the scratch
+PostgreSQL 18 cluster it is **635 tests, green, nothing skipped**, and
 `python3 -m compileall -q src/redkraken tests` is clean.
 
 ### Decisions worth naming
@@ -222,6 +225,87 @@ is one line over `ssl.create_default_context`, and what it adds is the name of
 the intent -- this run's root and nothing else -- at the one call site where
 getting that wrong is invisible.
 
+### A second review pass, over the committed work
+
+Both axes run again against `97ec396`, over `9c2ba9b` and `f0c7e78`. Nine
+findings were real and are fixed; five are declined, and the reason for each is
+below.
+
+**The trust the child was given had a second half nobody set.** `SSL_CERT_FILE`
+names a file, and OpenSSL looks up the hashed *directory* beside it
+independently -- so a child handed this run's root still trusted every root the
+system had installed, and the module's own comment claiming the first three
+variables "replace the store they name" was false of the first one. It is fixed
+by `STORE_VARIABLES`, which empties `SSL_CERT_DIR` in the child environment, and
+it was measured rather than reasoned about:
+`test_a_root_in_the_hashed_directory_is_not_a_store_the_child_still_reads` puts
+a leaf in the file so the issuer can only be found in the directory, verifies a
+handshake while the directory is named, and gets `ssl.SSLCertVerificationError`
+once the environment has emptied it. With `STORE_VARIABLES` emptied to `()` the test
+fails, which is the falsification: an empty value means "look in no directory"
+and not "fall back to the default".
+
+**A CONNECT could make the door mint certificates without limit.** The host in a
+CONNECT line is unauthenticated -- it has to be, because the capability arrives
+inside the tunnel -- and every host not seen before forked `openssl` twice and
+left a file in the door's directory. `Authority.context` now stops at
+`tls.HOSTS`, which `do_CONNECT` already answers as a 400 because it catches
+`tls.Unusable`. The ceiling is on new hosts and not on requests: what has been
+certified is still served, or a burst would take a target's own tunnels down
+with it.
+
+Two were breaches of what the code already says about itself. `cli._Source`
+documented itself as "where one connection string comes from" while carrying a
+URL, two paths, a directory and a key file, and the comment above `ARTIFACTS`
+called it "the one input that is not a connection string" beside four others
+that are not either. And `TRUST` resolved `--ca` under the fact `ca_file` while
+`proxy.send` files every refusal about it under `trust_root`: one input under
+two names, in the one field whose whole job is to be the name a refusal is filed
+under. Both are corrected, and `_Source` now says why the field is not a
+spelling invented in `cli`.
+
+The IPv6 bracket strip existed three times -- `scope.normalize_host`,
+`proxy._hostport` and `tls._san` -- which is three chances for one of them to
+stop agreeing about what a host is. It is `scope.unbracket`, in the module that
+owns how a host is spelled.
+
+Two were about what the tests could not see.
+`test_an_out_of_scope_https_target_is_refused_before_the_target_is_contacted`
+spent a capability that resolved to nothing, so the stub refused on the
+capability and the host was never looked at: the test's name and criterion 4's
+evidence were about scope, and the assertion was not. `Stub` now refuses by host
+through the same exception the real fence raises for both, and the test spends
+the good capability against a host it has put out of scope. Criterion 5 had the
+mirror gap: what the *target* saw was asserted and so was where the tunnel
+ended, and nothing asserted what came back to the agent.
+`test_the_agent_is_answered_without_the_capability_it_spent` reads the answer's
+headers and body: no authorization echoed, no control header but the Receipt's
+label, and neither transcript digest the door had just sealed.
+
+The last two are this file and the one before it. Criterion 1 is unticked, for
+the reason in the next section. And ticket 09 recorded nothing about the change
+this ticket made to it: a blocked HTTP request closed the Tool run `success` and
+exited 0 there, and closes `denied` and exits 2 here, so ticket 09 now says so
+rather than describing behaviour the branch no longer has.
+
+Five are declined. **`_path` is not a fifth resolver wanting to be folded in**:
+the four that file a ledger differ in where the value comes from and in what
+they say when it is absent, and folding them would take a callable per case,
+which is the same code behind an indirection. **The dialler's four parameters
+are not a clump wanting `scope.Request`**: `connect(host, port, timeout,
+protocol)` is handed what it needs to open a socket and nothing else, and a
+`Request` would hand the outbound side the path and the query it has no business
+seeing. **`openssl` is not added to `rk doctor`**: `REQUIREMENTS` states modules
+and distributions, `backup.DUMP` is not checked there either, and the refusal
+that matters is at the point of use -- `_run` names the program and exits
+`missing_dependency`. Adding one of the two programs would make that report look
+complete. **A door with no authority still files a passing `authority`
+assertion**, and that is what it is: HTTPS is opt-in, so no authority is a
+configuration rather than a fault, and failing the assertion would make every
+plain-HTTP run report a failure. The hold's own text says a tunnel is refused
+rather than relayed. **`_port` filling the scheme's default** was already
+answered in the first pass and the docstring carries the reason.
+
 ### Raised by review and deliberately not built here
 
 - **Criterion 3 is half done, and that is why this ticket is not resolved.**
@@ -238,19 +322,22 @@ getting that wrong is invisible.
   or whether this ticket reopens when it lands; until then the box stays
   unticked, because a TCP connection to a directly-dialled target still succeeds
   and only the certificate check fails.
-- **`agent_environment` has no production caller.** It is a pure function, fully
-  tested, and nothing in `src/redkraken/` builds a child environment yet --
-  ticket 16 is "start clean real agent child", and it is the consumer. Adding a
-  caller here was considered and rejected: the only candidate was `serve`'s
-  report, which is written when the listener closes, so the endpoint it would
-  carry is dead by the time anything reads it.
-- **`NODE_EXTRA_CA_CERTS` adds rather than replaces.** The other three trust
-  variables replace the store they name; Node's bundled roots stay, so a Node
-  client in the child trusts this run *and* the public internet. A fifth
-  variable does not close that -- what closes it is having no route to the
-  public internet, which is the previous point. The list is documented as making
-  the door trusted everywhere and untrusting the internet only where a variable
-  can.
+- **Criterion 1 is not ticked either, because `agent_environment` has no
+  production caller.** It is a pure function, fully tested, and nothing in
+  `src/redkraken/` builds a child environment yet -- ticket 16 is "start clean
+  real agent child", and it is the consumer. So "the runtime configures both
+  proxy schemes" is true of a function this branch never calls, which is not the
+  same sentence. Adding a caller here was considered and rejected: the only
+  candidate was `serve`'s report, which is written when the listener closes, so
+  the endpoint it would carry is dead by the time anything reads it. The box was
+  ticked in the first pass and is now unticked; what a maintainer decides is
+  whether it moves to ticket 16 or this ticket reopens when 16 lands.
+- **`NODE_EXTRA_CA_CERTS` adds rather than replaces.** The other three name a
+  file and replace it, and `SSL_CERT_DIR` is emptied beside them, so the only
+  store left over is Node's own bundled roots: a Node client in the child trusts
+  this run *and* the public internet. A further variable does not close that --
+  what closes it is having no route to the public internet, which is the
+  previous point.
 - **One request per tunnel.** `do_CONNECT` loops on `handle_one_request`, but
   `_answer` sets `close_connection = True` on every answer it sends, so in
   practice a client gets one request per CONNECT and reconnects. Keeping the
