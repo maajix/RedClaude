@@ -231,3 +231,86 @@ writer whose name is the reason ticket 07's seal rule exempts empty artifacts.
   handler threads queue on for the database half of each request, and the
   rebinding discipline described above; a pool is a thing to build when a
   measurement asks for one.
+
+### A second review pass, over the committed work
+
+Both axes run again against `92c546c`. Seventeen findings: ten Standards, seven
+Spec. Thirteen were real and are fixed; four were wrong.
+
+Three of them were holes, and all three are about what the audit trail does not
+say.
+
+**A duplicated control header bought a refusal nobody could see.** `take_control`
+raised on two values under one name, before `_serve` had derived a Program, so
+the request was refused and no row was written -- which made sending your own
+capability header twice the quietest way to probe this fence. The Program was
+never the ambiguous part of such a request: it is named once, and it is what the
+attempt belongs to. `take_control` now reports the ambiguity instead of raising,
+resolves the duplicated name to nothing so no later line can pick a side, and
+`_serve` files the blocked Receipt whenever the Program survived. Two headers
+naming two Programs still file nothing, because there is nothing to file under.
+`do_CONNECT` keeps answering without a record, and that is a different case: no
+tunnel is opened, so there is no exchange for a Receipt to be about.
+
+**A served exchange whose record would not write left no record at all.** The
+502 was right -- a caller must never read a 200 for an exchange the harness
+cannot account for -- but the bytes had already crossed, and discarding both
+transcripts and answering was the end of it. It now writes what can still be
+written: a blocked Receipt naming the target, the status it answered with and
+the moment of egress. It cannot name the transcripts, because registering them is
+exactly what failed, so the unreachable bytes are still discarded.
+
+**A refusal after contact looked like a refusal before it.** `target
+unreachable` and `response too large` filed rows with no `ts_egress` and no
+`status_code`, which is the shape of a request that never left. `_refuse` takes
+the moment of egress on the paths that had one, and `Refused` carries the
+target's status separately from the proxy's own answer -- one is what the fence
+said, the other is what the target said, and a Receipt records both.
+
+The fourth behavioural fix is the listener. `rk proxy serve --host` accepted any
+interface, and `endpoint` refusing to send a capability anywhere but this machine
+is worth nothing if the door binds a routable one: what arrives there is bearer
+material, spendable by whoever reaches the port first. A non-loopback `--host` is
+now refused with exit 2 rather than bound.
+
+The rest were smaller: `README.md` said the corpus holds forty-seven files when
+it holds forty-eight; `"no grant was returned"` used the glossary's word for an
+operator's standing predicate to describe a capability that did not resolve; the
+`BIND` statement was retyped as a literal in the runtime half; the two-branch
+`jsonb` decode existed twice; the hop-by-hop and internal-prefix filter existed
+twice, once per direction, which is a rule that can drift on one side only; the
+target exchange came out of `_forward` as `_exchange`, which is also what let
+every post-contact refusal be raised in one place; `_spend` took a `proxy` tuple
+it indexed by position and which shadowed this module's own name; the proxy
+subparsers were `hops` where `db` calls the same thing `operations`; and the two
+suites each built their own recording counterparty, now `fixtures.counterparty`.
+`authorize_egress_request` exempted GET, HEAD and OPTIONS from the declared-method
+check with no comment saying why: §7 has subresources and redirects sharing one
+capability, both arrive as GET whatever was declared, and a safe method is the
+one substitution a holder of the capability gains nothing from. That is now
+written down beside the rule.
+
+Four were wrong. **The trigger's `lane = 'agent'` arm is not a bypass**: a
+`replay` Receipt is the runtime re-executing a recorded exchange and a
+`proxy_internal` one is the proxy acting for itself, and neither has a capability
+by construction -- requiring a live one there would refuse the two lanes that
+cannot have it, and the lane is derived by the writer rather than stated by a
+caller. **`model = 'operator'` is not a deviation**: 0019's
+`agent_runs_renderer_has_no_model` makes `model = 'none'` legal only for
+`runs_as = 'renderer'`, and this run is a session, so the spelling review
+proposed is the one the constraint refuses. **`(program_id, capability)` is not a
+data clump wanting `Control`**: `Control.program` is the caller's unvalidated
+word and `program_id` is what survived `_identifier`, and the split is what stops
+the second from being the first. And **"capability" still wants a glossary entry
+rather than a rename**, which is the note two sections above: `docs/agents/domain.md`
+routes a missing term to `/domain-modeling`, and no implementation ticket in this
+branch edits `CONTEXT.md`.
+
+Six tests carry the four behavioural changes: the take reports ambiguity on each
+of the two headers, a duplicated capability is refused and recorded while two
+Programs record nothing, the receipt-refused path files a row carrying the status
+and the egress moment, a refusal before contact carries neither, and the door
+refuses to listen on `0.0.0.0`, `::` or a routable address. The live suite gains
+the same duplicated-capability arm against the real database, where the row is
+`agent`/`blocked`/`ambiguous control headers` with no Tool run named. 596 tests,
+nothing skipped.
