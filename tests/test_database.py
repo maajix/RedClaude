@@ -3159,6 +3159,17 @@ URL = "http://app.example.com/notes"
 #: is the transport and nothing about the decision.
 SECURE = "https://app.example.com/notes"
 
+#: What every name in this suite resolves to. A public address, because the door
+#: refuses to dial one that is not, and `127.0.0.1` -- where the target actually
+#: listens -- is exactly what a rebinding answer looks like. So the resolver
+#: answers what a real zone would and `connector` is still where the socket goes.
+PINNED = "93.184.216.34"
+
+#: The one address `SCOPED` withdraws. One octet away from `PINNED`, so a rule
+#: that matched loosely would match both and the test asserting a refusal would
+#: pass for the wrong reason.
+WITHDRAWN = "93.184.216.35"
+
 
 class LiveTarget(Target):
     """The shared recording counterparty, answering this suite's own body."""
@@ -3201,7 +3212,11 @@ class ProxyEgressTest(DatabaseCase):
 
         cls.identifiers = {}
         cls.configurations = {}
-        for name in ("a", "b", "retired"):
+        # `shared` is where the exchanges that spend one capability more than once
+        # live, kept apart from `a` because those are counted: a suite that
+        # asserts "two Receipts and no more" under the Program every other test
+        # uses is a suite where adding a test breaks an unrelated one.
+        for name in ("a", "b", "retired", "shared"):
             path = write(SCOPED.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, opened.violations
@@ -3212,12 +3227,15 @@ class ProxyEgressTest(DatabaseCase):
         cls.secure_target, _, cls.target_ca = tls_counterparty(LiveTarget)
         cls.authority = tls.authority(scratch() / "door-authority")
 
+        cls.resolved = []
+        cls.dialled = []
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
         cls.server = proxy.listen(
             ("127.0.0.1", 0),
             fence=cls.fence,
             store=Store(cls.root),
             connector=cls.dial,
+            resolver=cls.look_up,
             authority=cls.authority,
         )
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
@@ -3229,6 +3247,10 @@ class ProxyEgressTest(DatabaseCase):
         cls.sent = proxy.send(
             cls.harness.runtime, cls.configurations["a"], URL, proxy_url=cls.proxy_url
         )
+        # What arrived for that one exchange, held rather than looked up later:
+        # the target is shared, so "the last thing it saw" is whatever test ran
+        # most recently, and the request this report is about is this one.
+        cls.arrived = cls.target.seen[-1]
         # And the same request over the other protocol, through a tunnel this
         # door terminates. Its Receipt is read beside the one above: two rows
         # from one path is the claim ticket 10 makes.
@@ -3271,16 +3293,40 @@ class ProxyEgressTest(DatabaseCase):
                 )
         super().tearDownClass()
 
+    #: What `look_up` answers. Mutable, because the resolver the server holds was
+    #: bound once in setup: a test that needs a different answer changes what the
+    #: resolver reads rather than which resolver runs.
+    answers = (PINNED,)
+
+    @classmethod
+    def look_up(cls, host: str, port: int) -> tuple[str, ...]:
+        """What the names in this suite resolve to, without asking a real zone.
+
+        A lookup is a packet leaving the machine, so a suite that let this reach
+        the operator's resolver would be testing the operator's DNS. What it
+        answers is a public address, because the point of the pin is that the
+        door refuses anything else.
+        """
+        cls.resolved.append((host, port))
+        return cls.answers
+
     @classmethod
     def dial(
-        cls, host: str, port: int, timeout: float, protocol: str
+        cls, host: str, port: int, timeout: float, protocol: str, address: str
     ) -> http.client.HTTPConnection:
         """Every authorised name reaches the one target this machine is running.
 
         One target per protocol, because the door's outbound side is not the same
         socket for the two: an https target is verified by the door itself, which
         is the half of interception the agent can no longer do for itself.
+
+        The `address` the door pinned is recorded rather than dialled: what it
+        proves is that the socket was opened at the address the database decided
+        and not at the name, and no test on this machine can route to the real
+        one. Everything before this point -- resolution, routability, the second
+        decision -- happened for real.
         """
+        cls.dialled.append((host, port, protocol, address))
         if protocol == "https":
             return http.client.HTTPSConnection(
                 "127.0.0.1",
@@ -3323,7 +3369,13 @@ class ProxyEgressTest(DatabaseCase):
         self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
         return str(capability), str(opened[0]), str(run)
 
-    def attempt(self, capability: str | None, program_id: str | None) -> tuple[int, str | None]:
+    def attempt(
+        self,
+        capability: str | None,
+        program_id: str | None,
+        url: str = URL,
+        method: str = "GET",
+    ) -> tuple[int, str | None]:
         """One request at the door, with whatever control headers it was given."""
         headers = {}
         if capability is not None:
@@ -3334,12 +3386,71 @@ class ProxyEgressTest(DatabaseCase):
             "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
         )
         try:
-            client.request("GET", URL, headers=headers)
+            client.request(method, url, headers=headers)
             answer = client.getresponse()
             answer.read()
             return answer.status, answer.headers.get(proxy.DECISION)
         finally:
             client.close()
+
+    def owned(self, sql: str, parameters: tuple = ()) -> str:
+        """The same as `owner`, for a statement whose one value is needed back."""
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(self.connection.execute(sql, parameters).scalar())
+
+    def leased(self, name: str) -> tuple[str, str, str]:
+        """A capability whose run holds a task lease, the way a subagent's does.
+
+        `mint` imitates the operator path, and that path has no task -- nor may
+        it: `agent_runs_kind_with_task` and the role roster make the
+        orchestrator's lack of one a constraint rather than a habit. The lease is
+        the fourth thing a capability hangs from and the only one the rest of
+        this suite cannot reach, so getting to it means opening the run the
+        scheduler would have opened: a recon subagent under a claimed task.
+
+        The task is written by the owner because granting a lease is the
+        scheduler's, and neither the runtime nor the proxy may write one.
+        """
+        task = self.owned(
+            "INSERT INTO tasks (program_id, kind, status, claimed_at, lease_expires_at)"
+            " VALUES ($1::uuid, 'recon', 'claimed', now(), now() + interval '10 minutes')"
+            " RETURNING id::text",
+            (self.identifiers[name],),
+        )
+        self.runtime.execute(proxy.BIND, (self.identifiers[name],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = self.runtime.execute(
+                "INSERT INTO agent_runs (program_id, task_id, role, kind, runs_as, model,"
+                " effort, mission_packet)"
+                " VALUES ($1::uuid, $2::uuid, 'recon', 'recon', 'subagent', 'operator',"
+                " 'low', $3::jsonb) RETURNING id::text",
+                (self.identifiers[name], task, json.dumps({"command": "selftest"})),
+            ).scalar()
+            opened = self.runtime.execute(
+                "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args, status,"
+                " transport) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, 'running',"
+                " 'runtime') RETURNING id::text",
+                (
+                    self.identifiers[name],
+                    str(run),
+                    task,
+                    proxy.TOOL,
+                    json.dumps({"url": URL, "method": "GET", "identity_slot": ""}),
+                ),
+            ).scalar()
+        gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (str(opened),)).scalar()
+        answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
+        capability = answer.get("capability")
+        self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
+        return str(capability), str(opened), task
+
+    def resolving_to(self, *addresses: str) -> None:
+        """Point every name at these addresses, for the length of one test."""
+        self.addCleanup(setattr, type(self), "answers", type(self).answers)
+        type(self).answers = addresses
 
     def owner(self, sql: str, parameters: tuple = ()) -> None:
         """One statement as the role that owns the tables, committed."""
@@ -3484,7 +3595,7 @@ class ProxyEgressTest(DatabaseCase):
         # Criterion 3, against a target that actually ran. The request line is
         # origin form -- the target is not a proxy -- and nothing that named the
         # capability or the Program survived the hop.
-        method, path, headers = self.target.seen[-1]
+        method, path, headers = self.arrived
         names = [name for name, _ in headers]
 
         self.assertEqual(("GET", "/notes"), (method, path))
@@ -3494,6 +3605,69 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual([], [name for name in names if name.startswith(proxy.INTERNAL)])
         for _, value in headers:
             self.assertNotIn("RedKraken", value)
+
+    def test_the_receipt_names_the_address_the_door_resolved_and_then_dialled(self):
+        # PH2-11, criterion 2. The name was decided, then resolved once by the
+        # door itself, then decided again as the literal address, and the socket
+        # was opened at that address rather than at the name. A door that handed
+        # the name to the socket layer would be letting whoever runs the zone
+        # answer twice, and nothing in a Receipt would show it; this row carries
+        # the address, so the second answer is a fact somebody can read.
+        row = self.connection.execute(
+            "SELECT pinned_ips FROM receipts"
+            " WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+            (self.sent.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual(PINNED, str(row[0]))
+        self.assertIn(("app.example.com", 80), self.resolved)
+        self.assertIn(("app.example.com", 80, "http", PINNED), self.dialled)
+        self.assertIn(("app.example.com", 443, "https", PINNED), self.dialled)
+
+    def test_an_address_the_program_withdrew_is_refused_with_nothing_dialled(self):
+        # The half of criterion 2 a policy written in names cannot answer on its
+        # own. The name is in scope and the first decision allows it; what comes
+        # back from resolution is an address this Program excluded, and the
+        # exchange stops there. `SCOPED` withdraws `93.184.216.35`, one octet
+        # from the address every other test pins, so a rule that matched loosely
+        # would make this pass for the wrong reason.
+        self.resolving_to(WITHDRAWN)
+        capability, tool_run, _ = self.mint("a")
+        dialled = len(self.dialled)
+
+        record = self.refused("a", capability, self.identifiers["a"])
+
+        self.assertEqual(("agent", "blocked", "address refused"), record[:3])
+        self.assertEqual(tool_run, record[3], "the capability resolved, so its run is named")
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened towards the target")
+
+        row = self.connection.execute(
+            "SELECT pinned_ips, ts_egress, host FROM receipts"
+            " WHERE program_id = $1::uuid ORDER BY ts_arrival DESC, label DESC LIMIT 1",
+            (self.identifiers["a"],),
+        ).rows[0]
+
+        self.assertEqual(WITHDRAWN, str(row[0]))
+        self.assertIsNone(row[1], "a refusal before contact records no moment of egress")
+        self.assertEqual("app.example.com", str(row[2]), "the name it asked for is still the row")
+
+    def test_a_name_that_answers_off_the_public_internet_is_refused_by_the_door(self):
+        # The other rebinding shape, and the one that needs no policy at all: an
+        # address the public internet does not route to is not a bug bounty
+        # target under any scope, so the refusal is the door's own and happens
+        # before the database is asked a second question. The two answers are the
+        # classic pair -- loopback, which reaches this machine, and the link-local
+        # address every cloud metadata service listens on.
+        for address in ("127.0.0.1", "169.254.169.254"):
+            with self.subTest(address=address):
+                self.resolving_to(address)
+                capability, _, _ = self.mint("a")
+                dialled = len(self.dialled)
+
+                record = self.refused("a", capability, self.identifiers["a"])
+
+                self.assertEqual(("agent", "blocked", "address refused"), record[:3])
+                self.assertEqual(dialled, len(self.dialled), "a socket was opened")
 
     def test_the_capability_no_longer_resolves_once_the_tool_run_is_closed(self):
         # Criterion 2's "current lifecycle", read as a fact about the row: the
@@ -3650,9 +3824,10 @@ class ProxyEgressTest(DatabaseCase):
             ("127.0.0.1", 0),
             fence=fence,
             store=Store(self.root),
-            connector=lambda host, port, timeout, protocol: http.client.HTTPConnection(
-                "127.0.0.1", closed, timeout=timeout
+            connector=lambda host, port, timeout, protocol, address: (
+                http.client.HTTPConnection("127.0.0.1", closed, timeout=timeout)
             ),
+            resolver=self.look_up,
             authority=self.authority,
         )
         thread = threading.Thread(target=door.serve_forever, daemon=True)
@@ -3802,6 +3977,93 @@ class ProxyEgressTest(DatabaseCase):
         record = self.refused("retired", capability, self.identifiers["retired"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+
+    def test_a_subresource_earns_its_own_receipt_under_the_parent_tool_run(self):
+        # PH2-11, criterion 4. One capability and four exchanges: the page, the
+        # script it pulls, a method the Tool run never declared, and a path this
+        # Program withdrew. Nothing is inherited from the exchange before it --
+        # each one resolves the capability again, is decided against the current
+        # policy, is resolved and pinned again, and is recorded on its own -- so
+        # the sharing §7 asks for costs nothing in evidence. Four Receipts under
+        # one Tool run, and the two that were refused never reached the target.
+        capability, tool_run, _ = self.mint("shared")
+        seen = len(self.target.seen)
+
+        page = self.attempt(capability, self.identifiers["shared"], URL)
+        script = self.attempt(
+            capability, self.identifiers["shared"], "http://app.example.com/static/app.js"
+        )
+        self.assertEqual((200, None), page)
+        self.assertEqual((200, None), script, "a subresource GET was refused")
+        self.assertEqual(seen + 2, len(self.target.seen))
+
+        # And the same capability buys nothing the Tool run did not authorise. A
+        # shared capability that could be spent on an unsafe method, or on a path
+        # the policy withdrew, would make every subresource an opening.
+        unsafe = self.attempt(capability, self.identifiers["shared"], URL, "DELETE")
+        withdrawn = self.attempt(
+            capability, self.identifiers["shared"], "https://app.example.com/internal/secrets"
+        )
+
+        self.assertEqual((407, proxy.REFUSED), unsafe)
+        self.assertEqual((407, proxy.REFUSED), withdrawn)
+        self.assertEqual(seen + 2, len(self.target.seen), "a refused exchange reached the target")
+
+        rows = [
+            (str(row[0]), str(row[1]), str(row[2]), row[3] and str(row[3]))
+            for row in self.connection.execute(
+                "SELECT decision, method, path, pinned_ips FROM receipts"
+                " WHERE tool_run_id = $1::uuid ORDER BY ts_arrival, label",
+                (tool_run,),
+            ).rows
+        ]
+
+        self.assertEqual(
+            [
+                ("allowed", "GET", "/notes", PINNED),
+                ("allowed", "GET", "/static/app.js", PINNED),
+                # Refused before resolution, so there is no address to name: the
+                # exchange stopped at the first decision, not at the second.
+                ("blocked", "DELETE", "/notes", None),
+                ("blocked", "GET", "/internal/secrets", None),
+            ],
+            rows,
+        )
+
+    def test_a_lease_lost_between_two_requests_stops_the_second_before_contact(self):
+        # PH2-11, criterion 5, and the arm 09 could not reach: the capability,
+        # the Tool run, the Agent run and the Program are all untouched between
+        # the two requests, and what lapses is the task lease the run holds.
+        # `resolve_egress_capability` requires it on every exchange rather than
+        # at mint time, so the parent is served and the child is stopped with
+        # nothing dialled -- which is what makes one capability safe to share
+        # across a page and everything the page pulls.
+        capability, tool_run, task = self.leased("shared")
+
+        served = self.attempt(capability, self.identifiers["shared"])
+        dialled = len(self.dialled)
+        self.owner(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 minute'"
+            " WHERE id = $1::uuid",
+            (task,),
+        )
+        record = self.refused("shared", capability, self.identifiers["shared"])
+
+        self.assertEqual(200, served[0])
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened without a lease")
+        # Nothing about the run itself changed, which is the point: the fence is
+        # not reading a revoked capability, it is reading a lease that lapsed.
+        row = self.connection.execute(
+            "SELECT tr.status, tr.egress_token_sha256 IS NOT NULL, ar.finished_at"
+            "  FROM tool_runs tr JOIN agent_runs ar ON ar.id = tr.agent_run_id"
+            " WHERE tr.id = $1::uuid",
+            (tool_run,),
+        ).rows[0]
+
+        self.assertEqual("running", str(row[0]))
+        self.assertTrue(row[1], "the capability was still live")
+        self.assertIsNone(row[2])
 
     def test_another_programs_request_between_the_decision_and_the_write_records_anyway(self):
         # The fence holds one connection for every handler thread, the Program is

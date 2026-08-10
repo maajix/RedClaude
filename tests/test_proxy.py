@@ -43,10 +43,10 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from redkraken import proxy, scope, tls
+from redkraken import pg, proxy, scope, tls
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
 from redkraken.store import Store
-from tests.fixtures import counterparty, scratch, tls_counterparty
+from tests.fixtures import Redirecting, counterparty, scratch, tls_counterparty
 
 
 #: A capability the way the runtime mints one: 32 random bytes in lowercase hex.
@@ -63,6 +63,22 @@ DATABASE_ERROR = (
     "PL/pgSQL function authorize_egress_request(text,text,text,text,integer,"
     "text,text,text) line 71 at RAISE"
 )
+
+#: The same, for the second decision. A separate string because it is a separate
+#: function: a test that could not tell the two apart could not tell "the name
+#: was refused" from "the address the name pointed at was".
+ADDRESS_ERROR = (
+    "23514: egress destination 10.0.0.5 is withdrawn by the current scope | "
+    "PL/pgSQL function authorize_egress_address(text,text,text,integer,text) "
+    "line 63 at RAISE"
+)
+
+#: What every name in the exchange suites resolves to. Public, because the door
+#: refuses an address that is not, and deliberately not where the fixture is
+#: listening: `connector` is what puts the request on the loopback port. Keeping
+#: the decided address and the dialled socket apart is what lets a test assert
+#: that the one decided is the one handed over.
+PINNED = "93.184.216.34"
 
 
 def message(pairs: list[tuple[str, str]]) -> Message:
@@ -101,7 +117,14 @@ class Stub:
         )
         self.fail = fail
         self.out_of_scope: set[str] = set()
+        self.withdrawn: set[str] = set()
+        #: How many requests this capability has left. What expiry, a closed Tool
+        #: run and a lapsed lease all look like from the door's side is this: the
+        #: capability that worked a moment ago resolves to nothing now, and the
+        #: next exchange stops before the target is contacted.
+        self.revoked_after: int | None = None
         self.authorized: list[tuple] = []
+        self.addressed: list[tuple] = []
         self.allowed: list[dict] = []
         self.blocked: list[dict] = []
 
@@ -113,12 +136,30 @@ class Stub:
             request.host in self.out_of_scope
             or capability != CAPABILITY
             or program_id != self.decided.program_id
+            or (self.revoked_after is not None and len(self.authorized) > self.revoked_after)
         ):
             # Shaped like the real one: `Fence.authorize` turns a `DatabaseError`
             # into this, and the detail is the server's own text down to the
             # PL/pgSQL frame the exception was raised in.
             raise proxy.Refused("capability refused", DATABASE_ERROR)
         return self.decided
+
+    def authorize_address(
+        self, program_id: str, capability: str, request: scope.Request, address: str
+    ) -> None:
+        """The second decision, refusing by address the way the real one does.
+
+        Withdrawal and silence, not scope membership: a policy written in names
+        answers `unlisted` about nearly every address there is, and a stub that
+        refused on that would be a stricter fence than the one in the schema.
+
+        Nothing comes back, because nothing comes back from the real one: the
+        Receipt records the class the *name* was allowed as, and an address a
+        name-based policy has no rule about is `unlisted` almost every time.
+        """
+        self.addressed.append((program_id, capability, request, address))
+        if address in self.withdrawn:
+            raise proxy.Refused("address refused", ADDRESS_ERROR, pinned=address)
 
     def allowed_receipt(
         self, program_id: str, capability: str, receipt: dict, artifacts: list[dict]
@@ -244,6 +285,161 @@ class HeaderTest(unittest.TestCase):
         self.assertNotEqual(first, proxy.query_sha256("http://a.example.test/v1?id=3"))
 
 
+class AddressTest(unittest.TestCase):
+    """Criteria 2 and 3, in the parts that need no socket and no decision."""
+
+    def test_every_address_the_public_internet_does_not_route_to_is_refused(self):
+        # Named one class at a time rather than asserted as "not global", because
+        # the sentence in the blocked Receipt is what an operator reads to tell a
+        # hostile target from a misconfigured Program. `224.0.0.1` is the reason
+        # the multicast check exists at all: `is_global` answers yes for it.
+        for address, said in (
+            ("0.0.0.0", "unspecified"),
+            ("::", "unspecified"),
+            ("127.0.0.1", "loopback"),
+            ("::1", "loopback"),
+            ("::ffff:127.0.0.1", "loopback"),
+            ("169.254.169.254", "link-local"),
+            ("fe80::1", "link-local"),
+            ("224.0.0.1", "multicast"),
+            ("ff02::1", "multicast"),
+            ("10.0.0.5", "not a public"),
+            ("192.168.1.1", "not a public"),
+            ("172.16.0.1", "not a public"),
+            ("100.64.0.1", "not a public"),
+            ("::ffff:10.0.0.5", "not a public"),
+            ("not-an-address", "not an address"),
+        ):
+            with self.subTest(address=address):
+                refused = proxy.routable(address)
+
+                self.assertIsNotNone(refused)
+                self.assertIn(said, refused)
+
+    def test_a_public_address_is_the_one_thing_that_may_be_dialled(self):
+        for address in (PINNED, "2606:2800:220:1:248:1893:25c8:1946"):
+            with self.subTest(address=address):
+                self.assertIsNone(proxy.routable(address))
+
+    def test_a_name_that_answers_with_one_bad_address_answers_for_all_of_them(self):
+        # The rebinding signature. Taking the address that passes would leave the
+        # choice of which half gets dialled with whoever runs the zone, on a
+        # lookup this door does not repeat.
+        with self.assertRaises(proxy.Refused) as raised:
+            proxy.destination(
+                "target.example.test", 443, lambda host, port: (PINNED, "127.0.0.1")
+            )
+
+        self.assertEqual("address refused", raised.exception.reason)
+        # Both, because a record naming only the offending one would not show
+        # that a public answer was on offer beside it.
+        self.assertEqual(f"{PINNED},127.0.0.1", raised.exception.pinned)
+
+    def test_a_name_that_answers_with_nothing_reaches_no_socket(self):
+        for resolver in (
+            lambda host, port: (),
+            lambda host, port: (_ for _ in ()).throw(socket.gaierror("no such host")),
+        ):
+            with self.subTest(resolver=resolver):
+                with self.assertRaises(proxy.Refused) as raised:
+                    proxy.destination("target.example.test", 443, resolver)
+
+                self.assertEqual("target unresolved", raised.exception.reason)
+                # Nothing was resolved, so nothing is pinned: a blocked Receipt
+                # carrying an empty address column would be a claim about an
+                # answer that never came.
+                self.assertIsNone(raised.exception.pinned)
+
+    def test_the_addresses_come_back_in_the_order_the_resolver_gave_them(self):
+        # The first is the one dialled, so the order is not decoration. Duplicates
+        # collapse because a name with an A record and a matching AAAA-mapped one
+        # has said one thing twice.
+        addresses = proxy.destination(
+            "target.example.test", 443, lambda host, port: (PINNED, "93.184.216.36", PINNED)
+        )
+
+        self.assertEqual((PINNED, "93.184.216.36"), addresses)
+
+    def test_a_redirect_target_is_canonicalised_before_it_is_recorded(self):
+        for location, expected in (
+            ("/followed", "http://a.example.test/followed"),
+            ("https://B.EXAMPLE.test:443/x", "https://b.example.test/x"),
+            # Resolved against the request, and normalised: the record names the
+            # URL a client would actually go to, not the one the target typed.
+            ("../admin", "http://a.example.test/admin"),
+            ("/v1/%2e%2e/admin", "http://a.example.test/admin"),
+        ):
+            with self.subTest(location=location):
+                self.assertEqual(
+                    expected, proxy.redirected("http://a.example.test/v1/notes", location)
+                )
+
+    def test_a_redirect_that_points_nowhere_usable_is_recorded_as_nothing(self):
+        # Rather than as prose holding whatever the target sent. A `Location` this
+        # module cannot canonicalise is one no client will follow through this
+        # fence either, and putting it in the record unparsed would put target
+        # bytes in a column an operator reads as the door's own words.
+        for location in (None, "", "   ", "ftp://a.example.test/x", "https://a..b/x"):
+            with self.subTest(location=location):
+                self.assertIsNone(
+                    proxy.redirected("http://a.example.test/v1/notes", location)
+                )
+
+
+class RefusalTest(unittest.TestCase):
+    """Which of the two things the second decision refused, the Receipt says so.
+
+    That decision resolves the capability again before it looks at an address, so
+    the same function raises for a Tool run that closed, a Program that was
+    retired or a lease that lapsed since the first decision -- criterion 5's
+    "between parent and child requests" landing one step later than usual. Both
+    arrive as `23514`, so the text is what separates them, and a Receipt reading
+    `address refused` for a lapsed lease sends an auditor to look at an address
+    that was never the problem.
+    """
+
+    def failure(self, message: str) -> pg.DatabaseError:
+        """One server error, in the fields the server actually sends them in."""
+        return pg.DatabaseError(
+            {
+                "C": "23514",
+                "M": message,
+                "W": (
+                    "PL/pgSQL function authorize_egress_address"
+                    "(text,text,text,integer,text) line 63 at RAISE"
+                ),
+            }
+        )
+
+    def test_a_capability_that_lapsed_between_the_two_decisions_says_so(self):
+        refused = proxy._refusal(self.failure("egress capability refused"), PINNED)
+
+        self.assertEqual("capability refused", refused.reason)
+        # Still pinned: the address was resolved, and a record that dropped it
+        # would lose the one fact proving no socket was opened towards it.
+        self.assertEqual(PINNED, refused.pinned)
+
+    def test_an_address_the_scope_withdrew_says_that_instead(self):
+        refused = proxy._refusal(
+            self.failure(f"egress destination {PINNED} is withdrawn by the current scope"),
+            PINNED,
+        )
+
+        self.assertEqual("address refused", refused.reason)
+        self.assertEqual(PINNED, refused.pinned)
+
+    def test_either_way_the_detail_is_the_server_own_words(self):
+        for message in (
+            "egress capability refused",
+            "egress destination states no port in 1-65535",
+        ):
+            with self.subTest(message=message):
+                refused = proxy._refusal(self.failure(message), PINNED)
+
+                self.assertIn(message, refused.detail)
+                self.assertIn("line 63 at RAISE", refused.detail)
+
+
 class ExchangeTest(unittest.TestCase):
     """What happens on the wire, against a stub decision and a real target."""
 
@@ -263,11 +459,19 @@ class ExchangeTest(unittest.TestCase):
     def setUp(self):
         self.target.seen.clear()
         self.fence = Stub()
+        #: What the resolver answers with, and what it was asked. Both are the
+        #: test's to set and to read: a name that answers with two addresses, or
+        #: with none, is a case the door has to decide, and a refusal that
+        #: resolved anything at all is a lookup that should not have happened.
+        self.answers: tuple[str, ...] = (PINNED,)
+        self.resolved: list[tuple[str, int]] = []
+        self.dialled: list[tuple[str, int, str, str]] = []
         self.server = proxy.listen(
             ("127.0.0.1", 0),
             fence=self.fence,
             store=Store(self.root),
             connector=self.connector,
+            resolver=self.resolver,
         )
         self.serving = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.serving.start()
@@ -278,10 +482,18 @@ class ExchangeTest(unittest.TestCase):
         self.server.server_close()
         self.serving.join(timeout=5)
 
+    def resolver(self, host: str, port: int) -> tuple[str, ...]:
+        """Every name answers with whatever this test decided it answers with."""
+        self.resolved.append((host, port))
+        if isinstance(self.answers, OSError):
+            raise self.answers
+        return self.answers
+
     def connector(
-        self, host: str, port: int, timeout: float, protocol: str
+        self, host: str, port: int, timeout: float, protocol: str, address: str
     ) -> http.client.HTTPConnection:
-        """Every name resolves to the fixture. Address policy is ticket 11's."""
+        """The fixture, wherever the name pointed, and a record of both."""
+        self.dialled.append((host, port, protocol, address))
         return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
 
     def through(
@@ -338,6 +550,122 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(200, receipt["status_code"])
         self.assertEqual("target", receipt["scope_class"])
         self.assertEqual(64, len(receipt["query_sha256"]))
+
+    def test_the_address_that_was_decided_is_the_address_that_was_dialled(self):
+        # Criterion 2. The name is resolved once, that answer is what the second
+        # decision is made against, and it is what the socket is opened to: the
+        # connector is handed an address rather than a name, so there is no
+        # second lookup for a zone with a one-second life to answer differently.
+        self.through("http://target.example.test/v1/notes").read()
+
+        self.assertEqual([("target.example.test", 80)], self.resolved)
+        self.assertEqual([("target.example.test", 80, "http", PINNED)], self.dialled)
+        self.assertEqual(1, len(self.fence.addressed))
+        _, capability, request, address = self.fence.addressed[0]
+        self.assertEqual(CAPABILITY, capability)
+        self.assertEqual("target.example.test", request.host)
+        self.assertEqual(PINNED, address)
+        self.assertEqual(PINNED, self.fence.allowed[0]["receipt"]["pinned_ips"])
+
+    def test_the_receipt_names_every_address_the_name_answered_with(self):
+        # Not only the one that was used. The check that let this request through
+        # was made of all of them, and a record naming one could not be read back
+        # as evidence that the others were looked at.
+        self.answers = (PINNED, "93.184.216.36")
+
+        self.through("http://target.example.test/v1/notes").read()
+
+        self.assertEqual(PINNED, self.dialled[0][3])
+        self.assertEqual(
+            f"{PINNED},93.184.216.36", self.fence.allowed[0]["receipt"]["pinned_ips"]
+        )
+
+    def test_a_name_is_not_resolved_for_a_request_that_was_going_to_be_refused(self):
+        # A lookup is egress: it leaves this machine carrying the name that was
+        # asked for. Made before the decision, it would be an unrecorded channel
+        # out of here for every refused request -- one that says a great deal to
+        # whoever runs the zone and nothing to any Receipt.
+        self.fence.out_of_scope.add("target.example.test")
+
+        response = self.through("http://target.example.test/v1/notes")
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.resolved)
+        self.assertEqual([], self.dialled)
+        self.assertEqual([], self.fence.addressed)
+        self.assertEqual([], self.target.seen)
+
+    def test_a_name_that_resolves_off_the_public_internet_opens_no_socket(self):
+        # The rebinding case, and with it every address a name could point at
+        # that this machine can reach and the internet cannot: the door itself,
+        # the database behind it, the operator's network, the metadata endpoint.
+        for answers in (
+            ("127.0.0.1",),
+            ("169.254.169.254",),
+            (PINNED, "10.0.0.5"),
+        ):
+            with self.subTest(answers=answers):
+                self.fence.blocked.clear()
+                self.target.seen.clear()
+                self.dialled.clear()
+                self.answers = answers
+
+                response = self.through("http://target.example.test/v1/notes")
+
+                self.assertEqual(407, response.status)
+                self.assertEqual([], self.dialled)
+                self.assertEqual([], self.target.seen)
+                filed = self.fence.blocked[0]["receipt"]
+                self.assertEqual("address refused", filed["reason"])
+                self.assertEqual(",".join(answers), filed["pinned_ips"])
+                # In scope by name and refused by address, which is the case
+                # worth telling apart from a request that was never in scope: a
+                # `denied` here would file the two under one shape.
+                self.assertEqual("target", filed["scope_class"])
+                # Nothing left, so nothing waited: the moment of egress is what
+                # separates a refusal from a refusal after contact.
+                self.assertNotIn("ts_egress", filed)
+                # And the policy was never asked. An address this door will not
+                # dial is refused on its shape, before a decision is spent on it.
+                self.assertEqual([], self.fence.addressed)
+
+    def test_a_name_that_resolves_to_nothing_is_refused_with_no_address_named(self):
+        self.answers = socket.gaierror("Name or service not known")
+
+        response = self.through("http://target.example.test/v1/notes")
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.dialled)
+        self.assertEqual([], self.target.seen)
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("target unresolved", filed["reason"])
+        self.assertNotIn("pinned_ips", filed)
+
+    def test_an_address_the_program_withdrew_is_refused_before_the_socket(self):
+        # Criterion 2's second half, and the half the shape check cannot make:
+        # the address is a perfectly routable one, the name passed the first
+        # decision, and what refuses it is the current policy withdrawing the
+        # machine. The door does not know why -- it cannot read the rules -- it
+        # only ever learns the verdict.
+        self.answers = ("93.184.216.35",)
+        self.fence.withdrawn.add("93.184.216.35")
+
+        response = self.through("http://target.example.test/v1/notes")
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.dialled)
+        self.assertEqual([], self.target.seen)
+        self.assertEqual(
+            [(PROGRAM_ID, CAPABILITY, "93.184.216.35")],
+            [(program, held, address) for program, held, _, address in self.fence.addressed],
+        )
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("address refused", filed["reason"])
+        self.assertEqual("93.184.216.35", filed["pinned_ips"])
+        self.assertEqual("target", filed["scope_class"])
+        # The database's own text explains it to the log and to nothing else.
+        self.assertEqual("address refused", response.headers[proxy.DETAIL])
+        self.assertNotIn("withdrawn by the current scope", str(response.headers))
 
     def test_the_target_never_receives_the_capability_or_any_control_header(self):
         # Criterion 3. Asked of the bytes the target actually read, not of the
@@ -604,6 +932,198 @@ class ExchangeTest(unittest.TestCase):
         self.assertNotIn("status_code", filed)
 
 
+class RedirectTest(unittest.TestCase):
+    """Criteria 3, 4 and 5: every hop is its own exchange, or it is not one.
+
+    An ordinary client, following an ordinary redirect. That is the whole design
+    of it: the door does not follow, because following would be an exchange
+    nobody asked for against a target nobody named. The client follows, comes
+    back through the same fence, and the second request is decided from nothing
+    but itself -- its own capability check, its own address, its own Receipt.
+
+    `urllib` rather than a hand-written pair of requests, because what is under
+    test is the behaviour of a client the door does not control: a test that sent
+    the second request itself would be asserting that the suite follows
+    redirects, which nothing in production depends on.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = scratch() / "redirect-store"
+        cls.root.mkdir(parents=True, exist_ok=True)
+
+    def setUp(self):
+        self.target, self.thread = counterparty(self.handler())
+        self.target_port = self.target.server_address[1]
+        self.addCleanup(self.shutdown)
+        self.fence = Stub()
+        self.dialled: list[str] = []
+        self.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=self.fence,
+            store=Store(self.root),
+            connector=self.connector,
+            resolver=lambda host, port: (PINNED,),
+        )
+        self.serving = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.serving.start()
+        self.addCleanup(self.stop)
+        self.enterContext(mock.patch.dict(os.environ, {"no_proxy": "", "NO_PROXY": ""}))
+
+    def handler(self) -> type:
+        return Redirecting
+
+    def shutdown(self) -> None:
+        self.target.shutdown()
+        self.target.server_close()
+        self.thread.join(timeout=5)
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.serving.join(timeout=5)
+
+    def connector(
+        self, host: str, port: int, timeout: float, protocol: str, address: str
+    ) -> http.client.HTTPConnection:
+        self.dialled.append(address)
+        return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
+
+    def fetch(self, url: str):
+        """One request from a client that follows what it is told to follow."""
+        door = "http://%s:%d" % self.server.server_address
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": door}))
+        asked = urllib.request.Request(url)
+        asked.add_header(proxy.AUTHORIZATION, f"RedKraken {CAPABILITY}")
+        asked.add_header(proxy.PROGRAM, PROGRAM_ID)
+        return opener.open(asked, timeout=5)
+
+    def test_a_followed_redirect_is_a_second_exchange_with_a_receipt_of_its_own(self):
+        answer = self.fetch("http://target.example.test/v1/notes")
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual(b'{"note":"target answered"}', answer.read())
+        # Two of everything, which is the criterion: two decisions, two lookups,
+        # two sockets, two Receipts, two contacts at the target.
+        self.assertEqual(2, len(self.fence.authorized))
+        self.assertEqual(2, len(self.fence.addressed))
+        self.assertEqual([PINNED, PINNED], self.dialled)
+        self.assertEqual(2, len(self.fence.allowed))
+        self.assertEqual([], self.fence.blocked)
+        self.assertEqual(
+            ["/v1/notes", "/followed"], [path for _, path, _ in self.target.seen]
+        )
+        # One capability, spent twice and resolved twice. §7 has subresources and
+        # redirects sharing one, and each earning its own verdict is what makes
+        # the sharing safe rather than a second request nobody decided.
+        self.assertEqual({CAPABILITY}, {held for _, held, _, _ in self.fence.authorized})
+        self.assertEqual(
+            {"22222222-2222-2222-2222-222222222222"},
+            {self.fence.decided.tool_run_id},
+        )
+
+    def test_the_receipt_for_a_redirect_names_where_it_pointed(self):
+        # The chain, written down. Without it the child Receipt names a URL
+        # nobody asked for, and an auditor cannot tell a followed redirect from
+        # an agent that invented a target for itself.
+        self.fetch("http://target.example.test/v1/notes").read()
+
+        parent, child = (written["receipt"] for written in self.fence.allowed)
+
+        self.assertEqual(303, parent["status_code"])
+        self.assertEqual(
+            "redirect to http://target.example.test/followed", parent["notes"]
+        )
+        self.assertEqual(200, child["status_code"])
+        self.assertEqual("/followed", child["path"])
+        # And the child says nothing about a redirect, because it is not one.
+        self.assertIsNone(child["notes"])
+
+    def test_a_capability_that_stopped_resolving_stops_the_next_hop_before_contact(self):
+        # Criterion 5 on the door's side. Expiry, a closed Tool run, a finished
+        # agent run and a lapsed lease are one thing from here: the capability
+        # that worked for the parent resolves to nothing for the child, and the
+        # child never reaches the target.
+        self.fence.revoked_after = 1
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.fetch("http://target.example.test/v1/notes")
+
+        raised.exception.close()
+        self.assertEqual(407, raised.exception.code)
+        self.assertEqual(1, len(self.fence.allowed))
+        self.assertEqual(1, len(self.fence.blocked))
+        self.assertEqual([PINNED], self.dialled)
+        self.assertEqual(["/v1/notes"], [path for _, path, _ in self.target.seen])
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("capability refused", filed["reason"])
+        self.assertEqual("/followed", filed["path"])
+        # Refused before the name was even resolved, so nothing about the child
+        # left this machine at all.
+        self.assertNotIn("pinned_ips", filed)
+        self.assertNotIn("ts_egress", filed)
+
+
+class CrossHostRedirectTest(RedirectTest):
+    """The same chain, pointed at a host the Program does not cover.
+
+    A redirect is the cheapest way to ask a fence to fetch something it would
+    have refused: the first URL is in scope, and the answer to it names the
+    second. Every assertion here is that the second one is decided anyway.
+    """
+
+    def handler(self) -> type:
+        class Elsewhere(Redirecting):
+            elsewhere = "http://other.example.test/followed"
+
+        return Elsewhere
+
+    def setUp(self):
+        super().setUp()
+        self.fence.out_of_scope.add("other.example.test")
+
+    def test_a_followed_redirect_is_a_second_exchange_with_a_receipt_of_its_own(self):
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.fetch("http://target.example.test/v1/notes")
+
+        raised.exception.close()
+        self.assertEqual(407, raised.exception.code)
+        self.assertEqual(2, len(self.fence.authorized))
+        self.assertEqual(1, len(self.fence.allowed))
+        self.assertEqual(1, len(self.fence.blocked))
+        # One contact, and it is the parent's. The refused hop opened nothing.
+        self.assertEqual(["/v1/notes"], [path for _, path, _ in self.target.seen])
+        self.assertEqual([PINNED], self.dialled)
+        self.assertEqual("other.example.test", self.fence.blocked[0]["receipt"]["host"])
+
+    def test_the_receipt_for_a_redirect_names_where_it_pointed(self):
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.fetch("http://target.example.test/v1/notes")
+        raised.exception.close()
+
+        parent = self.fence.allowed[0]["receipt"]
+
+        # Canonicalised, and by this module rather than repeated from the wire:
+        # the port the scheme implies is dropped and the host is lowercased, so
+        # the note is the spelling the next decision was made against.
+        self.assertEqual(
+            "redirect to http://other.example.test/followed", parent["notes"]
+        )
+
+    def test_a_capability_that_stopped_resolving_stops_the_next_hop_before_contact(self):
+        # The parent is enough here: with the child refused for its host as well,
+        # this class would be asserting the same thing twice.
+        self.fence.revoked_after = 1
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.fetch("http://target.example.test/v1/notes")
+
+        raised.exception.close()
+        self.assertEqual(407, raised.exception.code)
+        self.assertEqual([PINNED], self.dialled)
+        self.assertEqual(1, len(self.fence.blocked))
+
+
 class TunnelTest(unittest.TestCase):
     """The same door, with an authority, answering HTTPS.
 
@@ -642,6 +1162,7 @@ class TunnelTest(unittest.TestCase):
             fence=self.fence,
             store=Store(self.root),
             connector=self.connector,
+            resolver=lambda host, port: (PINNED,),
             authority=self.authority,
         )
         self.serving = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -659,7 +1180,7 @@ class TunnelTest(unittest.TestCase):
         self.serving.join(timeout=5)
 
     def connector(
-        self, host: str, port: int, timeout: float, protocol: str
+        self, host: str, port: int, timeout: float, protocol: str, address: str
     ) -> http.client.HTTPConnection:
         """The door's outbound side, verifying the target it was sent to.
 
@@ -968,11 +1489,14 @@ class TunnelTest(unittest.TestCase):
         # between the door and the internet would look like: the door refuses it,
         # and it is the only side left that can, because the agent is looking at
         # this door's certificate rather than the target's.
-        outbound = proxy.connect("127.0.0.1", self.target_port, 5.0, "https")
-        self.addCleanup(outbound.close)
-
+        #
+        # The refusal comes out of `connect` rather than out of the request after
+        # it, because pinning moved the handshake there: the socket is opened
+        # against the decided address and wrapped immediately, so there is no
+        # moment where a caller holds a connection whose peer has not been
+        # checked.
         with self.assertRaises(ssl.SSLCertVerificationError):
-            outbound.request("GET", "/v1/notes")
+            proxy.connect("127.0.0.1", self.target_port, 5.0, "https", "127.0.0.1")
 
         self.assertEqual([], self.target.seen)
 

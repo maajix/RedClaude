@@ -211,7 +211,7 @@ class ScopeCommandTest(unittest.TestCase):
         policy = self.report["policy"]
 
         self.assertEqual("matrix-web", policy["program"])
-        self.assertEqual(14, policy["rules"])
+        self.assertEqual(18, policy["rules"])
         self.assertEqual(64, len(policy["policy_sha256"]))
         self.assertEqual(["X-Bounty-Id"], policy["required_headers"])
 

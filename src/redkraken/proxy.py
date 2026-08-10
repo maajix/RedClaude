@@ -42,9 +42,19 @@ down: the agent's view of the target's certificate is this door's, so a TLS
 claim about the target is only true if this side made it, and `intercepted` is
 on every Receipt to say so.
 
-Two things are deliberately not here. Address policy and pinning are ticket 11:
-the `connector` seam below is where they attach, and today it resolves a name
-the ordinary way and verifies an https target against the system trust store.
+The address is decided before the socket, and then pinned. The name is resolved
+once, *after* the capability has been spent and the scope check has passed --
+never before, because a DNS query is itself egress, and one made on behalf of a
+request that was going to be refused is a channel out of this machine that no
+Receipt names. Every address the name answers with has to be one the public
+internet routes to, and the one that will be dialled is re-decided against the
+Program's own policy as a literal address, so a name pointing at loopback, at a
+private network, at link-local metadata or at a host the policy withdrew is
+refused with no socket opened. What is then dialled is that address and not the
+name: the name survives as the `Host` header and as the certificate the door
+verifies, so a name that moves between the decision and the connection moves
+nothing.
+
 Credential injection is ticket 12, which is also when the wire view of an
 exchange first differs from the agent's -- until then there is one view, it is
 the agent's, and claiming two would be recording a difference that does not
@@ -53,9 +63,10 @@ exist.
 Containment is not here either, and cannot be. Telling a child to use this door
 (`tls.agent_environment`) is a request; a client that ignores it reaches the
 network the same way it always would. What makes the door the only peer is a
-network namespace with no other route, which is ticket 11's, and until then the
-honest statement is that this module refuses everything it is asked and nothing
-it is not.
+network namespace with no other route, and that is a topology rather than a
+module: it is ticket 11's first criterion, the child that has to live in it is
+ticket 16's, and until both exist the honest statement is that this module
+refuses everything it is asked and nothing it is not.
 """
 
 from __future__ import annotations
@@ -74,7 +85,7 @@ from datetime import datetime, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 from redkraken import config, migrate, pg, program, scope, tls
 from redkraken.outcome import (
@@ -107,13 +118,18 @@ __all__ = [
     "Refused",
     "Server",
     "capability_of",
+    "connect",
     "describes_this_hop",
+    "destination",
     "endpoint",
     "forwardable",
     "listen",
     "merge_control",
     "origin_form",
     "query_sha256",
+    "redirected",
+    "resolve",
+    "routable",
     "send",
     "serve",
     "take_control",
@@ -238,6 +254,12 @@ CEILING = 32 * 1024 * 1024
 #: gate's risk rules are written against this exact name.
 TOOL = "mcp__rk2__net_request"
 
+#: The statuses that point a client somewhere else. Named because the door does
+#: not follow one -- the client does, back through this same fence, where the
+#: new URL is canonicalised and decided on its own -- and what the door owes the
+#: record is the target it handed over, canonicalised the same way.
+REDIRECTS = frozenset({301, 302, 303, 307, 308})
+
 
 class Refused(Exception):
     """One request that will not be forwarded, and the reason a Receipt cites.
@@ -256,6 +278,7 @@ class Refused(Exception):
         *,
         status: int = 407,
         target_status: int | None = None,
+        pinned: str | None = None,
     ) -> None:
         super().__init__(detail or reason)
         self.reason = reason
@@ -266,6 +289,12 @@ class Refused(Exception):
         #: live on one object because a Receipt records both facts about the
         #: same refusal, and a refusal before contact has only the first.
         self.target_status = target_status
+        #: What the name resolved to, on the refusals that happen after it did.
+        #: Carried on the exception rather than passed to the recorder, because
+        #: the line that refuses an address is the only line that knows which
+        #: addresses were on the table, and a blocked Receipt that named none of
+        #: them would say a name was refused without saying what it pointed at.
+        self.pinned = pinned
 
 
 @dataclass(frozen=True)
@@ -431,6 +460,39 @@ def query_sha256(url: str) -> str | None:
     return digest(query.encode("utf-8")) if query else None
 
 
+def redirected(url: str, location: str | None) -> str | None:
+    """Where a redirect points, canonicalised, or nothing when it points nowhere.
+
+    The door does not follow one and must not: following would spend a
+    capability on a URL the caller never asked for, and the caller is going to
+    come back through this same fence anyway, where the new URL is canonicalised
+    by `_request` and decided on its own like any other. What this is for is the
+    record. A `Location` is the target's text, it is relative as often as it is
+    absolute, and an auditor reading a Receipt for a 302 has no way to chain it
+    to the next Receipt unless the door writes down the same spelling the next
+    decision will be made against.
+
+    The query goes no further than `query_sha256` lets one go: a redirect
+    carries session identifiers and occasionally a credential, and a note is
+    read by a person rather than hashed. Nothing readable comes back as nothing
+    at all -- a `Location` this canonicaliser refuses is one the next request
+    would be refused for, and repeating the target's own bytes into a record to
+    say so would be putting unparsed input where an operator reads prose.
+    """
+    # Stripped before it is tested, not after: `urljoin` reads an empty reference
+    # as "the same URL", so whitespace alone would be recorded as a redirect
+    # pointing at the request that produced it.
+    pointing = (location or "").strip()
+    if not pointing:
+        return None
+    try:
+        target = scope.canonical_request(urljoin(url, pointing))
+    except (scope.PolicyError, ValueError):
+        return None
+    authority = _authority(target.host, target.port, target.protocol)
+    return f"{target.protocol}://{authority}{target.path_norm}"
+
+
 def transcript(start: str, headers: list[tuple[str, str]], body: bytes) -> bytes:
     """One HTTP message as bytes, in the order it went or came.
 
@@ -500,6 +562,42 @@ AUTHORIZE = (
     "SELECT program_id::text, tool_run_id::text, scope_version, scope_class"
     "  FROM authorize_egress_request($1, $2, $3, $4, $5::integer, $6, $7, $8)"
 )
+
+#: The second decision, about the address rather than the name. It is a separate
+#: function because it is a separate question asked at a separate moment: the
+#: address does not exist until the name has been resolved, and the name is not
+#: resolved until the first decision has said yes. It is in the database rather
+#: than here for the same reason the first one is -- and for one more. This role
+#: holds no `SELECT` on `program_scope_rules` and `scope_class_of` is not a
+#: definer function, so the proxy cannot read the policy even to agree with it.
+#: The capability is passed rather than the Program: the function resolves it and
+#: takes the Program from that, so a door made to lie about which Program it is
+#: serving cannot have an address checked against somebody else's policy.
+AUTHORIZE_ADDRESS = (
+    "SELECT scope_class, reason"
+    "  FROM authorize_egress_address($1, $2, $3, $4::integer, $5)"
+)
+
+#: What that function says when the capability, rather than the address, is what
+#: it refused. Matched as a string because it arrives as one: both refusals carry
+#: `23514`, so the code separates them from a constraint violation and this
+#: separates them from each other.
+LAPSED = "egress capability refused"
+
+
+def _refusal(error: pg.DatabaseError, address: str) -> Refused:
+    """Which of the two things the address decision refuses, this one was.
+
+    The address check resolves the capability again before it looks at anything
+    else, so a Tool run that closed, a Program that was retired or a task lease
+    that lapsed between the two decisions arrives here rather than at the first
+    one. Filing that as `address refused` would be a Receipt sending an auditor
+    to look at an address that was never the problem, so it is filed under the
+    same reason the first decision would have used, and the address it had
+    already pinned rides along either way.
+    """
+    reason = "capability refused" if LAPSED in str(error) else "address refused"
+    return Refused(reason, str(error), pinned=address)
 
 #: One call, one transaction: the artifacts of the exchange and the Receipt that
 #: names them are written together or not at all. A Receipt naming bytes no row
@@ -579,6 +677,42 @@ class Fence:
             scope_class=str(klass),
         )
 
+    def authorize_address(
+        self, program_id: str, capability: str, request: scope.Request, address: str
+    ) -> None:
+        """Decide the address the name answered with, before a socket is opened.
+
+        The name was decided already. This asks the narrower question the name
+        cannot answer: whether the machine it points at is one the Program
+        withdrew. A policy stated in names says nothing about most addresses, and
+        that silence is not a refusal -- it is the ordinary case, and refusing on
+        it would refuse every request there is. What refuses is a withdrawal that
+        reaches the address: an excluded network, an excluded address, whichever
+        name was used to arrive at it.
+
+        Nothing comes back, and that is the shape of the question rather than an
+        omission. `authorize` returns a class because the Receipt records what a
+        request was allowed AS; the answer here is `unlisted` for almost every
+        address a name-based policy ever sees, so recording it would fill a
+        column with a word that means "the policy is written in names".
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(
+                    AUTHORIZE_ADDRESS,
+                    (capability, request.protocol, request.host, request.port, address),
+                ).rows
+            except pg.DatabaseError as error:
+                # The capability is resolved again inside that function, so this
+                # is also where a capability that stopped being live between the
+                # two decisions arrives. It is reported as what it is: a Receipt
+                # reading "address refused" for a lapsed lease would send an
+                # auditor looking at the address, which was never the problem.
+                raise _refusal(error, address) from error
+        if not rows:
+            raise Refused("address refused", "no address verdict", pinned=address)
+
     def allowed_receipt(
         self, program_id: str, capability: str, receipt: dict, artifacts: list[dict]
     ) -> dict:
@@ -616,16 +750,110 @@ class Fence:
 # ---------------------------------------------------------------------------
 
 
-Connector = Callable[[str, int, float, str], http.client.HTTPConnection]
+Resolver = Callable[[str, int], tuple[str, ...]]
+Connector = Callable[[str, int, float, str, str], http.client.HTTPConnection]
 
 
-def connect(host: str, port: int, timeout: float, protocol: str) -> http.client.HTTPConnection:
-    """Open the connection to the target this request was authorized for.
+def resolve(host: str, port: int) -> tuple[str, ...]:
+    """Every address one name answers with, in the order the resolver gave them.
 
-    The seam ticket 11 attaches to. Today the name is resolved the ordinary way
-    and whatever it resolves to is dialled; pinning the address that was decided
-    against, and refusing one that moved between the decision and the socket, is
-    that ticket's whole subject and is not simulated here.
+    All of them, not the first: a name that answers with a public address and a
+    private one is the shape of a rebinding attack, and a caller that saw only
+    the address it was about to dial could not tell that apart from a name with
+    one record. `destination` is what makes the distinction; this is only the
+    lookup, and it is a seam so that a test can decide what a name answers
+    without a resolver on the machine agreeing.
+    """
+    found = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return tuple(info[4][0] for info in found)
+
+
+def routable(address: str) -> str | None:
+    """Why one address may not be dialled from here, or nothing when it may.
+
+    Deny by default, like the policy above it: an address is dialled because it
+    is one the public internet routes to, not because it failed to match a list
+    of bad ones. That is what makes the answer the same for the ranges nobody
+    remembers -- carrier-grade NAT, the documentation blocks, the IPv4-mapped
+    spelling of loopback -- as for `127.0.0.1`.
+
+    The classes are named separately rather than collapsed into "not public"
+    because each one is a different way in, and the blocked Receipt is read by
+    somebody deciding whether a target was hostile or a Program was misconfigured:
+    link-local is the cloud metadata endpoint, private is the operator's own
+    network and this machine's provisioning and control ports, loopback is the
+    door itself and the database behind it. Multicast is said out loud because
+    it is the one class `is_global` answers yes for.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return f"{address!r} is not an address"
+    if parsed.is_unspecified:
+        return f"{address} is the unspecified address"
+    if parsed.is_loopback:
+        return f"{address} is a loopback address"
+    if parsed.is_link_local:
+        return f"{address} is a link-local address"
+    if parsed.is_multicast:
+        return f"{address} is a multicast address"
+    if not parsed.is_global:
+        return f"{address} is not a public address"
+    return None
+
+
+def destination(host: str, port: int, resolver: Resolver) -> tuple[str, ...]:
+    """The addresses the request may be sent to, or a refusal that opens nothing.
+
+    Called after the capability has been spent and the scope check has passed,
+    which is the whole of why it is a separate step. A DNS query is egress: it
+    leaves this machine, it carries the name that was asked for, and a door that
+    resolved before it decided would be answering "is this name in scope" with a
+    lookup a watcher of the network can read. So the order is decide, then
+    resolve, then dial.
+
+    One bad address refuses the name rather than being skipped over. A name that
+    answers with a routable address and an unroutable one has said two things,
+    and picking the half that passes would let whoever controls the zone decide
+    which half this door dials on the next lookup.
+    """
+    try:
+        # Deduplicated here rather than in the resolver, so that it holds however
+        # the name was looked up. A name with an A record and the mapped spelling
+        # of the same address has said one thing twice, and a record listing it
+        # twice reads as two answers that happen to agree.
+        addresses = tuple(dict.fromkeys(resolver(host, port)))
+    except OSError as error:
+        raise Refused("target unresolved", f"{host} does not resolve: {error}") from error
+    if not addresses:
+        raise Refused("target unresolved", f"{host} resolves to no address at all")
+    for address in addresses:
+        refused = routable(address)
+        if refused is not None:
+            raise Refused(
+                "address refused",
+                f"{host} does not resolve to a public address: {refused}",
+                pinned=",".join(addresses),
+            )
+    return addresses
+
+
+def connect(
+    host: str, port: int, timeout: float, protocol: str, address: str
+) -> http.client.HTTPConnection:
+    """Open the connection to the address this request was pinned to.
+
+    The socket is opened against `address` and never against `host`, and that is
+    the pin: the name was resolved once, every address it answered with was
+    checked, and this dials the one that was decided about. A second lookup here
+    -- which is what handing the name to `http.client` would be -- is exactly the
+    window a zone with a one-second TTL exists to use.
+
+    The name is not thrown away, because two things still have to be true of it:
+    the target has to be told which host it is being asked for, and an https
+    certificate has to be checked against the name the policy authorised rather
+    than against the address underneath it. So the connection keeps the name and
+    the socket keeps the address, and `server_hostname` is the name.
 
     An https target is verified against the system trust store, and this is the
     only place in the harness where a real certificate is seen at all. The agent
@@ -634,11 +862,26 @@ def connect(host: str, port: int, timeout: float, protocol: str) -> http.client.
     the door. `intercepted` on the Receipt is what stops the agent's view from
     being read as the target's.
     """
-    if protocol == "https":
-        return http.client.HTTPSConnection(
-            host, port, timeout=timeout, context=ssl.create_default_context()
-        )
-    return http.client.HTTPConnection(host, port, timeout=timeout)
+    raw = socket.create_connection((address, port), timeout=timeout)
+    try:
+        if protocol == "https":
+            context = ssl.create_default_context()
+            connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=context
+            )
+            connection.sock = context.wrap_socket(raw, server_hostname=host)
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+            connection.sock = raw
+    except OSError:
+        # The handshake is where this happens, and a target whose certificate
+        # does not verify has already been given a socket. Closing it here is
+        # what stops a refused exchange from holding a descriptor open until the
+        # collector notices: nothing else refers to it, because the connection
+        # object that would have owned it was never returned.
+        raw.close()
+        raise
+    return connection
 
 
 class Server(ThreadingHTTPServer):
@@ -655,6 +898,7 @@ class Server(ThreadingHTTPServer):
         fence: Fence | None,
         store: Store,
         connector: Connector,
+        resolver: Resolver = resolve,
         timeout: float = TIMEOUT,
         authority: tls.Authority | None = None,
     ):
@@ -662,6 +906,10 @@ class Server(ThreadingHTTPServer):
         self.fence = fence
         self.store = store
         self.connector = connector
+        #: How a name becomes addresses. Separate from the connector because they
+        #: happen at different moments and for different reasons: this one runs
+        #: before anything is dialled, so that what is dialled has been decided.
+        self.resolver = resolver
         self.target_timeout = timeout
         #: What a tunnel is answered with, or nothing -- in which case CONNECT is
         #: refused. Optional rather than required so that a door with no
@@ -732,7 +980,27 @@ class Handler(BaseHTTPRequestHandler):
         except Refused as refusal:
             return self._refuse(program_id, control.capability, refusal, arrival, url=url)
 
-        self._forward(authorization, control.capability, request, body, arrival, url)
+        try:
+            addresses = self._pin(authorization, control.capability, request)
+        except Refused as refusal:
+            # Its own block, because by here there is an `authorization` and the
+            # record has to say so. A request refused for its address was in
+            # scope by name and spent a live capability to get that far, and a
+            # Receipt that filed it as `denied` alongside the ones that never
+            # resolved anything would hide exactly the case worth seeing: a name
+            # the policy allows, pointing somewhere the policy does not.
+            return self._refuse(
+                program_id,
+                control.capability,
+                refusal,
+                arrival,
+                url=url,
+                authorization=authorization,
+            )
+
+        self._forward(
+            authorization, control.capability, request, body, arrival, url, addresses
+        )
 
     do_GET = _serve
     do_HEAD = _serve
@@ -877,9 +1145,38 @@ class Handler(BaseHTTPRequestHandler):
             raise Refused("unsupported framing", f"a request body over {CEILING} bytes")
         return self.rfile.read(length) if length else b""
 
+    def _pin(
+        self, authorization: Authorization, capability: str, request: scope.Request
+    ) -> tuple[str, ...]:
+        """Turn the authorized name into the address that will be dialled.
+
+        Three steps in one order, and the order is the point. The name is
+        resolved -- which happens here and not earlier, because a lookup is a
+        packet leaving this machine carrying the name that was asked for, and one
+        made for a request that was about to be refused would be egress no
+        Receipt could name. Every address it answered with is checked for being
+        one the public internet routes to, which is where loopback, the
+        operator's own networks, the metadata endpoint and this machine's own
+        control ports stop being reachable through a name. And the address that
+        will be dialled is put back to the database as a destination in its own
+        right, so a Program that withdrew a network has withdrawn it however the
+        request spelled its way there.
+
+        What comes back is every address, not the one that was chosen. The
+        Receipt names them all: an auditor asking why a name was refused needs to
+        see what it answered with, and an auditor reading an allowed exchange
+        needs to see that the other answers were checked too.
+        """
+        addresses = destination(request.host, request.port, self.server.resolver)
+        self.server.fence.authorize_address(
+            authorization.program_id, capability, request, addresses[0]
+        )
+        return addresses
+
     def _exchange(
         self,
         request: scope.Request,
+        address: str,
         target: str,
         headers: list[tuple[str, str]],
         body: bytes,
@@ -892,7 +1189,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             connection = self.server.connector(
-                request.host, request.port, self.server.target_timeout, request.protocol
+                request.host,
+                request.port,
+                self.server.target_timeout,
+                request.protocol,
+                address,
             )
             try:
                 # Header by header, in the order the transcript records, rather
@@ -917,7 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 connection.close()
         except (OSError, http.client.HTTPException) as error:
-            raise Refused("target unreachable", str(error)) from error
+            raise Refused("target unreachable", str(error), pinned=address) from error
         if len(returned) > CEILING:
             raise Refused(
                 "response too large",
@@ -934,6 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
         body: bytes,
         arrival: datetime,
         url: str,
+        addresses: tuple[str, ...],
     ) -> None:
         """Send the authorized request, record the exchange, answer the caller."""
         authority = _authority(request.host, request.port, request.protocol)
@@ -948,9 +1250,12 @@ class Handler(BaseHTTPRequestHandler):
         target = origin_form(url)
         line = f"{self.command} {target} HTTP/1.1"
 
+        pinned = addresses[0]
         egress = datetime.now(timezone.utc)
         try:
-            status, reason, back, returned = self._exchange(request, target, headers, body)
+            status, reason, back, returned = self._exchange(
+                request, pinned, target, headers, body
+            )
         except Refused as refusal:
             return self._refuse(
                 authorization.program_id,
@@ -967,6 +1272,19 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         request_sha, request_new = store.put(sent)
         response_sha, response_new = store.put(received)
+
+        # Where the target pointed, when it pointed anywhere. The door does not
+        # follow it and must not: following would be an exchange the client never
+        # asked for, made against a target the client never named, and the whole
+        # of §7's subresource rule is that each exchange earns its own verdict.
+        # The client follows, and comes back through this fence, where the new
+        # URL is canonicalised and decided on its own. What the record owes is
+        # the link between the two -- without it the child Receipt names a URL
+        # nobody asked for, and an auditor cannot tell a followed redirect from
+        # an agent that invented a target for itself.
+        onward = (
+            redirected(url, _header(back, "Location")) if status in REDIRECTS else None
+        )
 
         receipt = {
             # The version this request was decided against, named in the words of
@@ -992,7 +1310,13 @@ class Handler(BaseHTTPRequestHandler):
             "response_wire_sha": None,
             "scope_class": authorization.scope_class,
             "intercepted": True,
-            "notes": None,
+            # Every address the name answered with, and the one that was dialled
+            # is the first. All of them, because the check that let this request
+            # through was made of all of them, and a record naming only the one
+            # that was used could not be read back as evidence that the rest were
+            # looked at.
+            "pinned_ips": ",".join(addresses),
+            "notes": f"redirect to {onward}" if onward else None,
         }
         artifacts = [
             {"sha256": request_sha, "byte_size": len(sent), "content_type": TRANSCRIPT},
@@ -1090,6 +1414,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         if refusal.target_status is not None:
             receipt["status_code"] = refusal.target_status
+        if refusal.pinned is not None:
+            # Only on the refusals that got far enough to have one. A blocked
+            # Receipt saying an address was refused, with no address in it, tells
+            # an auditor that a name misbehaved without telling them how.
+            receipt["pinned_ips"] = refusal.pinned
         written: str | None = None
         try:
             written = self.server.fence.blocked_receipt(program_id, capability, receipt)
@@ -1166,6 +1495,18 @@ def _identifier(value: str | None) -> str | None:
         return None
 
 
+def _header(headers: list[tuple[str, str]], name: str) -> str | None:
+    """One header out of what a target answered, by name, case-insensitively.
+
+    The first, when there are several. A target that answered with two `Location`
+    lines has not said where it is pointing, and the record says what the first
+    one claimed rather than silently joining two claims into one string nobody
+    sent.
+    """
+    wanted = name.lower()
+    return next((value for header, value in headers if header.lower() == wanted), None)
+
+
 def _authority(host: str, port: int, protocol: str | None) -> str:
     """The `Host` header for a canonicalised target, default port omitted."""
     literal = f"[{host}]" if ":" in host else host
@@ -1234,6 +1575,7 @@ def listen(
     fence: Fence | None,
     store: Store,
     connector: Connector = connect,
+    resolver: Resolver = resolve,
     timeout: float = TIMEOUT,
     authority: tls.Authority | None = None,
 ) -> Server:
@@ -1244,6 +1586,7 @@ def listen(
         fence=fence,
         store=store,
         connector=connector,
+        resolver=resolver,
         timeout=timeout,
         authority=authority,
     )

@@ -99,6 +99,15 @@ ports = [443]
 protocols = ["https"]
 paths = ["/internal/"]
 
+# An address rather than a name, which is the only kind of rule a request can
+# be measured against *after* its name has been resolved. Nothing ever dials it:
+# every test that reaches it is testing that the connection was not opened.
+[[scope.exclude]]
+host = "93.184.216.35"
+ports = [80, 443]
+protocols = ["http", "https"]
+paths = ["/"]
+
 [[required_header]]
 name = "X-Bounty-Id"
 value_ref = "slot://header/bounty-id"
@@ -147,6 +156,10 @@ SCOPE_REQUESTS = (
     # A DNS channel is not an HTTP destination.
     ("https://dns.example.org/", "denied", "unlisted"),
     ("https://93.184.216.34/", "denied", "unlisted"),
+    # An address rule matches the address it names and no neighbour of it: there
+    # is no candidate ladder under an address, so `*.216.34` is not a rule and
+    # `93.184.216.34` is not covered by the exclusion one octet away.
+    ("https://93.184.216.35/", "denied", "excluded"),
 )
 
 #: One URL that cannot be canonicalised, and the reason. These never reach SQL:
@@ -221,6 +234,47 @@ class Target(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *arguments: object) -> None:
         return
+
+
+class Redirecting(Target):
+    """A target that points somewhere else, and records having been asked.
+
+    Answers the first request with a 303 to `elsewhere` and everything after it
+    the way `Target` does, so one fixture serves both halves of a redirect chain
+    and the `seen` list counts the two exchanges separately. The door does not
+    follow a redirect -- the client does, back through the fence -- so a test
+    that reads `seen` is reading how many times a client came back through it.
+    """
+
+    #: What the `Location` says, and what this target answers 200 for. Two names
+    #: because a redirect may point at another host entirely, and then nothing
+    #: comes back here at all: the second request is a request to somewhere else,
+    #: decided on its own, and the door is what it has to pass through to arrive.
+    elsewhere = "/followed"
+    answered = "/followed"
+
+    def do_GET(self) -> None:
+        self.server.seen.append(
+            (
+                self.command,
+                self.path,
+                [(name.lower(), value) for name, value in self.headers.items()],
+            )
+        )
+        if self.path == self.answered:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(self.answer)))
+            self.end_headers()
+            self.wfile.write(self.answer)
+            return
+        self.send_response(303)
+        self.send_header("Location", self.elsewhere)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_GET
+    do_HEAD = do_GET
 
 
 def counterparty(
