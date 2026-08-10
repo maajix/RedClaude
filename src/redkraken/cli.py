@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import __version__, artifact, backup, doctor, migrate, pg, program, state
+from redkraken import __version__, artifact, backup, doctor, migrate, pg, program, scope, state
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
     INVALID_CONFIGURATION,
@@ -110,6 +110,79 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     runner.set_defaults(run=_run)
+
+    policy = commands.add_parser(
+        "scope",
+        help="compile a Program configuration and decide what it authorises",
+        description=(
+            "Compile the Scope Policy and answer questions about it. Reaches no "
+            "database: a verdict is a function of the policy and the request, so "
+            "this is the same decision the runtime makes. A denial is an answer "
+            "and exits 0; a configuration that will not compile is refused."
+        ),
+    )
+    policy.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the Program configuration to compile",
+    )
+    policy.add_argument(
+        "--url",
+        action="append",
+        default=[],
+        dest="urls",
+        metavar="https://...",
+        help="decide one request; repeatable",
+    )
+    policy.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        dest="hosts",
+        metavar="host[:port][/path]",
+        help="decide one host as the projection would; repeatable",
+    )
+    policy.add_argument(
+        "--subtree",
+        action="append",
+        default=[],
+        dest="subtrees",
+        metavar="domain",
+        help="decide a whole domain as a wildcard seed; repeatable",
+    )
+    policy.add_argument(
+        "--callback",
+        action="append",
+        default=[],
+        dest="callbacks",
+        metavar="host",
+        help="decide whether an observed interaction arrived on a declared channel",
+    )
+    policy.add_argument(
+        "--action",
+        action="append",
+        default=[],
+        dest="actions",
+        metavar="permission",
+        help=(
+            "ask about one rule of engagement; repeatable, and all five are "
+            "reported when none is named"
+        ),
+    )
+    policy.add_argument(
+        "--discovery",
+        action="append",
+        default=[],
+        dest="techniques",
+        metavar="technique",
+        help=(
+            "ask about one discovery technique; repeatable, and all five are "
+            "reported when none is named"
+        ),
+    )
+    policy.set_defaults(run=_scope)
 
     inspect = commands.add_parser(
         "state",
@@ -450,6 +523,20 @@ def _doctor(arguments: argparse.Namespace) -> int:
     diagnosis = doctor.diagnose(arguments.config)
     print(json.dumps(diagnosis.as_dict(), indent=2))
     return diagnosis.exit_code
+
+
+def _scope(arguments: argparse.Namespace) -> int:
+    return _render(
+        scope.diagnose(
+            arguments.config,
+            urls=tuple(arguments.urls),
+            hosts=tuple(arguments.hosts),
+            subtrees=tuple(arguments.subtrees),
+            callbacks=tuple(arguments.callbacks),
+            actions=tuple(arguments.actions),
+            techniques=tuple(arguments.techniques),
+        )
+    )
 
 
 def _run(arguments: argparse.Namespace) -> int:

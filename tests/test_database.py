@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-from redkraken import artifact, backup, integrity, migrate, pg, program, seal, state
+from redkraken import artifact, backup, config, integrity, migrate, pg, program, scope, seal, state
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
@@ -47,7 +47,7 @@ from redkraken.outcome import (
     EXIT_OK,
     Report,
 )
-from tests.fixtures import VALID, scratch, write
+from tests.fixtures import SCOPE_ENTITIES, SCOPE_REQUESTS, SCOPED, VALID, scratch, write
 
 
 SUPERUSER_URL = os.environ.get("RK_TEST_SUPERUSER_URL", "")
@@ -662,6 +662,55 @@ CONTROLS = (
         "         canonical_sha256, document, platform, token_budget, reason)"
         "        VALUES (p, 1, 1, 'selftest', repeat('a', 64), repeat('b', 64),"
         "                '{}'::jsonb, 'hackerone', 2000, 'a policy the Program does not run');"
+        " END $ctl$",
+    ),
+    Control(
+        # A Program that stated a scope and runs under none. Every entity of it
+        # projects to denied, which is safe and is indistinguishable from a
+        # policy that lists nothing -- so the operator sees an enforced scope
+        # where there is no compiled one.
+        "standing:scope_policy",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name, platform, token_budget)"
+        "        VALUES ('scopeless-selftest', 'Self test', 'hackerone', 1000)"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO program_configurations"
+        "        (program_id, revision, schema_version, source_path, source_sha256,"
+        "         canonical_sha256, document, platform, token_budget, reason)"
+        "        VALUES (p, 1, 1, 'selftest', repeat('a', 64), repeat('b', 64),"
+        "                '{}'::jsonb, 'hackerone', 1000, 'program opened');"
+        " END $ctl$",
+    ),
+    Control(
+        # The redaction, which is a grant and not a convention: one row in the
+        # registry is the whole edit that would put a runtime-owned secret
+        # reference on the agent's read surface.
+        "standing:scope_policy",
+        "INSERT INTO state_read_surface (table_name, column_name, added_by)"
+        " VALUES ('program_required_headers', 'value_ref', 'selftest')",
+    ),
+    Control(
+        # A live version with a header and no body. Deny-by-default makes this
+        # silent: the Program looks configured and every request is `unlisted`.
+        "standing:scope_policy",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name, platform, token_budget)"
+        "        VALUES ('bodyless-selftest', 'Self test', 'hackerone', 1000)"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO program_configurations"
+        "        (program_id, revision, schema_version, source_path, source_sha256,"
+        "         canonical_sha256, document, platform, token_budget, reason)"
+        "        VALUES (p, 1, 1, 'selftest', repeat('a', 64), repeat('b', 64),"
+        "                '{}'::jsonb, 'hackerone', 1000, 'program opened');"
+        "   INSERT INTO program_scope_versions"
+        "        (program_id, version, policy, policy_sha256, configuration_revision)"
+        "        VALUES (p, 1, jsonb_build_object('configuration_sha256', repeat('b', 64)),"
+        "                repeat('c', 64), 1);"
+        "   PERFORM set_scope_version(p, 1);"
         " END $ctl$",
     ),
     # --- the registry, and the catalogue it describes ------------------------
@@ -1339,6 +1388,301 @@ class ProgramRunTest(DatabaseCase):
             result = integrity.verify(connection, self.harness.expected)
 
         self.assertTrue(result.ok, result.violations)
+
+
+#: The Program the scope tests open. Named apart from `RUN_SLUG` so the purge at
+#: the end of each class finds only its own rows.
+SCOPE_SLUG = "selftest-scope"
+
+
+class ScopeEvaluatorTest(DatabaseCase):
+    """PH2-08: the compiled policy, decided in SQL rather than in Python.
+
+    The fixture matrix is the subject. `tests/test_scope.py` puts it through the
+    evaluator and `tests/test_cli.py` puts it through `rk scope`; this puts the
+    same rows through `scope_class_of`, and a disagreement between the three is
+    the failure the whole ticket is about -- two implementations of one grammar
+    that answer differently are two policies.
+
+    Canonicalisation is Python's job in both worlds, so the matrix is read into
+    a `Request` here and the host, port and both path spellings are handed to
+    SQL. That is exactly what the runtime does: the proxy canonicalises once and
+    the database matches what it was given.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.opened = program.run(cls.harness.runtime, cls.written("matrix"))
+        assert cls.opened.ok, cls.opened.violations
+        cls.program_id = cls.opened.facts["program_id"]
+        cls.version = cls.opened.facts["scope"]["version"]
+        cls.policy = cls.compiled()
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SCOPE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def written(cls, name: str, text: str = SCOPED) -> Path:
+        return write(text.replace('name = "matrix-web"', f'name = "{SCOPE_SLUG}-{name}"'))
+
+    @classmethod
+    def compiled(cls, text: str = SCOPED) -> scope.Policy:
+        configuration, refusals = config.load(cls.written("compiled", text))
+        assert configuration is not None, refusals
+        policy, refused = scope.compile_policy(configuration)
+        assert policy is not None, refused
+        return policy
+
+    def ask(self, request: scope.Request) -> tuple:
+        return tuple(
+            self.connection.execute(
+                "SELECT scope_class, reason, rule_ord"
+                "  FROM scope_class_of($1::uuid, $2, $3, $4, $5, $6, $7, $8)",
+                (
+                    self.program_id,
+                    self.version,
+                    request.host,
+                    request.protocol,
+                    request.port,
+                    request.path_raw,
+                    request.path_norm,
+                    request.question,
+                ),
+            ).rows[0]
+        )
+
+    def project(self, kind: str, selector: str, port: int | None, path: str) -> tuple:
+        raw, normalized = scope.path_variants(path)
+        return tuple(
+            self.connection.execute(
+                "SELECT scope_class, reason, rule_ord"
+                "  FROM scope_class_of_entity($1::uuid, $2, $3, $4, $5, $6, $7)",
+                (self.program_id, self.version, kind, selector, port, raw, normalized),
+            ).rows[0]
+        )
+
+    def rules(self, version: int) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT count(*) FROM program_scope_rules"
+                " WHERE program_id = $1::uuid AND version = $2",
+                (self.program_id, version),
+            ).scalar()
+        )
+
+    def test_the_run_writes_the_policy_it_compiled_and_promotes_it(self):
+        # 021 built these tables and left nothing writing them. This is the first
+        # test in the suite for which `programs.scope_version` is not NULL.
+        facts = self.opened.facts["scope"]
+
+        self.assertEqual(1, facts["version"])
+        self.assertEqual(1, facts["configuration_revision"])
+        self.assertTrue(facts["compiled"])
+        self.assertEqual(len(self.policy.rules), facts["rules"])
+        self.assertEqual(self.policy.policy_sha256(), facts["policy_sha256"])
+        self.assertEqual(
+            [(1, self.policy.policy_sha256(), 1, True)],
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    "SELECT p.scope_version, sv.policy_sha256, sv.configuration_revision,"
+                    "       sv.mutation"
+                    "  FROM programs p"
+                    "  JOIN program_scope_versions sv"
+                    "    ON sv.program_id = p.id AND sv.version = p.scope_version"
+                    " WHERE p.id = $1::uuid",
+                    (self.program_id,),
+                ).rows
+            ],
+        )
+        self.assertEqual(len(self.policy.rules), self.rules(1))
+
+    def test_every_request_in_the_matrix_gets_the_same_verdict_from_sql(self):
+        for url, scope_class, reason in SCOPE_REQUESTS:
+            with self.subTest(url):
+                request = scope.canonical_request(url)
+                verdict = scope.decide_request(self.policy, request)
+
+                answered, said, ord_cited = self.ask(request)
+
+                self.assertEqual((scope_class, reason), (answered, said))
+                # And the same rule is cited, which is the part a receipt records:
+                # agreeing on the verdict while disagreeing on why is a policy an
+                # operator cannot audit.
+                self.assertEqual(verdict.rule_ord, None if ord_cited is None else int(ord_cited))
+
+    def test_every_entity_in_the_matrix_gets_the_same_verdict_from_sql(self):
+        for kind, selector, port, path, scope_class, reason in SCOPE_ENTITIES:
+            with self.subTest(f"{kind}:{selector}:{port}:{path}"):
+                verdict = scope.decide_entity(
+                    self.policy, kind, selector, port=port, path=path
+                )
+
+                answered, said, ord_cited = self.project(kind, selector, port, path)
+
+                self.assertEqual((scope_class, reason), (answered, said))
+                self.assertEqual(verdict.rule_ord, None if ord_cited is None else int(ord_cited))
+
+    def test_an_entity_with_no_selector_is_not_a_scope_question_in_either_world(self):
+        # An identity slot and a technology fingerprint have no address. Denied
+        # and not-addressable are both refusals and they are not the same fact.
+        answered, said, _ = self.project(None, None, None, "/")
+
+        self.assertEqual(("not_addressable", "not_addressable"), (answered, said))
+        self.assertEqual(
+            scope.NOT_ADDRESSABLE, scope.decide_entity(self.policy, None, None).scope_class
+        )
+
+    def test_a_host_sql_cannot_read_is_refused_for_the_reason_python_gives(self):
+        # `scope_normalize_host` returns NULL for "there was no host" and for
+        # "the host was malformed" alike, so `scope_host_problem` is what keeps
+        # the two reasons apart. Without it the matrix would agree on every
+        # verdict and disagree on half the reasons.
+        for host, reason in (("", "no_host"), ("app..example.com", "malformed_host")):
+            with self.subTest(host):
+                answered, said, _ = self.ask(
+                    scope.Request(protocol="https", host=host, port=443, path_raw="/", path_norm="/")
+                )
+
+                self.assertEqual(("denied", reason), (answered, said))
+
+    def test_the_required_header_name_is_readable_and_its_reference_is_not(self):
+        # Criterion 3. The grant is the redaction: `rk2_state` holds no
+        # relation-level privilege on this table, so the read surface registry is
+        # the grant, and `value_ref` is not in it.
+        self.assertEqual(
+            [("X-Bounty-Id", True, False)],
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    "SELECT h.name,"
+                    "       has_column_privilege('rk2_state', 'program_required_headers',"
+                    "                            'name', 'SELECT'),"
+                    "       has_column_privilege('rk2_state', 'program_required_headers',"
+                    "                            'value_ref', 'SELECT')"
+                    "  FROM program_required_headers h"
+                    " WHERE h.program_id = $1::uuid AND h.version = $2"
+                    " ORDER BY h.ord",
+                    (self.program_id, self.version),
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            ["name", "ord", "program_id", "version"],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT column_name FROM state_read_surface"
+                    " WHERE table_name = 'program_required_headers' ORDER BY column_name"
+                ).rows
+            ],
+        )
+
+    def test_no_event_carries_the_reference_the_runtime_resolves(self):
+        # The other half of the same criterion, and why the table emits nothing:
+        # a redacted column in an event payload is a rule that has to keep
+        # working, and no event at all is a rule that cannot stop working.
+        events = [
+            (str(row[0]), str(row[1]))
+            for row in self.connection.execute(
+                "SELECT type, payload::text FROM events WHERE program_id = $1::uuid ORDER BY seq",
+                (self.program_id,),
+            ).rows
+        ]
+
+        self.assertEqual(["program.configured"], [name for name, _ in events])
+        for name, payload in events:
+            with self.subTest(name):
+                self.assertNotIn("slot://", payload)
+
+    def test_a_required_header_cannot_be_edited_or_dropped_afterwards(self):
+        # Immutable with the version it belongs to. A header whose reference
+        # could be repointed would change what every request carries without
+        # changing the policy digest that says what the request should carry.
+        for statement in (
+            "UPDATE program_required_headers SET value_ref = 'slot://header/other'"
+            " WHERE program_id = $1::uuid",
+            "DELETE FROM program_required_headers WHERE program_id = $1::uuid",
+        ):
+            with self.subTest(statement.split()[0]), self.assertRaises(pg.DatabaseError) as refused:
+                with self.connection.transaction():
+                    self.connection.execute(statement, (self.program_id,))
+
+            self.assertIn("immutable", str(refused.exception).lower())
+
+    def test_resuming_the_same_policy_writes_no_second_version(self):
+        # Idempotent by digest. Without this every `rk run` would append an
+        # identical version, and the version numbers receipts cite would count
+        # restarts rather than policy changes.
+        resumed = program.run(self.harness.runtime, self.written("matrix"))
+
+        self.assertTrue(resumed.ok, resumed.violations)
+        self.assertEqual(self.program_id, resumed.facts["program_id"])
+        self.assertEqual(1, resumed.facts["scope"]["version"])
+        self.assertFalse(resumed.facts["scope"]["compiled"])
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT count(*) FROM program_scope_versions WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ).scalar(),
+        )
+
+    def test_an_accepted_change_compiles_the_next_version_and_promotes_it(self):
+        # A Program of its own, so the matrix above keeps reading version 1.
+        changed = SCOPED.replace('host = "api.example.net"', 'host = "api.example.org"')
+        opened = program.run(self.harness.runtime, self.written("revised"))
+        assert opened.ok, opened.violations
+        program_id = opened.facts["program_id"]
+
+        revised = program.run(
+            self.harness.runtime, self.written("revised", changed), accept_change=True
+        )
+
+        self.assertTrue(revised.ok, revised.violations)
+        self.assertEqual(program_id, revised.facts["program_id"])
+        self.assertEqual(2, revised.facts["configuration"]["revision"])
+        self.assertEqual(2, revised.facts["scope"]["version"])
+        self.assertNotEqual(
+            opened.facts["scope"]["policy_sha256"], revised.facts["scope"]["policy_sha256"]
+        )
+        # Version 1 is still there and still says what it said: receipts cite it.
+        self.assertEqual(
+            [(1, 1), (2, 2)],
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    "SELECT version, configuration_revision FROM program_scope_versions"
+                    " WHERE program_id = $1::uuid ORDER BY version",
+                    (program_id,),
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            2,
+            self.connection.execute(
+                "SELECT scope_version FROM programs WHERE id = $1::uuid", (program_id,)
+            ).scalar(),
+        )
+
+    def test_the_invariants_this_ticket_added_hold_over_what_the_run_wrote(self):
+        # The check the migration registered, over the rows the real path wrote:
+        # every Program that stated a policy runs the compiled form of its newest
+        # revision, that form names the bytes it came from, and it has rules.
+        self.assertEqual([], [tuple(row) for row in self.connection.execute(
+            "SELECT * FROM check_scope_policy()"
+        ).rows])
 
 
 #: The Programs the state tests open. Two, because one Program can never

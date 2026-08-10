@@ -161,6 +161,53 @@ class RefusalTest(unittest.TestCase):
             with self.subTest(result.violations[0].code):
                 self.assertEqual(set(program.FACTS), set(result.facts))
 
+    def test_a_configuration_that_will_not_compile_never_opens_a_connection(self):
+        # The configuration is valid TOML the validator accepts, so the earlier
+        # refusal cannot catch it: the compiler is the only thing that knows a
+        # private address is not a target. It has to run before the connection,
+        # because a Program whose policy denies everything is worse than none.
+        source = write(VALID.replace('host = "app.example.com"', 'host = "10.0.0.1"'))
+
+        with mock.patch.object(pg, "connect", side_effect=AssertionError("connected")) as opened:
+            result = program.run(settings(), source)
+
+        opened.assert_not_called()
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(program.STOPPED_REFUSED, result.facts["stop_reason"])
+        self.assertIsNone(result.facts["scope"])
+        # The source names the compiler rather than the validator, which is how an
+        # operator tells "your file is wrong" from "your file says nothing usable".
+        self.assertEqual(
+            [("invalid_configuration", True)],
+            [
+                (violation.code, violation.source.startswith("scope:scope.include["))
+                for violation in result.violations
+            ],
+        )
+
+    def test_the_policy_is_compiled_before_the_corpus_is_read(self):
+        # A corpus this run cannot read would be a different refusal, and the
+        # scope refusal has to win: reading migrations is work done on behalf of
+        # a policy that does not exist.
+        source = write(VALID.replace('host = "app.example.com"', 'host = "10.0.0.1"'))
+
+        result = program.run(settings(), source, corpus=write(VALID).parent / "absent")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertEqual(
+            ["scope_policy"],
+            [assertion.name for assertion in result.assertions if not assertion.ok],
+        )
+
+    def test_a_configuration_that_compiles_reports_the_policy_it_compiled(self):
+        # The hold is what an operator reads when the run stops for any later
+        # reason, so it names the shape of the policy rather than merely passing.
+        result = program.run(settings(), write(VALID))
+
+        holds = {assertion.name: assertion.detail for assertion in result.assertions}
+        self.assertIn("scope_policy", holds)
+        self.assertRegex(holds["scope_policy"], r"^\d+ rule\(s\), \d+ channel\(s\), policy [0-9a-f]{12}$")
+
     def test_the_report_carries_no_value_out_of_the_configuration(self):
         # The document holds hosts, headers and `slot://` references. None of
         # them is a durable identifier, so none of them belongs in the outcome.

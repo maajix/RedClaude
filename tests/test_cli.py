@@ -16,7 +16,15 @@ from redkraken.outcome import (
     EXIT_USAGE,
 )
 from tests import ROOT, SOURCE
-from tests.fixtures import VALID, scratch, write
+from tests.fixtures import (
+    SCOPE_ENTITIES,
+    SCOPE_REFUSALS,
+    SCOPE_REQUESTS,
+    SCOPED,
+    VALID,
+    scratch,
+    write,
+)
 
 
 #: Records the effects `rk doctor` promises never to have, rather than raising
@@ -161,6 +169,171 @@ class DoctorCommandTest(unittest.TestCase):
         result = run("hunt")
 
         self.assertEqual(EXIT_USAGE, result.returncode)
+
+
+class ScopeCommandTest(unittest.TestCase):
+    """`rk scope`: the compiled policy, asked through the operator's own adapter.
+
+    The whole fixture matrix goes through one invocation, because the ticket's
+    last criterion is that the CLI and the runtime decide alike. `tests.test_scope`
+    puts the same matrix through the evaluator and `tests.test_database` puts it
+    through `scope_class_of`; a disagreement is a bug in one of the three, and
+    without the shared matrix it would be a bug nobody could see.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        arguments = ["scope", "--config", str(write(SCOPED))]
+        for url, _, _ in SCOPE_REQUESTS:
+            arguments += ["--url", url]
+        for url, _ in SCOPE_REFUSALS:
+            arguments += ["--url", url]
+        for kind, selector, port, path, _, _ in SCOPE_ENTITIES:
+            flag = "--host" if kind == "host" else "--subtree"
+            spelling = selector + (f":{port}" if port else "") + ("" if path == "/" else path)
+            arguments += [flag, spelling]
+        cls.result = run(*arguments)
+        assert cls.result.returncode == EXIT_OK, cls.result.stderr
+        cls.report = json.loads(cls.result.stdout)
+
+    def decided(self, url: str) -> dict:
+        return next(item for item in self.report["requests"] if item["url"] == url)
+
+    def projected(self, kind: str, selector: str, port: int | None, path: str) -> dict:
+        return next(
+            item
+            for item in self.report["entities"]
+            if (item["selector_kind"], item["selector"], item["port"], item["path"])
+            == (kind, selector, port, path)
+        )
+
+    def test_the_command_reports_the_compiled_policy(self):
+        policy = self.report["policy"]
+
+        self.assertEqual("matrix-web", policy["program"])
+        self.assertEqual(14, policy["rules"])
+        self.assertEqual(64, len(policy["policy_sha256"]))
+        self.assertEqual(["X-Bounty-Id"], policy["required_headers"])
+
+    def test_every_request_in_the_matrix_is_decided_as_the_matrix_says(self):
+        for url, scope_class, reason in SCOPE_REQUESTS:
+            with self.subTest(url):
+                decision = self.decided(url)
+                self.assertEqual(scope_class, decision["scope_class"])
+                self.assertEqual(reason, decision["reason"])
+
+    def test_every_refused_url_in_the_matrix_is_denied_for_the_stated_reason(self):
+        for url, reason in SCOPE_REFUSALS:
+            with self.subTest(url):
+                decision = self.decided(url)
+                self.assertEqual("denied", decision["scope_class"])
+                self.assertEqual(reason, decision["reason"])
+
+    def test_every_entity_in_the_matrix_is_projected_as_the_matrix_says(self):
+        for kind, selector, port, path, scope_class, reason in SCOPE_ENTITIES:
+            with self.subTest(f"{kind}:{selector}:{port}:{path}"):
+                decision = self.projected(kind, selector, port, path)
+                self.assertEqual(scope_class, decision["scope_class"])
+                self.assertEqual(reason, decision["reason"])
+
+    def test_a_denial_is_an_answer_rather_than_a_refusal(self):
+        # Denials are the majority of the matrix and the command still exits 0:
+        # `ok` is about whether the question could be answered.
+        self.assertTrue(self.report["ok"])
+        self.assertEqual(EXIT_OK, self.report["exit_code"])
+        self.assertEqual([], self.report["violations"])
+        self.assertIn(
+            "denied", {decision["scope_class"] for decision in self.report["requests"]}
+        )
+
+    def test_all_five_permissions_and_all_five_techniques_are_reported_unasked(self):
+        self.assertEqual(
+            {"availability_impact", "credential_use", "mutation", "pivoting",
+             "sensitive_data_access"},
+            {item["subject"] for item in self.report["permissions"]},
+        )
+        self.assertEqual(
+            {"adjacent_host", "certificate_transparency", "dns_enumeration",
+             "reverse_ip", "virtual_host"},
+            {item["subject"] for item in self.report["discovery"]},
+        )
+        self.assertEqual(
+            [False] * 5, [item["allowed"] for item in self.report["discovery"]]
+        )
+
+    def test_no_required_header_value_reaches_the_operator_s_terminal(self):
+        self.assertIn("X-Bounty-Id", self.result.stdout)
+        self.assertNotIn("slot://", self.result.stdout)
+
+    def test_a_refused_configuration_is_reported_in_the_scope_shape(self):
+        result = run("scope", "--config", str(write(SCOPED.replace("[budgets]", "[budget]"))))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ok"])
+        self.assertIsNone(report["policy"])
+        self.assertEqual([], report["requests"])
+
+    def test_a_configuration_that_parses_and_does_not_compile_is_refused(self):
+        result = run(
+            "scope",
+            "--config",
+            str(write(SCOPED.replace('host = "api.example.net"', 'host = "127.0.0.1"'))),
+            "--url",
+            "https://app.example.com/",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["policy"])
+        self.assertEqual(
+            ["scope:scope.include[1].host"],
+            [violation["source"] for violation in report["violations"]],
+        )
+
+    def test_a_permission_this_grammar_has_no_word_for_is_refused(self):
+        result = run("scope", "--config", str(write(SCOPED)), "--action", "exfiltration")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            ["argument:exfiltration"],
+            [violation["source"] for violation in report["violations"]],
+        )
+
+    def test_a_discovery_technique_this_grammar_has_no_word_for_is_refused(self):
+        result = run("scope", "--config", str(write(SCOPED)), "--discovery", "port_scan")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+
+    def test_a_scope_question_without_a_configuration_is_a_usage_error(self):
+        result = run("scope", "--url", "https://app.example.com/")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+
+    def test_an_observed_interaction_is_matched_against_the_declared_channels(self):
+        result = run(
+            "scope",
+            "--config",
+            str(write(SCOPED)),
+            "--callback",
+            "abc123.dns.example.org",
+            "--callback",
+            "elsewhere.test",
+        )
+
+        self.assertEqual(EXIT_OK, result.returncode)
+        callbacks = json.loads(result.stdout)["callbacks"]
+        self.assertEqual(["egress_support", "denied"], [item["scope_class"] for item in callbacks])
+        self.assertEqual("oob-dns", callbacks[0]["channel"])
+
+    def test_the_command_reaches_no_database(self):
+        # No RK_* variable is set for these runs, and none is asked for: a scope
+        # question is a function of the configuration and nothing else.
+        loaded = observe("scope", "--config", str(write(SCOPED)), "--url", "https://app.example.com/")
+
+        self.assertEqual(0, loaded["exit"])
+        self.assertEqual([], [event for event in loaded["events"] if event[0] == "socket.connect"])
 
 
 class DatabaseCommandTest(unittest.TestCase):

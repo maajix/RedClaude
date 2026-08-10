@@ -28,7 +28,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import config, integrity, migrate, pg
+from redkraken import config, integrity, migrate, pg, scope
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
     INTEGRITY_FAILED,
@@ -74,6 +74,7 @@ FACTS = (
     "program_id",
     "program_slug",
     "configuration",
+    "scope",
     "lifecycle",
     "stop_reason",
     "pending_decisions",
@@ -185,6 +186,27 @@ def run(
         f"policy {_short(configuration.canonical_sha256)}",
     )
 
+    # Compiled here, before the corpus is read and long before a connection is
+    # opened. A configuration that parses and does not compile authorises
+    # nothing, so it must not be able to reach a Program: without this the run
+    # would create the root row, record the revision and then discover it had no
+    # policy to enforce, leaving a Program every entity of which projects denied.
+    policy, policy_refusals = scope.compile_policy(configuration)
+    if policy is None:
+        ledger.refuse(
+            "scope_policy",
+            f"the configuration does not compile to a scope policy "
+            f"({len(policy_refusals)} violation(s)); nothing was written",
+            policy_refusals,
+        )
+        return _report(ledger, state)
+    state.policy = policy
+    ledger.hold(
+        "scope_policy",
+        f"{len(policy.rules)} rule(s), {len(policy.channels)} channel(s), "
+        f"policy {_short(policy.policy_sha256())}",
+    )
+
     migrations, corpus_refusals = migrate.load(corpus)
     if corpus_refusals:
         ledger.refuse("corpus", f"{len(corpus_refusals)} refused migration file(s)", corpus_refusals)
@@ -249,8 +271,10 @@ class _State:
 
     slug: str | None = None
     configuration: config.Configuration | None = None
+    policy: scope.Policy | None = None
     program_id: str | None = None
     revision: Revision | None = None
+    scope: dict | None = None
     lifecycle: str | None = None
     pending: list[dict] | None = None
     integrity: dict | None = None
@@ -270,6 +294,7 @@ def _report(ledger: Ledger, state: _State) -> Report:
         program_id=state.program_id,
         program_slug=state.slug,
         configuration=state.revision.summary() if state.revision else None,
+        scope=state.scope,
         lifecycle=state.lifecycle,
         stop_reason=stop_reason,
         pending_decisions=pending,
@@ -353,7 +378,8 @@ def _open_program(
     survive its own transaction.
     """
     configuration = state.configuration
-    assert configuration is not None  # established by the caller
+    policy = state.policy
+    assert configuration is not None and policy is not None  # established by the caller
     slug = str(state.slug)
 
     with connection.transaction():
@@ -422,6 +448,23 @@ def _open_program(
                 revision=next_revision,
                 reason=reason,
             )
+
+        # Every answer that keeps the Program open leaves it running a compiled
+        # policy, resume included: a Program opened before this path existed has
+        # `scope_version` NULL, and NULL is a Program nothing may be sent to.
+        state.scope = _project_scope(
+            connection,
+            policy,
+            str(state.program_id),
+            revision=state.revision.revision if state.revision else next_revision,
+        )
+        ledger.hold(
+            "scope_version",
+            f"version {state.scope['version']} from configuration revision "
+            f"{state.scope['configuration_revision']}, {state.scope['rules']} rule(s), "
+            f"policy {_short(state.scope['policy_sha256'])}"
+            + ("" if state.scope["compiled"] else " (already live)"),
+        )
 
         if answer in (RESUME, REVISE):
             counts = _resume(connection, str(state.program_id), state.revision)
@@ -557,6 +600,137 @@ def _record(
         source_sha256=configuration.source_sha256,
         canonical_sha256=configuration.canonical_sha256,
     )
+
+
+def _project_scope(
+    connection: pg.Connection,
+    policy: scope.Policy,
+    program_id: str,
+    *,
+    revision: int,
+) -> dict:
+    """Record the compiled policy as a scope version, promote it and reproject.
+
+    The scope version is its own sequence rather than the configuration revision
+    number, and the two are joined by a column instead. They mostly move
+    together, and the case that separates them is the one that matters: the
+    compiler itself changes, the operator's file does not, and the same
+    configuration now compiles to different rules. That is a change in what the
+    policy *means*, so it is a new version -- receipts cite the version, and
+    rewriting one would rewrite what they say. Nothing here ever updates a
+    version already written; `scope_versions_immutable` would refuse it anyway.
+
+    Idempotent by digest: a resume whose live version already holds this exact
+    policy writes nothing at all, which is what lets `rk run` be run repeatedly
+    without filling the version history with identical rows.
+    """
+    live, live_digest, live_at = connection.execute(
+        "SELECT p.scope_version, sv.policy_sha256, sv.configuration_revision"
+        "  FROM programs p"
+        "  LEFT JOIN program_scope_versions sv"
+        "    ON sv.program_id = p.id AND sv.version = p.scope_version"
+        " WHERE p.id = $1::uuid",
+        (program_id,),
+    ).rows[0]
+    digest = policy.policy_sha256()
+    unchanged = (
+        live is not None
+        and str(live_digest) == digest
+        and live_at is not None
+        and int(live_at) == revision
+    )
+    if unchanged:
+        return {
+            "version": int(live),
+            "configuration_revision": revision,
+            "policy_sha256": digest,
+            "rules": len(policy.rules),
+            "required_headers": len(policy.headers),
+            "compiled": False,
+            "reprojected": 0,
+        }
+
+    version = int(
+        connection.execute(
+            "SELECT coalesce(max(version), 0) + 1 FROM program_scope_versions"
+            " WHERE program_id = $1::uuid",
+            (program_id,),
+        ).scalar()
+    )
+    controls = dict(policy.controls)
+    connection.execute(
+        "INSERT INTO program_scope_versions"
+        " (program_id, version, policy, policy_sha256, configuration_revision, reason,"
+        "  availability_impact, credential_use, mutation, pivoting, sensitive_data_access)"
+        " VALUES ($1::uuid, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11)",
+        (
+            program_id,
+            version,
+            config.canonical_bytes(policy.document()).decode("utf-8"),
+            digest,
+            revision,
+            f"compiled from configuration revision {revision} by grammar "
+            f"{policy.grammar_version}",
+            # Named one by one rather than splatted, so a sixth control added to
+            # the loader fails here instead of being dropped on the way in.
+            controls["availability_impact"],
+            controls["credential_use"],
+            controls["mutation"],
+            controls["pivoting"],
+            controls["sensitive_data_access"],
+        ),
+    )
+    # One statement per table, whatever the rule count: the ordinals and the
+    # digest are already fixed by the compiler, so the rows are a projection of
+    # the document rather than a second decision made here.
+    connection.execute(
+        "INSERT INTO program_scope_rules"
+        " (program_id, version, ord, effect, effect_rank, pattern_kind, pattern_text,"
+        "  match_key, protocol, port, path_prefix, spec_kind, spec_len)"
+        " SELECT $1::uuid, $2, r.ord, r.effect, r.effect_rank, r.pattern_kind,"
+        "        r.pattern_text, r.match_key, r.protocol, r.port, r.path_prefix,"
+        "        r.spec_kind, r.spec_len"
+        "   FROM jsonb_to_recordset($3::jsonb) AS r("
+        "        ord integer, effect text, effect_rank smallint, pattern_kind text,"
+        "        pattern_text text, match_key text, protocol text, port integer,"
+        "        path_prefix text, spec_kind smallint, spec_len smallint)",
+        (program_id, version, _encode([rule.row() for rule in policy.rules])),
+    )
+    if policy.headers:
+        connection.execute(
+            "INSERT INTO program_required_headers (program_id, version, ord, name, value_ref)"
+            " SELECT $1::uuid, $2, h.ord, h.name, h.value_ref"
+            "   FROM jsonb_to_recordset($3::jsonb) AS h(ord integer, name text, value_ref text)",
+            (
+                program_id,
+                version,
+                _encode(
+                    [
+                        {"ord": index + 1, "name": header.name, "value_ref": header.value_ref}
+                        for index, header in enumerate(policy.headers)
+                    ]
+                ),
+            ),
+        )
+    moved = int(
+        connection.execute(
+            "SELECT count(*) FROM set_scope_version($1::uuid, $2)", (program_id, version)
+        ).scalar()
+    )
+    return {
+        "version": version,
+        "configuration_revision": revision,
+        "policy_sha256": digest,
+        "rules": len(policy.rules),
+        "required_headers": len(policy.headers),
+        "compiled": True,
+        "reprojected": moved,
+    }
+
+
+def _encode(rows: list[dict]) -> str:
+    """One statement's worth of rows, in the encoding `jsonb_to_recordset` reads."""
+    return json.dumps(rows, sort_keys=True, separators=(",", ":"))
 
 
 def _resume(connection: pg.Connection, program_id: str, revision: Revision | None) -> dict:
