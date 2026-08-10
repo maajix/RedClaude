@@ -17,12 +17,21 @@ A caller may run fewer than three, because which families a connection is
 entitled to run is part of what the role split means. What it may not do is run
 fewer and report as though it ran all of them, so the families that ran are a
 fact in the report rather than an assumption in the reader.
+
+One invariant has no checker and cannot have one. `artifact_references.sha256`
+claims that some bytes on a filesystem hash to it, and no registered check can
+open a file. So the gate takes an optional store root and answers that claim the
+only way it can be answered: by reading the bytes. Optional because the store is
+not part of the database and a caller may not have it -- but a caller who names
+one and gets a pass has been told something `run_standing_checks()` alone cannot
+say.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from redkraken import pg
 from redkraken.outcome import (
@@ -32,6 +41,7 @@ from redkraken.outcome import (
     Report,
     report,
 )
+from redkraken.store import Store
 
 
 #: The registered surface, and what a caller has to supply to run it. The
@@ -53,6 +63,11 @@ ROLES_FAMILY = "roles"
 STANDING_FAMILY = "standing"
 ALL_FAMILIES = (BASELINE_FAMILY, ROLES_FAMILY, STANDING_FAMILY)
 RUNTIME_FAMILIES = (BASELINE_FAMILY, STANDING_FAMILY)
+
+#: Every recorded claim about the store, in the order an operator reads them.
+#: No Program in the query: this is the gate, which asks whether the record as a
+#: whole is still true, not what any one Program may reach.
+REFERENCES = "SELECT label, sha256 FROM artifact_references ORDER BY label"
 
 
 @dataclass(frozen=True)
@@ -117,12 +132,20 @@ def verify(
     connection: pg.Connection,
     expected: list[str] | None = None,
     families: Sequence[str] = ALL_FAMILIES,
+    store: Path | None = None,
 ) -> Report:
     """Run the gate and report it.
 
     A database that has no gate to run is reported as drift rather than as an
     integrity failure: the checks did not fail, they were not there, and the
     thing to do about it is to migrate.
+
+    A store root, when one is given, is verified alongside the registered checks
+    and lands in the report as its own fact. It is not counted as a check,
+    because `checks` is how many registered checkers ran and this is not one of
+    them -- but it fails the gate exactly as they do, which is what makes a
+    corrupt artifact something `rk db verify` refuses over rather than a thing
+    only `rk artifact audit` ever notices.
     """
     ledger = Ledger()
     if not _installed(connection):
@@ -156,13 +179,60 @@ def verify(
             )
 
     failed = [check.source for check in checks if not check.ok]
-    return report(
-        "db verify",
-        ledger,
-        checks=len(checks),
-        failed=failed,
-        families=sorted({check.family for check in checks}),
-    )
+    facts: dict[str, object] = {
+        "checks": len(checks),
+        "failed": failed,
+        "families": sorted({check.family for check in checks}),
+    }
+    if store is not None:
+        facts["artifacts"] = artifacts(ledger, connection, Path(store))
+    return report("db verify", ledger, **facts)
+
+
+def artifacts(ledger: Ledger, connection: pg.Connection, root: Path) -> dict:
+    """Hold every recorded artifact against the bytes filed under its identifier.
+
+    Every reference, not one Program's: a hash that names nothing is a broken
+    record whoever recorded it, and a gate that only checked the Program in front
+    of it would pass a database whose other half is gone.
+    """
+    if not connection.execute("SELECT to_regclass('artifact_references') IS NOT NULL").scalar():
+        ledger.fail(
+            "artifact_store",
+            "this database records no artifact references; run `rk db migrate`",
+            code=SCHEMA_DRIFT,
+            source="database",
+        )
+        return {"sound": False, "verified": 0, "broken": [], "root": str(root)}
+
+    try:
+        rows = connection.execute(REFERENCES).rows
+    except pg.DatabaseError as error:
+        ledger.fail(
+            "artifact_store",
+            f"the recorded artifacts could not be read: {error}",
+            code=INTEGRITY_FAILED,
+            source="database",
+        )
+        return {"sound": False, "verified": 0, "broken": [], "root": str(root)}
+
+    named = [{"label": str(label), "sha256": str(sha256)} for label, sha256 in rows]
+    answer = Store(root).verify(named)
+    broken = answer["broken"]
+    if broken:
+        ledger.fail(
+            "artifact_store",
+            f"{len(broken)} of {len(named)} recorded artifact(s) cannot be verified: "
+            + "; ".join(f"{item['label']} ({item['detail']})" for item in broken),
+            code=INTEGRITY_FAILED,
+            source="artifact_store",
+        )
+    else:
+        ledger.hold(
+            "artifact_store",
+            f"{len(named)} recorded artifact(s) hash to the identifier recorded for them",
+        )
+    return answer
 
 
 def _installed(connection: pg.Connection) -> bool:

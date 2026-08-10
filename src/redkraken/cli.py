@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import __version__, backup, doctor, migrate, pg, program, state
+from redkraken import __version__, artifact, backup, doctor, migrate, pg, program, state
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
     INVALID_CONFIGURATION,
@@ -56,6 +56,11 @@ MIGRATION = _Source("connection_string", "--url", MIGRATE_URL)
 RESTORATION = _Source("connection_string", "--url", RESTORE_URL)
 RUNTIME = _Source("connection_string", "--url", DATABASE_URL)
 AGENT = _Source("state_connection_string", "--state-url", STATE_URL)
+
+#: The one input that is not a connection string and is resolved the same way.
+#: The artifact store is a directory, so it has a variable of its own: an
+#: operator who moved the database has not moved the bytes.
+ARTIFACTS = _Source("artifact_root", "--artifacts", artifact.ROOT_VARIABLE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -147,6 +152,114 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect.set_defaults(run=_state)
 
+    artifacts = commands.add_parser(
+        "artifact", help="store, read and verify this Program's content-addressed artifacts"
+    )
+    verbs = artifacts.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    deposit = verbs.add_parser(
+        "put",
+        help=(
+            "store one file by the hash of its bytes and record that this "
+            f"Program holds it (${DATABASE_URL})"
+        ),
+    )
+    _add_url(deposit, RUNTIME)
+    _add_root(deposit)
+    deposit.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program that will hold it",
+    )
+    deposit.add_argument(
+        "--from",
+        dest="source",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the file whose bytes are stored",
+    )
+    deposit.add_argument(
+        "--kind",
+        default="runtime",
+        choices=artifact.KINDS,
+        help="why this Program holds these bytes (default: runtime)",
+    )
+    deposit.add_argument(
+        "--content-type",
+        dest="content_type",
+        metavar="type",
+        help="what the bytes are, recorded beside them and never inferred from them",
+    )
+    deposit.set_defaults(run=_artifact_put)
+
+    fetch = verbs.add_parser(
+        "get",
+        help=(
+            "read one artifact by label, bounded, as the agent connection sees "
+            f"it (${DATABASE_URL} and ${STATE_URL})"
+        ),
+    )
+    _add_url(fetch, RUNTIME)
+    fetch.add_argument(
+        AGENT.flag,
+        metavar="postgresql://...",
+        help=f"the agent connection string (default: ${AGENT.variable})",
+    )
+    _add_root(fetch)
+    fetch.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program to read as",
+    )
+    fetch.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help="the artifact's label; there is no way to ask for one by hash",
+    )
+    fetch.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        metavar="n",
+        help="where the returned range starts (default: 0)",
+    )
+    fetch.add_argument(
+        "--bytes",
+        dest="byte_limit",
+        type=int,
+        default=artifact.DEFAULT_BYTES,
+        metavar="n",
+        help=(
+            "how many bytes the range carries; what is left out is reported "
+            f"rather than dropped (default: {artifact.DEFAULT_BYTES})"
+        ),
+    )
+    fetch.set_defaults(run=_artifact_get)
+
+    check = verbs.add_parser(
+        "audit",
+        help=(
+            "read every artifact this Program holds and hold its hash against "
+            f"its bytes (${DATABASE_URL})"
+        ),
+    )
+    _add_url(check, RUNTIME)
+    _add_root(check)
+    check.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program whose holdings are checked",
+    )
+    check.set_defaults(run=_artifact_audit)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -173,6 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
         "verify", help=f"run every registered integrity check (${MIGRATE_URL})"
     )
     _add_url(verify, MIGRATION)
+    _add_root(
+        verify,
+        help=(
+            "also hold every recorded artifact against the bytes filed under it; "
+            f"no registered check can open a file (default: ${ARTIFACTS.variable})"
+        ),
+    )
     verify.set_defaults(run=_verify)
 
     status = operations.add_parser(
@@ -208,6 +328,15 @@ def _add_url(parser: argparse.ArgumentParser, source: _Source) -> None:
         help=f"the connection string (default: ${source.variable})",
     )
     parser.set_defaults(url_source=source)
+
+
+def _add_root(parser: argparse.ArgumentParser, help: str | None = None) -> None:
+    parser.add_argument(
+        ARTIFACTS.flag,
+        type=Path,
+        metavar="dir",
+        help=help or f"where the artifact bytes live (default: ${ARTIFACTS.variable})",
+    )
 
 
 def _doctor(arguments: argparse.Namespace) -> int:
@@ -254,6 +383,71 @@ def _state(arguments: argparse.Namespace) -> int:
     )
 
 
+def _artifact_put(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, artifact.PUT)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(artifact.PUT, ledger))
+    return _render(
+        _guarded(
+            artifact.PUT,
+            lambda: artifact.put(
+                runtime,
+                arguments.config,
+                arguments.source,
+                root=root,
+                kind=arguments.kind,
+                content_type=arguments.content_type,
+            ),
+        )
+    )
+
+
+def _artifact_get(arguments: argparse.Namespace) -> int:
+    """Two connection strings and a directory, because the read is about all three.
+
+    The Program is resolved on the runtime connection and the label on the
+    agent's, for the reason `rk state` gives. The bytes are neither connection's:
+    the database holds a hash, and whether the hash is still true of what is on
+    disk is a question only this process can ask.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, artifact.GET)
+    agent = _url(ledger, AGENT, arguments.state_url, artifact.GET)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or agent is None or root is None:
+        return _render(report(artifact.GET, ledger))
+    return _render(
+        _guarded(
+            artifact.GET,
+            lambda: artifact.get(
+                runtime,
+                agent,
+                arguments.config,
+                root=root,
+                label=arguments.label,
+                offset=arguments.offset,
+                limit=arguments.byte_limit,
+            ),
+        )
+    )
+
+
+def _artifact_audit(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, artifact.AUDIT)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(artifact.AUDIT, ledger))
+    return _render(
+        _guarded(
+            artifact.AUDIT,
+            lambda: artifact.audit(runtime, arguments.config, root=root),
+        )
+    )
+
+
 def _provision(arguments: argparse.Namespace) -> int:
     return _with_settings(
         arguments,
@@ -271,7 +465,13 @@ def _migrate(arguments: argparse.Namespace) -> int:
 
 
 def _verify(arguments: argparse.Namespace) -> int:
-    return _with_settings(arguments, "db verify", migrate.verify)
+    # Not refused when absent, unlike `rk artifact`: the gate has an answer
+    # either way, and which one it gave is in the report. Refusing here would
+    # make an operator who has no store unable to run the gate at all.
+    store = artifact.root_from_environment(arguments.artifacts)
+    return _with_settings(
+        arguments, "db verify", lambda settings: migrate.verify(settings, store=store)
+    )
 
 
 def _status(arguments: argparse.Namespace) -> int:
@@ -333,6 +533,24 @@ def _refusal(command: str, name: str, detail: str, code: str) -> Report:
     ledger = Ledger()
     ledger.fail(name, f"the command stopped part-way: {detail}", code=code, source="database")
     return report(command, ledger)
+
+
+def _root(ledger: Ledger, given: Path | None) -> Path | None:
+    """The artifact store, from the argument or from the variable behind it.
+
+    Refused rather than defaulted. A default would file bytes somewhere nobody
+    chose, and the next run with a different working directory would report a
+    store that had lost every artifact in it.
+    """
+    root = artifact.root_from_environment(given)
+    if root is None:
+        ledger.fail(
+            ARTIFACTS.fact,
+            f"no artifact store: pass {ARTIFACTS.flag} or set {ARTIFACTS.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{ARTIFACTS.variable}",
+        )
+    return root
 
 
 def _url(

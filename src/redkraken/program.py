@@ -196,7 +196,7 @@ def run(
         return _report(ledger, state)
 
     with connection:
-        _assert_runtime_connection(ledger, connection)
+        assert_runtime_connection(ledger, connection)
         if ledger.violations:
             return _report(ledger, state)
 
@@ -277,13 +277,15 @@ def _report(ledger: Ledger, state: _State) -> Report:
     )
 
 
-def _assert_runtime_connection(ledger: Ledger, connection: pg.Connection) -> None:
+def assert_runtime_connection(ledger: Ledger, connection: pg.Connection) -> None:
     """Refuse the wrong connection string before the gate, let alone a write.
 
-    The corpus wrote this assertion for exactly this caller — eight properties
+    The corpus wrote this assertion for exactly this purpose — eight properties
     of the connection rather than of the schema, defaulting to whoever asks — so
     running as the owner, as a superuser or as a role that can turn triggers off
-    is a refusal here instead of a surprise later.
+    is a refusal here instead of a surprise later. Public because every command
+    that writes as the runtime needs it, and two copies of "which role is this"
+    would be two answers the day one of them is updated.
     """
     if not connection.execute(
         "SELECT to_regprocedure($1) IS NOT NULL", (RUNTIME_ASSERTION,)
@@ -314,6 +316,29 @@ def _assert_runtime_connection(ledger: Ledger, connection: pg.Connection) -> Non
         )
         return
     ledger.hold("runtime_connection", f"connected as {user}")
+
+
+def resolve(ledger: Ledger, connection: pg.Connection, slug: str) -> str | None:
+    """The identifier of the Program a configuration names, or a refusal.
+
+    On the runtime connection, always: the agent's cannot read `programs` and is
+    not supposed to be able to, so this is the one crossing point where a name an
+    operator wrote becomes an identifier a session can be bound to. Public
+    because `rk state` and `rk artifact` both need that crossing, and the failure
+    they share -- a configuration naming a Program nobody opened -- is one an
+    operator should not see worded two ways.
+    """
+    rows = connection.execute("SELECT id::text FROM programs WHERE slug = $1", (slug,)).rows
+    if not rows:
+        ledger.fail(
+            "program",
+            f"no Program is named {slug}; `rk run --config` opens one",
+            code=INVALID_CONFIGURATION,
+            source="database",
+        )
+        return None
+    ledger.hold("program", f"{slug} resolved on the runtime connection")
+    return str(rows[0][0])
 
 
 def _open_program(

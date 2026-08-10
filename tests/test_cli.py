@@ -245,6 +245,24 @@ class DatabaseCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_USAGE, run("db", "dump").returncode)
         self.assertEqual(EXIT_USAGE, run("db", "restore").returncode)
 
+    def test_the_gate_can_be_asked_about_the_artifact_store_and_is_not_refused_without_one(self):
+        # Unlike `rk artifact`, which has nothing to do without a store. The gate
+        # has an answer either way, and refusing here would leave an operator who
+        # keeps no artifacts unable to run it at all.
+        without = run("db", "verify")
+        with_store = run("db", "verify", "--artifacts", str(scratch() / "artifacts"))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, without.returncode)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, with_store.returncode)
+        self.assertEqual(
+            ["environment:RK_MIGRATE_URL"],
+            [item["source"] for item in json.loads(without.stdout)["violations"]],
+        )
+        self.assertEqual(
+            ["environment:RK_MIGRATE_URL"],
+            [item["source"] for item in json.loads(with_store.stdout)["violations"]],
+        )
+
 
 class RunCommandTest(unittest.TestCase):
     """`rk run`, up to the point where a database is needed.
@@ -388,6 +406,116 @@ class StateCommandTest(unittest.TestCase):
 
         self.assertEqual([], observed["events"])
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+
+class ArtifactCommandTest(unittest.TestCase):
+    """`rk artifact`, up to the point where a database is needed.
+
+    Three inputs rather than two, and the third is not a connection string. The
+    database holds a hash and the filesystem holds the bytes, so a store that
+    was never named is a refusal: defaulting to somewhere would file bytes
+    somewhere nobody chose and report an empty store the next time the command
+    ran from a different directory.
+    """
+
+    def test_the_store_is_named_alongside_the_connection_when_neither_is_set(self):
+        result = run("artifact", "audit", "--config", str(write(VALID)))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("artifact audit", report["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_ROOT", "environment:RK_DATABASE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_a_read_names_both_connection_strings_and_the_store(self):
+        result = run("artifact", "get", "--config", str(write(VALID)), "--label", "AF1")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertEqual(
+            [
+                "environment:RK_ARTIFACT_ROOT",
+                "environment:RK_DATABASE_URL",
+                "environment:RK_STATE_URL",
+            ],
+            [item["source"] for item in json.loads(result.stdout)["violations"]],
+        )
+
+    def test_a_read_without_a_label_is_a_usage_error(self):
+        result = run(
+            "artifact",
+            "get",
+            "--config", str(write(VALID)),
+            "--artifacts", str(scratch()),
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--label", result.stderr)
+
+    def test_there_is_no_way_to_ask_for_an_artifact_by_hash(self):
+        result = run(
+            "artifact",
+            "get",
+            "--config", str(write(VALID)),
+            "--label", "AF1",
+            "--sha256", "0" * 64,
+            "--artifacts", str(scratch()),
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--sha256", result.stderr)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        payload = scratch() / "body.txt"
+        payload.write_bytes(b"stored by nobody")
+
+        result = run(
+            "artifact",
+            "put",
+            "--config", str(write(VALID)),
+            "--from", str(payload),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("artifact put", json.loads(result.stdout)["command"])
+
+    def test_neither_connection_string_is_ever_echoed_back(self):
+        result = run(
+            "artifact",
+            "get",
+            "--config", str(write(VALID)),
+            "--label", "AF1",
+            "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+            "--state-url", "postgresql://rk2_state:s3cr3t-agent@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+        )
+
+        for secret in ("s3cr3t-runtime", "s3cr3t-agent"):
+            with self.subTest(secret):
+                self.assertNotIn(secret, result.stdout)
+                self.assertNotIn(secret, result.stderr)
+
+    def test_a_refused_configuration_reaches_no_database_and_writes_nothing(self):
+        source = write(VALID.replace("requests = 5000", "requests = 0"))
+        payload = scratch() / "body.txt"
+        payload.write_bytes(b"never stored")
+        root = scratch() / "artifacts"
+
+        observed = observe(
+            "artifact",
+            "put",
+            "--config", str(source),
+            "--from", str(payload),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(root),
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+        self.assertFalse(root.exists())
 
 
 class InterruptedCommandTest(unittest.TestCase):

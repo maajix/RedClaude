@@ -521,13 +521,20 @@ def status(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
         )
 
 
-def verify(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
+def verify(
+    settings: pg.Settings, *, corpus: Path = CORPUS, store: Path | None = None
+) -> Report:
     """Run the integrity gate against a database, on its own.
 
     `migrate` ends by running this, so an operator only reaches for it to ask a
     database that nobody is changing whether it still holds. The corpus is read
     here rather than in the gate because the expected migration set is a fact
     about the installed package, and the database cannot see the filesystem.
+
+    The artifact store is passed the same way and for the same reason: where the
+    bytes are is a fact about this installation, and a hash in a row is a claim
+    about a file no SQL statement can open. Naming one turns that claim into an
+    answer; leaving it out means the gate ran without asking.
     """
     migrations, refusals = load(corpus)
     ledger = Ledger()
@@ -546,7 +553,9 @@ def verify(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
         _assert_migrate_connection(ledger, connection)
         if ledger.violations:
             return report("db verify", ledger, target=settings.describe(), checks=0)
-        gate = integrity.verify(connection, expected=[item.identity for item in migrations])
+        gate = integrity.verify(
+            connection, expected=[item.identity for item in migrations], store=store
+        )
     ledger.assertions.extend(gate.assertions)
     ledger.violations.extend(gate.violations)
     return report("db verify", ledger, target=settings.describe(), **gate.facts)

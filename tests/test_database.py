@@ -17,12 +17,16 @@ up, and a gate of those is a green light with nothing behind it.
 `ProgramRunTest` asks a fifth, about an operation rather than about the schema:
 that `rk run` opens one Program and afterwards resumes that one. `StateReadTest`
 asks a sixth, about the connection the model reads through: that one Program
-cannot name, infer or mutate another's rows. Both commit, because what survives
-the transaction is their subject.
+cannot name, infer or mutate another's rows. `ArtifactStoreTest` asks a seventh,
+about the half of the state that is not in the database: that bytes shared by
+content hash stay one row and two claims, and that a hash on its own opens
+nothing. All three commit, because what survives the transaction is their
+subject.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -32,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-from redkraken import backup, integrity, migrate, pg, program, state
+from redkraken import artifact, backup, integrity, migrate, pg, program, state
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
@@ -670,6 +674,54 @@ CONTROLS = (
         " FOR EACH ROW EXECUTE FUNCTION selftest_block_delete()",
     ),
     Control("standing:role_catalogue", "GRANT TRUNCATE ON entities TO rk2_runtime"),
+    # --- artifacts a Program can reach ---------------------------------------
+    Control(
+        # Rule 1: the bytes go and the label that cites them stays. This is the
+        # state the NO ACTION key exists to prevent, so it takes a purge rather
+        # than a delete to reach it at all.
+        "standing:artifact_reachability",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('dangling-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+        "        VALUES (repeat('c', 64), 3, 'text/plain', 'agent_visible');"
+        "   INSERT INTO artifact_references (program_id, sha256, kind)"
+        "        VALUES (p, repeat('c', 64), 'runtime');"
+        "   UPDATE artifacts SET purged_at = now() WHERE sha256 = repeat('c', 64);"
+        " END $ctl$",
+    ),
+    Control(
+        # Rule 2: a label pointing at credential-bearing material. The table
+        # already insists such an artifact is encrypted, which is why the check
+        # is about the reference rather than about the artifact.
+        "standing:artifact_reachability",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('secret-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
+        "        VALUES (repeat('d', 64), 3, 'credential_bearing', true);"
+        "   INSERT INTO artifact_references (program_id, sha256, kind)"
+        "        VALUES (p, repeat('d', 64), 'runtime');"
+        " END $ctl$",
+    ),
+    Control(
+        # Rule 3: one line of a later migration, which is the whole reason the
+        # rule is a standing check and not a comment on the constraint.
+        "standing:artifact_reachability",
+        "ALTER TABLE artifact_references DROP CONSTRAINT artifact_references_sha256_fkey;"
+        " ALTER TABLE artifact_references ADD CONSTRAINT artifact_references_sha256_fkey"
+        " FOREIGN KEY (sha256) REFERENCES artifacts(sha256) ON DELETE CASCADE",
+    ),
+    Control(
+        # Rule 4: the bridge read as its owner. Every reference of every Program
+        # would satisfy the policy on `artifacts` from any session.
+        "standing:artifact_reachability",
+        "ALTER VIEW artifact_refs SET (security_invoker = false)",
+    ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
@@ -1608,6 +1660,415 @@ class StateReadTest(DatabaseCase):
             result = integrity.verify(connection, self.harness.expected)
 
         self.assertTrue(result.ok, result.violations)
+
+
+ARTIFACT_SLUG = "selftest-artifact"
+
+#: The bytes both Programs store. Long enough that a bounded range leaves
+#: something out at both ends, and numbered so a range that came back shifted
+#: would not match the slice it is compared against.
+PLAINTEXT = b"".join(f"artifact line {number}\n".encode() for number in range(32))
+
+#: The bytes only the first Program ever stores, which is what makes an absence
+#: testable from the second: there is something there to be denied.
+PRIVATE = b"only the first Program ever stored these bytes\n"
+
+
+class ArtifactStoreTest(DatabaseCase):
+    """PH2-06: one artifact, two Programs, and the reference that separates them.
+
+    The store deduplicates by content hash and the reference does not, so the
+    interesting case is the one where both Programs put the *same* file: one row
+    of bytes, two claims on it, and a label each. Everything here runs through
+    the roles an operator actually points at the database -- writes as
+    `rk2_runtime`, reads as `rk2_state` -- because a claim about isolation made
+    from a connection that owns the tables is a claim about nothing.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = scratch() / "artifacts"
+        cls.configurations = {}
+        cls.identifiers = {}
+        for name in ("a", "b"):
+            slug = f"{ARTIFACT_SLUG}-{name}"
+            path = write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.shared = scratch() / "shared.txt"
+        cls.shared.write_bytes(PLAINTEXT)
+        cls.private = scratch() / "private.txt"
+        cls.private.write_bytes(PRIVATE)
+
+        # The order matters for exactly one assertion below: the first put is
+        # the one that writes bytes, and the second is the one that finds them
+        # already there under the same name.
+        cls.stored = {
+            "a": cls.store("a", cls.shared, content_type="text/plain"),
+            "b": cls.store("b", cls.shared, content_type="text/plain"),
+        }
+        cls.stored["private"] = cls.store("a", cls.private, kind="tool_output")
+        for name, result in cls.stored.items():
+            assert result.ok, (name, result.violations)
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{ARTIFACT_SLUG}-%",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                ("{" + ",".join(cls.hashes()) + "}",),
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def hashes(cls) -> tuple[str, ...]:
+        return (artifact.digest(PLAINTEXT), artifact.digest(PRIVATE))
+
+    @classmethod
+    def store(cls, name: str, source: Path, **options: object) -> Report:
+        return artifact.put(
+            cls.harness.runtime, cls.configurations[name], source, root=cls.root, **options
+        )
+
+    def read(self, name: str, **options: object) -> Report:
+        return artifact.get(
+            self.harness.runtime,
+            self.harness.state,
+            self.configurations[name],
+            root=self.root,
+            **options,
+        )
+
+    def bound(self, name: str) -> pg.Connection:
+        """An agent session bound to one Program, as `rk artifact get` binds it."""
+        session = pg.connect(self.harness.state)
+        session.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers[name],)
+        )
+        return session
+
+    def test_identical_plaintext_is_one_artifact_and_a_reference_each(self):
+        # Criterion 1. The second put finds the bytes already filed under their
+        # hash and does not write them again; it still makes a reference, and
+        # the two Programs both call theirs `AF1` because labels are per Program.
+        sha256 = artifact.digest(PLAINTEXT)
+        first, second = self.stored["a"].facts["artifact"], self.stored["b"].facts["artifact"]
+
+        self.assertEqual(sha256, first["sha256"])
+        self.assertEqual(sha256, second["sha256"])
+        self.assertEqual([True, False], [first["stored"], second["stored"]])
+        self.assertEqual([True, True], [first["referenced"], second["referenced"]])
+        self.assertEqual(["AF1", "AF1"], [first["label"], second["label"]])
+
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT count(*) FROM artifacts WHERE sha256 = $1", (sha256,)
+            ).scalar(),
+        )
+        self.assertEqual(
+            sorted([self.identifiers["a"], self.identifiers["b"]]),
+            sorted(
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT program_id FROM artifact_references WHERE sha256 = $1", (sha256,)
+                ).rows
+            ),
+        )
+        self.assertEqual(1, len(list(self.root.rglob(sha256))), "one file, under one name")
+
+    def test_storing_the_same_bytes_again_adds_neither_a_row_nor_a_file(self):
+        # The other half of criterion 1: within one Program the reference is the
+        # claim, and a claim made twice is one claim. The report says so rather
+        # than reporting a second label nobody else would ever see again.
+        again = self.store("a", self.shared, content_type="text/plain")
+
+        self.assertTrue(again.ok, again.violations)
+        self.assertEqual("AF1", again.facts["artifact"]["label"])
+        self.assertEqual(False, again.facts["artifact"]["stored"])
+        self.assertEqual(False, again.facts["artifact"]["referenced"])
+        self.assertEqual(
+            2,
+            self.connection.execute(
+                "SELECT count(*) FROM artifact_references WHERE program_id = $1::uuid",
+                (self.identifiers["a"],),
+            ).scalar(),
+        )
+
+    def test_the_recorded_identifier_is_the_hash_of_the_bytes_on_disk(self):
+        # Criterion 2, at the only place the two can disagree: the name the
+        # database recorded, and what the file filed under it hashes to now.
+        for label, plaintext in (("AF1", PLAINTEXT), ("AF2", PRIVATE)):
+            with self.subTest(label):
+                recorded = self.connection.execute(
+                    "SELECT sha256 FROM artifact_references"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.identifiers["a"], label),
+                ).scalar()
+                path = artifact.path_for(self.root, str(recorded))
+
+                self.assertEqual(artifact.digest(plaintext), str(recorded))
+                self.assertEqual(plaintext, path.read_bytes())
+                self.assertEqual(str(recorded), artifact.digest(path.read_bytes()))
+
+    def test_the_audit_holds_every_recorded_hash_against_its_bytes(self):
+        # And the verb that says so for the whole Program at once, which is the
+        # only thing that can: no SQL statement reaches the filesystem.
+        result = artifact.audit(self.harness.runtime, self.configurations["a"], root=self.root)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(
+            {"sound": True, "verified": 2, "broken": [], "root": str(self.root)},
+            result.facts["integrity"],
+        )
+        self.assertEqual(
+            [("AF1", "runtime"), ("AF2", "tool_output")],
+            [(item["label"], item["kind"]) for item in result.facts["holdings"]],
+        )
+
+    def test_a_bounded_read_returns_one_range_and_names_what_it_left_out(self):
+        # Criterion 3. The range is the range that was asked for, and the report
+        # accounts for every byte of the artifact that is not in it.
+        result = self.read("a", label="AF1", offset=10, limit=20)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(
+            {
+                "size": len(PLAINTEXT),
+                "offset": 10,
+                "returned": 20,
+                "omitted_before": 10,
+                "omitted_after": len(PLAINTEXT) - 30,
+                "complete": False,
+            },
+            result.facts["window"],
+        )
+        self.assertEqual(
+            PLAINTEXT[10:30], base64.b64decode(result.facts["content"]["data"])
+        )
+        self.assertEqual(len(PLAINTEXT), result.facts["artifact"]["byte_size"])
+        self.assertEqual("text/plain", result.facts["artifact"]["content_type"])
+
+    def test_a_read_that_asks_for_everything_says_it_got_everything(self):
+        result = self.read("a", label="AF2")
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertTrue(result.facts["window"]["complete"])
+        self.assertEqual(0, result.facts["window"]["omitted_after"])
+        self.assertEqual(PRIVATE, base64.b64decode(result.facts["content"]["data"]))
+
+    def test_a_range_beyond_the_end_is_empty_rather_than_an_error(self):
+        result = self.read("a", label="AF2", offset=len(PRIVATE) + 100)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(0, result.facts["window"]["returned"])
+        self.assertEqual(b"", base64.b64decode(result.facts["content"]["data"]))
+
+    def test_another_programs_label_and_a_label_nobody_holds_are_one_answer(self):
+        # Criterion 4. `AF2` exists and belongs to the first Program; `AF404`
+        # belongs to nobody. From the second Program the two reports differ only
+        # where the label itself appears, and neither exit code says which case
+        # it was.
+        foreign = self.read("b", label="AF2")
+        unknown = self.read("b", label="AF404")
+
+        self.assertEqual(EXIT_OK, foreign.exit_code)
+        self.assertEqual(EXIT_OK, unknown.exit_code)
+        self.assertEqual({"label": "AF2", "present": False}, foreign.facts["artifact"])
+        self.assertEqual({"label": "AF404", "present": False}, unknown.facts["artifact"])
+        self.assertEqual(
+            json.dumps(foreign.as_dict()).replace("AF2", "L"),
+            json.dumps(unknown.as_dict()).replace("AF404", "L"),
+        )
+
+    def test_a_bare_hash_from_another_program_reveals_neither_bytes_nor_existence(self):
+        # The heart of criterion 4, and the reason deduplication is safe: the
+        # hash is the whole address of the bytes, so a Program that guessed one
+        # would hold the store open if reachability were not a row of its own.
+        # Asked from the Program that does hold it, the same three queries
+        # answer -- otherwise this would pass over a surface that answers
+        # nothing to anybody.
+        sha256 = artifact.digest(PRIVATE)
+        counts = {}
+        for name in ("a", "b"):
+            with self.bound(name) as session:
+                counts[name] = [
+                    session.execute(sql, (sha256,)).scalar()
+                    for sql in (
+                        "SELECT count(*) FROM artifacts WHERE sha256 = $1",
+                        "SELECT count(*) FROM artifact_references WHERE sha256 = $1",
+                        "SELECT count(*) FROM v_artifacts WHERE sha256 = $1",
+                    )
+                ]
+
+        self.assertEqual([1, 1, 1], counts["a"])
+        self.assertEqual([0, 0, 0], counts["b"])
+
+    def test_the_shared_artifact_is_one_row_to_each_program_and_not_two(self):
+        # Deduplicated bytes, un-deduplicated claims: from either session the
+        # store holds exactly what that Program put in it, and the row both
+        # Programs refer to is not doubled by the other's reference.
+        for name in ("a", "b"):
+            with self.subTest(name), self.bound(name) as session:
+                labels = [
+                    str(row[0])
+                    for row in session.execute("SELECT label FROM v_artifacts ORDER BY label").rows
+                ]
+
+                self.assertEqual({"a": ["AF1", "AF2"], "b": ["AF1"]}[name], labels)
+
+    def test_coming_to_hold_an_artifact_is_audited_and_the_bytes_are_not(self):
+        # Criterion 5. One event per reference, carrying the label, the hash and
+        # the kind -- identifiers and a digest, which is what §6 lets into the
+        # log -- and no fragment of what the artifact says.
+        rows = self.connection.execute(
+            "SELECT type, payload::text FROM events"
+            " WHERE program_id = $1::uuid AND subject_table = 'artifact_references'"
+            " ORDER BY seq",
+            (self.identifiers["a"],),
+        ).rows
+
+        self.assertEqual(["artifact.referenced", "artifact.referenced"], [str(r[0]) for r in rows])
+        payloads = [json.loads(str(row[1]))["after"] for row in rows]
+        self.assertEqual(["AF1", "AF2"], [item["label"] for item in payloads])
+        self.assertEqual([artifact.digest(PLAINTEXT), artifact.digest(PRIVATE)],
+                         [item["sha256"] for item in payloads])
+        self.assertEqual(["runtime", "tool_output"], [item["kind"] for item in payloads])
+        written = json.dumps(payloads)
+        for fragment in ("artifact line 3", "only the first Program", "b64", "data"):
+            with self.subTest(fragment):
+                self.assertNotIn(fragment, written)
+
+    def test_the_content_addressed_store_is_not_an_event_and_says_why(self):
+        # The other half of criterion 5. `artifacts` is program-global, so an
+        # event about a row of it has no Program to belong to; the exemption is
+        # recorded with that reason rather than left as an open question.
+        exemption = self.connection.execute(
+            "SELECT exempt_kind, owner_ticket, reason FROM event_table_exempt"
+            " WHERE table_name = 'artifacts'"
+        ).rows[0]
+
+        self.assertEqual(("bookkeeping", "ph2-06"), (str(exemption[0]), str(exemption[1])))
+        self.assertIn("without the bytes", str(exemption[2]))
+
+    def test_bytes_missing_from_the_store_fail_closed_on_read_and_on_audit(self):
+        # Criterion 6. The database still records the hash, so the artifact is
+        # not "gone" from anything that reads SQL alone -- which is exactly why
+        # the failure has to be loud on the one path that touches the bytes.
+        path = artifact.path_for(self.root, artifact.digest(PRIVATE))
+        kept = path.read_bytes()
+        path.unlink()
+        try:
+            read = self.read("a", label="AF2")
+            checked = artifact.audit(
+                self.harness.runtime, self.configurations["a"], root=self.root
+            )
+        finally:
+            path.write_bytes(kept)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, read.exit_code)
+        self.assertFalse(read.facts["integrity"]["sound"])
+        self.assertIsNone(read.facts["content"], "no partial answer")
+        self.assertIn("not in the store", read.facts["integrity"]["broken"][0]["detail"])
+        self.assertEqual(EXIT_INTEGRITY_FAILED, checked.exit_code)
+        self.assertEqual(1, checked.facts["integrity"]["verified"], "the one that is still there")
+
+    def test_bytes_that_do_not_hash_to_their_name_fail_closed(self):
+        # The other corruption: a file is there, is the right length, and is not
+        # what it is filed as. A read that returned the range asked for would be
+        # returning evidence under a digest that no longer describes it.
+        path = artifact.path_for(self.root, artifact.digest(PRIVATE))
+        kept = path.read_bytes()
+        path.write_bytes(b"x" * len(kept))
+        try:
+            read = self.read("a", label="AF2", offset=0, limit=4)
+        finally:
+            path.write_bytes(kept)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, read.exit_code)
+        self.assertIsNone(read.facts["content"])
+        self.assertIn("hashes to", read.facts["integrity"]["broken"][0]["detail"])
+
+    def test_a_connection_that_is_not_the_agents_is_refused_rather_than_read(self):
+        result = artifact.get(
+            self.harness.runtime,
+            self.harness.runtime,
+            self.configurations["a"],
+            root=self.root,
+            label="AF1",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIn("rk2_state", result.violations[0].detail)
+
+    def test_a_write_through_the_agent_connection_is_refused(self):
+        # Reachability is a row, so a session that could write one could grant
+        # itself the store. It cannot: the reference table is on the read
+        # surface by column, and the surface is read-only.
+        with self.bound("b") as session:
+            with self.assertRaises(pg.DatabaseError) as refused:
+                session.execute(
+                    "INSERT INTO artifact_references (program_id, sha256, kind)"
+                    " VALUES ($1::uuid, $2, 'runtime')",
+                    (self.identifiers["b"], artifact.digest(PRIVATE)),
+                )
+
+        self.assertEqual("42501", refused.exception.sqlstate)
+
+    def test_the_gate_still_holds_over_the_rows_these_writes_made(self):
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected)
+
+        self.assertTrue(result.ok, result.violations)
+
+    def test_the_gate_holds_the_recorded_hashes_against_the_store_when_given_one(self):
+        # The rest of criterion 6. `rk artifact audit` is one Program's answer
+        # and nothing calls it; the gate is what every command ends by running,
+        # so this is the path on which a corrupt store makes the checks that
+        # trust these hashes unsound rather than merely unasked.
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected, store=self.root)
+
+        self.assertTrue(result.ok, result.violations)
+        artifacts = result.facts["artifacts"]
+        self.assertTrue(artifacts["sound"])
+        self.assertEqual(str(self.root), artifacts["root"])
+        self.assertGreaterEqual(artifacts["verified"], 3, "both labels of a, and b's")
+        self.assertEqual([], artifacts["broken"])
+
+    def test_a_store_the_gate_cannot_verify_fails_the_gate(self):
+        # And the negative control for it: the database is untouched and every
+        # registered check still passes, so a gate that never opened a file
+        # would report this database as holding.
+        path = artifact.path_for(self.root, artifact.digest(PRIVATE))
+        kept = path.read_bytes()
+        path.write_bytes(b"x" * len(kept))
+        try:
+            with pg.connect(self.harness.migrate) as connection:
+                blind = integrity.verify(connection, self.harness.expected)
+                seeing = integrity.verify(connection, self.harness.expected, store=self.root)
+        finally:
+            path.write_bytes(kept)
+
+        self.assertTrue(blind.ok, "no registered check can open a file")
+        self.assertEqual(EXIT_INTEGRITY_FAILED, seeing.exit_code)
+        self.assertEqual(
+            ["artifact_store"], [item.source for item in seeing.violations]
+        )
+        self.assertIn("hashes to", seeing.violations[0].detail)
+        self.assertEqual(blind.facts["checks"], seeing.facts["checks"], "not a registered check")
 
 
 class ArchiveTest(DatabaseCase):

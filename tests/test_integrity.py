@@ -6,23 +6,45 @@ every family is run in one pass, that a caller asking for fewer says which ones
 it ran, that a failure is reported as a refusal rather than as a number nobody
 reads, and that a database with no checks in it is not mistaken for a database
 that passed them.
+
+One thing the gate answers is not a registered check and could not be: an
+artifact's hash is a claim about bytes on a filesystem, and no SQL function can
+open a file. So the store is verified here too, and the cases are about what it
+costs -- a store nobody named must leave the report exactly as it was, and a
+store that is named must be able to fail the gate.
 """
 
 import unittest
+from pathlib import Path
 
-from redkraken import integrity, pg
+from redkraken import integrity, pg, store
 from redkraken.outcome import EXIT_INTEGRITY_FAILED, EXIT_OK, EXIT_SCHEMA_DRIFT, INTEGRITY_FAILED
+from tests.fixtures import scratch
 
 
 class FakeConnection:
-    """Answers the four statements the gate sends, and records that it did."""
+    """Answers the statements the gate sends, and records that it did."""
 
-    def __init__(self, *, baseline=(), roles=(), standing=(), installed=True, error=None):
+    def __init__(
+        self,
+        *,
+        baseline=(),
+        roles=(),
+        standing=(),
+        installed=True,
+        error=None,
+        references=(),
+        records_references=True,
+        references_error=None,
+    ):
         self.baseline = baseline
         self.roles = roles
         self.standing = standing
         self.installed = installed
         self.error = error
+        self.references = references
+        self.records_references = records_references
+        self.references_error = references_error
         self.statements: list[str] = []
         self.parameters: list[tuple] = []
 
@@ -31,6 +53,8 @@ class FakeConnection:
         self.parameters.append(tuple(parameters))
         if "to_regprocedure" in sql:
             return pg.Result(columns=("ok",), rows=((self.installed,),))
+        if "to_regclass" in sql:
+            return pg.Result(columns=("ok",), rows=((self.records_references,),))
         if self.error is not None:
             raise self.error
         if integrity.BASELINE in sql:
@@ -39,6 +63,10 @@ class FakeConnection:
             return pg.Result(columns=("check_name", "ok", "detail"), rows=tuple(self.roles))
         if integrity.STANDING in sql:
             return pg.Result(columns=("name", "problems", "detail"), rows=tuple(self.standing))
+        if "FROM artifact_references" in sql:
+            if self.references_error is not None:
+                raise self.references_error
+            return pg.Result(columns=("label", "sha256"), rows=tuple(self.references))
         raise AssertionError(f"unexpected statement: {sql}")
 
 
@@ -165,6 +193,119 @@ class VerifyTest(unittest.TestCase):
 
         self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
         self.assertIn("could not be run", result.violations[0].detail)
+
+
+class StoreVerificationTest(unittest.TestCase):
+    """The half of the record no registered check can reach.
+
+    `artifact_references.sha256` says some bytes hash to it. Nothing in SQL can
+    open the file, so a gate that never reads one passes over a store that has
+    been emptied -- which is the shape of unsoundness criterion 6 names, because
+    every later check that trusts a recorded hash is then trusting nothing.
+    """
+
+    def keep(self, plaintexts: dict[str, bytes]) -> tuple[Path, list[tuple[str, str]]]:
+        """A store holding these bytes, and the rows a database would record."""
+        root = scratch() / "artifacts"
+        deposit = store.Store(root)
+        return root, [(label, deposit.put(data)[0]) for label, data in plaintexts.items()]
+
+    def gate(self, **arguments) -> FakeConnection:
+        return FakeConnection(
+            baseline=(("server_major", True, "18.4"),),
+            standing=(("artifact_reachability", 0, ""),),
+            **arguments,
+        )
+
+    def test_a_store_nobody_named_is_not_asked_about_and_not_reported(self):
+        # The gate has to stay runnable by an operator who has no store on this
+        # machine, and a report that gained a null key would be a report every
+        # existing reader has to be taught about for no answer.
+        connection = self.gate()
+
+        result = integrity.verify(connection)
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("artifacts", result.as_dict())
+        self.assertFalse([sql for sql in connection.statements if "artifact_references" in sql])
+
+    def test_a_named_store_holds_every_recorded_artifact_against_its_bytes(self):
+        root, rows = self.keep({"AF1": b"first artifact\n", "AF2": b"second artifact\n"})
+
+        result = integrity.verify(self.gate(references=rows), store=root)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(EXIT_OK, result.exit_code)
+        self.assertEqual(
+            {"sound": True, "verified": 2, "broken": [], "root": str(root)},
+            result.as_dict()["artifacts"],
+        )
+
+    def test_the_store_is_reported_beside_the_checks_and_not_counted_as_one(self):
+        # `checks` is how many registered checkers ran. Counting this one would
+        # make the number disagree with `standing_checks` and would put a
+        # filesystem answer in a family that is about the database.
+        root, rows = self.keep({"AF1": b"first artifact\n"})
+
+        result = integrity.verify(self.gate(references=rows), store=root)
+
+        self.assertEqual(2, result.as_dict()["checks"])
+        self.assertEqual(["baseline", "standing"], result.as_dict()["families"])
+        self.assertEqual(
+            ["artifact_store"],
+            [item.name for item in result.assertions if item.name == "artifact_store"],
+        )
+
+    def test_bytes_that_are_gone_fail_the_gate_and_name_the_label(self):
+        root, rows = self.keep({"AF1": b"first artifact\n", "AF2": b"second artifact\n"})
+        store.path_for(root, rows[1][1]).unlink()
+
+        result = integrity.verify(self.gate(references=rows), store=root)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(
+            [(INTEGRITY_FAILED, "artifact_store")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        self.assertIn("AF2", result.violations[0].detail)
+        artifacts = result.as_dict()["artifacts"]
+        self.assertFalse(artifacts["sound"])
+        self.assertEqual(1, artifacts["verified"])
+        self.assertEqual(["AF2"], [item["label"] for item in artifacts["broken"]])
+
+    def test_bytes_that_changed_under_their_own_hash_fail_the_gate(self):
+        root, rows = self.keep({"AF1": b"first artifact\n"})
+        store.path_for(root, rows[0][1]).write_bytes(b"tampered\n")
+
+        result = integrity.verify(self.gate(references=rows), store=root)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertIn("hashes to", result.violations[0].detail)
+
+    def test_a_database_that_records_no_references_is_drift_rather_than_a_pass(self):
+        # An empty answer and a missing table read the same from a report that
+        # only counts rows, and they mean opposite things about the store.
+        root, _ = self.keep({"AF1": b"first artifact\n"})
+
+        result = integrity.verify(self.gate(records_references=False), store=root)
+
+        self.assertEqual(EXIT_SCHEMA_DRIFT, result.exit_code)
+        self.assertIn("run `rk db migrate`", result.violations[0].detail)
+
+    def test_references_that_cannot_be_read_are_a_failure_rather_than_an_empty_store(self):
+        # A connection refused the rows and a store with nothing recorded in it
+        # produce the same list. Only one of them means the record still holds.
+        root, _ = self.keep({"AF1": b"first artifact\n"})
+        connection = self.gate(references_error=failure("42501: permission denied"))
+
+        result = integrity.verify(connection, store=root)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(
+            [(INTEGRITY_FAILED, "database")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        self.assertFalse(result.as_dict()["artifacts"]["sound"])
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import config, migrate, pg
+from redkraken import config, migrate, pg, program
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -252,43 +252,20 @@ def read(
     if connection is None:
         return _report(ledger, state)
     with connection:
-        rows = connection.execute(
-            "SELECT id::text FROM programs WHERE slug = $1", (slug,)
-        ).rows
-        if not rows:
-            ledger.fail(
-                "program",
-                f"no Program is named {slug}; `rk run --config` opens one",
-                code=INVALID_CONFIGURATION,
-                source="database",
-            )
+        state.program_id = program.resolve(ledger, connection, slug)
+        if state.program_id is None:
             return _report(ledger, state)
-        state.program_id = str(rows[0][0])
-    ledger.hold("program", f"{slug} resolved on the runtime connection")
 
     session = migrate.open_connection(ledger, agent)
     if session is None:
         return _report(ledger, state)
     with session:
-        if not _assert_agent_connection(ledger, session):
+        if not assert_agent_connection(ledger, session):
             return _report(ledger, state)
         with session.transaction():
             session.execute("SET TRANSACTION READ ONLY")
-            session.execute(
-                "SELECT set_config('rk2.program_id', $1, true)", (state.program_id,)
-            )
-            bound_to = session.execute("SELECT rk2_program()::text").scalar()
-            if str(bound_to) != state.program_id:
-                ledger.fail(
-                    "program_binding",
-                    "the session did not bind to the Program; every read would be refused",
-                    code=INTEGRITY_FAILED,
-                    source="database",
-                )
+            if not bind_agent_session(ledger, session, state.program_id):
                 return _report(ledger, state)
-            ledger.hold(
-                "program_binding", "bound by session context; no read names a Program"
-            )
 
             compact = records(session, per_kind=per_kind, byte_limit=byte_limit)
             state.compact = compact.summary()
@@ -326,13 +303,17 @@ def _report(ledger: Ledger, state: _State) -> Report:
     )
 
 
-def _assert_agent_connection(ledger: Ledger, session: pg.Connection) -> bool:
+def assert_agent_connection(ledger: Ledger, session: pg.Connection) -> bool:
     """Refuse a connection that is not the one this command is about.
 
     Two properties, and the second is the one worth spending a query on. A
     connection that can read `programs` can tell a label nobody holds from a
     label another Program holds, by asking a second question — so a read that
     claims indistinguishable absence has to establish that it cannot.
+
+    Public because `rk artifact get` makes the same claim about the same role,
+    and two copies of "is this really the agent connection" would be two answers
+    the day one of them is updated.
     """
     user = str(session.execute("SELECT current_user").scalar())
     if user != STATE_ROLE:
@@ -356,6 +337,34 @@ def _assert_agent_connection(ledger: Ledger, session: pg.Connection) -> bool:
         )
         return False
     ledger.hold("state_connection", f"connected as {user}; the Program registry is unreadable")
+    return True
+
+
+def bind_agent_session(ledger: Ledger, session: pg.Connection, program_id: str) -> bool:
+    """Tell the agent's session which Program it is, and check that it took.
+
+    Called inside the caller's transaction, because `set_config(..., true)` is
+    scoped to one and a binding that outlived it would be a Program the next
+    statement inherits by accident. The read-back is not ceremony: if the setting
+    did not land, `rk2_program()` is null, every policy denies, and the session
+    would report an empty Program rather than a broken one -- which reads exactly
+    like isolation working.
+
+    Public for the same reason `assert_agent_connection` is: `rk state` and
+    `rk artifact get` bind the same way, and the day the mechanism changes it
+    should change in one place.
+    """
+    session.execute("SELECT set_config('rk2.program_id', $1, true)", (program_id,))
+    bound = session.execute("SELECT rk2_program()::text").scalar()
+    if str(bound) != program_id:
+        ledger.fail(
+            "program_binding",
+            "the session did not bind to the Program; every read would be refused",
+            code=INTEGRITY_FAILED,
+            source="database",
+        )
+        return False
+    ledger.hold("program_binding", "bound by session context; no read names a Program")
     return True
 
 
