@@ -16,7 +16,7 @@
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `0af60f6` on
-2026-08-10.
+2026-08-10, with fourteen review findings closed in `62cc499` on the same day.
 
 `src/redkraken/scope.py` is the compiler and the evaluator, `_project_scope` in
 `src/redkraken/program.py` writes what it produced, `rk scope` is the adapter
@@ -39,11 +39,11 @@ place where scope is decided.
 
 ### What is asserted, and by what
 
-`tests/test_scope.py` is 48 offline tests with no database in it:
+`tests/test_scope.py` is 59 offline tests with no database in it:
 `CompilationTest` (13) on what compiles and what is refused, `CanonicalFormTest`
-(10) on the forms that are folded and the forms that are rejected,
+(18) on the forms that are folded and the forms that are rejected,
 `RequiredHeaderTest` (3), `PermissionTest` (3), `DiscoveryTest` (6) and
-`VerdictTest` (13) on the fixture matrix itself.
+`VerdictTest` (16) on the fixture matrix itself.
 
 `SCOPE_REQUESTS`, `SCOPE_ENTITIES` and `SCOPE_REFUSALS` in `tests/fixtures.py`
 are that matrix, and it is asked three times over. `VerdictTest` asks it in
@@ -134,25 +134,81 @@ grammar has no word for is refused rather than answered false, because an
 operator who writes `exfiltration` has said something, and answering "not
 permitted" would let them believe the question was understood.
 
+### What review changed
+
+`/code-review` on `0af60f6` returned sixteen findings. Fourteen were real and
+are fixed in `62cc499`; two were wrong.
+
+Two were structural. The migration dropped 0021's four-argument
+`scope_class_of` and created an eight-argument one, which orphaned
+`gate_tool_call` (0026) and `authorize_egress_request` (0039) -- both call the
+old arity, and the two new arguments spliced mid-list would have bound their
+positional arguments to the wrong parameters. The new arguments now go on the
+end with defaults. And `check_scope_policy()` rule 1 was a deadlock: "every
+configured Program has a scope version" fails for the Program being opened right
+now, because the standing gate runs at `program.py:231` and `_project_scope`
+cannot promote a version until 252, so a fresh `rk run` could never pass its own
+gate. It now fails only a Program that has compiled versions and points at none.
+
+Nine were canonicalization holes -- each one a request the policy read
+differently from the way it is served: single-pass percent-decoding, so
+`%252e%252e` survived as a literal and walked out of an excluded prefix; the two
+leading slashes `normpath` preserves, so `//admin` was not under `/admin`; bare
+`startswith`, so `/v1` authorized `/v1-internal/dump`; prefixes stored in the
+operator's verbatim spelling, so an exclusion written `/%69nternal/` never
+matched a canonical path; `str.strip()` removing Unicode spaces where `btrim`
+removes none; `inet` accepting leading-zero octets that `ipaddress` refuses;
+`::1.2.3.4` rendering as `::102:304` on one side and `::1.2.3.4` on the other;
+`str.isdigit()` accepting `٤` and `⁴` as port digits, the latter raising a bare
+`ValueError` out of `int()`; and `_IPV6` matching hex without requiring a colon,
+so `db`, `cafe` and `ec2` were malformed addresses rather than hostnames.
+
+Two were plain bugs: `Request` took any word as its `question` and anything
+unrecognised fell through to the widest polarity, which is a subtree match --
+an unknown question answered as the most permissive one -- and
+`ScopeEvaluatorTest.compiled()` compiled a configuration named `scope` while the
+test opens a Program named `matrix`, so the digest it stored described a policy
+the Program does not have.
+
+The two that were wrong: PostgreSQL's `lower(U&'\212A')` returns `k` under
+UTF-8, so there is no Kelvin-sign divergence from Python's `str.lower()`; and
+`scope_normalize_host` already wraps its `v::inet` cast in `EXCEPTION WHEN
+others THEN RETURN NULL`, so a malformed literal was never going to raise out of
+it. One more is unresolved rather than dismissed: review reported the rebuilt
+`scope_class_of` at 36 080 ms against 406 ms for 0021's, and that could not be
+reproduced -- the live run applies the corpus and asks the whole matrix through
+both functions in 13 s. It is recorded here as a claim nobody has confirmed, on
+a table with no rows in it worth planning around yet.
+
 ### Raised by review and deliberately not built here
 
-- **The live-database half of this ticket has never been executed.** Every prior
-  ticket in this branch was verified against `pgvector/pgvector:pg18`; this
-  environment has no container runtime (podman cannot write `/run/user/1000`,
-  the docker socket refuses the connection) and no pgvector for the local
-  PostgreSQL 18.3, and `0010_embeddings.sql` builds an `hnsw` index over
-  `vector_cosine_ops`, so a stub extension is not possible. The offline suite is
-  421 tests, green, with 13 skipped -- and those 13 are the whole of
-  `tests/test_database.py`, which includes all 11 `ScopeEvaluatorTest` tests, the
-  three new negative controls, and therefore every assertion about
-  `scope_class_of`, `check_scope_policy()`, the header grants and the immutability
-  trigger. The migration itself has never been applied. It was written against
-  the catalogue definitions it depends on and read against them line by line, but
-  reading is not running: **this ticket's SQL needs one run with a server present
-  before it should be trusted.** `tools/check_baseline.py` reports
-  `classifications=10 regressions=7 artifacts=223`, unchanged, and
-  `python3 -m compileall -q src tests` is clean, which remains what runs in place
-  of a typechecker.
+- **The live-database half did run, on a cluster built for it.** This
+  environment has no container runtime -- podman cannot write `/run/user/1000`
+  and the docker socket refuses the connection -- so the earlier tickets'
+  `pgvector/pgvector:pg18` image was unavailable, and for a while this ticket's
+  457 lines of SQL had only ever been read. What unblocked it is
+  `extension_control_path`, new in PostgreSQL 18: pgvector 0.8.1 built from
+  source with the distribution's PGXS and installed under a `DESTDIR` in `/tmp`,
+  then pointed at with `extension_control_path` and `dynamic_library_path` on a
+  scratch PostgreSQL 18.3 cluster listening on a Unix socket only. No corpus file
+  was modified and nothing was stubbed -- `0001_extensions.sql` creates the real
+  extension, `0010_embeddings.sql` builds both real `hnsw` indexes, and the
+  `PERFORM '[1]'::vector` that 0027 and 0028 use to force the library into the
+  backend does what it was written to do. `RK_TEST_SUPERUSER_URL` pointed at that
+  socket, and `tests/test_database.py` provisioned the seven roles, applied the
+  whole corpus twice and ran all 115 of its tests green, `ScopeEvaluatorTest`'s
+  11 among them, in 13 s. The full suite is **547 tests, green, nothing
+  skipped**, which is the first time in this branch that no test skipped for want
+  of a server. Specifically now executed rather than read: the migration itself,
+  `scope_class_of` and `scope_class_of_entity` over every row of the matrix
+  including the cited ordinal, `check_scope_policy()` and its three negative
+  controls through `test_each_check_fails_when_its_subject_is_broken`, its
+  registration in `standing_checks` through
+  `test_every_check_the_gate_runs_has_a_control`, the `program_required_headers`
+  grants, and the `ENABLE ALWAYS` immutability trigger.
+  `tools/check_baseline.py` reports `classifications=10 regressions=7
+  artifacts=223`, unchanged, and `python3 -m compileall -q src tests` is clean,
+  which remains what runs in place of a typechecker.
 - **Nothing resolves a host to an address.** The compiler refuses a private or
   loopback literal in an inclusion, but a hostname that *resolves* to one is
   accepted, because resolving it would mean a DNS query at compile time -- the
@@ -184,7 +240,21 @@ permitted" would let them believe the question was understood.
 - **Callback channels are matched, not verified.** An observed interaction is
   matched against the declared channel hosts, and nothing proves the interaction
   really arrived on that channel -- there is no listener in this branch to prove
-  it from.
+  it from. Review read `decide_callback` consulting only the channel list, and
+  not the scope rules, as a hole; it is the intent. A callback host is harness
+  infrastructure the operator declares, not a target surface the program
+  authorized, so requiring it to also be in scope would make every operator write
+  their own collaborator domain into `scope.include` -- an inclusion that then
+  reads as permission to attack it.
+- **`tier` and `default_tier` stay NULL.** 0021 gives `program_scope_rules` a
+  `tier` column, `program_scope_versions` a `default_tier`, and `scope_class_of`
+  a `tier` in its return row. The compiler has no tier at all: `Rule.row()` names
+  thirteen columns and that is not one of them, so the projection leaves both
+  NULL and every verdict carries a NULL tier. The configuration grammar has no
+  word an operator could set one from, which is why the compiler does not read
+  one. Same category as the unreachable `cidr` kind: 0021's surface, kept because
+  a program that ranks its assets is a thing the grammar will eventually have to
+  say.
 - **The glossary is not updated.** `CONTEXT.md` defines **Scope Policy** and says
   nothing about a compiled version, a grammar version or a policy digest. As with
   tickets 06 and 07, no implementation ticket in this branch edits that file, so
