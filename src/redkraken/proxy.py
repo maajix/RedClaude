@@ -45,7 +45,7 @@ on every Receipt to say so.
 The address is decided before the socket, and then pinned. The name is resolved
 once, *after* the capability has been spent and the scope check has passed --
 never before, because a DNS query is itself egress, and one made on behalf of a
-request that was going to be refused is a channel out of this machine that no
+request that was going to be refused is a packet leaving this machine that no
 Receipt names. Every address the name answers with has to be one the public
 internet routes to, and the one that will be dialled is re-decided against the
 Program's own policy as a literal address, so a name pointing at loopback, at a
@@ -126,13 +126,14 @@ __all__ = [
     "listen",
     "merge_control",
     "origin_form",
+    "pinned_ips",
     "query_sha256",
     "redirected",
     "resolve",
-    "routable",
     "send",
     "serve",
     "take_control",
+    "unroutable",
 ]
 
 
@@ -278,7 +279,7 @@ class Refused(Exception):
         *,
         status: int = 407,
         target_status: int | None = None,
-        pinned: str | None = None,
+        pinned: tuple[str, ...] = (),
     ) -> None:
         super().__init__(detail or reason)
         self.reason = reason
@@ -294,6 +295,10 @@ class Refused(Exception):
         #: the line that refuses an address is the only line that knows which
         #: addresses were on the table, and a blocked Receipt that named none of
         #: them would say a name was refused without saying what it pointed at.
+        #:
+        #: Always the addresses rather than one of them joined into a string, so
+        #: that a refusal knowing one and a refusal knowing four are the same
+        #: kind of thing here and `pinned_ips` is written in one place.
         self.pinned = pinned
 
 
@@ -584,21 +589,6 @@ AUTHORIZE_ADDRESS = (
 #: separates them from each other.
 LAPSED = "egress capability refused"
 
-
-def _refusal(error: pg.DatabaseError, address: str) -> Refused:
-    """Which of the two things the address decision refuses, this one was.
-
-    The address check resolves the capability again before it looks at anything
-    else, so a Tool run that closed, a Program that was retired or a task lease
-    that lapsed between the two decisions arrives here rather than at the first
-    one. Filing that as `address refused` would be a Receipt sending an auditor
-    to look at an address that was never the problem, so it is filed under the
-    same reason the first decision would have used, and the address it had
-    already pinned rides along either way.
-    """
-    reason = "capability refused" if LAPSED in str(error) else "address refused"
-    return Refused(reason, str(error), pinned=address)
-
 #: One call, one transaction: the artifacts of the exchange and the Receipt that
 #: names them are written together or not at all. A Receipt naming bytes no row
 #: registered is a dangling reference, and rows for bytes no Receipt names are
@@ -618,6 +608,21 @@ def _object(answer: object) -> dict:
     to disagree about what an answer with no rows looks like.
     """
     return json.loads(answer) if isinstance(answer, str) else dict(answer)
+
+
+def _refusal(error: pg.DatabaseError, address: str) -> Refused:
+    """Which of the two things the address decision refuses, this one was.
+
+    The address check resolves the capability again before it looks at anything
+    else, so a Tool run that closed, a Program that was retired or a task lease
+    that lapsed between the two decisions arrives here rather than at the first
+    one. Filing that as `address refused` would be a Receipt sending an auditor
+    to look at an address that was never the problem, so it is filed under the
+    same reason the first decision would have used, and the address it had
+    already pinned rides along either way.
+    """
+    reason = "capability refused" if LAPSED in str(error) else "address refused"
+    return Refused(reason, str(error), pinned=(address,))
 
 
 class Fence:
@@ -711,7 +716,7 @@ class Fence:
                 # auditor looking at the address, which was never the problem.
                 raise _refusal(error, address) from error
         if not rows:
-            raise Refused("address refused", "no address verdict", pinned=address)
+            raise Refused("address refused", "no address verdict", pinned=(address,))
 
     def allowed_receipt(
         self, program_id: str, capability: str, receipt: dict, artifacts: list[dict]
@@ -768,8 +773,12 @@ def resolve(host: str, port: int) -> tuple[str, ...]:
     return tuple(info[4][0] for info in found)
 
 
-def routable(address: str) -> str | None:
+def unroutable(address: str) -> str | None:
     """Why one address may not be dialled from here, or nothing when it may.
+
+    Named for the answer it gives rather than for the question: it speaks when
+    an address is refused and stays silent when it is not, so `routable` would
+    have read as true at every call site where it means the opposite.
 
     Deny by default, like the policy above it: an address is dialled because it
     is one the public internet routes to, not because it failed to match a list
@@ -828,14 +837,26 @@ def destination(host: str, port: int, resolver: Resolver) -> tuple[str, ...]:
     if not addresses:
         raise Refused("target unresolved", f"{host} resolves to no address at all")
     for address in addresses:
-        refused = routable(address)
+        refused = unroutable(address)
         if refused is not None:
             raise Refused(
                 "address refused",
                 f"{host} does not resolve to a public address: {refused}",
-                pinned=",".join(addresses),
+                pinned=addresses,
             )
     return addresses
+
+
+def pinned_ips(addresses: tuple[str, ...]) -> str:
+    """Every address a name answered with, in the column a Receipt reads it from.
+
+    One spelling for the allowed row and the blocked one, because an auditor
+    filtering `pinned_ips` across both is filtering one format. The order is the
+    resolver's, so the address that was dialled -- or would have been -- is the
+    first, and a row with several is a name that answered with several rather
+    than a request that went to more than one place.
+    """
+    return ",".join(addresses)
 
 
 def connect(
@@ -1165,7 +1186,10 @@ class Handler(BaseHTTPRequestHandler):
         What comes back is every address, not the one that was chosen. The
         Receipt names them all: an auditor asking why a name was refused needs to
         see what it answered with, and an auditor reading an allowed exchange
-        needs to see that the other answers were checked too.
+        needs to see that the other answers were checked too. Only the first is
+        put to the policy, because only the first is dialled -- the rest are held
+        to being routable and to being recorded, and a Program that withdrew one
+        of them has withdrawn a machine this request never contacted.
         """
         addresses = destination(request.host, request.port, self.server.resolver)
         self.server.fence.authorize_address(
@@ -1176,7 +1200,7 @@ class Handler(BaseHTTPRequestHandler):
     def _exchange(
         self,
         request: scope.Request,
-        address: str,
+        addresses: tuple[str, ...],
         target: str,
         headers: list[tuple[str, str]],
         body: bytes,
@@ -1186,7 +1210,14 @@ class Handler(BaseHTTPRequestHandler):
         Every refusal from here is one that happened after the socket was opened,
         which is why they are raised together: the caller of this method knows the
         request left the machine and records that on all of them.
+
+        The whole answer set comes in and the first of it is dialled, so that a
+        target that never came back is recorded with the same addresses an
+        exchange that did would have named. A row saying one address for a failed
+        connection and four for a successful one would read as two different
+        facts about the same lookup.
         """
+        address = addresses[0]
         try:
             connection = self.server.connector(
                 request.host,
@@ -1218,7 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 connection.close()
         except (OSError, http.client.HTTPException) as error:
-            raise Refused("target unreachable", str(error), pinned=address) from error
+            raise Refused("target unreachable", str(error), pinned=addresses) from error
         if len(returned) > CEILING:
             raise Refused(
                 "response too large",
@@ -1250,11 +1281,10 @@ class Handler(BaseHTTPRequestHandler):
         target = origin_form(url)
         line = f"{self.command} {target} HTTP/1.1"
 
-        pinned = addresses[0]
         egress = datetime.now(timezone.utc)
         try:
             status, reason, back, returned = self._exchange(
-                request, pinned, target, headers, body
+                request, addresses, target, headers, body
             )
         except Refused as refusal:
             return self._refuse(
@@ -1311,11 +1341,13 @@ class Handler(BaseHTTPRequestHandler):
             "scope_class": authorization.scope_class,
             "intercepted": True,
             # Every address the name answered with, and the one that was dialled
-            # is the first. All of them, because the check that let this request
-            # through was made of all of them, and a record naming only the one
-            # that was used could not be read back as evidence that the rest were
-            # looked at.
-            "pinned_ips": ",".join(addresses),
+            # is the first. All of them, because every one of them had to be an
+            # address the public internet routes to for this request to be here
+            # at all, and a record naming only the one that was used could not be
+            # read back as evidence that the rest were looked at. What the policy
+            # was asked about is the first alone -- the one a socket was opened
+            # to -- so this column is the lookup's answer and not the verdict's.
+            "pinned_ips": pinned_ips(addresses),
             "notes": f"redirect to {onward}" if onward else None,
         }
         artifacts = [
@@ -1414,11 +1446,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         if refusal.target_status is not None:
             receipt["status_code"] = refusal.target_status
-        if refusal.pinned is not None:
+        if refusal.pinned:
             # Only on the refusals that got far enough to have one. A blocked
             # Receipt saying an address was refused, with no address in it, tells
             # an auditor that a name misbehaved without telling them how.
-            receipt["pinned_ips"] = refusal.pinned
+            receipt["pinned_ips"] = pinned_ips(refusal.pinned)
         written: str | None = None
         try:
             written = self.server.fence.blocked_receipt(program_id, capability, receipt)

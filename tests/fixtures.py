@@ -123,6 +123,25 @@ kind = "dns"
 host = "dns.example.org"
 """
 
+#: What every name in the egress suites resolves to, and the one address the
+#: configuration above withdraws. Here rather than in either suite, because the
+#: second of them has to be the address the `[[scope.exclude]]` rule names: a
+#: test asserting "the Program withdrew this" and a rule written about a
+#: different address would pass while proving nothing. Public, because the door
+#: refuses to dial an address that is not, and deliberately not where any fixture
+#: listens -- the connector is what puts a request on the loopback port, and
+#: keeping the decided address apart from the dialled socket is what lets a test
+#: assert that the one decided is the one handed over. One octet apart, so a rule
+#: that matched loosely would match both.
+PINNED = "93.184.216.34"
+WITHDRAWN = "93.184.216.35"
+
+#: The configuration is a literal so that it reads as one, so this is what keeps
+#: the two agreeing: a name changed in one place and not the other would leave
+#: every withdrawal test passing against a rule about some other machine.
+assert f'host = "{WITHDRAWN}"' in SCOPED, "SCOPED must exclude the withdrawn address"
+assert PINNED not in SCOPED, "SCOPED must say nothing about the pinned address"
+
 #: One request, and the verdict every evaluator must reach about it: the URL,
 #: the scope class and the reason. Decided in Python, through the CLI and in SQL,
 #: because "the policy" is only one policy if the three agree.
@@ -155,11 +174,11 @@ SCOPE_REQUESTS = (
     ("https://token.callback.example.org/", "denied", "unlisted"),
     # A DNS channel is not an HTTP destination.
     ("https://dns.example.org/", "denied", "unlisted"),
-    ("https://93.184.216.34/", "denied", "unlisted"),
+    (f"https://{PINNED}/", "denied", "unlisted"),
     # An address rule matches the address it names and no neighbour of it: there
     # is no candidate ladder under an address, so `*.216.34` is not a rule and
-    # `93.184.216.34` is not covered by the exclusion one octet away.
-    ("https://93.184.216.35/", "denied", "excluded"),
+    # the pinned address is not covered by the exclusion one octet away.
+    (f"https://{WITHDRAWN}/", "denied", "excluded"),
 )
 
 #: One URL that cannot be canonicalised, and the reason. These never reach SQL:
@@ -254,6 +273,13 @@ class Redirecting(Target):
     answered = "/followed"
 
     def do_GET(self) -> None:
+        # The 200 half is `Target`'s, called rather than copied: what the target
+        # saw is recorded in one place, so a suite reading `seen` after a
+        # redirect is reading the same tuple as a suite reading it after a plain
+        # exchange.
+        if self.path == self.answered:
+            super().do_GET()
+            return
         self.server.seen.append(
             (
                 self.command,
@@ -261,13 +287,6 @@ class Redirecting(Target):
                 [(name.lower(), value) for name, value in self.headers.items()],
             )
         )
-        if self.path == self.answered:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(self.answer)))
-            self.end_headers()
-            self.wfile.write(self.answer)
-            return
         self.send_response(303)
         self.send_header("Location", self.elsewhere)
         self.send_header("Content-Length", "0")

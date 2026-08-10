@@ -1,4 +1,7 @@
--- Ticket 11: the destination is decided as an address, not only as a name.
+-- ===========================================================================
+-- Production harness 11 -- the destination is decided as an address, not only
+-- as a name
+-- ===========================================================================
 --
 -- What was here before decided a request once, against the hostname the caller
 -- asked for, and then handed that hostname to the socket layer to resolve for
@@ -46,6 +49,14 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
 DECLARE
+    -- What a normalized address looks like, and nothing else does. The same two
+    -- shapes `scope_normalize_host` uses to decide it is holding an address:
+    -- four dotted decimal groups, or hexadecimal with at least one colon in it.
+    -- The colon is why it is spelled this way rather than as a character class
+    -- -- `cafe` is a legal single-label hostname and is made entirely of
+    -- hexadecimal digits -- and the four groups are why `1.2.3` is a name here,
+    -- as it is there, rather than the address `inet` would widen it into.
+    v_shape   constant text := '^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-f]*:[0-9a-f:]*)$';
     v_auth    record;
     v_version integer;
     v_address text;
@@ -75,11 +86,11 @@ BEGIN
 
     -- An address, and nothing that merely looks like one. `scope_normalize_host`
     -- answers with a bare host for a name and with the canonical spelling for an
-    -- address, so the regular expression is what separates the two: a caller
-    -- passing a hostname here would be asking the policy about the thing it was
-    -- already asked about, and getting a second yes for free.
+    -- address, so the shape above is what separates the two: a caller passing a
+    -- hostname here would be asking the policy about the thing it was already
+    -- asked about, and getting a second yes for free.
     v_address := scope_normalize_host(p_address);
-    IF v_address IS NULL OR v_address !~ '^([0-9.]+|[0-9a-f:]+)$' THEN
+    IF v_address IS NULL OR v_address !~ v_shape THEN
         RAISE EXCEPTION 'egress destination % is not an address',
             coalesce(p_address, '<null>') USING ERRCODE = '23514';
     END IF;
@@ -88,7 +99,7 @@ BEGIN
     -- is dialled at must be the address it named. A proxy handing over a
     -- different one would be asking about a destination it is not about to open.
     v_asked := scope_normalize_host(p_host);
-    IF v_asked ~ '^([0-9.]+|[0-9a-f:]+)$' AND v_asked IS DISTINCT FROM v_address THEN
+    IF v_asked ~ v_shape AND v_asked IS DISTINCT FROM v_address THEN
         RAISE EXCEPTION
             'egress destination % is not the address % the request named',
             v_address, v_asked USING ERRCODE = '23514';

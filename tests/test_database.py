@@ -66,10 +66,12 @@ from redkraken.outcome import (
 )
 from redkraken.store import Store
 from tests.fixtures import (
+    PINNED,
     SCOPE_ENTITIES,
     SCOPE_REQUESTS,
     SCOPED,
     VALID,
+    WITHDRAWN,
     Target,
     counterparty,
     scratch,
@@ -3159,17 +3161,6 @@ URL = "http://app.example.com/notes"
 #: is the transport and nothing about the decision.
 SECURE = "https://app.example.com/notes"
 
-#: What every name in this suite resolves to. A public address, because the door
-#: refuses to dial one that is not, and `127.0.0.1` -- where the target actually
-#: listens -- is exactly what a rebinding answer looks like. So the resolver
-#: answers what a real zone would and `connector` is still where the socket goes.
-PINNED = "93.184.216.34"
-
-#: The one address `SCOPED` withdraws. One octet away from `PINNED`, so a rule
-#: that matched loosely would match both and the test asserting a refusal would
-#: pass for the wrong reason.
-WITHDRAWN = "93.184.216.35"
-
 
 class LiveTarget(Target):
     """The shared recording counterparty, answering this suite's own body."""
@@ -3628,9 +3619,9 @@ class ProxyEgressTest(DatabaseCase):
         # The half of criterion 2 a policy written in names cannot answer on its
         # own. The name is in scope and the first decision allows it; what comes
         # back from resolution is an address this Program excluded, and the
-        # exchange stops there. `SCOPED` withdraws `93.184.216.35`, one octet
-        # from the address every other test pins, so a rule that matched loosely
-        # would make this pass for the wrong reason.
+        # exchange stops there. What `SCOPED` withdraws is one octet from the
+        # address every other test pins, so a rule that matched loosely would
+        # make this pass for the wrong reason.
         self.resolving_to(WITHDRAWN)
         capability, tool_run, _ = self.mint("a")
         dialled = len(self.dialled)
@@ -4064,6 +4055,41 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("running", str(row[0]))
         self.assertTrue(row[1], "the capability was still live")
         self.assertIsNone(row[2])
+
+    def test_a_name_made_of_hexadecimal_is_a_name_and_not_an_address(self):
+        # The address decision refuses a request whose *host* was already an
+        # address and whose pinned address is a different one, because a caller
+        # that resolved nothing has nothing to disagree about. Which hosts count
+        # as addresses is therefore load-bearing: `cafe` is a legal single-label
+        # hostname made entirely of hexadecimal digits, and a shape test loose
+        # enough to call it an address would refuse it forever, whatever the
+        # policy said. `1.2.3` is the same trap from the other side -- `inet`
+        # widens it into an address and `scope_normalize_host` does not.
+        capability, _, _ = self.mint("a")
+
+        for host in ("cafe", "1.2.3", "app.example.com"):
+            with self.subTest(host=host):
+                self.fence.authorize_address(
+                    self.identifiers["a"],
+                    capability,
+                    scope.canonical_request(f"http://{host}/notes"),
+                    PINNED,
+                )
+
+        # And an address literal that disagrees with the pin is still refused,
+        # which is the rule the shape test exists to apply. The pinned address
+        # here is one no rule mentions, so the only thing left to refuse it is
+        # the disagreement itself.
+        with self.assertRaises(proxy.Refused) as raised:
+            self.fence.authorize_address(
+                self.identifiers["a"],
+                capability,
+                scope.canonical_request(f"http://{PINNED}/notes"),
+                "93.184.216.36",
+            )
+
+        self.assertEqual("address refused", raised.exception.reason)
+        self.assertIn("is not the address", raised.exception.detail)
 
     def test_another_programs_request_between_the_decision_and_the_write_records_anyway(self):
         # The fence holds one connection for every handler thread, the Program is
