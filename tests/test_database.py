@@ -30,16 +30,31 @@ survives the transaction is their subject.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import secrets
 import shutil
+import threading
 import unittest
 from dataclasses import dataclass
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from redkraken import artifact, backup, config, integrity, migrate, pg, program, scope, seal, state
+from redkraken import (
+    artifact,
+    backup,
+    config,
+    integrity,
+    migrate,
+    pg,
+    program,
+    proxy,
+    scope,
+    seal,
+    state,
+)
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
@@ -47,7 +62,16 @@ from redkraken.outcome import (
     EXIT_OK,
     Report,
 )
-from tests.fixtures import SCOPE_ENTITIES, SCOPE_REQUESTS, SCOPED, VALID, scratch, write
+from redkraken.store import Store
+from tests.fixtures import (
+    SCOPE_ENTITIES,
+    SCOPE_REQUESTS,
+    SCOPED,
+    VALID,
+    Target,
+    scratch,
+    write,
+)
 
 
 SUPERUSER_URL = os.environ.get("RK_TEST_SUPERUSER_URL", "")
@@ -96,6 +120,10 @@ class Harness:
     #: owns nothing, writes nothing and cannot resolve a Program, so everything
     #: it returns is what row level security left it.
     state: pg.Settings
+    #: What `rk proxy serve` holds: EXECUTE on two writers and no DML of its own.
+    #: The fence is tested through this one because a proxy tested as the owner
+    #: would prove nothing about the role a compromised proxy would be holding.
+    proxy: pg.Settings
     passwords: dict[str, str]
     migrations: tuple[migrate.Migration, ...]
     created: object = None
@@ -153,6 +181,9 @@ def _build() -> Harness:
         ),
         state=admin.replace(
             database=DATABASE, user="rk2_state", password=passwords["rk2_state"]
+        ),
+        proxy=admin.replace(
+            database=DATABASE, user="rk2_proxy", password=passwords["rk2_proxy"]
         ),
         passwords=passwords,
         migrations=migrations,
@@ -636,6 +667,22 @@ CONTROLS = (
         "ALTER FUNCTION rk2_descriptor(uuid) SECURITY DEFINER",
     ),
     Control("standing:capability_receipt_fence", "GRANT INSERT ON receipts TO rk2_proxy"),
+    Control(
+        # Rule 4: the writer that checks nothing, reachable again. Every rule
+        # `record_proxy_exchange` enforces is optional for a role that can call
+        # what it delegates to, so the grant itself is the falsification.
+        "standing:capability_receipt_fence",
+        "GRANT EXECUTE ON FUNCTION write_allowed_receipt(text, jsonb) TO rk2_proxy",
+    ),
+    Control(
+        # Rule 5: the gap 07's seal rule left for `register_proxy_artifacts`,
+        # which this branch dropped. An encrypted artifact with no bytes is no
+        # longer a placeholder for bytes somebody else registered; it is
+        # credential-bearing material with no seal over it.
+        "standing:capability_receipt_fence",
+        "INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
+        " VALUES (" + repeat("a") + ", 0, 'credential_bearing', true)",
+    ),
     Control("standing:program_isolation", "CREATE TABLE public.orphan_table (id uuid PRIMARY KEY)"),
     Control(
         # A Program opened by hand around `rk run`, which is what the check is
@@ -3087,6 +3134,527 @@ class SealedWireArtifactTest(DatabaseCase):
         self.assertEqual(EXIT_INTEGRITY_FAILED, seeing.exit_code)
         self.assertEqual(["artifact_store"], [item.source for item in seeing.violations])
         self.assertIn("not in the store", seeing.violations[0].detail)
+
+
+#: The Programs the proxy tests open. Three: the one that makes the request, one
+#: it is not, and one that is retired while its capability is still live.
+PROXY_SLUG = "selftest-proxy"
+
+#: What the target answers. Distinctive so that finding it in a transcript is
+#: unambiguous, and long enough that a byte count is a real measurement.
+ANSWER = b'{"note":"the target answered the proxy","items":[1,2,3,4,5,6,7,8]}'
+
+#: The request the matrix already decides: `http://app.example.com/` is `target`
+#: under `SCOPED`, on port 80, over http. Loopback can never be a scope
+#: inclusion, so this is the name the proxy asks about and `connector` is where
+#: the socket actually goes.
+URL = "http://app.example.com/notes"
+
+
+class LiveTarget(Target):
+    """The shared recording counterparty, answering this suite's own body."""
+
+    answer = ANSWER
+
+
+class ProxyEgressTest(DatabaseCase):
+    """PH2-09: one request through the door, and five that never reach it.
+
+    The half of ticket 09 only a server can answer. `tests/test_proxy.py` holds
+    the other half -- what the door does with the bytes -- against a stub; here
+    the fence is `rk2_proxy` on a real connection, the capability is minted by
+    `authorize_tool_run`, and every refusal is a row somebody can read afterwards.
+
+    Three things make this a test of the production path rather than of a
+    rehearsal of it. The runtime half is `proxy.send`, the same function
+    `rk proxy request` calls. The fence holds the proxy role, so anything it
+    manages to write is something a compromised proxy could write. And the
+    target is reached through the `connector` seam rather than through DNS,
+    because `127.0.0.1` can never be in a Program's scope -- what is faked is
+    the address, and nothing about the decision that authorised it.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        cls.root = scratch() / "proxy-store"
+
+        cls.identifiers = {}
+        cls.configurations = {}
+        for name in ("a", "b", "retired"):
+            path = write(SCOPED.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.target = ThreadingHTTPServer(("127.0.0.1", 0), LiveTarget)
+        cls.target.seen = []
+        cls.target.daemon_threads = True
+        threading.Thread(target=cls.target.serve_forever, daemon=True).start()
+
+        cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
+        cls.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=cls.fence,
+            store=Store(cls.root),
+            connector=cls.dial,
+        )
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+        # The one exchange every criterion but the fifth is read from. Run once,
+        # in setup, because it commits: repeating it per test would multiply the
+        # Receipts the counting assertions are about.
+        cls.sent = proxy.send(
+            cls.harness.runtime, cls.configurations["a"], URL, proxy_url=cls.proxy_url
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.fence.close()
+        cls.target.shutdown()
+        cls.target.server_close()
+        cls.runtime.close()
+
+        stored = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha])"
+                "  FROM receipts r JOIN programs p ON p.id = r.program_id"
+                " WHERE p.slug LIKE $1",
+                (f"{PROXY_SLUG}-%",),
+            ).rows
+            if row[0] is not None
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{PROXY_SLUG}-%",))
+            if stored:
+                cls.connection.execute(
+                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    ("{" + ",".join(stored) + "}",),
+                )
+        super().tearDownClass()
+
+    @classmethod
+    def dial(cls, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
+        """Every authorised name reaches the one target this machine is running."""
+        return http.client.HTTPConnection(
+            "127.0.0.1", cls.target.server_address[1], timeout=timeout
+        )
+
+    # -- the arms of criterion 5, each of which needs a capability of its own ---
+
+    def mint(self, name: str) -> tuple[str, str, str]:
+        """One Agent run, one Tool run and one live capability, committed.
+
+        Committed because the fence resolves it on a session of its own, which is
+        the arrangement production has and the reason these arms cannot be asked
+        inside a transaction that rolls back.
+        """
+        self.runtime.execute(proxy.BIND, (self.identifiers[name],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = self.runtime.execute(
+                proxy.OPEN_RUN,
+                (self.identifiers[name], "operator", json.dumps({"command": "selftest"})),
+            ).scalar()
+            opened = self.runtime.execute(
+                proxy.OPEN_TOOL_RUN,
+                (
+                    self.identifiers[name],
+                    str(run),
+                    proxy.TOOL,
+                    json.dumps({"url": URL, "method": "GET", "identity_slot": ""}),
+                ),
+            ).rows[0]
+        gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (str(opened[0]),)).scalar()
+        answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
+        capability = answer.get("capability")
+        self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
+        return str(capability), str(opened[0]), str(run)
+
+    def attempt(self, capability: str | None, program_id: str | None) -> tuple[int, str | None]:
+        """One request at the door, with whatever control headers it was given."""
+        headers = {}
+        if capability is not None:
+            headers[proxy.AUTHORIZATION] = f"RedKraken {capability}"
+        if program_id is not None:
+            headers[proxy.PROGRAM] = program_id
+        client = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
+        )
+        try:
+            client.request("GET", URL, headers=headers)
+            answer = client.getresponse()
+            answer.read()
+            return answer.status, answer.headers.get(proxy.DECISION)
+        finally:
+            client.close()
+
+    def owner(self, sql: str, parameters: tuple = ()) -> None:
+        """One statement as the role that owns the tables, committed."""
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(sql, parameters)
+
+    def version(self, name: str) -> int:
+        """The scope version the Program is on, which the Receipt cites by name."""
+        return int(
+            self.connection.execute(
+                "SELECT scope_version FROM programs WHERE id = $1::uuid",
+                (self.identifiers[name],),
+            ).scalar()
+        )
+
+    def receipts(self, name: str) -> list[tuple]:
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), row[3], str(row[4]))
+            for row in self.connection.execute(
+                "SELECT lane, decision, reason, tool_run_id::text, coalesce(scope_class, '')"
+                "  FROM receipts WHERE program_id = $1::uuid ORDER BY ts_arrival, label",
+                (self.identifiers[name],),
+            ).rows
+        ]
+
+    def refused(self, name: str, capability: str | None, program_id: str | None) -> tuple:
+        """One blocked arm: the answer, and the single record it left behind."""
+        before = len(self.receipts(name))
+        seen = len(self.target.seen)
+
+        status, decision = self.attempt(capability, program_id)
+        after = self.receipts(name)
+
+        self.assertEqual(407, status)
+        self.assertEqual(proxy.REFUSED, decision)
+        self.assertEqual(seen, len(self.target.seen), "the target was contacted")
+        self.assertEqual(before + 1, len(after), "a refusal wrote something other than one record")
+        return after[-1]
+
+    def test_the_capability_is_minted_by_the_database_and_stored_as_a_digest(self):
+        # Criterion 1. The plaintext is 32 random bytes in hex, it is never a
+        # column, and what the row holds is its SHA-256 and an expiry the caller
+        # did not choose. `authorize_tool_run` is the only minter: the guard
+        # trigger refuses the columns to anyone below the owner.
+        capability, tool_run, _ = self.mint("a")
+        row = self.connection.execute(
+            "SELECT egress_token_sha256, encode(digest($2, 'sha256'), 'hex'),"
+            "       egress_token_expires_at > now() + interval '4 minutes',"
+            "       egress_token_expires_at < now() + interval '6 minutes'"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (tool_run, capability),
+        ).rows[0]
+
+        self.assertEqual(64, len(capability))
+        self.assertRegex(capability, "^[0-9a-f]{64}$")
+        self.assertEqual(str(row[1]), str(row[0]))
+        self.assertNotEqual(capability, str(row[0]))
+        self.assertEqual([True, True], [bool(row[2]), bool(row[3])])
+        self.assertEqual(
+            0,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM tool_runs WHERE egress_token_sha256 = $1", (capability,)
+                ).scalar()
+            ),
+        )
+
+    def test_one_request_is_served_and_one_allowed_receipt_records_it(self):
+        # Criteria 2 and 4, from the caller's side. The report names the Receipt
+        # the database wrote, not one the runtime chose, and the row is `agent`
+        # lane, `allowed`, and attributed to the Tool run that spent it.
+        self.assertTrue(self.sent.ok, self.sent.violations)
+        self.assertEqual(EXIT_OK, self.sent.exit_code)
+        self.assertEqual(200, self.sent.facts["response"]["status"])
+        self.assertEqual(len(ANSWER), self.sent.facts["response"]["byte_size"])
+
+        allowed = [row for row in self.receipts("a") if row[1] == "allowed"]
+
+        self.assertEqual(1, len(allowed))
+        # The lane is `agent` because a capability is the only thing that mints
+        # one: 038's writer derives it rather than accepting it, the same way
+        # 040 derives a blocked Receipt's lane from its purpose. A replay or a
+        # proxy-internal request reaches a different writer.
+        self.assertEqual("agent", allowed[0][0])
+        self.assertEqual(
+            f"allowed as target under scope version {self.version('a')}", allowed[0][2]
+        )
+        self.assertEqual(self.sent.facts["tool_run"]["id"], allowed[0][3])
+        self.assertEqual("target", allowed[0][4])
+        self.assertEqual(
+            self.sent.facts["receipt"],
+            str(
+                self.connection.execute(
+                    "SELECT label FROM receipts WHERE tool_run_id = $1::uuid AND decision='allowed'",
+                    (self.sent.facts["tool_run"]["id"],),
+                ).scalar()
+            ),
+        )
+
+    def test_the_receipt_names_the_bytes_of_both_directions_and_they_are_stored(self):
+        # The other half of criterion 4: a Receipt that names a hash nothing
+        # registered proves nothing, so the row, the artifact and the file on
+        # disk are asked about together. No wire view is claimed -- ticket 12
+        # injects and seals; this exchange sent what the agent may read.
+        row = self.connection.execute(
+            "SELECT r.request_agent_sha, r.response_agent_sha, r.request_wire_sha,"
+            "       r.response_wire_sha, r.status_code, r.method, r.host, r.port, r.path"
+            "  FROM receipts r WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'",
+            (self.sent.facts["tool_run"]["id"],),
+        ).rows[0]
+        request_sha, response_sha = str(row[0]), str(row[1])
+        stored = {
+            str(item[0]): (int(item[1]), str(item[2]), str(item[3]), bool(item[4]))
+            for item in self.connection.execute(
+                "SELECT sha256, byte_size, content_type, visibility, encrypted FROM artifacts"
+                " WHERE sha256 = ANY($1)",
+                ("{" + request_sha + "," + response_sha + "}",),
+            ).rows
+        }
+
+        self.assertIsNone(row[2])
+        self.assertIsNone(row[3])
+        self.assertEqual((200, "GET", "app.example.com", 80, "/notes"), tuple(row[4:9]))
+        self.assertEqual({request_sha, response_sha}, set(stored))
+        for sha, (byte_size, content_type, visibility, encrypted) in stored.items():
+            with self.subTest(sha=sha):
+                blob = artifact.path_for(self.root, sha).read_bytes()
+                self.assertEqual(byte_size, len(blob))
+                self.assertEqual(sha, artifact.digest(blob))
+                self.assertEqual(proxy.TRANSCRIPT, content_type)
+                self.assertEqual(("agent_visible", False), (visibility, encrypted))
+        self.assertIn(ANSWER, artifact.path_for(self.root, response_sha).read_bytes())
+
+    def test_the_target_saw_the_request_and_none_of_the_control_headers(self):
+        # Criterion 3, against a target that actually ran. The request line is
+        # origin form -- the target is not a proxy -- and nothing that named the
+        # capability or the Program survived the hop.
+        method, path, headers = self.target.seen[-1]
+        names = [name for name, _ in headers]
+
+        self.assertEqual(("GET", "/notes"), (method, path))
+        self.assertEqual(["app.example.com"], [value for name, value in headers if name == "host"])
+        self.assertNotIn(proxy.AUTHORIZATION.lower(), names)
+        self.assertNotIn(proxy.PROGRAM.lower(), names)
+        self.assertEqual([], [name for name in names if name.startswith(proxy.INTERNAL)])
+        for _, value in headers:
+            self.assertNotIn("RedKraken", value)
+
+    def test_the_capability_no_longer_resolves_once_the_tool_run_is_closed(self):
+        # Criterion 2's "current lifecycle", read as a fact about the row: the
+        # Tool run `send` closed carries no digest at all, so the capability it
+        # spent cannot be spent again by anyone who kept it.
+        row = self.connection.execute(
+            "SELECT status, egress_token_sha256, egress_token_expires_at"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (self.sent.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual("success", str(row[0]))
+        self.assertIsNone(row[1])
+        self.assertIsNone(row[2])
+
+    def test_a_missing_capability_is_blocked_and_recorded_under_its_program(self):
+        # Criterion 5, first arm. A Program is named and nothing else, so there
+        # is somewhere to file the refusal -- and it is filed with no Tool run,
+        # because no capability resolved one.
+        record = self.refused("a", None, self.identifiers["a"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+        self.assertIsNone(record[3])
+
+    def test_a_fabricated_capability_is_blocked_before_the_target_is_contacted(self):
+        # Second arm. Well-formed, right length, never minted.
+        record = self.refused("a", "c" * 64, self.identifiers["a"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+
+    def test_a_capability_offered_under_another_program_resolves_to_nothing(self):
+        # Third arm, and the one the header cannot decide: the Program header is
+        # the caller's word, and `resolve_egress_capability` requires the Tool
+        # run to belong to the bound Program. A real capability under the wrong
+        # Program is filed against the Program that was claimed.
+        capability, _, _ = self.mint("a")
+
+        record = self.refused("b", capability, self.identifiers["b"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+        self.assertIsNone(record[3])
+
+    def test_an_expired_capability_is_blocked_although_its_tool_run_still_runs(self):
+        # Fourth arm. The Tool run is untouched -- still running, still allowed,
+        # still holding its digest -- and only the clock has moved past it.
+        capability, tool_run, _ = self.mint("a")
+        self.owner(
+            "UPDATE tool_runs SET egress_token_expires_at = now() - interval '1 minute'"
+            " WHERE id = $1::uuid",
+            (tool_run,),
+        )
+
+        record = self.refused("a", capability, self.identifiers["a"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+        self.assertEqual(
+            "running",
+            str(
+                self.connection.execute(
+                    "SELECT status FROM tool_runs WHERE id = $1::uuid", (tool_run,)
+                ).scalar()
+            ),
+        )
+
+    def test_a_cleared_capability_is_blocked_because_closing_the_run_revoked_it(self):
+        # Fifth arm, and the structural one: nothing revokes the capability, the
+        # Tool run simply stops running and the guard trigger clears the digest.
+        capability, tool_run, _ = self.mint("a")
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            self.runtime.execute(proxy.CLOSE_TOOL_RUN, (tool_run, "success"))
+
+        record = self.refused("a", capability, self.identifiers["a"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT egress_token_sha256 FROM tool_runs WHERE id = $1::uuid", (tool_run,)
+            ).scalar()
+        )
+
+    def test_a_capability_does_not_outlive_the_program_it_was_minted_under(self):
+        # The sixth arm, which 038 did not have: a Program can be retired with
+        # its runs still running, and a capability minted a minute earlier would
+        # otherwise stay live for its full five against withdrawn authority.
+        capability, _, _ = self.mint("retired")
+        self.owner("SELECT retire_program($1::uuid)", (self.identifiers["retired"],))
+
+        record = self.refused("retired", capability, self.identifiers["retired"])
+
+        self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+
+    def test_another_programs_request_between_the_decision_and_the_write_records_anyway(self):
+        # The fence holds one connection for every handler thread, the Program is
+        # a session setting, and the target exchange happens outside the lock --
+        # so a second Program's request has the whole round trip in which to
+        # rebind the session out from under this one. Interleaved by hand here,
+        # because a race left to the scheduler is a test that passes for the
+        # wrong reason more often than it fails for the right one.
+        capability, tool_run, _ = self.mint("b")
+        decided = self.fence.authorize(
+            self.identifiers["b"], capability, "GET", scope.canonical_request(URL)
+        )
+        with self.assertRaises(proxy.Refused):
+            self.fence.authorize(
+                self.identifiers["a"], "e" * 64, "GET", scope.canonical_request(URL)
+            )
+
+        store = Store(self.root)
+        sent = b"GET /notes HTTP/1.1\r\nHost: app.example.com\r\n\r\n"
+        received = b"HTTP/1.1 200 OK\r\n\r\n" + ANSWER + b"\n"
+        request_sha, _ = store.put(sent)
+        response_sha, _ = store.put(received)
+        written = self.fence.allowed_receipt(
+            self.identifiers["b"],
+            capability,
+            {
+                "reason": f"allowed as {decided.scope_class}",
+                "method": "GET",
+                "scheme": "http",
+                "host": "app.example.com",
+                "port": 80,
+                "path": "/notes",
+                "status_code": 200,
+                "request_agent_sha": request_sha,
+                "response_agent_sha": response_sha,
+                "scope_class": decided.scope_class,
+            },
+            [
+                {"sha256": request_sha, "byte_size": len(sent), "content_type": proxy.TRANSCRIPT},
+                {
+                    "sha256": response_sha,
+                    "byte_size": len(received),
+                    "content_type": proxy.TRANSCRIPT,
+                },
+            ],
+        )
+
+        self.assertEqual(
+            (self.identifiers["b"], tool_run, "allowed"),
+            tuple(
+                str(value)
+                for value in self.connection.execute(
+                    "SELECT program_id, tool_run_id, decision FROM receipts WHERE id = $1::uuid",
+                    (str(written["receipt_id"]),),
+                ).rows[0]
+            ),
+        )
+
+    def test_the_proxy_role_cannot_write_a_receipt_by_any_route_it_holds(self):
+        # Criterion 6, for the role the door actually runs as. Direct DML is
+        # revoked, and the writer that would have let it choose the decision is
+        # no longer granted: `record_proxy_exchange` is the one door left, and
+        # that one forces `allowed` only after the bytes agree.
+        with pg.connect(self.harness.proxy) as session:
+            session.execute(proxy.BIND, (self.identifiers["a"],))
+            for statement, parameters in (
+                (
+                    "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival)"
+                    " VALUES ($1::uuid, 'agent', 'allowed', 'by hand', now())",
+                    (self.identifiers["a"],),
+                ),
+                (
+                    "SELECT write_allowed_receipt($1, '{}'::jsonb)",
+                    ("d" * 64,),
+                ),
+                ("UPDATE receipts SET decision = 'allowed'", ()),
+                ("SELECT id FROM receipts", ()),
+            ):
+                with self.subTest(statement=statement[:40]):
+                    with self.assertRaises(pg.DatabaseError) as raised:
+                        session.execute(statement, parameters)
+                    self.assertIn("permission denied", str(raised.exception).lower())
+
+    def test_an_owner_level_insert_cannot_forge_an_allowed_receipt_either(self):
+        # The rest of criterion 6, and the reason the rule is a trigger rather
+        # than a grant. `rk2_owner` is above every privilege the fence uses, the
+        # trigger is ENABLE ALWAYS, and a Receipt whose Tool run is closed, whose
+        # Program is retired, or which names no Tool run at all is refused all
+        # the same. The last row is the control: the same INSERT against a live
+        # capability succeeds, so what fails above is the invariant and not the
+        # statement.
+        closed = self.sent.facts["tool_run"]["id"]
+        live_capability, live_tool_run, _ = self.mint("a")
+        insert = (
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+            " ts_arrival, scope_class, scope_version, host)"
+            " VALUES ($1::uuid, $2::uuid, 'agent', 'allowed', 'forged', now(),"
+            " 'target', 1, 'app.example.com')"
+        )
+        for description, program_id, tool_run in (
+            ("no tool run at all", self.identifiers["a"], None),
+            ("a tool run that has closed", self.identifiers["a"], closed),
+            ("another program's tool run", self.identifiers["b"], live_tool_run),
+        ):
+            with self.subTest(description):
+                with self.assertRaises(pg.DatabaseError) as raised:
+                    self.owner(insert, (program_id, tool_run))
+                self.assertIn("live authorized capability", str(raised.exception))
+
+        with self.assertRaises(Rollback):
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(insert, (self.identifiers["a"], live_tool_run))
+                raise Rollback
+        self.assertIsNotNone(live_capability)
 
 
 class ArchiveTest(DatabaseCase):

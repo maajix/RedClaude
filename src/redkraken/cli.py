@@ -14,7 +14,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import __version__, artifact, backup, doctor, migrate, pg, program, scope, state
+from redkraken import (
+    __version__,
+    artifact,
+    backup,
+    doctor,
+    migrate,
+    pg,
+    program,
+    proxy,
+    scope,
+    state,
+)
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
     INVALID_CONFIGURATION,
@@ -32,8 +43,20 @@ MIGRATE_URL = "RK_MIGRATE_URL"
 RESTORE_URL = "RK_RESTORE_URL"
 DATABASE_URL = "RK_DATABASE_URL"
 STATE_URL = "RK_STATE_URL"
+#: The egress door's own connection, held as `rk2_proxy`: EXECUTE on two writers
+#: and no receipt DML at all. Spelled out rather than folded into
+#: `RK_DATABASE_URL` because a fence running as the runtime would be a fence with
+#: the privileges of the thing it fences.
+PROXY_DATABASE_URL = "RK_PROXY_DATABASE_URL"
 
 DEFAULT_DATABASE = "rk2"
+
+#: Where the door listens when nobody says otherwise. Loopback because a
+#: capability is bearer material and the runtime is on this machine; a fixed port
+#: because the operator has to be able to name it in `RK_PROXY_URL` before the
+#: process that will use it starts.
+DEFAULT_PROXY_HOST = "127.0.0.1"
+DEFAULT_PROXY_PORT = 8080
 
 
 @dataclass(frozen=True)
@@ -56,6 +79,12 @@ MIGRATION = _Source("connection_string", "--url", MIGRATE_URL)
 RESTORATION = _Source("connection_string", "--url", RESTORE_URL)
 RUNTIME = _Source("connection_string", "--url", DATABASE_URL)
 AGENT = _Source("state_connection_string", "--state-url", STATE_URL)
+FENCE = _Source("connection_string", "--url", PROXY_DATABASE_URL)
+
+#: Where the door listens, which is neither a role nor a store. The capability
+#: is sent to this address and to nothing else, and `proxy.endpoint` refuses any
+#: spelling of it that is not plain HTTP on the loopback interface.
+PROXY = _Source("proxy_url", "--proxy", proxy.PROXY_URL)
 
 #: The one input that is not a connection string and is resolved the same way.
 #: The artifact store is a directory, so it has a variable of its own: an
@@ -427,6 +456,81 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release.set_defaults(run=_artifact_open)
 
+    door = commands.add_parser(
+        "proxy", help="the egress door: run it, and spend one capability through it"
+    )
+    hops = door.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    listener = hops.add_parser(
+        "serve",
+        help=(
+            "run the egress fence until it is interrupted, as the proxy role "
+            f"(${PROXY_DATABASE_URL})"
+        ),
+    )
+    _add_url(listener, FENCE)
+    _add_root(
+        listener,
+        help=(
+            "where the transcripts of each exchange are filed, under the hash of "
+            f"their bytes (default: ${ARTIFACTS.variable})"
+        ),
+    )
+    listener.add_argument(
+        "--host",
+        default=DEFAULT_PROXY_HOST,
+        metavar="address",
+        help=(
+            "the interface to listen on; a capability is bearer material, so the "
+            f"default is loopback alone (default: {DEFAULT_PROXY_HOST})"
+        ),
+    )
+    listener.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PROXY_PORT,
+        metavar="port",
+        help=f"the port to listen on (default: {DEFAULT_PROXY_PORT})",
+    )
+    listener.set_defaults(run=_proxy_serve)
+
+    spend = hops.add_parser(
+        "request",
+        help=(
+            "open one Tool run, mint its capability and spend it on one request "
+            f"through the door (${DATABASE_URL})"
+        ),
+    )
+    _add_url(spend, RUNTIME)
+    spend.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program whose scope decides this request",
+    )
+    spend.add_argument(
+        PROXY.flag,
+        dest="proxy_url",
+        metavar="http://127.0.0.1:port",
+        help=f"where the door is listening (default: ${PROXY.variable})",
+    )
+    spend.add_argument(
+        "--method",
+        default="GET",
+        metavar="verb",
+        help="the HTTP method, which the authorized Tool run has to agree with (default: GET)",
+    )
+    spend.add_argument(
+        "target",
+        metavar="url",
+        help=(
+            "the absolute URL to request; decided against the compiled policy "
+            "twice, once here and once at the door"
+        ),
+    )
+    spend.set_defaults(run=_proxy_request)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -694,6 +798,49 @@ def _artifact_open(arguments: argparse.Namespace) -> int:
     )
 
 
+def _proxy_serve(arguments: argparse.Namespace) -> int:
+    """The one command that does not return until an operator stops it.
+
+    Its report is written when the listener closes, which is the only moment it
+    has anything final to say. What an operator needs before then is on the
+    socket: the door answers every request, refused or served, with a decision
+    header and the name of the record it wrote.
+    """
+    ledger = Ledger()
+    settings = _url(ledger, FENCE, arguments.url, proxy.SERVE)
+    root = _root(ledger, arguments.artifacts)
+    if settings is None or root is None:
+        return _render(report(proxy.SERVE, ledger))
+    return _render(
+        _guarded(
+            proxy.SERVE,
+            lambda: proxy.serve(
+                settings, root=root, host=arguments.host, port=arguments.port
+            ),
+        )
+    )
+
+
+def _proxy_request(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, proxy.REQUEST)
+    endpoint = _proxy(ledger, arguments.proxy_url)
+    if runtime is None or endpoint is None:
+        return _render(report(proxy.REQUEST, ledger))
+    return _render(
+        _guarded(
+            proxy.REQUEST,
+            lambda: proxy.send(
+                runtime,
+                arguments.config,
+                arguments.target,
+                proxy_url=endpoint,
+                method=arguments.method,
+            ),
+        )
+    )
+
+
 def _provision(arguments: argparse.Namespace) -> int:
     return _with_settings(
         arguments,
@@ -797,6 +944,27 @@ def _root(ledger: Ledger, given: Path | None) -> Path | None:
             source=f"environment:{ARTIFACTS.variable}",
         )
     return root
+
+
+def _proxy(ledger: Ledger, given: str | None) -> str | None:
+    """Where the capability is allowed to go, from the argument or the variable.
+
+    Refused rather than defaulted, for the same reason as the store and a sharper
+    one: a default would be an address this installation did not choose, and the
+    thing that would be sent to it is bearer material. Whether the address is one
+    a capability may travel to at all is `proxy.endpoint`'s question, asked by the
+    operation before it opens anything.
+    """
+    url = given or os.environ.get(PROXY.variable)
+    if not url:
+        ledger.fail(
+            PROXY.fact,
+            f"no proxy endpoint: pass {PROXY.flag} or set {PROXY.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{PROXY.variable}",
+        )
+        return None
+    return url
 
 
 def _key(ledger: Ledger, given: Path | None) -> Path | None:

@@ -840,6 +840,123 @@ class SealCommandTest(unittest.TestCase):
         self.assertFalse(root.exists())
 
 
+class ProxyCommandTest(unittest.TestCase):
+    """`rk proxy`, up to the point where a database or a door is needed.
+
+    The two verbs read different variables because they are different roles on
+    two sides of one fence: `serve` is the door and holds `rk2_proxy`, `request`
+    is the thing being fenced and holds the runtime connection. An operator who
+    exported one URL for both would be running a fence with the privileges of
+    what it fences, so there is no variable that satisfies both.
+
+    The third input is not a role at all. `RK_PROXY_URL` is where a capability is
+    allowed to travel, and the refusals below are the Python half of "the runtime
+    sends the plaintext capability only to the local proxy".
+    """
+
+    def test_each_side_of_the_fence_reads_the_variable_for_its_own_role(self):
+        serving = json.loads(run("proxy", "serve").stdout)
+        sending = json.loads(
+            run("proxy", "request", "--config", str(write(SCOPED)), "http://app.example.com/").stdout
+        )
+
+        self.assertEqual("proxy serve", serving["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_ROOT", "environment:RK_PROXY_DATABASE_URL"],
+            [item["source"] for item in serving["violations"]],
+        )
+        self.assertEqual("proxy request", sending["command"])
+        self.assertEqual(
+            ["environment:RK_DATABASE_URL", "environment:RK_PROXY_URL"],
+            [item["source"] for item in sending["violations"]],
+        )
+
+    def test_a_request_without_a_url_or_a_configuration_is_a_usage_error(self):
+        self.assertEqual(EXIT_USAGE, run("proxy", "request", "--config", str(write(SCOPED))).returncode)
+        self.assertEqual(EXIT_USAGE, run("proxy", "request", "http://app.example.com/").returncode)
+        self.assertEqual(EXIT_USAGE, run("proxy").returncode)
+
+    def test_a_capability_may_not_be_sent_anywhere_but_the_loopback_interface(self):
+        # The refusal happens before the configuration is read and before any
+        # connection is opened, because the endpoint decides where the one secret
+        # this command holds is allowed to go.
+        for endpoint, why in (
+            ("http://proxy.example.net:8080", "not on this machine"),
+            ("https://127.0.0.1:8080", "not plain HTTP"),
+            ("127.0.0.1:8080", "not a URL at all"),
+        ):
+            with self.subTest(why):
+                result = run(
+                    "proxy",
+                    "request",
+                    "--config", str(write(SCOPED)),
+                    "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                    "--proxy", endpoint,
+                    "http://app.example.com/",
+                )
+
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+                self.assertEqual(
+                    ["environment:RK_PROXY_URL"],
+                    [item["source"] for item in json.loads(result.stdout)["violations"]],
+                )
+
+    def test_a_request_to_a_door_nobody_answers_at_reaches_no_database(self):
+        # Port 1 on loopback is an address a capability may travel to and nothing
+        # is listening on it. The order matters: the endpoint and the URL are
+        # decided before a connection is opened, so this is still a refusal that
+        # opened no Tool run and minted nothing.
+        observed = observe(
+            "proxy",
+            "request",
+            "--config", str(write(SCOPED.replace("requests = 100", "requests = 0"))),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--proxy", "http://127.0.0.1:1",
+            "http://app.example.com/",
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+    def test_a_url_this_proxy_cannot_carry_is_refused_before_the_database(self):
+        # HTTPS through this door is ticket 10, and a URL that cannot be
+        # canonicalised has no scope answer at all. Both are the caller's to fix,
+        # and neither is worth a connection.
+        for url, expected in (
+            ("https://app.example.com/", "argument:--url"),
+            ("ftp://app.example.com/", "argument:--url"),
+            ("http://app..example.com/", "argument:--url"),
+        ):
+            with self.subTest(url):
+                result = run(
+                    "proxy",
+                    "request",
+                    "--config", str(write(SCOPED)),
+                    "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                    "--proxy", "http://127.0.0.1:8080",
+                    url,
+                )
+
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+                self.assertEqual(
+                    [expected],
+                    [item["source"] for item in json.loads(result.stdout)["violations"]],
+                )
+
+    def test_neither_connection_string_nor_capability_material_is_echoed_back(self):
+        result = run(
+            "proxy",
+            "request",
+            "--config", str(write(SCOPED)),
+            "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+            "--proxy", "http://127.0.0.1:1",
+            "http://app.example.com/",
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

@@ -3,6 +3,7 @@
 import atexit
 import shutil
 import tempfile
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 
@@ -180,6 +181,42 @@ SCOPE_ENTITIES = (
     ("wildcard_domain", "api.example.net", None, "/", "denied", "unlisted"),
     ("wildcard_domain", "example.org", None, "/", "denied", "unlisted"),
 )
+
+
+class Target(BaseHTTPRequestHandler):
+    """The counterparty an egress test needs: it records and it answers.
+
+    Shared because both proxy suites need the same thing from a target and want
+    to assert different things about it -- the offline one reads what arrived,
+    the live one reads what was stored -- and two copies would be two chances for
+    "what the target saw" to mean two different sets of bytes.
+
+    Appends `(command, path, headers)` to the server's own `seen` list, which the
+    test owns and clears. Subclass and set `answer` to change the body.
+    """
+
+    protocol_version = "HTTP/1.1"
+    answer = b'{"note":"target answered"}'
+
+    def do_GET(self) -> None:
+        self.server.seen.append(
+            (
+                self.command,
+                self.path,
+                [(name.lower(), value) for name, value in self.headers.items()],
+            )
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.answer)))
+        self.end_headers()
+        self.wfile.write(self.answer)
+
+    do_POST = do_GET
+    do_HEAD = do_GET
+
+    def log_message(self, format: str, *arguments: object) -> None:
+        return
 
 
 def scratch() -> Path:
