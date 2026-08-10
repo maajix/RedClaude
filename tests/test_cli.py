@@ -313,6 +313,83 @@ class RunCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
 
 
+class StateCommandTest(unittest.TestCase):
+    """`rk state`, up to the point where a database is needed.
+
+    Two connection strings, and they are not interchangeable. The Program is
+    resolved as the runtime and its records are read as the agent, which cannot
+    resolve one -- so a missing second string is a refusal rather than a
+    fallback to the first.
+    """
+
+    def test_both_connection_strings_are_named_when_neither_is_set(self):
+        result = run("state", "--config", str(write(VALID)))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("state", report["command"])
+        self.assertEqual(
+            ["environment:RK_DATABASE_URL", "environment:RK_STATE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_the_agent_connection_string_has_no_fallback(self):
+        result = run(
+            "state",
+            "--config", str(write(VALID)),
+            "--url", "postgresql://rk2_runtime@127.0.0.1:1/rk2",
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertEqual(
+            ["environment:RK_STATE_URL"],
+            [item["source"] for item in json.loads(result.stdout)["violations"]],
+        )
+
+    def test_a_read_without_a_configuration_is_a_usage_error(self):
+        result = run("state", "--url", "postgresql://rk2_runtime@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--config", result.stderr)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(
+            "state",
+            "--config", str(write(VALID)),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--state-url", "postgresql://rk2_state@127.0.0.1:1/rk2",
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("state", json.loads(result.stdout)["command"])
+
+    def test_neither_connection_string_is_ever_echoed_back(self):
+        result = run(
+            "state",
+            "--config", str(write(VALID)),
+            "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+            "--state-url", "postgresql://rk2_state:s3cr3t-agent@127.0.0.1:1/rk2",
+        )
+
+        for secret in ("s3cr3t-runtime", "s3cr3t-agent"):
+            with self.subTest(secret):
+                self.assertNotIn(secret, result.stdout)
+                self.assertNotIn(secret, result.stderr)
+
+    def test_a_refused_configuration_reaches_no_database_at_all(self):
+        source = write(VALID.replace("requests = 5000", "requests = 0"))
+
+        observed = observe(
+            "state",
+            "--config", str(source),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--state-url", "postgresql://rk2_state@127.0.0.1:1/rk2",
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

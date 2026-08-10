@@ -15,8 +15,10 @@ controls exist: a check nobody has seen fail is a check nobody knows is wired
 up, and a gate of those is a green light with nothing behind it.
 
 `ProgramRunTest` asks a fifth, about an operation rather than about the schema:
-that `rk run` opens one Program and afterwards resumes that one. It is the only
-case here that commits, because what survives the transaction is its subject.
+that `rk run` opens one Program and afterwards resumes that one. `StateReadTest`
+asks a sixth, about the connection the model reads through: that one Program
+cannot name, infer or mutate another's rows. Both commit, because what survives
+the transaction is their subject.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-from redkraken import backup, integrity, migrate, pg, program
+from redkraken import backup, integrity, migrate, pg, program, state
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
@@ -83,6 +85,10 @@ class Harness:
     #: running it as the owner would prove nothing about the connection an
     #: operator actually points at the database.
     runtime: pg.Settings
+    #: What `RK_STATE_URL` names: the connection the model's reads run on. It
+    #: owns nothing, writes nothing and cannot resolve a Program, so everything
+    #: it returns is what row level security left it.
+    state: pg.Settings
     passwords: dict[str, str]
     migrations: tuple[migrate.Migration, ...]
     created: object = None
@@ -137,6 +143,9 @@ def _build() -> Harness:
         ),
         runtime=admin.replace(
             database=DATABASE, user="rk2_runtime", password=passwords["rk2_runtime"]
+        ),
+        state=admin.replace(
+            database=DATABASE, user="rk2_state", password=passwords["rk2_state"]
         ),
         passwords=passwords,
         migrations=migrations,
@@ -557,6 +566,34 @@ CONTROLS = (
     Control("standing:rls_coverage", "ALTER TABLE entities DISABLE ROW LEVEL SECURITY"),
     Control("standing:state_access", "ALTER TABLE entities DISABLE ROW LEVEL SECURITY"),
     Control("standing:state_grants", "GRANT SELECT ON entities TO rk2_state"),
+    Control(
+        # The registry back on the agent's surface. A role that can enumerate
+        # Programs can tell a label nobody holds from a label another Program
+        # holds, by asking a second question -- which is the whole of what
+        # indistinguishable absence means.
+        "standing:state_isolation",
+        "GRANT SELECT ON programs TO rk2_state",
+    ),
+    Control(
+        # The hole `state_access` rule 8 has and this one closes: a column grant
+        # on a runtime table, which `information_schema.table_privileges` does
+        # not list, so the older rule cannot see it.
+        "standing:state_isolation",
+        "GRANT SELECT (program_id) ON events TO rk2_state",
+    ),
+    Control(
+        # The revision lookup answering with the owner's view of the log rather
+        # than the caller's, which is every Program's.
+        "standing:state_isolation",
+        "ALTER FUNCTION rk2_revision(text, uuid) SECURITY DEFINER",
+    ),
+    Control(
+        # The other half of the same rule: the descriptor is the one definition
+        # of what an entity is called, and as a definer function it would name
+        # any Program's entity to whoever could name one.
+        "standing:state_isolation",
+        "ALTER FUNCTION rk2_descriptor(uuid) SECURITY DEFINER",
+    ),
     Control("standing:capability_receipt_fence", "GRANT INSERT ON receipts TO rk2_proxy"),
     Control("standing:program_isolation", "CREATE TABLE public.orphan_table (id uuid PRIMARY KEY)"),
     Control(
@@ -1142,6 +1179,431 @@ class ProgramRunTest(DatabaseCase):
         # run, and this is where the third one is answered about the same rows.
         self.run_for(f"{RUN_SLUG}-gate")
 
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected)
+
+        self.assertTrue(result.ok, result.violations)
+
+
+#: The Programs the state tests open. Two, because one Program can never
+#: demonstrate isolation from itself.
+STATE_SLUG = "selftest-state"
+
+#: What the database is, in the terms criterion 6 is about: its size on disk,
+#: the log that every revision is read from, and the Leases. A read that changed
+#: any of them would move at least one of these numbers.
+SNAPSHOT = """
+SELECT pg_database_size(current_database()),
+       (SELECT count(*) FROM events),
+       (SELECT coalesce(max(seq), 0) FROM events),
+       (SELECT count(*) FROM identity_leases),
+       (SELECT coalesce(md5(string_agg(l::text, '|' ORDER BY l.id)), '')
+          FROM identity_leases l),
+       (SELECT coalesce(md5(string_agg(e::text, '|' ORDER BY e.id)), '') FROM entities e),
+       (SELECT coalesce(md5(string_agg(h::text, '|' ORDER BY h.id)), '') FROM hypotheses h)
+"""
+
+#: Everything in `SNAPSHOT` except its first column. The size on disk moves for
+#: reasons that are not writes -- a catalogue page dirtied by a GRANT, autovacuum
+#: -- so it is compared across one test rather than across a whole class.
+ROWS = slice(1, None)
+
+
+def snapshot(connection: pg.Connection) -> tuple:
+    return tuple(connection.execute(SNAPSHOT).rows[0])
+
+
+class StateReadTest(DatabaseCase):
+    """PH2-05: what one Program can read about itself, and what it cannot ask.
+
+    Two Programs, both holding the label `TEC1`, because colliding short labels
+    are not an accident to be avoided: labels are per Program and are meant to
+    be short, so the collision is the ordinary case and isolation has to hold
+    through it rather than around it.
+
+    The reads run as `rk2_state` over a real server for the same reason
+    `ProgramRunTest` runs as `rk2_runtime`. Every claim here is about row level
+    security and about grants, and neither is in force on a connection that owns
+    the tables. This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.configurations = {}
+        cls.identifiers = {}
+        for name in ("a", "b"):
+            slug = f"{STATE_SLUG}-{name}"
+            path = write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+        cls._populate()
+        # Before any read in this class has run, so that a read which changed
+        # something once and then never again is still caught: every later test
+        # reads, and criterion 6 is measured against this.
+        cls.populated = snapshot(cls.connection)
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{STATE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def _populate(cls) -> None:
+        """One technology in each Program, and everything else in the first.
+
+        The technology rows are what collide: each Program's own counter hands
+        out `TEC1`, so both hold that label and the descriptor is the only thing
+        that differs. What only the first Program has -- hypotheses, an identity,
+        a Lease -- is what makes an absence testable from the second.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for name in ("a", "b"):
+                cls.connection.execute(
+                    "INSERT INTO entities (program_id, type, dedup_key)"
+                    " VALUES ($1::uuid, 'technology', $2)",
+                    (cls.identifiers[name], f"tech:{STATE_SLUG}-{name}"),
+                )
+            first = cls.identifiers["a"]
+            subject = cls.connection.execute(
+                "SELECT id FROM entities WHERE program_id = $1::uuid AND type = 'technology'",
+                (first,),
+            ).scalar()
+            for number in (1, 2, 3):
+                # A different property class each time: the dedup index is over
+                # the subject and the property, so three hypotheses about one
+                # entity are three properties of it or they are one row.
+                cls.connection.execute(
+                    "INSERT INTO hypotheses"
+                    " (program_id, subject_entity_id, property_class, statement)"
+                    " VALUES ($1::uuid, $2,"
+                    f" (SELECT id FROM property_classes ORDER BY id OFFSET {number - 1} LIMIT 1),"
+                    " $3)",
+                    (first, subject, f"a self test, number {number}"),
+                )
+            identity = cls.connection.execute(
+                "INSERT INTO entities (program_id, type, dedup_key)"
+                " VALUES ($1::uuid, 'identity', 'identity:selftest-state') RETURNING id",
+                (first,),
+            ).scalar()
+            cls.connection.execute(
+                "INSERT INTO identities (entity_id, slot_name, class)"
+                " VALUES ($1, 'slot://selftest-state/member', 'anonymous')",
+                (identity,),
+            )
+            # The orchestrator, because it is the one role that holds no task:
+            # `executes_tasks` is generated from `task_id` and has to agree with
+            # the roster, so any other role here would need a task under it.
+            holder = cls.connection.execute(
+                "INSERT INTO agent_runs"
+                " (program_id, role, runs_as, model, effort, mission_packet)"
+                " VALUES ($1::uuid, 'orchestrator', 'session', 'selftest', 'low', '{}'::jsonb)"
+                " RETURNING id",
+                (first,),
+            ).scalar()
+            cls.connection.execute(
+                "INSERT INTO identity_leases"
+                " (program_id, identity_entity_id, holder_agent_run_id, expires_at)"
+                " VALUES ($1::uuid, $2, $3, now() + interval '1 hour')",
+                (first, identity, holder),
+            )
+
+    def read(self, name: str, **options: object) -> Report:
+        return state.read(
+            self.harness.runtime,
+            self.harness.state,
+            self.configurations[name],
+            **options,
+        )
+
+    def labels(self, result: Report) -> dict[str, str]:
+        return {item["label"]: item["kind"] for item in result.facts["state"]["records"]}
+
+    def test_two_programs_hold_the_same_label_and_neither_resolves_the_other(self):
+        # Criterion 1. Both reads return `TEC1`; the descriptor says they are
+        # different rows, and neither read returns the other's.
+        first = self.read("a", label="TEC1")
+        second = self.read("b", label="TEC1")
+
+        self.assertTrue(first.ok, first.violations)
+        self.assertTrue(second.ok, second.violations)
+        self.assertIn("TEC1", self.labels(first))
+        self.assertIn("TEC1", self.labels(second))
+        self.assertEqual(
+            [f"tech:{STATE_SLUG}-a", f"tech:{STATE_SLUG}-b"],
+            [result.facts["record"]["document"]["descriptor"] for result in (first, second)],
+        )
+        self.assertNotEqual(
+            first.facts["record"]["digest"], second.facts["record"]["digest"]
+        )
+        # The second Program holds one record of one kind, and the first holds
+        # everything else this case wrote. Neither count includes the other.
+        self.assertEqual(
+            [("entity", 1)],
+            [
+                (item["kind"], item["count"])
+                for item in second.facts["state"]["kinds"]
+                if item["count"]
+            ],
+        )
+
+    def test_the_identifier_crosses_once_into_the_session_and_never_into_a_read(self):
+        # Criterion 2, over the wire rather than in a signature. Every statement
+        # the read sends is recorded: the Program's identifier is a parameter of
+        # exactly one of them, the one that binds the session, and none of the
+        # three read statements so much as names a Program.
+        sent: list[tuple[str, tuple]] = []
+        execute = pg.Connection.execute
+
+        def record(connection, sql, parameters=()):
+            sent.append((sql, parameters))
+            return execute(connection, sql, parameters)
+
+        with mock.patch.object(pg.Connection, "execute", record):
+            result = self.read("a", label="H1")
+
+        self.assertTrue(result.ok, result.violations)
+        identifier = self.identifiers["a"]
+        self.assertEqual(
+            ["SELECT set_config('rk2.program_id', $1, true)"],
+            [
+                sql
+                for sql, parameters in sent
+                if identifier in [str(value) for value in parameters]
+            ],
+        )
+        reads = (state.COMPACT, state.COUNTS, state.RECORD)
+        self.assertEqual(list(reads), [sql for sql, _ in sent if sql in reads])
+        for sql in reads:
+            with self.subTest(sql[:30]):
+                self.assertNotIn("program", sql.lower())
+
+    def test_a_compact_read_carries_labels_revisions_digests_and_what_it_omitted(self):
+        # Criterion 3. One record per kind, against three hypotheses: the read
+        # is smaller than the Program, and says by how much.
+        result = self.read("a", per_kind=1)
+
+        self.assertTrue(result.ok, result.violations)
+        compact = result.facts["state"]
+        kinds = {item["kind"]: item for item in compact["kinds"]}
+        self.assertEqual(
+            {"count": 3, "returned": 1, "omitted": 2, "kind": "hypothesis"},
+            kinds["hypothesis"],
+        )
+        self.assertEqual(list(state.KINDS), [item["kind"] for item in compact["kinds"]])
+        for record in compact["records"]:
+            with self.subTest(record["label"]):
+                self.assertGreaterEqual(record["revision"], 1)
+                self.assertEqual(64, len(record["digest"]))
+        self.assertEqual(
+            compact["bytes"],
+            len(json.dumps(compact["records"], separators=(",", ":")).encode("utf-8")),
+        )
+
+    def test_a_byte_ceiling_is_honoured_by_the_read_the_command_returns(self):
+        # The other half of criterion 3: the limit an operator passes is the
+        # limit the report is under, whatever the Program holds.
+        result = self.read("a", byte_limit=200)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertLessEqual(result.facts["state"]["bytes"], 200)
+        self.assertLess(
+            len(result.facts["state"]["records"]),
+            sum(item["count"] for item in result.facts["state"]["kinds"]),
+        )
+
+    def test_a_label_the_compact_read_exposed_retrieves_the_whole_record(self):
+        # Criterion 4: what a compact read names is what a full read resolves,
+        # so a model working from labels never has to guess an identifier. Every
+        # hypothesis, not one, because resolving the first is also what a read
+        # that ignored the label would do.
+        compact = self.read("a")
+        labels = [
+            item["label"]
+            for item in compact.facts["state"]["records"]
+            if item["kind"] == "hypothesis"
+        ]
+
+        self.assertEqual(["H3", "H2", "H1"], labels, "newest revision first")
+        for label in labels:
+            with self.subTest(label):
+                result = self.read("a", label=label)
+
+                self.assertTrue(result.ok, result.violations)
+                record = result.facts["record"]
+                self.assertTrue(record["present"])
+                self.assertEqual("hypothesis", record["kind"])
+                self.assertEqual(label, record["document"]["label"])
+                self.assertEqual(
+                    f"a self test, number {label.removeprefix('H')}",
+                    record["document"]["statement"],
+                )
+                self.assertEqual(
+                    [
+                        item["digest"]
+                        for item in compact.facts["state"]["records"]
+                        if item["label"] == label
+                    ],
+                    [record["digest"]],
+                )
+
+    def test_an_unknown_label_and_another_programs_label_are_the_same_answer(self):
+        # Criterion 5. `H1` exists and belongs to the first Program; `H404`
+        # belongs to nobody. From the second Program the two reports differ only
+        # where the label itself appears, so nothing in either says which case
+        # it was -- and the exit code says nothing either.
+        foreign = self.read("b", label="H1")
+        unknown = self.read("b", label="H404")
+
+        self.assertEqual(EXIT_OK, foreign.exit_code)
+        self.assertEqual(EXIT_OK, unknown.exit_code)
+        self.assertEqual({"label": "H1", "present": False}, foreign.facts["record"])
+        self.assertEqual({"label": "H404", "present": False}, unknown.facts["record"])
+        self.assertEqual(
+            json.dumps(foreign.as_dict()).replace("H1", "L"),
+            json.dumps(unknown.as_dict()).replace("H404", "L"),
+        )
+
+    def test_the_program_registry_is_not_reachable_from_the_agent_connection(self):
+        # What makes the answer above indistinguishable rather than merely
+        # identical: from this connection there is no second question to ask.
+        # The log is the third one, because a row of it names the Program the
+        # change belonged to.
+        with pg.connect(self.harness.state) as session:
+            for sql in (
+                "SELECT count(*) FROM programs",
+                "SELECT slug FROM programs LIMIT 1",
+                "SELECT program_id FROM events LIMIT 1",
+            ):
+                with self.subTest(sql):
+                    with self.assertRaises(pg.DatabaseError) as refused:
+                        session.execute(sql)
+                    self.assertEqual("42501", refused.exception.sqlstate)
+
+    def test_the_only_program_identifier_this_connection_can_reach_is_its_own(self):
+        # `entities.program_id` is on the read surface and stays there: row level
+        # security scopes the rows, so the identifier it yields is the one the
+        # session is already bound to and could read back out of the setting.
+        # What no query here yields is a *second* identifier -- which is what
+        # rebinding this session to another Program would take. The boundary is
+        # that nothing reachable from this side names another Program; which
+        # process holds the session is ticket 19's question, not this role's.
+        with pg.connect(self.harness.state) as session:
+            session.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers["a"],)
+            )
+            reachable = {
+                str(row[0])
+                for row in session.execute("SELECT DISTINCT program_id FROM entities").rows
+            }
+
+        self.assertEqual({self.identifiers["a"]}, reachable)
+        self.assertNotIn(self.identifiers["b"], reachable)
+
+    def test_a_column_of_the_registry_is_refused_like_the_whole_table(self):
+        # The read asserts its own premise before it reads, and asserts it at
+        # column granularity: `has_table_privilege` answers "no" for a role
+        # holding `SELECT (slug)`, and one readable column is the whole of what
+        # indistinguishable absence has to rule out. Committed, because the
+        # premise is checked on a connection this transaction does not own.
+        with pg.connect(self.harness.migrate) as owner:
+            self._as_owner(owner, "GRANT SELECT (slug) ON programs TO rk2_state")
+            try:
+                result = self.read("a")
+
+                self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+                self.assertIn("Program registry", result.violations[0].detail)
+                self.assertIsNone(result.facts["state"])
+            finally:
+                self._as_owner(owner, "REVOKE SELECT (slug) ON programs FROM rk2_state")
+
+    @staticmethod
+    def _as_owner(connection: pg.Connection, sql: str) -> None:
+        with connection.transaction():
+            connection.execute("SET LOCAL ROLE rk2_owner")
+            connection.execute(sql)
+
+    def test_the_agent_connection_cannot_write_what_it_can_read(self):
+        # Criterion 6, before the reads: a repeated read cannot change the
+        # database because this connection cannot change it at all.
+        with pg.connect(self.harness.state) as session:
+            session.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers["a"],)
+            )
+            for sql in (
+                "INSERT INTO entities (program_id, type, dedup_key)"
+                " VALUES ($1::uuid, 'technology', 'tech:intruder')",
+                "DELETE FROM events",
+            ):
+                with self.subTest(sql[:20]):
+                    with self.assertRaises(pg.DatabaseError) as refused:
+                        session.execute(sql, (self.identifiers["a"],) if "$1" in sql else ())
+                    self.assertEqual("42501", refused.exception.sqlstate)
+
+    def test_repeating_every_read_leaves_the_database_and_the_leases_alone(self):
+        # Criterion 6. The Lease is the one piece of runtime state a read could
+        # plausibly touch by being observed -- a scheduler that renewed one on
+        # access would move it -- so it is measured by name rather than only as
+        # part of the database size, which is page-granular and would not notice
+        # a single row.
+        before = snapshot(self.connection)
+
+        for name in ("a", "b"):
+            self.read(name)
+            self.read(name, label="TEC1")
+            self.read(name, label="H404", per_kind=1, byte_limit=200)
+        after = snapshot(self.connection)
+
+        self.assertEqual(before, after)
+        # And against the state as it was written, before any read in this class
+        # had run: a read that moved something once would pass the comparison
+        # above and fail this one.
+        self.assertEqual(self.populated[ROWS], after[ROWS])
+        # Anchored, so that a snapshot which had stopped seeing rows would fail
+        # here rather than pass as two equal descriptions of nothing.
+        self.assertEqual(1, before[3], "the Lease this case wrote")
+        self.assertGreater(before[1], 0, "the log every revision is read from")
+        self.assertNotIn("", before[4:], "a digest over rows that are there")
+
+    def test_the_same_read_twice_returns_the_same_bytes(self):
+        # A digest that moved without the row moving would make every revision
+        # and every comparison a model makes from one meaningless.
+        first = self.read("a", label="TEC1")
+        second = self.read("a", label="TEC1")
+
+        self.assertEqual(first.facts["state"], second.facts["state"])
+        self.assertEqual(first.facts["record"], second.facts["record"])
+
+    def test_a_connection_that_is_not_the_agents_is_refused_rather_than_read(self):
+        # The whole report describes an isolation that only holds for one role.
+        # Read through the runtime it would look identical and mean nothing.
+        result = state.read(
+            self.harness.runtime, self.harness.runtime, self.configurations["a"]
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIn("rk2_state", result.violations[0].detail)
+
+    def test_a_configuration_naming_no_program_is_refused_before_the_agent_connects(self):
+        path = write(VALID.replace('name = "acme-web"', f'name = "{STATE_SLUG}-absent"'))
+
+        result = state.read(self.harness.runtime, self.harness.state, path)
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIsNone(result.facts["program_id"])
+        self.assertIsNone(result.facts["state"])
+
+    def test_the_gate_still_holds_over_the_rows_these_reads_were_made_from(self):
         with pg.connect(self.harness.migrate) as connection:
             result = integrity.verify(connection, self.harness.expected)
 
