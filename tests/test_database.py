@@ -48,6 +48,7 @@ from redkraken import (
     artifact,
     backup,
     config,
+    decisions,
     header,
     identity,
     integrity,
@@ -651,6 +652,43 @@ CONTROLS = (
     Control(
         "standing:control_surface",
         "DROP TRIGGER hypothesis_transitions_actor_kind_guard ON hypothesis_transitions",
+    ),
+    Control(
+        # A question every channel has given up on. The fan-out is a trigger, so
+        # the notification here is the one the database wrote; what the control
+        # does is spend its attempts, which is the state a notifier that never
+        # works arrives at on its own. From there nothing will carry the question
+        # again and the deadline is the only thing left that happens to it -- so
+        # it would be retired as a timeout against a human who was never told
+        # there was anything to answer.
+        "standing:control_surface",
+        "DO $ctl$ DECLARE p uuid; a uuid; t uuid; g jsonb;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('unannounced-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO agent_runs (program_id, role, runs_as, model, effort, mission_packet)"
+        "        VALUES (p, 'orchestrator', 'session', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO a;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport)"
+        "        VALUES (p, a, 'mcp__rk2__net_request',"
+        "                '{\"url\":\"https://probe.invalid/a\",\"method\":\"POST\"}'::jsonb,"
+        "                'running', 'runtime')"
+        "     RETURNING id INTO t;"
+        "   g := canonical_request('mcp__rk2__net_request',"
+        "                          '{\"url\":\"https://probe.invalid/a\",\"method\":\"POST\"}'::jsonb,"
+        "                          'probe');"
+        "   INSERT INTO pending_decisions"
+        "        (program_id, agent_run_id, tool_run_id, tool, risk_class, risk_rule,"
+        "         question_code, request_digest, equivalence_key, question, deadline_at)"
+        "        VALUES (p, a, t, 'mcp__rk2__net_request', 'approval_required',"
+        "                'net_unsafe_method', 'destructive_action', g, equivalence_key(g),"
+        "                render_decision_question(g, 'approval_required', 'net_unsafe_method'),"
+        "                now() + interval '1 hour');"
+        "   UPDATE decision_notifications n SET attempts = c.max_attempts"
+        "     FROM notification_channels c"
+        "    WHERE c.channel = n.channel AND n.program_id = p;"
+        " END $ctl$",
     ),
     # --- causal attribution --------------------------------------------------
     Control(
@@ -3631,6 +3669,10 @@ class ProxyEgressTest(DatabaseCase):
             "identity-audit",
             "identity-revision",
             "mtls",
+            # The queue cases park questions and leave some of them open across a
+            # sweep, and a sweep is machine-wide. Their own Program keeps that out
+            # of the counting assertions the exchanges above make.
+            "decision",
             *BUDGETS,
         ):
             source = SCOPED + "\n[[identity]]\nname = \"member\"\nslot_ref = \"slot://identity/member\"\n"
@@ -5655,6 +5697,229 @@ class ProxyEgressTest(DatabaseCase):
                 "                   'ask_closed_as_a_verdict')",
                 (self.identifiers["a"],),
             ).rows,
+        )
+
+    def question(self, ttl: str = "10 minutes") -> tuple[str, str]:
+        """One filed question, and the notification the fan-out wrote for it.
+
+        The door parks with the default deadline, which is right for an operator
+        and useless for a case about deadlines, so the run is opened here and
+        `park_for_human` is called with the interval the case needs. Everything
+        before that is the production path: the gate is what answers `ask`, and
+        it answers it because the method mutates.
+
+        Cleanup answers the question rather than deleting it. Nothing may delete
+        one -- `pending_decisions_no_delete` -- and a question left open would be
+        a question the next sweep in this module finds, which is exactly the
+        state these cases are about.
+        """
+        self.runtime.execute(proxy.BIND, (self.identifiers["decision"],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = self.runtime.execute(
+                proxy.OPEN_RUN,
+                (self.identifiers["decision"], "operator", json.dumps({"command": "selftest"})),
+            ).scalar()
+            opened = self.runtime.execute(
+                proxy.OPEN_TOOL_RUN,
+                (
+                    self.identifiers["decision"],
+                    str(run),
+                    proxy.TOOL,
+                    json.dumps({"url": URL, "method": "POST", "identity_slot": ""}),
+                ),
+            ).rows[0][0]
+        label = str(
+            self.runtime.execute(
+                "SELECT park_for_human($1::uuid, $2::interval)", (str(opened), ttl)
+            ).scalar()
+        )
+        self.addCleanup(self.close_question, label)
+        notification = str(
+            self.runtime.execute(
+                "SELECT n.id::text FROM decision_notifications n"
+                "  JOIN pending_decisions d ON d.id = n.pending_decision_id"
+                " WHERE d.program_id = $1::uuid AND d.label = $2",
+                (self.identifiers["decision"], label),
+            ).scalar()
+        )
+        return label, notification
+
+    def close_question(self, label: str) -> None:
+        """Answer it if it is still open, whatever this case did to it."""
+        self.human.execute(proxy.BIND, (self.identifiers["decision"],))
+        with self.human.transaction():
+            self.human.execute(
+                "SELECT answer_decision($1, 'denied', 'selftest')"
+                "  FROM pending_decisions"
+                " WHERE program_id = $2::uuid AND label = $1 AND status = 'pending'",
+                (label, self.identifiers["decision"]),
+            )
+
+    def surface(self, label: str) -> list[str]:
+        """What the standing check says about one question, and only that one."""
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT problem FROM check_control_surface() WHERE detail = $1", (label,)
+            ).rows
+        ]
+
+    def test_the_sweep_carries_a_question_to_its_channel_and_stops_carrying_it(self):
+        # Ticket 11's second clock. The database files the question and fans it
+        # out; nothing in it can run a command, so a queue nobody tends is a
+        # question nobody is told about. What the channel is handed is the label
+        # and the rendered question, substituted per argv element -- never a
+        # string a shell parses, because the host and the path in it come from
+        # the request the agent asked to make.
+        label, notification = self.question()
+        carried: list[list[str]] = []
+
+        first = decisions.sweep(self.harness.runtime, deliver=self.recorder(carried))
+
+        self.assertTrue(first.ok, first.violations)
+        self.assertIn(
+            f"{label} was carried to the desktop channel",
+            [item.detail for item in first.assertions if item.name == "notification"],
+        )
+        sent = [command for command in carried if f"redKrakenV2 {label}" in command]
+        self.assertEqual(1, len(sent), carried)
+        self.assertEqual("notify-send", sent[0][0])
+        self.assertIn("POST", sent[0][-1], "the question the human has to answer")
+        # Recorded, and gone from the queue: a delivery that is not written down
+        # is one the next pass makes again, for ever.
+        self.assertEqual((1, True), self.attempted(notification))
+        carried.clear()
+        second = decisions.sweep(self.harness.runtime, deliver=self.recorder(carried))
+
+        self.assertTrue(second.ok, second.violations)
+        self.assertEqual([], [command for command in carried if f"redKrakenV2 {label}" in command])
+
+    def test_a_channel_that_refuses_is_recorded_and_tried_again_later(self):
+        # A failed delivery is not a failure of the sweep. The queue exists so
+        # that it can be tried again, so the pass says what happened and exits
+        # zero -- and the attempt is written down, because a channel that fails
+        # for ever has to run out eventually rather than be retried for ever.
+        label, notification = self.question()
+
+        result = decisions.sweep(
+            self.harness.runtime, deliver=lambda command: (False, "no session bus")
+        )
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual(
+            [f"{label} did not reach the desktop channel and will be retried: no session bus"],
+            [
+                item.detail
+                for item in result.assertions
+                if item.name == "notification" and label in item.detail
+            ],
+        )
+        self.assertEqual((1, False), self.attempted(notification))
+        self.assertEqual(
+            "no session bus",
+            str(
+                self.connection.execute(
+                    "SELECT last_error FROM decision_notifications WHERE id = $1::uuid",
+                    (notification,),
+                ).scalar()
+            ),
+        )
+        # And it is not due again immediately: the channel's backoff is what
+        # stands between "retry" and a loop that hammers a broken notifier.
+        self.assertEqual(
+            (),
+            self.runtime.execute(
+                "SELECT notification_id FROM due_notifications() WHERE notification_id = $1::uuid",
+                (notification,),
+            ).rows,
+        )
+
+    def test_a_question_no_channel_will_carry_again_is_a_standing_failure(self):
+        # The half of ticket 11 that had no alarm. A notification that spends
+        # every attempt leaves the question in the queue, and the only thing that
+        # then happens to it is the deadline -- so it is retired as a timeout
+        # against a human who was never told there was anything to answer.
+        label, notification = self.question()
+
+        self.assertEqual([], self.surface(label), "still being tried")
+        self.spend(notification)
+
+        self.assertEqual(["decision_unannounced"], self.surface(label))
+        # One delivery anywhere closes it. The rule is about a question nobody
+        # was told about, not about a channel that failed.
+        self.owner(
+            "UPDATE decision_notifications SET delivered_at = now() WHERE id = $1::uuid",
+            (notification,),
+        )
+
+        self.assertEqual([], self.surface(label))
+
+    def test_a_question_that_dies_unannounced_is_reported_before_it_is_retired(self):
+        # The order inside one pass, which is the whole of what the arm is worth.
+        # `decision_unannounced` is a rule about a pending question, and this
+        # sweep is about to retire this one -- so a sweep that expired first and
+        # looked afterwards would find nothing to report, every time, and the
+        # question would go to a timeout in silence. It is read first.
+        label, notification = self.question(ttl="1 millisecond")
+        self.spend(notification)
+
+        result = decisions.sweep(self.harness.runtime, deliver=lambda command: (True, ""))
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(
+            [(False, f"no channel will carry these questions again and no human has been told about them: {label}")],
+            [
+                (item.ok, item.detail)
+                for item in result.assertions
+                if item.name == "announcement" and label in item.detail
+            ],
+        )
+        # Retired all the same, by the same pass: the alarm is about the record
+        # being honest, not about holding the deadline open.
+        self.assertEqual(
+            ("expired", "runtime", "deadline passed with no human answer"),
+            tuple(
+                str(value)
+                for value in self.connection.execute(
+                    "SELECT status, actor_kind, answer FROM pending_decisions"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.identifiers["decision"], label),
+                ).rows[0]
+            ),
+        )
+
+    @staticmethod
+    def recorder(carried: list[list[str]]):
+        """A channel that always works, and keeps what it was handed.
+
+        Nothing here runs `notify-send`: what the substitution produced is the
+        subject, and a suite that put it on a desktop would be a suite whose
+        result depends on whether one is there.
+        """
+
+        def deliver(command):
+            carried.append(list(command))
+            return True, ""
+
+        return deliver
+
+    def attempted(self, notification: str) -> tuple[int, bool]:
+        """How many times a notification was tried, and whether it landed."""
+        row = self.connection.execute(
+            "SELECT attempts, delivered_at IS NOT NULL FROM decision_notifications"
+            " WHERE id = $1::uuid",
+            (notification,),
+        ).rows[0]
+        return int(row[0]), bool(row[1])
+
+    def spend(self, notification: str) -> None:
+        """Burn every attempt this notification's channel allows it."""
+        self.owner(
+            "UPDATE decision_notifications n SET attempts = c.max_attempts"
+            "  FROM notification_channels c"
+            " WHERE c.channel = n.channel AND n.id = $1::uuid",
+            (notification,),
         )
 
     def test_a_missing_capability_is_blocked_and_recorded_under_its_program(self):

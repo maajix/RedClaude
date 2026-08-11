@@ -581,6 +581,55 @@ class StateCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
 
 
+class DecisionCommandTest(unittest.TestCase):
+    """`rk decision sweep`, up to the point where a database is needed.
+
+    The runtime's connection string, because the queue is the runtime's: the
+    door holds `rk2_proxy`, which cannot reach a single one of these tables, and
+    that is why the sweep is a command of its own rather than a thread inside
+    the fence.
+    """
+
+    def test_the_sweep_reads_the_runtime_connection_string(self):
+        result = run("decision", "sweep")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("decision sweep", report["command"])
+        self.assertEqual(
+            [("invalid_configuration", "environment:RK_DATABASE_URL")],
+            [(item["code"], item["source"]) for item in report["violations"]],
+        )
+
+    def test_a_decision_command_without_an_operation_is_a_usage_error(self):
+        result = run("decision")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("usage: rk decision", result.stderr)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run("decision", "sweep", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("decision sweep", json.loads(result.stdout)["command"])
+
+    def test_a_sweep_that_reached_nothing_still_says_how_many_passes_it_made(self):
+        # A sweeper that never ran and a sweeper with nothing to do write the
+        # same document otherwise, and only one of them means the queue is being
+        # tended.
+        result = run("decision", "sweep", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(0, json.loads(result.stdout)["passes"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        url = "postgresql://rk2:s3cr3t-sentinel@127.0.0.1:1/rk2"
+
+        result = run("decision", "sweep", "--url", url)
+
+        self.assertNotIn("s3cr3t-sentinel", result.stdout)
+        self.assertNotIn("s3cr3t-sentinel", result.stderr)
+
+
 class IdentityCommandTest(unittest.TestCase):
     """Identity provisioning is an explicit operator adapter, never a net tool input."""
 

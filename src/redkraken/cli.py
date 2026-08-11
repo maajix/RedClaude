@@ -18,6 +18,7 @@ from redkraken import (
     __version__,
     artifact,
     backup,
+    decisions,
     doctor,
     header,
     identity,
@@ -647,6 +648,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     spend.set_defaults(run=_proxy_request)
 
+    questions = commands.add_parser(
+        "decision",
+        help="tend the queue a gate verdict of `ask` leaves behind",
+    )
+    tending = questions.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    tend = tending.add_parser(
+        "sweep",
+        help=(
+            "retire the questions whose deadline passed and deliver the "
+            f"notifications that are due (${DATABASE_URL})"
+        ),
+    )
+    _add_url(tend, RUNTIME)
+    tend.add_argument(
+        "--every",
+        type=float,
+        metavar="seconds",
+        help=(
+            "keep sweeping this often until interrupted; without it one pass is "
+            "made and the command exits, which is what a timer wants"
+        ),
+    )
+    tend.set_defaults(run=_decision_sweep)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -1002,6 +1028,26 @@ def _proxy_request(arguments: argparse.Namespace) -> int:
                 method=arguments.method,
                 ca_file=ca_file,
             ),
+        )
+    )
+
+
+def _decision_sweep(arguments: argparse.Namespace) -> int:
+    """The one command whose useful run is usually the one that did nothing.
+
+    A sweep that retires no question and delivers no notification is the queue
+    in the state it should be in, so the report says how many passes it made
+    rather than only what it changed -- otherwise a sweeper that never ran and a
+    sweeper with nothing to do write the same document.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, decisions.COMMAND)
+    if runtime is None:
+        return _render(report(decisions.COMMAND, ledger))
+    return _render(
+        _guarded(
+            decisions.COMMAND,
+            lambda: decisions.sweep(runtime, every=arguments.every),
         )
     )
 
