@@ -35,9 +35,9 @@ class PackagingTest(unittest.TestCase):
             ["redkraken*"], self.pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
         )
 
-    def test_auth_resolution_evidence_is_shipped_with_the_application(self):
+    def test_auth_resolution_manifest_is_shipped_with_the_application(self):
         self.assertIn(
-            "evidence/*.json",
+            "measurements/*.json",
             self.pyproject["tool"]["setuptools"]["package-data"]["redkraken"],
         )
 
@@ -133,6 +133,21 @@ class InstallationTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(0, installed.returncode, installed.stdout + installed.stderr)
+
+        replayed = subprocess.run(
+            [
+                str(venv / "bin" / "python"),
+                "-I",
+                "-c",
+                "from redkraken import _startup; print(len(_startup.replay_auth_resolution()))",
+            ],
+            cwd=scratch(),
+            env=environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual("17\n", replayed.stdout, replayed.stderr)
 
         rk = str(venv / "bin" / "rk")
         version = subprocess.run(

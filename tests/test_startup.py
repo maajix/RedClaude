@@ -13,15 +13,15 @@ MANIFEST = (
     ROOT
     / "src"
     / "redkraken"
-    / "evidence"
+    / "measurements"
     / "auth-resolution-sdk-0.2.132-cli-2.1.224.json"
 )
 
 
-class AuthResolutionEvidenceTest(unittest.TestCase):
+class AuthResolutionManifestTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.manifest = _startup._load_evidence()
+        cls.manifest = _startup._load_manifest()
 
     def test_the_complete_measured_matrix_replays_offline(self):
         replay = _startup.replay_auth_resolution()
@@ -53,7 +53,7 @@ class AuthResolutionEvidenceTest(unittest.TestCase):
 
         for mutation in mutations:
             with self.subTest(ids=[case["id"] for case in mutation["cases"]]):
-                with self.assertRaisesRegex(_startup.EvidenceError, "^case set mismatch"):
+                with self.assertRaisesRegex(_startup.ManifestError, "^case set mismatch"):
                     _startup._validate_manifest(mutation)
 
     def test_each_measured_case_returns_its_literal_structured_violations(self):
@@ -184,20 +184,31 @@ class AuthResolutionEvidenceTest(unittest.TestCase):
                     result["decision"],
                 )
 
-    def test_subscription_labels_without_a_request_are_not_positive_evidence(self):
+    def test_subscription_labels_without_a_request_are_not_a_positive_measurement(self):
         baseline = next(case for case in self.manifest["cases"] if case["id"] == "baseline")
         wire = copy.deepcopy(baseline["wire"])
         wire["request_count"] = 0
 
         self.assertEqual("refuse", _startup._measured_decision(wire))
 
-    def test_changed_evidence_is_rejected_before_manifest_evaluation(self):
-        with (
-            mock.patch.object(_startup, "_EVIDENCE_SHA256", "0" * 64),
-            mock.patch.object(_startup, "_validate_manifest") as validate,
-            self.assertRaisesRegex(_startup.EvidenceError, "evidence digest changed"),
+    def test_a_different_refusal_shape_cannot_corroborate_a_vector_effect(self):
+        manifest = copy.deepcopy(self.manifest)
+        cases = {case["id"]: case for case in manifest["cases"]}
+        cases["base_url"]["wire"] = copy.deepcopy(cases["fd"]["wire"])
+
+        with self.assertRaisesRegex(
+            _startup.ManifestError,
+            "base_url: wire outcome does not measure destination_override",
         ):
-            _startup._load_evidence()
+            _startup._replay_manifest(manifest)
+
+    def test_changed_manifest_is_rejected_before_case_evaluation(self):
+        with (
+            mock.patch.object(_startup, "_MANIFEST_SHA256", "0" * 64),
+            mock.patch.object(_startup, "_validate_manifest") as validate,
+            self.assertRaisesRegex(_startup.ManifestError, "manifest digest changed"),
+        ):
+            _startup._load_manifest()
 
         validate.assert_not_called()
 

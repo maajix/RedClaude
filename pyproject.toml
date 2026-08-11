@@ -30,4 +30,4 @@ include = ["redkraken*"]
 # migrate` applies the migrations it was installed with rather than whatever is
 # in the working directory, so they have to be in the wheel.
 [tool.setuptools.package-data]
-redkraken = ["migrations/*.sql", "evidence/*.json"]
+redkraken = ["migrations/*.sql", "measurements/*.json"]
