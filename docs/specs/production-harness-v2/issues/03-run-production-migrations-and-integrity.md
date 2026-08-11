@@ -107,3 +107,16 @@ revoked `FROM PUBLIC` rather than from the role that `ALTER DEFAULT PRIVILEGES`
 had already granted them to. Fixing it means changing promoted schema and
 deciding what the runtime's privilege surface is, which is not what a ticket
 about running migrations gets to decide silently.
+
+### Completion remediation, 2026-08-11
+
+The earlier criterion-5 limitation is superseded. The server baseline now
+passes its observed runtime facts through `evaluate_server_runtime`, a pure
+gate evaluator. The four binary/extension facts can therefore be supplied one
+independently false observation at a time without pretending the live server
+changed underneath the test. Missing runtime and proxy roles now produce their
+own named false catalogue checks rather than aborting a whole family first.
+
+The live negative-control suite consequently has an executable falsification
+for every check the gate runs. Its coverage assertion still fails by name when
+a new registered check arrives without a control.

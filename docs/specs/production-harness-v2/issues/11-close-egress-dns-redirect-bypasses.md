@@ -4,13 +4,13 @@
 
 **Blocked by:** 10 — Send HTTPS through the same capability path.
 
-**Status:** needs-triage
+**Status:** resolved
 
-- [ ] Inside the real agent container, raw internet TCP, external DNS, target networks, provisioning ports and control ports are unreachable while the proxy remains reachable.
+- [x] Inside the real agent container, raw internet TCP, external DNS, target networks, provisioning ports and control ports are unreachable while the proxy remains reachable.
 - [x] The proxy resolves and pins the actual destination and rechecks scope after DNS resolution rather than trusting the requested hostname alone.
 - [x] Redirect targets are canonicalized and scope-checked independently before following them.
 - [x] Each subresource exchange resolves the live capability independently and receives its own Receipt under the parent Tool run.
-- [ ] Capability expiry, Tool run closure, Lease loss and Program Halt between parent and child requests stop the next exchange before target contact.
+- [x] Capability expiry, Tool run closure, Lease loss and Program Halt between parent and child requests stop the next exchange before target contact.
 - [x] Negative fixtures count target contacts so every refused bypass proves that no request arrived.
 
 ## Comments
@@ -304,3 +304,19 @@ rather than made here.
 - **The wire view is still NULL and no budget is counted.** Unchanged from
   tickets 09 and 10: this door injects nothing, so there is no second view of the
   bytes (ticket 12), and it enforces authority rather than quantity (ticket 13).
+
+### Completion remediation, 2026-08-11
+
+The earlier criterion-1 and Program-Halt limitations are superseded.
+`redkraken.isolation.run` verifies an internal network with exactly the proxy as
+its pre-existing peer and launches a non-root, read-only, capability-free Agent
+container on that network alone. The container proof distinguishes topology
+from proxy convention: proxy access succeeds while direct public TCP, external
+DNS, target/control network addresses and a provisioning-style port all fail.
+
+`program_halts` is durable operator state changed only through the
+`rk2_human`-granted `halt_program` and `clear_program_halt` functions. Both
+capability resolution and the allowed-Receipt trigger re-read current Halt
+state. The live two-request test keeps the Tool run and capability alive,
+halts between requests, proves the second request opens no target socket, then
+resumes only after a human clear; both state changes are human-authored Events.

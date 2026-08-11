@@ -130,6 +130,9 @@ class Harness:
     #: The fence is tested through this one because a proxy tested as the owner
     #: would prove nothing about the role a compromised proxy would be holding.
     proxy: pg.Settings
+    #: The operator connection. It owns no tables and changes Halt/decision
+    #: state only through SECURITY DEFINER verbs granted to this login.
+    human: pg.Settings
     passwords: dict[str, str]
     migrations: tuple[migrate.Migration, ...]
     created: object = None
@@ -190,6 +193,9 @@ def _build() -> Harness:
         ),
         proxy=admin.replace(
             database=DATABASE, user="rk2_proxy", password=passwords["rk2_proxy"]
+        ),
+        human=admin.replace(
+            database=DATABASE, user="rk2_human", password=passwords["rk2_human"]
         ),
         passwords=passwords,
         migrations=migrations,
@@ -545,6 +551,7 @@ class Control:
     #: `SET ROLE rk2_owner`; `superuser` is the only one that can change a role,
     #: which is exactly why a migration cannot.
     on: str = "owner"
+    families: tuple[str, ...] = integrity.ALL_FAMILIES
 
 
 def repeat(character: str) -> str:
@@ -862,6 +869,10 @@ CONTROLS = (
         " FOREIGN KEY (sha256) REFERENCES artifacts(sha256) ON DELETE CASCADE",
     ),
     Control(
+        "standing:program_halt",
+        "GRANT EXECUTE ON FUNCTION halt_program(uuid,text) TO rk2_runtime",
+    ),
+    Control(
         # Rule 4: the bridge read as its owner. Every reference of every Program
         # would satisfy the policy on `artifacts` from any session.
         "standing:artifact_reachability",
@@ -991,39 +1002,44 @@ CONTROLS = (
     Control("roles:runtime_not_bypassrls", "ALTER ROLE rk2_runtime BYPASSRLS", on="superuser"),
     Control("roles:runtime_not_owner", "GRANT rk2_owner TO rk2_runtime", on="superuser"),
     Control("roles:proxy_is_not_owner_or_human", "GRANT rk2_human TO rk2_proxy", on="superuser"),
-)
-
-#: Checks whose subject cannot be taken away without a sibling check in the same
-#: function raising first, which aborts the whole family before any row is
-#: returned. The gate reports that as a refusal rather than as a pass -- the
-#: property that actually protects an operator -- but it cannot name the check
-#: that was about to fail, so these are counted apart from the controls above
-#: rather than quietly folded in with them.
-REFUSES = (
-    ("ALTER ROLE rk2_proxy RENAME TO rk2_absent", "superuser", ("roles:proxy_role_exists",)),
-    ("ALTER ROLE rk2_runtime RENAME TO rk2_gone", "superuser", ("roles:runtime_role_exists",)),
-    (
-        "DROP EXTENSION vector CASCADE",
-        "superuser",
-        ("baseline:pgvector_version", "baseline:hnsw_cosine_opclass"),
+    Control(
+        "roles:runtime_role_exists",
+        "ALTER ROLE rk2_runtime RENAME TO rk2_absent",
+        on="superuser",
+        families=(integrity.ROLES_FAMILY,),
+    ),
+    Control(
+        "roles:proxy_role_exists",
+        "ALTER ROLE rk2_proxy RENAME TO rk2_absent",
+        on="superuser",
+        families=(integrity.ROLES_FAMILY,),
     ),
 )
 
-#: Checks about the server binary itself. Falsifying either means running a
-#: different PostgreSQL, which is a property of the container this suite is
-#: pointed at rather than something a test can arrange. `uuidv7_is_builtin`
-#: belongs here only because it is aggregated: read as a scalar subquery it
-#: would raise on a second zero-argument `uuidv7()` instead of reporting.
-UNFALSIFIABLE = {"baseline:server_major", "baseline:uuidv7_is_builtin"}
+#: The four facts fixed by the running binary and installed extension cannot be
+#: changed transactionally. They cross the same evaluator the live gate uses,
+#: so each negative control supplies one independently bad observation and asks
+#: that evaluator for the named failed check. Expected values are literals from
+#: the production baseline, not recomputed from the predicate under test.
+RUNTIME_CONTROLS = (
+    ("baseline:server_major", 170000, "{1}", "0.8.6", True),
+    ("baseline:uuidv7_is_builtin", 180000, "{1,20000}", "0.8.6", True),
+    ("baseline:pgvector_version", 180000, "{1}", "0.7.9", True),
+    ("baseline:hnsw_cosine_opclass", 180000, "{1}", "0.8.6", False),
+)
 
 
 class NegativeControlTest(DatabaseCase):
     """Criterion 5: each check, shown failing when its subject is broken."""
 
-    def run_gate(self, connection: pg.Connection) -> list[str]:
+    def run_gate(
+        self,
+        connection: pg.Connection,
+        families: tuple[str, ...] = integrity.ALL_FAMILIES,
+    ) -> list[str]:
         return [
             check.source
-            for check in integrity.run(connection, self.harness.expected)
+            for check in integrity.run(connection, self.harness.expected, families=families)
             if not check.ok
         ]
 
@@ -1047,15 +1063,15 @@ class NegativeControlTest(DatabaseCase):
         cls.restore.close()
         super().tearDownClass()
 
-    def break_it(self, sql: str, on: str) -> list[str]:
-        connection = self.connection_for(on)
+    def break_it(self, control: Control) -> list[str]:
+        connection = self.connection_for(control.on)
         failed: list[str] = []
         try:
             with connection.transaction():
-                if on == "owner":
+                if control.on == "owner":
                     connection.execute("SET LOCAL ROLE rk2_owner")
-                connection.execute_script(sql)
-                failed = self.run_gate(connection)
+                connection.execute_script(control.sql)
+                failed = self.run_gate(connection, control.families)
                 raise Rollback
         except Rollback:
             pass
@@ -1067,23 +1083,19 @@ class NegativeControlTest(DatabaseCase):
     def test_each_check_fails_when_its_subject_is_broken(self):
         for control in CONTROLS:
             with self.subTest(control.check):
-                self.assertIn(control.check, self.break_it(control.sql, control.on))
+                self.assertIn(control.check, self.break_it(control))
 
-    def test_a_check_whose_subject_is_gone_refuses_rather_than_passes(self):
-        for sql, on, checks in REFUSES:
-            with self.subTest(checks):
-                connection = self.connection_for(on)
-                try:
-                    with connection.transaction():
-                        connection.execute_script(sql)
-                        result = integrity.verify(connection, self.harness.expected)
+    def test_each_fixed_runtime_fact_fails_through_the_gate_evaluator(self):
+        for check, version, uuid_oids, vector_version, cosine in RUNTIME_CONTROLS:
+            with self.subTest(check):
+                failed = self.connection.execute(
+                    "SELECT 'baseline:' || check_name"
+                    "  FROM evaluate_server_runtime($1::integer, $2::bigint[], $3, $4)"
+                    " WHERE NOT ok",
+                    (version, uuid_oids, vector_version, cosine),
+                ).rows
 
-                        self.assertFalse(result.ok)
-                        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
-                        self.assertIn("could not be run", result.violations[0].detail)
-                        raise Rollback
-                except Rollback:
-                    pass
+                self.assertEqual([check], [str(row[0]) for row in failed])
 
     def test_an_index_the_server_cannot_build_fails_the_headroom_check(self):
         # The one check that needs rows rather than an edit: headroom is the
@@ -1143,8 +1155,7 @@ class NegativeControlTest(DatabaseCase):
         # without a control fails here, naming itself, instead of joining the
         # gate as one more thing nobody has seen fail.
         covered = {control.check for control in CONTROLS}
-        covered |= {check for _, _, checks in REFUSES for check in checks}
-        covered |= UNFALSIFIABLE
+        covered |= {check for check, *_ in RUNTIME_CONTROLS}
         covered |= {"baseline:hnsw_headroom", "standing:receipt_integrity"}
         ran = {check.source for check in integrity.run(self.connection, self.harness.expected)}
 
@@ -3199,6 +3210,7 @@ class ProxyEgressTest(DatabaseCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.runtime = pg.connect(cls.harness.runtime)
+        cls.human = pg.connect(cls.harness.human)
         cls.root = scratch() / "proxy-store"
 
         cls.identifiers = {}
@@ -3207,7 +3219,7 @@ class ProxyEgressTest(DatabaseCase):
         # live, kept apart from `a` because those are counted: a suite that
         # asserts "two Receipts and no more" under the Program every other test
         # uses is a suite where adding a test breaks an unrelated one.
-        for name in ("a", "b", "retired", "shared"):
+        for name in ("a", "b", "retired", "shared", "credential"):
             path = write(SCOPED.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, opened.violations
@@ -3217,6 +3229,10 @@ class ProxyEgressTest(DatabaseCase):
         cls.target, _ = counterparty(LiveTarget)
         cls.secure_target, _, cls.target_ca = tls_counterparty(LiveTarget)
         cls.authority = tls.authority(scratch() / "door-authority")
+        # One installation has one root.  The sealed-artifact case later in
+        # this module deliberately uses the same material against the key
+        # generation this proxy may establish first.
+        cls.root_secret = seal.Root(Path("live-proxy-selftest-root"), SECRET)
 
         cls.resolved = []
         cls.dialled = []
@@ -3228,6 +3244,7 @@ class ProxyEgressTest(DatabaseCase):
             connector=cls.dial,
             resolver=cls.look_up,
             authority=cls.authority,
+            root_secret=cls.root_secret,
         )
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -3263,25 +3280,49 @@ class ProxyEgressTest(DatabaseCase):
         cls.secure_target.shutdown()
         cls.secure_target.server_close()
         cls.runtime.close()
+        cls.human.close()
 
         stored = [
             str(row[0])
             for row in cls.connection.execute(
-                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha])"
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
                 "  FROM receipts r JOIN programs p ON p.id = r.program_id"
                 " WHERE p.slug LIKE $1",
                 (f"{PROXY_SLUG}-%",),
             ).rows
             if row[0] is not None
         ]
+        ciphertexts = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT s.ciphertext_sha256 FROM artifact_seal s JOIN programs p"
+                "    ON p.id = s.scope_id AND s.scope_kind = 'program'"
+                " WHERE p.slug LIKE $1",
+                (f"{PROXY_SLUG}-%",),
+            ).rows
+        ]
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM secret_access_log WHERE program_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{PROXY_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program' AND scope_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{PROXY_SLUG}-%",),
+            )
             cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{PROXY_SLUG}-%",))
             if stored:
                 cls.connection.execute(
                     "DELETE FROM artifacts WHERE sha256 = ANY($1)",
                     ("{" + ",".join(stored) + "}",),
                 )
+        keep = Store(cls.root)
+        for sha256 in (*stored, *ciphertexts):
+            keep.discard(sha256)
         super().tearDownClass()
 
     #: What `look_up` answers. Mutable, because the resolver the server holds was
@@ -3551,8 +3592,9 @@ class ProxyEgressTest(DatabaseCase):
     def test_the_receipt_names_the_bytes_of_both_directions_and_they_are_stored(self):
         # The other half of criterion 4: a Receipt that names a hash nothing
         # registered proves nothing, so the row, the artifact and the file on
-        # disk are asked about together. No wire view is claimed -- ticket 12
-        # injects and seals; this exchange sent what the agent may read.
+        # disk are asked about together. No wire view is claimed: this target
+        # issued no authentication material, so the exchange sent exactly what
+        # the agent may read. Ticket 12 adds injected Identity material.
         row = self.connection.execute(
             "SELECT r.request_agent_sha, r.response_agent_sha, r.request_wire_sha,"
             "       r.response_wire_sha, r.status_code, r.method, r.host, r.port, r.path"
@@ -3596,6 +3638,75 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual([], [name for name in names if name.startswith(proxy.INTERNAL)])
         for _, value in headers:
             self.assertNotIn("RedKraken", value)
+
+    def test_target_credentials_are_absent_from_the_agent_and_sealed_on_the_wire(self):
+        marker = "rk2-live-target-cookie-91ae73"
+        previous = LiveTarget.response_headers
+        LiveTarget.response_headers = (("Set-Cookie", f"session={marker}; Secure; HttpOnly"),)
+        self.addCleanup(setattr, LiveTarget, "response_headers", previous)
+        capability, tool_run, _ = self.mint("credential")
+        program_id = self.identifiers["credential"]
+        client = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
+        )
+        try:
+            client.request(
+                "GET",
+                URL,
+                headers={
+                    proxy.AUTHORIZATION: f"RedKraken {capability}",
+                    proxy.PROGRAM: program_id,
+                },
+            )
+            answer = client.getresponse()
+            body = answer.read()
+            self.assertEqual(200, answer.status)
+            self.assertIsNone(answer.headers.get("Set-Cookie"))
+            self.assertEqual(ANSWER, body)
+        finally:
+            client.close()
+
+        row = self.connection.execute(
+            "SELECT r.response_agent_sha, r.response_wire_sha, s.ciphertext_sha256,"
+            "       s.alg, s.nonce, s.kek_gen, encode(k.salt, 'hex')"
+            "  FROM receipts r"
+            "  JOIN artifact_seal s ON s.sha256 = r.response_wire_sha"
+            "  JOIN secret_kek k ON k.gen = s.kek_gen"
+            " WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'",
+            (tool_run,),
+        ).rows[0]
+        agent_sha, wire_sha, ciphertext_sha = map(str, row[:3])
+        visible = Store(self.root).load(agent_sha)
+        envelope = Store(self.root).load(ciphertext_sha)
+        self.assertNotEqual(agent_sha, wire_sha)
+        self.assertNotIn(marker.encode(), visible)
+        self.assertNotIn(marker.encode(), envelope)
+        self.assertFalse(artifact.path_for(self.root, wire_sha).exists())
+
+        generation = int(row[5])
+        key = self.root_secret.program_key(
+            bytes.fromhex(str(row[6])), generation=generation, program_id=program_id
+        )
+        opened = seal.unseal(
+            key,
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=program_id, sha256=wire_sha, generation=generation
+            ),
+        )
+        self.assertIn(marker.encode(), opened)
+        self.assertFalse(
+            self.connection.execute("SELECT * FROM find_in_database($1)", (marker,)).rows
+        )
+        access = self.connection.execute(
+            "SELECT verb, scope_kind, scope_id::text, tool_run_id::text, field, outcome"
+            "  FROM secret_access_log WHERE tool_run_id = $1::uuid",
+            (tool_run,),
+        ).rows
+        self.assertEqual(
+            [("seal", "program", program_id, tool_run, "target_response", "ok")],
+            [tuple(map(str, item)) for item in access],
+        )
 
     def test_the_receipt_names_the_address_the_door_resolved_and_then_dialled(self):
         # PH2-11, criterion 2. The name was decided, then resolved once by the
@@ -4055,6 +4166,64 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("running", str(row[0]))
         self.assertTrue(row[1], "the capability was still live")
         self.assertIsNone(row[2])
+
+    def test_a_program_halted_between_two_requests_stops_the_second_until_an_operator_clears_it(self):
+        # PH2-11, criterion 5's fourth arm. The capability predates the Halt and
+        # remains live throughout; what changes is the Program's current
+        # operator state. Every exchange resolves that state again, so the
+        # parent is served, the child stops before a socket, and remediation
+        # allows the same still-live Tool run to continue.
+        capability, tool_run, _ = self.mint("shared")
+        program_id = self.identifiers["shared"]
+
+        parent = self.attempt(capability, program_id)
+        dialled = len(self.dialled)
+        halted = self.human.execute(
+            "SELECT halt_program($1::uuid, $2)",
+            (program_id, "operator containment self-test"),
+        ).scalar()
+        child = self.refused("shared", capability, program_id)
+
+        self.assertEqual(200, parent[0])
+        self.assertEqual(("agent", "blocked", "capability refused"), child[:3])
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened during Halt")
+        halt_payload = json.loads(halted) if isinstance(halted, str) else dict(halted)
+        self.assertEqual("halted", halt_payload["status"])
+        row = self.connection.execute(
+            "SELECT tr.status, tr.egress_token_sha256 IS NOT NULL, ar.finished_at"
+            "  FROM tool_runs tr JOIN agent_runs ar ON ar.id = tr.agent_run_id"
+            " WHERE tr.id = $1::uuid",
+            (tool_run,),
+        ).rows[0]
+        self.assertEqual(("running", True, None), (str(row[0]), bool(row[1]), row[2]))
+
+        with self.assertRaises(pg.DatabaseError):
+            self.runtime.execute(
+                "SELECT clear_program_halt($1::uuid, $2)",
+                (program_id, "runtime must not clear this"),
+            )
+
+        cleared = self.human.execute(
+            "SELECT clear_program_halt($1::uuid, $2)",
+            (program_id, "operator remediation complete"),
+        ).scalar()
+        resumed = self.attempt(capability, program_id)
+
+        clear_payload = json.loads(cleared) if isinstance(cleared, str) else dict(cleared)
+        self.assertEqual("cleared", clear_payload["status"])
+        self.assertEqual(200, resumed[0])
+        events = self.connection.execute(
+            "SELECT type, actor_kind, payload -> 'after' ->> 'status'"
+            "  FROM events WHERE subject_table = 'program_halts'"
+            "   AND subject_id = (SELECT id FROM program_halts WHERE program_id = $1::uuid)"
+            " ORDER BY seq",
+            (program_id,),
+        ).rows
+        self.assertEqual(
+            [("program.halted", "human", "halted"),
+             ("program.halt_changed", "human", "cleared")],
+            [(str(event[0]), str(event[1]), str(event[2])) for event in events],
+        )
 
     def test_a_name_made_of_hexadecimal_is_a_name_and_not_an_address(self):
         # The address decision refuses a request whose *host* was already an

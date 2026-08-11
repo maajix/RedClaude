@@ -55,10 +55,12 @@ name: the name survives as the `Host` header and as the certificate the door
 verifies, so a name that moves between the decision and the connection moves
 nothing.
 
-Credential injection is ticket 12, which is also when the wire view of an
-exchange first differs from the agent's -- until then there is one view, it is
-the agent's, and claiming two would be recording a difference that does not
-exist.
+Target-issued authentication headers are wire-only.  They are removed before
+the response is answered or made agent-visible; when that changes the message,
+the exact target response is encrypted under the installation root key and the
+Receipt names both hashes.  A door without that key refuses such a response
+instead of leaking it.  Ticket 12 extends this same boundary with injected
+Identity material and persisted session state.
 
 Containment is not here either, and cannot be. Telling a child to use this door
 (`tls.agent_environment`) is a request; a client that ignores it reaches the
@@ -72,6 +74,7 @@ refuses everything it is asked and nothing it is not.
 from __future__ import annotations
 
 import http.client
+import hmac
 import ipaddress
 import json
 import re
@@ -87,7 +90,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urljoin, urlsplit
 
-from redkraken import config, migrate, pg, program, scope, tls
+from redkraken import config, migrate, pg, program, scope, seal, tls
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -129,6 +132,7 @@ __all__ = [
     "pinned_ips",
     "query_sha256",
     "redirected",
+    "response_for_agent",
     "resolve",
     "send",
     "serve",
@@ -260,6 +264,20 @@ TOOL = "mcp__rk2__net_request"
 #: new URL is canonicalised and decided on its own -- and what the door owes the
 #: record is the target it handed over, canonicalised the same way.
 REDIRECTS = frozenset({301, 302, 303, 307, 308})
+
+# Response fields whose value is authentication material issued by the target,
+# rather than content the Agent may consume.  Header names are the enforceable
+# boundary available before ticket 12 adds per-Identity body projections.
+WIRE_RESPONSE_HEADERS = frozenset(
+    {
+        "authentication-info",
+        "proxy-authenticate",
+        "proxy-authentication-info",
+        "set-cookie",
+        "set-cookie2",
+        "www-authenticate",
+    }
+)
 
 
 class Refused(Exception):
@@ -440,6 +458,20 @@ def forwardable(headers: Message) -> list[tuple[str, str]]:
     ]
 
 
+def response_for_agent(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Remove target-issued authentication material from an Agent response.
+
+    The unmodified list remains the wire view.  Returning a new list makes the
+    transformation explicit at the call site: the caller is answered from this
+    value and the encrypted artifact is made from the original.
+    """
+    return [
+        (name, value)
+        for name, value in headers
+        if name.lower() not in WIRE_RESPONSE_HEADERS
+    ]
+
+
 def origin_form(url: str) -> str:
     """The request line a target expects, from the absolute form a proxy gets.
 
@@ -593,7 +625,12 @@ LAPSED = "egress capability refused"
 #: names them are written together or not at all. A Receipt naming bytes no row
 #: registered is a dangling reference, and rows for bytes no Receipt names are
 #: an artifact nobody can reach.
-RECORD = "SELECT record_proxy_exchange($1, $2::jsonb, $3::jsonb)"
+RECORD_SEALED = "SELECT record_proxy_exchange($1, $2::jsonb, $3::jsonb, $4::jsonb)"
+
+WIRE_KEYING = (
+    "SELECT generation, salt_hex, root_check_hex"
+    "  FROM ensure_proxy_wire_keying($1, $2::bytea, $3::bytea)"
+)
 
 BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)::text"
 
@@ -719,7 +756,12 @@ class Fence:
             raise Refused("address refused", "no address verdict", pinned=(address,))
 
     def allowed_receipt(
-        self, program_id: str, capability: str, receipt: dict, artifacts: list[dict]
+        self,
+        program_id: str,
+        capability: str,
+        receipt: dict,
+        artifacts: list[dict],
+        seals: list[dict] | None = None,
     ) -> dict:
         """Record one exchange, under the Program this request was decided for.
 
@@ -734,12 +776,50 @@ class Fence:
             self._bind(program_id)
             try:
                 answer = self.connection.execute(
-                    RECORD,
-                    (capability, json.dumps(receipt), json.dumps(artifacts)),
+                    RECORD_SEALED,
+                    (
+                        capability,
+                        json.dumps(receipt),
+                        json.dumps(artifacts),
+                        json.dumps(seals or []),
+                    ),
                 ).scalar()
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
         return _object(answer)
+
+    def wire_key(
+        self, program_id: str, capability: str, root: seal.Root
+    ) -> tuple[int, bytes]:
+        """Derive the Program key after the database confirms its generation.
+
+        The database supplies only a random salt and a root-check value.  The
+        secret and the derived key never cross the connection, and a proxy with
+        the wrong root refuses before producing ciphertext nobody can open.
+        """
+        proposed = seal.new_salt()
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(
+                    WIRE_KEYING,
+                    (capability, proposed, root.check(proposed, generation=1)),
+                ).rows
+            except pg.DatabaseError as error:
+                raise Refused("wire seal refused", str(error), status=502) from error
+        if not rows:
+            raise Refused("wire seal refused", "no active key generation", status=502)
+        generation, salt_hex, root_check_hex = rows[0]
+        number = int(generation)
+        salt = bytes.fromhex(str(salt_hex))
+        expected = root.check(salt, generation=number)
+        if not hmac.compare_digest(expected, bytes.fromhex(str(root_check_hex))):
+            raise Refused(
+                "wire seal refused",
+                "the proxy artifact key does not match this installation",
+                status=502,
+            )
+        return number, root.program_key(salt, generation=number, program_id=program_id)
 
     def blocked_receipt(self, program_id: str, capability: str | None, receipt: dict) -> str:
         with self._lock:
@@ -922,6 +1002,7 @@ class Server(ThreadingHTTPServer):
         resolver: Resolver = resolve,
         timeout: float = TIMEOUT,
         authority: tls.Authority | None = None,
+        root_secret: seal.Root | None = None,
     ):
         super().__init__(address, handler)
         self.fence = fence
@@ -937,6 +1018,10 @@ class Server(ThreadingHTTPServer):
         #: certificate material is a door that says no to tunnels, not a door
         #: that relays one it cannot read.
         self.authority = authority
+        #: The installation root used only when a target response contains
+        #: wire-only credential headers.  Without it those responses fail
+        #: closed; ordinary one-view exchanges do not need key material.
+        self.root_secret = root_secret
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1298,10 +1383,82 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         sent = transcript(line, headers, body)
-        received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
+        agent_back = response_for_agent(back)
+        received = transcript(f"HTTP/1.1 {status} {reason}", agent_back, returned)
         store = self.server.store
         request_sha, request_new = store.put(sent)
         response_sha, response_new = store.put(received)
+
+        seals: list[dict] = []
+        ciphertext_new = False
+        if agent_back != back:
+            root = self.server.root_secret
+            if root is None:
+                if request_new:
+                    store.discard(request_sha)
+                if response_new:
+                    store.discard(response_sha)
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    Refused(
+                        "wire response refused",
+                        "the target returned authentication material but the door has no artifact key",
+                        status=502,
+                        target_status=status,
+                    ),
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                    egress=egress,
+                )
+            try:
+                generation, key = self.server.fence.wire_key(
+                    authorization.program_id, capability, root
+                )
+            except Refused as refusal:
+                if request_new:
+                    store.discard(request_sha)
+                if response_new:
+                    store.discard(response_sha)
+                refusal.target_status = status
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    refusal,
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                    egress=egress,
+                )
+
+            wire = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
+            wire_sha = digest(wire)
+            encrypted = seal.seal(
+                key,
+                wire,
+                aad=seal.associated_data(
+                    program_id=authorization.program_id,
+                    sha256=wire_sha,
+                    generation=generation,
+                ),
+            )
+            envelope = encrypted.encode()
+            ciphertext_sha, ciphertext_new = store.put(envelope)
+            seals.append(
+                {
+                    "sha256": wire_sha,
+                    "byte_size": len(wire),
+                    "content_type": TRANSCRIPT,
+                    "alg": encrypted.alg,
+                    "nonce_hex": encrypted.nonce.hex(),
+                    "kek_gen": generation,
+                    "ciphertext_sha256": ciphertext_sha,
+                    "agent_sha256": response_sha,
+                    "value_fpr_hex": root.fingerprint(wire).hex(),
+                    "field": "target_response",
+                }
+            )
 
         # Where the target pointed, when it pointed anywhere. The door does not
         # follow it and must not: following would be an exchange the client never
@@ -1337,7 +1494,7 @@ class Handler(BaseHTTPRequestHandler):
             "request_agent_sha": request_sha,
             "request_wire_sha": None,
             "response_agent_sha": response_sha,
-            "response_wire_sha": None,
+            "response_wire_sha": seals[0]["sha256"] if seals else None,
             "scope_class": authorization.scope_class,
             "intercepted": True,
             # Every address the name answered with, and the one that was dialled
@@ -1356,7 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
         ]
         try:
             written = self.server.fence.allowed_receipt(
-                authorization.program_id, capability, receipt, artifacts
+                authorization.program_id, capability, receipt, artifacts, seals
             )
         except Refused as refusal:
             # The bytes are spent: the target has answered and cannot be asked to
@@ -1372,6 +1529,8 @@ class Handler(BaseHTTPRequestHandler):
                 store.discard(request_sha)
             if response_new:
                 store.discard(response_sha)
+            if ciphertext_new:
+                store.discard(seals[0]["ciphertext_sha256"])
             return self._refuse(
                 authorization.program_id,
                 capability,
@@ -1389,7 +1548,14 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         label = str(written.get("label") or written.get("receipt_id") or "")
-        self._answer(status, None, body=returned, headers=back, receipt=label, reason=reason)
+        self._answer(
+            status,
+            None,
+            body=returned,
+            headers=agent_back,
+            receipt=label,
+            reason=reason,
+        )
 
     def _refuse(
         self,
@@ -1610,6 +1776,7 @@ def listen(
     resolver: Resolver = resolve,
     timeout: float = TIMEOUT,
     authority: tls.Authority | None = None,
+    root_secret: seal.Root | None = None,
 ) -> Server:
     """Bind the listening socket without serving on it."""
     return Server(
@@ -1621,6 +1788,7 @@ def listen(
         resolver=resolver,
         timeout=timeout,
         authority=authority,
+        root_secret=root_secret,
     )
 
 
@@ -1631,6 +1799,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 0,
     authority: Path | None = None,
+    key: Path | None = None,
 ) -> Report:
     """Run the fence until it is interrupted.
 
@@ -1675,9 +1844,32 @@ def serve(
         ledger.hold("authority", NO_AUTHORITY + "; a tunnel is refused rather than relayed")
     certificate = str(signing.certificate) if signing else None
 
+    root_secret: seal.Root | None = None
+    if key is not None:
+        try:
+            root_secret = seal.load_root(key)
+        except seal.Unusable as error:
+            ledger.fail(
+                "artifact_key",
+                str(error),
+                code=INVALID_CONFIGURATION,
+                source="argument:--key",
+            )
+            return report(SERVE, ledger, endpoint=None, certificate=certificate)
+        ledger.hold("artifact_key", "wire-only target responses will be sealed")
+    else:
+        ledger.hold(
+            "artifact_key",
+            f"no key material (${seal.KEY_VARIABLE}); authentication-bearing responses are refused",
+        )
+
     try:
         server = listen(
-            (host, port), fence=None, store=Store(Path(root)), authority=signing
+            (host, port),
+            fence=None,
+            store=Store(Path(root)),
+            authority=signing,
+            root_secret=root_secret,
         )
     except OSError as error:
         ledger.fail(

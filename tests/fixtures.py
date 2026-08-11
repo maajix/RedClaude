@@ -233,6 +233,7 @@ class Target(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
     answer = b'{"note":"target answered"}'
+    response_headers: tuple[tuple[str, str], ...] = ()
 
     def do_GET(self) -> None:
         self.server.seen.append(
@@ -244,6 +245,8 @@ class Target(BaseHTTPRequestHandler):
         )
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        for name, value in self.response_headers:
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(self.answer)))
         self.end_headers()
         self.wfile.write(self.answer)

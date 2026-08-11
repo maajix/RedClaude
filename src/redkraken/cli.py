@@ -485,6 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"their bytes (default: ${ARTIFACTS.variable})"
         ),
     )
+    _add_key(listener)
     listener.add_argument(
         "--host",
         default=DEFAULT_PROXY_HOST,
@@ -844,6 +845,7 @@ def _proxy_serve(arguments: argparse.Namespace) -> int:
     if settings is None or root is None:
         return _render(report(proxy.SERVE, ledger))
     authority = _path(AUTHORITY, arguments.authority)
+    key = artifact.key_from_environment(arguments.key)
     return _render(
         _guarded(
             proxy.SERVE,
@@ -853,6 +855,7 @@ def _proxy_serve(arguments: argparse.Namespace) -> int:
                 host=arguments.host,
                 port=arguments.port,
                 authority=authority,
+                key=key,
             ),
         )
     )

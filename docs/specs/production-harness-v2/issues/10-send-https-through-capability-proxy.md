@@ -4,11 +4,11 @@
 
 **Blocked by:** 09 — Send one HTTP request through the capability proxy.
 
-**Status:** needs-triage
+**Status:** resolved
 
-- [ ] The runtime configures both HTTP and HTTPS proxy schemes explicitly and installs only the run-specific trust root needed by the agent environment.
+- [x] The runtime configures both HTTP and HTTPS proxy schemes explicitly and installs only the run-specific trust root needed by the agent environment.
 - [x] A local TLS target is reached through the proxy and produces a capability-bound allowed Receipt.
-- [ ] Direct HTTPS from the agent network namespace fails even when a client ignores conventional proxy environment variables.
+- [x] Direct HTTPS from the agent network namespace fails even when a client ignores conventional proxy environment variables.
 - [x] An out-of-scope HTTPS target is refused before target contact with an auditable blocked Receipt.
 - [x] The agent never receives proxy authorization, target credentials or wire-only response material.
 - [x] A regression test fails against the prototype behavior that configured only the HTTP proxy handler.
@@ -362,3 +362,22 @@ answered in the first pass and the docstring carries the reason.
   edits `CONTEXT.md`; `tls.py`'s docstring carries the argument for why the trust
   is narrow, and the terms belong in the glossary whenever `/domain-modeling`
   runs next.
+
+### Completion remediation, 2026-08-11
+
+The earlier unresolved-criteria sections are superseded by the production
+container boundary and response projection. `redkraken.isolation.run` is now a
+real caller of `tls.agent_environment`: it launches the Agent on an internal
+one-peer Docker network, mounts only the run CA certificate, supplies both HTTP
+and HTTPS proxy variables, empties bypass and trust-directory variables, and
+blackholes external DNS. A disposable-container test proves the proxy remains
+reachable while raw public TCP, external DNS, the target network and a control
+port do not.
+
+The proxy also treats target authentication response headers, including
+`Set-Cookie`, as wire-only. It answers and stores the redacted Agent view, seals
+the exact target response under the installation root key, and records the two
+different hashes atomically with the capability-bound Receipt. The live test
+runs through `rk2_proxy`, confirms the synthetic credential is absent from the
+caller, plaintext store and database, and authenticates the encrypted wire
+envelope. Without the artifact key, the proxy fails the response closed.

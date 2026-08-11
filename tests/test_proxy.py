@@ -43,7 +43,7 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from redkraken import pg, proxy, scope, tls
+from redkraken import pg, proxy, scope, seal, tls
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
 from redkraken.store import Store
 from tests.fixtures import (
@@ -162,14 +162,32 @@ class Stub:
             raise proxy.Refused("address refused", ADDRESS_ERROR, pinned=(address,))
 
     def allowed_receipt(
-        self, program_id: str, capability: str, receipt: dict, artifacts: list[dict]
+        self,
+        program_id: str,
+        capability: str,
+        receipt: dict,
+        artifacts: list[dict],
+        seals: list[dict] | None = None,
     ) -> dict:
         if self.fail:
             raise proxy.Refused("receipt write refused")
         self.allowed.append(
-            {"program_id": program_id, "receipt": receipt, "artifacts": artifacts}
+            {
+                "program_id": program_id,
+                "receipt": receipt,
+                "artifacts": artifacts,
+                "seals": list(seals or []),
+            }
         )
         return {"receipt_id": "33333333-3333-3333-3333-333333333333", "label": "R1"}
+
+    def wire_key(
+        self, program_id: str, capability: str, root: seal.Root
+    ) -> tuple[int, bytes]:
+        if capability != CAPABILITY or program_id != self.decided.program_id:
+            raise proxy.Refused("wire seal refused", status=502)
+        salt = bytes(range(seal.SALT_BYTES))
+        return 1, root.program_key(salt, generation=1, program_id=program_id)
 
     def blocked_receipt(self, program_id: str, capability: str | None, receipt: dict) -> str:
         self.blocked.append({"program_id": program_id, "receipt": receipt})
@@ -736,6 +754,62 @@ class ExchangeTest(unittest.TestCase):
         # nothing differs until an identity is injected: ticket 12 fills these.
         self.assertIsNone(receipt["request_wire_sha"])
         self.assertIsNone(receipt["response_wire_sha"])
+
+    def test_target_credentials_are_stripped_and_the_wire_response_is_sealed(self):
+        marker = "rk2-target-cookie-4f72d9"
+        handler = self.target.RequestHandlerClass
+        previous = handler.response_headers
+        handler.response_headers = (("Set-Cookie", f"session={marker}; Secure; HttpOnly"),)
+        self.addCleanup(setattr, handler, "response_headers", previous)
+        root = seal.Root(Path("test-only-root"), b"p" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+
+        response = self.through("http://target.example.test/v1/credential")
+        body = response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual(self.target.RequestHandlerClass.answer, body)
+        self.assertIsNone(response.headers.get("Set-Cookie"))
+        recorded = self.fence.allowed[0]
+        receipt = recorded["receipt"]
+        self.assertIsNotNone(receipt["response_wire_sha"])
+        self.assertNotEqual(receipt["response_agent_sha"], receipt["response_wire_sha"])
+        visible = Store(self.root).load(receipt["response_agent_sha"])
+        self.assertNotIn(marker.encode(), visible)
+
+        [description] = recorded["seals"]
+        envelope = Store(self.root).load(description["ciphertext_sha256"])
+        self.assertNotIn(marker.encode(), envelope)
+        key = self.fence.wire_key(PROGRAM_ID, CAPABILITY, root)[1]
+        opened = seal.unseal(
+            key,
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=PROGRAM_ID,
+                sha256=description["sha256"],
+                generation=description["kek_gen"],
+            ),
+        )
+        self.assertIn(marker.encode(), opened)
+        self.assertFalse((self.root / description["sha256"][:2] / description["sha256"]).exists())
+
+    def test_a_target_credential_response_fails_closed_without_the_artifact_key(self):
+        marker = "rk2-target-cookie-no-key"
+        handler = self.target.RequestHandlerClass
+        previous = handler.response_headers
+        handler.response_headers = (("Set-Cookie", f"session={marker}"),)
+        self.addCleanup(setattr, handler, "response_headers", previous)
+
+        response = self.through("http://target.example.test/v1/credential")
+        body = response.read()
+
+        self.assertEqual(502, response.status)
+        self.assertEqual(proxy.REFUSED, response.headers[proxy.DECISION])
+        self.assertIsNone(response.headers.get("Set-Cookie"))
+        self.assertEqual(b"", body)
+        self.assertEqual([], self.fence.allowed)
+        self.assertEqual("wire response refused", self.fence.blocked[0]["receipt"]["reason"])
 
     def test_a_stored_request_transcript_holds_no_control_header(self):
         self.through("http://target.example.test/v1/notes").read()
