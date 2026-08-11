@@ -30,6 +30,12 @@ BACKUP_FAILED = "backup_failed"
 #: minted and spent, and what failed is outside it. Reported as an invalid
 #: configuration it would send an operator to fix a file that is correct.
 TARGET_UNREACHABLE = "target_unreachable"
+#: The gate answered `ask`: this call is one a human decides, the question has
+#: been filed and nothing has gone wrong. Its own class because every other one
+#: names a fault an operator should go and fix, and the only action this one
+#: calls for is answering it -- reported as a refused configuration it would
+#: read as a harness that broke rather than a harness that stopped to ask.
+AWAITING_DECISION = "awaiting_decision"
 
 EXIT_OK = 0
 EXIT_UNCLASSIFIED = 1
@@ -43,6 +49,7 @@ EXIT_SCHEMA_DRIFT = 8
 EXIT_INTEGRITY_FAILED = 9
 EXIT_BACKUP_FAILED = 10
 EXIT_TARGET_UNREACHABLE = 11
+EXIT_AWAITING_DECISION = 12
 
 #: Reported and exited first-to-last when several classes are observed at once.
 #: An unsupported runtime outranks a missing dependency, which outranks operator
@@ -55,7 +62,9 @@ EXIT_TARGET_UNREACHABLE = 11
 #: with an integrity failure for the same exit. A target nobody reached sorts
 #: after all of them: every class above it is a statement about this machine, and
 #: any one of them explains a request that did not complete better than the
-#: outside world does.
+#: outside world does. An open human decision is last of all, and it is the only
+#: entry here that is not a fault: everything above it is something to fix, so if
+#: one of them is also present it is what an operator should be told about.
 PRECEDENCE = (
     (UNSUPPORTED_VERSION, EXIT_UNSUPPORTED_VERSION),
     (MISSING_DEPENDENCY, EXIT_MISSING_DEPENDENCY),
@@ -66,6 +75,7 @@ PRECEDENCE = (
     (INTEGRITY_FAILED, EXIT_INTEGRITY_FAILED),
     (BACKUP_FAILED, EXIT_BACKUP_FAILED),
     (TARGET_UNREACHABLE, EXIT_TARGET_UNREACHABLE),
+    (AWAITING_DECISION, EXIT_AWAITING_DECISION),
 )
 
 

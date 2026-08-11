@@ -61,6 +61,8 @@ from redkraken import (
     tls,
 )
 from redkraken.outcome import (
+    AWAITING_DECISION,
+    EXIT_AWAITING_DECISION,
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INTEGRITY_FAILED,
     EXIT_INVALID_CONFIGURATION,
@@ -1349,7 +1351,66 @@ class NegativeControlTest(DatabaseCase):
 
         self.assertNotIn("standing:receipt_integrity", failed)
 
-    def _refused_tool_run(self, slug: str, decision: str = "deny") -> tuple[str, str]:
+    def test_a_question_for_a_human_closed_as_a_refusal_fails_the_receipt_check(self):
+        # Arm (j). `ask` is the one verdict this harness may not act on, and the
+        # shape ticket 11 gives it is `parked` naming the decision it opened.
+        # A run closed `denied` under it says the harness refused a request
+        # nobody had yet ruled on -- and the row is all that is left, because
+        # nothing was queued and nobody was asked.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self._refused_tool_run(
+                    "discarded-question-selftest",
+                    decision="ask",
+                    risk_class="approval_required",
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertIn("standing:receipt_integrity", failed)
+
+    def test_a_call_allowed_by_no_answer_fails_the_receipt_check(self):
+        # Arm (e), for the one class whose policy is to ask. `approval_required`
+        # resolves to `ask`, so an `allow` on it did not come from the policy
+        # table; the only thing that can produce one is a live grant, and this
+        # run names no decision at all.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self._refused_tool_run(
+                    "ungranted-allow-selftest",
+                    decision="allow",
+                    risk_class="approval_required",
+                    status="success",
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertIn("standing:receipt_integrity", failed)
+
+    # Arm (e)'s other half -- a call a human did approve, which departs from its
+    # risk class legitimately -- is asserted where the rows are real, in
+    # `test_a_call_the_gate_reserves_for_a_human_is_asked_and_not_refused`. It
+    # cannot be built here: `actor_kind = 'human'` is refused unless the session
+    # is a member of `rk2_human`, which is the whole point of that guard.
+
+    def _refused_tool_run(
+        self,
+        slug: str,
+        decision: str = "deny",
+        *,
+        risk_class: str | None = None,
+        status: str = "denied",
+    ) -> tuple[str, str]:
         """A Program with one closed tool run carrying the gate's verdict."""
         program = self.connection.execute(PROGRAM, (slug,)).scalar()
         self.connection.execute(
@@ -1365,13 +1426,14 @@ class NegativeControlTest(DatabaseCase):
         ).scalar()
         tool_run = self.connection.execute(
             "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
-            " risk_class, decision) VALUES ($1, $2, $3, '{}'::jsonb, 'denied', 'runtime',"
-            " $4, $5) RETURNING id",
+            " risk_class, decision) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'runtime',"
+            " $5, $6) RETURNING id",
             (
                 program,
                 run,
                 proxy.TOOL,
-                "forbidden" if decision == "deny" else "constrained",
+                status,
+                risk_class or ("forbidden" if decision == "deny" else "constrained"),
                 decision,
             ),
         ).scalar()
@@ -4844,14 +4906,19 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(200, self.sent.facts["response"]["status"])
         self.assertEqual(len(ANSWER), self.sent.facts["response"]["byte_size"])
 
+        fixture = {
+            self.sent.facts["tool_run"]["id"],
+            self.secured.facts["tool_run"]["id"],
+        }
         served = [row for row in self.receipts("a") if row[1] == "allowed"]
         allowed = [row for row in served if row[3] == self.sent.facts["tool_run"]["id"]]
 
         # One Receipt for this exchange, and one per exchange: the https run in
         # setup is the other, and a path that recorded twice or not at all is a
-        # Receipt count that no longer equals the egress count.
+        # Receipt count that no longer equals the egress count. Counted over the
+        # fixture's two runs, because other tests in this class make their own.
         self.assertEqual(1, len(allowed))
-        self.assertEqual(2, len(served))
+        self.assertEqual(2, len([row for row in served if row[3] in fixture]))
         # The lane is `agent` because a capability is the only thing that mints
         # one: 038's writer derives it rather than accepting it, the same way
         # 040 derives a blocked Receipt's lane from its purpose. A replay or a
@@ -4915,11 +4982,18 @@ class ProxyEgressTest(DatabaseCase):
         # label, and §6's rule that a hash is never an argument then means the
         # agent cannot ask for it at all. Both directions of both exchanges are
         # asked for through an agent session, not through the owner, because the
-        # claim is about what the agent surface answers.
+        # claim is about what the agent surface answers. Named by Tool run rather
+        # than swept from the Program: other tests in this class make exchanges
+        # of their own, and this one is about the two the fixture made.
         rows = self.connection.execute(
             "SELECT request_agent_sha, response_agent_sha, request_wire_sha, response_wire_sha"
-            "  FROM receipts WHERE program_id = $1::uuid AND decision = 'allowed'",
-            (self.identifiers["a"],),
+            "  FROM receipts WHERE program_id = $1::uuid AND decision = 'allowed'"
+            "   AND tool_run_id IN ($2::uuid, $3::uuid)",
+            (
+                self.identifiers["a"],
+                self.sent.facts["tool_run"]["id"],
+                self.secured.facts["tool_run"]["id"],
+            ),
         ).rows
         agent = {str(row[column]) for row in rows for column in (0, 1)}
         wire = {str(row[column]) for row in rows for column in (2, 3) if row[column] is not None}
@@ -4936,10 +5010,12 @@ class ProxyEgressTest(DatabaseCase):
 
         # Two exchanges, two hashes: the http and https runs sent the same bytes
         # and read the same answer, and a content-addressed store holds that
-        # once. What matters is that the set is the same one on both sides.
+        # once. What matters is that every one of them is citable through the
+        # agent surface -- the Program may hold more, because other tests in this
+        # class make exchanges of their own -- and that no wire artifact is.
         self.assertEqual(2, len(agent))
         self.assertTrue(wire)
-        self.assertEqual(agent, set(held))
+        self.assertLessEqual(agent, set(held))
         self.assertEqual(set(), wire & set(held))
         for sha, (label, byte_size) in held.items():
             with self.subTest(label=label):
@@ -5486,6 +5562,100 @@ class ProxyEgressTest(DatabaseCase):
             (str(blocked[0]), str(blocked[1]), str(blocked[2])),
         )
         self.assertIsNotNone(blocked[3], "the door had already tried the target")
+
+    def test_a_call_the_gate_reserves_for_a_human_is_asked_and_not_refused(self):
+        # Ticket 11's whole loop, on the path an operator uses. The verdict is
+        # `ask` -- a mutating method, which is the call the risk table reserves
+        # for a person -- and what the runtime did with it was report "no
+        # capability was minted" and close the run as `denied`: the question was
+        # never filed, no human could answer it, and the row read as if this
+        # harness had refused a request nobody had ruled on.
+        first = proxy.send(
+            self.harness.runtime,
+            self.configurations["a"],
+            SECURE,
+            proxy_url=self.proxy_url,
+            method="POST",
+            ca_file=self.authority.certificate,
+        )
+
+        self.assertEqual(EXIT_AWAITING_DECISION, first.exit_code)
+        self.assertIsNone(first.facts["response"], "an unanswered question sends nothing")
+        label = first.facts["decision"]
+        self.assertEqual(
+            [(AWAITING_DECISION, f"decision:{label}")],
+            [(item.code, item.source) for item in first.violations],
+        )
+
+        parked = self.connection.execute(
+            "SELECT t.status, t.decision, t.egress_token_sha256, d.label, d.status,"
+            "       d.task_id, d.question, a.stop_reason"
+            "  FROM tool_runs t"
+            "  JOIN pending_decisions d ON d.id = t.pending_decision_id"
+            "  JOIN agent_runs a ON a.id = t.agent_run_id"
+            " WHERE t.id = $1::uuid",
+            (first.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual("parked", str(parked[0]))
+        self.assertEqual("deny", str(parked[1]), "a request that stopped at a question")
+        self.assertIsNone(parked[2], "nothing to spend while the question is open")
+        self.assertEqual(label, str(parked[3]))
+        self.assertEqual("pending", str(parked[4]))
+        # No task, and the column that used to require one. An operator-initiated
+        # call has nothing to resume; the operator repeats the command.
+        self.assertIsNone(parked[5])
+        self.assertIn("POST", str(parked[6]))
+        self.assertEqual("parked", str(parked[7]), "the run ends; the lane slot frees")
+
+        # The answer, given by the one role that may give it, and then the same
+        # request again -- which is what resumption is when there is no task.
+        self.human.execute(proxy.BIND, (self.identifiers["a"],))
+        with self.human.transaction():
+            self.human.execute(
+                "SELECT answer_decision($1, 'approved', 'selftest operator',"
+                " interval '10 minutes')",
+                (label,),
+            )
+
+        second = proxy.send(
+            self.harness.runtime,
+            self.configurations["a"],
+            SECURE,
+            proxy_url=self.proxy_url,
+            method="POST",
+            ca_file=self.authority.certificate,
+        )
+
+        self.assertEqual(EXIT_OK, second.exit_code, second.violations)
+        self.assertEqual(200, second.facts["response"]["status"])
+        # Named on the row and in the report: rule 5 admitted this call because a
+        # human answered, and "which answer" is a question the record has to be
+        # able to close. Recomputing it later cannot -- the equivalence key is
+        # taken at the scope version the approval was given under.
+        self.assertEqual(label, second.facts["decision"])
+        allowed = self.connection.execute(
+            "SELECT t.decision, t.risk_class, d.label, d.status"
+            "  FROM tool_runs t JOIN pending_decisions d ON d.id = t.pending_decision_id"
+            " WHERE t.id = $1::uuid",
+            (second.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        self.assertEqual(("allow", "approval_required"), (str(allowed[0]), str(allowed[1])))
+        self.assertEqual((label, "approved"), (str(allowed[2]), str(allowed[3])))
+        # And the standing check agrees about both of them. `approval_required`
+        # resolves to `ask`, so the parked `deny` and the granted `allow` are
+        # each a decision the policy table did not give -- which is exactly what
+        # arm (e) counts, unless the row names the decision that authorised it.
+        self.assertEqual(
+            (),
+            self.connection.execute(
+                "SELECT detail FROM check_receipt_integrity($1::uuid, interval '1 hour')"
+                " WHERE problem IN ('decision_disagrees_with_risk_class',"
+                "                   'ask_closed_as_a_verdict')",
+                (self.identifiers["a"],),
+            ).rows,
+        )
 
     def test_a_missing_capability_is_blocked_and_recorded_under_its_program(self):
         # Criterion 5, first arm. A Program is named and nothing else, so there

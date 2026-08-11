@@ -93,6 +93,7 @@ from urllib.parse import SplitResult, urljoin, urlsplit
 
 from redkraken import config, identity, migrate, pg, program, scope, seal, tls
 from redkraken.outcome import (
+    AWAITING_DECISION,
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
     MISSING_DEPENDENCY,
@@ -2930,6 +2931,13 @@ OPEN_TOOL_RUN = (
     " RETURNING id::text, label"
 )
 AUTHORIZE_TOOL_RUN = "SELECT authorize_tool_run($1::uuid)"
+#: The third verdict. `ask` is not a refusal to work around and not a permission:
+#: it is the request ticket 11 reserves for a person, and this is the verb that
+#: puts the question where a person can answer it. Everything the parked shape
+#: needs -- the pending decision, the notification, the `parked` Tool run naming
+#: it, the Agent run ending -- is one transaction inside the database, because a
+#: runtime that assembled it here would be a second place the parked shape lives.
+PARK_TOOL_RUN = "SELECT park_for_human($1::uuid)"
 #: Closing is what revokes: `guard_tool_run_authorization` clears the digest and
 #: its expiry on any update that leaves `running`, so a Tool run cannot end and
 #: keep a live capability. Stated here rather than written here, because a
@@ -2938,8 +2946,19 @@ AUTHORIZE_TOOL_RUN = "SELECT authorize_tool_run($1::uuid)"
 #: and exempts a runtime-opened row from carrying one, because the runtime
 #: closing its own row has no hook event to cite and inventing one would make the
 #: column unusable as evidence.
-CLOSE_TOOL_RUN = "UPDATE tool_runs SET status = $2, finished_at = now() WHERE id = $1::uuid"
-CLOSE_RUN = "UPDATE agent_runs SET finished_at = now(), stop_reason = $2 WHERE id = $1::uuid"
+#:
+#: Both are guarded against a row that has already ended, because the close runs
+#: in a `finally` and one path -- parking -- closes the run itself, with words
+#: this one does not have: the decision it is waiting on, and `parked` rather
+#: than an outcome. Unguarded, the last writer would win and erase them.
+CLOSE_TOOL_RUN = (
+    "UPDATE tool_runs SET status = $2, finished_at = now()"
+    " WHERE id = $1::uuid AND status = 'running'"
+)
+CLOSE_RUN = (
+    "UPDATE agent_runs SET finished_at = now(), stop_reason = $2"
+    " WHERE id = $1::uuid AND finished_at IS NULL"
+)
 
 
 @dataclass(frozen=True)
@@ -2996,6 +3015,7 @@ def send(
         "program_id": None,
         "program_slug": None,
         "tool_run": None,
+        "decision": None,
         "receipt": None,
         "response": None,
     }
@@ -3124,6 +3144,9 @@ def _spend(
     try:
         gate = _object(connection.execute(AUTHORIZE_TOOL_RUN, (tool_run_id,)).scalar())
         capability = gate.get("capability")
+        if not capability and gate.get("decision") == "ask":
+            outcome = _park(ledger, facts, connection, tool_run_id, label, gate)
+            return
         if not capability:
             ledger.fail(
                 "authorization",
@@ -3133,9 +3156,16 @@ def _spend(
             )
             outcome = "denied"
             return
+        # The approval, when a live grant is what admitted this call rather than
+        # the policy alone. Reported for the same reason the database records it:
+        # an operator reading "allowed" on a call whose class asks a human should
+        # be able to see which answer it was allowed under, without going to look
+        # for it.
+        facts["decision"] = gate.get("approval")
         ledger.hold(
             "authorization",
-            f"{label} is {gate.get('risk_class')}/{gate.get('decision')} by {gate.get('rule')}",
+            f"{label} is {gate.get('risk_class')}/{gate.get('decision')} by {gate.get('rule')}"
+            + (f" under {gate['approval']}" if gate.get("approval") else ""),
         )
         answer = _through(
             listener, url, method, capability, program_id, timeout, request, trust
@@ -3202,6 +3232,54 @@ def _spend(
         ledger.hold(
             "revocation", f"{label} closed as {outcome}; its capability no longer resolves"
         )
+
+
+def _park(
+    ledger: Ledger,
+    facts: dict,
+    connection: pg.Connection,
+    tool_run_id: str,
+    label: str,
+    gate: dict,
+) -> str:
+    """The third verdict: file the question and stop, rather than settle it.
+
+    `ask` is the one answer the gate gives that this process may not act on. The
+    shape it had before was to report "no capability was minted" and close the
+    Tool run as `denied`, which is this runtime deciding the request it was told
+    to bring to a person -- and deciding it in the direction that leaves no trace
+    of the question. Nobody was asked, nothing was queued, and the row read as if
+    the harness had refused.
+
+    Reported as a failed assertion because the request did not happen and a
+    caller must not read the exit as "served", but under its own class: an open
+    decision is not a fault to go and fix, and the only thing that resolves it is
+    an answer.
+    """
+    try:
+        with connection.transaction():
+            decision = str(connection.execute(PARK_TOOL_RUN, (tool_run_id,)).scalar())
+    except pg.DatabaseError as error:
+        # The question could not be filed, so nobody will be asked it. Loud, and
+        # under the integrity class: the parked shape is the whole of ticket 11's
+        # answer to a call this harness may not make alone, and a runtime that
+        # quietly continued past it would be back to deciding it.
+        ledger.fail(
+            "authorization",
+            f"the gate answered ask for {label} and the question could not be filed: {error}",
+            code=INTEGRITY_FAILED,
+            source="database",
+        )
+        return "error"
+    facts["decision"] = decision
+    ledger.fail(
+        "authorization",
+        f"{label} is {gate.get('risk_class')}/ask by {gate.get('rule')}: "
+        f"filed as {decision} for a human to answer",
+        code=AWAITING_DECISION,
+        source=f"decision:{decision}",
+    )
+    return "parked"
 
 
 def _through(
