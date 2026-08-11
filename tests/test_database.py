@@ -1224,6 +1224,88 @@ class NegativeControlTest(DatabaseCase):
 
         self.assertNotIn("standing:receipt_integrity", failed)
 
+    def test_egress_under_a_verdict_the_gate_refused_fails_the_receipt_check(self):
+        # The second arm's own control. What it means is one sentence -- the
+        # hook said no and the network happened anyway -- and both halves have
+        # to be present for it to be that: a tool run the gate did not allow,
+        # and a Receipt carrying `ts_egress`.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                program, tool_run = self._refused_tool_run("denied-egress-selftest")
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    " ts_arrival, ts_egress, scope_class, scope_version, host)"
+                    " VALUES ($1, $2, 'agent', 'blocked', 'self test', now(), now(),"
+                    " 'target', 1, 'example.test')",
+                    (program, tool_run),
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertIn("standing:receipt_integrity", failed)
+
+    def test_a_budget_refusal_the_door_enforced_does_not_fail_the_receipt_check(self):
+        # The shape ticket 13 produced against a live target, which failed this
+        # arm five times over and could not be cleared: a Receipt is insert-only
+        # evidence. The gate allowed the call, the door refused it before
+        # contact, and the runtime closed the run as denied because a refused
+        # request must not close as success. Nothing here is a hole -- reading
+        # the outcome as the verdict was.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                program, tool_run = self._refused_tool_run(
+                    "budget-refusal-selftest", decision="allow"
+                )
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1, $2, 'agent', 'blocked', 'rate limited', now(),"
+                    " 'target', 1, 'example.test')",
+                    (program, tool_run),
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertNotIn("standing:receipt_integrity", failed)
+
+    def _refused_tool_run(self, slug: str, decision: str = "deny") -> tuple[str, str]:
+        """A Program with one closed tool run carrying the gate's verdict."""
+        program = self.connection.execute(PROGRAM, (slug,)).scalar()
+        self.connection.execute(
+            "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
+            " VALUES ($1, 1, '{}'::jsonb, repeat('d', 64))",
+            (program,),
+        )
+        run = self.connection.execute(
+            "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+            " mission_packet) VALUES ($1, 'orchestrator', 'session', 'operator',"
+            " 'low', '{}'::jsonb) RETURNING id",
+            (program,),
+        ).scalar()
+        tool_run = self.connection.execute(
+            "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+            " risk_class, decision) VALUES ($1, $2, $3, '{}'::jsonb, 'denied', 'runtime',"
+            " $4, $5) RETURNING id",
+            (
+                program,
+                run,
+                proxy.TOOL,
+                "forbidden" if decision == "deny" else "constrained",
+                decision,
+            ),
+        ).scalar()
+        return str(program), str(tool_run)
+
     def test_every_check_the_gate_runs_has_a_control(self):
         # The assertion that keeps the rest of this file honest: a check added
         # without a control fails here, naming itself, instead of joining the
