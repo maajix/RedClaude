@@ -539,6 +539,125 @@ class AddressTest(unittest.TestCase):
                 )
 
 
+class HandshakeTest(unittest.TestCase):
+    """A target with a bad certificate is reached, and the certificate is filed.
+
+    The targets this harness exists to reach are targets under test. An expired,
+    a self-signed or a misnamed certificate is one of the findings it is looking
+    for, and the door that refuses to speak to it produces no status, no bytes
+    and -- because the refusal it wrote said `target unreachable` and nothing
+    else -- no statement about the certificate either. So the strict attempt is
+    made first, and what it failed with is kept.
+
+    The fixture's target is signed by an authority that is not in this machine's
+    trust store, which is what every one of those defects looks like from the
+    door's side: a chain that does not verify. What the assertions are about is
+    not that it connected but that the row can tell the difference between a
+    verified target and this one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.target, cls.thread, cls.target_ca = tls_counterparty()
+        cls.plain, cls.plain_thread = counterparty()
+        cls.addClassCleanup(cls.target.shutdown)
+        cls.addClassCleanup(cls.plain.shutdown)
+
+    def dial(self, protocol: str = "https") -> proxy.Handshake | None:
+        port = (self.target if protocol == "https" else self.plain).server_address[1]
+        connection, negotiated = proxy.connect(
+            "127.0.0.1", port, 5.0, protocol, "127.0.0.1", None
+        )
+        self.addCleanup(connection.close)
+        # Used, not just opened. A socket dropped mid-handshake is a reset the
+        # target logs from its own thread, and what is under test here is a
+        # connection an exchange could be made over.
+        connection.request("GET", "/v1/notes")
+        connection.getresponse().read()
+        return negotiated
+
+    def test_a_target_whose_certificate_does_not_verify_is_still_reached(self):
+        negotiated = self.dial()
+
+        self.assertIsNotNone(negotiated)
+        self.assertTrue(negotiated.tls_version.startswith("TLSv1."), negotiated.tls_version)
+        self.assertEqual("127.0.0.1", negotiated.sni)
+        self.assertRegex(negotiated.cert_sha256, r"^[0-9a-f]{64}$")
+
+    def test_the_certificate_that_did_not_verify_is_what_the_record_says(self):
+        negotiated = self.dial()
+
+        # Both false, and both are columns rather than prose: `transport_citable`
+        # is generated from exactly these two, so a downgraded exchange cannot be
+        # cited as a measurement of the target's transport however it is read.
+        self.assertFalse(negotiated.chain_verified)
+        self.assertFalse(negotiated.hostname_verified)
+        # And the target's own words for what was wrong with it, which is the
+        # finding: "self-signed", "expired" and "does not match" all arrive here.
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", negotiated.defect)
+
+    def test_a_plain_target_negotiates_nothing_and_says_so(self):
+        # Nothing rather than a record full of nulls: "this hop was not TLS" and
+        # "this hop was TLS and told us nothing" are different facts, and the
+        # Receipt tells them apart by whether the columns were written at all.
+        self.assertIsNone(self.dial("http"))
+
+    def test_the_two_sides_are_recorded_together_or_the_wire_side_alone(self):
+        wire = self.dial()
+        agent = proxy.Handshake(
+            tls_version="TLSv1.3",
+            cipher="TLS_AES_256_GCM_SHA384",
+            alpn="http/1.1",
+            sni=None,
+            cert_sha256="a" * 64,
+            cert_issuer="commonName=RedKraken run authority",
+            cert_subject="commonName=target.example.test",
+            cert_not_after=None,
+            chain_verified=True,
+            hostname_verified=True,
+        )
+
+        both = proxy.transport(agent, wire)
+        alone = proxy.transport(agent, None)
+
+        self.assertEqual("TLSv1.3", both["agent_tls_version"])
+        self.assertEqual(wire.cert_sha256, both["wire_cert_sha256"])
+        self.assertFalse(both["wire_chain_verified"])
+        # The leaf the door forged is known and still not written: naming it
+        # means naming the forging key under `receipts_intercepted_leaf_names_ca`,
+        # and nothing yet writes the `interception_cas` row it would point at.
+        self.assertNotIn("agent_cert_sha256", both)
+        # Neither side without the wire side. An agent-only row is the one a door
+        # that did not know it was lying would write, and the table refuses it.
+        self.assertEqual({}, alone)
+        self.assertEqual({}, proxy.transport(None, None))
+
+    def test_the_wire_side_may_be_recorded_with_no_agent_side_at_all(self):
+        # A client that sent an absolute-form https request over a cleartext hop
+        # instead of opening a tunnel. There is a target handshake to describe
+        # and no agent one, and dropping the first to match the second would lose
+        # the certificate of the exchange that actually happened.
+        recorded = proxy.transport(None, self.dial())
+
+        self.assertNotIn("agent_tls_version", recorded)
+        self.assertIsNotNone(recorded["wire_cert_sha256"])
+        self.assertFalse(recorded["wire_hostname_verified"])
+
+    def test_a_certificate_defect_and_a_redirect_are_both_kept(self):
+        wire = self.dial()
+
+        self.assertEqual("redirect to http://a.example.test/x", proxy._notes(
+            "redirect to http://a.example.test/x", None
+        ))
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", proxy._notes(None, wire))
+        # One column, both statements: a certificate defect must not be the
+        # reason a redirect stops being recorded.
+        together = proxy._notes("redirect to http://a.example.test/x", wire)
+        self.assertIn("redirect to", together)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", together)
+        self.assertIsNone(proxy._notes(None, None))
+
+
 class RefusalTest(unittest.TestCase):
     """Which of the two things the second decision refused, the Receipt says so.
 
@@ -651,8 +770,13 @@ class ExchangeTest(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
-    ) -> http.client.HTTPConnection:
-        """The fixture, wherever the name pointed, and a record of both."""
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
+        """The fixture, wherever the name pointed, and a record of both.
+
+        No `Handshake`: these connections are handed back before they are
+        dialled, so there is no handshake to read off one. What `connect` reads
+        off a real socket has its own test.
+        """
         self.dialled.append((host, port, protocol, address))
         self.client_certificates.append(client_certificate)
         mtls = getattr(self, "mtls", None)
@@ -666,8 +790,11 @@ class ExchangeTest(unittest.TestCase):
                 target.server_address[1],
                 timeout=timeout,
                 context=context,
-            )
-        return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
+            ), None
+        return (
+            http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout),
+            None,
+        )
 
     def through(
         self,
@@ -1614,9 +1741,12 @@ class Redirected(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
-    ) -> http.client.HTTPConnection:
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         self.dialled.append(address)
-        return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
+        return (
+            http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout),
+            None,
+        )
 
     def fetch(self, url: str):
         """One request from a client that follows what it is told to follow."""
@@ -1846,7 +1976,7 @@ class TunnelTest(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
-    ) -> http.client.HTTPConnection:
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The door's outbound side, verifying the target it was sent to.
 
         In production this is `proxy.connect`, which verifies against the system
@@ -1863,7 +1993,7 @@ class TunnelTest(unittest.TestCase):
             self.target_port,
             timeout=timeout,
             context=context,
-        )
+        ), None
 
     def control(self, capability: str | None = CAPABILITY, program: str = PROGRAM_ID) -> dict:
         headers = {proxy.PROGRAM: program}
@@ -2203,24 +2333,34 @@ class TunnelTest(unittest.TestCase):
         self.assertEqual(1, len(self.fence.allowed))
         self.assertEqual(1, len(self.target.seen))
 
-    def test_the_door_itself_refuses_a_target_no_public_authority_vouches_for(self):
+    def test_the_door_itself_checks_the_target_no_public_authority_vouches_for(self):
         # Every test above substitutes `connector`, so this is the one that runs
         # the production one. The fixture target holds a certificate from an
-        # authority nobody has heard of, which is what a target impersonated
-        # between the door and the internet would look like: the door refuses it,
-        # and it is the only side left that can, because the agent is looking at
-        # this door's certificate rather than the target's.
+        # authority nobody has heard of, which is both what a target impersonated
+        # between the door and the internet would look like and what a target
+        # with an expired or self-signed certificate looks like. The door is the
+        # only side that can tell, because the agent is looking at this door's
+        # certificate rather than the target's.
         #
-        # The refusal comes out of `connect` rather than out of the request after
-        # it, because pinning moved the handshake there: the socket is opened
-        # against the decided address and wrapped immediately, so there is no
-        # moment where a caller holds a connection whose peer has not been
-        # checked.
-        with self.assertRaises(ssl.SSLCertVerificationError):
-            proxy.connect(
-                "127.0.0.1", self.target_port, 5.0, "https", "127.0.0.1", None
-            )
+        # It is checked here rather than in the request after it, because pinning
+        # moved the handshake into `connect`: the socket is opened against the
+        # decided address and wrapped immediately, so there is no moment where a
+        # caller holds a connection whose peer has not been looked at.
+        #
+        # It is reached anyway, and that is the deliberate half. Refusing gave
+        # the agent "target unreachable" and no certificate, which is the one
+        # answer that is useless about a target under test. The verdict is on the
+        # Receipt instead: the chain and the name were not verified, so
+        # `transport_citable` is false for this exchange whatever is done with it.
+        connection, negotiated = proxy.connect(
+            "127.0.0.1", self.target_port, 5.0, "https", "127.0.0.1", None
+        )
+        self.addCleanup(connection.close)
 
+        self.assertFalse(negotiated.chain_verified)
+        self.assertFalse(negotiated.hostname_verified)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", negotiated.defect)
+        self.assertRegex(negotiated.cert_sha256, r"^[0-9a-f]{64}$")
         self.assertEqual([], self.target.seen)
 
 

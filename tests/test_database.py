@@ -3551,6 +3551,26 @@ class ProxyEgressTest(DatabaseCase):
 
         cls.resolved = []
         cls.dialled = []
+        # What `connect` would have read off the socket towards an https target,
+        # stated by the fixture because the connection `dial` hands back has not
+        # been dialled yet. The values are the shape of a target whose
+        # certificate does not chain to a public root -- which is what this
+        # machine's target is -- so a Receipt written from them says the door
+        # reached it without verifying it, and every field differs from the
+        # forged leaf the agent saw on the other side of the tunnel.
+        cls.upstream = proxy.Handshake(
+            tls_version="TLSv1.3",
+            cipher="TLS_AES_128_GCM_SHA256",
+            alpn="http/1.1",
+            sni="app.example.com",
+            cert_sha256="f" * 64,
+            cert_issuer=None,
+            cert_subject=None,
+            cert_not_after=None,
+            chain_verified=False,
+            hostname_verified=False,
+            defect="[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate",
+        )
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
         cls.server = proxy.listen(
             ("127.0.0.1", 0),
@@ -3673,7 +3693,7 @@ class ProxyEgressTest(DatabaseCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
-    ) -> http.client.HTTPConnection:
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """Every authorised name reaches the one target this machine is running.
 
         One target per protocol, because the door's outbound side is not the same
@@ -3690,7 +3710,7 @@ class ProxyEgressTest(DatabaseCase):
         if protocol == "http" and cls.holding:
             return http.client.HTTPConnection(
                 "127.0.0.1", cls.parked.server_address[1], timeout=timeout
-            )
+            ), None
         if protocol == "https":
             context = ssl.create_default_context(cafile=str(cls.target_ca))
             if client_certificate is not None:
@@ -3700,10 +3720,10 @@ class ProxyEgressTest(DatabaseCase):
                 cls.secure_target.server_address[1],
                 timeout=timeout,
                 context=context,
-            )
+            ), cls.upstream
         return http.client.HTTPConnection(
             "127.0.0.1", cls.target.server_address[1], timeout=timeout
-        )
+        ), None
 
     # -- the arms of criterion 5, each of which needs a capability of its own ---
 
@@ -5153,6 +5173,54 @@ class ProxyEgressTest(DatabaseCase):
         self.assertIsNotNone(row[9])
         self.assertIsNone(row[10])
 
+    def test_both_sides_of_the_intercepted_handshake_are_on_the_receipt(self):
+        # The gap, written down. The agent's TLS stack negotiated with this door
+        # and the door negotiated with the target, and until now the row said
+        # nothing about either -- so an agent concluding "the target speaks TLS
+        # 1.3 under a certificate that verifies" from what it saw had nothing
+        # contradicting it. Now the row holds both, and `transport_divergence` is
+        # generated from the pair.
+        row = self.connection.execute(
+            "SELECT agent_tls_version, agent_cipher, agent_alpn, agent_cert_sha256,"
+            "       wire_tls_version, wire_cipher, wire_sni, wire_cert_sha256,"
+            "       wire_chain_verified, wire_hostname_verified,"
+            "       transport_divergence, transport_citable, notes"
+            "  FROM receipts WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+            (self.secured.facts["tool_run"]["id"],),
+        ).rows[0]
+
+        # The agent side is read off the socket the request arrived on, which
+        # inside a tunnel is this door's own TLS.
+        self.assertTrue(str(row[0]).startswith("TLSv1."), row[0])
+        self.assertIsNotNone(row[1])
+        # Null because `_through` -- the runtime's own client, which is what sent
+        # this -- proposes no ALPN, and a server negotiates only what the client
+        # offered. Recorded as the null it is rather than as the `http/1.1` the
+        # door would have accepted: this column is what was negotiated, and the
+        # upstream one beside it is `http/1.1` because the door does propose it.
+        self.assertIsNone(row[2])
+        # And the leaf the door forged stays unwritten: naming it means naming
+        # the forging key, and nothing yet writes the `interception_cas` row that
+        # `receipts_intercepted_leaf_names_ca` would make it point at.
+        self.assertIsNone(row[3])
+
+        self.assertEqual(self.upstream.tls_version, str(row[4]))
+        self.assertEqual(self.upstream.cipher, str(row[5]))
+        self.assertEqual("app.example.com", str(row[6]))
+        self.assertEqual(self.upstream.cert_sha256, str(row[7]))
+        # The target's certificate did not verify and the row says so in the two
+        # columns `transport_citable` is generated from, which is why an exchange
+        # that was served is still not a citable measurement of its transport.
+        self.assertFalse(row[8])
+        self.assertFalse(row[9])
+        self.assertFalse(row[11])
+        # Which fields the two sides disagree about, computed by the column and
+        # not by the door: the certificate above all, because the agent was shown
+        # a forged one, and the cipher because the two handshakes are two.
+        self.assertIn("cert_sha256", str(row[10]))
+        self.assertIn("cipher", str(row[10]))
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", str(row[12]))
+
     def test_the_tunnelled_request_reached_the_target_with_no_control_header(self):
         # PH2-10, criterion 5, against a target that actually ran behind TLS. The
         # capability crossed on the CONNECT this time -- a hop `forwardable` never
@@ -5264,7 +5332,8 @@ class ProxyEgressTest(DatabaseCase):
             fence=fence,
             store=Store(self.root),
             connector=lambda host, port, timeout, protocol, address, client_certificate: (
-                http.client.HTTPConnection("127.0.0.1", closed, timeout=timeout)
+                http.client.HTTPConnection("127.0.0.1", closed, timeout=timeout),
+                None,
             ),
             resolver=self.look_up,
             authority=self.authority,

@@ -1339,7 +1339,7 @@ class Fence:
 Resolver = Callable[[str, int], tuple[str, ...]]
 Connector = Callable[
     [str, int, float, str, str, identity.ClientCertificate | None],
-    http.client.HTTPConnection,
+    "tuple[http.client.HTTPConnection, Handshake | None]",
 ]
 
 
@@ -1444,6 +1444,150 @@ def _retry_after(moment: datetime | None) -> list[tuple[str, str]] | None:
     return [("Retry-After", str(max(1, math.ceil(waiting))))]
 
 
+@dataclass(frozen=True)
+class Handshake:
+    """What one TLS connection negotiated, and whether it was verified.
+
+    Read off a live socket rather than declared by the code that opened it, so
+    the record describes the connection that happened. `chain_verified` and
+    `hostname_verified` come from the context the socket is wrapped in for the
+    same reason: they are what OpenSSL was told to enforce on this handshake,
+    not what the door intended to enforce.
+
+    `defect` is the words the strict attempt failed with, on the connections
+    that only completed because it was tried again without verification. It is
+    the finding: a target whose certificate has expired, is self-signed or names
+    another host is a target with a defect, and the whole point of reaching it
+    anyway is to have that written down.
+    """
+
+    tls_version: str | None
+    cipher: str | None
+    alpn: str | None
+    #: The name this side asked for, which is the name the certificate below was
+    #: checked against. Null on the door's own listening socket: a server is told
+    #: the name, it does not send one.
+    sni: str | None
+    cert_sha256: str | None
+    cert_issuer: str | None
+    cert_subject: str | None
+    cert_not_after: str | None
+    chain_verified: bool
+    hostname_verified: bool
+    defect: str | None = None
+
+
+def _name(field: tuple | None) -> str | None:
+    """One certificate name, flattened to the pairs OpenSSL reported.
+
+    The attribute names are OpenSSL's own spelling and are not shortened: a
+    column an auditor compares between the two sides of an intercepted exchange
+    has to hold one vocabulary, and the abbreviation table that would produce
+    `CN=` is a second one.
+    """
+    if not field:
+        return None
+    return ", ".join(f"{name}={value}" for rdn in field for name, value in rdn)
+
+
+def handshake(sock: socket.socket, defect: str | None = None) -> Handshake | None:
+    """The facts of a completed TLS handshake, or nothing for a plain socket.
+
+    Nothing rather than an empty record, because "this hop was not TLS" and
+    "this hop was TLS and told us nothing" are different facts and the Receipt
+    distinguishes them by whether the columns are null.
+
+    The certificate is read in binary form because that is the only form
+    available on an unverified connection: `getpeercert()` answers with an empty
+    mapping when the context was told not to verify, while the DER is there
+    either way. So a downgraded exchange still names the certificate it saw by
+    hash -- which is the identifying fact -- and leaves the parsed fields null
+    rather than inventing them.
+    """
+    if not isinstance(sock, ssl.SSLSocket):
+        return None
+    context = sock.context
+    parsed = sock.getpeercert() or {}
+    der = sock.getpeercert(binary_form=True)
+    expires = parsed.get("notAfter")
+    return Handshake(
+        tls_version=sock.version(),
+        cipher=(sock.cipher() or (None,))[0],
+        alpn=sock.selected_alpn_protocol(),
+        sni=sock.server_hostname,
+        cert_sha256=digest(der) if der else None,
+        cert_issuer=_name(parsed.get("issuer")),
+        cert_subject=_name(parsed.get("subject")),
+        cert_not_after=(
+            datetime.fromtimestamp(ssl.cert_time_to_seconds(expires), timezone.utc).isoformat()
+            if expires
+            else None
+        ),
+        chain_verified=context.verify_mode != ssl.CERT_NONE,
+        hostname_verified=context.check_hostname,
+        defect=defect,
+    )
+
+
+def _notes(redirect: str | None, wire: Handshake | None) -> str | None:
+    """The Receipt's free text: where the target pointed, and what was wrong.
+
+    One column holds both because both are the same kind of statement -- a thing
+    about this exchange an auditor reads rather than filters on -- and because a
+    certificate defect must not be the reason a redirect stops being recorded.
+    The verification failure is kept in the target's own words; which columns
+    were left unverified is the queryable form of it, and this is the sentence
+    that says why.
+    """
+    said = [note for note in (redirect, None if wire is None else wire.defect) if note]
+    return "; ".join(said) or None
+
+
+def transport(agent: Handshake | None, wire: Handshake | None) -> dict:
+    """Both sides of an intercepted exchange, in the columns a Receipt holds.
+
+    The gap is the product. What the agent's TLS stack negotiated is a fact
+    about this door, what the door negotiated upstream is a fact about the
+    target, and `receipts.transport_divergence` is generated from the two -- so
+    an agent that concluded "the target speaks TLS 1.3 with a valid Let's
+    Encrypt certificate" from what it saw is contradicted by the row rather than
+    believed.
+
+    Nothing at all when the upstream hop was not TLS: there is no target-side
+    handshake to describe, and `receipts_agent_transport_records_both_sides`
+    refuses a row that describes only the agent's -- which is exactly the shape
+    a door that did not know it was lying would write.
+
+    `agent_cert_*` stays null even though the door knows the leaf it presented.
+    Recording it means naming the forging key under
+    `receipts_intercepted_leaf_names_ca`, and nothing yet writes the
+    `interception_cas` row that name would point at. A null column is "not
+    recorded"; a leaf with no CA behind it would be an unattributable forging
+    key, which `check_transport_claims` reports as a defect in its own right.
+    """
+    if wire is None:
+        return {}
+    facts = {
+        "wire_tls_version": wire.tls_version,
+        "wire_cipher": wire.cipher,
+        "wire_alpn": wire.alpn,
+        "wire_cert_sha256": wire.cert_sha256,
+        "wire_cert_issuer": wire.cert_issuer,
+        "wire_cert_subject": wire.cert_subject,
+        "wire_cert_not_after": wire.cert_not_after,
+        "wire_sni": wire.sni,
+        "wire_chain_verified": wire.chain_verified,
+        "wire_hostname_verified": wire.hostname_verified,
+    }
+    if agent is not None:
+        facts |= {
+            "agent_tls_version": agent.tls_version,
+            "agent_cipher": agent.cipher,
+            "agent_alpn": agent.alpn,
+        }
+    return facts
+
+
 def connect(
     host: str,
     port: int,
@@ -1451,7 +1595,7 @@ def connect(
     protocol: str,
     address: str,
     client_certificate: identity.ClientCertificate | None,
-) -> http.client.HTTPConnection:
+) -> tuple[http.client.HTTPConnection, Handshake | None]:
     """Open the connection to the address this request was pinned to.
 
     The socket is opened against `address` and never against `host`, and that is
@@ -1466,29 +1610,80 @@ def connect(
     than against the address underneath it. So the connection keeps the name and
     the socket keeps the address, and `server_hostname` is the name.
 
-    An https target is verified against the system trust store, and this is the
-    only place in the harness where a real certificate is seen at all. The agent
-    is looking at this door's certificate by construction, so a claim about the
-    target's -- issuer, expiry, name, chain -- can only be made on this side of
-    the door. `intercepted` on the Receipt is what stops the agent's view from
-    being read as the target's.
+    An https target is tried against the system trust store first, and this is
+    the only place in the harness where a real certificate is seen at all. The
+    agent is looking at this door's certificate by construction, so a claim
+    about the target's -- issuer, expiry, name, chain -- can only be made on
+    this side of the door. `intercepted` on the Receipt is what stops the
+    agent's view from being read as the target's.
+
+    A certificate that does not verify does not end the request. The targets
+    this door exists to reach are targets under test, and an expired, a
+    self-signed or a misnamed certificate is a finding about one of them rather
+    than a reason to have no record of it: refusing here produced "target
+    unreachable" and nothing else -- no status, no bytes, and no statement about
+    the certificate that caused it. So the strict attempt is made, its words are
+    kept, and the connection is dialled a second time with verification off.
+    What makes that safe to have written is that it is written: the returned
+    `Handshake` says the chain and the name were not checked, and
+    `receipts.transport_citable` is generated from exactly those two columns, so
+    a downgraded exchange can never be cited as a verified measurement of the
+    target's transport.
+
+    Only a verification failure is retried. Any other handshake error -- a
+    protocol the target will not speak, a reset, a timeout -- is the target
+    being unreachable, and dialling it again without verification would answer
+    a question nobody asked.
     """
-    context: ssl.SSLContext | None = None
-    if protocol == "https":
-        context = ssl.create_default_context()
-        if client_certificate is not None:
-            client_certificate.install(context)
+    if protocol != "https":
+        raw = socket.create_connection((address, port), timeout=timeout)
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection.sock = raw
+        return connection, None
+
+    context = ssl.create_default_context()
+    # Told to the target because it is true: everything above this speaks
+    # HTTP/1.1 and nothing here can read a frame of anything else. Unset, the
+    # two sides of an intercepted exchange disagreed about ALPN on every row --
+    # the door offers `http/1.1` to the agent -- and a divergence that is on
+    # every Receipt is one an auditor stops reading.
+    context.set_alpn_protocols(["http/1.1"])
+    if client_certificate is not None:
+        client_certificate.install(context)
+    try:
+        return _dial(host, port, timeout, address, context, None)
+    except ssl.SSLCertVerificationError as error:
+        defect = str(error)
+    # A second context rather than the first with its verification turned off:
+    # `check_hostname` must be cleared before `verify_mode`, the order is easy
+    # to get wrong, and a context that has been mutated mid-request is one the
+    # next reader of `Handshake.chain_verified` cannot trust to describe the
+    # socket it was read from.
+    downgraded = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    downgraded.check_hostname = False
+    downgraded.verify_mode = ssl.CERT_NONE
+    downgraded.set_alpn_protocols(["http/1.1"])
+    if client_certificate is not None:
+        client_certificate.install(downgraded)
+    return _dial(host, port, timeout, address, downgraded, defect)
+
+
+def _dial(
+    host: str,
+    port: int,
+    timeout: float,
+    address: str,
+    context: ssl.SSLContext,
+    defect: str | None,
+) -> tuple[http.client.HTTPConnection, Handshake | None]:
+    """One TLS attempt against the pinned address, and what it negotiated."""
     raw = socket.create_connection((address, port), timeout=timeout)
     try:
-        if protocol == "https":
-            assert context is not None
-            connection: http.client.HTTPConnection = http.client.HTTPSConnection(
-                host, port, timeout=timeout, context=context
-            )
-            connection.sock = context.wrap_socket(raw, server_hostname=host)
-        else:
-            connection = http.client.HTTPConnection(host, port, timeout=timeout)
-            connection.sock = raw
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            host, port, timeout=timeout, context=context
+        )
+        secured = context.wrap_socket(raw, server_hostname=host)
+        connection.sock = secured
     except OSError:
         # The handshake is where this happens, and a target whose certificate
         # does not verify has already been given a socket. Closing it here is
@@ -1497,7 +1692,7 @@ def connect(
         # object that would have owned it was never returned.
         raw.close()
         raise
-    return connection
+    return connection, handshake(secured, defect)
 
 
 class Server(ThreadingHTTPServer):
@@ -1560,6 +1755,13 @@ class Handler(BaseHTTPRequestHandler):
     #: the one line that dials, so it means what it says.
     contacted: bool = False
 
+    #: What the socket towards the target negotiated, for the request being
+    #: served now. Null on a plain http target and until the dial, and reset with
+    #: `contacted` for the same reason: one handler serves every request inside a
+    #: tunnel, and a handshake carried over would put one target's certificate on
+    #: another target's Receipt.
+    wire: Handshake | None = None
+
     #: The budget slot this request holds, and the Program it was taken under.
     #: On the instance rather than passed down, because what gives it back is not
     #: the code that took it: the exchange releases it the moment the socket is
@@ -1605,6 +1807,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         self.contacted = False
+        self.wire = None
         self.slot = None
         self.slot_program = program_id
         try:
@@ -1870,7 +2073,7 @@ class Handler(BaseHTTPRequestHandler):
         # succeeded could hammer a target that never answers for free.
         self.contacted = True
         try:
-            connection = self.server.connector(
+            connection, self.wire = self.server.connector(
                 request.host,
                 request.port,
                 self.server.target_timeout,
@@ -2266,7 +2469,12 @@ class Handler(BaseHTTPRequestHandler):
             # was asked about is the first alone -- the one a socket was opened
             # to -- so this column is the lookup's answer and not the verdict's.
             "pinned_ips": pinned_ips(addresses),
-            "notes": f"redirect to {onward}" if onward else None,
+            "notes": _notes(f"redirect to {onward}" if onward else None, self.wire),
+            # Both sides of the handshake, or neither. The agent's is read off
+            # the socket this request arrived on, which inside a tunnel is the
+            # door's own TLS -- so the row carries what the agent was shown next
+            # to what the target actually presented.
+            **transport(handshake(self.connection), self.wire),
         }
         artifacts = [
             {"sha256": request_sha, "byte_size": len(sent), "content_type": TRANSCRIPT},
