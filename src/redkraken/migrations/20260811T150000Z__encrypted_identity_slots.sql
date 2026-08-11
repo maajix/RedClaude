@@ -133,7 +133,7 @@ COMMENT ON COLUMN secret_access_log.operation_id IS
 INSERT INTO skills(name, enabled, description, source_sha256) VALUES (
     'use-identity', true,
     'Authenticated target requests through a named RedKraken Identity. Use when testing logged-in reachability, comparing two leased Identities, or following redirects and subresources within an authenticated session.',
-    '60e68acd923ce548c3b3a9916ecef8b2cf43b791b9e2faef72b17219c47bffe4'
+    'ad8c51536f091446c62c271946618b64f2dcbc9148e73ffb59a4a0f5de2db1e6'
 );
 INSERT INTO role_skills(role, skill_name) VALUES ('web_hunter', 'use-identity');
 
