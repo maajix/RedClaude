@@ -48,7 +48,7 @@ RULES_OF_ENGAGEMENT = (
     "pivoting",
     "sensitive_data_access",
 )
-BUDGET_LIMITS = ("concurrency", "requests", "tokens", "window_seconds")
+BUDGET_LIMITS = ("burst", "concurrency", "requests", "tokens", "window_seconds")
 SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
 IDENTITY_KEYS = ("name", "slot_ref")

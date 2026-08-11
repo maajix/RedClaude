@@ -40,6 +40,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -63,6 +64,9 @@ OTHER = "b" * 64
 
 #: The Program every request here is filed under.
 PROGRAM_ID = "11111111-1111-1111-1111-111111111111"
+#: And the slot the stubbed budget hands out, named so that a test asserting the
+#: door gave one back is asserting it gave back the one it took.
+SLOT = "33333333-3333-3333-3333-333333333333"
 IDENTITY_ID = "55555555-5555-5555-5555-555555555555"
 
 #: What a refused capability looks like from the database, in the shape `pg`
@@ -182,8 +186,14 @@ class Stub:
         #: capability that worked a moment ago resolves to nothing now, and the
         #: next exchange stops before the target is contacted.
         self.revoked_after: int | None = None
+        #: What the budget says, and it says yes by default. A stub that refused
+        #: on a limit would make every test in this file a budget test; the ones
+        #: that are about the budget set this to the refusal they want.
+        self.slot: proxy.Reservation | None = None
         self.authorized: list[tuple] = []
         self.addressed: list[tuple] = []
+        self.reserved: list[tuple] = []
+        self.released: list[tuple] = []
         self.allowed: list[dict] = []
         self.blocked: list[dict] = []
         self.identity: proxy.IdentityBinding | None = None
@@ -220,6 +230,30 @@ class Stub:
         self.addressed.append((program_id, capability, request, address))
         if address in self.withdrawn:
             raise proxy.Refused("address refused", ADDRESS_ERROR, pinned=(address,))
+
+    def reserve(
+        self, program_id: str, capability: str, request: scope.Request
+    ) -> proxy.Reservation:
+        """The third decision, granted unless a test asked for otherwise.
+
+        Recorded rather than counted: what the handler owes this method is one
+        call per request that got past the capability, and what it owes `release`
+        is one call per grant. Whether the arithmetic behind a refusal is right
+        is a question for the database, and is asked where the database is.
+        """
+        self.reserved.append((program_id, capability, request))
+        if self.slot is not None:
+            return self.slot
+        return proxy.Reservation(
+            id=SLOT,
+            granted=True,
+            reason="reserved",
+            retry_at=None,
+            target=request.host,
+        )
+
+    def release(self, program_id: str, reservation: str, contacted: bool) -> None:
+        self.released.append((program_id, reservation, contacted))
 
     def allowed_receipt(
         self,
@@ -1149,6 +1183,87 @@ class ExchangeTest(unittest.TestCase):
         self.assertNotIn(CAPABILITY.encode(), stored)
         self.assertNotIn(b"Proxy-Authorization", stored)
         self.assertNotIn(b"X-RedKraken", stored)
+
+    def test_an_exhausted_budget_refuses_before_the_name_is_even_resolved(self):
+        # Ticket 13, criterion 4. The refusal is not about this request -- the
+        # capability resolved and the target was in scope -- so what has to be
+        # true is that nothing left the machine anyway: no lookup, no socket, and
+        # a blocked Receipt saying which limit it was.
+        self.fence.slot = proxy.Reservation(
+            id=None, granted=False, reason="budget exhausted", retry_at=None, target="t"
+        )
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual(proxy.BUDGETED, response.headers[proxy.DECISION])
+        self.assertEqual("budget exhausted", response.headers[proxy.DETAIL])
+        self.assertEqual([], self.resolved)
+        self.assertEqual([], self.dialled)
+        self.assertEqual([], self.target.seen)
+        self.assertEqual(1, len(self.fence.blocked))
+        self.assertEqual("budget exhausted", self.fence.blocked[0]["receipt"]["reason"])
+        # And nothing to give back: there was no slot, so releasing one would be
+        # refunding a Program a request it never took.
+        self.assertEqual([], self.fence.released)
+
+    def test_a_throttled_request_is_told_when_to_come_back(self):
+        # The other half of criterion 4: durable retry information. It is in the
+        # Receipt as a moment, because a row is what a retry is reconstructed
+        # from later, and on the wire as seconds, because the caller's clock is
+        # not this machine's.
+        later = datetime.now(timezone.utc) + timedelta(seconds=42)
+        self.fence.slot = proxy.Reservation(
+            id=None, granted=False, reason="rate limited", retry_at=later, target="t"
+        )
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(proxy.BUDGETED, response.headers[proxy.DECISION])
+        self.assertEqual("rate limited", response.headers[proxy.DETAIL])
+        self.assertIn(int(response.headers["Retry-After"]), range(1, 43))
+        self.assertEqual(
+            later.isoformat(), self.fence.blocked[0]["receipt"]["retry_after"]
+        )
+        self.assertEqual([], self.target.seen)
+
+    def test_a_served_request_gives_its_slot_back_and_says_it_reached_the_target(self):
+        # Criterion 3 depends on this: a slot that is never released is a Program
+        # throttling itself, and a slot released as uncontacted is a request the
+        # Program made and was not charged for.
+        self.through("http://target.example.test/v1/notes").read()
+
+        self.assertEqual(1, len(self.fence.reserved))
+        self.assertEqual(1, len(self.fence.released))
+        self.assertEqual(
+            ("11111111-1111-1111-1111-111111111111", SLOT, True), self.fence.released[0]
+        )
+
+    def test_a_slot_taken_for_a_request_that_never_left_is_given_back_unspent(self):
+        # The refund. The name resolves off the public internet, so the request
+        # is refused after it reserved and before anything was dialled: the
+        # Program's allowance should be exactly where it started.
+        self.answers = ("127.0.0.1",)
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.dialled)
+        self.assertEqual(
+            ("11111111-1111-1111-1111-111111111111", SLOT, False), self.fence.released[0]
+        )
+
+    def test_a_request_with_no_capability_reserves_nothing(self):
+        # Order, stated as a test: the budget is asked after the capability, so a
+        # caller with no capability cannot drain a Program's allowance by sending
+        # requests that were never going to be authorized.
+        self.through("http://target.example.test/v1/notes", capability=None).read()
+
+        self.assertEqual([], self.fence.reserved)
+        self.assertEqual([], self.fence.released)
 
     def test_a_missing_capability_is_refused_before_the_target_is_contacted(self):
         # Criterion 5, first arm.

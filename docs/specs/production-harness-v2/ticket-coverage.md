@@ -1,23 +1,55 @@
 # Production harness v2 — ticket coverage audit
 
-Status: ticket-plan coverage complete; implementation not started
+Status: ticket-plan coverage complete; implementation in progress
 
 This audit answers whether the approved ticket plan covers the production Spec
-and ends in a runnable first-hunt release candidate. It does not claim that any
-ticket has been implemented.
+and ends in a runnable first-hunt release candidate. Coverage is a property of
+the plan; the progress section below is the separate, smaller claim about what
+has been built, and neither section is evidence for the other. Ticket 63 remains
+the only thing that proves per-story implementation.
 
 ## Structural validation
 
+Re-measured 2026-08-11, after ticket 66 was raised by the ticket-03 review and
+triaged into the graph.
+
 | Check | Result |
 | --- | --- |
-| Ticket files | 65, numbered continuously 01–65 |
-| Ticket status | 65/65 `ready-for-agent` |
-| Acceptance criteria | 391 unchecked criteria |
-| Blocking edges | 124 exact title-and-number references |
+| Ticket files | 66, numbered continuously 01–66 |
+| Ticket status | 14 `resolved`, 52 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 398 total, 84 ticked |
+| Blocking edges | 126 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
 | Release reachability | Every ticket has a dependency path to ticket 65 |
 | Absolute, scratch or issue-file paths in tickets | 0 |
+
+Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
+the plan's reachability property. Ticket 62 now lists it as a blocker, which
+restores it: 65 is again the only ticket nothing depends on.
+
+## Implementation progress
+
+| Measure | Value |
+| --- | --- |
+| Resolved | 01–13 and 15 |
+| Unblocked and open | 14, 16, 18, 66 |
+| Criteria ticked | 84 of 398 |
+
+What that covers is the foundation and the egress spine: installable runtime and
+diagnostics, the migration corpus and its integrity gate, Program isolation and
+bounded reads, redacted and encrypted Artifacts, compiled scope, the capability
+proxy over HTTP and HTTPS, the container network boundary, lease-gated encrypted
+Identities, the operator Halt and the aggregate request budget enforced at that
+same door, and the startup assertion imported as ticket 15. The scheduler, the
+role roster, the epistemic pipeline, kill chains, the v1 knowledge migration and
+the operator surface are untouched.
+
+Two limits belong in the same breath as the number. The live database suite runs
+only with `RK_TEST_SUPERUSER_URL` set and the container suite only with
+`RK_TEST_CONTAINERS=1`, and the repository has no CI, so a clean checkout
+enforces neither. And a ticked box records the implementer's judgement, not an
+audit: ticket 63 is where per-story evidence is actually demanded.
 
 ## User-story coverage
 
@@ -63,7 +95,7 @@ prevents a prose-only completion claim.
 | 16 — Complete v1 corpus disposition | 01, 47–58 |
 | 17 — Validation and reporting | 37, 42, 43 |
 | 18 — Operator CLI and local UI | 02, 04, 05, 29, 59, 60 |
-| 19 — Delivery phases and exit gates | 01–65, enforced by 63–65 |
+| 19 — Delivery phases and exit gates | 01–66, enforced by 63–65 |
 
 ## Testing-decision coverage
 
@@ -80,6 +112,7 @@ prevents a prose-only completion claim.
 | Safe legacy import | 58 |
 | Deterministic report and export | 42, 43 |
 | Secret, restore, performance and clean-install gates | 01, 07, 43, 62 |
+| Database role privilege surface | 66, re-verified on install and restore by 62 |
 | Independent final review | 63, 64 |
 | Full first-hunt dress rehearsal | 65 |
 
@@ -154,8 +187,9 @@ schema work or catalogue files.
 
 ## Verdict
 
-**PASS at ticket-plan level.** The approved dependency graph covers the complete
-production Spec, the complete planned v1 knowledge migration and an end-to-end
-first-hunt release outcome. Runtime functionality remains unimplemented until
-the tickets are executed and ticket 63 proves implementation evidence for every
-story.
+**PASS at ticket-plan level**, re-confirmed at 66 tickets. The approved
+dependency graph covers the complete production Spec, the complete planned v1
+knowledge migration and an end-to-end first-hunt release outcome. Thirteen
+tickets are resolved and the remaining fifty-three carry the runtime
+functionality; ticket 63 is still what proves implementation evidence for every
+story, and nothing in this file substitutes for it.

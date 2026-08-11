@@ -80,6 +80,7 @@ mutation = true
 requests = 5000
 tokens = 2000000
 concurrency = 2
+burst = 500
 window_seconds = 3600
 
 [[scope.include]]

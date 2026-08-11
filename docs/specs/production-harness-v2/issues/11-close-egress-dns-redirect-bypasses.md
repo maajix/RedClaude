@@ -16,9 +16,11 @@
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `096196e` on
-2026-08-10. **The first and fifth criteria are not ticked and this ticket is not
-resolved**, which is why the status is `needs-triage` rather than `resolved`: see
-the last section.
+2026-08-10. When that commit landed the first and fifth criteria were not ticked
+and the status was `needs-triage`. Both were closed on 2026-08-11 by the work
+recorded under "Completion remediation" at the end of this file, which is what
+moved the status to `resolved`; the sections between here and there are kept as
+they were written, and what they call unfinished is answered there.
 
 Before this change the door decided a *name* and dialled whatever a resolver
 handed back. Everything between those two acts was trust: the request that was
@@ -252,11 +254,13 @@ criterion 1 and is not enforceable from here. **Only the address that will be
 dialled goes to the second decision**, which is the section below and unchanged.
 **Criterion 1 is still unticked and its home is still unstated** -- ticket 16
 does not claim it either -- which is a maintainer's call and is written down
-rather than made here.
+rather than made here. *Answered on 2026-08-11: the criterion stayed here and was
+built here, in `redkraken.isolation`. See "Completion remediation" below.*
 
 ### Raised by review and deliberately not built here
 
 - **Criterion 1 is not built, and that is why this ticket is not resolved.**
+  *Superseded 2026-08-11; built as described below.*
   "Inside the real agent container, raw internet TCP, external DNS, target
   networks, provisioning ports and control ports are unreachable while the proxy
   remains reachable" needs two things this repository does not have: a container

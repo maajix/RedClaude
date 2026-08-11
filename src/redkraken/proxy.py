@@ -77,6 +77,7 @@ import http.client
 import hmac
 import ipaddress
 import json
+import math
 import re
 import socket
 import ssl
@@ -189,6 +190,13 @@ NO_PROGRAM = "no-program"
 RECEIPT_REFUSED = "receipt-refused"
 TUNNEL = "tunnel-refused"
 
+#: The refusals that are about how much rather than about whether. Its own token
+#: because the caller's response to one is the opposite of its response to a
+#: capability refusal: a throttled request is the same request, sent again later,
+#: and a caller that read them as one token would either retry a refusal that
+#: will never succeed or abandon one that would have.
+BUDGETED = "budget-refused"
+
 #: What an ambiguous take says, in one place because two paths report it and a
 #: caller comparing the two would otherwise be reading a difference that means
 #: nothing.
@@ -239,6 +247,12 @@ HOP_BY_HOP = frozenset(
 #: Every internal control header, by prefix rather than by name, so a header
 #: added later is excluded by having been named at all.
 INTERNAL = "x-redkraken-"
+
+#: The line that makes a wire view the document of one exchange rather than of
+#: the bytes it happened to carry. Under the internal prefix, so it is the
+#: door's own statement and never something a target sent: `describes_this_hop`
+#: keeps the prefix off the wire in both directions.
+EXCHANGE = INTERNAL + "exchange"
 
 #: What an artifact of one whole exchange is. Not the body's type: the bytes
 #: stored are a complete HTTP message, headers included, and calling them
@@ -299,6 +313,7 @@ class Refused(Exception):
         status: int = 407,
         target_status: int | None = None,
         pinned: tuple[str, ...] = (),
+        retry_at: datetime | None = None,
     ) -> None:
         super().__init__(detail or reason)
         self.reason = reason
@@ -319,6 +334,13 @@ class Refused(Exception):
         #: that a refusal knowing one and a refusal knowing four are the same
         #: kind of thing here and `pinned_ips` is written in one place.
         self.pinned = pinned
+        #: When the same request would be worth making again, on the refusals
+        #: that are about a limit rather than about authority. Nothing on the
+        #: rest, and that absence is the fact: a capability that lapsed does not
+        #: come back, so a retry time on one would be this door telling a caller
+        #: to keep asking. The database computes it, because it holds the bucket
+        #: this request would have drawn from.
+        self.retry_at = retry_at
 
 
 @dataclass(frozen=True)
@@ -347,6 +369,25 @@ class Authorization:
     scope_class: str
     identity_entity_id: str | None = None
     identity_label: str | None = None
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """One request's share of a Program's budget, taken or refused.
+
+    A refusal comes back as a value rather than as an exception, unlike every
+    other decision this door asks the database for. That is deliberate: the other
+    refusals mean the request had no business being made, and this one means it
+    had business being made later. The two are told apart by `granted`, and the
+    caller of a refused one still owes it nothing -- there is no slot to give
+    back, which is why `id` is empty on exactly those.
+    """
+
+    id: str | None
+    granted: bool
+    reason: str
+    retry_at: datetime | None
+    target: str
 
 
 @dataclass
@@ -591,6 +632,29 @@ def transcript(start: str, headers: list[tuple[str, str]], body: bytes) -> bytes
     return head.encode("latin-1", "replace") + body
 
 
+def wire_view(
+    start: str, headers: list[tuple[str, str]], body: bytes, *, exchange: str
+) -> bytes:
+    """The same message, as the document of the one exchange that carried it.
+
+    Sealed material and Agent-visible material share one content-addressed
+    store, where the hash is the whole identity of an artifact and an artifact
+    is either readable or sealed and never both. The bytes of a message are not
+    unique to an exchange: the same page fetched anonymously and then with an
+    Identity produces one Agent artifact and one wire view that are the same
+    bytes, the two classifications land on one row, and whichever exchange
+    arrives second cannot be recorded at all -- the target has answered and
+    there is nowhere to put the answer.
+
+    The exchange line is what separates them. It names the moment and the
+    request, both of which the Receipt already carries in the clear, so it
+    withholds nothing and reveals nothing; what it does is make a wire view a
+    document no anonymous fetch can reproduce, which is the property the store
+    needs and the bytes alone do not have.
+    """
+    return transcript(start, [(EXCHANGE, exchange)] + headers, body)
+
+
 def endpoint(url: str) -> tuple[str, int]:
     """The local proxy an operator named, refused if it is not local.
 
@@ -695,6 +759,24 @@ WIRE_KEYING = (
 
 BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)::text"
 
+#: The third decision, and the only one that is not about this request alone. It
+#: takes the capability rather than the Program for the same reason the address
+#: check does -- it resolves it and takes the Program from that -- and it takes
+#: the canonical request because it has to find the scope rule that matched, and
+#: the per-target limits hang off that rule rather than off the hostname the
+#: caller wrote. Everything it decides is decided under a row lock, which is what
+#: makes the limits a Program's limits rather than a process's.
+RESERVE = (
+    "SELECT reservation::text, granted, reason, retry_at, scope_target"
+    "  FROM reserve_egress_slot($1, $2, $3, $4::integer, $5, $6)"
+)
+
+#: And giving it back. `contacted` is the fact the door alone holds: the database
+#: knows a slot was taken, and only this process knows whether a socket towards
+#: the target was ever opened. A slot released as uncontacted refunds itself, so
+#: the counters count exchanges rather than attempts.
+RELEASE = "SELECT release_egress_slot($1::uuid, $2)"
+
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 
 
@@ -706,6 +788,20 @@ def _object(answer: object) -> dict:
     to disagree about what an answer with no rows looks like.
     """
     return json.loads(answer) if isinstance(answer, str) else dict(answer)
+
+
+def _moment(answer: object) -> datetime | None:
+    """One `timestamptz` as a moment, or nothing when the column was null.
+
+    The driver hands timestamps over as the text the server sent, offset and
+    all, so this is a parse rather than a conversion and the result is aware
+    whatever the session's time zone happens to be. Absent stays absent: the
+    column is null on the refusals that have no time to name, and inventing one
+    would tell a caller to retry something that will never lift.
+    """
+    if answer is None:
+        return None
+    return datetime.fromisoformat(str(answer))
 
 
 def _refusal(error: pg.DatabaseError, address: str) -> Refused:
@@ -816,6 +912,75 @@ class Fence:
                 raise _refusal(error, address) from error
         if not rows:
             raise Refused("address refused", "no address verdict", pinned=(address,))
+
+    def reserve(
+        self, program_id: str, capability: str, request: scope.Request
+    ) -> Reservation:
+        """Take one request's worth of the Program's budget, or learn it is spent.
+
+        Third of the three decisions, and the one that cannot be made here. Rate,
+        burst and concurrency are properties of a Program, not of a process: two
+        doors, two Tool runs and two threads of one Tool run all draw on the same
+        allowance, and a counter in this process would be a counter of what this
+        process happened to see. So the arithmetic happens under a row lock in
+        the database, and what comes back is the verdict, not the numbers.
+
+        It runs after `authorize` and before the name is resolved, which puts it
+        on the right side of the only line that matters: a request refused here
+        has not resolved a name, opened a socket or sent a byte. Spending budget
+        on a request that scope would have refused would also let a caller
+        measure the policy by watching its own allowance drain.
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(
+                    RESERVE,
+                    (
+                        capability,
+                        request.protocol,
+                        request.host,
+                        request.port,
+                        request.path_raw,
+                        request.path_norm,
+                    ),
+                ).rows
+            except pg.DatabaseError as error:
+                # Same two-into-one as the address check: the function resolves
+                # the capability before it looks at any limit, so a Tool run that
+                # closed between the first decision and this one arrives here. It
+                # is filed as what it is rather than as a budget refusal, because
+                # a caller told to retry after a lapsed capability would retry
+                # forever.
+                reason = "capability refused" if LAPSED in str(error) else "budget refused"
+                raise Refused(reason, str(error)) from error
+        if not rows:
+            raise Refused("budget refused", "no reservation verdict")
+        reservation, granted, reason, retry_at, target = rows[0]
+        return Reservation(
+            id=str(reservation) if reservation is not None else None,
+            granted=bool(granted),
+            reason=str(reason),
+            retry_at=_moment(retry_at),
+            target=str(target),
+        )
+
+    def release(self, program_id: str, reservation: str, contacted: bool) -> None:
+        """Give the slot back, and say whether a target heard about it.
+
+        Idempotent, because the caller releases from a `finally` and a request
+        that was refused after contact runs through more than one of them. A
+        second release of the same slot changes nothing, which is what makes the
+        `finally` safe to write without asking whether an earlier one already ran.
+
+        A slot that is never given back is not a hole. It expires on its own, and
+        until it does it occupies concurrency -- so the failure mode of this call
+        is a Program that is briefly more restricted than its policy says, which
+        is the direction a fence should fail in.
+        """
+        with self._lock:
+            self._bind(program_id)
+            self.connection.execute(RELEASE, (reservation, contacted))
 
     def allowed_receipt(
         self,
@@ -1108,6 +1273,21 @@ def pinned_ips(addresses: tuple[str, ...]) -> str:
     return ",".join(addresses)
 
 
+def _retry_after(moment: datetime | None) -> list[tuple[str, str]] | None:
+    """`Retry-After` as a whole number of seconds, or no header at all.
+
+    Seconds rather than the date RFC 9110 also allows, because the caller's clock
+    is not this machine's and the interval is what the answer means. Rounded up
+    and floored at one: a client that retried after the truncated value would
+    arrive fractionally too early and be refused again, and zero would read as
+    "now", which is the one thing this header exists to say it is not.
+    """
+    if moment is None:
+        return None
+    waiting = (moment - datetime.now(timezone.utc)).total_seconds()
+    return [("Retry-After", str(max(1, math.ceil(waiting))))]
+
+
 def connect(
     host: str,
     port: int,
@@ -1217,6 +1397,20 @@ class Handler(BaseHTTPRequestHandler):
     tunnel: tuple[str, int] | None = None
     tunnel_control: Control = Control(None, None)
 
+    #: Whether a socket towards the target has been opened for the request being
+    #: served now. Reset per request rather than per connection, because one
+    #: handler serves every request inside a tunnel and a flag carried over from
+    #: the last one would charge a Program for an exchange it never had. Set at
+    #: the one line that dials, so it means what it says.
+    contacted: bool = False
+
+    #: The budget slot this request holds, and the Program it was taken under.
+    #: On the instance rather than passed down, because what gives it back is not
+    #: the code that took it: the exchange releases it the moment the socket is
+    #: closed, and `_serve` releases whatever is left on every other way out.
+    slot: str | None = None
+    slot_program: str | None = None
+
     def _serve(self) -> None:
         arrival = datetime.now(timezone.utc)
         control = take_control(self.headers)
@@ -1254,6 +1448,9 @@ class Handler(BaseHTTPRequestHandler):
                 detail=said,
             )
 
+        self.contacted = False
+        self.slot = None
+        self.slot_program = program_id
         try:
             request = self._request(url)
             if control.capability is None:
@@ -1262,30 +1459,58 @@ class Handler(BaseHTTPRequestHandler):
                 program_id, control.capability, self.command, request
             )
             body = self._body()
+            slot = self.server.fence.reserve(program_id, control.capability, request)
         except Refused as refusal:
             return self._refuse(program_id, control.capability, refusal, arrival, url=url)
 
-        try:
-            addresses = self._pin(authorization, control.capability, request)
-        except Refused as refusal:
-            # Its own block, because by here there is an `authorization` and the
-            # record has to say so. A request refused for its address was in
-            # scope by name and spent a live capability to get that far, and a
-            # Receipt that filed it as `denied` alongside the ones that never
-            # resolved anything would hide exactly the case worth seeing: a name
-            # the policy allows, pointing somewhere the policy does not.
+        if not slot.granted:
+            # A limit, not a verdict about this request. It is filed with the
+            # authorization it earned, so that the row says what the request was
+            # allowed as and then says it was not sent anyway -- an auditor
+            # reading a Program that stopped working needs to tell "out of scope"
+            # from "out of budget", and those are the same shape without it.
             return self._refuse(
                 program_id,
                 control.capability,
-                refusal,
+                Refused(slot.reason, slot.reason, retry_at=slot.retry_at),
                 arrival,
                 url=url,
                 authorization=authorization,
+                decision=BUDGETED,
+                detail=slot.reason,
             )
 
-        self._forward(
-            authorization, control.capability, request, body, arrival, url, addresses
-        )
+        self.slot = slot.id
+        try:
+            try:
+                addresses = self._pin(authorization, control.capability, request)
+            except Refused as refusal:
+                # Its own block, because by here there is an `authorization` and
+                # the record has to say so. A request refused for its address was
+                # in scope by name and spent a live capability to get that far,
+                # and a Receipt that filed it as `denied` alongside the ones that
+                # never resolved anything would hide exactly the case worth
+                # seeing: a name the policy allows, pointing somewhere the policy
+                # does not.
+                return self._refuse(
+                    program_id,
+                    control.capability,
+                    refusal,
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                )
+
+            self._forward(
+                authorization, control.capability, request, body, arrival, url, addresses
+            )
+        finally:
+            # Whatever the exchange did not already give back. Every way out of
+            # the block above ends here, including the refusal that returns from
+            # inside it, and a slot released as uncontacted is refunded -- so a
+            # request that took budget and then failed to resolve a name does not
+            # count against a Program that never reached anything.
+            self._release()
 
     do_GET = _serve
     do_HEAD = _serve
@@ -1483,6 +1708,11 @@ class Handler(BaseHTTPRequestHandler):
         facts about the same lookup.
         """
         address = addresses[0]
+        # Immediately before the dial and not after it: a connection that was
+        # opened and then failed is still a request this Program made of that
+        # target, and a Program whose budget only counted the exchanges that
+        # succeeded could hammer a target that never answers for free.
+        self.contacted = True
         try:
             connection = self.server.connector(
                 request.host,
@@ -1518,6 +1748,13 @@ class Handler(BaseHTTPRequestHandler):
             raise Refused("identity slot refused", str(error), pinned=addresses) from error
         except (OSError, http.client.HTTPException) as error:
             raise Refused("target unreachable", str(error), pinned=addresses) from error
+        finally:
+            # Here rather than after the record is written, because the slot
+            # limits how many requests are at a target at once and this one is no
+            # longer at it. Holding it through the Receipt, the artifact store and
+            # the answer would make a Program's concurrency a limit on how fast
+            # this process writes rows, which is not a fact about the target.
+            self._release()
         if len(returned) > CEILING:
             raise Refused(
                 "response too large",
@@ -1525,6 +1762,28 @@ class Handler(BaseHTTPRequestHandler):
                 target_status=status,
             )
         return status, reason, back, returned
+
+    def _release(self) -> None:
+        """Give this request's budget slot back, at most once, and never fail on it.
+
+        Taken out of the field first, so the second caller has nothing to give
+        back: two paths release -- the exchange when the socket closes, `_serve`
+        for every way out that never got there -- and neither knows whether the
+        other ran.
+
+        A release that cannot be written is logged rather than raised. The
+        request it belongs to has already been decided, and turning a bookkeeping
+        failure into the caller's answer would replace a served exchange with an
+        error about a row. What it costs instead is one slot held until the
+        reservation lapses, which refuses requests rather than admitting them.
+        """
+        slot, self.slot = self.slot, None
+        if slot is None or self.slot_program is None:
+            return
+        try:
+            self.server.fence.release(self.slot_program, slot, self.contacted)
+        except (pg.DatabaseError, OSError) as error:
+            self.log_error("no release for %s: %s", slot, error)
 
     def _forward(
         self,
@@ -1635,27 +1894,57 @@ class Handler(BaseHTTPRequestHandler):
 
         sent = transcript(line, agent_headers, body)
         wire_sent = transcript(line, wire_headers, body)
+        wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
+        store = self.server.store
         if binding is not None:
             binding.changed = binding.session.capture(url, back)
-            agent_back, agent_returned = project_identity_response(back, returned)
-            agent_reason = ""
+            if store.holds(digest(wire_received)):
+                # These exact bytes are already an Agent artifact, so some
+                # earlier exchange obtained them without this Identity's
+                # credential and nothing in them can be a reflection of it.
+                # Withholding them would withhold nothing -- the Agent can read
+                # them under the hash it already holds -- and would seal, for a
+                # Program, a ciphertext of that Program's own plaintext.
+                agent_back, agent_returned, agent_reason = back, returned, reason
+            else:
+                agent_back, agent_returned = project_identity_response(back, returned)
+                agent_reason = ""
         else:
             agent_back, agent_returned = response_for_agent(back), returned
             agent_reason = reason
         received = transcript(f"HTTP/1.1 {status} {agent_reason}", agent_back, agent_returned)
-        wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
-        store = self.server.store
         request_sha, request_new = store.put(sent)
         response_sha, response_new = store.put(received)
 
         seals: list[dict] = []
         ciphertext_new: set[str] = set()
+        # Whether a direction was transformed is a question about the bytes: the
+        # Agent view and the wire view either differ or they do not. What gets
+        # sealed is the exchange's own document, because a hash that another
+        # exchange could arrive at is a classification two exchanges have to
+        # share, and they cannot.
+        exchange = f"{arrival.isoformat()} {self.command} {url}"
         transformations = [
-            (wire_sent, request_sha, "target_request")
-            for _ in range(1 if wire_sent != sent else 0)
-        ] + [
-            (wire_received, response_sha, "target_response")
-            for _ in range(1 if wire_received != received else 0)
+            (bound, agent_sha, field)
+            for raw, agent, bound, agent_sha, field in (
+                (
+                    wire_sent,
+                    sent,
+                    wire_view(line, wire_headers, body, exchange=exchange),
+                    request_sha,
+                    "target_request",
+                ),
+                (
+                    wire_received,
+                    received,
+                    wire_view(
+                        f"HTTP/1.1 {status} {reason}", back, returned, exchange=exchange
+                    ),
+                    response_sha,
+                    "target_response",
+                ),
+            )
+            if raw != agent
         ]
         if transformations:
             root = self.server.root_secret
@@ -1896,6 +2185,13 @@ class Handler(BaseHTTPRequestHandler):
             # Receipt saying an address was refused, with no address in it, tells
             # an auditor that a name misbehaved without telling them how.
             receipt["pinned_ips"] = pinned_ips(refusal.pinned)
+        if refusal.retry_at is not None:
+            # In the row and not only in the answer. The answer is read once, by
+            # a caller that may not be running any more by the time anyone asks
+            # what happened; the Receipt is what a retry is reconstructed from,
+            # and a throttle with no time on it is indistinguishable from a
+            # refusal that will never lift.
+            receipt["retry_after"] = refusal.retry_at.isoformat()
         written: str | None = None
         try:
             written = self.server.fence.blocked_receipt(program_id, capability, receipt)
@@ -1917,6 +2213,7 @@ class Handler(BaseHTTPRequestHandler):
             detail=detail or refusal.reason,
             body=b"",
             receipt=written,
+            headers=_retry_after(refusal.retry_at),
         )
 
     def _answer(

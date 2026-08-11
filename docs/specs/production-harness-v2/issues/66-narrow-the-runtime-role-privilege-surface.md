@@ -4,7 +4,12 @@
 
 **Blocked by:** 03 — Run production migrations and the integrity gate.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
+
+**Triaged 2026-08-11:** kept as its own ticket rather than folded into 03, because
+it changes promoted schema and decides a security surface. Ticket 62 now lists it
+as a blocker, so it has a dependency path to the release ticket the way the
+original 01–65 plan requires of every ticket.
 
 ## Why
 
@@ -15,11 +20,13 @@ The narrowing is therefore opt-out, and three of the four opt-outs were written 
 | Function | Gated in the corpus to | `rk2_runtime` can execute |
 | --- | --- | --- |
 | `answer_decision(text,text,text,interval)` | `rk2_human` (`0026_human_control.sql:839-840`) | yes |
-| `register_proxy_artifacts(text,text,text,text,text)` | `rk2_proxy` (`0040_receipt_contract.sql:38-39`) | yes |
+| `register_proxy_artifacts(text,text,text,text,text)` | `rk2_proxy` (`0040_receipt_contract.sql:38-39`) | function no longer exists |
 | `write_blocked_receipt(uuid,jsonb,text)` | `rk2_proxy` (`0040_receipt_contract.sql:114-115`) | yes |
 | `force_lane_quota(text,text,integer)` | `rk2_human` (`0037_lane_quota.sql:749-750`) | no |
 
-`force_lane_quota` is the one that is actually closed, and it is the one written as `REVOKE EXECUTE ... FROM rk2_runtime`. The corpus knows the pattern and applies it in one place out of four.
+`register_proxy_artifacts` was dropped by ticket 10 at `20260810T214500Z__capability_proxy_egress.sql:284`, which is why that row now reads as it does. It is left in the table because it is the shape of the problem rather than an instance to fix: the grant at `0040_receipt_contract.sql:38-39` was as open as the other two for as long as the function existed, and deleting a verb is not a mechanism that keeps the next one closed.
+
+`force_lane_quota` is the one that is actually closed, and it is the one written as `REVOKE EXECUTE ... FROM rk2_runtime`. The corpus knows the pattern and applies it in one place out of the four it wrote.
 
 `answer_decision` is the sharpest case: `0026_human_control.sql:980-984` revokes the decision queue from `rk2_state` on the reasoning that "an agent that can read the decision queue can read the question it caused and tune the next one". The same agent reaches the database as `rk2_runtime`, and as `rk2_runtime` it can answer its own escalation.
 

@@ -143,6 +143,17 @@ class Store:
         pending.replace(path)
         return sha256, True
 
+    def holds(self, sha256: str) -> bool:
+        """Whether these bytes are already filed, without reading them back.
+
+        The store holds Agent-visible artifacts as themselves and credential-
+        bearing ones only as sealed envelopes filed under the envelope's hash,
+        so a hit on a plaintext hash is the same fact as "the Agent may read
+        these bytes" -- which is what the proxy asks before deciding whether
+        withholding a wire view would withhold anything at all.
+        """
+        return path_for(self.root, sha256).exists()
+
     def discard(self, sha256: str) -> bool:
         """Remove bytes this process wrote that nothing can have referenced.
 

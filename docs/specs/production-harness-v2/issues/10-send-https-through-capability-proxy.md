@@ -16,9 +16,11 @@
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `9c2ba9b` on
-2026-08-10. **The first, third and fifth criteria are not ticked and this ticket
-is not resolved**, which is why the status is `needs-triage` rather than
-`resolved`: see the last section.
+2026-08-10, and resolved on 2026-08-11 once its three deferred criteria landed
+in the tickets that owned them. **At `9c2ba9b` the first, third and fifth
+criteria were not ticked and the status was `needs-triage`**; the sections below
+are written from that commit, and the closing section records what settled each
+one. Read a "not built here" bullet as the state on 2026-08-10.
 
 `src/redkraken/tls.py` is the run's certificate authority -- one per run, in a
 directory the door owns, issuing a leaf that names exactly one host -- and
@@ -314,6 +316,8 @@ answered in the first pass and the docstring carries the reason.
   target `Set-Cookie` reaches the HTTPS caller. Ticket 12 owns runtime credential
   injection, response redaction and the distinct sealed wire view, so criterion
   5 remains unticked until that integration exists.
+  *Closed 2026-08-11: the sealed response projection landed here and ticket 12
+  resolved. Criterion 5 is ticked.*
 
 - **Criterion 3 is half done, and that is why this ticket is not resolved.**
   "Direct HTTPS from the agent network namespace fails even when a client
@@ -329,6 +333,9 @@ answered in the first pass and the docstring carries the reason.
   or whether this ticket reopens when it lands; until then the box stays
   unticked, because a TCP connection to a directly-dialled target still succeeds
   and only the certificate check fails.
+  *Closed 2026-08-11: the maintainer decision was that this ticket reopens and
+  then closes on the routing half, which `redkraken.isolation` now builds and
+  ticket 11 proves. Criterion 3 is ticked.*
 - **Criterion 1 is not ticked either, because `agent_environment` has no
   production caller.** It is a pure function, fully tested, and nothing in
   `src/redkraken/` builds a child environment yet -- ticket 16 is "start clean
@@ -339,6 +346,9 @@ answered in the first pass and the docstring carries the reason.
   the endpoint it would carry is dead by the time anything reads it. The box was
   ticked in the first pass and is now unticked; what a maintainer decides is
   whether it moves to ticket 16 or this ticket reopens when 16 lands.
+  *Closed 2026-08-11: neither. `redkraken.isolation.run` is the production
+  caller, built here rather than deferred to 16, so the sentence is now true of
+  a function the runtime calls. Criterion 1 is ticked.*
 - **`NODE_EXTRA_CA_CERTS` adds rather than replaces.** The other three name a
   file and replace it, and `SSL_CERT_DIR` is emptied beside them, so the only
   store left over is Node's own bundled roots: a Node client in the child trusts

@@ -215,3 +215,38 @@ in the database can open a file.
   says the glossary is maintained by `/domain-modeling` — so the terms this
   ticket introduces are documented in the migration header and belong in the
   glossary whenever that skill runs next.
+
+### The wire view names its exchange, 2026-08-11
+
+A sealed wire view is now `x-redkraken-exchange: <arrival> <method> <url>`
+followed by the message, and the hash that identifies the artifact is the hash
+of that document. Criterion 4 still holds -- the two views are separate
+immutable references and each hash describes exactly what its party is shown --
+but the wire hash is no longer the hash of the target's message alone, and that
+is the change.
+
+What forced it is the store, not the cryptography. One hash is the whole
+identity of an artifact, and an artifact is either agent-visible or
+credential-bearing and never both. The bytes of a message are not unique to an
+exchange: fetch a page anonymously and then with an Identity, whose wire view is
+that same message, and the two classifications land on one row. Whichever
+exchange arrived second could not be recorded at all -- `record_proxy_exchange`
+refused it, the door answered 502, and the bytes were already spent. Both orders
+happened, in the ordinary case of reading a page and then reading it as somebody.
+
+Neither party loses anything to the added line. The Receipt already carries the
+moment and the request in the clear, so the line reveals nothing the record does
+not, and it withholds nothing: the message follows it unaltered. It is written
+under the internal prefix, which `describes_this_hop` keeps off the wire in both
+directions, so it is the door's own statement and never something a target sent.
+The transcript was already a reconstruction rather than the socket's bytes --
+`transcript()` says so -- and this makes it a reconstruction of one exchange.
+
+`tests/test_database.py::ProxyEgressTest` has the two orders as two cases, each
+of which fails with `(502, 'receipt-refused')` without this: an authenticated
+fetch of bytes the Agent already read, and an anonymous fetch of bytes an
+Identity already sealed. The first also records the other half of the rule --
+when the message is already in the store as an Agent artifact, the door hands it
+to the Agent rather than projecting it away, because withholding bytes a Program
+can already read under a hash it already holds is theatre, and sealing them
+would pair that Program's plaintext with a ciphertext of itself.

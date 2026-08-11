@@ -220,7 +220,7 @@ a table with no rows in it worth planning around yet.
   is counted over. It is compiled, digested, carried in
   `program_scope_versions.policy` and reported by `rk scope`, and no code path
   consults it, because nothing in this branch performs a target-facing operation
-  yet. The enforcement point is the proxy, and it is ticket 09's.
+  yet. The enforcement point is the proxy, and it is ticket 13's.
 - **Discovery is denied unconditionally, because the grammar cannot authorize
   it.** `decide_discovery` returns `allowed = False` with
   `discovery_not_authorized` for all five techniques, always: the configuration

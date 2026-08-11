@@ -34,9 +34,10 @@ constraint read back from `pg_get_constraintdef`, a trigger-authored
 an earlier transaction's actor and a direct `hypotheses.status` write, one gate
 covering all three families, and dump → provision → restore → gate.
 
-Criterion 5 is not complete. All 51 checks the gate runs are accounted for, and
-`test_every_check_the_gate_runs_has_a_control` fails by name if a new check
-arrives without an entry:
+Criterion 5 was not complete at this commit, and the paragraph below records
+why; the 2026-08-11 section closes it. All 51 checks the gate runs were
+accounted for, and `test_every_check_the_gate_runs_has_a_control` fails by name
+if a new check arrives without an entry:
 
 - 45 have a control that makes that named check report false.
 - Four cannot: `roles:proxy_role_exists`, `roles:runtime_role_exists`,
@@ -49,10 +50,10 @@ arrives without an entry:
 - Two are properties of the running binary: `baseline:server_major` and
   `baseline:uuidv7_is_builtin`. Falsifying either means a different PostgreSQL.
 
-The last two have no negative control, and the four family-refusal cases do not
-make the named check return false. Accounting for them keeps a new untested
-check visible, but it is not the acceptance criterion as written; the box stays
-unticked until those checks have an executable falsification.
+The last two had no negative control, and the four family-refusal cases did not
+make the named check return false. Accounting for them kept a new untested check
+visible, but that is not the acceptance criterion as written, so the box stayed
+unticked here.
 
 Three defects the review found were fixed before the commit: `_apply` inlined
 `set_actor()`'s body instead of calling it (it now calls the helper wherever it
@@ -125,3 +126,39 @@ own named false catalogue checks rather than aborting a whole family first.
 The live negative-control suite consequently has an executable falsification
 for every check the gate runs. Its coverage assertion still fails by name when
 a new registered check arrives without a control.
+
+Where each falsification lives, so the claim is checkable: `CONTROLS` drives the
+table-shaped ones, `RUNTIME_CONTROLS` supplies the four binary and extension
+facts one false observation at a time through `evaluate_server_runtime`, and two
+checks that need rows rather than an edit have a test each --
+`baseline:hnsw_headroom` is falsified by building an index the setting cannot
+fit and `standing:receipt_integrity` by a Receipt whose subject is gone. Those
+two are named as literals in the coverage assertion because they are not
+table-driven, which is why criterion 5 reads as met with 45 table controls
+rather than 51.
+
+Criterion 5 is ticked on this evidence. The box and this section are the
+current claim; the 2026-08-09 text above is retained as the record of the
+earlier state, not as a live limitation.
+
+### `receipt_integrity` arm (a), narrowed, 2026-08-11
+
+`20260811T160000Z__egress_integrity_after_contact.sql` replaces
+`check_receipt_integrity`. Arm (a) counted every agent-lane Receipt with no tool
+run, and a blocked Receipt written by the door when it refuses a capability has
+exactly that shape: the capability resolved to nothing, so there is no tool run
+to attribute the attempt to. One refused capability therefore failed the standing
+gate for every Program, permanently, and the only way to clear it was to delete
+the audit row the refusal existed to leave.
+
+What the arm is for is narrower than what it measured: bytes that left this
+machine with no tool call accounting for them. `ts_egress` separates the two --
+it is set once a socket has been opened and is null on every refusal made before
+contact -- so the no-tool-run half now requires it. The second half is unchanged:
+a Receipt citing a tool run that does not exist is corruption either way.
+
+The negative control gained its opposite. `test_an_unattributable_receipt_fails_
+the_receipt_check` now writes `ts_egress`, because that is what makes the row the
+shape RK-REG-002 produced, and `test_a_refusal_before_contact_does_not_fail_the_
+receipt_check` asserts the gate stays clear for the refusal. Removing the
+migration fails the second one by name.

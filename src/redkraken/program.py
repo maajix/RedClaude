@@ -668,11 +668,14 @@ def _project_scope(
         ).scalar()
     )
     controls = dict(policy.controls)
+    budgets = dict(policy.budgets)
     connection.execute(
         "INSERT INTO program_scope_versions"
         " (program_id, version, policy, policy_sha256, configuration_revision, reason,"
-        "  availability_impact, credential_use, mutation, pivoting, sensitive_data_access)"
-        " VALUES ($1::uuid, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11)",
+        "  availability_impact, credential_use, mutation, pivoting, sensitive_data_access,"
+        "  budget_burst, budget_concurrency, budget_requests, budget_window_seconds)"
+        " VALUES ($1::uuid, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11,"
+        "         $12, $13, $14, $15)",
         (
             program_id,
             version,
@@ -688,6 +691,13 @@ def _project_scope(
             controls["mutation"],
             controls["pivoting"],
             controls["sensitive_data_access"],
+            # And the four limits the egress door enforces, for the same reason.
+            # A limit missing here is a NULL column, and a NULL column refuses
+            # every request rather than admitting an unbounded one.
+            budgets["burst"],
+            budgets["concurrency"],
+            budgets["requests"],
+            budgets["window_seconds"],
         ),
     )
     # One statement per table, whatever the rule count: the ordinals and the

@@ -38,6 +38,7 @@ import shutil
 import socket
 import ssl
 import threading
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -886,6 +887,15 @@ CONTROLS = (
         "GRANT EXECUTE ON FUNCTION halt_program(uuid,text) TO rk2_runtime",
     ),
     Control(
+        # Rule 1: the reservation is the door's, and only the door's. A runtime
+        # that can reserve can spend a Program's budget without passing the
+        # capability check the door does first, and the count stops meaning
+        # "requests that reached a target".
+        "standing:egress_budget",
+        "GRANT EXECUTE ON FUNCTION"
+        " reserve_egress_slot(text,text,text,integer,text,text) TO rk2_runtime",
+    ),
+    Control(
         # Rule 4: the bridge read as its owner. Every reference of every Program
         # would satisfy the policy on `artifacts` from any session.
         "standing:artifact_reachability",
@@ -1138,7 +1148,10 @@ class NegativeControlTest(DatabaseCase):
 
     def test_an_unattributable_receipt_fails_the_receipt_check(self):
         # Also rows rather than an edit: an agent-lane request that no tool run
-        # accounts for is the shape RK-REG-002 produced.
+        # accounts for is the shape RK-REG-002 produced. `ts_egress` is what
+        # makes it that shape rather than a refusal: bytes left this machine and
+        # nothing accounts for them. A refusal decided before contact has no
+        # tool run either, by construction, and is not this.
         failed: list[str] = []
         try:
             with self.connection.transaction():
@@ -1152,8 +1165,9 @@ class NegativeControlTest(DatabaseCase):
                 )
                 self.connection.execute(
                     "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
-                    " scope_class, scope_version, host)"
-                    " VALUES ($1, 'agent', 'blocked', 'self test', now(), 'target', 1, 'example.test')",
+                    " ts_egress, scope_class, scope_version, host)"
+                    " VALUES ($1, 'agent', 'blocked', 'self test', now(), now(),"
+                    " 'target', 1, 'example.test')",
                     (program,),
                 )
                 failed = self.run_gate(self.connection)
@@ -1162,6 +1176,38 @@ class NegativeControlTest(DatabaseCase):
             pass
 
         self.assertIn("standing:receipt_integrity", failed)
+
+    def test_a_refusal_before_contact_does_not_fail_the_receipt_check(self):
+        # The other side of the same arm, and the reason it needed narrowing.
+        # The door files a blocked Receipt for every capability it refuses, and
+        # a refused capability resolves to no tool run -- that is what refusing
+        # it means. Counting those made one fabricated capability fail the
+        # standing gate for every Program, for good, and the only way to clear
+        # it was to delete the row the refusal existed to leave.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                program = self.connection.execute(PROGRAM, ("refusal-selftest",)).scalar()
+                self.connection.execute(
+                    "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
+                    " VALUES ($1, 1, '{}'::jsonb, repeat('c', 64))",
+                    (program,),
+                )
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
+                    " scope_class, scope_version, host)"
+                    " VALUES ($1, 'agent', 'blocked', 'refused before contact', now(),"
+                    " 'target', 1, 'example.test')",
+                    (program,),
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertNotIn("standing:receipt_integrity", failed)
 
     def test_every_check_the_gate_runs_has_a_control(self):
         # The assertion that keeps the rest of this file honest: a check added
@@ -3237,6 +3283,70 @@ class LiveTarget(Target):
     answer = ANSWER
 
 
+class HeldTarget(Target):
+    """A counterparty that answers only once the test lets go of it.
+
+    Concurrency is the one limit that cannot be shown against a target which
+    answers immediately: two fast requests are two sequential requests, and a
+    door that allowed both would be right to. So one request is parked here,
+    inside the exchange and holding its slot, while the second is made.
+
+    The gate is a class attribute because the handler is constructed per request
+    and there is nothing to hand it one through. It starts set, so a stray
+    request never hangs the suite; a test that wants a request parked clears it
+    and sets it again.
+    """
+
+    answer = ANSWER
+    release = threading.Event()
+    release.set()
+
+    def do_GET(self) -> None:
+        HeldTarget.release.wait(timeout=30)
+        super().do_GET()
+
+    do_POST = do_GET
+    do_HEAD = do_GET
+
+
+#: The `[budgets]` block `SCOPED` carries, so that a Program built from it can be
+#: given a different one. Matched as the whole block rather than line by line: a
+#: partial replacement would leave a document whose limits half agree.
+SCOPED_BUDGETS = (
+    "requests = 100\ntokens = 10000\nconcurrency = 1\nburst = 100\nwindow_seconds = 60"
+)
+
+#: What every Program in the suite below gets unless it is a Program about
+#: budgets. Wide on purpose: a limit shared by tests that are not about it is a
+#: limit that makes adding an unrelated test break an unrelated assertion, and
+#: `SCOPED` is tight enough that the suite would run into its own ceiling.
+WIDE_ENOUGH = (
+    "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+)
+
+#: And the Programs that exist to be stopped, each named for the limit it hits.
+#: A window of an hour against a burst of two is a refill of one token every half
+#: hour, which is what makes `throttle` a test of the limit rather than of how
+#: fast the suite runs.
+BUDGETS = {
+    "budget": (
+        "requests = 2\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+    ),
+    "throttle": (
+        "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 2\nwindow_seconds = 3600"
+    ),
+    "concurrent": (
+        "requests = 500\ntokens = 10000\nconcurrency = 1\nburst = 500\nwindow_seconds = 3600"
+    ),
+    "race": (
+        "requests = 3\ntokens = 10000\nconcurrency = 8\nburst = 500\nwindow_seconds = 3600"
+    ),
+    "halted": (
+        "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+    ),
+}
+
+
 class ProxyEgressTest(DatabaseCase):
     """PH2-09 and PH2-10: two requests through the door, and ten that fail at it.
 
@@ -3286,11 +3396,15 @@ class ProxyEgressTest(DatabaseCase):
             "lease",
             "other",
             "slot-reference",
+            "reused-bytes",
+            "sealed-first",
             "identity-audit",
             "identity-revision",
             "mtls",
+            *BUDGETS,
         ):
             source = SCOPED + "\n[[identity]]\nname = \"member\"\nslot_ref = \"slot://identity/member\"\n"
+            source = source.replace(SCOPED_BUDGETS, BUDGETS.get(name, WIDE_ENOUGH))
             path = write(source.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, opened.violations
@@ -3298,6 +3412,7 @@ class ProxyEgressTest(DatabaseCase):
             cls.identifiers[name] = opened.facts["program_id"]
 
         cls.target, _ = counterparty(LiveTarget)
+        cls.parked, _ = counterparty(HeldTarget)
         cls.secure_target, _, cls.target_ca = tls_counterparty(LiveTarget)
         cls.authority = tls.authority(scratch() / "door-authority")
         # One installation has one root.  The sealed-artifact case later in
@@ -3348,6 +3463,8 @@ class ProxyEgressTest(DatabaseCase):
         cls.fence.close()
         cls.target.shutdown()
         cls.target.server_close()
+        cls.parked.shutdown()
+        cls.parked.server_close()
         cls.secure_target.shutdown()
         cls.secure_target.server_close()
         cls.runtime.close()
@@ -3401,6 +3518,11 @@ class ProxyEgressTest(DatabaseCase):
     #: resolver reads rather than which resolver runs.
     answers = (PINNED,)
 
+    #: Whether http exchanges reach the target that answers or the one that
+    #: waits. Read by `dial` for the same reason `answers` is read by `look_up`:
+    #: the connector was bound once, in setup.
+    holding = False
+
     @classmethod
     def look_up(cls, host: str, port: int) -> tuple[str, ...]:
         """What the names in this suite resolve to, without asking a real zone.
@@ -3436,6 +3558,10 @@ class ProxyEgressTest(DatabaseCase):
         decision -- happened for real.
         """
         cls.dialled.append((host, port, protocol, address))
+        if protocol == "http" and cls.holding:
+            return http.client.HTTPConnection(
+                "127.0.0.1", cls.parked.server_address[1], timeout=timeout
+            )
         if protocol == "https":
             context = ssl.create_default_context(cafile=str(cls.target_ca))
             if client_certificate is not None:
@@ -3481,29 +3607,47 @@ class ProxyEgressTest(DatabaseCase):
         self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
         return str(capability), str(opened[0]), str(run)
 
-    def attempt(
+    def answered(
         self,
         capability: str | None,
         program_id: str | None,
         url: str = URL,
         method: str = "GET",
-    ) -> tuple[int, str | None]:
-        """One request at the door, with whatever control headers it was given."""
+        port: int | None = None,
+    ) -> http.client.HTTPResponse:
+        """One request at the door, and the whole answer it came back with.
+
+        The `port` is a parameter because a Program's limits are not one door's:
+        the arms that prove that send half their requests at a second door with a
+        fence of its own, and the only thing that differs between them is this.
+        """
         headers = {}
         if capability is not None:
             headers[proxy.AUTHORIZATION] = f"RedKraken {capability}"
         if program_id is not None:
             headers[proxy.PROGRAM] = program_id
         client = http.client.HTTPConnection(
-            "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
+            "127.0.0.1", port or self.server.server_address[1], timeout=proxy.TIMEOUT
         )
         try:
             client.request(method, url, headers=headers)
             answer = client.getresponse()
             answer.read()
-            return answer.status, answer.headers.get(proxy.DECISION)
+            return answer
         finally:
             client.close()
+
+    def attempt(
+        self,
+        capability: str | None,
+        program_id: str | None,
+        url: str = URL,
+        method: str = "GET",
+        port: int | None = None,
+    ) -> tuple[int, str | None]:
+        """The two fields most arms read out of that answer."""
+        answer = self.answered(capability, program_id, url, method, port)
+        return answer.status, answer.headers.get(proxy.DECISION)
 
     def owned(self, sql: str, parameters: tuple = ()) -> str:
         """The same as `owner`, for a statement whose one value is needed back."""
@@ -3632,6 +3776,59 @@ class ProxyEgressTest(DatabaseCase):
                 (self.identifiers[name],),
             ).rows
         ]
+
+    def latest(self, name: str) -> tuple[str, str, object]:
+        """The newest Receipt a Program has: its verdict, reason and retry time."""
+        row = self.connection.execute(
+            "SELECT decision, reason, retry_after FROM receipts"
+            " WHERE program_id = $1::uuid ORDER BY ts_arrival DESC LIMIT 1",
+            (self.identifiers[name],),
+        ).rows[0]
+        return str(row[0]), str(row[1]), row[2]
+
+    def spent(self, name: str) -> tuple[int, int]:
+        """What the Program's own row says it contacted, and was refused after."""
+        rows = self.connection.execute(
+            "SELECT contacted, exhausted FROM program_egress_spend"
+            " WHERE program_id = $1::uuid",
+            (self.identifiers[name],),
+        ).rows
+        return (int(rows[0][0]), int(rows[0][1])) if rows else (0, 0)
+
+    def parking(self) -> None:
+        """Send http exchanges to the target that waits, for one test.
+
+        Both halves are undone on the way out, and the gate is set again rather
+        than left cleared: a class attribute a failing test leaves behind would
+        park every later exchange in the suite for thirty seconds each.
+        """
+        self.addCleanup(HeldTarget.release.set)
+        self.addCleanup(setattr, type(self), "holding", type(self).holding)
+        type(self).holding = True
+        HeldTarget.release.clear()
+
+    def another_door(self) -> proxy.Server:
+        """A second door, on a fence and a database session of its own.
+
+        What makes the aggregate arms mean anything. Two doors that share a
+        Program share its budget or they do not, and a suite that only ever ran
+        one could not tell a limit from a counter in a process.
+        """
+        fence = proxy.Fence(pg.connect(self.harness.proxy))
+        server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=fence,
+            store=Store(self.root),
+            connector=self.dial,
+            resolver=self.look_up,
+            authority=self.authority,
+            root_secret=self.root_secret,
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(fence.close)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
 
     def refused(self, name: str, capability: str | None, program_id: str | None) -> tuple:
         """One blocked arm: the answer, and the single record it left behind."""
@@ -4162,6 +4359,194 @@ class ProxyEgressTest(DatabaseCase):
             self.assertFalse(
                 self.connection.execute("SELECT * FROM find_in_database($1)", (secret,)).rows
             )
+
+    def test_an_authenticated_fetch_of_bytes_the_agent_already_read_is_recorded(self):
+        # The wire view of an authenticated exchange is the target's message
+        # unaltered, and that is exactly what an anonymous exchange stores as
+        # its Agent artifact. Artifacts are content-addressed and a row is
+        # either Agent-visible or credential-bearing, so sealing the same bytes
+        # a second time under the other classification has nowhere to go: the
+        # exchange happened, the target answered, and the Receipt would not
+        # write. Fetching a page anonymously and then with an Identity is
+        # ordinary hunting, so this is the ordinary case, not a corner.
+        marker = "rk2-reused-bytes-4c81ab"
+        material = scratch() / "reused-bytes-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {marker}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["reused-bytes"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+
+        previous = LiveTarget.response_headers
+        LiveTarget.response_headers = ()
+        self.addCleanup(setattr, LiveTarget, "response_headers", previous)
+        # `Date` is the one part of this target's answer that changes between two
+        # requests, and it changes once a second. Left alone it would make the
+        # collision this test is about depend on which side of a second boundary
+        # the two exchanges landed, which is a coin flip and not a test.
+        steady = mock.patch.object(
+            LiveTarget,
+            "date_time_string",
+            lambda self, timestamp=None: "Tue, 11 Aug 2026 09:00:00 GMT",
+        )
+        steady.start()
+        self.addCleanup(steady.stop)
+
+        anonymous, plain_run, plain_task = self.leased("reused-bytes")
+        self.assertEqual(
+            (200, None), self.attempt(anonymous, self.identifiers["reused-bytes"])
+        )
+        # The anonymous read is over, and a Program may hold one live recon task
+        # at a time, so it is closed the way the scheduler closes one it has an
+        # answer for. The second read is a second task by construction: nothing
+        # about this exchange carries over except the bytes.
+        self.owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            " finished_at = now() WHERE id = $1::uuid",
+            (plain_task,),
+        )
+        plain_sha = str(
+            self.connection.execute(
+                "SELECT response_agent_sha FROM receipts"
+                " WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+                (plain_run,),
+            ).scalar()
+        )
+
+        capability, tool_run, _ = self.leased("reused-bytes", "member")
+        self.assertEqual(
+            (200, None), self.attempt(capability, self.identifiers["reused-bytes"])
+        )
+        self.assertEqual(
+            f"Bearer {marker}", dict(self.target.seen[-1][2]).get("authorization")
+        )
+
+        rows = self.connection.execute(
+            "SELECT r.identity_entity_id IS NOT NULL, r.request_wire_sha IS NOT NULL,"
+            "       r.response_agent_sha, r.response_wire_sha"
+            "  FROM receipts r"
+            " WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'",
+            (tool_run,),
+        ).rows
+        self.assertEqual(1, len(rows))
+        authenticated, request_sealed, response_agent_sha, response_wire_sha = rows[0]
+        self.assertTrue(authenticated)
+        # The request still carries the credential the Agent never sent, so that
+        # direction is still transformed and still sealed.
+        self.assertTrue(request_sealed)
+        # The response direction is not: these bytes came back once already
+        # without the credential, so there is nothing in them to withhold and
+        # nothing to pair a ciphertext of the Program's own plaintext with.
+        self.assertEqual(plain_sha, str(response_agent_sha))
+        self.assertIsNone(response_wire_sha)
+
+    def test_an_anonymous_fetch_of_bytes_an_identity_sealed_is_still_recorded(self):
+        # The same collision in the order the store cannot answer. The Identity
+        # exchange goes first and seals its wire view; the anonymous one then
+        # returns those same bytes and has to file them as an Agent artifact,
+        # which the row -- classified credential-bearing by the seal -- cannot
+        # be. The store holds only the envelope, so nothing on this side of the
+        # database could see it coming, and the exchange that could not be
+        # recorded is an ordinary unauthenticated GET.
+        marker = "rk2-sealed-first-7d2fe0"
+        material = scratch() / "sealed-first-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {marker}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["sealed-first"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+
+        previous = LiveTarget.response_headers
+        LiveTarget.response_headers = ()
+        self.addCleanup(setattr, LiveTarget, "response_headers", previous)
+        # A date of this case's own, for the reason the other case pins one and
+        # so that the two cases cannot reach each other's bytes: this one needs
+        # the Identity exchange to seal, which is the opposite of what happens
+        # when the same message is already in the store.
+        steady = mock.patch.object(
+            LiveTarget,
+            "date_time_string",
+            lambda self, timestamp=None: "Wed, 12 Aug 2026 10:00:00 GMT",
+        )
+        steady.start()
+        self.addCleanup(steady.stop)
+
+        capability, tool_run, task = self.leased("sealed-first", "member")
+        self.assertEqual(
+            (200, None), self.attempt(capability, self.identifiers["sealed-first"])
+        )
+        sealed = self.connection.execute(
+            "SELECT r.response_wire_sha, a.visibility, a.encrypted"
+            "  FROM receipts r JOIN artifacts a ON a.sha256 = r.response_wire_sha"
+            " WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'",
+            (tool_run,),
+        ).rows[0]
+        self.assertEqual(("credential_bearing", True), (str(sealed[1]), bool(sealed[2])))
+        self.owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            " finished_at = now() WHERE id = $1::uuid",
+            (task,),
+        )
+
+        anonymous, plain_run, _ = self.leased("sealed-first")
+        self.assertEqual(
+            (200, None), self.attempt(anonymous, self.identifiers["sealed-first"])
+        )
+        self.assertIsNone(dict(self.target.seen[-1][2]).get("authorization"))
+
+        plain = self.connection.execute(
+            "SELECT r.response_agent_sha, r.response_wire_sha, a.visibility, a.encrypted"
+            "  FROM receipts r JOIN artifacts a ON a.sha256 = r.response_agent_sha"
+            " WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'",
+            (plain_run,),
+        ).rows[0]
+        self.assertEqual(("agent_visible", False), (str(plain[2]), bool(plain[3])))
+        self.assertIsNone(plain[1])
+        # The two exchanges answered with the same message and are not the same
+        # document: the sealed one names the exchange that carried it, so the
+        # anonymous read has a hash of its own to be readable under.
+        self.assertNotEqual(str(sealed[0]), str(plain[0]))
+        self.assertIn(ANSWER, Store(self.root).load(str(plain[0])))
 
     def test_an_identity_cannot_be_shared_crossed_or_used_after_its_lease_expires(self):
         marker = "rk2-exclusive-identity-91b7fd"
@@ -4911,6 +5296,202 @@ class ProxyEgressTest(DatabaseCase):
             [("program.halted", "human", "halted"),
              ("program.halt_changed", "human", "cleared")],
             [(str(event[0]), str(event[1]), str(event[2])) for event in events],
+        )
+
+    def test_clearing_a_halt_revives_neither_an_expired_capability_nor_a_closed_run(self):
+        # PH2-13, criterion 5. Clearing is remediation of one thing -- the
+        # operator's stop -- and every other reason a capability stopped
+        # resolving is still a reason afterwards. The arm that matters is the
+        # ordering: both capabilities lapse *during* the Halt, when nothing was
+        # being decided about them, so a clear that resumed "everything that was
+        # live when I halted" would put both of them back.
+        program_id = self.identifiers["halted"]
+        expired, expiring_run, _ = self.mint("halted")
+        closed, closed_run, _ = self.mint("halted")
+        self.human.execute(
+            "SELECT halt_program($1::uuid, $2)", (program_id, "operator containment")
+        )
+        self.owner(
+            "UPDATE tool_runs SET egress_token_expires_at = now() - interval '1 minute'"
+            " WHERE id = $1::uuid",
+            (expiring_run,),
+        )
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            self.runtime.execute(proxy.CLOSE_TOOL_RUN, (closed_run, "success"))
+        self.human.execute(
+            "SELECT clear_program_halt($1::uuid, $2)", (program_id, "remediation done")
+        )
+
+        dialled = len(self.dialled)
+        lapsed = self.refused("halted", expired, program_id)
+        finished = self.refused("halted", closed, program_id)
+
+        self.assertEqual(("agent", "blocked", "capability refused"), lapsed[:3])
+        self.assertEqual(("agent", "blocked", "capability refused"), finished[:3])
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened after the clear")
+        # And the clear did lift the Halt, or the two refusals above would prove
+        # nothing: a capability minted after it works.
+        live, _, _ = self.mint("halted")
+        self.assertEqual(200, self.attempt(live, program_id)[0])
+
+    def test_an_exhausted_program_budget_stops_a_tool_run_that_never_spent_any(self):
+        # PH2-13, criteria 3 and 4. The total is the Program's: two exchanges
+        # spend it under one Tool run, and the third is refused under a
+        # capability minted afterwards, from a Tool run that had made no request
+        # at all. A per-run or per-process counter would have let it through.
+        program_id = self.identifiers["budget"]
+        first, _, _ = self.mint("budget")
+        self.assertEqual(200, self.attempt(first, program_id)[0])
+        self.assertEqual(200, self.attempt(first, program_id)[0])
+
+        second, _, _ = self.mint("budget")
+        dialled = len(self.dialled)
+        seen = len(self.target.seen)
+        resolved = len(self.resolved)
+        answer = self.answered(second, program_id)
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(proxy.BUDGETED, answer.headers.get(proxy.DECISION))
+        self.assertEqual("budget exhausted", answer.headers.get(proxy.DETAIL))
+        # Nothing left the machine, and that includes the lookup: the budget is
+        # decided before the name is resolved, so an exhausted Program does not
+        # keep announcing its targets to a resolver.
+        self.assertEqual(resolved, len(self.resolved), "a name was resolved past the budget")
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened past the budget")
+        self.assertEqual(seen, len(self.target.seen))
+        # A typed Receipt, and no retry time on it. Exhaustion is not a wait: the
+        # engagement's allowance is gone until an operator decides otherwise, and
+        # a time here would be this door promising it comes back on its own.
+        self.assertEqual(("blocked", "budget exhausted", None), self.latest("budget"))
+        self.assertIsNone(answer.headers.get("Retry-After"))
+        self.assertEqual((2, 1), self.spent("budget"))
+
+    def test_a_rate_limited_request_is_refused_with_the_time_it_may_be_retried(self):
+        # The other half of criterion 4. `throttle` allows a burst of two per
+        # hour, so the third request in a row is refused for its rate -- and
+        # unlike exhaustion it is refused *until* a moment, which is on the wire
+        # as seconds and in the row as an instant. The row is what makes the
+        # retry durable: the answer is read once by a caller that may not
+        # outlive it.
+        program_id = self.identifiers["throttle"]
+        capability, _, _ = self.mint("throttle")
+        self.assertEqual(200, self.attempt(capability, program_id)[0])
+        self.assertEqual(200, self.attempt(capability, program_id)[0])
+
+        dialled = len(self.dialled)
+        answer = self.answered(capability, program_id)
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(proxy.BUDGETED, answer.headers.get(proxy.DECISION))
+        self.assertEqual("rate limited", answer.headers.get(proxy.DETAIL))
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened past the rate")
+        decision, reason, retry_after = self.latest("throttle")
+        self.assertEqual(("blocked", "rate limited"), (decision, reason))
+        self.assertIsNotNone(retry_after, "a throttle with no time to retry after")
+        # Two tokens an hour is one every half hour, so the wait is that and not
+        # a round number this test could have got by accident.
+        self.assertIn(int(answer.headers["Retry-After"]), range(1750, 1801))
+
+    def test_a_second_request_in_flight_is_refused_by_the_concurrency_limit(self):
+        # Criterion 3's concurrency arm, which needs a request that is still
+        # happening: `concurrent` allows one at a time, so the second is refused
+        # while the first is parked at a target that has not answered yet. Two
+        # capabilities from two Tool runs, because the limit is the Program's.
+        program_id = self.identifiers["concurrent"]
+        first, _, _ = self.mint("concurrent")
+        second, _, _ = self.mint("concurrent")
+        self.parking()
+
+        held: list[tuple[int, str | None]] = []
+        dialled = len(self.dialled)
+        running = threading.Thread(
+            target=lambda: held.append(self.attempt(first, program_id))
+        )
+        running.start()
+        self.addCleanup(running.join, 30)
+        # Wait for the socket rather than for a moment: a sleep long enough to be
+        # reliable on a loaded machine is a sleep this suite pays on every run,
+        # and the thing the second request has to overlap is an exchange that has
+        # started, which is exactly what the dial records.
+        deadline = time.monotonic() + 30
+        while len(self.dialled) == dialled and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        answer = self.answered(second, program_id)
+        HeldTarget.release.set()
+        running.join(timeout=30)
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(proxy.BUDGETED, answer.headers.get(proxy.DECISION))
+        self.assertEqual("too many concurrent requests", answer.headers.get(proxy.DETAIL))
+        self.assertEqual([200], [status for status, _ in held], "the first never finished")
+        decision, reason, retry_after = self.latest("concurrent")
+        self.assertEqual(("blocked", "too many concurrent requests"), (decision, reason))
+        # Told when to come back, and the answer is bounded by the slot's own
+        # lifetime rather than open-ended: the request ahead either finishes or
+        # its reservation lapses.
+        self.assertIsNotNone(retry_after)
+        self.assertIn(int(answer.headers["Retry-After"]), range(1, 91))
+
+    def test_a_concurrent_burst_across_two_doors_spends_one_budget(self):
+        # PH2-13, criterion 6, and the claim the whole ticket rests on. Eight
+        # Tool runs, eight capabilities, two doors on two database sessions, one
+        # Program with three requests left -- fired at once off a barrier. Three
+        # is what the target may be contacted, and five is what has to be
+        # refused, whichever door happened to be quicker.
+        program_id = self.identifiers["race"]
+        capabilities = [self.mint("race")[0] for _ in range(8)]
+        second = self.another_door()
+        doors = (self.server.server_address[1], second.server_address[1])
+
+        dialled = len(self.dialled)
+        seen = len(self.target.seen)
+        answers: list[tuple[int, str | None]] = []
+        start = threading.Barrier(len(capabilities), timeout=30)
+
+        def race(index: int) -> None:
+            start.wait()
+            answers.append(
+                self.attempt(capabilities[index], program_id, port=doors[index % 2])
+            )
+
+        threads = [
+            threading.Thread(target=race, args=(index,))
+            for index in range(len(capabilities))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(8, len(answers), "a request never came back")
+        self.assertEqual(3, len([1 for status, _ in answers if status == 200]))
+        self.assertEqual(
+            5, len([1 for _, decision in answers if decision == proxy.BUDGETED])
+        )
+        # The exact count, which is the part a limit enforced per process would
+        # get wrong: eight racing requests, three sockets, three arrivals.
+        self.assertEqual(3, len(self.dialled) - dialled, "the target was contacted twice over")
+        self.assertEqual(3, len(self.target.seen) - seen)
+        self.assertEqual((3, 5), self.spent("race"))
+        self.assertEqual(
+            [("agent", "allowed"), ("agent", "allowed"), ("agent", "allowed"),
+             ("agent", "blocked"), ("agent", "blocked"), ("agent", "blocked"),
+             ("agent", "blocked"), ("agent", "blocked")],
+            sorted(row[:2] for row in self.receipts("race")),
+        )
+        # And nothing is still held: every slot the race took was given back, so
+        # a Program that ran out of total has not also lost its concurrency.
+        self.assertEqual(
+            0,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM egress_reservations"
+                    " WHERE program_id = $1::uuid AND released_at IS NULL",
+                    (program_id,),
+                ).scalar()
+            ),
         )
 
     def test_a_name_made_of_hexadecimal_is_a_name_and_not_an_address(self):
