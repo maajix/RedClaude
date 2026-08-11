@@ -11,8 +11,10 @@ from __future__ import annotations
 import http.cookiejar
 import hmac
 import json
+import os
 import re
-from dataclasses import dataclass
+import ssl
+from dataclasses import dataclass, field
 from email.message import Message
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -26,9 +28,11 @@ SCHEMA_VERSION = 1
 MAX_STATE_BYTES = 1024 * 1024
 COMMAND = "identity provision"
 KEYING = (
-    "SELECT identity_entity_id::text, revision, generation, salt_hex, root_check_hex"
+    "SELECT identity_entity_id::text, revision, binding_revision, generation,"
+    "       salt_hex, root_check_hex, audit_id"
     "  FROM identity_slot_keying($1::uuid, $2, $3::bytea, $4::bytea)"
 )
+CONFIRM_ROOTCHECK = "SELECT confirm_identity_root_check($1::uuid, $2, $3::uuid, $4)"
 PROVISION = "SELECT provision_identity_slot($1::uuid, $2, $3::bigint, $4::jsonb)"
 _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _FORBIDDEN = frozenset(
@@ -97,12 +101,58 @@ class _Response:
 
 
 @dataclass(frozen=True)
+class ClientCertificate:
+    """One upstream TLS credential, loaded without a plaintext filesystem copy."""
+
+    certificate_pem: str = field(repr=False)
+    private_key_pem: str = field(repr=False)
+    password: str | None = field(default=None, repr=False)
+
+    def public_sha256(self) -> str:
+        """Hash the leaf certificate bytes used for upstream Identity TLS."""
+        found = re.search(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            self.certificate_pem,
+            re.DOTALL,
+        )
+        if found is None:
+            raise Invalid("the client Identity has no leaf certificate")
+        try:
+            der = ssl.PEM_cert_to_DER_cert(found.group(0))
+        except ValueError as error:
+            raise Invalid("the client Identity leaf certificate is not valid PEM") from error
+        return digest(der)
+
+    def install(self, context: ssl.SSLContext) -> None:
+        """Load this credential through an anonymous in-memory Linux file."""
+        if not hasattr(os, "memfd_create"):
+            raise Invalid("this platform cannot load a client Identity without a plaintext file")
+        material = (self.certificate_pem.rstrip() + "\n" + self.private_key_pem).encode()
+        descriptor = os.memfd_create("rk2-client-identity", flags=os.MFD_CLOEXEC)
+        try:
+            remaining = memoryview(material)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise Invalid("the in-memory client Identity stopped accepting bytes")
+                remaining = remaining[written:]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                context.load_cert_chain(f"/proc/self/fd/{descriptor}", password=self.password)
+            except ssl.SSLError as error:
+                raise Invalid(f"the client certificate cannot be loaded: {error}") from error
+        finally:
+            os.close(descriptor)
+
+
+@dataclass(frozen=True)
 class Origin:
     scheme: str
     host: str
     port: int
     headers: tuple[tuple[str, str], ...]
     source_url: str
+    client_certificate: ClientCertificate | None = field(default=None, repr=False)
 
     def matches(self, url: str) -> bool:
         parts = urlsplit(url)
@@ -139,7 +189,12 @@ class Session:
         for index, raw in enumerate(raw_origins):
             if not isinstance(raw, dict):
                 raise Invalid(f"Identity material origins[{index}] must be an object")
-            _keys(raw, {"url", "headers", "cookies"}, f"origins[{index}]")
+            _keys(
+                raw,
+                {"url", "headers", "cookies", "client_certificate"},
+                f"origins[{index}]",
+                optional={"client_certificate"},
+            )
             url = raw.get("url")
             if not isinstance(url, str):
                 raise Invalid(f"origins[{index}].url must be a string")
@@ -163,10 +218,21 @@ class Session:
                 raise Invalid(f"origins[{index}].cookies must be a list of Set-Cookie strings")
             if any("\r" in value or "\n" in value for value in cookies):
                 raise Invalid(f"origins[{index}].cookies contains a line break")
+            try:
+                for value in cookies:
+                    value.encode("latin-1")
+            except UnicodeEncodeError as error:
+                raise Invalid(f"origins[{index}].cookies is not HTTP header text") from error
             if cookies:
                 jar.extract_cookies(_Response(cookies), _Request(url))
-            origins.append(Origin(*key, headers, url))
-        return cls(tuple(origins), jar)
+            client_certificate = _client_certificate(raw.get("client_certificate"), index)
+            if client_certificate is not None and parts.scheme != "https":
+                raise Invalid(f"origins[{index}].client_certificate requires an HTTPS origin")
+            origins.append(Origin(*key, headers, url, client_certificate))
+        session = cls(tuple(origins), jar)
+        if len(session.encode()) > MAX_STATE_BYTES:
+            raise Invalid(f"Identity slot plaintext exceeds {MAX_STATE_BYTES} bytes")
+        return session
 
     @classmethod
     def decode(cls, encoded: bytes) -> Session:
@@ -199,6 +265,21 @@ class Session:
                     ],
                     # Provisioning cookies are consumed into the normalized jar.
                     "cookies": [],
+                    **(
+                        {
+                            "client_certificate": {
+                                "certificate_pem": origin.client_certificate.certificate_pem,
+                                "private_key_pem": origin.client_certificate.private_key_pem,
+                                **(
+                                    {"password": origin.client_certificate.password}
+                                    if origin.client_certificate.password is not None
+                                    else {}
+                                ),
+                            }
+                        }
+                        if origin.client_certificate is not None
+                        else {}
+                    ),
                 }
                 for origin in self.origins
             ],
@@ -229,6 +310,10 @@ class Session:
         self.jar.extract_cookies(_Response(values), _Request(url))
         return self.encode() != before
 
+    def client_certificate(self, url: str) -> ClientCertificate | None:
+        """Return the upstream TLS credential only for its exact HTTPS origin."""
+        origin = next((item for item in self.origins if item.matches(url)), None)
+        return origin.client_certificate if origin is not None else None
 
 def seal_session(
     session: Session,
@@ -238,6 +323,7 @@ def seal_session(
     identity_id: str,
     generation: int,
     salt: bytes,
+    binding_revision: int,
     revision: int,
 ) -> dict:
     """Describe one authenticated slot revision without exposing its plaintext."""
@@ -257,12 +343,14 @@ def seal_session(
             program_id=program_id,
             identity_id=identity_id,
             generation=generation,
+            binding_revision=binding_revision,
             revision=revision,
         ),
     )
     envelope = encrypted.encode()
     return {
         "revision": revision,
+        "binding_revision": binding_revision,
         "alg": encrypted.alg,
         "nonce_hex": encrypted.nonce.hex(),
         "kek_gen": generation,
@@ -279,6 +367,7 @@ def open_session(
     program_id: str,
     identity_id: str,
     revision: int,
+    binding_revision: int,
     generation: int,
     salt: bytes,
     root_check: bytes,
@@ -306,6 +395,7 @@ def open_session(
             program_id=program_id,
             identity_id=identity_id,
             generation=generation,
+            binding_revision=binding_revision,
             revision=revision,
         ),
     )
@@ -409,10 +499,23 @@ def provision(
                 source="database",
             )
             return report(COMMAND, ledger, **facts)
-        identity_id, current, generation, salt_hex, root_check_hex = rows[0]
+        (
+            identity_id,
+            current,
+            binding_revision,
+            generation,
+            salt_hex,
+            root_check_hex,
+            audit_id,
+        ) = rows[0]
         salt = bytes.fromhex(str(salt_hex))
         expected_check = root.check(salt, generation=int(generation))
-        if not hmac.compare_digest(expected_check, bytes.fromhex(str(root_check_hex))):
+        matched = hmac.compare_digest(expected_check, bytes.fromhex(str(root_check_hex)))
+        connection.execute(
+            CONFIRM_ROOTCHECK,
+            (program_id, label, str(audit_id), "ok" if matched else "denied"),
+        )
+        if not matched:
             ledger.fail(
                 "identity_key",
                 "the key does not match this installation",
@@ -428,6 +531,7 @@ def provision(
             identity_id=str(identity_id),
             generation=int(generation),
             salt=salt,
+            binding_revision=int(binding_revision),
             revision=revision,
         )
         written = int(
@@ -453,9 +557,15 @@ def provision(
     return report(COMMAND, ledger, **facts)
 
 
-def _keys(document: dict, expected: set[str], source: str) -> None:
+def _keys(
+    document: dict,
+    expected: set[str],
+    source: str,
+    *,
+    optional: set[str] | frozenset[str] = frozenset(),
+) -> None:
     extra = set(document) - expected
-    missing = expected - set(document)
+    missing = expected - optional - set(document)
     if extra or missing:
         detail = []
         if missing:
@@ -463,6 +573,31 @@ def _keys(document: dict, expected: set[str], source: str) -> None:
         if extra:
             detail.append("unknown " + ", ".join(sorted(extra)))
         raise Invalid(f"{source} has " + "; ".join(detail))
+
+
+def _client_certificate(value: object, origin: int) -> ClientCertificate | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise Invalid(f"origins[{origin}].client_certificate must be an object")
+    _keys(
+        value,
+        {"certificate_pem", "private_key_pem", "password"},
+        f"origins[{origin}].client_certificate",
+        optional={"password"},
+    )
+    certificate = value.get("certificate_pem")
+    private_key = value.get("private_key_pem")
+    password = value.get("password")
+    if not isinstance(certificate, str) or "-----BEGIN CERTIFICATE-----" not in certificate:
+        raise Invalid(f"origins[{origin}].client_certificate.certificate_pem is not PEM")
+    if not isinstance(private_key, str) or not re.search(
+        r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", private_key
+    ):
+        raise Invalid(f"origins[{origin}].client_certificate.private_key_pem is not PEM")
+    if password is not None and not isinstance(password, str):
+        raise Invalid(f"origins[{origin}].client_certificate.password must be a string")
+    return ClientCertificate(certificate, private_key, password)
 
 
 def _headers(value: object, origin: int) -> tuple[tuple[str, str], ...]:
@@ -484,6 +619,12 @@ def _headers(value: object, origin: int) -> tuple[tuple[str, str], ...]:
             raise Invalid(f"origins[{origin}].headers repeats {name}")
         if not isinstance(header_value, str) or "\r" in header_value or "\n" in header_value:
             raise Invalid(f"origins[{origin}].headers[{index}].value is not one header value")
+        try:
+            header_value.encode("latin-1")
+        except UnicodeEncodeError as error:
+            raise Invalid(
+                f"origins[{origin}].headers[{index}].value is not HTTP header text"
+            ) from error
         seen.add(lowered)
         answer.append((name, header_value))
     return tuple(answer)

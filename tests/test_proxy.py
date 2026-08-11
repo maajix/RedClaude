@@ -35,6 +35,7 @@ import json
 import os
 import socket
 import ssl
+import subprocess
 import threading
 import unittest
 import urllib.error
@@ -43,7 +44,7 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from redkraken import pg, proxy, scope, seal, tls
+from redkraken import identity, pg, proxy, scope, seal, tls
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
 from redkraken.store import Store
 from tests.fixtures import (
@@ -93,6 +94,63 @@ def message(pairs: list[tuple[str, str]]) -> Message:
 def common_name(name: tuple) -> str:
     """The CN out of the nested tuples `getpeercert` returns for a distinguished name."""
     return next(value for rdn in name for key, value in rdn if key == "commonName")
+
+
+def client_identity() -> tuple[tls.Authority, identity.ClientCertificate]:
+    """A valid clientAuth fixture under a CA the target can require."""
+    root = tls.authority(scratch() / "client-identity-authority")
+    directory = scratch()
+    key = directory / "client-key.pem"
+    request = directory / "client.csr"
+    certificate = directory / "client.pem"
+    extensions = directory / "client.ext"
+    extensions.write_text(
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\n"
+        "extendedKeyUsage=clientAuth\n",
+        encoding="utf-8",
+    )
+    for command in (
+        [
+            tls.OPENSSL,
+            "req",
+            "-new",
+            "-noenc",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            f"ec_paramgen_curve:{tls.CURVE}",
+            "-subj",
+            "/CN=redKraken fixture client",
+            "-keyout",
+            str(key),
+            "-out",
+            str(request),
+        ],
+        [
+            tls.OPENSSL,
+            "x509",
+            "-req",
+            "-sha256",
+            "-in",
+            str(request),
+            "-CA",
+            str(root.certificate),
+            "-CAkey",
+            str(root.key),
+            "-CAcreateserial",
+            "-days",
+            str(tls.DAYS),
+            "-extfile",
+            str(extensions),
+            "-out",
+            str(certificate),
+        ],
+    ):
+        subprocess.run(command, check=True, capture_output=True)
+    return root, identity.ClientCertificate(
+        certificate.read_text(encoding="utf-8"), key.read_text(encoding="utf-8")
+    )
 
 
 class Stub:
@@ -281,6 +339,16 @@ class HeaderTest(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertIsNone(proxy.capability_of(value))
+
+    def test_a_reflected_identity_in_a_redirect_cannot_enter_receipt_notes(self):
+        marker = b"private-redirect-token"
+        headers, _ = proxy.project_identity_response(
+            [("Location", f"/continue/{marker.decode()}")], b""
+        )
+
+        location = next((value for name, value in headers if name.lower() == "location"), None)
+        self.assertIsNone(proxy.redirected("https://app.example.com/start", location))
+        self.assertEqual([], headers)
 
     def test_every_control_and_hop_by_hop_header_is_dropped_from_the_forwarded_request(self):
         headers = message(
@@ -501,6 +569,7 @@ class ExchangeTest(unittest.TestCase):
         self.answers: tuple[str, ...] = (PINNED,)
         self.resolved: list[tuple[str, int]] = []
         self.dialled: list[tuple[str, int, str, str]] = []
+        self.client_certificates: list[identity.ClientCertificate | None] = []
         self.server = proxy.listen(
             ("127.0.0.1", 0),
             fence=self.fence,
@@ -525,10 +594,29 @@ class ExchangeTest(unittest.TestCase):
         return self.answers
 
     def connector(
-        self, host: str, port: int, timeout: float, protocol: str, address: str
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
     ) -> http.client.HTTPConnection:
         """The fixture, wherever the name pointed, and a record of both."""
         self.dialled.append((host, port, protocol, address))
+        self.client_certificates.append(client_certificate)
+        mtls = getattr(self, "mtls", None)
+        if protocol == "https" and mtls is not None:
+            target, server_authority = mtls
+            context = ssl.create_default_context(cafile=str(server_authority.certificate))
+            if client_certificate is not None:
+                client_certificate.install(context)
+            return http.client.HTTPSConnection(
+                "127.0.0.1",
+                target.server_address[1],
+                timeout=timeout,
+                context=context,
+            )
         return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
 
     def through(
@@ -870,6 +958,170 @@ class ExchangeTest(unittest.TestCase):
         )
         self.assertIn(marker.encode(), opened)
 
+    def test_a_reflected_identity_token_is_removed_from_every_agent_response_field(self):
+        marker = "rk2-reflected-identity-token-97e1d3"
+        cookie = "rk2-reflected-cookie-89b2a4"
+        old_cookie = "rk2-rotated-cookie-17d6f8"
+        handler = self.target.RequestHandlerClass
+        prior_headers, prior_answer = handler.response_headers, handler.answer
+        handler.response_headers = (
+            ("X-Reflected-Token", f"prefix {marker}"),
+            (f"X-{marker}", "reflected in the field name"),
+            ("Set-Cookie", f"session={cookie}; HttpOnly"),
+        )
+        handler.answer = (
+            f'{{"authorization":"Bearer {marker}","old":"{old_cookie}",'
+            f'"session":"{cookie}"}}'.encode()
+        )
+        self.addCleanup(setattr, handler, "response_headers", prior_headers)
+        self.addCleanup(setattr, handler, "answer", prior_answer)
+        root = seal.Root(Path("test-only-root"), b"r" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "http://target.example.test/",
+                        "headers": [
+                            {"name": "Authorization", "value": f"Bearer {marker}"}
+                        ],
+                        "cookies": [f"session={old_cookie}; Path=/; HttpOnly"],
+                    }
+                ],
+            },
+        )
+
+        response = self.through("http://target.example.test/v1/reflection")
+        body = response.read()
+
+        self.assertEqual(b"", body)
+        self.assertNotIn(marker.encode(), body)
+        self.assertNotIn(cookie.encode(), body)
+        self.assertNotIn(old_cookie.encode(), body)
+        self.assertIsNone(response.headers.get("X-Reflected-Token"))
+        self.assertIsNone(response.headers.get(f"X-{marker}"))
+        receipt = self.fence.allowed[0]["receipt"]
+        self.assertNotEqual(receipt["response_agent_sha"], receipt["response_wire_sha"])
+        visible = Store(self.root).load(receipt["response_agent_sha"])
+        self.assertNotIn(marker.encode(), visible)
+        self.assertNotIn(cookie.encode(), visible)
+        self.assertNotIn(old_cookie.encode(), visible)
+        [description] = [
+            item for item in self.fence.allowed[0]["seals"] if item["field"] == "target_response"
+        ]
+        envelope = Store(self.root).load(description["ciphertext_sha256"])
+        opened = seal.unseal(
+            self.fence.wire_key(PROGRAM_ID, CAPABILITY, root)[1],
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=PROGRAM_ID,
+                sha256=description["sha256"],
+                generation=description["kek_gen"],
+            ),
+        )
+        self.assertIn(marker.encode(), opened)
+        self.assertIn(cookie.encode(), opened)
+        self.assertIn(old_cookie.encode(), opened)
+
+    def test_an_identity_client_certificate_reaches_only_the_https_connector(self):
+        server_authority = tls.authority(scratch() / "mtls-target-authority")
+        client_authority, credential = client_identity()
+        target_context = server_authority.context("127.0.0.1")
+        target_context.load_verify_locations(cafile=str(client_authority.certificate))
+        target_context.verify_mode = ssl.CERT_REQUIRED
+        target, thread = counterparty(context=target_context)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(target.server_close)
+        self.addCleanup(target.shutdown)
+        self.mtls = (target, server_authority)
+        root = seal.Root(Path("test-only-root"), b"m" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "https://target.example.test/",
+                        "headers": [],
+                        "cookies": [],
+                        "client_certificate": {
+                            "certificate_pem": credential.certificate_pem,
+                            "private_key_pem": credential.private_key_pem,
+                        },
+                    }
+                ],
+            },
+        )
+
+        response = self.through("https://target.example.test/v1/mtls")
+        response.read()
+
+        self.assertEqual(200, response.status)
+        [credential] = self.client_certificates
+        self.assertIsNotNone(credential)
+        self.assertIn("BEGIN CERTIFICATE", credential.certificate_pem)
+        self.assertEqual(1, len(target.seen))
+        self.assertEqual(
+            credential.public_sha256(),
+            self.fence.allowed[0]["receipt"]["identity_tls_cert_sha256"],
+        )
+
+    def test_an_oversized_captured_session_becomes_a_fence_refusal(self):
+        binding = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "https://target.example.test/",
+                        "headers": [],
+                        "cookies": [],
+                    }
+                ],
+            },
+        )
+        binding.changed = binding.session.capture(
+            "https://target.example.test/",
+            [("Set-Cookie", f"cookie{index}=x") for index in range(6_000)],
+        )
+        binding.root = seal.Root(Path("test-only-root"), b"o" * seal.KEY_BYTES)
+        binding.salt = b"s" * seal.SALT_BYTES
+        binding.generation = 1
+
+        with self.assertRaises(proxy.Refused) as raised:
+            proxy.Fence(None).allowed_receipt(
+                PROGRAM_ID, CAPABILITY, {}, [], binding=binding
+            )
+
+        self.assertEqual("identity session refused", raised.exception.reason)
+
     def test_a_target_credential_response_fails_closed_without_the_artifact_key(self):
         marker = "rk2-target-cookie-no-key"
         handler = self.target.RequestHandlerClass
@@ -1129,7 +1381,13 @@ class Redirected(unittest.TestCase):
         self.serving.join(timeout=5)
 
     def connector(
-        self, host: str, port: int, timeout: float, protocol: str, address: str
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
     ) -> http.client.HTTPConnection:
         self.dialled.append(address)
         return http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout)
@@ -1355,7 +1613,13 @@ class TunnelTest(unittest.TestCase):
         self.serving.join(timeout=5)
 
     def connector(
-        self, host: str, port: int, timeout: float, protocol: str, address: str
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
     ) -> http.client.HTTPConnection:
         """The door's outbound side, verifying the target it was sent to.
 
@@ -1365,11 +1629,14 @@ class TunnelTest(unittest.TestCase):
         certificate itself, because the agent no longer can.
         """
         self.dialled.append(address)
+        context = ssl.create_default_context(cafile=str(self.target_ca))
+        if client_certificate is not None:
+            client_certificate.install(context)
         return http.client.HTTPSConnection(
             "127.0.0.1",
             self.target_port,
             timeout=timeout,
-            context=ssl.create_default_context(cafile=str(self.target_ca)),
+            context=context,
         )
 
     def control(self, capability: str | None = CAPABILITY, program: str = PROGRAM_ID) -> dict:
@@ -1724,7 +1991,9 @@ class TunnelTest(unittest.TestCase):
         # moment where a caller holds a connection whose peer has not been
         # checked.
         with self.assertRaises(ssl.SSLCertVerificationError):
-            proxy.connect("127.0.0.1", self.target_port, 5.0, "https", "127.0.0.1")
+            proxy.connect(
+                "127.0.0.1", self.target_port, 5.0, "https", "127.0.0.1", None
+            )
 
         self.assertEqual([], self.target.seen)
 

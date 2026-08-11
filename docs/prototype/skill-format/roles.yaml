@@ -6,7 +6,8 @@
 roles:
   hunter:
     tools: [Read, Bash, Glob, Grep]
-    skills: [probe-alpha, probe-beta]
+    # `hunter` stands in for the production roster's `web_hunter` role.
+    skills: [probe-alpha, probe-beta, use-identity]
   validator:
     tools: [Read, Grep]
     skills: [probe-alpha]

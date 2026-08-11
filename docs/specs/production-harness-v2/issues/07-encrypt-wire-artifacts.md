@@ -184,6 +184,13 @@ in the database can open a file.
 
 ### Raised by review and deliberately not built here
 
+- **The proxy now integrates this primitive for target authentication response
+  headers.** A target-supplied `Set-Cookie` is removed from the Agent response
+  and plaintext Artifact while the exact response is stored only as an
+  authenticated encrypted envelope. Ticket 12 still owns Identity injection,
+  encrypted session state and Identity-specific body projections; it extends
+  this boundary rather than introducing the first proxy-side sealed view.
+
 - **`--authorize` is a reason, not an identity.** It records why the plaintext
   was released, and the trail records the reason verbatim, but nothing here says
   *who*. `secret_access_log` has held `peer_pid`, `peer_uid` and `peer_exe` since

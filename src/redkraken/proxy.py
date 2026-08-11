@@ -356,6 +356,7 @@ class IdentityBinding:
     entity_id: str
     label: str
     revision: int
+    binding_revision: int
     session: identity.Session = field(repr=False)
     generation: int = 0
     salt: bytes = field(default=b"", repr=False)
@@ -364,10 +365,22 @@ class IdentityBinding:
 
     @classmethod
     def provisioned(
-        cls, *, entity_id: str, label: str, revision: int, material: dict
+        cls,
+        *,
+        entity_id: str,
+        label: str,
+        revision: int,
+        material: dict,
+        binding_revision: int = 1,
     ) -> IdentityBinding:
         """Build a binding from control-side material before it is encrypted."""
-        return cls(entity_id, label, revision, identity.Session.from_material(material))
+        return cls(
+            entity_id,
+            label,
+            revision,
+            binding_revision,
+            identity.Session.from_material(material),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +507,18 @@ def response_for_agent(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
         for name, value in headers
         if name.lower() not in WIRE_RESPONSE_HEADERS
     ]
+
+
+def project_identity_response(
+    headers: list[tuple[str, str]], body: bytes
+) -> tuple[list[tuple[str, str]], bytes]:
+    """Withhold target-controlled Identity response fields from the Agent view.
+
+    Credential reflection is not safely recognizable: a target may transform,
+    split or encode a value before returning it. The exact headers and body
+    remain available only through the sealed wire view.
+    """
+    return [], b""
 
 
 def origin_form(url: str) -> str:
@@ -656,10 +681,12 @@ RECORD_SEALED = (
 )
 
 OPEN_IDENTITY = (
-    "SELECT identity_entity_id::text, identity_label, revision, alg, nonce_hex,"
-    "       kek_gen, envelope_hex, ciphertext_sha256, salt_hex, root_check_hex"
+    "SELECT identity_entity_id::text, identity_label, revision, binding_revision, alg, nonce_hex,"
+    "       kek_gen, envelope_hex, ciphertext_sha256, salt_hex, root_check_hex, audit_id"
     "  FROM open_identity_slot($1, $2)"
 )
+
+CONFIRM_IDENTITY = "SELECT confirm_identity_slot_open($1, $2, $3::uuid, $4)"
 
 WIRE_KEYING = (
     "SELECT generation, salt_hex, root_check_hex"
@@ -821,15 +848,21 @@ class Fence:
                         "the opened Identity has no authenticated keying context",
                         status=502,
                     )
-                state = identity.seal_session(
-                    binding.session,
-                    root=binding.root,
-                    program_id=program_id,
-                    identity_id=binding.entity_id,
-                    generation=binding.generation,
-                    salt=binding.salt,
-                    revision=binding.revision + 1,
-                )
+                try:
+                    state = identity.seal_session(
+                        binding.session,
+                        root=binding.root,
+                        program_id=program_id,
+                        identity_id=binding.entity_id,
+                        generation=binding.generation,
+                        salt=binding.salt,
+                        binding_revision=binding.binding_revision,
+                        revision=binding.revision + 1,
+                    )
+                except identity.Invalid as error:
+                    raise Refused(
+                        "identity session refused", str(error), status=502
+                    ) from error
 
         with self._lock:
             self._bind(program_id)
@@ -871,6 +904,7 @@ class Fence:
             found_id,
             found_label,
             revision,
+            binding_revision,
             alg,
             nonce_hex,
             generation,
@@ -878,35 +912,61 @@ class Fence:
             ciphertext_sha256,
             salt_hex,
             root_check_hex,
+            audit_id,
         ) = rows[0]
-        if str(found_id) != entity_id or str(found_label) != label:
-            raise Refused("identity slot refused", "the selected Identity changed")
-        envelope = bytes.fromhex(str(envelope_hex))
-        if not hmac.compare_digest(digest(envelope), str(ciphertext_sha256)):
-            raise seal.Tampered("Identity slot envelope digest disagrees")
-        salt = bytes.fromhex(str(salt_hex))
-        number = int(generation)
-        session = identity.open_session(
-            root=root,
-            program_id=program_id,
-            identity_id=entity_id,
-            revision=int(revision),
-            generation=number,
-            salt=salt,
-            root_check=bytes.fromhex(str(root_check_hex)),
-            alg=str(alg),
-            nonce=bytes.fromhex(str(nonce_hex)),
-            envelope=envelope,
-        )
+        try:
+            if str(found_id) != entity_id or str(found_label) != label:
+                raise Refused("identity slot refused", "the selected Identity changed")
+            envelope = bytes.fromhex(str(envelope_hex))
+            if not hmac.compare_digest(digest(envelope), str(ciphertext_sha256)):
+                raise seal.Tampered("Identity slot envelope digest disagrees")
+            salt = bytes.fromhex(str(salt_hex))
+            number = int(generation)
+            session = identity.open_session(
+                root=root,
+                program_id=program_id,
+                identity_id=entity_id,
+                revision=int(revision),
+                binding_revision=int(binding_revision),
+                generation=number,
+                salt=salt,
+                root_check=bytes.fromhex(str(root_check_hex)),
+                alg=str(alg),
+                nonce=bytes.fromhex(str(nonce_hex)),
+                envelope=envelope,
+            )
+        except (ValueError, identity.Invalid, seal.Tampered, seal.Unusable, Refused):
+            self._confirm_identity_open(program_id, capability, label, str(audit_id), "denied")
+            raise
+        self._confirm_identity_open(program_id, capability, label, str(audit_id), "ok")
         return IdentityBinding(
             entity_id=entity_id,
             label=label,
             revision=int(revision),
+            binding_revision=int(binding_revision),
             session=session,
             generation=number,
             salt=salt,
             root=root,
         )
+
+    def _confirm_identity_open(
+        self,
+        program_id: str,
+        capability: str,
+        label: str,
+        audit_id: str,
+        outcome: str,
+    ) -> None:
+        """Append the authenticated result of a previously audited slot-open attempt."""
+        with self._lock:
+            self._bind(program_id)
+            try:
+                self.connection.execute(
+                    CONFIRM_IDENTITY, (capability, label, audit_id, outcome)
+                )
+            except pg.DatabaseError as error:
+                raise Refused("identity slot refused", str(error)) from error
 
     def wire_key(
         self, program_id: str, capability: str, root: seal.Root
@@ -956,7 +1016,10 @@ class Fence:
 
 
 Resolver = Callable[[str, int], tuple[str, ...]]
-Connector = Callable[[str, int, float, str, str], http.client.HTTPConnection]
+Connector = Callable[
+    [str, int, float, str, str, identity.ClientCertificate | None],
+    http.client.HTTPConnection,
+]
 
 
 def resolve(host: str, port: int) -> tuple[str, ...]:
@@ -994,21 +1057,7 @@ def unroutable(address: str) -> str | None:
     door itself and the database behind it. Multicast is said out loud because
     it is the one class `is_global` answers yes for.
     """
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return f"{address!r} is not an address"
-    if parsed.is_unspecified:
-        return f"{address} is the unspecified address"
-    if parsed.is_loopback:
-        return f"{address} is a loopback address"
-    if parsed.is_link_local:
-        return f"{address} is a link-local address"
-    if parsed.is_multicast:
-        return f"{address} is a multicast address"
-    if not parsed.is_global:
-        return f"{address} is not a public address"
-    return None
+    return scope.address_refusal(address)
 
 
 def destination(host: str, port: int, resolver: Resolver) -> tuple[str, ...]:
@@ -1060,7 +1109,12 @@ def pinned_ips(addresses: tuple[str, ...]) -> str:
 
 
 def connect(
-    host: str, port: int, timeout: float, protocol: str, address: str
+    host: str,
+    port: int,
+    timeout: float,
+    protocol: str,
+    address: str,
+    client_certificate: identity.ClientCertificate | None,
 ) -> http.client.HTTPConnection:
     """Open the connection to the address this request was pinned to.
 
@@ -1083,10 +1137,15 @@ def connect(
     the door. `intercepted` on the Receipt is what stops the agent's view from
     being read as the target's.
     """
+    context: ssl.SSLContext | None = None
+    if protocol == "https":
+        context = ssl.create_default_context()
+        if client_certificate is not None:
+            client_certificate.install(context)
     raw = socket.create_connection((address, port), timeout=timeout)
     try:
         if protocol == "https":
-            context = ssl.create_default_context()
+            assert context is not None
             connection: http.client.HTTPConnection = http.client.HTTPSConnection(
                 host, port, timeout=timeout, context=context
             )
@@ -1409,6 +1468,7 @@ class Handler(BaseHTTPRequestHandler):
         target: str,
         headers: list[tuple[str, str]],
         body: bytes,
+        client_certificate: identity.ClientCertificate | None,
     ) -> tuple[int, str, list[tuple[str, str]], bytes]:
         """Contact the authorized target and read what it answered, or refuse.
 
@@ -1430,6 +1490,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.target_timeout,
                 request.protocol,
                 address,
+                client_certificate,
             )
             try:
                 # Header by header, in the order the transcript records, rather
@@ -1453,6 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
                 reason = answer.reason
             finally:
                 connection.close()
+        except identity.Invalid as error:
+            raise Refused("identity slot refused", str(error), pinned=addresses) from error
         except (OSError, http.client.HTTPException) as error:
             raise Refused("target unreachable", str(error), pinned=addresses) from error
         if len(returned) > CEILING:
@@ -1487,6 +1550,8 @@ class Handler(BaseHTTPRequestHandler):
         line = f"{self.command} {target} HTTP/1.1"
 
         binding: IdentityBinding | None = None
+        client_certificate: identity.ClientCertificate | None = None
+        client_certificate_sha: str | None = None
         wire_headers = list(agent_headers)
         if authorization.identity_entity_id is not None:
             root = self.server.root_secret
@@ -1530,11 +1595,32 @@ class Handler(BaseHTTPRequestHandler):
                     authorization=authorization,
                 )
             wire_headers = binding.session.inject(url, agent_headers)
+            client_certificate = binding.session.client_certificate(url)
+            try:
+                client_certificate_sha = (
+                    client_certificate.public_sha256()
+                    if client_certificate is not None
+                    else None
+                )
+            except identity.Invalid as error:
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    Refused("identity slot refused", str(error), status=502),
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                )
 
         egress = datetime.now(timezone.utc)
         try:
             status, reason, back, returned = self._exchange(
-                request, addresses, target, wire_headers, body
+                request,
+                addresses,
+                target,
+                wire_headers,
+                body,
+                client_certificate,
             )
         except Refused as refusal:
             return self._refuse(
@@ -1551,8 +1637,12 @@ class Handler(BaseHTTPRequestHandler):
         wire_sent = transcript(line, wire_headers, body)
         if binding is not None:
             binding.changed = binding.session.capture(url, back)
-        agent_back = response_for_agent(back)
-        received = transcript(f"HTTP/1.1 {status} {reason}", agent_back, returned)
+            agent_back, agent_returned = project_identity_response(back, returned)
+            agent_reason = ""
+        else:
+            agent_back, agent_returned = response_for_agent(back), returned
+            agent_reason = reason
+        received = transcript(f"HTTP/1.1 {status} {agent_reason}", agent_back, agent_returned)
         wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
         store = self.server.store
         request_sha, request_new = store.put(sent)
@@ -1648,7 +1738,7 @@ class Handler(BaseHTTPRequestHandler):
         # nobody asked for, and an auditor cannot tell a followed redirect from
         # an agent that invented a target for itself.
         onward = (
-            redirected(url, _header(back, "Location")) if status in REDIRECTS else None
+            redirected(url, _header(agent_back, "Location")) if status in REDIRECTS else None
         )
 
         receipt = {
@@ -1678,6 +1768,7 @@ class Handler(BaseHTTPRequestHandler):
                 (item["sha256"] for item in seals if item["field"] == "target_response"), None
             ),
             "identity_entity_id": authorization.identity_entity_id,
+            "identity_tls_cert_sha256": client_certificate_sha,
             "scope_class": authorization.scope_class,
             "intercepted": True,
             # Every address the name answered with, and the one that was dialled
@@ -1739,10 +1830,10 @@ class Handler(BaseHTTPRequestHandler):
         self._answer(
             status,
             None,
-            body=returned,
+            body=agent_returned,
             headers=agent_back,
             receipt=label,
-            reason=reason,
+            reason=agent_reason,
         )
 
     def _refuse(

@@ -119,9 +119,14 @@ def associated_data(*, program_id: str, sha256: str, generation: int) -> bytes:
 
 
 def identity_associated_data(
-    *, program_id: str, identity_id: str, generation: int, revision: int
+    *,
+    program_id: str,
+    identity_id: str,
+    generation: int,
+    binding_revision: int,
+    revision: int,
 ) -> bytes:
-    """Bind mutable slot ciphertext to one Identity and one monotonic revision.
+    """Bind slot ciphertext to one Identity, declaration and mutable revision.
 
     Slot plaintext deliberately has no unkeyed digest in canonical state: a
     small cookie or password document must not become offline-guessable through
@@ -130,9 +135,11 @@ def identity_associated_data(
     """
     if revision < 1:
         raise ValueError("an Identity slot revision starts at one")
+    if binding_revision < 1:
+        raise ValueError("an Identity binding revision starts at one")
     return (
         f"rk2/identity-slot/v1|alg={ALG}|gen={generation}|program={program_id}"
-        f"|identity={identity_id}|revision={revision}"
+        f"|identity={identity_id}|binding={binding_revision}|revision={revision}"
     ).encode("utf-8")
 
 

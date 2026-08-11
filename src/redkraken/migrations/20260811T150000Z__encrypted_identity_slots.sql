@@ -4,6 +4,7 @@ CREATE TABLE identity_slots (
     id                 uuid PRIMARY KEY DEFAULT uuidv7(),
     program_id         uuid NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
     identity_entity_id uuid NOT NULL UNIQUE,
+    binding_revision   bigint NOT NULL CHECK (binding_revision > 0),
     revision           bigint NOT NULL CHECK (revision > 0),
     alg                text NOT NULL REFERENCES seal_algorithms(name),
     nonce              bytea NOT NULL CHECK (octet_length(nonce) = 32),
@@ -22,8 +23,119 @@ COMMENT ON TABLE identity_slots IS
   'Mutable, authenticated ciphertext for one Identity cookie jar and origin-bound authorization material. Plaintext exists only in the control adapter and proxy process.';
 COMMENT ON COLUMN identity_slots.revision IS
   'Monotonic and authenticated as associated data, so an older valid envelope cannot be rolled back onto the current slot.';
+COMMENT ON COLUMN identity_slots.binding_revision IS
+  'Configuration revision of the Identity declaration this ciphertext belongs to; declaration changes leave the old row authoritative but unusable.';
 COMMENT ON COLUMN identity_slots.byte_size IS
   'Plaintext length for audit and bounds; no unkeyed plaintext hash is stored because a small credential document must not become offline-guessable.';
+
+ALTER TABLE receipts ADD COLUMN identity_tls_cert_sha256 text
+    CHECK (identity_tls_cert_sha256 IS NULL
+           OR identity_tls_cert_sha256 ~ '^[0-9a-f]{64}$');
+ALTER TABLE receipts ADD CONSTRAINT receipts_identity_tls_credential_shape CHECK (
+    identity_tls_cert_sha256 IS NULL
+    OR (identity_entity_id IS NOT NULL AND scheme = 'https')
+);
+COMMENT ON COLUMN receipts.identity_tls_cert_sha256 IS
+  'Hash of the public client certificate installed for the upstream Identity TLS handshake; null when HTTP-layer credentials alone were used.';
+
+-- Receipts are insert-only evidence. Extend the existing writer so the mTLS
+-- claim is present in both the row and its receipt.recorded event after-image.
+CREATE OR REPLACE FUNCTION write_allowed_receipt(p_capability text, p_receipt jsonb)
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $fn$
+DECLARE
+    v_auth          record;
+    v_receipt       receipts%ROWTYPE;
+    v_scope_version integer;
+    v_id            uuid;
+BEGIN
+    IF p_capability IS NULL
+       OR coalesce(jsonb_typeof(p_receipt), 'null') <> 'object' THEN
+        RAISE EXCEPTION 'egress capability refused' USING ERRCODE = '23514';
+    END IF;
+    IF position(p_capability IN p_receipt::text) > 0 THEN
+        RAISE EXCEPTION 'receipt payload contains protected capability'
+            USING ERRCODE = '23514';
+    END IF;
+
+    SELECT * INTO v_auth FROM resolve_egress_capability(p_capability);
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'egress capability refused' USING ERRCODE = '23514';
+    END IF;
+    SELECT scope_version INTO v_scope_version
+      FROM programs WHERE id = v_auth.program_id;
+
+    v_receipt := jsonb_populate_record(NULL::receipts, p_receipt);
+    v_receipt.id := uuidv7();
+    v_receipt.program_id := v_auth.program_id;
+    v_receipt.label := '';
+    v_receipt.tool_run_id := v_auth.tool_run_id;
+    v_receipt.lane := 'agent';
+    v_receipt.decision := 'allowed';
+    v_receipt.scope_version := v_scope_version;
+    v_receipt.ts_arrival := coalesce(v_receipt.ts_arrival, clock_timestamp());
+    v_receipt.intercepted := coalesce(v_receipt.intercepted, true);
+
+    PERFORM set_actor('runtime');
+    INSERT INTO receipts (
+        id, program_id, label, tool_run_id, lane, decision, reason,
+        identity_entity_id, identity_tls_cert_sha256,
+        method, scheme, host, port, path, query_sha256,
+        pinned_ips, status_code, ts_arrival, ts_egress, waited_ms,
+        request_agent_sha, request_wire_sha, response_agent_sha,
+        response_wire_sha, notes, scope_version, scope_class, intercepted,
+        alpn_pin_mode, agent_tls_version, agent_cipher, agent_alpn,
+        agent_cert_sha256, agent_cert_issuer, agent_cert_subject,
+        agent_cert_not_after, wire_tls_version, wire_cipher, wire_alpn,
+        wire_cert_sha256, wire_cert_issuer, wire_cert_subject,
+        wire_cert_not_after, wire_sni, wire_chain_verified,
+        wire_hostname_verified, interception_ca_id
+    ) VALUES (
+        v_receipt.id, v_receipt.program_id, v_receipt.label,
+        v_receipt.tool_run_id, v_receipt.lane, v_receipt.decision,
+        v_receipt.reason, v_receipt.identity_entity_id,
+        v_receipt.identity_tls_cert_sha256, v_receipt.method,
+        v_receipt.scheme, v_receipt.host, v_receipt.port, v_receipt.path,
+        v_receipt.query_sha256, v_receipt.pinned_ips, v_receipt.status_code,
+        v_receipt.ts_arrival, v_receipt.ts_egress, v_receipt.waited_ms,
+        v_receipt.request_agent_sha, v_receipt.request_wire_sha,
+        v_receipt.response_agent_sha, v_receipt.response_wire_sha,
+        v_receipt.notes, v_receipt.scope_version, v_receipt.scope_class,
+        v_receipt.intercepted, v_receipt.alpn_pin_mode,
+        v_receipt.agent_tls_version, v_receipt.agent_cipher,
+        v_receipt.agent_alpn, v_receipt.agent_cert_sha256,
+        v_receipt.agent_cert_issuer, v_receipt.agent_cert_subject,
+        v_receipt.agent_cert_not_after, v_receipt.wire_tls_version,
+        v_receipt.wire_cipher, v_receipt.wire_alpn,
+        v_receipt.wire_cert_sha256, v_receipt.wire_cert_issuer,
+        v_receipt.wire_cert_subject, v_receipt.wire_cert_not_after,
+        v_receipt.wire_sni, v_receipt.wire_chain_verified,
+        v_receipt.wire_hostname_verified, v_receipt.interception_ca_id
+    )
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END $fn$;
+
+ALTER TABLE secret_access_log
+    ADD COLUMN operation_id uuid;
+ALTER TABLE secret_access_log
+    DROP CONSTRAINT secret_access_log_outcome_check;
+ALTER TABLE secret_access_log
+    ADD CONSTRAINT secret_access_log_outcome_check
+    CHECK (outcome IN ('attempted','ok','denied','shredded','error'));
+CREATE UNIQUE INDEX secret_access_log_identity_completion_uq
+    ON secret_access_log(operation_id)
+    WHERE operation_id IS NOT NULL AND outcome <> 'attempted';
+COMMENT ON COLUMN secret_access_log.operation_id IS
+  'Correlates an append-only Identity key-access attempt with its terminal outcome row.';
+
+INSERT INTO skills(name, enabled, description, source_sha256) VALUES (
+    'use-identity', true,
+    'Authenticated target requests through a named RedKraken Identity. Use when testing logged-in reachability, comparing two leased Identities, or following redirects and subresources within an authenticated session.',
+    '60e68acd923ce548c3b3a9916ecef8b2cf43b791b9e2faef72b17219c47bffe4'
+);
+INSERT INTO role_skills(role, skill_name) VALUES ('web_hunter', 'use-identity');
 
 INSERT INTO purge_cascade_edges(table_name, column_name, rationale) VALUES
     ('identity_slots', 'program_id', 'program-scoped encrypted Identity state');
@@ -107,23 +219,34 @@ CREATE FUNCTION identity_slot_keying(
 ) RETURNS TABLE(
     identity_entity_id uuid,
     revision bigint,
+    binding_revision bigint,
     generation integer,
     salt_hex text,
-    root_check_hex text
+    root_check_hex text,
+    audit_id uuid
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
-DECLARE v_identity uuid; v_revision bigint;
+DECLARE
+    v_identity uuid;
+    v_revision bigint;
+    v_binding bigint;
+    v_generation integer;
+    v_salt_hex text;
+    v_root_check_hex text;
+    v_audit uuid;
 BEGIN
     IF p_program IS DISTINCT FROM rk2_program()
        OR NOT EXISTS (SELECT 1 FROM programs p
                        WHERE p.id = p_program AND p.closed_at IS NULL) THEN
         RAISE EXCEPTION 'Identity Program refused' USING ERRCODE = '23514';
     END IF;
-    SELECT i.entity_id, coalesce(s.revision, 0)
-      INTO v_identity, v_revision
+    SELECT i.entity_id, coalesce(s.revision, 0),
+           (e.metadata ->> 'configuration_revision')::bigint
+      INTO v_identity, v_revision, v_binding
       FROM identities i
+      JOIN entities e ON e.id = i.entity_id
       LEFT JOIN identity_slots s ON s.identity_entity_id = i.entity_id
      WHERE i.program_id = p_program AND i.slot_name = p_identity
        AND i.invalidated_at IS NULL;
@@ -131,9 +254,58 @@ BEGIN
         RAISE EXCEPTION 'Identity label refused' USING ERRCODE = '23514';
     END IF;
 
-    RETURN QUERY
-    SELECT v_identity, v_revision, k.generation, k.salt_hex, k.root_check_hex
+    SELECT k.generation, k.salt_hex, k.root_check_hex
+      INTO v_generation, v_salt_hex, v_root_check_hex
       FROM ensure_active_secret_kek(p_salt, p_root_check) k;
+    v_audit := uuidv7();
+    INSERT INTO secret_access_log(
+        id, operation_id,
+        verb, scope_kind, scope_id, kek_gen, program_id,
+        field, outcome, detail
+    ) VALUES (
+        v_audit, v_audit,
+        'rootcheck', 'identity', v_identity, v_generation, p_program,
+        'identity_slot', 'attempted', 'control side requested an Identity root check'
+    );
+    RETURN QUERY SELECT v_identity, v_revision, v_binding, v_generation, v_salt_hex,
+                        v_root_check_hex, v_audit;
+END $fn$;
+
+
+CREATE FUNCTION confirm_identity_root_check(
+    p_program uuid, p_identity text, p_audit uuid, p_outcome text
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $fn$
+DECLARE v_identity uuid; v_attempt secret_access_log%ROWTYPE;
+BEGIN
+    IF p_program IS DISTINCT FROM rk2_program()
+       OR p_outcome NOT IN ('ok', 'denied') THEN
+        RAISE EXCEPTION 'Identity root-check audit refused' USING ERRCODE = '23514';
+    END IF;
+    SELECT i.entity_id INTO v_identity FROM identities i
+     WHERE i.program_id = p_program AND i.slot_name = p_identity
+       AND i.invalidated_at IS NULL;
+    SELECT * INTO v_attempt FROM secret_access_log
+     WHERE id = p_audit AND operation_id = p_audit
+       AND verb = 'rootcheck' AND program_id = p_program
+       AND scope_kind = 'identity' AND scope_id = v_identity
+       AND outcome = 'attempted';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Identity root-check audit attempt changed' USING ERRCODE = '23514';
+    END IF;
+    INSERT INTO secret_access_log(
+        operation_id, verb, scope_kind, scope_id, kek_gen, program_id,
+        field, outcome, detail
+    ) VALUES (
+        p_audit, v_attempt.verb, v_attempt.scope_kind, v_attempt.scope_id,
+        v_attempt.kek_gen, v_attempt.program_id, v_attempt.field, p_outcome,
+        CASE p_outcome
+            WHEN 'ok' THEN 'control side confirmed the Identity root check'
+            ELSE 'control side refused an Identity root mismatch'
+        END
+    );
 END $fn$;
 
 
@@ -146,10 +318,11 @@ BEGIN
     IF coalesce(jsonb_typeof(p_state), 'null') <> 'object'
        OR (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(p_state) key)
           IS DISTINCT FROM ARRAY[
-              'alg','byte_size','ciphertext_sha256','envelope_hex',
+              'alg','binding_revision','byte_size','ciphertext_sha256','envelope_hex',
               'kek_gen','nonce_hex','revision','value_fpr_hex'
           ]::text[]
        OR coalesce((p_state ->> 'revision')::bigint, 0) < 1
+       OR coalesce((p_state ->> 'binding_revision')::bigint, 0) < 1
        OR coalesce((p_state ->> 'byte_size')::bigint, 0) < 1
        OR coalesce((p_state ->> 'kek_gen')::integer, 0) < 1
        OR coalesce(p_state ->> 'nonce_hex', '') !~ '^[0-9a-f]{64}$'
@@ -176,30 +349,34 @@ CREATE FUNCTION provision_identity_slot(
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
-DECLARE v_identity uuid; v_written bigint;
+DECLARE v_identity uuid; v_binding bigint; v_written bigint;
 BEGIN
     IF p_program IS DISTINCT FROM rk2_program() THEN
         RAISE EXCEPTION 'Identity Program refused' USING ERRCODE = '23514';
     END IF;
-    SELECT i.entity_id INTO v_identity
+    SELECT i.entity_id, (e.metadata ->> 'configuration_revision')::bigint
+      INTO v_identity, v_binding
       FROM identities i JOIN programs p ON p.id = i.program_id
+      JOIN entities e ON e.id = i.entity_id
      WHERE i.program_id = p_program AND i.slot_name = p_identity
        AND i.invalidated_at IS NULL AND p.closed_at IS NULL;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Identity label refused' USING ERRCODE = '23514';
     END IF;
     PERFORM assert_identity_slot_state(p_state);
-    IF (p_state ->> 'revision')::bigint <> p_expected_revision + 1 THEN
-        RAISE EXCEPTION 'Identity slot revision is not the next revision'
+    IF (p_state ->> 'revision')::bigint <> p_expected_revision + 1
+       OR (p_state ->> 'binding_revision')::bigint <> v_binding THEN
+        RAISE EXCEPTION 'Identity slot revision or configuration binding changed'
             USING ERRCODE = '23514';
     END IF;
 
     PERFORM set_actor('runtime', 'Identity provisioning');
     INSERT INTO identity_slots(
-        program_id, identity_entity_id, revision, alg, nonce, kek_gen,
+        program_id, identity_entity_id, binding_revision, revision, alg, nonce, kek_gen,
         envelope, ciphertext_sha256, byte_size, value_fpr
     ) VALUES (
-        p_program, v_identity, (p_state ->> 'revision')::bigint,
+        p_program, v_identity, (p_state ->> 'binding_revision')::bigint,
+        (p_state ->> 'revision')::bigint,
         p_state ->> 'alg', decode(p_state ->> 'nonce_hex', 'hex'),
         (p_state ->> 'kek_gen')::integer,
         decode(p_state ->> 'envelope_hex', 'hex'), p_state ->> 'ciphertext_sha256',
@@ -207,6 +384,7 @@ BEGIN
         decode(p_state ->> 'value_fpr_hex', 'hex')
     )
     ON CONFLICT (identity_entity_id) DO UPDATE SET
+        binding_revision = EXCLUDED.binding_revision,
         revision = EXCLUDED.revision,
         alg = EXCLUDED.alg,
         nonce = EXCLUDED.nonce,
@@ -330,47 +508,92 @@ RETURNS TABLE(
     identity_entity_id uuid,
     identity_label text,
     revision bigint,
+    binding_revision bigint,
     alg text,
     nonce_hex text,
     kek_gen integer,
     envelope_hex text,
     ciphertext_sha256 text,
     salt_hex text,
-    root_check_hex text
+    root_check_hex text,
+    audit_id uuid
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
-DECLARE v_auth record; v_slot identity_slots%ROWTYPE;
+DECLARE v_auth record; v_slot identity_slots%ROWTYPE; v_audit uuid;
 BEGIN
     SELECT * INTO v_auth FROM resolve_egress_identity(p_capability);
     IF v_auth.identity_label IS NULL
        OR v_auth.identity_label IS DISTINCT FROM p_identity THEN
         RAISE EXCEPTION 'Identity selection refused' USING ERRCODE = '23514';
     END IF;
-    SELECT * INTO v_slot FROM identity_slots s
+    SELECT s.* INTO v_slot FROM identity_slots s
+      JOIN entities e ON e.id = s.identity_entity_id
      WHERE s.program_id = v_auth.program_id
-       AND s.identity_entity_id = v_auth.identity_entity_id;
+       AND s.identity_entity_id = v_auth.identity_entity_id
+       AND s.binding_revision = (e.metadata ->> 'configuration_revision')::bigint;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Identity has no provisioned slot' USING ERRCODE = '23514';
     END IF;
 
+    v_audit := uuidv7();
     INSERT INTO secret_access_log(
+        id, operation_id,
         verb, scope_kind, scope_id, kek_gen, program_id, tool_run_id,
         field, value_len, value_fpr, outcome, detail
     ) VALUES (
+        v_audit, v_audit,
         'open_identity', 'identity', v_slot.identity_entity_id, v_slot.kek_gen,
         v_slot.program_id, v_auth.tool_run_id, 'identity_slot', v_slot.byte_size,
-        v_slot.value_fpr, 'ok', 'proxy opened a live leased Identity slot'
+        v_slot.value_fpr, 'attempted', 'proxy requested an Identity slot open'
     );
 
     RETURN QUERY
     SELECT v_slot.identity_entity_id, v_auth.identity_label, v_slot.revision,
+           v_slot.binding_revision,
            v_slot.alg, encode(v_slot.nonce, 'hex'), v_slot.kek_gen,
            encode(v_slot.envelope, 'hex'), v_slot.ciphertext_sha256::text,
            encode(k.salt, 'hex'),
-           encode(k.root_check, 'hex')
+           encode(k.root_check, 'hex'), v_audit
       FROM secret_kek k WHERE k.gen = v_slot.kek_gen;
+END $fn$;
+
+
+CREATE FUNCTION confirm_identity_slot_open(
+    p_capability text, p_identity text, p_audit uuid, p_outcome text
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $fn$
+DECLARE v_auth record; v_attempt secret_access_log%ROWTYPE;
+BEGIN
+    SELECT * INTO v_auth FROM resolve_egress_identity(p_capability);
+    IF v_auth.identity_label IS NULL
+       OR v_auth.identity_label IS DISTINCT FROM p_identity
+       OR p_outcome NOT IN ('ok', 'denied') THEN
+        RAISE EXCEPTION 'Identity open confirmation refused' USING ERRCODE = '23514';
+    END IF;
+    SELECT * INTO v_attempt FROM secret_access_log
+     WHERE id = p_audit AND operation_id = p_audit AND verb = 'open_identity'
+       AND program_id = v_auth.program_id AND tool_run_id = v_auth.tool_run_id
+       AND scope_kind = 'identity' AND scope_id = v_auth.identity_entity_id
+       AND outcome = 'attempted';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Identity open audit attempt changed' USING ERRCODE = '23514';
+    END IF;
+    INSERT INTO secret_access_log(
+        operation_id, verb, scope_kind, scope_id, kek_gen, program_id,
+        tool_run_id, field, value_len, value_fpr, outcome, detail
+    ) VALUES (
+        p_audit, v_attempt.verb, v_attempt.scope_kind, v_attempt.scope_id,
+        v_attempt.kek_gen, v_attempt.program_id, v_attempt.tool_run_id,
+        v_attempt.field, v_attempt.value_len, v_attempt.value_fpr, p_outcome,
+        CASE p_outcome
+            WHEN 'ok' THEN 'proxy authenticated a live leased Identity slot'
+            ELSE 'proxy refused unauthenticated Identity slot material'
+        END
+    );
 END $fn$;
 
 
@@ -386,7 +609,11 @@ CREATE FUNCTION record_identity_proxy_exchange(
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
-DECLARE v_auth record; v_receipt jsonb; v_written bigint;
+DECLARE
+    v_auth record;
+    v_receipt jsonb;
+    v_written bigint;
+    v_binding bigint;
 BEGIN
     SELECT * INTO v_auth FROM resolve_egress_identity(p_capability);
     IF coalesce(v_auth.identity_label, '') IS DISTINCT FROM coalesce(p_identity, '') THEN
@@ -403,10 +630,29 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
+    IF v_auth.identity_entity_id IS NOT NULL THEN
+        IF p_expected_revision IS NULL THEN
+            RAISE EXCEPTION 'Identity exchange has no opened slot revision'
+                USING ERRCODE = '23514';
+        END IF;
+        SELECT s.binding_revision INTO v_binding FROM identity_slots s
+          JOIN entities e ON e.id = s.identity_entity_id
+         WHERE s.program_id = v_auth.program_id
+           AND s.identity_entity_id = v_auth.identity_entity_id
+           AND s.revision = p_expected_revision
+           AND s.binding_revision = (e.metadata ->> 'configuration_revision')::bigint
+         FOR UPDATE OF s, e;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Identity slot revision changed during exchange'
+                USING ERRCODE = '40001';
+        END IF;
+    END IF;
+
     IF p_state IS NOT NULL THEN
         PERFORM assert_identity_slot_state(p_state);
-        IF (p_state ->> 'revision')::bigint <> p_expected_revision + 1 THEN
-            RAISE EXCEPTION 'Identity slot revision is not the next revision'
+        IF (p_state ->> 'revision')::bigint <> p_expected_revision + 1
+           OR (p_state ->> 'binding_revision')::bigint <> v_binding THEN
+            RAISE EXCEPTION 'Identity slot revision or configuration binding changed'
                 USING ERRCODE = '23514';
         END IF;
         PERFORM set_actor('runtime', 'proxy Identity session capture');
@@ -423,6 +669,7 @@ BEGIN
          WHERE program_id = v_auth.program_id
            AND identity_entity_id = v_auth.identity_entity_id
            AND revision = p_expected_revision
+           AND binding_revision = v_binding
         RETURNING revision INTO v_written;
         IF v_written IS NULL THEN
             RAISE EXCEPTION 'Identity slot revision changed during exchange'
@@ -544,33 +791,40 @@ REVOKE ALL ON FUNCTION ensure_active_secret_kek(bytea,bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION assert_identity_slot_state(jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION resolve_egress_identity(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION identity_slot_keying(uuid,text,bytea,bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION confirm_identity_root_check(uuid,text,uuid,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION provision_identity_slot(uuid,text,bigint,jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION authorize_identity_egress_request(text,text,text,text,integer,text,text)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION authorize_identity_egress_address(text,text,text,integer,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION open_identity_slot(text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION confirm_identity_slot_open(text,text,uuid,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION record_identity_proxy_exchange(text,jsonb,jsonb,jsonb,text,bigint,jsonb)
     FROM PUBLIC;
 
 REVOKE EXECUTE ON FUNCTION ensure_active_secret_kek(bytea,bytea),
     assert_identity_slot_state(jsonb), resolve_egress_identity(text),
     open_identity_slot(text,text),
+    confirm_identity_slot_open(text,text,uuid,text),
     record_identity_proxy_exchange(text,jsonb,jsonb,jsonb,text,bigint,jsonb)
     FROM rk2_runtime;
 GRANT EXECUTE ON FUNCTION identity_slot_keying(uuid,text,bytea,bytea),
+    confirm_identity_root_check(uuid,text,uuid,text),
     provision_identity_slot(uuid,text,bigint,jsonb) TO rk2_runtime;
 
 REVOKE EXECUTE ON FUNCTION
     authorize_egress_request(text,text,text,text,integer,text,text,text),
     authorize_egress_address(text,text,text,integer,text),
+    record_proxy_exchange(text,jsonb,jsonb),
     record_proxy_exchange(text,jsonb,jsonb,jsonb),
     identity_slot_keying(uuid,text,bytea,bytea),
+    confirm_identity_root_check(uuid,text,uuid,text),
     provision_identity_slot(uuid,text,bigint,jsonb)
     FROM rk2_proxy;
 GRANT EXECUTE ON FUNCTION
     authorize_identity_egress_request(text,text,text,text,integer,text,text),
     authorize_identity_egress_address(text,text,text,integer,text),
     open_identity_slot(text,text),
+    confirm_identity_slot_open(text,text,uuid,text),
     record_identity_proxy_exchange(text,jsonb,jsonb,jsonb,text,bigint,jsonb)
     TO rk2_proxy;
 
@@ -597,6 +851,8 @@ RETURNS TABLE(problem text, detail text) LANGUAGE sql STABLE AS $fn$
                'EXECUTE')
         OR NOT has_function_privilege('rk2_proxy', 'open_identity_slot(text,text)', 'EXECUTE')
         OR NOT has_function_privilege(
+               'rk2_proxy', 'confirm_identity_slot_open(text,text,uuid,text)', 'EXECUTE')
+        OR NOT has_function_privilege(
                'rk2_proxy',
                'record_identity_proxy_exchange(text,jsonb,jsonb,jsonb,text,bigint,jsonb)',
                'EXECUTE')
@@ -607,6 +863,8 @@ RETURNS TABLE(problem text, detail text) LANGUAGE sql STABLE AS $fn$
     UNION ALL
     SELECT 'proxy_bypasses_identity_writer', 'rk2_proxy retains an unchecked writer'
      WHERE has_function_privilege('rk2_proxy', 'write_allowed_receipt(text,jsonb)', 'EXECUTE')
+        OR has_function_privilege(
+               'rk2_proxy', 'record_proxy_exchange(text,jsonb,jsonb)', 'EXECUTE')
         OR has_function_privilege(
                'rk2_proxy', 'record_proxy_exchange(text,jsonb,jsonb,jsonb)', 'EXECUTE')
         OR has_function_privilege(

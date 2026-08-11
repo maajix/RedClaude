@@ -34,7 +34,7 @@ constraint read back from `pg_get_constraintdef`, a trigger-authored
 an earlier transaction's actor and a direct `hypotheses.status` write, one gate
 covering all three families, and dump → provision → restore → gate.
 
-Criterion 5, exactly. All 51 checks the gate runs are accounted for, and
+Criterion 5 is not complete. All 51 checks the gate runs are accounted for, and
 `test_every_check_the_gate_runs_has_a_control` fails by name if a new check
 arrives without an entry:
 
@@ -48,6 +48,11 @@ arrives without an entry:
   asserts the refusal instead, and says so.
 - Two are properties of the running binary: `baseline:server_major` and
   `baseline:uuidv7_is_builtin`. Falsifying either means a different PostgreSQL.
+
+The last two have no negative control, and the four family-refusal cases do not
+make the named check return false. Accounting for them keeps a new untested
+check visible, but it is not the acceptance criterion as written; the box stays
+unticked until those checks have an executable falsification.
 
 Three defects the review found were fixed before the commit: `_apply` inlined
 `set_actor()`'s body instead of calling it (it now calls the helper wherever it

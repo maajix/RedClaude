@@ -16,9 +16,9 @@
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `9c2ba9b` on
-2026-08-10. **The first and third criteria are not ticked and this ticket is not
-resolved**, which is why the status is `needs-triage` rather than `resolved`: see
-the last section.
+2026-08-10. **The first, third and fifth criteria are not ticked and this ticket
+is not resolved**, which is why the status is `needs-triage` rather than
+`resolved`: see the last section.
 
 `src/redkraken/tls.py` is the run's certificate authority -- one per run, in a
 directory the door owns, issuing a leaf that names exactly one host -- and
@@ -307,6 +307,13 @@ rather than relayed. **`_port` filling the scheme's default** was already
 answered in the first pass and the docstring carries the reason.
 
 ### Raised by review and deliberately not built here
+
+- **Credential redaction is not built.** The door removes its own capability and
+  control headers, but it currently returns upstream headers unchanged and
+  stores the exact response as `agent_visible`. A review probe confirmed that a
+  target `Set-Cookie` reaches the HTTPS caller. Ticket 12 owns runtime credential
+  injection, response redaction and the distinct sealed wire view, so criterion
+  5 remains unticked until that integration exists.
 
 - **Criterion 3 is half done, and that is why this ticket is not resolved.**
   "Direct HTTPS from the agent network namespace fails even when a client

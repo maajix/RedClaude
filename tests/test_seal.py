@@ -348,7 +348,11 @@ class RootTest(unittest.TestCase):
             b"s" * 32, generation=1, program_id=PROGRAM, identity_id=identity_id
         )
         aad = seal.identity_associated_data(
-            program_id=PROGRAM, identity_id=identity_id, generation=1, revision=4
+            program_id=PROGRAM,
+            identity_id=identity_id,
+            generation=1,
+            binding_revision=2,
+            revision=4,
         )
         encrypted = seal.seal(key, BODY, aad=aad)
 
@@ -360,7 +364,20 @@ class RootTest(unittest.TestCase):
                     program_id=PROGRAM,
                     identity_id=identity_id,
                     generation=1,
+                    binding_revision=2,
                     revision=5,
+                ),
+            )
+        with self.assertRaises(seal.Tampered):
+            seal.unseal(
+                key,
+                encrypted,
+                aad=seal.identity_associated_data(
+                    program_id=PROGRAM,
+                    identity_id=identity_id,
+                    generation=1,
+                    binding_revision=3,
+                    revision=4,
                 ),
             )
 

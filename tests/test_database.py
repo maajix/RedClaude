@@ -271,6 +271,18 @@ class CleanCreationTest(DatabaseCase):
             {item.identity: item.checksum for item in self.harness.migrations}, recorded
         )
 
+    def test_the_identity_skill_is_registered_for_the_web_hunter(self):
+        source = Path(__file__).parents[1] / "skills" / "use-identity" / "SKILL.md"
+        row = self.connection.execute(
+            "SELECT s.enabled, s.source_sha256, rs.role"
+            "  FROM skills s JOIN role_skills rs ON rs.skill_name = s.name"
+            " WHERE s.name = 'use-identity'"
+        ).rows
+
+        self.assertEqual(
+            ((True, artifact.digest(source.read_bytes()), "web_hunter"),), row
+        )
+
     def test_the_shipped_settings_reach_the_connection_the_gate_runs_on(self):
         # `apply_server_settings` is `ALTER DATABASE ... SET`, which only reaches
         # sessions opened after it. Verifying on the connection that applied it
@@ -2511,8 +2523,10 @@ class ArtifactStoreTest(DatabaseCase):
         self.assertEqual([artifact.digest(PLAINTEXT), artifact.digest(PRIVATE)],
                          [item["sha256"] for item in payloads])
         self.assertEqual(["runtime", "tool_output"], [item["kind"] for item in payloads])
+        expected_fields = {"id", "kind", "label", "sha256", "created_at", "program_id"}
+        self.assertTrue(all(set(item) == expected_fields for item in payloads))
         written = json.dumps(payloads)
-        for fragment in ("artifact line 3", "only the first Program", "b64", "data"):
+        for fragment in ("artifact line 3", "only the first Program"):
             with self.subTest(fragment):
                 self.assertNotIn(fragment, written)
 
@@ -3263,7 +3277,19 @@ class ProxyEgressTest(DatabaseCase):
         # live, kept apart from `a` because those are counted: a suite that
         # asserts "two Receipts and no more" under the Program every other test
         # uses is a suite where adding a test breaks an unrelated one.
-        for name in ("a", "b", "retired", "shared", "credential", "lease", "other"):
+        for name in (
+            "a",
+            "b",
+            "retired",
+            "shared",
+            "credential",
+            "lease",
+            "other",
+            "slot-reference",
+            "identity-audit",
+            "identity-revision",
+            "mtls",
+        ):
             source = SCOPED + "\n[[identity]]\nname = \"member\"\nslot_ref = \"slot://identity/member\"\n"
             path = write(source.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
             opened = program.run(cls.harness.runtime, path)
@@ -3389,7 +3415,13 @@ class ProxyEgressTest(DatabaseCase):
 
     @classmethod
     def dial(
-        cls, host: str, port: int, timeout: float, protocol: str, address: str
+        cls,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
     ) -> http.client.HTTPConnection:
         """Every authorised name reaches the one target this machine is running.
 
@@ -3405,11 +3437,14 @@ class ProxyEgressTest(DatabaseCase):
         """
         cls.dialled.append((host, port, protocol, address))
         if protocol == "https":
+            context = ssl.create_default_context(cafile=str(cls.target_ca))
+            if client_certificate is not None:
+                client_certificate.install(context)
             return http.client.HTTPSConnection(
                 "127.0.0.1",
                 cls.secure_target.server_address[1],
                 timeout=timeout,
-                context=ssl.create_default_context(cafile=str(cls.target_ca)),
+                context=context,
             )
         return http.client.HTTPConnection(
             "127.0.0.1", cls.target.server_address[1], timeout=timeout
@@ -3642,6 +3677,7 @@ class ProxyEgressTest(DatabaseCase):
 
     def test_identity_provisioning_leaves_only_an_encrypted_control_side_slot(self):
         marker = "rk2-provisioned-bearer-6d28ea"
+        client_key_marker = "rk2-private-client-key-25b7c4"
         material = scratch() / "identity.json"
         material.write_text(
             json.dumps(
@@ -3649,11 +3685,22 @@ class ProxyEgressTest(DatabaseCase):
                     "schema_version": 1,
                     "origins": [
                         {
-                            "url": "http://app.example.com/",
+                            "url": "https://app.example.com/",
                             "headers": [
                                 {"name": "Authorization", "value": f"Bearer {marker}"}
                             ],
                             "cookies": [],
+                            "client_certificate": {
+                                "certificate_pem": (
+                                    "-----BEGIN CERTIFICATE-----\nfixture\n"
+                                    "-----END CERTIFICATE-----\n"
+                                ),
+                                "private_key_pem": (
+                                    "-----BEGIN PRIVATE KEY-----\n"
+                                    f"{client_key_marker}\n"
+                                    "-----END PRIVATE KEY-----\n"
+                                ),
+                            },
                         }
                     ],
                 }
@@ -3680,15 +3727,17 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(1, int(row[0]))
         self.assertEqual(seal.ALG, str(row[1]))
         self.assertNotIn(marker.encode().hex(), str(row[2]))
+        self.assertNotIn(client_key_marker.encode().hex(), str(row[2]))
         self.assertGreater(int(row[3]), len(marker))
-        self.assertEqual(
-            (),
-            self.connection.execute(
-                "SELECT relation, attribute FROM find_in_database($1) WHERE hits > 0",
-                (marker,),
-            ).rows,
-        )
-        self.assertNotIn(marker, json.dumps(provisioned.as_dict()))
+        for secret in (marker, client_key_marker):
+            self.assertEqual(
+                (),
+                self.connection.execute(
+                    "SELECT relation, attribute FROM find_in_database($1) WHERE hits > 0",
+                    (secret,),
+                ).rows,
+            )
+            self.assertNotIn(secret, json.dumps(provisioned.as_dict()))
         self.assertFalse(
             self.connection.execute(
                 "SELECT has_table_privilege('rk2_state', 'identity_slots', 'SELECT')"
@@ -3700,6 +3749,303 @@ class ProxyEgressTest(DatabaseCase):
                 " 'rk2_state', 'provision_identity_slot(uuid,text,bigint,jsonb)', 'EXECUTE')"
             ).scalar()
         )
+        for signature in (
+            "record_proxy_exchange(text,jsonb,jsonb)",
+            "record_proxy_exchange(text,jsonb,jsonb,jsonb)",
+        ):
+            with self.subTest(signature=signature):
+                self.assertFalse(
+                    self.connection.execute(
+                        "SELECT has_function_privilege('rk2_proxy', $1, 'EXECUTE')",
+                        (signature,),
+                    ).scalar()
+                )
+
+    def test_normalized_identity_state_is_refused_without_crashing_provisioning(self):
+        material = scratch() / "oversized-normalized-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [],
+                            "cookies": [f"cookie{index}=x" for index in range(6_000)],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = identity.provision(
+            self.harness.runtime,
+            self.configurations["b"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIn("slot plaintext exceeds", result.violations[0].detail)
+
+    def test_an_identity_client_certificate_hash_is_persisted_in_its_receipt(self):
+        client = tls.authority(scratch() / "persisted-client-identity")
+        credential = identity.ClientCertificate(
+            client.certificate.read_text(encoding="utf-8"),
+            client.key.read_text(encoding="utf-8"),
+        )
+        material = scratch() / "persisted-client-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [],
+                            "cookies": [],
+                            "client_certificate": {
+                                "certificate_pem": credential.certificate_pem,
+                                "private_key_pem": credential.private_key_pem,
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["mtls"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+        capability, tool_run, _ = self.leased("mtls", "member")
+        previous = LiveTarget.response_headers
+        LiveTarget.response_headers = (("X-Identity-Fixture", "mtls-evidence"),)
+        try:
+            status, decision = self.attempt(
+                capability, self.identifiers["mtls"], url=SECURE
+            )
+        finally:
+            LiveTarget.response_headers = previous
+
+        self.assertEqual((200, None), (status, decision))
+        persisted = self.connection.execute(
+            "SELECT identity_tls_cert_sha256 FROM receipts"
+            " WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+            (tool_run,),
+        ).scalar()
+        self.assertEqual(credential.public_sha256(), str(persisted))
+
+    def test_a_configuration_change_invalidates_the_stale_identity_ciphertext(self):
+        name = "slot-reference"
+        path = self.configurations[name]
+        material = scratch() / "slot-reference.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [{"name": "X-Api-Key", "value": "stale-secret"}],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            path,
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "slot://identity/member", "slot://identity/replacement"
+            ),
+            encoding="utf-8",
+        )
+        revised = program.run(self.harness.runtime, path, accept_change=True)
+
+        self.assertTrue(revised.ok, revised.violations)
+        self.assertEqual(
+            1,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM identity_slots WHERE program_id = $1::uuid",
+                    (self.identifiers[name],),
+                ).scalar()
+            ),
+        )
+        binding, current = self.connection.execute(
+            "SELECT s.binding_revision, (e.metadata ->> 'configuration_revision')::bigint"
+            "  FROM identity_slots s JOIN entities e ON e.id = s.identity_entity_id"
+            " WHERE s.program_id = $1::uuid",
+            (self.identifiers[name],),
+        ).rows[0]
+        self.assertNotEqual(int(binding), int(current))
+
+        capability, _, _ = self.leased(name, "member")
+        before = len(self.target.seen)
+        attempted = self.attempt(capability, self.identifiers[name])
+        reasons = self.connection.execute(
+            "SELECT decision, reason FROM receipts WHERE program_id = $1::uuid"
+            " ORDER BY ts_arrival DESC LIMIT 3",
+            (self.identifiers[name],),
+        ).rows
+        self.assertEqual(
+            (407, proxy.REFUSED), attempted
+        )
+        self.assertEqual((("blocked", "identity slot refused"),), reasons)
+        self.assertEqual(before, len(self.target.seen))
+
+    def test_root_checks_and_failed_identity_opens_are_audited_at_their_real_outcome(self):
+        name = "identity-audit"
+        path = self.configurations[name]
+        material = scratch() / "identity-audit.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [{"name": "Authorization", "value": "Bearer audit"}],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            path,
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+        wrong = identity.provision(
+            self.harness.runtime,
+            path,
+            "member",
+            material,
+            root_secret=seal.Root(Path("wrong-identity-root"), b"w" * seal.KEY_BYTES),
+        )
+        self.assertFalse(wrong.ok)
+        rootchecks = [
+            (str(row[0]), str(row[1]))
+            for row in self.connection.execute(
+                "SELECT operation_id, string_agg(outcome, ',' ORDER BY at, id)"
+                " FROM secret_access_log"
+                " WHERE program_id = $1::uuid AND verb = 'rootcheck'"
+                " GROUP BY operation_id ORDER BY min(at), operation_id",
+                (self.identifiers[name],),
+            ).rows
+        ]
+        self.assertEqual(2, len(rootchecks))
+        self.assertEqual(["attempted,ok", "attempted,denied"], [row[1] for row in rootchecks])
+
+        capability, tool_run, _ = self.leased(name, "member")
+        previous_root = self.server.root_secret
+        before = len(self.target.seen)
+        self.server.root_secret = seal.Root(
+            Path("wrong-proxy-identity-root"), b"z" * seal.KEY_BYTES
+        )
+        try:
+            status, decision = self.attempt(capability, self.identifiers[name])
+        finally:
+            self.server.root_secret = previous_root
+
+        self.assertEqual((502, proxy.REFUSED), (status, decision))
+        self.assertEqual(before, len(self.target.seen))
+        audit = self.connection.execute(
+            "SELECT count(DISTINCT operation_id),"
+            "       string_agg(outcome, ',' ORDER BY at, id)"
+            "  FROM secret_access_log"
+            " WHERE tool_run_id = $1::uuid AND verb = 'open_identity'",
+            (tool_run,),
+        ).rows[0]
+        self.assertEqual(1, int(audit[0]))
+        self.assertEqual("attempted,denied", str(audit[1]))
+
+    def test_a_stale_identity_revision_refuses_even_when_no_cookie_changed(self):
+        name = "identity-revision"
+        path = self.configurations[name]
+        material = scratch() / "identity-revision.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [{"name": "Authorization", "value": "Bearer first"}],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        first = identity.provision(
+            self.harness.runtime,
+            path,
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(first.ok, first.violations)
+        capability, _, _ = self.leased(name, "member")
+        binding = self.fence.open_identity(
+            self.identifiers[name],
+            capability,
+            str(
+                self.connection.execute(
+                    "SELECT entity_id::text FROM identities"
+                    " WHERE program_id = $1::uuid AND slot_name = 'member'",
+                    (self.identifiers[name],),
+                ).scalar()
+            ),
+            "member",
+            self.root_secret,
+        )
+        material.write_text(
+            material.read_text(encoding="utf-8").replace("Bearer first", "Bearer second"),
+            encoding="utf-8",
+        )
+        second = identity.provision(
+            self.harness.runtime,
+            path,
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(second.ok, second.violations)
+
+        with pg.connect(self.harness.proxy) as session:
+            session.execute(proxy.BIND, (self.identifiers[name],))
+            with self.assertRaises(pg.DatabaseError) as raised:
+                session.execute(
+                    "SELECT record_identity_proxy_exchange("
+                    "$1, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, $2, $3, NULL)",
+                    (capability, binding.label, binding.revision),
+                )
+
+        self.assertIn("revision changed during exchange", str(raised.exception))
 
     def test_a_live_identity_lease_injects_and_persists_a_private_session(self):
         credential = "rk2-identity-bearer-f237c9"
@@ -4268,7 +4614,7 @@ class ProxyEgressTest(DatabaseCase):
             ("127.0.0.1", 0),
             fence=fence,
             store=Store(self.root),
-            connector=lambda host, port, timeout, protocol, address: (
+            connector=lambda host, port, timeout, protocol, address, client_certificate: (
                 http.client.HTTPConnection("127.0.0.1", closed, timeout=timeout)
             ),
             resolver=self.look_up,

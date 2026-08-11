@@ -213,6 +213,34 @@ def canonical_address(value: str) -> str:
     return (mapped or address).compressed
 
 
+def address_refusal(value: str) -> str | None:
+    """Why an address may not be dialled, or nothing when the public internet routes it.
+
+    This is shared by policy compilation and the egress door.  An inclusion
+    that the compiler accepts must not become an address the proxy refuses only
+    after a capability has been spent.  A non-address is a refusal here too;
+    callers that also accept hostnames first decide whether the value is an
+    address literal before asking this question.
+    """
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return f"{value!r} is not an address"
+    if parsed.is_unspecified:
+        return f"{value} is the unspecified address"
+    if parsed.is_loopback:
+        return f"{value} is a loopback address"
+    if parsed.is_link_local:
+        return f"{value} is a link-local address"
+    if parsed.is_multicast:
+        # `is_global` is true for multicast, although it is not a destination
+        # this harness can send an ordinary target exchange to.
+        return f"{value} is a multicast address"
+    if not parsed.is_global:
+        return f"{value} is not a public address"
+    return None
+
+
 def unbracket(host: str) -> str:
     """A host with the brackets a URL puts around an IPv6 address removed.
 
@@ -932,9 +960,10 @@ def _refusal(source: str, detail: str) -> Violation:
 def _unroutable(host: str) -> bool:
     """Whether a host is an address literal outside the globally routable space."""
     try:
-        return not ipaddress.ip_address(host).is_global
+        ipaddress.ip_address(host)
     except ValueError:
         return False
+    return address_refusal(host) is not None
 
 
 # ---------------------------------------------------------------------------

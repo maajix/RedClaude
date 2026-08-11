@@ -127,13 +127,15 @@ class CompilationTest(unittest.TestCase):
         self.assertEqual([], [rule for rule in policy.rules if rule.effect == scope.EGRESS_SUPPORT])
         self.assertEqual(["oob-dns"], [channel.name for channel in policy.channels])
 
-    def test_an_inclusion_may_not_name_a_private_address(self):
-        text = SCOPED.replace('host = "api.example.net"', 'host = "10.0.0.1"')
+    def test_an_inclusion_may_not_name_an_address_the_proxy_will_refuse(self):
+        for address in ("10.0.0.1", "224.0.0.1", "ff02::1"):
+            with self.subTest(address=address):
+                text = SCOPED.replace('host = "api.example.net"', f'host = "{address}"')
 
-        # Index 1 because the loader has already sorted the rules by content: the
-        # source a refusal names is where the rule ended up, which is the same
-        # place the compiled ordinals come from.
-        self.assertEqual(("scope:scope.include[1].host",), refused(text))
+                # Index 1 because the loader has already sorted the rules by
+                # content: the source names where the rule ended up, which is
+                # the same place the compiled ordinals come from.
+                self.assertEqual(("scope:scope.include[1].host",), refused(text))
 
     def test_an_exclusion_may_name_a_private_address(self):
         # Breadth withdraws authority here, so the asymmetry runs the other way.
