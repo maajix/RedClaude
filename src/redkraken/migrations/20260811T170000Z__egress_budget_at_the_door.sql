@@ -440,12 +440,39 @@ RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
-DECLARE v_row egress_reservations%ROWTYPE;
+DECLARE
+    v_row  egress_reservations%ROWTYPE;
+    v_held egress_reservations%ROWTYPE;
 BEGIN
     IF p_reservation IS NULL OR p_contacted IS NULL THEN
         RETURN false;
     END IF;
     PERFORM set_actor('runtime');
+
+    -- Which slot this is, read without locking anything, because the refund
+    -- below has to take the counters in the reserver's order -- Program row,
+    -- then bucket -- and it cannot know which bucket without reading the row
+    -- first. An unlocked read is enough: the UPDATE further down carries the
+    -- whole idempotency guard, so a release that lost a race changes no row and
+    -- refunds nothing, having only taken locks it then drops.
+    --
+    -- Taking them the other way round is the bug this shape exists to avoid. A
+    -- refund holding the bucket and waiting for the Program row, against a
+    -- reservation holding the Program row and waiting for the bucket, is a
+    -- cycle, and PostgreSQL breaks a cycle by killing one of the two.
+    SELECT * INTO v_held FROM egress_reservations
+     WHERE id = p_reservation AND program_id = rk2_program() AND released_at IS NULL;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+
+    IF NOT p_contacted THEN
+        PERFORM 1 FROM program_egress_spend
+         WHERE program_id = v_held.program_id FOR UPDATE;
+        PERFORM 1 FROM program_egress_budget
+         WHERE program_id = v_held.program_id AND target = v_held.target FOR UPDATE;
+    END IF;
+
     UPDATE egress_reservations
        SET released_at = clock_timestamp(), contacted = p_contacted
      WHERE id = p_reservation AND program_id = rk2_program() AND released_at IS NULL
@@ -459,12 +486,12 @@ BEGIN
     -- target contacts rather than of attempts -- which is the number the
     -- criterion is about, and the number an operator means by "requests".
     IF NOT p_contacted THEN
-        UPDATE program_egress_budget
-           SET tokens = tokens + 1, contacted = greatest(contacted - 1, 0)
-         WHERE program_id = v_row.program_id AND target = v_row.target;
         UPDATE program_egress_spend
            SET contacted = greatest(contacted - 1, 0)
          WHERE program_id = v_row.program_id;
+        UPDATE program_egress_budget
+           SET tokens = tokens + 1, contacted = greatest(contacted - 1, 0)
+         WHERE program_id = v_row.program_id AND target = v_row.target;
     END IF;
     RETURN true;
 END $fn$;
@@ -492,6 +519,35 @@ REVOKE ALL ON TABLE program_egress_spend, program_egress_budget, egress_reservat
 REVOKE ALL ON TABLE program_egress_spend, program_egress_budget, egress_reservations
     FROM rk2_proxy, rk2_state, rk2_human;
 
+-- And `rk2_runtime` by name, which is the one that matters and the one a
+-- `FROM PUBLIC` revoke does not touch: 0029 standing-grants INSERT, UPDATE and
+-- DELETE on every table the owner creates to the runtime, so without this the
+-- process the model runs inside could refill its own bucket, zero its own
+-- total, or delete the rows holding its concurrency down -- and never call a
+-- verb to do any of it.
+--
+-- Two verbs rather than all of them, because `readwrite_on_every_managed_table`
+-- asserts the runtime keeps SELECT and INSERT everywhere, and narrowing that
+-- surface generally is ticket 66's, not this one's. Neither retained verb is a
+-- way in. An INSERT cannot lower a count that already exists, and a bucket
+-- inserted pre-filled is clamped on the next read: the refill is
+-- `least(burst, ...)`, so a token that policy never granted does not survive
+-- being looked at. What is left is the ability to spend against yourself, which
+-- is the direction a fence may safely fail in.
+REVOKE UPDATE, DELETE
+    ON TABLE program_egress_spend, program_egress_budget, egress_reservations
+    FROM rk2_runtime;
+
+-- The same hole, on the table the Halt itself lives in. `20260811T130000Z`
+-- revoked `program_halts` from PUBLIC only, and the actor-kind guard it relies
+-- on is a BEFORE INSERT OR UPDATE trigger -- so DELETE was checked by nothing
+-- and reachable by the runtime, and deleting the row is exactly as good as
+-- clearing the Halt: `resolve_egress_capability` asks whether a halted row
+-- exists. INSERT stays for the same reason as above and is closed by other
+-- means -- the actor-kind guard does see an insert, and one Program has one
+-- Halt row.
+REVOKE UPDATE, DELETE ON TABLE program_halts FROM rk2_runtime, rk2_proxy, rk2_state;
+
 
 -- ===========================================================================
 -- 6. The standing check
@@ -512,33 +568,54 @@ LANGUAGE sql STABLE AS $fn$
                'rk2_runtime',
                'reserve_egress_slot(text,text,text,integer,text,text)', 'EXECUTE')
     UNION ALL
-    -- (b) ...and the counters are nobody's to write directly. A proxy that
-    --     could UPDATE the bucket could refill it, which is the same as having
-    --     no bucket at all.
-    SELECT 'proxy_writes_budget_directly',
-           'rk2_proxy holds ' || p.privilege_type || ' on ' || p.table_name
+    -- (b) ...and the counters are nobody's to change directly. A role that could
+    --     UPDATE the bucket could refill it, which is the same as having no
+    --     bucket at all, and one that could DELETE a reservation could free its
+    --     own concurrency. Every role below the owner is named, the runtime most
+    --     of all: it is the process the model runs inside, and it is the one the
+    --     owner's default privileges hand new tables to.
+    --
+    --     INSERT is asked of the roles that should not reach these tables at all
+    --     and not of the runtime, which keeps it deliberately -- see the revoke.
+    SELECT 'budget_tables_writable',
+           p.grantee || ' holds ' || p.privilege_type || ' on ' || p.table_name
       FROM (
-        SELECT t.table_name, v.privilege_type
+        SELECT g.grantee, t.table_name, g.privilege_type
           FROM (VALUES ('program_egress_spend'), ('program_egress_budget'),
                        ('egress_reservations')) AS t(table_name),
-               (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) AS v(privilege_type)
-         WHERE has_table_privilege('rk2_proxy', t.table_name, v.privilege_type)
+               (VALUES ('rk2_runtime', 'UPDATE'), ('rk2_runtime', 'DELETE'),
+                       ('rk2_proxy', 'INSERT'), ('rk2_proxy', 'UPDATE'),
+                       ('rk2_proxy', 'DELETE'),
+                       ('rk2_state', 'INSERT'), ('rk2_state', 'UPDATE'),
+                       ('rk2_state', 'DELETE'),
+                       ('rk2_human', 'INSERT'), ('rk2_human', 'UPDATE'),
+                       ('rk2_human', 'DELETE')) AS g(grantee, privilege_type)
+         WHERE has_table_privilege(g.grantee, t.table_name, g.privilege_type)
       ) p
     UNION ALL
     -- (c) The rows, not the shapes: a Program whose door let through more
-    --     exchanges than its live policy allows. Counted over allowed Receipts
-    --     because those are the exchanges an auditor can see, and every one of
-    --     them spent a reservation.
+    --     exchanges than any policy it has ever carried allows. Counted over
+    --     allowed Receipts because those are the exchanges an auditor can see,
+    --     and every one of them spent a reservation.
+    --
+    --     Against the widest version rather than the live one, because a check
+    --     that read only the live one would fire for good on the day an operator
+    --     narrowed a budget: the exchanges already made were authorised by the
+    --     policy that was live when they were made, and a standing check nobody
+    --     can clear stops being a signal.
     SELECT 'budget_overspent',
-           p.slug || ': ' || count(r.id) || ' allowed of ' || sv.budget_requests
+           p.slug || ': ' || count(r.id) || ' allowed of ' || w.widest
       FROM programs p
-      JOIN program_scope_versions sv
-        ON sv.program_id = p.id AND sv.version = p.scope_version
+      JOIN (
+        SELECT sv.program_id, max(sv.budget_requests) AS widest
+          FROM program_scope_versions sv
+         WHERE sv.budget_requests IS NOT NULL
+         GROUP BY sv.program_id
+      ) w ON w.program_id = p.id
       JOIN receipts r
         ON r.program_id = p.id AND r.decision = 'allowed' AND r.lane = 'agent'
-     WHERE sv.budget_requests IS NOT NULL
-     GROUP BY p.slug, sv.budget_requests
-    HAVING count(r.id) > sv.budget_requests
+     GROUP BY p.slug, w.widest
+    HAVING count(r.id) > w.widest
     UNION ALL
     -- (d) A reservation that says it is both held and finished. The pair is
     --     what the concurrency count reads, so a row that disagrees with itself
@@ -551,7 +628,68 @@ $fn$;
 REVOKE ALL ON FUNCTION check_egress_budget() FROM PUBLIC;
 INSERT INTO standing_checks(name, query, owner_ticket, note) VALUES
     ('egress_budget', 'SELECT * FROM check_egress_budget()', '13',
-     'the budget verbs are the proxy''s alone, the counters are nobody''s to write, and no Program has more allowed exchanges than its live policy permits');
+     'the budget verbs are the proxy''s alone, the counters are nobody''s to write, and no Program has more allowed exchanges than any policy it carried permits');
 
 COMMENT ON FUNCTION check_egress_budget() IS
   'The aggregate request budget, asserted from both ends: who may spend it, and whether more was spent than exists.';
+
+
+-- ===========================================================================
+-- 7. The Halt, closed at the table as well as at the verb
+-- ===========================================================================
+--
+-- Criterion 2 is about who can lift a Halt, and `20260811T130000Z` answered it
+-- for the verbs only: `clear_program_halt` is the operator's, and the check
+-- below already says so. But a Halt is lifted by any of three things -- clearing
+-- it, updating its status, or deleting the row -- and the previous check probed
+-- the verb, so the two writes went unseen. They are revoked above; this is the
+-- assertion that keeps them revoked.
+
+CREATE OR REPLACE FUNCTION check_program_halt()
+RETURNS TABLE(problem text, detail text)
+LANGUAGE sql STABLE AS $fn$
+    SELECT 'human_cannot_connect', 'rk2_human cannot connect to this database'
+     WHERE NOT has_database_privilege('rk2_human', current_database(), 'CONNECT')
+    UNION ALL
+    SELECT 'human_cannot_use_schema', 'rk2_human cannot use the public schema'
+     WHERE NOT has_schema_privilege('rk2_human', 'public', 'USAGE')
+    UNION ALL
+    SELECT 'human_cannot_change_halt', 'rk2_human cannot execute both Halt verbs'
+     WHERE NOT has_function_privilege('rk2_human', 'halt_program(uuid,text)', 'EXECUTE')
+        OR NOT has_function_privilege(
+               'rk2_human', 'clear_program_halt(uuid,text)', 'EXECUTE')
+    UNION ALL
+    SELECT 'runtime_can_halt', 'rk2_runtime can execute halt_program'
+     WHERE has_function_privilege('rk2_runtime', 'halt_program(uuid,text)', 'EXECUTE')
+    UNION ALL
+    SELECT 'runtime_can_clear_halt', 'rk2_runtime can execute clear_program_halt'
+     WHERE has_function_privilege('rk2_runtime', 'clear_program_halt(uuid,text)', 'EXECUTE')
+    UNION ALL
+    SELECT 'proxy_can_change_halt', 'rk2_proxy can change Program Halt state'
+     WHERE has_function_privilege('rk2_proxy', 'halt_program(uuid,text)', 'EXECUTE')
+        OR has_function_privilege('rk2_proxy', 'clear_program_halt(uuid,text)', 'EXECUTE')
+    UNION ALL
+    -- The row itself. DELETE above all: the actor-kind guard is a BEFORE INSERT
+    -- OR UPDATE trigger, so it never sees a delete, and a deleted Halt is an
+    -- absent Halt -- which is what `resolve_egress_capability` reads.
+    --
+    -- INSERT is not asked, and is not revoked either: the guard does fire on it,
+    -- one Program has one Halt row, and an insert cannot lift a Halt that is
+    -- already there.
+    SELECT 'halt_row_writable',
+           h.grantee || ' holds ' || h.privilege_type || ' on program_halts'
+      FROM (
+        SELECT g.grantee, v.privilege_type
+          FROM (VALUES ('UPDATE'), ('DELETE')) AS v(privilege_type),
+               (VALUES ('rk2_runtime'), ('rk2_proxy'), ('rk2_state')) AS g(grantee)
+         WHERE has_table_privilege(g.grantee, 'program_halts', v.privilege_type)
+      ) h
+    UNION ALL
+    SELECT 'allowed_receipt_during_halt', r.label
+      FROM receipts r JOIN program_halts h ON h.program_id = r.program_id
+     WHERE h.status = 'halted' AND r.decision = 'allowed' AND r.ts_arrival >= h.changed_at;
+$fn$;
+
+UPDATE standing_checks
+   SET note = 'only an operator changes Halt state, by verb or by row, and a current Halt admits no later allowed Receipt'
+ WHERE name = 'program_halt';

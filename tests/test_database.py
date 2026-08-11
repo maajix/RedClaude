@@ -896,6 +896,21 @@ CONTROLS = (
         " reserve_egress_slot(text,text,text,integer,text,text) TO rk2_runtime",
     ),
     Control(
+        # Rule 2, and the one the verbs alone do not cover: the counters are
+        # ordinary tables, so a role that can UPDATE the bucket refills it
+        # without calling anything. The runtime is the role that matters --
+        # 0029's default privileges hand it every DML verb on each new table, so
+        # this control restores the state the migration's revoke undoes.
+        "standing:egress_budget",
+        "GRANT UPDATE ON program_egress_budget TO rk2_runtime",
+    ),
+    Control(
+        # Rule 2 again, on the Halt. A DELETE lifts it and the actor-kind guard
+        # never sees one: the trigger is BEFORE INSERT OR UPDATE.
+        "standing:program_halt",
+        "GRANT DELETE ON program_halts TO rk2_runtime",
+    ),
+    Control(
         # Rule 4: the bridge read as its owner. Every reference of every Program
         # would satisfy the policy on `artifacts` from any session.
         "standing:artifact_reachability",
@@ -5334,6 +5349,55 @@ class ProxyEgressTest(DatabaseCase):
         # nothing: a capability minted after it works.
         live, _, _ = self.mint("halted")
         self.assertEqual(200, self.attempt(live, program_id)[0])
+
+    def test_the_runtime_can_neither_delete_its_halt_nor_refill_its_budget(self):
+        # PH2-13, criteria 2 and 3, at the table rather than at the verb. The
+        # earlier test proves `clear_program_halt` is out of the runtime's reach;
+        # this one proves the row is too, which is a different fact -- the
+        # actor-kind guard is a BEFORE INSERT OR UPDATE trigger, so a DELETE
+        # passes it untouched, and an absent Halt is a lifted Halt.
+        #
+        # Same for the three counters. They are ordinary tables created by the
+        # owner, and the owner's default privileges standing-grant the runtime
+        # every DML verb on those, so the revoke is the only thing between the
+        # process the model runs inside and its own budget.
+        program_id = self.identifiers["shared"]
+        self.human.execute(
+            "SELECT halt_program($1::uuid, $2)", (program_id, "privilege self-test")
+        )
+        self.addCleanup(
+            self.human.execute,
+            "SELECT clear_program_halt($1::uuid, $2)",
+            (program_id, "privilege self-test done"),
+        )
+
+        writes = (
+            ("DELETE FROM program_halts WHERE program_id = $1::uuid", (program_id,)),
+            ("UPDATE program_halts SET status = 'cleared' WHERE program_id = $1::uuid",
+             (program_id,)),
+            ("UPDATE program_egress_spend SET contacted = 0 WHERE program_id = $1::uuid",
+             (program_id,)),
+            ("UPDATE program_egress_budget SET tokens = 1000000"
+             " WHERE program_id = $1::uuid", (program_id,)),
+            ("DELETE FROM egress_reservations WHERE program_id = $1::uuid", (program_id,)),
+        )
+        for statement, arguments in writes:
+            with self.subTest(statement=statement.split(" WHERE")[0]):
+                self.runtime.execute(proxy.BIND, (program_id,))
+                with self.assertRaises(pg.DatabaseError) as refused:
+                    self.runtime.execute(statement, arguments)
+                self.assertEqual("42501", refused.exception.sqlstate)
+
+        # And the Halt is still a Halt afterwards, which is the point: a refused
+        # write that left the row changed would be a privilege error hiding a
+        # successful one.
+        self.assertEqual(
+            "halted",
+            str(self.connection.execute(
+                "SELECT status FROM program_halts WHERE program_id = $1::uuid",
+                (program_id,),
+            ).scalar()),
+        )
 
     def test_an_exhausted_program_budget_stops_a_tool_run_that_never_spent_any(self):
         # PH2-13, criteria 3 and 4. The total is the Program's: two exchanges

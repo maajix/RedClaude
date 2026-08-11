@@ -735,6 +735,12 @@ AUTHORIZE_ADDRESS = (
 #: separates them from each other.
 LAPSED = "egress capability refused"
 
+#: And what both scope decisions say when the request is in scope no longer.
+#: Named beside `LAPSED` for the same reason: three refusals share `23514`, and
+#: the reservation has to tell the one that means "later" from the two that mean
+#: "no". A scope version replaced between the two decisions is the second kind.
+UNSCOPED = "egress request is outside current scope"
+
 #: One call, one transaction: the artifacts of the exchange and the Receipt that
 #: names them are written together or not at all. A Receipt naming bytes no row
 #: registered is a dangling reference, and rows for bytes no Receipt names are
@@ -946,14 +952,19 @@ class Fence:
                     ),
                 ).rows
             except pg.DatabaseError as error:
-                # Same two-into-one as the address check: the function resolves
-                # the capability before it looks at any limit, so a Tool run that
-                # closed between the first decision and this one arrives here. It
-                # is filed as what it is rather than as a budget refusal, because
-                # a caller told to retry after a lapsed capability would retry
-                # forever.
-                reason = "capability refused" if LAPSED in str(error) else "budget refused"
-                raise Refused(reason, str(error)) from error
+                # Three refusals arrive down this one path, because the function
+                # re-resolves the capability and re-finds the rule before it
+                # looks at any limit: a Tool run that closed between the two
+                # decisions, and a scope version replaced between them. Only the
+                # third is a budget, and only a budget is worth retrying, so the
+                # other two are filed under the name the first decision already
+                # gives them -- a scope refusal caught here and a scope refusal
+                # caught by `authorize` are one condition and read as one.
+                said = str(error)
+                unretryable = LAPSED in said or UNSCOPED in said
+                raise Refused(
+                    "capability refused" if unretryable else "budget refused", said
+                ) from error
         if not rows:
             raise Refused("budget refused", "no reservation verdict")
         reservation, granted, reason, retry_at, target = rows[0]
