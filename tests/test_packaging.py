@@ -35,6 +35,12 @@ class PackagingTest(unittest.TestCase):
             ["redkraken*"], self.pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
         )
 
+    def test_auth_resolution_evidence_is_shipped_with_the_application(self):
+        self.assertIn(
+            "evidence/*.json",
+            self.pyproject["tool"]["setuptools"]["package-data"]["redkraken"],
+        )
+
     def test_the_version_has_one_source(self):
         self.assertEqual(
             {"attr": "redkraken.__version__"},
