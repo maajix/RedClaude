@@ -809,7 +809,9 @@ WIRE_KEYING = (
     "  FROM ensure_proxy_wire_keying($1, $2::bytea, $3::bytea)"
 )
 
-BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)::text"
+#: Answers with the Receipt's label rather than its row id, because a label is
+#: the only name the agent reading this refusal can look up.
+BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)"
 
 #: The third decision, and the only one that is not about this request alone. It
 #: takes the capability rather than the Program for the same reason the address
@@ -1320,6 +1322,7 @@ class Fence:
         return number, root.program_key(salt, generation=number, program_id=program_id)
 
     def blocked_receipt(self, program_id: str, capability: str | None, receipt: dict) -> str:
+        """File one refusal and return the label it was filed under."""
         with self._lock:
             self._bind(program_id)
             answer = self.connection.execute(
@@ -2392,10 +2395,13 @@ class Handler(BaseHTTPRequestHandler):
             written = self.server.fence.blocked_receipt(program_id, capability, receipt)
         except (pg.DatabaseError, OSError, Refused) as error:
             self.log_error("no blocked receipt for %s: %s", program_id, error)
-        # The refusal names the row it just wrote, for the same reason the served
-        # path names its label: a caller that cannot cite the record cannot show
+        # The refusal names the row it just wrote, in the same words the served
+        # path names its own: a caller that cannot cite the record cannot show
         # that its request was refused rather than lost, and the runtime reads a
         # missing name as an integrity failure -- which is what it should mean.
+        # `write_blocked_receipt` answers with the label for that reason: a row id
+        # would be a name only this process and the schema can resolve, and the
+        # thing being told is the agent.
         #
         # What it does not carry is `refusal.detail`. That field holds whatever
         # explained the refusal here, and for a fence refusal what explained it is

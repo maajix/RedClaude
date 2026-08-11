@@ -313,7 +313,10 @@ class Stub:
 
     def blocked_receipt(self, program_id: str, capability: str | None, receipt: dict) -> str:
         self.blocked.append({"program_id": program_id, "receipt": receipt})
-        return "44444444-4444-4444-4444-444444444444"
+        # A label, because that is what the writer returns and what the caller
+        # can look up. A stub answering with a uuid would let a door that put a
+        # row id on the wire pass this suite.
+        return "R4"
 
 
 class HeaderTest(unittest.TestCase):
@@ -1534,10 +1537,14 @@ class ExchangeTest(unittest.TestCase):
         # Without it, "refused and recorded" and "refused and lost" are the same
         # answer on the wire, and `_spend` reads a refusal with no Receipt as an
         # integrity failure -- which is what it should mean.
+        #
+        # It is a label and not a row id, which is the same name the served path
+        # answers with. `rk state --label` resolves labels and nothing else, so a
+        # uuid here would be a citation the caller it is handed to cannot follow.
         response = self.through("http://target.example.test/v1/notes", capability=OTHER)
         response.read()
 
-        self.assertEqual("44444444-4444-4444-4444-444444444444", response.headers[proxy.RECEIPT])
+        self.assertEqual("R4", response.headers[proxy.RECEIPT])
         self.assertEqual(1, len(self.fence.blocked))
 
     def test_a_refusal_before_contact_records_no_moment_of_egress(self):
@@ -2014,7 +2021,7 @@ class TunnelTest(unittest.TestCase):
 
         self.assertEqual(407, answer.status)
         self.assertEqual(b"", answer.body)
-        self.assertEqual("44444444-4444-4444-4444-444444444444", answer.receipt)
+        self.assertEqual("R4", answer.receipt)
         # Named as well as recorded: a Receipt with no decision beside it is what
         # the runtime reads as a served request, and this one was not served.
         self.assertEqual(proxy.REFUSED, answer.decision)

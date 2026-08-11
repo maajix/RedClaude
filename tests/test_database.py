@@ -711,6 +711,19 @@ CONTROLS = (
         "INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
         " VALUES (" + repeat("a") + ", 0, 'credential_bearing', true)",
     ),
+    Control(
+        # Rule 6: the blocked-receipt writer answering with a row id again. A
+        # return type can only be changed by dropping the function, and the drop
+        # takes the proxy's grant with it, so a second arm of this same check
+        # fires alongside -- which is why a control names the check and not one
+        # problem. What it falsifies is that the gate would notice at all: before
+        # this arm, a migration re-declaring the writer this way put a name on
+        # the wire that `rk state --label` cannot resolve, silently.
+        "standing:capability_receipt_fence",
+        "DROP FUNCTION write_blocked_receipt(uuid,jsonb,text);"
+        " CREATE FUNCTION write_blocked_receipt(uuid,jsonb,text) RETURNS uuid"
+        " LANGUAGE sql AS $ctl$ SELECT uuidv7() $ctl$",
+    ),
     Control("standing:program_isolation", "CREATE TABLE public.orphan_table (id uuid PRIMARY KEY)"),
     Control(
         # A Program opened by hand around `rk run`, which is what the check is
@@ -5186,8 +5199,9 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(("agent", "blocked", "capability refused"), after[-1][:3])
 
         row = self.connection.execute(
-            "SELECT scheme, host, port, path, ts_egress FROM receipts WHERE id = $1::uuid",
-            (answer.receipt,),
+            "SELECT scheme, host, port, path, ts_egress FROM receipts"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (self.identifiers["a"], answer.receipt),
         ).rows[0]
 
         self.assertEqual(
@@ -5290,8 +5304,9 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("denied", str(row[0]))
         self.assertIsNone(row[1])
         blocked = self.connection.execute(
-            "SELECT decision, reason, host, ts_egress FROM receipts WHERE id = $1::uuid",
-            (result.facts["receipt"],),
+            "SELECT decision, reason, host, ts_egress FROM receipts"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (self.identifiers["a"], result.facts["receipt"]),
         ).rows[0]
 
         self.assertEqual(
@@ -5314,6 +5329,37 @@ class ProxyEgressTest(DatabaseCase):
         record = self.refused("a", "c" * 64, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
+
+    def test_a_refusal_answers_with_a_label_the_agent_connection_can_open(self):
+        # The served path names its Receipt's label and the refused path named
+        # the row's uuid, so `rk state --label` -- the only lookup an agent has
+        # -- answered "is not a record of this Program" for a record sitting
+        # right there, and "refused and filed" read exactly like "refused and
+        # lost". This walks the whole way rather than asserting the shape of the
+        # header: the name on the wire, the row it belongs to, and the read.
+        answer = self.answered("c" * 64, self.identifiers["a"])
+        named = answer.headers[proxy.RECEIPT]
+
+        self.assertEqual(407, answer.status)
+        self.assertRegex(named, r"^R[0-9]+$")
+        row = self.connection.execute(
+            "SELECT decision, reason FROM receipts"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (self.identifiers["a"], named),
+        ).rows[0]
+
+        self.assertEqual(("blocked", "capability refused"), (str(row[0]), str(row[1])))
+        cited = state.read(
+            self.harness.runtime,
+            self.harness.state,
+            self.configurations["a"],
+            label=named,
+        )
+
+        self.assertTrue(cited.ok, cited.violations)
+        self.assertTrue(cited.facts["record"]["present"], named)
+        self.assertEqual("receipt", cited.facts["record"]["kind"])
+        self.assertEqual("blocked", cited.facts["record"]["document"]["decision"])
 
     def test_a_capability_offered_twice_is_refused_and_the_database_holds_the_row(self):
         # A caller who sent one header twice used to get a refusal that left no
