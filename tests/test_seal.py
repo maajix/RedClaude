@@ -321,6 +321,49 @@ class RootTest(unittest.TestCase):
             len(root.program_key(b"s" * 32, generation=1, program_id=PROGRAM)), seal.KEY_BYTES
         )
 
+    def test_each_identity_gets_a_key_of_its_own_inside_one_program(self):
+        root = seal.load_root(written(b"a" * 64))
+        salt = b"s" * 32
+
+        first = root.identity_key(
+            salt,
+            generation=1,
+            program_id=PROGRAM,
+            identity_id="11111111-1111-1111-1111-111111111111",
+        )
+        second = root.identity_key(
+            salt,
+            generation=1,
+            program_id=PROGRAM,
+            identity_id="22222222-2222-2222-2222-222222222222",
+        )
+
+        self.assertEqual(seal.KEY_BYTES, len(first))
+        self.assertNotEqual(first, second)
+
+    def test_an_identity_slot_is_bound_to_its_identity_and_revision(self):
+        root = seal.load_root(written(b"a" * 64))
+        identity_id = "11111111-1111-1111-1111-111111111111"
+        key = root.identity_key(
+            b"s" * 32, generation=1, program_id=PROGRAM, identity_id=identity_id
+        )
+        aad = seal.identity_associated_data(
+            program_id=PROGRAM, identity_id=identity_id, generation=1, revision=4
+        )
+        encrypted = seal.seal(key, BODY, aad=aad)
+
+        with self.assertRaises(seal.Tampered):
+            seal.unseal(
+                key,
+                encrypted,
+                aad=seal.identity_associated_data(
+                    program_id=PROGRAM,
+                    identity_id=identity_id,
+                    generation=1,
+                    revision=5,
+                ),
+            )
+
     def test_the_audit_fingerprint_is_four_keyed_bytes(self):
         root = seal.load_root(written(b"a" * 64))
         fingerprint = root.fingerprint(BODY)

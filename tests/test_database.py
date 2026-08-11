@@ -47,6 +47,7 @@ from redkraken import (
     artifact,
     backup,
     config,
+    identity,
     integrity,
     migrate,
     pg,
@@ -1269,6 +1270,37 @@ class ProgramRunTest(DatabaseCase):
             self.revisions(result.facts["program_id"]),
         )
 
+    def test_the_program_projects_only_identity_labels_to_the_agent_read_surface(self):
+        slug = f"{RUN_SLUG}-identity"
+        source = self.configuration(slug)
+        opened = program.run(self.harness.runtime, source)
+
+        visible = state.read(self.harness.runtime, self.harness.state, source)
+
+        self.assertTrue(opened.ok, opened.violations)
+        self.assertTrue(visible.ok, visible.violations)
+        entity_labels = [
+            item["label"]
+            for item in visible.facts["state"]["records"]
+            if item["kind"] == "entity"
+        ]
+        full_records = [
+            state.read(self.harness.runtime, self.harness.state, source, label=label)
+            for label in entity_labels
+        ]
+        identities = [
+            result
+            for result in full_records
+            if result.facts["record"]["document"]["type"] == "identity"
+        ]
+        self.assertEqual(1, len(identities))
+        [full] = identities
+        document = full.facts["record"]["document"]
+        self.assertEqual("member", document["descriptor"])
+        self.assertEqual("user", document["identity_class"])
+        self.assertNotIn("slot://", json.dumps(visible.as_dict()))
+        self.assertNotIn("slot://", json.dumps(full.as_dict()))
+
     def test_the_same_command_resumes_rather_than_opening_a_second_program(self):
         # Criterion 2: the identity is the slug and the policy is the canonical
         # hash, so the second run is the same Program even from a different path.
@@ -1283,10 +1315,10 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(1, self.programs(slug))
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(first.facts["program_id"])])
 
-    def test_opening_and_resuming_each_emit_exactly_one_event(self):
-        # Criterion 4. The first is trigger-authored, from the row write; the
-        # second is written by the command, because a sweep that changed nothing
-        # is still a fact about the Program and no trigger can observe it.
+    def test_opening_projects_the_identity_and_resuming_emits_one_more_event(self):
+        # The configured Identity is durable Program state now, so opening emits
+        # its creation and initial scope projection beside program.configured.
+        # Resuming adds only run.resumed because neither projection moved.
         slug = f"{RUN_SLUG}-events"
 
         opened = self.run_for(slug)
@@ -1296,12 +1328,16 @@ class ProgramRunTest(DatabaseCase):
         after_resume = self.events(program_id)
 
         self.assertEqual(
-            [("program.configured", "program_configurations", "runtime")],
+            [
+                ("program.configured", "program_configurations", "runtime"),
+                ("entity.created", "entities", "runtime"),
+                ("entity.updated", "entities", "runtime"),
+            ],
             [event[:3] for event in after_open],
         )
-        self.assertEqual(2, len(after_resume))
-        self.assertEqual(("run.resumed", None, "runtime"), after_resume[1][:3])
-        payload = json.loads(after_resume[1][3])
+        self.assertEqual(4, len(after_resume))
+        self.assertEqual(("run.resumed", None, "runtime"), after_resume[3][:3])
+        payload = json.loads(after_resume[3][3])
         self.assertEqual(1, payload["configuration_revision"])
         self.assertEqual(0, payload["counts"]["tasks_unclaimed"])
 
@@ -1340,7 +1376,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(program.STOPPED_REFUSED, changed.facts["stop_reason"])
         self.assertEqual(1, changed.facts["configuration"]["revision"])
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
-        self.assertEqual(1, len(self.events(program_id)))
+        self.assertEqual(3, len(self.events(program_id)))
 
     def test_a_change_the_operator_accepts_becomes_the_next_revision(self):
         # The other side of criterion 3: an explicit revision, never a silent
@@ -1368,7 +1404,14 @@ class ProgramRunTest(DatabaseCase):
         # A policy change and a resume both happened, and the log says both.
         events = self.events(program_id)
         self.assertEqual(
-            ["program.configured", "program.configured", "run.resumed"],
+            [
+                "program.configured",
+                "entity.created",
+                "entity.updated",
+                "program.configured",
+                "entity.updated",
+                "run.resumed",
+            ],
             [event[0] for event in events],
         )
         # And the budget the Program now runs under is readable as a before and
@@ -1397,7 +1440,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
         self.assertEqual("retired", result.facts["lifecycle"])
         self.assertEqual(program_id, result.facts["program_id"])
-        self.assertEqual(1, len(self.events(program_id)))
+        self.assertEqual(3, len(self.events(program_id)))
 
     def test_a_database_that_is_not_ready_is_refused_before_anything_is_written(self):
         # Criterion 5, the first half, at the last point it can still be true:
@@ -1918,10 +1961,11 @@ class StateReadTest(DatabaseCase):
         self.assertNotEqual(
             first.facts["record"]["digest"], second.facts["record"]["digest"]
         )
-        # The second Program holds one record of one kind, and the first holds
-        # everything else this case wrote. Neither count includes the other.
+        # The second Program holds its configured Identity beside the technology,
+        # and the first holds everything else this case wrote. Neither count
+        # includes the other Program's colliding labels.
         self.assertEqual(
-            [("entity", 1)],
+            [("entity", 2)],
             [
                 (item["kind"], item["count"])
                 for item in second.facts["state"]["kinds"]
@@ -3219,8 +3263,9 @@ class ProxyEgressTest(DatabaseCase):
         # live, kept apart from `a` because those are counted: a suite that
         # asserts "two Receipts and no more" under the Program every other test
         # uses is a suite where adding a test breaks an unrelated one.
-        for name in ("a", "b", "retired", "shared", "credential"):
-            path = write(SCOPED.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
+        for name in ("a", "b", "retired", "shared", "credential", "lease", "other"):
+            source = SCOPED + "\n[[identity]]\nname = \"member\"\nslot_ref = \"slot://identity/member\"\n"
+            path = write(source.replace('name = "matrix-web"', f'name = "{PROXY_SLUG}-{name}"'))
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, opened.violations
             cls.configurations[name] = path
@@ -3432,7 +3477,13 @@ class ProxyEgressTest(DatabaseCase):
             self.connection.execute("SELECT set_actor('runtime', 'selftest')")
             return str(self.connection.execute(sql, parameters).scalar())
 
-    def leased(self, name: str) -> tuple[str, str, str]:
+    def leased(
+        self,
+        name: str,
+        identity_label: str | None = None,
+        *,
+        approval_ready: bool = False,
+    ) -> tuple[str, str, str]:
         """A capability whose run holds a task lease, the way a subagent's does.
 
         `mint` imitates the operator path, and that path has no task -- nor may
@@ -3470,12 +3521,49 @@ class ProxyEgressTest(DatabaseCase):
                     str(run),
                     task,
                     proxy.TOOL,
-                    json.dumps({"url": URL, "method": "GET", "identity_slot": ""}),
+                    json.dumps(
+                        {
+                            "url": URL,
+                            "method": "GET",
+                            "identity_slot": identity_label or "",
+                        }
+                    ),
                 ),
             ).scalar()
+        if identity_label is not None:
+            self.owner(
+                "INSERT INTO identity_leases"
+                " (program_id, identity_entity_id, holder_agent_run_id, expires_at)"
+                " SELECT $1::uuid, i.entity_id, $2::uuid, now() + interval '10 minutes'"
+                "   FROM identities i"
+                "  WHERE i.program_id = $1::uuid AND i.slot_name = $3"
+                "    AND i.invalidated_at IS NULL",
+                (self.identifiers[name], str(run), identity_label),
+            )
         gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (str(opened),)).scalar()
         answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
         capability = answer.get("capability")
+        if capability is None and identity_label is not None and not approval_ready:
+            self.assertEqual("ask", answer.get("decision"))
+            decision = str(
+                self.runtime.execute(
+                    "SELECT park_for_human($1::uuid, interval '10 minutes')",
+                    (str(opened),),
+                ).scalar()
+            )
+            self.human.execute(proxy.BIND, (self.identifiers[name],))
+            with self.human.transaction():
+                self.human.execute(
+                    "SELECT answer_decision($1, 'approved', 'selftest leased Identity',"
+                    " interval '10 minutes')",
+                    (decision,),
+                )
+            self.owner(
+                "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+                " finished_at = now() WHERE id = $1::uuid",
+                (task,),
+            )
+            return self.leased(name, identity_label, approval_ready=True)
         self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
         return str(capability), str(opened), task
 
@@ -3551,6 +3639,260 @@ class ProxyEgressTest(DatabaseCase):
                 ).scalar()
             ),
         )
+
+    def test_identity_provisioning_leaves_only_an_encrypted_control_side_slot(self):
+        marker = "rk2-provisioned-bearer-6d28ea"
+        material = scratch() / "identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {marker}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["b"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+
+        self.assertTrue(provisioned.ok, provisioned.violations)
+        self.assertEqual(1, provisioned.facts["identity"]["revision"])
+        row = self.connection.execute(
+            "SELECT s.revision, s.alg, encode(s.envelope, 'hex'), s.byte_size"
+            "  FROM identity_slots s JOIN identities i ON i.entity_id = s.identity_entity_id"
+            " WHERE s.program_id = $1::uuid AND i.slot_name = 'member'",
+            (self.identifiers["b"],),
+        ).rows[0]
+        self.assertEqual(1, int(row[0]))
+        self.assertEqual(seal.ALG, str(row[1]))
+        self.assertNotIn(marker.encode().hex(), str(row[2]))
+        self.assertGreater(int(row[3]), len(marker))
+        self.assertEqual(
+            (),
+            self.connection.execute(
+                "SELECT relation, attribute FROM find_in_database($1) WHERE hits > 0",
+                (marker,),
+            ).rows,
+        )
+        self.assertNotIn(marker, json.dumps(provisioned.as_dict()))
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT has_table_privilege('rk2_state', 'identity_slots', 'SELECT')"
+            ).scalar()
+        )
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT has_function_privilege("
+                " 'rk2_state', 'provision_identity_slot(uuid,text,bigint,jsonb)', 'EXECUTE')"
+            ).scalar()
+        )
+
+    def test_a_live_identity_lease_injects_and_persists_a_private_session(self):
+        credential = "rk2-identity-bearer-f237c9"
+        cookie = "rk2-identity-cookie-6b0a41"
+        material = scratch() / "leased-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {credential}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["credential"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+
+        previous = LiveTarget.response_headers
+        LiveTarget.response_headers = (("Set-Cookie", f"session={cookie}; Path=/; HttpOnly"),)
+        self.addCleanup(setattr, LiveTarget, "response_headers", previous)
+        capability, tool_run, _ = self.leased("credential", "member")
+        first_seen = len(self.target.seen)
+        client = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=proxy.TIMEOUT
+        )
+        try:
+            client.request(
+                "GET",
+                URL,
+                headers={
+                    proxy.AUTHORIZATION: f"RedKraken {capability}",
+                    proxy.PROGRAM: self.identifiers["credential"],
+                },
+            )
+            answer = client.getresponse()
+            answer.read()
+            self.assertEqual(200, answer.status)
+            self.assertIsNone(answer.headers.get("Set-Cookie"))
+        finally:
+            client.close()
+
+        LiveTarget.response_headers = ()
+        self.assertEqual(
+            (200, None),
+            self.attempt(capability, self.identifiers["credential"]),
+        )
+        first_headers = dict(self.target.seen[first_seen][2])
+        second_headers = dict(self.target.seen[first_seen + 1][2])
+        self.assertEqual(f"Bearer {credential}", first_headers.get("authorization"))
+        self.assertIsNone(first_headers.get("cookie"))
+        self.assertEqual(f"Bearer {credential}", second_headers.get("authorization"))
+        self.assertIn(f"session={cookie}", second_headers.get("cookie", ""))
+
+        rows = self.connection.execute(
+            "SELECT r.identity_entity_id::text, r.request_agent_sha, r.request_wire_sha,"
+            "       r.response_agent_sha, r.response_wire_sha,"
+            "       s.ciphertext_sha256, s.kek_gen, encode(k.salt, 'hex')"
+            "  FROM receipts r"
+            "  JOIN artifact_seal s ON s.sha256 = r.request_wire_sha"
+            "  JOIN secret_kek k ON k.gen = s.kek_gen"
+            " WHERE r.tool_run_id = $1::uuid AND r.decision = 'allowed'"
+            " ORDER BY r.ts_arrival, r.label",
+            (tool_run,),
+        ).rows
+        self.assertEqual(2, len(rows))
+        self.assertEqual(1, len({str(row[0]) for row in rows}))
+        for row in rows:
+            agent_sha, wire_sha, ciphertext_sha = map(str, (row[1], row[2], row[5]))
+            self.assertNotEqual(agent_sha, wire_sha)
+            visible = Store(self.root).load(agent_sha)
+            self.assertNotIn(credential.encode(), visible)
+            self.assertNotIn(cookie.encode(), visible)
+            envelope = Store(self.root).load(ciphertext_sha)
+            generation = int(row[6])
+            opened = seal.unseal(
+                self.root_secret.program_key(
+                    bytes.fromhex(str(row[7])),
+                    generation=generation,
+                    program_id=self.identifiers["credential"],
+                ),
+                seal.Sealed.decode(envelope),
+                aad=seal.associated_data(
+                    program_id=self.identifiers["credential"],
+                    sha256=wire_sha,
+                    generation=generation,
+                ),
+            )
+            self.assertIn(credential.encode(), opened)
+
+        slot = self.connection.execute(
+            "SELECT s.revision, encode(s.envelope, 'hex')"
+            "  FROM identity_slots s JOIN identities i ON i.entity_id = s.identity_entity_id"
+            " WHERE s.program_id = $1::uuid AND i.slot_name = 'member'",
+            (self.identifiers["credential"],),
+        ).rows[0]
+        self.assertEqual(2, int(slot[0]), "the first response persisted its cookie jar")
+        self.assertNotIn(credential.encode().hex(), str(slot[1]))
+        self.assertNotIn(cookie.encode().hex(), str(slot[1]))
+        for secret in (credential, cookie):
+            self.assertFalse(
+                self.connection.execute("SELECT * FROM find_in_database($1)", (secret,)).rows
+            )
+
+    def test_an_identity_cannot_be_shared_crossed_or_used_after_its_lease_expires(self):
+        marker = "rk2-exclusive-identity-91b7fd"
+        material = scratch() / "exclusive-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "http://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {marker}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            self.harness.runtime,
+            self.configurations["lease"],
+            "member",
+            material,
+            root_secret=self.root_secret,
+        )
+        self.assertTrue(provisioned.ok, provisioned.violations)
+        capability, tool_run, _ = self.leased("lease", "member")
+
+        before = len(self.target.seen)
+        self.assertEqual((200, None), self.attempt(capability, self.identifiers["lease"]))
+        self.assertEqual(before + 1, len(self.target.seen))
+        self.assertEqual(
+            f"Bearer {marker}", dict(self.target.seen[-1][2]).get("authorization")
+        )
+
+        # The same stable label exists in both Programs. Binding the request to
+        # the other Program cannot turn that label into the other Program's row.
+        crossed = self.attempt(capability, self.identifiers["other"])
+        self.assertEqual((407, proxy.REFUSED), crossed)
+        self.assertEqual(before + 1, len(self.target.seen))
+
+        second_holder = self.owned(
+            "INSERT INTO agent_runs"
+            " (program_id, role, runs_as, model, effort, mission_packet)"
+            " VALUES ($1::uuid, 'orchestrator', 'session', 'selftest', 'low', '{}'::jsonb)"
+            " RETURNING id::text",
+            (self.identifiers["lease"],),
+        )
+        with self.assertRaises(pg.DatabaseError):
+            self.owner(
+                "INSERT INTO identity_leases"
+                " (program_id, identity_entity_id, holder_agent_run_id, expires_at)"
+                " SELECT $1::uuid, i.entity_id, $2::uuid, now() + interval '10 minutes'"
+                "   FROM identities i"
+                "  WHERE i.program_id = $1::uuid AND i.slot_name = 'member'",
+                (self.identifiers["lease"], second_holder),
+            )
+
+        self.owner(
+            "UPDATE identity_leases SET expires_at = now() - interval '1 minute'"
+            " WHERE holder_agent_run_id ="
+            "       (SELECT agent_run_id FROM tool_runs WHERE id = $1::uuid)"
+            "   AND released_at IS NULL",
+            (tool_run,),
+        )
+        expired = self.attempt(capability, self.identifiers["lease"])
+        self.assertEqual((407, proxy.REFUSED), expired)
+        self.assertEqual(before + 1, len(self.target.seen))
+        still_live = self.connection.execute(
+            "SELECT status, egress_token_sha256 IS NOT NULL"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (tool_run,),
+        ).rows[0]
+        self.assertEqual(("running", True), (str(still_live[0]), bool(still_live[1])))
 
     def test_one_request_is_served_and_one_allowed_receipt_records_it(self):
         # Criteria 2 and 4, from the caller's side. The report names the Receipt

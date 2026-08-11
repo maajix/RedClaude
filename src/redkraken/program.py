@@ -449,6 +449,16 @@ def _open_program(
                 reason=reason,
             )
 
+        identity_revision = (
+            state.revision.revision if state.revision is not None else next_revision
+        )
+        _project_identities(
+            connection,
+            configuration,
+            str(state.program_id),
+            revision=identity_revision,
+        )
+
         # Every answer that keeps the Program open leaves it running a compiled
         # policy, resume included: a Program opened before this path existed has
         # `scope_version` NULL, and NULL is a Program nothing may be sent to.
@@ -726,6 +736,93 @@ def _project_scope(
         "compiled": True,
         "reprojected": moved,
     }
+
+
+def _project_identities(
+    connection: pg.Connection,
+    configuration: config.Configuration,
+    program_id: str,
+    *,
+    revision: int,
+) -> None:
+    """Project configured Identity labels without making slot references readable.
+
+    The configuration document is the operator's declaration of which stable
+    labels exist.  ``secret_ref`` retains only the control-side ``slot://``
+    reference, and the state role's column grant excludes it.  Updating the
+    redacted entity metadata in the same transaction gives a configuration
+    change one Event without copying that reference into the Event payload.
+    """
+    configured = {
+        str(item["name"]): str(item["slot_ref"])
+        for item in configuration.document["identity"]
+    }
+    rows = connection.execute(
+        "SELECT i.entity_id::text, i.slot_name, i.secret_ref, i.invalidated_at IS NOT NULL,"
+        "       e.metadata ->> 'configuration_revision'"
+        "  FROM identities i JOIN entities e ON e.id = i.entity_id"
+        " WHERE i.program_id = $1::uuid"
+        "   AND e.metadata ->> 'source' = 'program_configuration'",
+        (program_id,),
+    ).rows
+    existing = {str(row[1]): row for row in rows}
+
+    for label, reference in configured.items():
+        current = existing.get(label)
+        metadata = json.dumps(
+            {
+                "configuration_revision": revision,
+                "source": "program_configuration",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if current is None:
+            entity_id = connection.execute(
+                "INSERT INTO entities (program_id, type, dedup_key, metadata)"
+                " VALUES ($1::uuid, 'identity', $2, $3::jsonb) RETURNING id::text",
+                (program_id, f"configured-identity:{label}", metadata),
+            ).scalar()
+            connection.execute(
+                "INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
+                " VALUES ($1::uuid, $2, 'user', $3)",
+                (str(entity_id), label, reference),
+            )
+            continue
+
+        entity_id, _, prior_reference, invalidated, _ = current
+        if str(prior_reference) == reference and not bool(invalidated):
+            continue
+        connection.execute(
+            "UPDATE identities SET secret_ref = $2, invalidated_at = NULL"
+            " WHERE entity_id = $1::uuid",
+            (str(entity_id), reference),
+        )
+        connection.execute(
+            "UPDATE entities SET metadata = $2::jsonb WHERE id = $1::uuid",
+            (str(entity_id), metadata),
+        )
+
+    for label, current in existing.items():
+        if label in configured or bool(current[3]):
+            continue
+        entity_id = str(current[0])
+        metadata = json.dumps(
+            {
+                "configuration_revision": revision,
+                "source": "program_configuration",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "UPDATE identities SET invalidated_at = now() WHERE entity_id = $1::uuid",
+            (entity_id,),
+        )
+        connection.execute(
+            "UPDATE entities SET metadata = $2::jsonb WHERE id = $1::uuid",
+            (entity_id, metadata),
+        )
 
 
 def _encode(rows: list[dict]) -> str:

@@ -19,6 +19,7 @@ from redkraken import (
     artifact,
     backup,
     doctor,
+    identity,
     migrate,
     pg,
     program,
@@ -268,6 +269,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     inspect.set_defaults(run=_state)
+
+    identities = commands.add_parser(
+        "identity",
+        help="seal operator-provided authentication material into a named Identity slot",
+    )
+    identity_operations = identities.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+    identity_provision = identity_operations.add_parser(
+        "provision",
+        help=(
+            "replace one configured Identity's encrypted proxy-side session "
+            f"(${DATABASE_URL})"
+        ),
+    )
+    _add_url(identity_provision, RUNTIME)
+    _add_key(identity_provision)
+    identity_provision.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program and Identity label",
+    )
+    identity_provision.add_argument(
+        "--identity",
+        required=True,
+        metavar="label",
+        help="the stable configured Identity label to provision",
+    )
+    identity_provision.add_argument(
+        "--from",
+        dest="source",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="a control-side JSON credential document; its values are never reported",
+    )
+    identity_provision.set_defaults(run=_identity_provision)
 
     artifacts = commands.add_parser(
         "artifact", help="store, read and verify this Program's content-addressed artifacts"
@@ -709,6 +749,26 @@ def _state(arguments: argparse.Namespace) -> int:
                 label=arguments.label,
                 per_kind=arguments.limit,
                 byte_limit=arguments.byte_limit,
+            ),
+        )
+    )
+
+
+def _identity_provision(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, identity.COMMAND)
+    key = _key(ledger, arguments.key)
+    if runtime is None or key is None:
+        return _render(report(identity.COMMAND, ledger))
+    return _render(
+        _guarded(
+            identity.COMMAND,
+            lambda: identity.provision(
+                runtime,
+                arguments.config,
+                arguments.identity,
+                arguments.source,
+                key_path=key,
             ),
         )
     )

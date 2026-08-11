@@ -62,6 +62,7 @@ OTHER = "b" * 64
 
 #: The Program every request here is filed under.
 PROGRAM_ID = "11111111-1111-1111-1111-111111111111"
+IDENTITY_ID = "55555555-5555-5555-5555-555555555555"
 
 #: What a refused capability looks like from the database, in the shape `pg`
 #: renders one: the SQLSTATE, the message, and the frame it was raised in.
@@ -127,6 +128,7 @@ class Stub:
         self.addressed: list[tuple] = []
         self.allowed: list[dict] = []
         self.blocked: list[dict] = []
+        self.identity: proxy.IdentityBinding | None = None
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -168,6 +170,7 @@ class Stub:
         receipt: dict,
         artifacts: list[dict],
         seals: list[dict] | None = None,
+        identity: proxy.IdentityBinding | None = None,
     ) -> dict:
         if self.fail:
             raise proxy.Refused("receipt write refused")
@@ -177,9 +180,23 @@ class Stub:
                 "receipt": receipt,
                 "artifacts": artifacts,
                 "seals": list(seals or []),
+                "identity": identity,
             }
         )
         return {"receipt_id": "33333333-3333-3333-3333-333333333333", "label": "R1"}
+
+    def open_identity(
+        self,
+        program_id: str,
+        capability: str,
+        identity_entity_id: str,
+        identity_label: str,
+        root: seal.Root,
+    ) -> proxy.IdentityBinding:
+        if self.identity is None:
+            raise proxy.Refused("identity slot refused", "the Identity has no provisioned slot")
+        self.asserts = (program_id, capability, identity_entity_id, identity_label, root)
+        return self.identity
 
     def wire_key(
         self, program_id: str, capability: str, root: seal.Root
@@ -793,6 +810,65 @@ class ExchangeTest(unittest.TestCase):
         )
         self.assertIn(marker.encode(), opened)
         self.assertFalse((self.root / description["sha256"][:2] / description["sha256"]).exists())
+
+    def test_a_named_identity_is_injected_without_entering_the_agent_view(self):
+        marker = "rk2-target-bearer-identity-8c40d1"
+        root = seal.Root(Path("test-only-root"), b"i" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "http://target.example.test/",
+                        "headers": [{"name": "Authorization", "value": f"Bearer {marker}"}],
+                        "cookies": [],
+                    }
+                ],
+            },
+        )
+
+        response = self.through("http://target.example.test/v1/identity")
+        response.read()
+
+        _, _, seen = self.target.seen[0]
+        self.assertEqual(
+            [f"Bearer {marker}"],
+            [value for name, value in seen if name == "authorization"],
+        )
+        recorded = self.fence.allowed[0]
+        receipt = recorded["receipt"]
+        self.assertEqual(IDENTITY_ID, receipt["identity_entity_id"])
+        self.assertNotEqual(receipt["request_agent_sha"], receipt["request_wire_sha"])
+        visible = Store(self.root).load(receipt["request_agent_sha"])
+        self.assertNotIn(marker.encode(), visible)
+
+        [description] = [item for item in recorded["seals"] if item["field"] == "target_request"]
+        envelope = Store(self.root).load(description["ciphertext_sha256"])
+        self.assertNotIn(marker.encode(), envelope)
+        key = self.fence.wire_key(PROGRAM_ID, CAPABILITY, root)[1]
+        opened = seal.unseal(
+            key,
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=PROGRAM_ID,
+                sha256=description["sha256"],
+                generation=description["kek_gen"],
+            ),
+        )
+        self.assertIn(marker.encode(), opened)
 
     def test_a_target_credential_response_fails_closed_without_the_artifact_key(self):
         marker = "rk2-target-cookie-no-key"

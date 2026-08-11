@@ -83,14 +83,14 @@ import ssl
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urljoin, urlsplit
 
-from redkraken import config, migrate, pg, program, scope, seal, tls
+from redkraken import config, identity, migrate, pg, program, scope, seal, tls
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -118,6 +118,7 @@ __all__ = [
     "Authorization",
     "Control",
     "Fence",
+    "IdentityBinding",
     "Refused",
     "Server",
     "capability_of",
@@ -344,6 +345,29 @@ class Authorization:
     tool_run_id: str
     scope_version: int
     scope_class: str
+    identity_entity_id: str | None = None
+    identity_label: str | None = None
+
+
+@dataclass
+class IdentityBinding:
+    """One leased Identity slot opened into short-lived proxy memory."""
+
+    entity_id: str
+    label: str
+    revision: int
+    session: identity.Session = field(repr=False)
+    generation: int = 0
+    salt: bytes = field(default=b"", repr=False)
+    root: seal.Root | None = field(default=None, repr=False)
+    changed: bool = False
+
+    @classmethod
+    def provisioned(
+        cls, *, entity_id: str, label: str, revision: int, material: dict
+    ) -> IdentityBinding:
+        """Build a binding from control-side material before it is encrypted."""
+        return cls(entity_id, label, revision, identity.Session.from_material(material))
 
 
 # ---------------------------------------------------------------------------
@@ -596,8 +620,9 @@ def _loopback(host: str) -> bool:
 #: whose answer the socket is opened against. So the proxy sends what it
 #: canonicalised and the function refuses anything that is not canonical.
 AUTHORIZE = (
-    "SELECT program_id::text, tool_run_id::text, scope_version, scope_class"
-    "  FROM authorize_egress_request($1, $2, $3, $4, $5::integer, $6, $7, $8)"
+    "SELECT program_id::text, tool_run_id::text, scope_version, scope_class,"
+    "       identity_entity_id::text, identity_label"
+    "  FROM authorize_identity_egress_request($1, $2, $3, $4, $5::integer, $6, $7)"
 )
 
 #: The second decision, about the address rather than the name. It is a separate
@@ -612,7 +637,7 @@ AUTHORIZE = (
 #: serving cannot have an address checked against somebody else's policy.
 AUTHORIZE_ADDRESS = (
     "SELECT scope_class, reason"
-    "  FROM authorize_egress_address($1, $2, $3, $4::integer, $5)"
+    "  FROM authorize_identity_egress_address($1, $2, $3, $4::integer, $5)"
 )
 
 #: What that function says when the capability, rather than the address, is what
@@ -625,7 +650,16 @@ LAPSED = "egress capability refused"
 #: names them are written together or not at all. A Receipt naming bytes no row
 #: registered is a dangling reference, and rows for bytes no Receipt names are
 #: an artifact nobody can reach.
-RECORD_SEALED = "SELECT record_proxy_exchange($1, $2::jsonb, $3::jsonb, $4::jsonb)"
+RECORD_SEALED = (
+    "SELECT record_identity_proxy_exchange("
+    "$1, $2::jsonb, $3::jsonb, $4::jsonb, $5, $6::bigint, $7::jsonb)"
+)
+
+OPEN_IDENTITY = (
+    "SELECT identity_entity_id::text, identity_label, revision, alg, nonce_hex,"
+    "       kek_gen, envelope_hex, ciphertext_sha256, salt_hex, root_check_hex"
+    "  FROM open_identity_slot($1, $2)"
+)
 
 WIRE_KEYING = (
     "SELECT generation, salt_hex, root_check_hex"
@@ -704,19 +738,20 @@ class Fence:
                         request.port,
                         request.path_raw,
                         request.path_norm,
-                        "",
                     ),
                 ).rows
             except pg.DatabaseError as error:
                 raise Refused("capability refused", str(error)) from error
         if not rows:
             raise Refused("capability refused", "no capability resolved")
-        found, tool_run, version, klass = rows[0]
+        found, tool_run, version, klass, identity_id, identity_label = rows[0]
         return Authorization(
             program_id=str(found),
             tool_run_id=str(tool_run),
             scope_version=int(version),
             scope_class=str(klass),
+            identity_entity_id=str(identity_id) if identity_id is not None else None,
+            identity_label=str(identity_label) if identity_label is not None else None,
         )
 
     def authorize_address(
@@ -762,6 +797,7 @@ class Fence:
         receipt: dict,
         artifacts: list[dict],
         seals: list[dict] | None = None,
+        binding: IdentityBinding | None = None,
     ) -> dict:
         """Record one exchange, under the Program this request was decided for.
 
@@ -772,6 +808,29 @@ class Fence:
         rebind the session to its own Program. Binding again is what stops a
         served exchange from failing to record because somebody else was faster.
         """
+        state: dict | None = None
+        expected_revision: int | None = None
+        identity_label: str | None = None
+        if binding is not None:
+            identity_label = binding.label
+            expected_revision = binding.revision
+            if binding.changed:
+                if binding.root is None or not binding.salt or binding.generation < 1:
+                    raise Refused(
+                        "identity slot refused",
+                        "the opened Identity has no authenticated keying context",
+                        status=502,
+                    )
+                state = identity.seal_session(
+                    binding.session,
+                    root=binding.root,
+                    program_id=program_id,
+                    identity_id=binding.entity_id,
+                    generation=binding.generation,
+                    salt=binding.salt,
+                    revision=binding.revision + 1,
+                )
+
         with self._lock:
             self._bind(program_id)
             try:
@@ -782,11 +841,72 @@ class Fence:
                         json.dumps(receipt),
                         json.dumps(artifacts),
                         json.dumps(seals or []),
+                        identity_label,
+                        expected_revision,
+                        json.dumps(state) if state is not None else None,
                     ),
                 ).scalar()
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
         return _object(answer)
+
+    def open_identity(
+        self,
+        program_id: str,
+        capability: str,
+        entity_id: str,
+        label: str,
+        root: seal.Root,
+    ) -> IdentityBinding:
+        """Open exactly the Identity the live capability currently leases."""
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(OPEN_IDENTITY, (capability, label)).rows
+            except pg.DatabaseError as error:
+                raise Refused("identity slot refused", str(error)) from error
+        if not rows:
+            raise Refused("identity slot refused", "no live Identity slot resolved")
+        (
+            found_id,
+            found_label,
+            revision,
+            alg,
+            nonce_hex,
+            generation,
+            envelope_hex,
+            ciphertext_sha256,
+            salt_hex,
+            root_check_hex,
+        ) = rows[0]
+        if str(found_id) != entity_id or str(found_label) != label:
+            raise Refused("identity slot refused", "the selected Identity changed")
+        envelope = bytes.fromhex(str(envelope_hex))
+        if not hmac.compare_digest(digest(envelope), str(ciphertext_sha256)):
+            raise seal.Tampered("Identity slot envelope digest disagrees")
+        salt = bytes.fromhex(str(salt_hex))
+        number = int(generation)
+        session = identity.open_session(
+            root=root,
+            program_id=program_id,
+            identity_id=entity_id,
+            revision=int(revision),
+            generation=number,
+            salt=salt,
+            root_check=bytes.fromhex(str(root_check_hex)),
+            alg=str(alg),
+            nonce=bytes.fromhex(str(nonce_hex)),
+            envelope=envelope,
+        )
+        return IdentityBinding(
+            entity_id=entity_id,
+            label=label,
+            revision=int(revision),
+            session=session,
+            generation=number,
+            salt=salt,
+            root=root,
+        )
 
     def wire_key(
         self, program_id: str, capability: str, root: seal.Root
@@ -1355,21 +1475,66 @@ class Handler(BaseHTTPRequestHandler):
     ) -> None:
         """Send the authorized request, record the exchange, answer the caller."""
         authority = _authority(request.host, request.port, request.protocol)
-        headers = [("Host", authority), *forwardable(self.headers)]
+        agent_headers = [("Host", authority), *forwardable(self.headers)]
         if body:
-            headers.append(("Content-Length", str(len(body))))
-        if not any(name.lower() == "accept-encoding" for name, _ in headers):
+            agent_headers.append(("Content-Length", str(len(body))))
+        if not any(name.lower() == "accept-encoding" for name, _ in agent_headers):
             # `http.client` adds this one when the caller does not, and a
             # transcript that omitted it would be a hash of bytes that differ
             # from the ones the socket carried.
-            headers.append(("Accept-Encoding", "identity"))
+            agent_headers.append(("Accept-Encoding", "identity"))
         target = origin_form(url)
         line = f"{self.command} {target} HTTP/1.1"
+
+        binding: IdentityBinding | None = None
+        wire_headers = list(agent_headers)
+        if authorization.identity_entity_id is not None:
+            root = self.server.root_secret
+            if root is None:
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    Refused(
+                        "identity slot refused",
+                        "an authenticated exchange needs the proxy artifact key",
+                        status=502,
+                    ),
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                )
+            try:
+                binding = self.server.fence.open_identity(
+                    authorization.program_id,
+                    capability,
+                    authorization.identity_entity_id,
+                    authorization.identity_label or "",
+                    root,
+                )
+            except (identity.Invalid, seal.Tampered, seal.Unusable) as error:
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    Refused("identity slot refused", str(error), status=502),
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                )
+            except Refused as refusal:
+                return self._refuse(
+                    authorization.program_id,
+                    capability,
+                    refusal,
+                    arrival,
+                    url=url,
+                    authorization=authorization,
+                )
+            wire_headers = binding.session.inject(url, agent_headers)
 
         egress = datetime.now(timezone.utc)
         try:
             status, reason, back, returned = self._exchange(
-                request, addresses, target, headers, body
+                request, addresses, target, wire_headers, body
             )
         except Refused as refusal:
             return self._refuse(
@@ -1382,16 +1547,27 @@ class Handler(BaseHTTPRequestHandler):
                 egress=egress,
             )
 
-        sent = transcript(line, headers, body)
+        sent = transcript(line, agent_headers, body)
+        wire_sent = transcript(line, wire_headers, body)
+        if binding is not None:
+            binding.changed = binding.session.capture(url, back)
         agent_back = response_for_agent(back)
         received = transcript(f"HTTP/1.1 {status} {reason}", agent_back, returned)
+        wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
         store = self.server.store
         request_sha, request_new = store.put(sent)
         response_sha, response_new = store.put(received)
 
         seals: list[dict] = []
-        ciphertext_new = False
-        if agent_back != back:
+        ciphertext_new: set[str] = set()
+        transformations = [
+            (wire_sent, request_sha, "target_request")
+            for _ in range(1 if wire_sent != sent else 0)
+        ] + [
+            (wire_received, response_sha, "target_response")
+            for _ in range(1 if wire_received != received else 0)
+        ]
+        if transformations:
             root = self.server.root_secret
             if root is None:
                 if request_new:
@@ -1403,7 +1579,7 @@ class Handler(BaseHTTPRequestHandler):
                     capability,
                     Refused(
                         "wire response refused",
-                        "the target returned authentication material but the door has no artifact key",
+                        "the exchange carried authentication material but the door has no artifact key",
                         status=502,
                         target_status=status,
                     ),
@@ -1432,33 +1608,35 @@ class Handler(BaseHTTPRequestHandler):
                     egress=egress,
                 )
 
-            wire = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
-            wire_sha = digest(wire)
-            encrypted = seal.seal(
-                key,
-                wire,
-                aad=seal.associated_data(
-                    program_id=authorization.program_id,
-                    sha256=wire_sha,
-                    generation=generation,
-                ),
-            )
-            envelope = encrypted.encode()
-            ciphertext_sha, ciphertext_new = store.put(envelope)
-            seals.append(
-                {
-                    "sha256": wire_sha,
-                    "byte_size": len(wire),
-                    "content_type": TRANSCRIPT,
-                    "alg": encrypted.alg,
-                    "nonce_hex": encrypted.nonce.hex(),
-                    "kek_gen": generation,
-                    "ciphertext_sha256": ciphertext_sha,
-                    "agent_sha256": response_sha,
-                    "value_fpr_hex": root.fingerprint(wire).hex(),
-                    "field": "target_response",
-                }
-            )
+            for wire, agent_sha, field_name in transformations:
+                wire_sha = digest(wire)
+                encrypted = seal.seal(
+                    key,
+                    wire,
+                    aad=seal.associated_data(
+                        program_id=authorization.program_id,
+                        sha256=wire_sha,
+                        generation=generation,
+                    ),
+                )
+                envelope = encrypted.encode()
+                ciphertext_sha, is_new = store.put(envelope)
+                if is_new:
+                    ciphertext_new.add(ciphertext_sha)
+                seals.append(
+                    {
+                        "sha256": wire_sha,
+                        "byte_size": len(wire),
+                        "content_type": TRANSCRIPT,
+                        "alg": encrypted.alg,
+                        "nonce_hex": encrypted.nonce.hex(),
+                        "kek_gen": generation,
+                        "ciphertext_sha256": ciphertext_sha,
+                        "agent_sha256": agent_sha,
+                        "value_fpr_hex": root.fingerprint(wire).hex(),
+                        "field": field_name,
+                    }
+                )
 
         # Where the target pointed, when it pointed anywhere. The door does not
         # follow it and must not: following would be an exchange the client never
@@ -1492,9 +1670,14 @@ class Handler(BaseHTTPRequestHandler):
             "ts_egress": egress.isoformat(),
             "waited_ms": int((datetime.now(timezone.utc) - egress).total_seconds() * 1000),
             "request_agent_sha": request_sha,
-            "request_wire_sha": None,
+            "request_wire_sha": next(
+                (item["sha256"] for item in seals if item["field"] == "target_request"), None
+            ),
             "response_agent_sha": response_sha,
-            "response_wire_sha": seals[0]["sha256"] if seals else None,
+            "response_wire_sha": next(
+                (item["sha256"] for item in seals if item["field"] == "target_response"), None
+            ),
+            "identity_entity_id": authorization.identity_entity_id,
             "scope_class": authorization.scope_class,
             "intercepted": True,
             # Every address the name answered with, and the one that was dialled
@@ -1513,7 +1696,12 @@ class Handler(BaseHTTPRequestHandler):
         ]
         try:
             written = self.server.fence.allowed_receipt(
-                authorization.program_id, capability, receipt, artifacts, seals
+                authorization.program_id,
+                capability,
+                receipt,
+                artifacts,
+                seals,
+                binding,
             )
         except Refused as refusal:
             # The bytes are spent: the target has answered and cannot be asked to
@@ -1529,8 +1717,8 @@ class Handler(BaseHTTPRequestHandler):
                 store.discard(request_sha)
             if response_new:
                 store.discard(response_sha)
-            if ciphertext_new:
-                store.discard(seals[0]["ciphertext_sha256"])
+            for sha256 in ciphertext_new:
+                store.discard(sha256)
             return self._refuse(
                 authorization.program_id,
                 capability,

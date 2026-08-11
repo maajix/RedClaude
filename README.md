@@ -132,6 +132,33 @@ over the file as written and `canonical_sha256` over its normalised content, so
 reformatting does not change the policy's identity — and never a reference or a
 header value.
 
+Provision an Identity from the operator side after opening the Program:
+
+```sh
+rk run --config program.toml
+rk identity provision \
+  --config program.toml \
+  --identity member \
+  --from member-identity.json \
+  --key /run/secrets/redkraken-root.key
+```
+
+The input is a closed JSON document with `schema_version: 1` and a non-empty
+`origins` list. Each origin has an absolute HTTP(S) `url`, a list of static
+`headers` (`name` and `value`), and a list of initial `cookies` written as
+`Set-Cookie` values. Keep this file on the control side with the same care as
+the credential itself. The command reports only the Identity label, encrypted
+slot revision, and counts; PostgreSQL receives an authenticated ciphertext,
+not the document.
+
+An Agent can select the stable label but cannot provision or open the slot. On
+each authenticated exchange the proxy resolves the label under the Program,
+rechecks that the Agent run holds the live exclusive Identity Lease, injects
+origin-bound headers and cookies, and persists target-issued cookies back into
+the encrypted slot. Credential-bearing response headers remain only in the
+encrypted wire view; the Agent-visible request and response have their own
+hashes in the Receipt.
+
 ## Outcomes
 
 `rk doctor` aggregates: it reports every violation it found, not the first, and

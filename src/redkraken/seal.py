@@ -118,6 +118,24 @@ def associated_data(*, program_id: str, sha256: str, generation: int) -> bytes:
     ).encode("utf-8")
 
 
+def identity_associated_data(
+    *, program_id: str, identity_id: str, generation: int, revision: int
+) -> bytes:
+    """Bind mutable slot ciphertext to one Identity and one monotonic revision.
+
+    Slot plaintext deliberately has no unkeyed digest in canonical state: a
+    small cookie or password document must not become offline-guessable through
+    its hash.  The authenticated revision prevents an older, otherwise valid
+    envelope being moved back onto the current row.
+    """
+    if revision < 1:
+        raise ValueError("an Identity slot revision starts at one")
+    return (
+        f"rk2/identity-slot/v1|alg={ALG}|gen={generation}|program={program_id}"
+        f"|identity={identity_id}|revision={revision}"
+    ).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class Sealed:
     """One ciphertext and everything needed to authenticate it, minus the key."""
@@ -268,6 +286,24 @@ class Root:
             self._kek(salt, generation),
             salt=b"",
             info=f"rk2/artifact-dek/v1|program={program_id}".encode("utf-8"),
+            length=KEY_BYTES,
+        )
+
+    def identity_key(
+        self,
+        salt: bytes,
+        *,
+        generation: int,
+        program_id: str,
+        identity_id: str,
+    ) -> bytes:
+        """One Identity's key, isolated from every other Identity and Artifact."""
+        return hkdf(
+            self._kek(salt, generation),
+            salt=b"",
+            info=(
+                f"rk2/identity-dek/v1|program={program_id}|identity={identity_id}"
+            ).encode("utf-8"),
             length=KEY_BYTES,
         )
 

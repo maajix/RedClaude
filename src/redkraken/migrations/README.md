@@ -1,6 +1,6 @@
 # The schema corpus
 
-Forty-eight files that build the production database, applied in filename order by
+Forty-nine files that build the production database, applied in filename order by
 `rk db migrate`. Nothing else applies them: there is no shell script, no
 `docker exec psql`, and no ordering that lives in someone's head.
 

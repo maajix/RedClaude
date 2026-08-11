@@ -581,6 +581,63 @@ class StateCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
 
 
+class IdentityCommandTest(unittest.TestCase):
+    """Identity provisioning is an explicit operator adapter, never a net tool input."""
+
+    def test_provisioning_names_every_control_side_input_without_echoing_values(self):
+        marker = "rk2-cli-credential-2fd3b1"
+        material = scratch() / "identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer {marker}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = run(
+            "identity",
+            "provision",
+            "--config", str(write(VALID)),
+            "--identity", "member",
+            "--from", str(material),
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        rendered = json.loads(result.stdout)
+        self.assertEqual("identity provision", rendered["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_KEY", "environment:RK_DATABASE_URL"],
+            sorted(item["source"] for item in rendered["violations"]),
+        )
+        self.assertNotIn(marker, result.stdout)
+        self.assertNotIn(marker, result.stderr)
+
+    def test_the_credential_document_and_identity_label_are_required(self):
+        missing_material = run(
+            "identity", "provision", "--config", str(write(VALID)), "--identity", "member"
+        )
+        missing_identity = run(
+            "identity",
+            "provision",
+            "--config", str(write(VALID)),
+            "--from", str(write("{}", "identity.json")),
+        )
+
+        self.assertEqual(EXIT_USAGE, missing_material.returncode)
+        self.assertEqual(EXIT_USAGE, missing_identity.returncode)
+
+
 class ArtifactCommandTest(unittest.TestCase):
     """`rk artifact`, up to the point where a database is needed.
 
