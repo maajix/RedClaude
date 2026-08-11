@@ -5664,7 +5664,11 @@ class ProxyEgressTest(DatabaseCase):
         child = self.refused("shared", capability, program_id)
 
         self.assertEqual(200, parent[0])
-        self.assertEqual(("agent", "blocked", "capability refused"), child[:3])
+        # Named as the Halt rather than as a lapse. A Halt refuses by making the
+        # capability resolve to nothing, which is what an expired token does, so
+        # without the writer saying which it was the one refusal an operator
+        # caused reads like the one nobody can lift.
+        self.assertEqual(("agent", "blocked", "program halted"), child[:3])
         self.assertEqual(dialled, len(self.dialled), "a socket was opened during Halt")
         halt_payload = json.loads(halted) if isinstance(halted, str) else dict(halted)
         self.assertEqual("halted", halt_payload["status"])
