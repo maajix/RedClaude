@@ -638,6 +638,47 @@ class IdentityCommandTest(unittest.TestCase):
         self.assertEqual(EXIT_USAGE, missing_identity.returncode)
 
 
+class HeaderCommandTest(unittest.TestCase):
+    """`rk header provision`, which is the same adapter over a shorter secret."""
+
+    def test_provisioning_names_every_control_side_input_without_echoing_the_value(self):
+        marker = "rk2-cli-bounty-identifier-6b1f04"
+        value = scratch() / "bounty-id.txt"
+        value.write_text(marker, encoding="utf-8")
+
+        result = run(
+            "header",
+            "provision",
+            "--config", str(write(VALID)),
+            "--header", "X-Bounty-Id",
+            "--from", str(value),
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        rendered = json.loads(result.stdout)
+        self.assertEqual("header provision", rendered["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_KEY", "environment:RK_DATABASE_URL"],
+            sorted(item["source"] for item in rendered["violations"]),
+        )
+        self.assertNotIn(marker, result.stdout)
+        self.assertNotIn(marker, result.stderr)
+
+    def test_the_value_file_and_the_header_name_are_required(self):
+        missing_value = run(
+            "header", "provision", "--config", str(write(VALID)), "--header", "X-Bounty-Id"
+        )
+        missing_name = run(
+            "header",
+            "provision",
+            "--config", str(write(VALID)),
+            "--from", str(write("x", "bounty-id.txt")),
+        )
+
+        self.assertEqual(EXIT_USAGE, missing_value.returncode)
+        self.assertEqual(EXIT_USAGE, missing_name.returncode)
+
+
 class ArtifactCommandTest(unittest.TestCase):
     """`rk artifact`, up to the point where a database is needed.
 

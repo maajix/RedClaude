@@ -143,6 +143,26 @@ def identity_associated_data(
     ).encode("utf-8")
 
 
+def header_associated_data(
+    *, program_id: str, name: str, generation: int, revision: int
+) -> bytes:
+    """Bind a required-header ciphertext to one Program, name and revision.
+
+    A bounty identifier is a short string, so the same rule that governs Identity
+    material governs this: no unkeyed digest of the plaintext exists anywhere, or
+    the value becomes guessable from the row that stores it. The header name is
+    covered because a value sealed for one header must not open as another's, and
+    the revision is covered because an older envelope that still authenticates is
+    an old identifier being replayed onto a live Program.
+    """
+    if revision < 1:
+        raise ValueError("a header slot revision starts at one")
+    return (
+        f"rk2/header-slot/v1|alg={ALG}|gen={generation}|program={program_id}"
+        f"|header={name.lower()}|revision={revision}"
+    ).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class Sealed:
     """One ciphertext and everything needed to authenticate it, minus the key."""
@@ -310,6 +330,19 @@ class Root:
             salt=b"",
             info=(
                 f"rk2/identity-dek/v1|program={program_id}|identity={identity_id}"
+            ).encode("utf-8"),
+            length=KEY_BYTES,
+        )
+
+    def header_key(
+        self, salt: bytes, *, generation: int, program_id: str, name: str
+    ) -> bytes:
+        """One required header's key, isolated from every other header and Artifact."""
+        return hkdf(
+            self._kek(salt, generation),
+            salt=b"",
+            info=(
+                f"rk2/header-dek/v1|program={program_id}|header={name.lower()}"
             ).encode("utf-8"),
             length=KEY_BYTES,
         )

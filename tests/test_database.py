@@ -48,6 +48,7 @@ from redkraken import (
     artifact,
     backup,
     config,
+    header,
     identity,
     integrity,
     migrate,
@@ -3517,6 +3518,24 @@ class ProxyEgressTest(DatabaseCase):
         # generation this proxy may establish first.
         cls.root_secret = seal.Root(Path("live-proxy-selftest-root"), SECRET)
 
+        # Every configuration above declares `X-Bounty-Id`, and a declared header
+        # with no provisioned value is a request the door refuses before it dials.
+        # So the value exists here for the same reason the target does: the thing
+        # under test is what reaches the wire, and a Program that cannot reach it
+        # tests nothing. `bounty-id` is the marker the header assertions look for.
+        cls.bounty_id = "rk2-selftest-bounty-9c4e17"
+        value = scratch() / "bounty-id.txt"
+        value.write_text(cls.bounty_id, encoding="utf-8")
+        for name, path in cls.configurations.items():
+            sealed = header.provision(
+                cls.harness.runtime,
+                path,
+                "X-Bounty-Id",
+                value,
+                root_secret=cls.root_secret,
+            )
+            assert sealed.ok, (name, sealed.violations)
+
         cls.resolved = []
         cls.dialled = []
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
@@ -4246,6 +4265,7 @@ class ProxyEgressTest(DatabaseCase):
                 "SELECT operation_id, string_agg(outcome, ',' ORDER BY at, id)"
                 " FROM secret_access_log"
                 " WHERE program_id = $1::uuid AND verb = 'rootcheck'"
+                "   AND field = 'identity_slot'"
                 " GROUP BY operation_id ORDER BY min(at), operation_id",
                 (self.identifiers[name],),
             ).rows
@@ -4256,6 +4276,9 @@ class ProxyEgressTest(DatabaseCase):
         capability, tool_run, _ = self.leased(name, "member")
         previous_root = self.server.root_secret
         before = len(self.target.seen)
+        # A wrong root at the door breaks the required header too, and the order
+        # is what this asserts: the Identity is opened first, so its refusal is
+        # the one that comes back and the header is never reached.
         self.server.root_secret = seal.Root(
             Path("wrong-proxy-identity-root"), b"z" * seal.KEY_BYTES
         )
@@ -4762,9 +4785,10 @@ class ProxyEgressTest(DatabaseCase):
     def test_the_receipt_names_the_bytes_of_both_directions_and_they_are_stored(self):
         # The other half of criterion 4: a Receipt that names a hash nothing
         # registered proves nothing, so the row, the artifact and the file on
-        # disk are asked about together. No wire view is claimed: this target
-        # issued no authentication material, so the exchange sent exactly what
-        # the agent may read. Ticket 12 adds injected Identity material.
+        # disk are asked about together. The request claims a wire view and the
+        # response does not: this Program requires a header, so what left the
+        # door is not what the agent may read, and the target issued no
+        # authentication material, so what came back is.
         row = self.connection.execute(
             "SELECT r.request_agent_sha, r.response_agent_sha, r.request_wire_sha,"
             "       r.response_wire_sha, r.status_code, r.method, r.host, r.port, r.path"
@@ -4781,7 +4805,8 @@ class ProxyEgressTest(DatabaseCase):
             ).rows
         }
 
-        self.assertIsNone(row[2])
+        self.assertIsNotNone(row[2])
+        self.assertNotEqual(request_sha, str(row[2]))
         self.assertIsNone(row[3])
         self.assertEqual((200, "GET", "app.example.com", 80, "/notes"), tuple(row[4:9]))
         self.assertEqual({request_sha, response_sha}, set(stored))
@@ -4808,6 +4833,124 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual([], [name for name in names if name.startswith(proxy.INTERNAL)])
         for _, value in headers:
             self.assertNotIn("RedKraken", value)
+
+    def test_the_required_header_reached_the_target_and_stayed_out_of_the_agent_view(self):
+        """Story 8 end to end, over a real fence, a real slot and a real socket.
+
+        The stub in `tests/test_proxy.py` proves the handler puts the value on
+        the wire. This proves the value came out of the database, through the
+        capability, under the installation root -- and that the record the Agent
+        may read does not contain it.
+        """
+        _, _, headers = self.arrived
+        row = self.connection.execute(
+            "SELECT request_agent_sha, request_wire_sha FROM receipts"
+            " WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
+            (self.sent.facts["tool_run"]["id"],),
+        ).rows[0]
+        visible = Store(self.root).load(str(row[0]))
+
+        self.assertEqual(
+            [self.bounty_id], [value for name, value in headers if name == "x-bounty-id"]
+        )
+        self.assertNotIn(self.bounty_id.encode(), visible)
+        self.assertNotIn(b"X-Bounty-Id", visible)
+        # And the wire view exists, is not the agent's, and is not on disk in
+        # the clear: the door wrote what it sent, sealed, beside what it showed.
+        wire_sha = str(row[1])
+        self.assertNotEqual(str(row[0]), wire_sha)
+        self.assertFalse(artifact.path_for(self.root, wire_sha).exists())
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT * FROM find_in_database($1)", (self.bounty_id,)
+            ).rows
+        )
+
+    def test_a_header_the_configuration_does_not_declare_is_refused_unsealed(self):
+        """The declaration is the authority, and it is checked before the key.
+
+        A value sealed into a slot no policy names is a value the door never
+        sends and an operator who believes their traffic carries it.
+        """
+        value = scratch() / "undeclared-header.txt"
+        value.write_text("rk2-undeclared-header-2b71fe", encoding="utf-8")
+
+        refused = header.provision(
+            self.harness.runtime,
+            self.configurations["b"],
+            "X-Not-Declared",
+            value,
+            root_secret=self.root_secret,
+        )
+
+        self.assertFalse(refused.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, refused.exit_code)
+        self.assertEqual(
+            ["argument:--header"], [item.source for item in refused.violations]
+        )
+        self.assertIn("X-Bounty-Id", refused.violations[0].detail)
+        self.assertEqual(
+            0,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM program_header_slots"
+                    " WHERE program_id = $1::uuid AND lower(name) = 'x-not-declared'",
+                    (self.identifiers["b"],),
+                ).scalar()
+            ),
+        )
+
+    def test_a_replaced_header_value_takes_the_next_revision_and_the_door_sends_it(self):
+        """Rotation, which is the operation a bounty identifier actually gets.
+
+        The revision is authenticated as associated data, so a slot rolled back
+        to an earlier ciphertext cannot open; asserting it moves is asserting
+        that the rollback has something to fail against.
+        """
+        name = "other"
+        first = scratch() / "rotate-first.txt"
+        first.write_text("rk2-rotated-first-8f20ac", encoding="utf-8")
+        second = scratch() / "rotate-second.txt"
+        second.write_text("rk2-rotated-second-3ce914", encoding="utf-8")
+
+        before = header.provision(
+            self.harness.runtime,
+            self.configurations[name],
+            "X-Bounty-Id",
+            first,
+            root_secret=self.root_secret,
+        )
+        after = header.provision(
+            self.harness.runtime,
+            self.configurations[name],
+            "x-bounty-id",
+            second,
+            root_secret=self.root_secret,
+        )
+
+        self.assertTrue(before.ok, before.violations)
+        self.assertTrue(after.ok, after.violations)
+        self.assertEqual(
+            before.facts["header"]["revision"] + 1, after.facts["header"]["revision"]
+        )
+        # One row, in the declaration's spelling rather than the operator's.
+        row = self.connection.execute(
+            "SELECT count(*), min(name), min(byte_size) FROM program_header_slots"
+            " WHERE program_id = $1::uuid",
+            (self.identifiers[name],),
+        ).rows[0]
+
+        self.assertEqual((1, "X-Bounty-Id", 25), (int(row[0]), str(row[1]), int(row[2])))
+
+        capability, tool_run, _ = self.mint(name)
+        status, _ = self.attempt(capability, self.identifiers[name])
+        _, _, headers = self.target.seen[-1]
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["rk2-rotated-second-3ce914"],
+            [value for header_name, value in headers if header_name == "x-bounty-id"],
+        )
 
     def test_target_credentials_are_absent_from_the_agent_and_sealed_on_the_wire(self):
         marker = "rk2-live-target-cookie-91ae73"
@@ -4873,8 +5016,17 @@ class ProxyEgressTest(DatabaseCase):
             "  FROM secret_access_log WHERE tool_run_id = $1::uuid",
             (tool_run,),
         ).rows
+        # Every touch of key material for this one exchange, in the order it
+        # happened: the required header opened on the way out, then both
+        # directions sealed. The request is sealed too, because the header the
+        # door added is not in the agent's copy of it.
         self.assertEqual(
-            [("seal", "program", program_id, tool_run, "target_response", "ok")],
+            [
+                ("open", "program", program_id, tool_run, "header_slot", "attempted"),
+                ("open", "program", program_id, tool_run, "header_slot", "ok"),
+                ("seal", "program", program_id, tool_run, "target_request", "ok"),
+                ("seal", "program", program_id, tool_run, "target_response", "ok"),
+            ],
             [tuple(map(str, item)) for item in access],
         )
 
@@ -4981,10 +5133,11 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("target", str(row[11]))
         self.assertTrue(row[7], "a terminated tunnel is an intercepted exchange")
         self.assertEqual(self.secured.facts["receipt"], str(row[8]))
-        # And no wire view is claimed. What the door saw of the target's own
-        # connection is not what the agent read, and the row says so by leaving
-        # the two wire hashes null rather than by repeating the agent's.
-        self.assertIsNone(row[9])
+        # And the wire view is claimed on the side that has one. The request left
+        # with a header the agent never saw, so the row names a different hash;
+        # the response came back with nothing the agent may not read, so the row
+        # says so by leaving that hash null rather than by repeating the agent's.
+        self.assertIsNotNone(row[9])
         self.assertIsNone(row[10])
 
     def test_the_tunnelled_request_reached_the_target_with_no_control_header(self):
@@ -5101,6 +5254,10 @@ class ProxyEgressTest(DatabaseCase):
             ),
             resolver=self.look_up,
             authority=self.authority,
+            # A door with no root cannot open the header this Program requires,
+            # and refuses before it dials. This case is about what happens when
+            # it does dial, so it carries the same key the others do.
+            root_secret=self.root_secret,
         )
         thread = threading.Thread(target=door.serve_forever, daemon=True)
         thread.start()

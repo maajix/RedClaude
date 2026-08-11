@@ -197,6 +197,11 @@ class Stub:
         self.allowed: list[dict] = []
         self.blocked: list[dict] = []
         self.identity: proxy.IdentityBinding | None = None
+        #: What the Program requires on every request, and it requires none by
+        #: default. A stub that always returned one would make every test in this
+        #: file a header test; the ones that are about required headers set this.
+        self.required: list[tuple[str, str]] | Exception = []
+        self.opened: list[tuple] = []
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -289,6 +294,14 @@ class Stub:
             raise proxy.Refused("identity slot refused", "the Identity has no provisioned slot")
         self.asserts = (program_id, capability, identity_entity_id, identity_label, root)
         return self.identity
+
+    def required_headers(
+        self, program_id: str, capability: str, root: seal.Root | None
+    ) -> list[tuple[str, str]]:
+        self.opened.append((program_id, capability, root))
+        if isinstance(self.required, Exception):
+            raise self.required
+        return list(self.required)
 
     def wire_key(
         self, program_id: str, capability: str, root: seal.Root
@@ -991,6 +1004,97 @@ class ExchangeTest(unittest.TestCase):
             ),
         )
         self.assertIn(marker.encode(), opened)
+
+    def test_a_required_header_reaches_the_target_and_not_the_agent_view(self):
+        """The whole of story 8: the target sees it, the model does not.
+
+        Written against the wire the target read rather than against the receipt,
+        because the failure this covers was a harness in which the record and the
+        agent view agreed perfectly about a header neither of them had.
+        """
+        marker = "rk2-bounty-identifier-4d81ba"
+        root = seal.Root(Path("test-only-root"), b"h" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.required = [("X-Bounty-Id", marker)]
+
+        response = self.through("http://target.example.test/v1/required")
+        response.read()
+
+        _, _, seen = self.target.seen[0]
+        self.assertEqual(
+            [marker], [value for name, value in seen if name == "x-bounty-id"]
+        )
+        recorded = self.fence.allowed[0]
+        receipt = recorded["receipt"]
+        self.assertNotEqual(receipt["request_agent_sha"], receipt["request_wire_sha"])
+        visible = Store(self.root).load(receipt["request_agent_sha"])
+        self.assertNotIn(marker.encode(), visible)
+        self.assertNotIn(b"X-Bounty-Id", visible)
+
+        [description] = [item for item in recorded["seals"] if item["field"] == "target_request"]
+        envelope = Store(self.root).load(description["ciphertext_sha256"])
+        self.assertNotIn(marker.encode(), envelope)
+        opened = seal.unseal(
+            self.fence.wire_key(PROGRAM_ID, CAPABILITY, root)[1],
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=PROGRAM_ID,
+                sha256=description["sha256"],
+                generation=description["kek_gen"],
+            ),
+        )
+        self.assertIn(marker.encode(), opened)
+
+    def test_a_required_header_the_agent_set_itself_is_replaced_at_the_door(self):
+        """The Program's value wins, and the agent's spelling of the name loses.
+
+        A model that writes its own `X-Bounty-Id` is either guessing or probing.
+        Appending would send two, and which one the target honours is its own
+        business; the door owns this field, so it takes the agent's copy out
+        first -- case-insensitively, because the wire is.
+        """
+        root = seal.Root(Path("test-only-root"), b"h" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.required = [("X-Bounty-Id", "rk2-the-program-value")]
+
+        response = self.through(
+            "http://target.example.test/v1/required",
+            headers=[("x-BOUNTY-id", "rk2-the-agent-guess")],
+        )
+        response.read()
+
+        _, _, seen = self.target.seen[0]
+        self.assertEqual(
+            ["rk2-the-program-value"],
+            [value for name, value in seen if name == "x-bounty-id"],
+        )
+
+    def test_a_required_header_with_no_value_refuses_before_the_target_is_contacted(self):
+        """No value, no request. The alternative is unattributable traffic.
+
+        The refusal names itself: `required-header-refused` is not
+        `capability-refused`, because the capability was good and the thing
+        missing is one an operator fixes with `rk header provision`.
+        """
+        self.fence.required = proxy.Refused(
+            proxy.HEADER_MISSING,
+            "X-Bounty-Id is required on every request and no value is provisioned",
+            status=502,
+        )
+
+        response = self.through("http://target.example.test/v1/required")
+        response.read()
+
+        self.assertEqual(502, response.status)
+        self.assertEqual(
+            proxy.HEADERLESS, response.headers.get("X-RedKraken-Decision")
+        )
+        self.assertEqual([], self.target.seen)
+        self.assertEqual([], self.fence.allowed)
+        [blocked] = self.fence.blocked
+        self.assertEqual(proxy.HEADER_MISSING, blocked["receipt"]["reason"])
 
     def test_a_reflected_identity_token_is_removed_from_every_agent_response_field(self):
         marker = "rk2-reflected-identity-token-97e1d3"

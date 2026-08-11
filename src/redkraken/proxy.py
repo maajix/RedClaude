@@ -140,6 +140,7 @@ __all__ = [
     "serve",
     "take_control",
     "unroutable",
+    "with_required",
 ]
 
 
@@ -196,6 +197,21 @@ TUNNEL = "tunnel-refused"
 #: and a caller that read them as one token would either retry a refusal that
 #: will never succeed or abandon one that would have.
 BUDGETED = "budget-refused"
+
+#: The Program requires a header on every request and the door cannot produce its
+#: value. Its own token because it is the one refusal here that the caller cannot
+#: act on at all: the capability is live, the scope allows the target, the budget
+#: has room, and what is missing is a value only an operator can provide. A caller
+#: that read it as a capability refusal would give up on a Program that is one
+#: `rk header provision` away from working.
+HEADERLESS = "required-header-refused"
+
+#: The one required-header refusal whose prose the caller is allowed to read.
+#: Every other one down that path is the database's error text about this door's
+#: SQL, and the thing being fenced is the caller; this one is the door's own
+#: sentence about an operator's configuration, and withholding it would leave a
+#: Program refusing every request for a reason nobody can see from either side.
+HEADER_MISSING = "required header missing"
 
 #: What an ambiguous take says, in one place because two paths report it and a
 #: caller comparing the two would otherwise be reading a difference that means
@@ -536,6 +552,25 @@ def forwardable(headers: Message) -> list[tuple[str, str]]:
     ]
 
 
+def with_required(
+    headers: list[tuple[str, str]], required: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """The wire headers after the Program's required identifiers own their names.
+
+    Replacement rather than addition, matching `Session.inject`: a name the
+    Program requires is a name nothing else may also send, or the target reads
+    two values for one header and picks whichever its parser prefers. The list
+    comes back unchanged when nothing is required, so the ordinary request is not
+    copied for the sake of a rule that does not apply to it.
+    """
+    if not required:
+        return headers
+    owned = {name.lower() for name, _ in required}
+    return [
+        (name, value) for name, value in headers if name.lower() not in owned
+    ] + list(required)
+
+
 def response_for_agent(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Remove target-issued authentication material from an Agent response.
 
@@ -757,6 +792,17 @@ OPEN_IDENTITY = (
 )
 
 CONFIRM_IDENTITY = "SELECT confirm_identity_slot_open($1, $2, $3::uuid, $4)"
+
+#: One row per header the capability's live scope version requires, provisioned
+#: or not. The nulls are answers rather than absences: a declared header with no
+#: value is a request that must not leave, and a function that returned nothing
+#: for it would be saying the Program requires no headers.
+OPEN_HEADERS = (
+    "SELECT ord, name, revision, alg, nonce_hex, kek_gen, envelope_hex,"
+    "       ciphertext_sha256, salt_hex, root_check_hex, audit_id"
+    "  FROM open_required_headers($1)"
+)
+CONFIRM_HEADERS = "SELECT confirm_required_headers_open($1, $2::uuid, $3)"
 
 WIRE_KEYING = (
     "SELECT generation, salt_hex, root_check_hex"
@@ -1143,6 +1189,102 @@ class Fence:
                 )
             except pg.DatabaseError as error:
                 raise Refused("identity slot refused", str(error)) from error
+
+    def required_headers(
+        self, program_id: str, capability: str, root: seal.Root | None
+    ) -> list[tuple[str, str]]:
+        """The headers this Program requires on every request, with their values.
+
+        Empty when the policy requires none, which is the ordinary case and costs
+        one query and no audit row. When it requires any, every one of them has to
+        open: a Program that states it identifies itself with `X-Bounty-Id` and
+        then reaches a target without it has sent traffic nobody can attribute,
+        which is the failure the declaration exists to prevent. So a header with
+        no provisioned value refuses the request rather than sending the rest.
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(OPEN_HEADERS, (capability,)).rows
+            except pg.DatabaseError as error:
+                raise Refused("required header refused", str(error), status=502) from error
+        if not rows:
+            return []
+
+        audit_id = str(rows[0][10])
+        try:
+            if root is None:
+                raise Refused(
+                    HEADER_MISSING,
+                    "this Program requires a header the door has no artifact key to open",
+                    status=502,
+                )
+            answer: list[tuple[str, str]] = []
+            for (
+                _ord,
+                name,
+                revision,
+                alg,
+                nonce_hex,
+                generation,
+                envelope_hex,
+                ciphertext_sha256,
+                salt_hex,
+                root_check_hex,
+                _audit,
+            ) in rows:
+                if envelope_hex is None:
+                    raise Refused(
+                        HEADER_MISSING,
+                        f"{name} is required on every request and no value is provisioned",
+                        status=502,
+                    )
+                envelope = bytes.fromhex(str(envelope_hex))
+                if not hmac.compare_digest(digest(envelope), str(ciphertext_sha256)):
+                    raise seal.Tampered("header slot envelope digest disagrees")
+                number = int(generation)
+                salt = bytes.fromhex(str(salt_hex))
+                if not hmac.compare_digest(
+                    root.check(salt, generation=number),
+                    bytes.fromhex(str(root_check_hex)),
+                ):
+                    raise Refused(
+                        "required header refused",
+                        "the proxy artifact key does not match this installation",
+                        status=502,
+                    )
+                value = seal.unseal(
+                    root.header_key(
+                        salt,
+                        generation=number,
+                        program_id=program_id,
+                        name=str(name),
+                    ),
+                    seal.Sealed.decode(envelope),
+                    aad=seal.header_associated_data(
+                        program_id=program_id,
+                        name=str(name),
+                        generation=number,
+                        revision=int(revision),
+                    ),
+                )
+                answer.append((str(name), value.decode("latin-1")))
+        except (ValueError, seal.Tampered, seal.Unusable, Refused):
+            self._confirm_headers_open(program_id, capability, audit_id, "denied")
+            raise
+        self._confirm_headers_open(program_id, capability, audit_id, "ok")
+        return answer
+
+    def _confirm_headers_open(
+        self, program_id: str, capability: str, audit_id: str, outcome: str
+    ) -> None:
+        """Append the authenticated result of a previously audited header open."""
+        with self._lock:
+            self._bind(program_id)
+            try:
+                self.connection.execute(CONFIRM_HEADERS, (capability, audit_id, outcome))
+            except pg.DatabaseError as error:
+                raise Refused("required header refused", str(error), status=502) from error
 
     def wire_key(
         self, program_id: str, capability: str, root: seal.Root
@@ -1819,12 +1961,12 @@ class Handler(BaseHTTPRequestHandler):
         target = origin_form(url)
         line = f"{self.command} {target} HTTP/1.1"
 
+        root = self.server.root_secret
         binding: IdentityBinding | None = None
         client_certificate: identity.ClientCertificate | None = None
         client_certificate_sha: str | None = None
         wire_headers = list(agent_headers)
         if authorization.identity_entity_id is not None:
-            root = self.server.root_secret
             if root is None:
                 return self._refuse(
                     authorization.program_id,
@@ -1881,6 +2023,48 @@ class Handler(BaseHTTPRequestHandler):
                     url=url,
                     authorization=authorization,
                 )
+
+        # What the Program requires on every request. Fetched after the Identity
+        # rather than before it because the Identity is the narrower claim: it
+        # belongs to this capability and this Tool run, so when both are broken
+        # the refusal an operator gets back is the one that names the smaller
+        # thing. The ordinary case -- a policy that requires no header -- costs
+        # one query and leaves no audit row.
+        try:
+            required = self.server.fence.required_headers(
+                authorization.program_id, capability, root
+            )
+        except (seal.Tampered, seal.Unusable) as error:
+            return self._refuse(
+                authorization.program_id,
+                capability,
+                Refused("required header refused", str(error), status=502),
+                arrival,
+                url=url,
+                authorization=authorization,
+                decision=HEADERLESS,
+            )
+        except Refused as refusal:
+            return self._refuse(
+                authorization.program_id,
+                capability,
+                refusal,
+                arrival,
+                url=url,
+                authorization=authorization,
+                decision=HEADERLESS,
+                detail=refusal.detail if refusal.reason == HEADER_MISSING else None,
+            )
+
+        # Applied last, and over the Identity, because the Program's requirement
+        # is the stronger claim: an Identity that carried a header of the same
+        # name would be one credential document deciding how its Program
+        # identifies itself to a target. It goes onto the wire view alone, so the
+        # Agent's own record of its request does not contain a value the Agent
+        # may not have -- and the two views then differ, which puts the sealed
+        # wire artifact and its `target_request` transformation on the record as
+        # the proof of exactly what the door added.
+        wire_headers = with_required(wire_headers, required)
 
         egress = datetime.now(timezone.utc)
         try:

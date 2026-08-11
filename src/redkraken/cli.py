@@ -19,6 +19,7 @@ from redkraken import (
     artifact,
     backup,
     doctor,
+    header,
     identity,
     migrate,
     pg,
@@ -308,6 +309,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="a control-side JSON credential document; its values are never reported",
     )
     identity_provision.set_defaults(run=_identity_provision)
+
+    headers = commands.add_parser(
+        "header",
+        help="seal the value behind a Program's required-header declaration",
+    )
+    header_operations = headers.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+    header_provision = header_operations.add_parser(
+        "provision",
+        help=(
+            "replace the encrypted value the door injects for one required "
+            f"header (${DATABASE_URL})"
+        ),
+    )
+    _add_url(header_provision, RUNTIME)
+    _add_key(header_provision)
+    header_provision.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and the required header",
+    )
+    header_provision.add_argument(
+        "--header",
+        required=True,
+        metavar="name",
+        help="the declared header name whose value is being provisioned",
+    )
+    header_provision.add_argument(
+        "--from",
+        dest="source",
+        type=Path,
+        required=True,
+        metavar="path",
+        help=(
+            "a file holding the header value and nothing else; a file rather "
+            "than an argument, which every process on this machine can read"
+        ),
+    )
+    header_provision.set_defaults(run=_header_provision)
 
     artifacts = commands.add_parser(
         "artifact", help="store, read and verify this Program's content-addressed artifacts"
@@ -767,6 +810,26 @@ def _identity_provision(arguments: argparse.Namespace) -> int:
                 runtime,
                 arguments.config,
                 arguments.identity,
+                arguments.source,
+                key_path=key,
+            ),
+        )
+    )
+
+
+def _header_provision(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, header.COMMAND)
+    key = _key(ledger, arguments.key)
+    if runtime is None or key is None:
+        return _render(report(header.COMMAND, ledger))
+    return _render(
+        _guarded(
+            header.COMMAND,
+            lambda: header.provision(
+                runtime,
+                arguments.config,
+                arguments.header,
                 arguments.source,
                 key_path=key,
             ),
