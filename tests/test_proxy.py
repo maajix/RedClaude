@@ -934,12 +934,43 @@ class ExchangeTest(unittest.TestCase):
 
         response = self.through("http://target.example.test/v1/notes")
 
-        self.assertEqual(407, response.status)
+        # 502 and `target-unreachable`, not 407 and `capability-refused`. The
+        # capability was minted, resolved and spent; what answered with nothing
+        # is the target, and a 407 would ask this caller for the one thing that
+        # was not missing. The Receipt has said so all along -- this is the same
+        # sentence on the wire.
+        self.assertEqual(502, response.status)
+        self.assertEqual(proxy.UNREACHABLE, response.headers[proxy.DECISION])
         self.assertEqual([], self.dialled)
         self.assertEqual([], self.target.seen)
         filed = self.fence.blocked[0]["receipt"]
         self.assertEqual("target unresolved", filed["reason"])
         self.assertNotIn("pinned_ips", filed)
+
+    def test_a_socket_that_never_opened_is_not_answered_as_a_refused_capability(self):
+        # The other half of the same distinction, on the far side of the
+        # decisions: the name resolved, the address passed policy, the budget
+        # reserved, and the dial failed. A target under test is down, or
+        # firewalled, or speaking something this door cannot -- all findings
+        # about the target, and none of them a capability an agent can improve.
+        def refused(*arguments: object) -> tuple[http.client.HTTPConnection, None]:
+            raise ConnectionRefusedError(111, "Connection refused")
+
+        self.server.connector = refused
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(502, response.status)
+        self.assertEqual(proxy.UNREACHABLE, response.headers[proxy.DECISION])
+        self.assertEqual([], self.fence.allowed)
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("target unreachable", filed["reason"])
+        # The dial happened, so the row says the request left this machine and
+        # names the address it left for. A refusal made before contact is a
+        # different fact and is recorded as one.
+        self.assertIn("ts_egress", filed)
+        self.assertEqual(PINNED, filed["pinned_ips"])
 
     def test_an_address_the_program_withdrew_is_refused_before_the_socket(self):
         # Criterion 2's second half, and the half the shape check cannot make:

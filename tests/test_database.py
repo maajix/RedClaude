@@ -65,6 +65,8 @@ from redkraken.outcome import (
     EXIT_INTEGRITY_FAILED,
     EXIT_INVALID_CONFIGURATION,
     EXIT_OK,
+    EXIT_TARGET_UNREACHABLE,
+    TARGET_UNREACHABLE,
     Report,
 )
 from redkraken.store import Store
@@ -1285,6 +1287,61 @@ class NegativeControlTest(DatabaseCase):
                     " 'target', 1, 'example.test')",
                     (program, tool_run),
                 )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertNotIn("standing:receipt_integrity", failed)
+
+    def test_a_target_that_never_answered_closed_as_denied_fails_the_receipt_check(self):
+        # Arm (i)'s control, and the pair of the one above it. There, an outcome
+        # was read as a verdict; here, a verdict nobody gave is written as an
+        # outcome. The gate allowed this run, the name resolved to nothing, and
+        # `denied` says the harness refused a request it in fact authorized.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                program, tool_run = self._refused_tool_run(
+                    "target-fault-selftest", decision="allow"
+                )
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1, $2, 'agent', 'blocked', 'target unresolved', now(),"
+                    " 'target', 1, 'example.test')",
+                    (program, tool_run),
+                )
+                failed = self.run_gate(self.connection)
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertIn("standing:receipt_integrity", failed)
+
+    def test_a_run_that_was_also_refused_may_be_closed_as_denied(self):
+        # The other half of arm (i), and the reason it reads the Receipts rather
+        # than the status alone: one run may make several requests. This one met
+        # an unreachable target and was separately refused, so `denied` is a word
+        # something under it earned.
+        failed: list[str] = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                program, tool_run = self._refused_tool_run(
+                    "target-fault-and-refusal-selftest", decision="allow"
+                )
+                for reason in ("target unreachable", "capability refused"):
+                    self.connection.execute(
+                        "INSERT INTO receipts (program_id, tool_run_id, lane, decision,"
+                        " reason, ts_arrival, scope_class, scope_version, host)"
+                        " VALUES ($1, $2, 'agent', 'blocked', $3, now(),"
+                        " 'target', 1, 'example.test')",
+                        (program, tool_run, reason),
+                    )
                 failed = self.run_gate(self.connection)
                 raise Rollback
         except Rollback:
@@ -5347,14 +5404,18 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual("denied", str(row[0]))
         self.assertIsNone(row[1], "a denied Tool run holds no capability to spend")
 
-    def test_a_refusal_at_the_door_is_reported_as_a_refusal_and_not_as_a_success(self):
-        # A door that refuses a request the gate authorized, which is the case
-        # the runtime has to read correctly: the Receipt it is handed is a
-        # blocked one. Naming it is what makes the refusal auditable, and reading
-        # that name as "served" would close the Tool run as success, exit 0, and
-        # tell an operator scripting this command that the request went out.
+    def test_a_target_that_did_not_answer_is_neither_a_success_nor_a_refusal(self):
+        # A request the gate authorized, the door dialled, and nothing answered,
+        # which is the case the runtime has to read correctly twice over. Reading
+        # the blocked Receipt as "served" would close the Tool run as success and
+        # exit 0, telling an operator scripting this command that the request
+        # went out. Reading it as a refusal -- which is what a `denied` close, a
+        # 407 and an `invalid_configuration` violation all said -- points every
+        # later reader at this harness for a fact about the target: the
+        # capability was minted, resolved and spent, and the run's own `decision`
+        # column says `allow`.
         #
-        # The refusal is manufactured by pointing this door's outbound side at a
+        # The fault is manufactured by pointing this door's outbound side at a
         # port nothing listens on, because the two fences agree about everything
         # else: an out-of-scope URL is stopped by the gate above before the door
         # ever sees it.
@@ -5394,20 +5455,25 @@ class ProxyEgressTest(DatabaseCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
-        self.assertEqual(407, result.facts["response"]["status"])
+        self.assertEqual(EXIT_TARGET_UNREACHABLE, result.exit_code)
+        self.assertEqual(502, result.facts["response"]["status"])
         self.assertEqual(
             ["egress"], [item.name for item in result.assertions if not item.ok]
         )
-        # Cited, and closed as what it was. The capability is gone either way:
-        # the same close that says `denied` clears the digest.
+        self.assertEqual(
+            [(TARGET_UNREACHABLE, "target:app.example.com")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        # Cited, and closed as what it was: `error` is the outcome word for a run
+        # that was authorized and did not complete. The capability is gone either
+        # way -- any close that leaves `running` clears the digest.
         self.assertIsNotNone(result.facts["receipt"])
         row = self.connection.execute(
             "SELECT status, egress_token_sha256 FROM tool_runs WHERE id = $1::uuid",
             (result.facts["tool_run"]["id"],),
         ).rows[0]
 
-        self.assertEqual("denied", str(row[0]))
+        self.assertEqual("error", str(row[0]))
         self.assertIsNone(row[1])
         blocked = self.connection.execute(
             "SELECT decision, reason, host, ts_egress FROM receipts"

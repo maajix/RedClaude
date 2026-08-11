@@ -96,6 +96,7 @@ from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
     MISSING_DEPENDENCY,
+    TARGET_UNREACHABLE,
     Ledger,
     Report,
     report,
@@ -197,6 +198,22 @@ TUNNEL = "tunnel-refused"
 #: and a caller that read them as one token would either retry a refusal that
 #: will never succeed or abandon one that would have.
 BUDGETED = "budget-refused"
+
+#: The refusals that are the target's state rather than this fence's verdict: a
+#: name that answered with nothing, a socket that would not open, a TLS layer
+#: that would not come up. Its own token because the capability was valid, was
+#: spent and would be accepted again: a caller reading `capability-refused` for
+#: one of these mints a fresh capability and is told the same thing, while the
+#: fact worth acting on -- this target did not answer -- is the one it did not
+#: learn. Ticket 11 already separates them in the Receipt's `reason`; this is
+#: that same distinction on the wire.
+UNREACHABLE = "target-unreachable"
+
+#: The reasons that token stands for. Read from the reason the Receipt was filed
+#: under rather than passed at each refusal site, because the code that dials a
+#: target is not the code that knows about decision tokens, and a later path that
+#: forgot to pass it would file the target's state as a refused capability again.
+TARGET_FAULT = frozenset({"target unresolved", "target unreachable"})
 
 #: The Program requires a header on every request and the door cannot produce its
 #: value. Its own token because it is the one refusal here that the caller cannot
@@ -2616,8 +2633,20 @@ class Handler(BaseHTTPRequestHandler):
         # the database's own error text -- SQLSTATE, message and the PL/pgSQL
         # frame it was raised in. The caller is the thing being fenced. Prose it
         # may read is passed in explicitly by the caller of this method.
+        #
+        # Which token the answer carries, and under which status, is read off the
+        # reason the row was just filed under, so that the record and the answer
+        # cannot say two different things. Only the default is replaced: a caller
+        # that named a token itself -- a receipt that would not write, a tunnel
+        # that was not opened -- knows something this cannot improve on. The
+        # status moves for the same reason the token does: 407 asks the caller
+        # for a capability, and asking for one here would be this door demanding
+        # the one thing that was not missing.
+        status = refusal.status
+        if decision == REFUSED and refusal.reason in TARGET_FAULT:
+            decision, status = UNREACHABLE, 502
         self._answer(
-            refusal.status,
+            status,
             decision,
             detail=detail or refusal.reason,
             body=b"",
@@ -3122,6 +3151,22 @@ def _spend(
             )
             return
         ledger.hold("receipt", f"the proxy wrote {answer.receipt} for a {answer.status} answer")
+        if answer.decision == UNREACHABLE:
+            # Not a refusal at all: the gate said allow, the capability was
+            # minted and spent, and what did not answer is the target. Closing
+            # this run as `denied` would write the word for "the harness said no"
+            # onto a row whose own `decision` column says `allow`, and an
+            # operator reading the pair back cannot tell that from a fence that
+            # actually refused. `error` is the outcome word for a run that was
+            # authorised and did not complete, which is what this is.
+            ledger.fail(
+                "egress",
+                f"the target did not answer: {answer.detail or 'no reason given'}",
+                code=TARGET_UNREACHABLE,
+                source=f"target:{_hostname(urlsplit(url)) or url}",
+            )
+            outcome = "error"
+            return
         if answer.decision is not None:
             # A refused request is a request that did not happen, and it is the
             # blocked Receipt above that proves it. What it must not become is a

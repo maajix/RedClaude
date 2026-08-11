@@ -23,6 +23,13 @@ INVALID_CORPUS = "invalid_corpus"
 SCHEMA_DRIFT = "schema_drift"
 INTEGRITY_FAILED = "integrity_failed"
 BACKUP_FAILED = "backup_failed"
+#: A target this harness was authorised to reach did not answer: the name
+#: resolved to nothing, the socket would not open, the TLS layer would not come
+#: up. Its own class because it is the one outcome here that says nothing is
+#: wrong with this machine -- the configuration is valid, the capability was
+#: minted and spent, and what failed is outside it. Reported as an invalid
+#: configuration it would send an operator to fix a file that is correct.
+TARGET_UNREACHABLE = "target_unreachable"
 
 EXIT_OK = 0
 EXIT_UNCLASSIFIED = 1
@@ -35,6 +42,7 @@ EXIT_INVALID_CORPUS = 7
 EXIT_SCHEMA_DRIFT = 8
 EXIT_INTEGRITY_FAILED = 9
 EXIT_BACKUP_FAILED = 10
+EXIT_TARGET_UNREACHABLE = 11
 
 #: Reported and exited first-to-last when several classes are observed at once.
 #: An unsupported runtime outranks a missing dependency, which outranks operator
@@ -44,7 +52,10 @@ EXIT_BACKUP_FAILED = 10
 #: does not match it, and a schema that does not match explains an invariant
 #: that no longer holds. An archive that was never produced is last because it
 #: is reported by a command that stops before the gate, so it never competes
-#: with an integrity failure for the same exit.
+#: with an integrity failure for the same exit. A target nobody reached sorts
+#: after all of them: every class above it is a statement about this machine, and
+#: any one of them explains a request that did not complete better than the
+#: outside world does.
 PRECEDENCE = (
     (UNSUPPORTED_VERSION, EXIT_UNSUPPORTED_VERSION),
     (MISSING_DEPENDENCY, EXIT_MISSING_DEPENDENCY),
@@ -54,6 +65,7 @@ PRECEDENCE = (
     (SCHEMA_DRIFT, EXIT_SCHEMA_DRIFT),
     (INTEGRITY_FAILED, EXIT_INTEGRITY_FAILED),
     (BACKUP_FAILED, EXIT_BACKUP_FAILED),
+    (TARGET_UNREACHABLE, EXIT_TARGET_UNREACHABLE),
 )
 
 
