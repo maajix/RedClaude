@@ -4852,6 +4852,43 @@ class ProxyEgressTest(DatabaseCase):
                 self.assertEqual(("agent_visible", False), (visibility, encrypted))
         self.assertIn(ANSWER, artifact.path_for(self.root, response_sha).read_bytes())
 
+    def test_the_program_holds_both_transcripts_by_a_label_it_can_cite(self):
+        # Storing the bytes is not holding them. `v_artifacts` is built from
+        # `artifact_references` alone, so a transcript with no reference has no
+        # label, and §6's rule that a hash is never an argument then means the
+        # agent cannot ask for it at all. Both directions of both exchanges are
+        # asked for through an agent session, not through the owner, because the
+        # claim is about what the agent surface answers.
+        rows = self.connection.execute(
+            "SELECT request_agent_sha, response_agent_sha, request_wire_sha, response_wire_sha"
+            "  FROM receipts WHERE program_id = $1::uuid AND decision = 'allowed'",
+            (self.identifiers["a"],),
+        ).rows
+        agent = {str(row[column]) for row in rows for column in (0, 1)}
+        wire = {str(row[column]) for row in rows for column in (2, 3) if row[column] is not None}
+
+        session = pg.connect(self.harness.state)
+        self.addCleanup(session.close)
+        session.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers["a"],)
+        )
+        held = {
+            str(row[1]): (str(row[0]), int(row[2]))
+            for row in session.execute("SELECT label, sha256, byte_size FROM v_artifacts").rows
+        }
+
+        # Two exchanges, two hashes: the http and https runs sent the same bytes
+        # and read the same answer, and a content-addressed store holds that
+        # once. What matters is that the set is the same one on both sides.
+        self.assertEqual(2, len(agent))
+        self.assertTrue(wire)
+        self.assertEqual(agent, set(held))
+        self.assertEqual(set(), wire & set(held))
+        for sha, (label, byte_size) in held.items():
+            with self.subTest(label=label):
+                self.assertRegex(label, r"^AF[0-9]+$")
+                self.assertEqual(byte_size, len(artifact.path_for(self.root, sha).read_bytes()))
+
     def test_the_target_saw_the_request_and_none_of_the_control_headers(self):
         # Criterion 3, against a target that actually ran. The request line is
         # origin form -- the target is not a proxy -- and nothing that named the
