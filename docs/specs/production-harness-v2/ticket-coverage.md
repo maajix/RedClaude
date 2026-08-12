@@ -16,8 +16,8 @@ and triaged into the graph.
 | Check | Result |
 | --- | --- |
 | Ticket files | 70, numbered continuously 01–70 |
-| Ticket status | 17 `resolved`, 53 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 414 total, 102 ticked |
+| Ticket status | 18 `resolved`, 52 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 414 total, 108 ticked |
 | Blocking edges | 131 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -36,9 +36,9 @@ to list them before that claim reads "every ticket" again.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–17 |
-| Unblocked and open | 18, 66, 67, 68, 70 |
-| Criteria ticked | 102 of 414 |
+| Resolved | 01–18 |
+| Unblocked and open | 19, 66, 67, 68, 70 |
+| Criteria ticked | 108 of 414 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -48,11 +48,14 @@ Identities, the operator Halt and the aggregate request budget enforced at that
 same door, the startup assertion imported as ticket 15, the first evidence
 that arrives rather than being fetched -- one correlated callback on a declared
 channel -- the first real Agent child, started through one door into that
-same container boundary, and a startup refusal that is now an outcome rather
-than a crash: the supervisor latches, the Task goes back to `pending` with its
-attempt intact, and one redacted Event records that it happened. The scheduler,
-the role roster, the epistemic pipeline, kill chains, the v1 knowledge migration
-and the operator surface are untouched.
+same container boundary, a startup refusal that is now an outcome rather
+than a crash -- the supervisor latches, the Task goes back to `pending` with its
+attempt intact, and one redacted Event records that it happened -- and the
+six-role roster, compiled against a measured SDK/CLI tool inventory and enforced
+at every tool call by a pre-tool gate the permission mode cannot overrule. The
+scheduler, the MCP handlers behind the roster's contracts, the epistemic
+pipeline, kill chains, the v1 knowledge migration and the operator surface are
+untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

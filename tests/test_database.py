@@ -79,6 +79,7 @@ from redkraken.store import Store
 from tests.fixtures import (
     EXPORTED,
     PINNED,
+    ROLE,
     SCOPE_ENTITIES,
     SCOPE_REQUESTS,
     SCOPED,
@@ -7590,6 +7591,7 @@ class StartupRefusalTest(DatabaseCase):
             agent_run_id=run,
             objective="Say nothing.",
             container=boundary(),
+            role=ROLE,
             program_id=self.identifiers["launched"],
         )
 

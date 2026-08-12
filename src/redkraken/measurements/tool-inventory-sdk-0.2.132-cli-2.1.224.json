@@ -1,0 +1,63 @@
+{
+  "agent_types": [
+    "Explore",
+    "Plan",
+    "claude",
+    "general-purpose",
+    "statusline-setup"
+  ],
+  "builtin_tools": [
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "NotebookEdit",
+    "Read",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write"
+  ],
+  "effort_levels": [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh"
+  ],
+  "observation": {
+    "default_model": "claude-sonnet-5",
+    "probe": "tools/probe_tool_inventory.py",
+    "repetitions": 2,
+    "tools_preset": "claude_code"
+  },
+  "permission_modes": [
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "default",
+    "dontAsk",
+    "plan"
+  ],
+  "runtime": {
+    "bundled_cli_version": "2.1.224",
+    "sdk_version": "0.2.132"
+  },
+  "schema_version": 1
+}

@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, isolation, tls
+from redkraken import _launch, _startup, agent, isolation, roster, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -156,6 +156,7 @@ for index in (1, 2):
             agent_run_id="agent-run-%d" % index,
             objective="Say nothing.",
             container=fixtures.boundary(),
+            role=fixtures.ROLE,
         ))
     except agent.StartupRefusal as refusal:
         raised.append(type(refusal).__name__)
@@ -182,25 +183,42 @@ def measured(cli_path: str) -> dict:
     }
 
 
-def options(launch, cli_path: str, **overrides) -> types.SimpleNamespace:
+def matchers(*events) -> dict:
+    """A stand-in for the hook registration, shaped the way `_gated` reads it."""
+    return {
+        event: [types.SimpleNamespace(matcher=None, hooks=[lambda *_: None])]
+        for event in events
+    }
+
+
+def options(launch, cli_path: str, role: str = fixtures.ROLE, **overrides):
     """A stand-in for the SDK options value, contained on every field.
 
     `assess` reads the options value by duck typing, so this is the whole
     interface it uses. A namespace rather than the real class on purpose: the
     rules have to be exercisable on a machine with no SDK, which is the same
     machine that has to be able to prove the SDK's absence is a refusal.
+
+    Every field the roster decides is read from the roster here too, so a test
+    that wants a launch which disagrees with it has to say which field and by
+    how much rather than inheriting the disagreement from a literal.
     """
+    compiled = roster.ROLES[role]
     fields = {
         "env": {},
         "setting_sources": [],
         "sandbox": None,
         "cwd": str(launch),
-        "tools": [],
+        "tools": roster.visible_tools(role),
         "permission_mode": agent.PERMISSION_MODE,
-        "allowed_tools": [agent.TOOL],
+        "allowed_tools": roster.allowed_tools(role, agent.SERVED),
         "mcp_servers": {agent.SERVER: object()},
         "settings": str(launch / agent.SETTINGS),
         "cli_path": cli_path,
+        "model": compiled.model,
+        "effort": compiled.effort,
+        "max_turns": compiled.max_turns,
+        "hooks": matchers(*agent.GATE_EVENTS),
     }
     fields.update(overrides)
     return types.SimpleNamespace(**fields)
@@ -211,8 +229,7 @@ def job(launch_workspace, **overrides) -> dict:
     fields = {
         "agent_run_id": "agent-run-1",
         "objective": "Say nothing.",
-        "model": None,
-        "max_turns": 3,
+        "role": fixtures.ROLE,
         "workspace": str(launch_workspace),
     }
     fields.update(overrides)
@@ -346,12 +363,15 @@ class AssertionTest(unittest.TestCase):
         agent.write_settings(self.launch)
         self.runtime = measured(self.cli)
 
-    def assess(self, options_value, environment=None, runtime=None, managed=()):
+    def assess(
+        self, options_value, environment=None, runtime=None, managed=(), role=fixtures.ROLE
+    ):
         return agent.assess(
             options_value,
             {} if environment is None else environment,
             self.runtime if runtime is None else runtime,
             launch_dir=self.launch,
+            role=role,
             managed_settings=managed,
         )
 
@@ -691,19 +711,67 @@ class ReadbackTest(unittest.TestCase):
 class OptionsTest(unittest.TestCase):
     """The one options value, built the way a child builds it."""
 
-    def test_the_one_options_value_is_the_one_that_was_assessed(self):
+    def built(self, role: str = fixtures.ROLE):
         launch = agent.launch_directory(fixtures.scratch(), "agent-run-1")
         agent.write_settings(launch)
         runtime = _launch.runtime_facts()
-
         value = _launch.options_for(
-            job(launch.parent), runtime, _launch.server(_launch.Surface()), launch
+            job(launch.parent, role=role),
+            runtime,
+            _launch.server(_launch.Surface()),
+            launch,
+            roster.Gate(role),
         )
+        return value, runtime, launch
+
+    def test_the_one_options_value_is_the_one_that_was_assessed(self):
+        value, runtime, launch = self.built()
 
         self.assertEqual((), agent.assess(value, {}, runtime, launch_dir=launch,
-                                          managed_settings=()))
+                                          role=fixtures.ROLE, managed_settings=()))
         self.assertEqual(str(agent.bundled_executable(runtime)), value.cli_path)
         self.assertEqual([agent.TOOL], value.allowed_tools)
+
+    def test_every_field_the_roster_decides_is_read_from_the_roster(self):
+        # The point is not that these are good numbers. It is that there is one
+        # place they come from: a launch whose turn ceiling or model came from
+        # the job document would be a second roster, and the assertion checking
+        # them against the first would be checking a copy against itself.
+        for name, role in roster.ROLES.items():
+            if role.runs_as == roster.RENDERER:
+                continue
+            with self.subTest(role=name):
+                value, _, _ = self.built(name)
+                self.assertEqual(role.model, value.model)
+                self.assertEqual(role.effort, value.effort)
+                self.assertEqual(role.max_turns, value.max_turns)
+                self.assertEqual(sorted(role.builtin_tools), value.tools)
+                self.assertEqual(
+                    sorted(role.tools.intersection(agent.SERVED)), value.allowed_tools
+                )
+
+    def test_the_gate_is_registered_on_every_event_it_needs(self):
+        value, _, _ = self.built()
+
+        self.assertEqual(set(agent.GATE_EVENTS), set(value.hooks))
+        for event, registered in value.hooks.items():
+            with self.subTest(event=event):
+                # No matcher narrows by tool name. A matcher is a filter on
+                # which calls reach the gate, and a gate some calls do not
+                # reach is a gate with a hole shaped like a tool name.
+                self.assertEqual([None], [matcher.matcher for matcher in registered])
+                self.assertTrue(all(matcher.hooks for matcher in registered))
+
+    def test_a_launch_without_the_gate_is_refused_rather_than_started(self):
+        value, runtime, launch = self.built()
+        for hooks in ({}, None, matchers("PreToolUse")):
+            with self.subTest(hooks=hooks):
+                value.hooks = hooks
+                self.assertIn(
+                    "launch:hooks",
+                    sources(agent.assess(value, {}, runtime, launch_dir=launch,
+                                         role=fixtures.ROLE, managed_settings=())),
+                )
 
 
 @unittest.skipUnless(LIVE, NEEDS_CONTAINERS)
@@ -738,7 +806,7 @@ class ContainedChildTest(unittest.TestCase):
         cls.authority = tls.authority(cls.root / "authority")
         try:
             docker("network", "create", "--internal", cls.network)
-            cls._serve()
+            cls._serve(cls.upstream, cls.network, agent.TOOL)
         except BaseException:
             cls.tearDownClass()
             raise
@@ -754,8 +822,16 @@ class ContainedChildTest(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
     @classmethod
-    def _serve(cls) -> None:
-        """Start the model API as a peer, and wait for it to be one."""
+    def _serve(cls, name: str, network: str, tool: str, arguments: dict | None = None) -> None:
+        """Start the model API as a peer, and wait for it to be one.
+
+        Parameterised by what the scripted model asks for, because a run whose
+        subject is a *denial* needs the model to ask for the thing that is
+        denied, and a run whose subject is the tool surface needs it to ask for
+        the tool. One peer per script: the boundary verifies that the proxy it
+        was pointed at is the one other container on the network, so a second
+        script is a second network rather than a second container.
+        """
         docker(
             "run",
             "--detach",
@@ -763,9 +839,9 @@ class ContainedChildTest(unittest.TestCase):
             "--pull",
             "never",
             "--name",
-            cls.upstream,
+            name,
             "--network",
-            cls.network,
+            network,
             "--mount",
             f"type=bind,src={ROOT},dst={REPOSITORY},readonly",
             "--mount",
@@ -778,16 +854,34 @@ class ContainedChildTest(unittest.TestCase):
             "python3",
             "-m",
             control_upstream.__name__,
-            agent.TOOL,
+            tool,
             AUTHORITY,
             str(UPSTREAM_PORT),
+            *((json.dumps(arguments),) if arguments is not None else ()),
         )
         deadline = time.monotonic() + UPSTREAM_READY
         while time.monotonic() < deadline:
-            if control_upstream.LISTENING in docker("logs", cls.upstream, check=False).stdout:
+            if control_upstream.LISTENING in docker("logs", name, check=False).stdout:
                 return
             time.sleep(0.2)
-        raise AssertionError(docker("logs", cls.upstream, check=False).stderr)
+        raise AssertionError(docker("logs", name, check=False).stderr)
+
+    @contextlib.contextmanager
+    def scripted(self, tool: str, arguments: dict):
+        """A boundary of this test's own, whose model asks for one named call."""
+        suffix = uuid.uuid4().hex[:12]
+        network, upstream = f"rk2-canary-{suffix}", f"rk2-canary-upstream-{suffix}"
+        docker("network", "create", "--internal", network)
+        try:
+            self._serve(upstream, network, tool, arguments)
+            yield self.boundary(
+                network=network,
+                proxy_container=upstream,
+                proxy_url=f"http://{upstream}:{UPSTREAM_PORT}",
+            )
+        finally:
+            docker("rm", "--force", upstream, check=False)
+            docker("network", "rm", network, check=False)
 
     def boundary(self, **overrides) -> isolation.AgentContainer:
         """The boundary an Agent child runs in, with everything it needs in it."""
@@ -842,7 +936,7 @@ class ContainedChildTest(unittest.TestCase):
                     f"{fixtures.ControlUpstream.SPOKEN}."
                 ),
                 container=self.boundary(),
-                max_turns=3,
+                role=fixtures.ROLE,
                 timeout=300.0,
             )
         )
@@ -863,6 +957,53 @@ class ContainedChildTest(unittest.TestCase):
         self.assertGreaterEqual(
             sum(1 for _, line in seen if line.startswith("POST /v1/messages")), result.answers
         )
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_a_tool_the_child_can_see_and_run_is_still_refused_by_the_gate(self):
+        """The deny canary: visibility and permission mode are not the allowlist.
+
+        Everything that would let this call through is deliberately left open.
+        `Task` is in the role's own `tools`, so the model can see it and the
+        CLI will dispatch it. The permission mode is `bypassPermissions`, so
+        there is no prompt and no allowlist consulted. The subagent type is one
+        the pair genuinely ships, so it is a type the CLI could start. The only
+        thing standing between the model and a session with no roster row is
+        `Gate.decide`, and this is the run that proves it is enough -- in the
+        child, through the real hook, not against the decision function.
+        """
+        started = "Explore"
+        self.assertIn(started, roster.inventory()["agent_types"])
+        # A complete call, on purpose. The CLI validates a tool's input against
+        # its schema before the hook runs, so an incomplete one is rejected
+        # upstream of the gate and would prove nothing about the gate: dropping
+        # `description` here was observed to produce a run with no denial in it.
+        delegation = {
+            "description": "explore the workspace",
+            "prompt": "Explore this workspace.",
+            "subagent_type": started,
+        }
+        with self.scripted(roster.DELEGATION, delegation) as boundary:
+            result = agent.agent_run(
+                agent.AgentRunRequest(
+                    agent_run_id="agent-run-canary",
+                    objective=f"Delegate to the {started} agent.",
+                    container=boundary,
+                    role=fixtures.ROLE,
+                    timeout=300.0,
+                )
+            )
+
+        self.assertEqual(
+            [(roster.UNKNOWN_AGENT_TYPE, roster.DELEGATION, fixtures.ROLE)],
+            [(record["rule"], record["tool"], record["role"]) for record in result.denials],
+        )
+        self.assertIn(started, result.denials[0]["reason"])
+        # The child kept going and finished a turn, so what is being asserted
+        # is a refused call inside a live session rather than a session that
+        # failed to start -- and no tool was served on the way through.
+        self.assertEqual((), result.tools_served)
+        self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
+        self.assertEqual("end_turn", result.stop_reason)
 
     def test_the_boundary_an_agent_child_runs_in_has_no_path_to_a_target(self):
         """Measured in the Agent child's own boundary, not inherited from one.
@@ -925,6 +1066,7 @@ print(json.dumps({
                     agent_run_id="agent-run-1",
                     objective="Say nothing.",
                     container=self.boundary(sdk=None),
+                    role=fixtures.ROLE,
                     timeout=120.0,
                 )
             )
@@ -952,7 +1094,7 @@ class AnnouncementTest(unittest.TestCase):
 
         result = asyncio.run(
             _launch.run(
-                job(fixtures.scratch(), max_turns=1),
+                job(fixtures.scratch()),
                 environment={},
                 runtime=runtime,
                 transport=transport,
@@ -1163,7 +1305,7 @@ class InitRefusalTest(unittest.TestCase):
         with self.assertRaises(agent.StartupRefusal) as raised:
             asyncio.run(
                 _launch.run(
-                    job(fixtures.scratch(), max_turns=1),
+                    job(fixtures.scratch()),
                     environment={},
                     runtime=_launch.runtime_facts(),
                     transport=stream,
@@ -1221,7 +1363,12 @@ class DiagnosticsTest(unittest.TestCase):
 
     def refusal(self, environment: dict) -> agent.StartupRefusal:
         violations = agent.assess(
-            None, environment, {}, launch_dir=fixtures.scratch(), managed_settings=()
+            None,
+            environment,
+            {},
+            launch_dir=fixtures.scratch(),
+            role=fixtures.ROLE,
+            managed_settings=(),
         )
         return agent.StartupRefusal(violations, "pre_spawn", *_startup.KNOWN_RUNTIME)
 
@@ -1273,6 +1420,7 @@ class RecordingTest(unittest.TestCase):
             "agent_run_id": str(uuid.uuid4()),
             "objective": "Say nothing.",
             "container": fixtures.boundary(),
+            "role": fixtures.ROLE,
         }
         fields.update(overrides)
         return agent.AgentRunRequest(**fields)

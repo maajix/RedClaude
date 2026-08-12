@@ -39,7 +39,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, isolation, pg
+from redkraken import _startup, isolation, pg, roster
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -82,10 +82,12 @@ PRIVATE = 0o700
 #: How long a child may run before the supervisor stops waiting.
 TIMEOUT = 900.0
 
-#: How many turns a child may take when a caller does not say. Small, because
-#: nothing above this ticket yet decides a budget, and a default that ran long
-#: would be a budget chosen by omission.
-MAX_TURNS = 6
+#: The hook events a launch must register, and what each one is for. Three of
+#: the four exist so the fourth can be trusted: `PreToolUse` is the decision,
+#: `SubagentStart` is what turns an agent id into an attribution rather than a
+#: claim, and the two completions are what give an admitted delegation back. A
+#: launch missing any of them is a launch whose gate counts up and never down.
+GATE_EVENTS = ("PreToolUse", "SubagentStart", "PostToolUse", "PostToolUseFailure")
 
 #: How much of a failed child's output is quoted back in the error that reports
 #: it. A bound on the diagnostic, not on what the child produced.
@@ -93,18 +95,24 @@ DIAGNOSTIC = 1500
 
 #: The name of the runtime's own MCP server, and the one tool it serves. Named
 #: here rather than in `_launch` because the assertion checks them: a launch is
-#: contained partly by what it may call, so the roster is a field `assess` reads
-#: and not a detail of the module that builds the server.
+#: contained partly by what it may call, so what this server offers is a field
+#: `assess` reads and not a detail of the module that builds the server.
 SERVER = "rk2"
 SERVER_VERSION = "0.1.0"
 READY = "ready"
 TOOL = f"mcp__{SERVER}__{READY}"
 
+#: Everything this launch actually serves, which is one tool. The roster says
+#: what a role may call; this says what exists to be called, and the allowlist
+#: a launch carries is the intersection. Ticket 19 makes this list longer.
+SERVED = (TOOL,)
+
 #: How the child answers permission questions. `bypassPermissions` is the
 #: contained value here rather than the wide one: there is no human attached to
-#: an Agent run, so a prompt is a hang, and what the child may do is decided by
-#: the empty built-in tool list and the one-tool roster above rather than by
-#: answering questions about tools it does not have.
+#: an Agent run, so a prompt is a hang. It is safe because it is not what
+#: decides anything: the permission mode says whether a call is questioned, and
+#: `roster.Gate` says whether it happens. The gate's denial is the one decision
+#: this mode cannot overrule, which is why the allowlist lives in the roster.
 PERMISSION_MODE = "bypassPermissions"
 
 #: What the init message must report. `none` is the CLI's own word for "no key
@@ -208,22 +216,26 @@ class AgentRunRequest:
     that could start a child on the supervisor's own machine, with the
     supervisor's own home and a direct route to any target it can name.
 
+    `role` is required and is not a hint. It selects one row of `roster.ROLES`,
+    and that row is the whole of what the child is: its model, its effort, its
+    turn ceiling, the built-in tools it is offered, the served tools it may
+    call, the Skills it may execute and how many of it may run at once. There
+    is deliberately no way for a caller to set any of those individually --
+    a request that could raise a worker's turn ceiling or hand it one more tool
+    would be a second roster, and the one thing a roster cannot survive is a
+    second one.
+
     `program_id` is what makes a refusal recordable, and it is optional for the
     one case where it cannot be given: every Event belongs to a Program, so a
     run started before any Program exists is a run whose refusal can only be
     raised and rendered.
-
-    `model` and `max_turns` keep the SDK's own spelling: they set one option
-    each and are not translated on the way, so a reader can check them against
-    the SDK's documentation rather than against this file.
     """
 
     agent_run_id: str
     objective: str
     container: isolation.AgentContainer
+    role: str
     program_id: str | None = None
-    model: str | None = None
-    max_turns: int = MAX_TURNS
     timeout: float = TIMEOUT
 
 
@@ -236,14 +248,21 @@ class AgentRunResult:
     `api_key_source` is what the CLI reported rather than what the runtime
     required, for the same reason -- both are evidence, and evidence is what
     Promotion consumes.
+
+    `denials` is the same argument applied to the gate. A run whose evidence
+    said only which tools were served would not distinguish a model that never
+    asked for a forbidden one from a model that asked and was refused, and the
+    second is the more interesting run of the two.
     """
 
     agent_run_id: str
+    role: str
     sdk_version: str | None
     cli_version: str | None
     api_key_source: str
     tool_ready: int
     tools_served: tuple[str, ...]
+    denials: tuple[dict, ...]
     answers: int
     stop_reason: str | None
     text: str
@@ -251,11 +270,13 @@ class AgentRunResult:
     def as_dict(self) -> dict:
         return {
             "agent_run_id": self.agent_run_id,
+            "role": self.role,
             "sdk_version": self.sdk_version,
             "cli_version": self.cli_version,
             "api_key_source": self.api_key_source,
             "tool_ready": self.tool_ready,
             "tools_served": list(self.tools_served),
+            "denials": [dict(denial) for denial in self.denials],
             "answers": self.answers,
             "stop_reason": self.stop_reason,
             "text": self.text,
@@ -294,8 +315,7 @@ def agent_run(
         job = {
             "agent_run_id": request.agent_run_id,
             "objective": request.objective,
-            "model": request.model,
-            "max_turns": request.max_turns,
+            "role": request.role,
             "workspace": isolation.WORKSPACE,
         }
         return _spawn(request, job)
@@ -436,6 +456,7 @@ def assess(
     runtime: Mapping[str, object],
     *,
     launch_dir: Path | str,
+    role: object,
     managed_settings: Sequence[Path] | None = None,
 ) -> tuple[dict, ...]:
     """Everything about this launch that can be decided before it happens.
@@ -445,6 +466,15 @@ def assess(
     object the child then runs. Returns every violation it can see rather than
     the first, because an operator fixing one vector should be told about the
     other three in the same breath.
+
+    `role` is what most of the option checks are checks *against*: this launch
+    is contained by being one row of the roster, so the question is not whether
+    the turn ceiling is reasonable but whether it is that role's. A role this
+    roster does not have -- or one that runs no model, which this door cannot
+    start -- is itself the refusal, and the option checks are skipped after it
+    for the same reason they are skipped on an unmeasured runtime: they are
+    statements about what a particular role's launch should look like, and
+    there is no such role to compare against.
 
     `managed_settings` is a parameter so that the negative outcomes stay
     reachable from tests without writing to `/etc` on the machine running them.
@@ -460,7 +490,16 @@ def assess(
 
     unmeasured = _runtime_violations(options, runtime)
     configuration.extend(unmeasured)
-    if not any(violation["code"] == UNMEASURED_RUNTIME for violation in unmeasured):
+    launchable = isinstance(role, str) and role in roster.ROLES
+    if launchable and roster.ROLES[str(role)].runs_as == roster.RENDERER:
+        # A renderer is a role of this harness and not a session of this SDK.
+        # It has no model, no turn and no tool, so there is nothing here for it
+        # to be assessed as, and a door that started one would be a door that
+        # made it an agent.
+        launchable = False
+    if not launchable:
+        configuration.append(_violation(INVALID_LAUNCH, "launch:role"))
+    elif not any(violation["code"] == UNMEASURED_RUNTIME for violation in unmeasured):
         # Skipped rather than reported as failures on an unmeasured runtime.
         # Every one of those checks is a statement about what a field of *this*
         # SDK version does, and on a version this harness has not measured the
@@ -468,7 +507,7 @@ def assess(
         # The environment and the settings files are read either way: they are
         # facts about the machine, and an operator fixing the runtime pair
         # should learn about their exported key in the same breath.
-        configuration.extend(_option_violations(options, launch))
+        configuration.extend(_option_violations(options, launch, str(role)))
     settings, settings_violations = _settings_documents(options, launch, managed)
     configuration.extend(settings_violations)
 
@@ -534,6 +573,11 @@ def _runtime_violations(options: object, runtime: Mapping[str, object]) -> list[
     executable = bundled_executable(runtime)
     if pair != _startup.KNOWN_RUNTIME or executable is None:
         return [_violation(UNMEASURED_RUNTIME, "runtime:sdk-cli")]
+    if options is None:
+        # There is no options value to name an executable, and whatever made
+        # the launch undescribable has already said so. Adding a second
+        # violation here would report one fault as two.
+        return []
     if getattr(options, "cli_path", None) != str(executable):
         # Not a runtime violation but the same failure it prevents: an options
         # value that does not name the measured executable is one the SDK would
@@ -556,38 +600,72 @@ def bundled_executable(runtime: Mapping[str, object]) -> Path | None:
     return executable
 
 
-def _option_violations(options: object, launch: Path) -> list[dict]:
+def _option_violations(options: object, launch: Path, role: str) -> list[dict]:
     """The fields of the options value that decide what the child can reach.
 
     Each one is a containment property rather than a preference: an SDK `env`
     that is not empty can add a watched variable after it was inspected, a
     setting source that is not empty loads the operator's own files, a sandbox
-    merges settings this runtime did not write, a working directory that is not
-    the runtime's own is a directory the runtime does not own, and a built-in
-    tool list that is not empty is a network path that does not pass the door.
+    merges settings this runtime did not write, and a working directory that is
+    not the runtime's own is a directory the runtime does not own.
 
-    The last three are what the child may call, and they are assessed together
-    because they only mean anything together. `bypassPermissions` is safe here
-    exactly and only while the roster is the runtime's own one-tool server: the
-    permission mode decides whether a call is questioned, and these two decide
-    that there is nothing to question.
+    The rest are the roster, restated as a question about this options value.
+    They are not asserted because a mismatch would be dangerous by itself --
+    a turn ceiling of 60 on the orchestrator is merely wrong -- but because a
+    launch that differs from the roster in any field is a launch some other
+    thing decided, and the roster's whole claim is that nothing else does. The
+    two tool lists are the sharp end: `tools` is what the model is shown and
+    `allowed_tools` is what it may call unprompted, and neither may be wider
+    than the compiled grants, because the permission mode is
+    `bypassPermissions` and offering a tool under that mode is running it.
+
+    Widening either one still would not widen the role's authority -- the gate
+    denies from the roster and not from these lists -- but it would spend a
+    turn on a call that was always going to be refused, and it would put a tool
+    in a frame that is supposed to be the role's real surface.
     """
     served = getattr(options, "mcp_servers", None)
+    expected = roster.ROLES[role]
     checks = {
         "env": getattr(options, "env", None) == {},
         "setting_sources": getattr(options, "setting_sources", None) == [],
         "sandbox": getattr(options, "sandbox", "unset") is None,
         "cwd": getattr(options, "cwd", None) == str(launch) and launch.is_dir(),
-        "builtin_tools": getattr(options, "tools", None) == [],
+        "builtin_tools": getattr(options, "tools", None) == roster.visible_tools(role),
         "permission_mode": getattr(options, "permission_mode", None) == PERMISSION_MODE,
-        "allowed_tools": getattr(options, "allowed_tools", None) == [TOOL],
+        "allowed_tools": getattr(options, "allowed_tools", None)
+        == roster.allowed_tools(role, SERVED),
         "mcp_servers": isinstance(served, Mapping) and set(served) == {SERVER},
+        "model": getattr(options, "model", "unset") == expected.model,
+        "effort": getattr(options, "effort", "unset") == expected.effort,
+        "max_turns": getattr(options, "max_turns", None) == expected.max_turns,
+        "hooks": _gated(options),
     }
     return [
         _violation(INVALID_LAUNCH, f"launch:{field}")
         for field, holds in checks.items()
         if not holds
     ]
+
+
+def _gated(options: object) -> bool:
+    """Whether this options value carries the gate on every event it needs.
+
+    Checked structurally rather than by identity. What the assertion can see is
+    that each event has at least one matcher that matches every tool and has a
+    callback behind it; that the callback is the roster's is a fact about the
+    module that built the value, and `_launch` is the only module that can.
+    """
+    hooks = getattr(options, "hooks", None)
+    if not isinstance(hooks, Mapping) or set(hooks) != set(GATE_EVENTS):
+        return False
+    return all(
+        any(
+            getattr(matcher, "matcher", "unset") is None and getattr(matcher, "hooks", ())
+            for matcher in hooks[event]
+        )
+        for event in GATE_EVENTS
+    )
 
 
 def _settings_documents(
@@ -670,11 +748,17 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
         )
     return AgentRunResult(
         agent_run_id=request.agent_run_id,
+        role=request.role,
         sdk_version=result.get("sdk_version"),
         cli_version=result.get("cli_version"),
         api_key_source=str(result.get("api_key_source")),
         tool_ready=int(result.get("tool_ready") or 0),
         tools_served=tuple(result.get("tools_served") or ()),
+        denials=tuple(
+            dict(denial)
+            for denial in (result.get("denials") or ())
+            if isinstance(denial, Mapping)
+        ),
         answers=int(result.get("answers") or 0),
         stop_reason=result.get("stop_reason"),
         text=str(result.get("text") or ""),

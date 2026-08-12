@@ -44,7 +44,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import NoReturn
 
-from redkraken import agent
+from redkraken import agent, roster
 
 
 try:
@@ -52,6 +52,7 @@ try:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
+        HookMatcher,
         ResultMessage,
         SystemMessage,
         create_sdk_mcp_server,
@@ -172,8 +173,67 @@ def server(surface: Surface):
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=[ready])
 
 
+def gate_hooks(gate: roster.Gate) -> dict:
+    """The roster's decision, wired to the four events that make it one.
+
+    `PreToolUse` is the decision and the other three are what let it be taken
+    honestly. `SubagentStart` records what a delegated agent was started as, so
+    a later call carrying that identity is checked against a record rather than
+    believed; the two completions give an admitted delegation back, so the
+    concurrency ceiling is a ceiling on what is running rather than on what has
+    ever run.
+
+    None of the matchers narrows by tool name. A matcher is a filter on which
+    calls reach the gate, and a gate that some calls do not reach is not one.
+    """
+
+    async def before(payload, tool_use_id, context) -> dict:
+        call = roster.Call(
+            tool=str(payload.get("tool_name") or ""),
+            arguments=payload.get("tool_input") or {},
+            agent_id=payload.get("agent_id"),
+            agent_type=payload.get("agent_type"),
+            ticket=payload.get("tool_use_id") or tool_use_id,
+        )
+        denial = gate.decide(call)
+        if denial is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": str(denial),
+            }
+        }
+
+    async def started(payload, tool_use_id, context) -> dict:
+        gate.bind(str(payload.get("agent_id") or ""), str(payload.get("agent_type") or ""))
+        return {}
+
+    async def finished(payload, tool_use_id, context) -> dict:
+        ticket = payload.get("tool_use_id") or tool_use_id
+        if ticket is not None:
+            gate.release(str(ticket))
+        return {}
+
+    callbacks = {
+        "PreToolUse": before,
+        "SubagentStart": started,
+        "PostToolUse": finished,
+        "PostToolUseFailure": finished,
+    }
+    return {
+        event: [HookMatcher(matcher=None, hooks=[callbacks[event]])]
+        for event in agent.GATE_EVENTS
+    }
+
+
 def options_for(
-    job: Mapping[str, object], runtime: Mapping[str, object], mcp_server, launch: Path
+    job: Mapping[str, object],
+    runtime: Mapping[str, object],
+    mcp_server,
+    launch: Path,
+    gate: roster.Gate,
 ) -> object:
     """The one options value this launch is assessed with and started from.
 
@@ -183,14 +243,23 @@ def options_for(
     would look for on `PATH`. `settings` is the one document in `launch` for
     the same reason: naming the directory and naming the file in it separately
     would be two answers to which document loaded.
+
+    Everything that varies between one role and another is read off `gate.role`
+    rather than off the job. A job that could name a model or a turn ceiling
+    would be a caller deciding what the roster is for, and the assertion
+    checks these fields against the same row this reads them from, so a launch
+    that disagreed with the roster would not start.
     """
     executable = agent.bundled_executable(runtime)
+    role = gate.role
     return ClaudeAgentOptions(
-        model=job.get("model") or None,
-        max_turns=int(job.get("max_turns") or agent.MAX_TURNS),
-        tools=[],
+        model=role.model,
+        effort=role.effort,
+        max_turns=role.max_turns,
+        tools=roster.visible_tools(role.name),
         mcp_servers={agent.SERVER: mcp_server},
-        allowed_tools=[agent.TOOL],
+        allowed_tools=roster.allowed_tools(role.name, agent.SERVED),
+        hooks=gate_hooks(gate),
         setting_sources=[],
         permission_mode=agent.PERMISSION_MODE,
         cwd=str(launch),
@@ -232,19 +301,25 @@ async def run(
     launch = agent.launch_directory(str(job["workspace"]), str(job["agent_run_id"]))
     agent.write_settings(launch)
     surface = Surface()
-    # Nothing, when there is no SDK to build it from. An options value is a
-    # description of what one SDK version would do, so an absent SDK has no
-    # description rather than a broken one -- and `assess` refuses the absence
-    # as an unmeasured runtime, which is where that refusal already lives.
+    role = str(job.get("role") or "")
+    # Nothing, when there is no SDK to build it from, and nothing when there is
+    # no role to build it for. An options value is a description of what one
+    # SDK version would do for one role, so an absent SDK and an unknown role
+    # both leave it without a description rather than with a broken one --
+    # and `assess` already refuses each of them by name.
+    gate = _gate(role)
     options = (
-        None if claude_agent_sdk is None else options_for(job, runtime, server(surface), launch)
+        None
+        if claude_agent_sdk is None or gate is None
+        else options_for(job, runtime, server(surface), launch, gate)
     )
 
-    violations = agent.assess(options, environment, runtime, launch_dir=launch)
+    violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)
     if violations:
         raise agent.StartupRefusal(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")
         )
+    assert gate is not None
 
     messages = (transport or query)(prompt=str(job["objective"]), options=options)
     api_key_source = await _corroborate(messages, surface, runtime)
@@ -265,15 +340,30 @@ async def run(
             text = str(getattr(message, "result", "") or "")[:ANSWER]
             stop_reason = getattr(message, "stop_reason", None)
     return {
+        "role": gate.role.name,
         "sdk_version": runtime.get("sdk_version"),
         "cli_version": runtime.get("cli_version"),
         "api_key_source": api_key_source,
         "tool_ready": surface.opened,
         "tools_served": list(surface.served),
+        "denials": [denial.as_dict() for denial in gate.denials],
         "answers": answers,
         "stop_reason": stop_reason,
         "text": text,
     }
+
+
+def _gate(role: str) -> roster.Gate | None:
+    """The gate for this role, or nothing when the roster has no such role.
+
+    Nothing rather than an exception, because an unknown role is a refusal the
+    assertion makes with every other finding beside it, and a traceback here
+    would be one finding reported as a crash.
+    """
+    try:
+        return roster.Gate(role)
+    except roster.RosterError:
+        return None
 
 
 async def _corroborate(messages, surface: Surface, runtime: Mapping[str, object]) -> str:

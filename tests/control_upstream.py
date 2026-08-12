@@ -13,11 +13,14 @@ asserting on them is on the other side of a container boundary and reads them
 back from the log; and the process then does nothing at all, because the run
 under test is the one that ends.
 
-Run as `python -m tests.control_upstream <tool> <authority-dir> <port>`.
+Run as `python -m tests.control_upstream <tool> <authority-dir> <port>
+[arguments-json]`. The last is what the scripted call carries, for the runs
+whose subject is a gate that decides on an argument rather than on a name.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 
@@ -34,6 +37,7 @@ def main(argv: list[str]) -> int:
     tool, directory, port = argv[1], argv[2], int(argv[3])
     fixtures.ControlUpstream(
         tool,
+        arguments=json.loads(argv[4]) if len(argv) > 4 else None,
         authority=tls.authority(directory),
         bind=("0.0.0.0", port),
         watch=lambda host, line: print(f"{host}\t{line}", flush=True),

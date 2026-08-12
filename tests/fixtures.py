@@ -382,6 +382,7 @@ class ControlUpstream:
         self,
         tool: str,
         *,
+        arguments: dict | None = None,
         authority: tls.Authority | None = None,
         bind: tuple[str, int] = ("127.0.0.1", 0),
         watch: Callable[[str, str], None] | None = None,
@@ -395,8 +396,14 @@ class ControlUpstream:
         handed the run authority from outside instead of minting one only it
         can see, and reports what arrived on its own standard output because
         the process asserting on it is not this one.
+
+        `arguments` is what the scripted call carries. Empty is enough for a
+        tool that takes nothing; a gate that decides on an argument -- which
+        role a delegation would start, which skill a call would execute -- can
+        only be provoked by a call that has one.
         """
         self.tool = tool
+        self.arguments = {} if arguments is None else dict(arguments)
         self.authority = authority or tls.authority(scratch() / "control-authority")
         self.certificate = self.authority.certificate
         #: One entry per request that arrived, as (host, request line).
@@ -494,9 +501,10 @@ class ControlUpstream:
                  "content_block": {"type": "tool_use", "id": "toolu_control",
                                    "name": self.tool, "input": {}}},
                 {"type": "content_block_delta", "index": 0,
-                 # An empty object rather than an empty string: the deltas are
+                 # An object rather than an empty string: the deltas are
                  # concatenated and parsed, and `""` is not a document.
-                 "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+                 "delta": {"type": "input_json_delta",
+                           "partial_json": json.dumps(self.arguments)}},
                 {"type": "content_block_stop", "index": 0},
             ]
             stop = "tool_use"
@@ -613,6 +621,11 @@ def boundary(**overrides) -> isolation.AgentContainer:
 #: being grepped for.
 EXPORTED = "exported-into-the-launch"
 
+#: The role a launch under test runs as when the test is not about roles. The
+#: orchestrator, because it is the one role that holds the delegation tool, so
+#: a suite that used any other would leave the widest surface untested.
+ROLE = "orchestrator"
+
 
 def startup_refusal(environment: dict | None = None, phase: str = "pre_spawn"):
     """One refusal, measured on inputs rather than on the machine underneath.
@@ -627,6 +640,7 @@ def startup_refusal(environment: dict | None = None, phase: str = "pre_spawn"):
         {"ANTHROPIC_API_KEY": EXPORTED} if environment is None else environment,
         {},
         launch_dir=scratch(),
+        role=ROLE,
         managed_settings=(),
     )
     return agent.StartupRefusal(violations, phase, *_startup.KNOWN_RUNTIME)
