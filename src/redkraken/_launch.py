@@ -157,7 +157,7 @@ def runtime_facts() -> dict[str, str | None]:
 
 
 class Submission:
-    """The one Mission result a run may submit, and the count of the tries.
+    """The one result a run may submit, and the count of the tries.
 
     One, because the Spec says one: "Agents submit one Mission result". A
     second submission is not merged and does not overwrite -- the first is what
@@ -219,8 +219,9 @@ DESCRIPTIONS = {
         "with each Observation's provenance label."
     ),
     "get_receipts": (
-        "Fetch named Receipts. A label that is not in this run's packet comes back as "
-        "an omission marker rather than as an error."
+        "With no labels, list the Receipts this run's packet reached. With labels, "
+        "fetch those. A label that is not in this run's packet comes back as an "
+        "omission marker rather than as an error."
     ),
     "get_artifact": (
         "With no label, list the Artifacts this run's packet reached. With one, fetch "
@@ -229,7 +230,7 @@ DESCRIPTIONS = {
         "are analysed by a tool run, not read into this context."
     ),
     "submit_mission_result": (
-        "Submit this Mission's one result: proposed Entities, Relationships, "
+        "Submit this run's one result: proposed Entities, Relationships, "
         "Hypotheses, Observations with the Receipt or Tool Run each cites, evidence "
         "edges, suggested Tasks and a completion claim. It is staging data. The "
         "runtime checks provenance and decides what becomes canonical; nothing here "

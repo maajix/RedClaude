@@ -530,12 +530,32 @@ class ReaderTest(unittest.TestCase):
 
     # -- the receipts -------------------------------------------------------
 
+    def test_asking_for_no_receipts_lists_the_ones_this_packet_reached(self):
+        # The same reason `artifact()` lists: a Receipt label is cited by an
+        # Observation's provenance, and a child that cannot see which labels
+        # the packet holds can only cite one it guessed.
+        answer = self.reader().receipts()
+
+        self.assertEqual("receipts", answer["section"])
+        self.assertEqual(["R1", "R2"], [item["label"] for item in answer["records"]])
+        self.assertEqual(2, answer["counts"]["matched"])
+
+    def test_the_receipt_list_is_paged_by_the_limit_it_was_given(self):
+        answer = self.reader().receipts(limit=1)
+
+        self.assertEqual(["R1"], [item["label"] for item in answer["records"]])
+        self.assertIn({"reason": "limit", "count": 1}, answer["omitted"])
+
     def test_named_receipts_come_back_and_the_names_that_did_not_are_listed(self):
         answer = self.reader().receipts(receipt_labels=["R1", "R99"])
 
         self.assertEqual(["R1"], [item["label"] for item in answer["records"]])
         self.assertEqual(
-            [{"reason": "not_staged", "count": 1, "labels": ["R99"]}], answer["omitted"]
+            [
+                {"reason": "packet_bound", "count": 6},
+                {"reason": "not_staged", "count": 1, "labels": ["R99"]},
+            ],
+            answer["omitted"],
         )
 
     def test_a_receipt_named_twice_is_answered_once(self):
@@ -557,11 +577,18 @@ class ReaderTest(unittest.TestCase):
     def test_a_receipt_the_packet_lacks_says_it_was_not_staged_rather_than_why(self):
         # The child cannot tell absent from another Program's from
         # `proxy_internal`, and a marker that guessed would be the child
-        # asserting something it has no way to know.
+        # asserting something it has no way to know. `packet_bound` rides along
+        # for the same reason: six Receipts this Program has did not fit, so
+        # "not staged" is a fact about the packet and not about the Program.
         answer = self.reader().receipts(receipt_labels=["R99"])
 
-        self.assertEqual([{"reason": "not_staged", "count": 1, "labels": ["R99"]}],
-                         answer["omitted"])
+        self.assertEqual(
+            [
+                {"reason": "packet_bound", "count": 6},
+                {"reason": "not_staged", "count": 1, "labels": ["R99"]},
+            ],
+            answer["omitted"],
+        )
 
     # -- the artifact -------------------------------------------------------
 

@@ -1,4 +1,4 @@
-"""One Mission result, staged. The entire write an executing role can cause.
+"""One agent run's result, staged. The entire write an executing role can cause.
 
 Spec section 13: an Agent submits one result "containing proposed Entities,
 Relationships, Observations, Hypotheses, evidence edges, suggested Tasks and a
@@ -83,7 +83,7 @@ class Drop:
 
 @dataclass(frozen=True, slots=True)
 class Result:
-    """A Mission result as the child returned it, before anything checked it."""
+    """An agent run's result as the child returned it, before anything checked it."""
 
     payload: Mapping[str, Any] = field(default_factory=dict)
 
@@ -91,10 +91,11 @@ class Result:
     def completion(self) -> str:
         """The claim, clamped to a word the column accepts.
 
-        `completion_claim` is free text by contract -- `OPEN_ARGUMENTS` says why
-        -- so the model can put anything in it, and the column takes one of
-        three words. Anything else is not a lenient parse away from being a
-        claim of completeness; it is the absence of one.
+        The contract closes `completion_claim` to a `status` and a `note`, but
+        it does not close what the status says: the schema is checked by the
+        CLI, `status` is a string there, and the column takes one of three
+        words. Anything else is not a lenient parse away from being a claim of
+        completeness; it is the absence of one.
         """
         claim = self.payload.get("completion_claim")
         if not isinstance(claim, Mapping):
@@ -121,10 +122,6 @@ class Result:
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
             return []
         return [item for item in value if isinstance(item, Mapping)]
-
-    @classmethod
-    def from_dict(cls, document: Mapping[str, Any]) -> Result:
-        return cls(payload={key: document[key] for key in document if key != "kind"})
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +157,7 @@ def review(
     not exist yet -- a new Entity has no label, a Relationship names two
     Entities that may both be proposed beside it, and an evidence edge cites
     the Hypothesis proposed three keys above it -- so checking them against
-    canonical rows would refuse exactly the elements a Mission is for. An
+    canonical rows would refuse exactly the elements an agent run is for. An
     Observation is the one element that is a claim about something that already
     happened, which is why migration 0007 makes the same demand of the
     canonical table.
@@ -247,7 +244,7 @@ def _subject_fault(
 ) -> tuple[str, str | None] | None:
     """The Entity the Observation is about, if it says it is about a known one.
 
-    An Observation may name no subject, or may name one this Mission is
+    An Observation may name no subject, or may name one this run is
     proposing in the same packet. Neither is a fault. Naming a label that
     resolves to another Program's row is, and it is the one case a Program
     boundary can be crossed by citation rather than by query.
@@ -319,7 +316,7 @@ def stage(
     agent_run_id: str,
     task_id: str,
 ) -> Staged:
-    """Write one Mission result as staging rows, and nothing else, ever.
+    """Write one agent run's result as staging rows, and nothing else, ever.
 
     Two tables, one transaction. The transaction is not for speed: a proposal
     whose drops did not commit with it would read as a proposal that passed

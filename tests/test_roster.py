@@ -363,7 +363,11 @@ class SurfaceTest(unittest.TestCase):
     def test_a_proposal_reaches_staging_and_stops_there(self):
         proposal = roster.CONTRACTS["mcp__rk2__submit_mission_result"]
 
-        self.assertEqual(("proposals",), proposal.writes)
+        # Both staging tables, because `proposal.stage` writes both in one
+        # transaction: a contract naming only `proposals` would describe a
+        # write the runtime does not make on its own.
+        self.assertEqual(roster.STAGING, proposal.writes)
+        self.assertEqual(("proposals", "proposal_drops"), roster.STAGING)
         for name, role in roster.ROLES.items():
             with self.subTest(role=name):
                 self.assertFalse(
@@ -606,6 +610,35 @@ class GateTest(unittest.TestCase):
                 denial = self.denied(
                     self.gate, roster.Call(tool=agent_read(), arguments=arguments)
                 )
+                self.assertEqual(roster.FORBIDDEN_ARGUMENT, denial.rule)
+
+    def test_an_observation_about_a_credential_is_not_read_as_one_being_passed(self):
+        # The two sets are not one set. A Program selector is refused wherever
+        # it appears, because a call that carries one is a call trying to
+        # choose its own Program. An instruction word is refused only in an
+        # argument the runtime interprets -- inside a free-text element it is
+        # the hunter's own report, and "an exposed password" is the output this
+        # harness exists to produce, not an attempt to send one.
+        hunter = roster.Gate("web_hunter")
+        hunter.bind("agent-1", "web_hunter")
+
+        def submitting(**observation) -> roster.Call:
+            return roster.Call(
+                tool="mcp__rk2__submit_mission_result",
+                arguments={
+                    "observations": [observation],
+                    "completion_claim": {"status": "complete"},
+                },
+                agent_id="agent-1",
+                agent_type="web_hunter",
+            )
+
+        self.assertIsNone(
+            hunter.decide(submitting(note="password reflected", secret="AKIA...", sql="' OR 1=1"))
+        )
+        for leaked in ({"program_id": "other"}, {"where": {"tenant": "other"}}):
+            with self.subTest(observation=leaked):
+                denial = self.denied(hunter, submitting(**leaked))
                 self.assertEqual(roster.FORBIDDEN_ARGUMENT, denial.rule)
 
     def test_a_call_that_does_not_fit_its_contract_is_denied(self):

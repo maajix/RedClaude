@@ -424,6 +424,27 @@ class AssertionTest(unittest.TestCase):
                 self.assertEqual([agent.INVALID_LAUNCH], codes(violations))
                 self.assertEqual(["launch:cli_path"], sources(violations))
 
+    def test_a_role_with_no_served_tool_is_refused_before_a_model_is_started(self):
+        # `reporter` runs no model, and `validator` holds one group this
+        # runtime does not serve -- so a validator launch would start a model
+        # at its own effort with no verdict tool to reach, and the one thing it
+        # could produce is prose. The four roles that keep a served tool still
+        # launch, which is what makes this a refusal of two rows rather than of
+        # the roster.
+        for role in ("reporter", "validator", "no_such_role"):
+            with self.subTest(role=role):
+                violations = self.assess(options(self.launch, self.cli), role=role)
+
+                self.assertEqual([agent.INVALID_LAUNCH], codes(violations))
+                self.assertEqual(["launch:role"], sources(violations))
+
+        for role in ("orchestrator", "recon", "web_hunter", "js_analyst"):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    (),
+                    self.assess(options(self.launch, self.cli, role=role), role=role),
+                )
+
     def test_each_widening_of_the_child_is_refused_by_the_field_that_widened_it(self):
         widenings = {
             "launch:env": {"env": {"ANTHROPIC_API_KEY": "late"}},

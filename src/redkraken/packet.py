@@ -281,18 +281,27 @@ def fit[T](
     return remaining
 
 
-def _size(rows: Sequence[Row]) -> int:
-    """What the rows cost, measured the way they will be sent.
+def sent_bytes(items: Sequence[Any], project: Callable[[Any], object]) -> int:
+    """What the items cost, measured the way they will be sent.
 
     Nothing costs nothing, rather than the two bytes an empty array is written
-    in. `fit` stops when it has nothing left to drop, so counting the framing
-    would let a compile report a size over a ceiling it could not have met.
+    in. Both callers stop when they have nothing left to drop, so counting the
+    framing would let one report a size over a ceiling it could not have met.
+
+    The projection is the caller's because only the caller knows the shape it
+    sends -- a packet sends rows, a state read sends summaries -- and measuring
+    a shape other than the one that goes out would measure nothing anybody gets.
     """
-    if not rows:
+    if not items:
         return 0
     return len(
-        json.dumps([row.as_dict() for row in rows], separators=(",", ":")).encode("utf-8")
+        json.dumps([project(item) for item in items], separators=(",", ":")).encode("utf-8")
     )
+
+
+def _size(rows: Sequence[Row]) -> int:
+    """What the rows cost a packet, in the bytes they are sent as."""
+    return sent_bytes(rows, lambda row: row.as_dict())
 
 
 def bound(sections: Mapping[str, Section], *, byte_limit: int) -> dict[str, Section]:
@@ -617,8 +626,18 @@ class Reader:
 
         return self._page("evidence", limit, wanted).as_dict()
 
-    def receipts(self, *, receipt_labels: Iterable[str]) -> dict:
-        """The named Receipts, and the names that were not in the packet.
+    def receipts(
+        self, *, receipt_labels: Iterable[str] | None = None, limit: int | None = None
+    ) -> dict:
+        """The named Receipts, or the list of them, and the names not in the packet.
+
+        The same verb lists and fetches, for the reason `artifact` does: a
+        label is the only handle the child has, and it needs somewhere to learn
+        one. Its other source is the `receipt_label` on an evidence edge, which
+        reaches exactly the Receipts some Observation already cites -- so
+        without the listing a staged Receipt that nothing cites yet is a row
+        the packet carried and the child could not name. That is the case a
+        hunter is in on its first turn.
 
         A missing name has more than one cause and the child can distinguish
         none of them: the Receipt may not exist, may belong to another Program,
@@ -631,24 +650,18 @@ class Reader:
         missing, and the marker already carries that number: a `matched` above
         `staged` would say the filter selected rows the compile never staged.
         """
+        if receipt_labels is None:
+            return self._page("receipts", limit, lambda row: True).as_dict()
         wanted = list(dict.fromkeys(str(label) for label in receipt_labels))
-        section = self.packet.section("receipts")
-        held = {row.label: row for row in section.rows}
-        rows = tuple(held[label] for label in wanted if label in held)
+        held = {row.label for row in self.packet.section("receipts").rows}
         missing = [label for label in wanted if label not in held]
-        answer = Answer(
-            section="receipts",
-            revision=self.packet.revision,
-            rows=rows,
-            total=section.total,
-            staged=len(section.rows),
-            matched=len(rows),
-            omitted=(
-                ({"reason": "not_staged", "count": len(missing), "labels": missing},)
-                if missing
-                else ()
-            ),
-        )
+        answer = self._page("receipts", limit, lambda row: row.label in wanted)
+        if missing:
+            answer = replace(
+                answer,
+                omitted=answer.omitted
+                + ({"reason": "not_staged", "count": len(missing), "labels": missing},),
+            )
         return answer.as_dict()
 
     def artifact(self, *, artifact_label: str | None = None, span: str | None = None) -> dict:

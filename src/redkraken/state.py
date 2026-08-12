@@ -379,16 +379,5 @@ def _per_kind(entries: Sequence[Entry]) -> dict[str, int]:
 
 
 def _size(entries: Sequence[Entry]) -> int:
-    """What the entries cost a caller, measured the way they will be sent.
-
-    Nothing costs nothing, rather than the two bytes an empty array is written
-    in. `bound` stops when it has nothing left to drop, so counting the framing
-    would let a read report a size over a ceiling it could not have met.
-    """
-    if not entries:
-        return 0
-    return len(
-        json.dumps(
-            [item.summary() for item in entries], separators=(",", ":")
-        ).encode("utf-8")
-    )
+    """What the entries cost a caller, in the bytes they are sent as."""
+    return packet.sent_bytes(entries, lambda item: item.summary())

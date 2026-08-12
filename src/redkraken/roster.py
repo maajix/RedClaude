@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
 from typing import Any
@@ -110,6 +110,13 @@ CANONICAL = (
     "playbooks",
 )
 
+#: The staging tables a proposal is allowed to reach, which is the whole write
+#: surface of an executing role. Two rather than one: what the agent claimed
+#: and, beside it, every element the runtime refused with the reason it can
+#: prove. `proposal.stage` writes both in the same transaction, so declaring
+#: only the first would be a contract that describes half of what it does.
+STAGING = ("proposals", "proposal_drops")
+
 #: The label prefixes the database assigns, from `label_prefixes` in migration
 #: 0015 and the three later migrations that add one. A label is the prefix and
 #: a decimal with nothing between them -- `H7`, `EP12`, `R903` -- because that
@@ -168,14 +175,14 @@ HYPOTHESIS_STATUSES = (
     "inconclusive",
 )
 
-#: Argument names no model-facing tool may carry, whatever the tool. Program
-#: selection is the first: every canonical table is program-scoped and the
-#: program is bound in the handler from runtime configuration, so an argument
-#: that named one would be the agent choosing its own tenant. The rest are
-#: credential material and raw SQL, which have no legitimate spelling on this
-#: surface. Checked on the call as well as on the contracts, because a built-in
-#: tool has no contract here and still takes arguments.
-FORBIDDEN_ARGUMENTS = frozenset(
+#: Names for the runtime's own choice of tenant. Every canonical table is
+#: program-scoped and the program is bound in the handler from runtime
+#: configuration, so an argument that named one would be the agent choosing
+#: which Program it is working in. These are refused wherever they appear,
+#: including inside an otherwise opaque payload: a Program identifier is the
+#: one thing ticket 19's sixth criterion names by itself, and no element a
+#: model proposes has a reason to spell one.
+FORBIDDEN_SELECTORS = frozenset(
     {
         "program",
         "program_id",
@@ -183,9 +190,18 @@ FORBIDDEN_ARGUMENTS = frozenset(
         "tenant_id",
         "database",
         "dbname",
-        "schema",
         "dsn",
         "connection_string",
+    }
+)
+
+#: Credential material and raw SQL: names for something the runtime would
+#: *act on* if a handler read it. Refused in every argument the runtime
+#: interprets, and only there -- see `_forbidden_argument` for why an opaque
+#: payload is the one place these are allowed to appear.
+FORBIDDEN_INSTRUCTIONS = frozenset(
+    {
+        "schema",
         "sql",
         "statement",
         "api_key",
@@ -199,6 +215,11 @@ FORBIDDEN_ARGUMENTS = frozenset(
         "secret",
     }
 )
+
+#: Argument names no model-facing tool may declare, whatever the tool. Checked
+#: on the call as well as on the contracts, because a built-in tool has no
+#: contract here and still takes arguments.
+FORBIDDEN_ARGUMENTS = FORBIDDEN_SELECTORS | FORBIDDEN_INSTRUCTIONS
 
 #: How deep the argument scan goes. A bound rather than a budget: it exists so
 #: a pathological document cannot make the gate the slow part of a tool call,
@@ -427,10 +448,14 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
 
 #: Where an unconstrained value is allowed, and why. Two entries, both
 #: deliberate: a question whose recipient is a human rather than another agent,
-#: and the staging packet, whose contents become canonical only through the
-#: runtime's promotion step and whose observations are dropped when the receipt
-#: they cite does not exist. Nothing else on this surface takes a value the
-#: roster cannot describe.
+#: and the six element lists of the staging packet, whose contents become
+#: canonical only through the runtime's promotion step and whose observations
+#: are dropped when the receipt they cite does not exist. Nothing else on this
+#: surface takes a value the roster cannot describe.
+#:
+#: `completion_claim` is deliberately not here. It is the one member of that
+#: packet the runtime reads a field out of, so its keys are closed like any
+#: other interpreted argument's.
 OPEN_ARGUMENTS = {
     "mcp__rk2__park_for_human": ("question",),
     "mcp__rk2__submit_mission_result": (
@@ -440,7 +465,6 @@ OPEN_ARGUMENTS = {
         "hypotheses",
         "evidence",
         "suggested_tasks",
-        "completion_claim",
     ),
 }
 
@@ -468,11 +492,17 @@ _HASH = "^[0-9a-f]{64}$"
 #: ceiling and the byte budget is the half that binds.
 _PAGE = (1, 200)
 
+# The view each read comes through, then the canonical relations behind it.
+# The child has no database: `packet.compile` runs these on the supervisor's
+# `rk2_state` connection before the container starts, and the handler answers
+# out of the document that produced. So the first name is the relation actually
+# queried and the rest are what it is a view of -- which is the shape
+# `get_artifact` already had, and the reason it is the shape here.
 CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_attack_surface": Contract(
         "state.read",
         READ,
-        reads=("entities", "domains", "hosts", "services", "applications",
+        reads=("v_records", "entities", "domains", "hosts", "services", "applications",
                "endpoints", "parameters", "technologies", "identities"),
         arguments={
             "entity_type": Argument("string", enum=ENTITY_TYPES),
@@ -482,7 +512,7 @@ CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_hypotheses": Contract(
         "state.read",
         READ,
-        reads=("hypotheses", "entities"),
+        reads=("v_records", "hypotheses", "entities"),
         arguments={
             "subject_label": Argument("string", pattern=_ENTITY_LABEL),
             "status": Argument("string", enum=HYPOTHESIS_STATUSES),
@@ -492,21 +522,26 @@ CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_evidence": Contract(
         "state.read",
         READ,
-        reads=("hypothesis_evidence", "finding_evidence", "observations"),
+        reads=("v_evidence", "hypothesis_evidence", "finding_evidence", "observations"),
         arguments={
             "hypothesis_label": Argument("string", pattern=_label("H")),
             "finding_label": Argument("string", pattern=_label("F")),
             "limit": Argument("integer", bounds=_PAGE),
         },
     ),
+    # Nothing is required, for the reason `get_artifact` requires nothing: the
+    # same verb lists and fetches. Labels fetch those Receipts; no labels lists
+    # the ones this packet reached. Without the listing a Receipt is reachable
+    # only by a label quoted on an evidence edge, so a staged Receipt that no
+    # edge cites is a row the child was given and cannot name -- which is the
+    # defect this ticket already fixed once, for Artifacts.
     "mcp__rk2__get_receipts": Contract(
         "state.read",
         READ,
-        reads=("receipts",),
+        reads=("v_records", "receipts"),
         arguments={
-            "receipt_labels": Argument(
-                "array", required=True, items_pattern=_label("R")
-            )
+            "receipt_labels": Argument("array", items_pattern=_label("R")),
+            "limit": Argument("integer", bounds=_PAGE),
         },
     ),
     # By label, not by hash. `v_artifacts` says why on the view itself: "the
@@ -535,10 +570,16 @@ CONTRACTS: dict[str, Contract] = {
     # and a completion claim". This declaration is the closed set: an element
     # list that is not here is refused by the served schema before any handler
     # sees it, and `proposal_drops.element_path` points into it by these names.
+    # `completion_claim` is the one element the runtime reads a field out of --
+    # `proposal.Result.completion` clamps `status` to the three words the
+    # column takes -- so it is the one element whose keys are closed here. The
+    # element lists stay open because a proposal is raw model output and the
+    # runtime decides what grounds; the claim is not raw output, it is an
+    # answer to a question this schema asked.
     "mcp__rk2__submit_mission_result": Contract(
         "state.propose",
         PROPOSE,
-        writes=("proposals",),
+        writes=STAGING,
         arguments={
             "observations": Argument("array", required=True, free_text=True),
             "new_entities": Argument("array", free_text=True),
@@ -546,7 +587,9 @@ CONTRACTS: dict[str, Contract] = {
             "hypotheses": Argument("array", free_text=True),
             "evidence": Argument("array", free_text=True),
             "suggested_tasks": Argument("array", free_text=True),
-            "completion_claim": Argument("object", required=True, free_text=True),
+            "completion_claim": Argument(
+                "object", required=True, items_pattern="^(status|note)$"
+            ),
         },
     ),
     "mcp__rk2__get_slate": Contract(
@@ -910,7 +953,7 @@ class Gate:
                 UNLISTED_TOOL, tool, role.name, f"{role.name} was not granted {tool}"
             )
 
-        forbidden = _forbidden_argument(call.arguments)
+        forbidden = _forbidden_argument(call.arguments, _opaque(tool))
         if forbidden is not None:
             return Denial(
                 FORBIDDEN_ARGUMENT,
@@ -1035,27 +1078,59 @@ class Gate:
         return None
 
 
-def _forbidden_argument(arguments: Any, depth: int = 0) -> str | None:
+def _forbidden_argument(arguments: Any, opaque: Collection[str] = ()) -> str | None:
     """The first argument name on this surface that may not exist, at any depth.
 
     Nested rather than top-level because the names that matter are the ones a
     handler would read, and a handler reads a member of an object as readily as
-    it reads a top-level key. The depth bound is not a correctness limit here:
-    every contract on this surface is two levels deep at most, so a document
-    deeper than the bound is already not a call any contract describes.
+    it reads a top-level key.
+
+    `opaque` names the arguments the contract declared `free_text`, and inside
+    those only `FORBIDDEN_SELECTORS` is refused. The distinction is what the
+    runtime does with the value. An interpreted argument named `password` is a
+    credential being handed to a tool. The same name inside a proposal payload
+    is an agent *reporting* one -- an Observation of an exposed credential is
+    the core output of a bug bounty hunter, and scanning the payload for the
+    word would make the one finding class this harness exists to produce the
+    one it structurally cannot submit. A Program identifier stays refused
+    everywhere, because no element a model proposes has a reason to name a
+    tenant and ticket 19's sixth criterion names that case by itself.
+
+    Nothing is opaque unless a contract said so, so a built-in tool -- which
+    has no contract here -- is scanned in full.
+    """
+    if not isinstance(arguments, Mapping):
+        return _scan(arguments, FORBIDDEN_ARGUMENTS, 1)
+    for name, value in arguments.items():
+        if isinstance(name, str) and name.strip().lower() in FORBIDDEN_ARGUMENTS:
+            return name
+        within = FORBIDDEN_SELECTORS if name in opaque else FORBIDDEN_ARGUMENTS
+        found = _scan(value, within, 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _scan(value: Any, names: Collection[str], depth: int) -> str | None:
+    """The first key of this document that is one of `names`.
+
+    The depth bound is not a correctness limit: every contract on this surface
+    is two levels deep at most, so a document deeper than the bound is already
+    not a call any contract describes. It exists so a pathological payload
+    cannot make the gate the slow part of a tool call.
     """
     if depth >= DEPTH:
         return None
-    if isinstance(arguments, Mapping):
-        for name, value in arguments.items():
-            if isinstance(name, str) and name.strip().lower() in FORBIDDEN_ARGUMENTS:
+    if isinstance(value, Mapping):
+        for name, inner in value.items():
+            if isinstance(name, str) and name.strip().lower() in names:
                 return name
-            found = _forbidden_argument(value, depth + 1)
+            found = _scan(inner, names, depth + 1)
             if found is not None:
                 return found
-    elif isinstance(arguments, (list, tuple)):
-        for value in arguments:
-            found = _forbidden_argument(value, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _scan(item, names, depth + 1)
             if found is not None:
                 return found
     return None
@@ -1074,6 +1149,20 @@ def _impersonation(tool: str, identity: str, recorded: str, claimed: str) -> Den
         tool,
         recorded,
         f"agent {identity} was started as {recorded} and now claims {claimed}",
+    )
+
+
+def _opaque(tool: str) -> frozenset[str]:
+    """Which of this tool's arguments the roster declared it constrains nothing about.
+
+    A built-in tool has no contract here, so nothing of it is opaque and the
+    name scan runs over the whole call.
+    """
+    contract = CONTRACTS.get(tool)
+    if contract is None:
+        return frozenset()
+    return frozenset(
+        name for name, argument in contract.arguments.items() if argument.free_text
     )
 
 
@@ -1301,7 +1390,9 @@ def _check_contracts() -> None:
             raise RosterError(f"{name}: {contract.direction} is not a direction")
         if contract.direction == READ and contract.writes:
             raise RosterError(f"{name}: a read tool that writes is a proposal named as a getter")
-        if contract.direction == PROPOSE and set(contract.writes) != {"proposals"}:
+        if contract.direction == PROPOSE and (
+            "proposals" not in contract.writes or not set(contract.writes) <= set(STAGING)
+        ):
             raise RosterError(f"{name}: a proposal writes staging and nothing else")
         if contract.direction == REQUEST and not contract.writes:
             raise RosterError(f"{name}: a request writes the row the runtime reads")

@@ -536,7 +536,18 @@ def assess(
     # has no model, no turn and no tool, so there is nothing here for it to be
     # assessed as, and a door that started one would be a door that made it an
     # agent.
-    launchable = role in roster.ROLES and not roster.ROLES[role].rendered
+    #
+    # A role whose enforced surface is empty is refused for the same reason,
+    # and it is not a hypothetical: the roster states all six roles, this
+    # runtime serves two groups, and `validator` holds exactly `validate.judge`
+    # -- so a validator launch would start a model at its own effort for its
+    # own turn ceiling with no verdict tool to reach. What it could produce is
+    # prose, and prose is the one thing this runtime does not accept as a
+    # result. The intersection shrinking to nothing is how the roster says a
+    # role's ticket has not landed yet; the door should say so too, rather than
+    # spend a run finding out.
+    known = role in roster.ROLES and not roster.ROLES[role].rendered
+    launchable = known and bool(roster.ROLES[role].allowed_tools(SERVED))
     if not launchable:
         configuration.append(_violation(INVALID_LAUNCH, "launch:role"))
     elif not any(violation["code"] == UNMEASURED_RUNTIME for violation in unmeasured):

@@ -235,3 +235,52 @@ pre-existing and environmental, identical on a clean tree at `876a486` --
 `test_identity`, `test_proxy` and two `ProxyEgressTest` cases need a platform
 that loads a client key without a plaintext file, which the uv CPython builds on
 this machine are not.
+
+### What the combined review changed
+
+The review above was of this ticket alone against `1d52a32`. A second pass took
+eighteen and nineteen together against `876a486...main`, because the pair is
+what a run meets and neither review had seen the other's surface. Its findings
+on the roster and the door are recorded in ticket 18; four landed here.
+
+- **A Receipt label was unlearnable, the same way an Artifact label was.**
+  `get_receipts` required `receipt_labels`, so the only way to name a Receipt
+  was to already know its label -- and an Observation's provenance has to cite
+  one. With no labels it lists what the packet reached now, paged by a `limit`
+  the contract bounds like the other reads. Named labels still answer as they
+  did, with `not_staged` for what the packet lacks; the listing path put those
+  answers through `_page`, so they carry the section's `packet_bound` marker as
+  well, which is the honest reading -- six Receipts this Program has did not fit
+  the packet, so a label that is missing may be one of those rather than one
+  that does not exist.
+- **`_size` was written twice.** `packet._size` and `state._size` had the same
+  docstring and differed only in the projection -- `row.as_dict()` against
+  `item.summary()`. One `packet.sent_bytes(items, project)` now, called by both;
+  the projection stays the caller's because only the caller knows the shape it
+  sends.
+- **`Result.from_dict` was dead.** Nothing constructed a `Result` that way. It
+  is gone rather than kept for a caller that does not exist.
+- **A docstring had gone false.** `Result.completion` said `completion_claim`
+  is free text and pointed at `OPEN_ARGUMENTS` for why; ticket 18's patch closed
+  it to `status` and `note`. The clamp is still right and its reason is now the
+  real one: the contract closes the keys, not what the status says.
+
+The contracts' `reads` also stopped naming only canonical tables. The compile
+reads `v_records`, `v_evidence`, `v_artifacts` and `events`, and four contracts
+named the tables behind those views instead -- so the roster described reads
+that no longer happened. Each names the view first and then what stands behind
+it, which keeps `tests/test_roster.py`'s check that every named relation exists
+meaningful.
+
+Two prose fixes rather than behaviour: `CONTEXT.md` reserves "Mission" for the
+packet, and this ticket's modules still used it bare for the result -- an agent
+run's result is what the glossary calls it, and the wire names
+`submit_mission_result`, `mission_result` and `mission_attempts` keep the word
+because renaming half a pair leaves a key nothing is called.
+
+Three earlier findings stay defended rather than patched. Dropping
+`v_surface`, `v_hypotheses` and `v_receipts` was deliberate and is argued
+above -- they were granted to nobody and served no handler. `state.bound`
+delegating to `packet.fit` is still the lesser of two evils. And the missing
+glossary entries are still a note for `/domain-modeling` rather than something
+to fill in passing.

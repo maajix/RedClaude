@@ -287,3 +287,44 @@ hypothesis, so a hunt Task without one starts leaseless, and
 Ticket 73: the cross-role subagent cap is written twice, as
 `roster.GLOBAL_SUBAGENTS` and as `scheduler_weights.max_concurrent_subagents`,
 equal today only because both are 3.
+
+### What the combined review changed
+
+Each ticket was reviewed alone. Nineteen and eighteen together never were, and
+the pair is what a run actually meets: eighteen decides what a call may be and
+nineteen decides what a call may say. Both axes were pointed at `876a486...main`
+and asked specifically about drift between the two. Two findings landed on this
+ticket's side.
+
+- **The gate refused the findings it exists to collect.** `_forbidden_argument`
+  walked every nested key of a call against one set that held `program_id` next
+  to `password`, `secret`, `token`, `credential`, `sql` and `statement`. Those
+  are not one kind of word. A Program selector is a call trying to choose its
+  own Program and is refused wherever it appears; an instruction word is only
+  dangerous in an argument the runtime interprets. Inside `observations` -- a
+  free-text element list -- it is the hunter's report, and "an exposed password"
+  or "SQL injection at this parameter" is the output this harness exists to
+  produce. As written, a web hunter that found the bug it was sent to find lost
+  the whole submission to `R-ARGNAME`. `FORBIDDEN_ARGUMENTS` is now the union of
+  `FORBIDDEN_SELECTORS` and `FORBIDDEN_INSTRUCTIONS`, and an argument the
+  contract declares `free_text` is scanned for selectors only. Criterion 19-6
+  still reads the way it did: "Program identifiers" are refused at any depth.
+- **A role with no served tool was launchable.** The door refused `reporter`
+  because it renders rather than runs, and let `validator` through -- the roster
+  gives it exactly `validate.judge`, this runtime serves `state.read` and
+  `state.propose`, and the intersection is empty. A validator launch would have
+  started a model at `max` effort for its own turn ceiling with no verdict tool
+  to reach, and the only thing it could return is prose. `assess` refuses an
+  empty enforced surface under `launch:role` now, with the four roles that keep
+  a tool asserted launchable in the same test so it stays a refusal of two rows
+  rather than of the roster.
+
+Two smaller corrections came with them. `Contract.writes` for
+`submit_mission_result` named `proposals` alone while `proposal.stage` writes
+`proposals` and `proposal_drops` in one transaction, so the roster described a
+write the runtime does not make on its own; both are named through a `STAGING`
+constant the `_check_contracts` rule now reads, which is what keeps "a proposal
+writes staging and nothing else" a statement about a list rather than about a
+literal. And `completion_claim` was declared free text, which it never was --
+it is an object of `status` and `note` -- so it left `OPEN_ARGUMENTS` and became
+a closed object.
