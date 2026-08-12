@@ -60,6 +60,12 @@ _ENV_VECTOR_RULES = _VECTOR_RULES[:-1]
 _HELPER_RULE = _VECTOR_RULES[-1]
 WATCHED_ENV_VECTORS = tuple(rule.name for rule in _ENV_VECTOR_RULES)
 
+#: The keys every refusal this runtime raises carries: the ones minted here from
+#: the measured matrix, and the ones `agent` mints for what it could not measure
+#: at all. Stated once, because two modules shaping a refusal differently is an
+#: operator rendering the same finding two ways.
+VIOLATION_KEYS = frozenset({"code", "vector", "source", "effect"})
+
 _VECTOR_ORDER = {rule.name: index for index, rule in enumerate(_VECTOR_RULES)}
 _SETTING_KINDS = frozenset({"managed", "explicit", "user", "project", "local"})
 _ROUTES = frozenset({"anthropic_first_party", "other", "none"})
@@ -97,7 +103,7 @@ def _environment_violations(
     return violations
 
 
-def _evaluate_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
+def evaluate_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
     """Assess symbolic launch inputs without consulting ambient process state."""
     if not isinstance(inputs, Mapping):
         raise ManifestError("case inputs must be an object")
@@ -255,7 +261,7 @@ def _validate_manifest(manifest: Any) -> Mapping[str, Any]:
 
     for case_id in REQUIRED_CASE_IDS:
         case = cases[case_id]
-        _evaluate_inputs(case.get("inputs"))
+        evaluate_inputs(case.get("inputs"))
         wire = case.get("wire")
         if not isinstance(wire, Mapping):
             raise ManifestError(f"{case_id}: wire facts must be an object")
@@ -304,7 +310,7 @@ def _replay_manifest(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
     replay = []
     for case_id in REQUIRED_CASE_IDS:
         case = cases[case_id]
-        decision = _evaluate_inputs(case["inputs"])
+        decision = evaluate_inputs(case["inputs"])
         measured = _measured_decision(case["wire"])
         if decision["decision"] != measured:
             raise ManifestError(

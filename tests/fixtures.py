@@ -1,10 +1,13 @@
 """The Program configuration the runtime tests are written against."""
 
 import atexit
+import json
 import shutil
+import socket
 import ssl
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -343,6 +346,190 @@ def tls_counterparty(
     made = tls.authority(scratch() / "target-authority")
     server, thread = counterparty(handler, made.context("127.0.0.1"))
     return server, thread, made.certificate
+
+
+class ControlUpstream:
+    """The model API, on this machine, answering out of a script.
+
+    An Agent run cannot be tested against the real API: the assertion suite has
+    to run offline, on a laptop with no subscription, without spending tokens
+    and without the answer changing between runs. So this is the whole upstream
+    -- a CONNECT proxy that terminates TLS with the run's own authority and
+    replies to `POST /v1/messages` with a canned event stream.
+
+    It is not a stub in front of the SDK. It is a socket, and the bundled CLI
+    reaches it exactly the way it reaches Anthropic: proxy variables, a root it
+    was told to trust, a certificate for `api.anthropic.com`. That makes the
+    child under test a real child -- real process, real transport, real
+    protocol -- with only the far end replaced.
+
+    The script is two answers. Anything with no tool result in it is answered
+    with a call to `tool`, so the model asks for the runtime's tool exactly
+    once; everything after that is answered with `SPOKEN` and an end of turn, so
+    the run terminates rather than looping until `max_turns`.
+    """
+
+    #: What the scripted assistant says once it has its tool result. Asserted
+    #: on, so a run that finished for some other reason cannot look like this.
+    SPOKEN = "CONTROL_OK"
+
+    def __init__(self, tool: str) -> None:
+        self.tool = tool
+        self.authority = tls.authority(scratch() / "control-authority")
+        self.certificate = self.authority.certificate
+        #: One entry per request that arrived, as (host, request line).
+        self.seen: list[tuple[str, str]] = []
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(32)
+        self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+        self._running = True
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def stop(self) -> None:
+        self._running = False
+        self._listener.close()
+
+    @property
+    def completions(self) -> int:
+        """How many times the scripted model was asked for one."""
+        return sum(1 for _, line in self.seen if line.startswith("POST /v1/messages"))
+
+    def _accept(self) -> None:
+        while self._running:
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._tunnel, args=(client,), daemon=True).start()
+
+    def _tunnel(self, client: socket.socket) -> None:
+        """One CONNECT, then the far end of it, speaking TLS for whatever it named."""
+        stream = client.makefile("rb")
+        line = stream.readline().decode("latin-1").strip()
+        while stream.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        if not line.startswith("CONNECT "):
+            client.close()
+            return
+        host = line.split()[1].rsplit(":", 1)[0]
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        try:
+            wrapped = self.authority.context(host).wrap_socket(client, server_side=True)
+        except (OSError, ssl.SSLError):
+            client.close()
+            return
+        self._serve(host, wrapped)
+
+    def _serve(self, host: str, connection: ssl.SSLSocket) -> None:
+        stream = connection.makefile("rb")
+        try:
+            while True:
+                line, body = _request(stream)
+                if not line:
+                    return
+                self.seen.append((host, line))
+                if line.startswith("POST /v1/messages"):
+                    answer = self._completion(body)
+                    kind = b"text/event-stream"
+                else:
+                    answer = b'{"control":"upstream"}'
+                    kind = b"application/json"
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: " + kind + b"\r\n"
+                    b"cache-control: no-cache\r\n"
+                    + f"content-length: {len(answer)}\r\n\r\n".encode()
+                    + answer
+                )
+        except (OSError, ssl.SSLError):
+            return
+        finally:
+            connection.close()
+
+    def _completion(self, body: bytes) -> bytes:
+        """Ask for the tool, or speak. Whichever the conversation has not had yet."""
+        if b'"tool_result"' in body:
+            blocks = [
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "text_delta", "text": self.SPOKEN}},
+                {"type": "content_block_stop", "index": 0},
+            ]
+            stop = "end_turn"
+        else:
+            blocks = [
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "tool_use", "id": "toolu_control",
+                                   "name": self.tool, "input": {}}},
+                {"type": "content_block_delta", "index": 0,
+                 # An empty object rather than an empty string: the deltas are
+                 # concatenated and parsed, and `""` is not a document.
+                 "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+                {"type": "content_block_stop", "index": 0},
+            ]
+            stop = "tool_use"
+        events = [
+            {"type": "message_start",
+             "message": {"id": "msg_control", "type": "message", "role": "assistant",
+                         "model": "control", "content": [], "stop_reason": None,
+                         "stop_sequence": None,
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}},
+            *blocks,
+            {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+             "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ]
+        return "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+        ).encode()
+
+
+def _request(stream) -> tuple[str, bytes]:
+    """One HTTP/1.1 request off a stream, as its first line and its body."""
+    line = stream.readline().decode("latin-1").strip()
+    headers = {}
+    while True:
+        raw = stream.readline().decode("latin-1")
+        if raw in ("\r\n", "\n", ""):
+            break
+        name, _, value = raw.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length") or 0)
+    return line, stream.read(length) if length else b""
+
+
+def subscription(home: Path) -> Path:
+    """A home directory holding a credential that is not one.
+
+    The bundled CLI will not start a session without something that looks like
+    an authenticated operator, so the run is given a fabricated one. It is
+    inert by construction -- the token is a literal, and the only endpoint it
+    is ever presented to is `ControlUpstream` on loopback -- which is the point:
+    the child under test resolves *this*, not the operator's real credential,
+    and a test that leaked the operator's would be a test that spent their
+    tokens.
+    """
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-synthetic-test-value",
+                    "refreshToken": "sk-ant-ort01-synthetic-test-value",
+                    "expiresAt": int(time.time() + 3600) * 1000,
+                    "scopes": ["user:inference", "user:profile"],
+                    "subscriptionType": "max",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / ".claude.json").write_text(
+        json.dumps({"hasCompletedOnboarding": True}), encoding="utf-8"
+    )
+    return home
 
 
 def scratch() -> Path:

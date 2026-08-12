@@ -11,6 +11,13 @@ dynamic = ["version"]
 
 # The runtime is standard library only. Every entry added here is an exact pin,
 # and `rk doctor` verifies the same table at startup.
+#
+# One thing this application imports is deliberately absent: the Agent SDK, in
+# `redkraken/_launch.py`. What it needs is a *pair* -- an SDK version and the
+# CLI version that SDK bundles -- which a requirement specifier cannot express,
+# so the pair is pinned in `_startup.KNOWN_RUNTIME` and enforced by the startup
+# assertion, and an SDK missing here refuses one Agent run rather than every
+# `rk` command.
 dependencies = []
 
 [project.scripts]

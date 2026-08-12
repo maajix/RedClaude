@@ -176,7 +176,7 @@ class AuthResolutionManifestTest(unittest.TestCase):
     def test_only_the_measured_empty_api_key_is_unset(self):
         for vector in _startup.WATCHED_ENV_VECTORS:
             with self.subTest(vector=vector):
-                result = _startup._evaluate_inputs(
+                result = _startup.evaluate_inputs(
                     {"environment": {vector: ""}, "setting_sources": [], "settings": []}
                 )
                 self.assertEqual(

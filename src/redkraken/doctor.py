@@ -33,7 +33,10 @@ SUPPORTED_PYTHON = ((3, 14), (3, 15))
 #: Interpreter modules the runtime needs that a minimal build may omit.
 REQUIRED_MODULES = ("ssl", "tomllib")
 
-#: Production dependencies as exact pins, mirroring `pyproject.toml`.
+#: Production dependencies as exact pins, mirroring `pyproject.toml`. Empty,
+#: and the Agent SDK is not an omission: it is measured rather than declared
+#: (`_launch`), so a machine without it runs every command here and refuses at
+#: the one thing it cannot do, which is start an Agent run.
 REQUIRED_DISTRIBUTIONS: tuple[tuple[str, str], ...] = ()
 
 

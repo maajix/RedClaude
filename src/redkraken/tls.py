@@ -15,9 +15,9 @@ the trust is narrow, and every decision here exists to keep it narrow:
     cannot be replayed at another.
 
 The certificate is issued by `openssl`, not by a Python library. The application
-has no third-party dependencies (`doctor.REQUIREMENTS`), the standard library
-cannot build an X.509 certificate, and the alternative -- hand-rolling DER --
-would be a new place for a signing bug to live. Shelling out to a system binary
+declares no third-party dependencies (`doctor.REQUIREMENTS`), the standard
+library cannot build an X.509 certificate, and the alternative -- hand-rolling
+DER -- would be a new place for a signing bug to live. Shelling out to a system binary
 is already how `backup` reaches `pg_dump`; the same refusal applies when it is
 missing.
 
