@@ -156,7 +156,7 @@ def runtime_facts() -> dict[str, str | None]:
     return facts
 
 
-class Mission:
+class Submission:
     """The one Mission result a run may submit, and the count of the tries.
 
     One, because the Spec says one: "Agents submit one Mission result". A
@@ -164,6 +164,13 @@ class Mission:
     the run proposed, and a later contradiction of it is the run arguing with
     its own output. The attempt is still counted, so a model that tried twice
     is distinguishable from one that submitted once.
+
+    Named for what it holds rather than for the run. `CONTEXT.md` gives
+    "Mission" to the packet and tells the rest of us to avoid it -- "a payload,
+    not a lifecycle" -- and this is the lifecycle side: one latch and one
+    counter. The `mission_result` key it fills keeps the word because the tool
+    it comes from is `submit_mission_result` and renaming half of that pair
+    would leave a key nothing on the wire is called.
     """
 
     def __init__(self) -> None:
@@ -216,22 +223,22 @@ DESCRIPTIONS = {
         "an omission marker rather than as an error."
     ),
     "get_artifact": (
-        "Fetch one reachable Artifact by its label -- its metadata and, where its head "
-        "was staged as text, a byte range of it. The hash is reported, never asked "
-        "for. Whole large Artifacts are analysed by a tool run, not read into this "
-        "context."
+        "With no label, list the Artifacts this run's packet reached. With one, fetch "
+        "that Artifact -- its metadata and, where its head was staged as text, a byte "
+        "range of it. The hash is reported, never asked for. Whole large Artifacts "
+        "are analysed by a tool run, not read into this context."
     ),
     "submit_mission_result": (
-        "Submit this Mission's one result: proposed Entities, Hypotheses, "
-        "Observations with the Receipt or Tool Run each cites, evidence edges, "
-        "suggested Tasks and a completion claim. It is staging data. The runtime "
-        "checks provenance and decides what becomes canonical; nothing here is true "
-        "because it was submitted."
+        "Submit this Mission's one result: proposed Entities, Relationships, "
+        "Hypotheses, Observations with the Receipt or Tool Run each cites, evidence "
+        "edges, suggested Tasks and a completion claim. It is staging data. The "
+        "runtime checks provenance and decides what becomes canonical; nothing here "
+        "is true because it was submitted."
     ),
 }
 
 
-def server(surface: Surface, reader: packet.Reader, mission: Mission):
+def server(surface: Surface, reader: packet.Reader, submission: Submission):
     """The runtime's MCP server: five bounded reads and one proposal.
 
     Every handler goes through `surface.serve` first, which refuses while the
@@ -254,7 +261,7 @@ def server(surface: Surface, reader: packet.Reader, mission: Mission):
         "get_artifact": reader.artifact,
     }
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
-    tools.append(_propose(surface, mission))
+    tools.append(_propose(surface, submission))
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
 
@@ -277,13 +284,13 @@ def _read(surface: Surface, name: str, answer):
     return handler
 
 
-def _propose(surface: Surface, mission: Mission):
+def _propose(surface: Surface, submission: Submission):
     name = "submit_mission_result"
 
     @tool(name, DESCRIPTIONS[name], _schema(name))
     async def handler(arguments: dict) -> dict:
         surface.serve(name)
-        return _content(mission.submit(dict(arguments or {})))
+        return _content(submission.submit(dict(arguments or {})))
 
     return handler
 
@@ -425,7 +432,7 @@ async def run(
     agent.write_settings(launch)
     surface = Surface()
     reader = packet.Reader(packet.Packet.from_dict(dict(job.get("packet") or {})))
-    mission = Mission()
+    submission = Submission()
     role = str(job.get("role") or "")
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
@@ -436,7 +443,7 @@ async def run(
     options = (
         None
         if claude_agent_sdk is None or gate is None
-        else options_for(job, runtime, server(surface, reader, mission), launch, gate)
+        else options_for(job, runtime, server(surface, reader, submission), launch, gate)
     )
 
     violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)
@@ -475,8 +482,8 @@ async def run(
         "answers": answers,
         "stop_reason": stop_reason,
         "text": text,
-        "mission_result": mission.result,
-        "mission_attempts": mission.attempts,
+        "mission_result": submission.result,
+        "mission_attempts": submission.attempts,
     }
 
 

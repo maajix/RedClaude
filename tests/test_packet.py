@@ -544,6 +544,16 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(["R1", "R2"], [item["label"] for item in answer["records"]])
         self.assertEqual(2, answer["counts"]["matched"])
 
+    def test_matched_counts_the_named_receipts_the_packet_holds_not_the_names(self):
+        # `matched` is what the filter selected out of what was staged, so it
+        # cannot exceed `staged`: a number above it would claim the filter
+        # picked rows the compile never had.
+        answer = self.reader().receipts(receipt_labels=["R1", "R98", "R99"])
+
+        self.assertEqual(
+            {"total": 8, "staged": 2, "matched": 1, "returned": 1}, answer["counts"]
+        )
+
     def test_a_receipt_the_packet_lacks_says_it_was_not_staged_rather_than_why(self):
         # The child cannot tell absent from another Program's from
         # `proxy_internal`, and a marker that guessed would be the child
@@ -554,6 +564,46 @@ class ReaderTest(unittest.TestCase):
                          answer["omitted"])
 
     # -- the artifact -------------------------------------------------------
+
+    def test_asking_for_no_artifact_lists_the_ones_this_packet_reached(self):
+        # The only way a label is learnable. A Receipt record carries
+        # `request_agent_sha` and `response_agent_sha`, and a hash is not
+        # something this surface accepts as an argument -- so without the list,
+        # a reachable Artifact is one the child can hold the hash of and never
+        # name.
+        answer = self.reader().artifact()
+
+        self.assertEqual("artifacts", answer["section"])
+        self.assertEqual(["AF1"], [item["label"] for item in answer["records"]])
+        self.assertEqual("a" * 64, answer["records"][0]["record"]["sha256"])
+
+    def test_the_artifact_list_is_bounded_and_says_what_it_left_out(self):
+        held = sections(
+            artifacts=section(
+                "artifacts",
+                [artifact("AF1", "a" * 64), artifact("AF2", "b" * 64)],
+                total=9,
+            )
+        )
+        reader = packet.Reader(packet.Packet(sections=held), page=1)
+
+        answer = reader.artifact()
+
+        self.assertEqual(
+            {"total": 9, "staged": 2, "matched": 2, "returned": 1}, answer["counts"]
+        )
+        self.assertEqual(
+            [{"reason": "packet_bound", "count": 7}, {"reason": "limit", "count": 1}],
+            answer["omitted"],
+        )
+
+    def test_the_artifact_list_carries_no_bytes(self):
+        # Listing is metadata. The head is staged per Artifact and served when
+        # one is named, because a list that inlined every head would be the
+        # packet's byte ceiling spent by a verb that was asked for an index.
+        answer = self.reader().artifact()
+
+        self.assertNotIn("content", answer["records"][0])
 
     def test_an_artifact_outside_the_packet_is_an_omission_rather_than_an_error(self):
         answer = self.reader().artifact(artifact_label="AF9")

@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import pg
+from redkraken import pg
 
 #: The status every row this module writes carries. There is no argument for
 #: any other value here: `promoted` is the promotion step's word and `rejected`
@@ -56,12 +56,6 @@ REASONS = (
     "label_other_program",
     "no_provenance",
 )
-
-#: The five element lists a Mission result may carry, beside its completion
-#: claim. The names are the `submit_mission_result` argument names, because a
-#: `proposal_drops.element_path` has to point at something the agent can find
-#: in what it sent.
-ELEMENTS = ("observations", "new_entities", "hypotheses", "evidence", "suggested_tasks")
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +105,12 @@ class Result:
     def elements(self, name: str) -> list[Mapping[str, Any]]:
         """One element list, with anything that is not an object left out.
 
+        The names are `submit_mission_result`'s argument names, which
+        `roster.CONTRACTS` declares and this module does not re-list: a
+        `proposal_drops.element_path` has to point at something the agent can
+        find in what it sent, so a second copy of those names here is a second
+        copy that could be right about a list the schema no longer accepts.
+
         Left out of the walk, not out of the payload: the payload is stored as
         it arrived. A string where an Observation belongs cites no provenance
         and cannot be checked for any, so it is not something this module has a
@@ -156,13 +156,20 @@ def review(
 ) -> list[Drop]:
     """Every Observation element whose provenance the runtime can disprove.
 
-    Only Observations. The other four lists are proposals about things that do
-    not exist yet -- a new Entity has no label, and an evidence edge cites the
-    Hypothesis proposed three keys above it -- so checking them against
+    Only Observations. The other five lists are proposals about things that do
+    not exist yet -- a new Entity has no label, a Relationship names two
+    Entities that may both be proposed beside it, and an evidence edge cites
+    the Hypothesis proposed three keys above it -- so checking them against
     canonical rows would refuse exactly the elements a Mission is for. An
     Observation is the one element that is a claim about something that already
     happened, which is why migration 0007 makes the same demand of the
     canonical table.
+
+    Which is also why the criterion this satisfies names Observations and only
+    them: "Observation proposals referencing absent, foreign or incompatible
+    provenance are retained as rejected staging outcomes". A Relationship that
+    names another Program's Entity is refused by promotion, where the Entity it
+    names either does or does not resolve.
     """
     drops: list[Drop] = []
     for ordinal, element in enumerate(result.elements("observations")):

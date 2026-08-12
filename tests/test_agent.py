@@ -641,7 +641,7 @@ class MissionTest(unittest.TestCase):
     """One Mission result per run, and the count that makes a second visible."""
 
     def test_the_first_submission_is_accepted_and_kept_as_it_arrived(self):
-        mission = _launch.Mission()
+        mission = _launch.Submission()
 
         answer = mission.submit({"completion_claim": {"status": "partial"}})
 
@@ -652,7 +652,7 @@ class MissionTest(unittest.TestCase):
     def test_a_second_submission_is_refused_rather_than_merged_or_overwritten(self):
         # A later contradiction is the run arguing with its own output. The
         # first is what it proposed.
-        mission = _launch.Mission()
+        mission = _launch.Submission()
         mission.submit({"observations": ["first"]})
 
         answer = mission.submit({"observations": ["second"]})
@@ -666,16 +666,43 @@ class MissionTest(unittest.TestCase):
         # Nothing is staged yet: the row is written by the runtime after this
         # process ends and after provenance is checked. A handler saying
         # otherwise would be promising something it is not the one to do.
-        answer = _launch.Mission().submit({})
+        answer = _launch.Submission().submit({})
 
         self.assertNotIn("staged", json.dumps(answer).replace("staging", ""))
 
     def test_a_run_that_submitted_nothing_has_nothing_to_carry_back(self):
-        mission = _launch.Mission()
+        mission = _launch.Submission()
 
         self.assertFalse(mission.submitted)
         self.assertIsNone(mission.result)
         self.assertEqual(0, mission.attempts)
+
+    def test_the_tries_cross_back_beside_the_result_rather_than_only_the_result(self):
+        # One result and two attempts is a model that argued with its own
+        # output and was refused. That is a fact about the run, so it travels
+        # with the run rather than staying in the transcript.
+        mission = _launch.Submission()
+        mission.submit({"observations": []})
+        mission.submit({"observations": []})
+
+        carried = agent.AgentRunResult(
+            agent_run_id="ar",
+            role=fixtures.ROLE,
+            sdk_version=None,
+            cli_version=None,
+            api_key_source=agent.EXPECTED_KEY_SOURCE,
+            tool_ready=1,
+            tools_served=(),
+            denials=(),
+            answers=1,
+            stop_reason="end_turn",
+            text="",
+            mission_result=mission.result,
+            mission_attempts=mission.attempts,
+        ).as_dict()
+
+        self.assertEqual({"observations": []}, carried["mission_result"])
+        self.assertEqual(2, carried["mission_attempts"])
 
 
 class ServedToolTest(unittest.TestCase):
@@ -685,7 +712,7 @@ class ServedToolTest(unittest.TestCase):
         surface = _launch.Surface()
         offered = stack.enter_context(packaged())
         _launch.server(
-            surface, reader or packet.Reader(packet.Packet()), mission or _launch.Mission()
+            surface, reader or packet.Reader(packet.Packet()), mission or _launch.Submission()
         )
         return surface, offered
 
@@ -790,7 +817,7 @@ class ServedToolTest(unittest.TestCase):
         self.assertIn("range", _launch._schema("get_artifact")["properties"])
 
     def test_a_mission_result_is_accumulated_in_the_child_and_written_by_nobody_here(self):
-        mission = _launch.Mission()
+        mission = _launch.Submission()
         with contextlib.ExitStack() as stack:
             surface, offered = self.served(stack, mission=mission)
             surface.open()
@@ -937,7 +964,7 @@ class OptionsTest(unittest.TestCase):
         value = _launch.options_for(
             job(launch.parent, role=role),
             runtime,
-            _launch.server(_launch.Surface(), packet.Reader(packet.Packet()), _launch.Mission()),
+            _launch.server(_launch.Surface(), packet.Reader(packet.Packet()), _launch.Submission()),
             launch,
             roster.Gate(role),
         )

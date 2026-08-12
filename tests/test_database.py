@@ -3114,6 +3114,23 @@ class MissionPacketTest(DatabaseCase):
             [record["record"]["sha256"] for record in answer["records"]],
         )
 
+    def test_the_artifact_list_reaches_this_programs_references_and_no_others(self):
+        # How a label becomes learnable at all. The Receipt records the child
+        # reads carry `request_agent_sha` and `response_agent_sha`, and a hash
+        # is not an argument this surface takes -- so listing is the one path
+        # from "I am holding a Receipt" to "I may fetch its transcript", and it
+        # is a path that stops at this Program's own references.
+        answer = packet.Reader(self.compiled("a")).artifact()
+
+        self.assertEqual(
+            [self.seeded["a"]["artifact"]],
+            [record["record"]["sha256"] for record in answer["records"]],
+        )
+        self.assertNotIn(
+            self.seeded["b"]["artifact"],
+            [record["record"]["sha256"] for record in answer["records"]],
+        )
+
     # -- what the Mission result writes --------------------------------------
 
     def test_a_mission_result_writes_a_staging_row_and_moves_nothing_canonical(self):

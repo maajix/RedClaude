@@ -39,8 +39,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, isolation, pg, roster
-from redkraken import packet as packet_module
+from redkraken import _startup, isolation, packet as packet_module, pg, roster
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -281,7 +280,14 @@ class AgentRunResult:
     made one. Raw is the operative word: it has been through a closed schema
     and through the gate, and through nothing else. What its Observations cite
     is checked on the runtime's own connection, by `proposal.stage`, because
-    the check reads canonical rows and the child cannot.
+    the check reads canonical rows and the child cannot. Ticket 20 owns that
+    call: it is the ticket that runs one Task from a compiled packet to a
+    promoted Observation, and this pair of fields is the seam it writes to.
+
+    `mission_attempts` is how many times the child called the tool, which is
+    not how many results it got to make. One result and three attempts is a
+    model that argued with its own output and was refused twice, and that is
+    worth being able to see from the row rather than only from the transcript.
     """
 
     agent_run_id: str
@@ -296,6 +302,7 @@ class AgentRunResult:
     stop_reason: str | None
     text: str
     mission_result: Mapping[str, object] | None = None
+    mission_attempts: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -313,6 +320,7 @@ class AgentRunResult:
             "mission_result": (
                 None if self.mission_result is None else dict(self.mission_result)
             ),
+            "mission_attempts": self.mission_attempts,
         }
 
 
@@ -797,6 +805,7 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
         mission_result=(
             dict(mission) if isinstance(mission := result.get("mission_result"), Mapping) else None
         ),
+        mission_attempts=int(result.get("mission_attempts") or 0),
     )
 
 

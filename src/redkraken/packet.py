@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from . import pg
+from redkraken import pg
 
 #: The sections a packet carries, in the order a reader meets them. One per
 #: state read tool except `get_artifact`, which reads the same `artifacts`
@@ -625,6 +625,11 @@ class Reader:
         or may be `proxy_internal` and hidden from the agent read role by
         migration 0020's restrictive policy. So the marker says what is true --
         it was not staged -- rather than guessing which.
+
+        `matched` is how many of the asked-for labels this packet holds, not
+        how many were asked for. The two differ exactly when something is
+        missing, and the marker already carries that number: a `matched` above
+        `staged` would say the filter selected rows the compile never staged.
         """
         wanted = list(dict.fromkeys(str(label) for label in receipt_labels))
         section = self.packet.section("receipts")
@@ -637,7 +642,7 @@ class Reader:
             rows=rows,
             total=section.total,
             staged=len(section.rows),
-            matched=len(wanted),
+            matched=len(rows),
             omitted=(
                 ({"reason": "not_staged", "count": len(missing), "labels": missing},)
                 if missing
@@ -646,17 +651,27 @@ class Reader:
         )
         return answer.as_dict()
 
-    def artifact(self, *, artifact_label: str, span: str | None = None) -> dict:
-        """One Artifact's metadata, and as much of its head as was staged.
+    def artifact(self, *, artifact_label: str | None = None, span: str | None = None) -> dict:
+        """One Artifact's metadata and staged head, or the list of them.
 
         By label, never by hash. Migration `program_scoped_artifacts` states the
         reason on the view itself: a verb taking a hash reads across Programs
         whenever the caller can guess the bytes, and the store is one shared
         content-addressed namespace, so guessing is the attack.
 
+        Which is why the same verb lists. A label is the only handle the child
+        may use and it has no other way to learn one: the Receipt records it
+        reads carry `request_agent_sha` and `response_agent_sha`, and those are
+        hashes. Listing hands it the labels for the Artifacts this packet
+        already reached, with the hash beside each one, so it can tell which
+        Artifact a Receipt it is holding refers to -- and it can do that only
+        for Artifacts the compile already decided it may see.
+
         The wire name of `span` is `range`, which is a builtin; `_launch`
         renames it on the way in rather than this module shadowing one.
         """
+        if artifact_label is None:
+            return self._page("artifacts", None, lambda row: True).as_dict()
         section = self.packet.section("artifacts")
         row = next((item for item in section.rows if item.label == artifact_label), None)
         base: dict[str, Any] = {

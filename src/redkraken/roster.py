@@ -436,12 +436,14 @@ OPEN_ARGUMENTS = {
     "mcp__rk2__submit_mission_result": (
         "observations",
         "new_entities",
+        "relationships",
         "hypotheses",
         "evidence",
         "suggested_tasks",
         "completion_claim",
     ),
 }
+
 
 def _label(*prefixes: str) -> str:
     """The pattern one of these label prefixes and a decimal will match.
@@ -513,17 +515,26 @@ CONTRACTS: dict[str, Contract] = {
     # one content-addressed namespace shared by every Program, so a hash
     # argument is a lookup key an agent can construct without ever having been
     # told the Artifact exists.
+    # Nothing is required, because the same verb lists and fetches. A label
+    # fetches that Artifact; no label lists the ones this packet reached, which
+    # is the only way a child learns a label exists -- the Receipt records it
+    # reads carry agent-side hashes, and a hash is not something it may ask by.
     "mcp__rk2__get_artifact": Contract(
         "state.read",
         READ,
         reads=("v_artifacts", "artifact_references", "artifacts"),
         arguments={
             "artifact_label": Argument(
-                "string", required=True, pattern=_label(LABEL_PREFIXES["artifact_references"])
+                "string", pattern=_label(LABEL_PREFIXES["artifact_references"])
             ),
             "range": Argument("string", pattern="^[0-9]+-[0-9]+$"),
         },
     ),
+    # The six element lists Spec section 13 names -- "proposed Entities,
+    # Relationships, Observations, Hypotheses, evidence edges, suggested Tasks
+    # and a completion claim". This declaration is the closed set: an element
+    # list that is not here is refused by the served schema before any handler
+    # sees it, and `proposal_drops.element_path` points into it by these names.
     "mcp__rk2__submit_mission_result": Contract(
         "state.propose",
         PROPOSE,
@@ -531,6 +542,7 @@ CONTRACTS: dict[str, Contract] = {
         arguments={
             "observations": Argument("array", required=True, free_text=True),
             "new_entities": Argument("array", free_text=True),
+            "relationships": Argument("array", free_text=True),
             "hypotheses": Argument("array", free_text=True),
             "evidence": Argument("array", free_text=True),
             "suggested_tasks": Argument("array", free_text=True),

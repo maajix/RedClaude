@@ -839,7 +839,9 @@ class ContractSchemaTest(unittest.TestCase):
             {"type": "string", "pattern": roster._label("R")},
             receipts["properties"]["receipt_labels"]["items"],
         )
-        self.assertEqual(["artifact_label"], artifact["required"])
+        # Nothing is required: the same verb lists and fetches, and the list is
+        # the only way a child learns a label to fetch by.
+        self.assertEqual([], artifact["required"])
         # The rule `v_artifacts` states on itself, enforced where a model first
         # meets it: the schema takes a label and has no property a hash fits.
         self.assertEqual(
@@ -849,6 +851,27 @@ class ContractSchemaTest(unittest.TestCase):
         self.assertEqual(
             set(),
             {name for name in artifact["properties"] if "hash" in name},
+        )
+
+    def test_the_one_result_takes_every_element_list_the_spec_names(self):
+        # Spec section 13: "proposed Entities, Relationships, Observations,
+        # Hypotheses, evidence edges, suggested Tasks and a completion claim".
+        # A list the schema does not declare is not deferred -- `submit` is the
+        # only outbound verb, and `additionalProperties: false` denies the call
+        # rather than dropping the key.
+        schema = roster.CONTRACTS["mcp__rk2__submit_mission_result"].schema()
+
+        self.assertEqual(
+            {
+                "new_entities",
+                "relationships",
+                "observations",
+                "hypotheses",
+                "evidence",
+                "suggested_tasks",
+                "completion_claim",
+            },
+            set(schema["properties"]),
         )
 
     def test_an_argument_open_by_declaration_is_still_a_declared_argument(self):

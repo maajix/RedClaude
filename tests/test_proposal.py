@@ -235,12 +235,17 @@ class ReviewTest(unittest.TestCase):
         )
 
     def test_only_observations_are_checked_against_rows_that_already_exist(self):
-        # The other four lists propose things that do not exist yet. Checking
-        # them against canonical rows would drop every one of them.
+        # The other five lists propose things that do not exist yet. Checking
+        # them against canonical rows would drop every one of them -- including
+        # the Relationship below, whose two endpoints are the Entity proposed
+        # beside it and one this Program has never seen.
         connection = Recorder()
         sent = proposal.Result(
             payload={
                 "new_entities": [{"type": "endpoint", "value": "/admin"}],
+                "relationships": [
+                    {"kind": "serves", "from_ordinal": 0, "to_label": "HST99"}
+                ],
                 "hypotheses": [{"statement": "reflected", "subject_label": "EP99"}],
                 "evidence": [{"hypothesis_ordinal": 0, "observation_ordinal": 0}],
                 "suggested_tasks": [{"kind": "hunt", "rationale": "the parameter reflects"}],

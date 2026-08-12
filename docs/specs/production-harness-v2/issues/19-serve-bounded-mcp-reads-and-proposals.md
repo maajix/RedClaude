@@ -74,9 +74,10 @@ answer to the question "is this still the row I cited".
 ### One result, and it is staging data
 
 `mcp__rk2__submit_mission_result` is the only outbound verb an executing role
-holds. It takes proposed Observations, Entities, Hypotheses, evidence edges,
-suggested Tasks and a completion claim, and `proposal.stage` writes them to
-`proposals` and `proposal_drops` inside one transaction. Nothing else moves:
+holds. It takes all six element lists Spec section 13 names -- Observations,
+Entities, Relationships, Hypotheses, evidence edges and suggested Tasks --
+beside the completion claim, and `proposal.stage` writes them to `proposals`
+and `proposal_drops` inside one transaction. Nothing else moves:
 `MissionPacketTest.test_a_mission_result_writes_a_staging_row_and_moves_nothing_canonical`
 takes a ten-column snapshot of the canonical half of the database -- including
 the Task status vector, the validation queue and the report queue -- either
@@ -151,6 +152,15 @@ because it is the side that may not. Ticket 18's note that this verb "takes a
 content hash and no path" was corrected in place -- its argument, that a verb
 with no path replaces `Read`, is unaffected.
 
+Which left a label the child had no way to learn, and the code review caught
+it: a Receipt record carries `request_agent_sha` and `response_agent_sha`, and
+a hash is exactly what this surface will not take as an argument. So the same
+verb lists. Called with no label it returns the Artifacts this packet reached,
+metadata only, through the same `_page` every other section is bounded by --
+which means the list is subject to the same `packet_bound` and `limit` markers
+and stops at this Program's own references. Nothing is required by the schema
+now, because listing is how a fetch becomes possible.
+
 ### What is served, and what is only compiled
 
 `_launch.server` serves six tools: the five reads and the one proposal.
@@ -158,17 +168,62 @@ with no path replaces `Read`, is unaffected.
 which the state reads now do by answering -- and `agent.SERVED` is the
 intersection of the roster with what the launch actually serves, so a role
 holding `sched.pick` or `net.request` holds nothing until the ticket that
-implements those groups. The `Mission` handler accumulates the child's result
-in the supervisor and returns an acknowledgement; it does not write. The write
-is `proposal.stage`, on the runtime connection, after the run.
+implements those groups. `_launch.Submission` accumulates the child's one
+result and counts the tries; it returns an acknowledgement and writes nothing.
+
+What this ticket does not do is call either half. `packet.compile` and
+`proposal.stage` have no caller in `src/` yet: the seam they meet at is
+`AgentRunRequest.packet` going in and `AgentRunResult.mission_result` coming
+back, and the loop that fills one and drains the other is ticket 20, which is
+the ticket that runs one Task from a compiled packet to a promoted
+Observation. So the six criteria here are measured on the modules and on the
+live database rather than on a run: what exists is a compile that can only see
+one Program, a reader that can only answer from what it was given, and a write
+path that can only reach staging.
+
+### What the code review changed
+
+The two-axis review against `1d52a32` found four things worth the patch, all
+applied here:
+
+- **`relationships` was not accepted.** Section 13 names six element lists and
+  the contract declared five, and because the schema is closed that is not a
+  deferral -- a child proposing a Relationship was denied `R-ARGVALUE`. Added
+  to the contract, to `OPEN_ARGUMENTS` and to the served description. It is not
+  provenance-checked, for the reason the other four are not: its endpoints may
+  both be Entities proposed beside it.
+- **An Artifact label was unlearnable**, which is the listing above.
+- **`get_receipts` reported `matched` as the number of labels asked for**, so a
+  read for three labels the packet held one of answered `matched: 3` against
+  `staged: 2`. It is the number matched now, which is what `Answer`'s own
+  docstring says it is.
+- **`mission_attempts` crossed the process boundary and was dropped** on the
+  supervisor side. It is a field on `AgentRunResult` now: one result and three
+  attempts is a model that argued with its own output and was refused twice.
+
+Three more were style rather than behaviour: `class Mission` is `Submission`,
+because `CONTEXT.md` reserves "Mission" for the packet and calls it "a payload,
+not a lifecycle" while that class is the lifecycle side; `proposal.ELEMENTS`
+was a second copy of the element names that `roster.CONTRACTS` already
+declares, and is gone; and both new modules use `from redkraken import ...`
+like every other module.
+
+Two findings were considered and not taken. `state.bound` delegating to
+`packet.fit` reads oddly -- the operator's compact read importing the Agent's
+packet module -- but the alternative is two implementations of "which row goes
+first", and an operator and an Agent reading the same Program should not
+eventually disagree about that. And `proposals` has no `CONTEXT.md` glossary
+entry, which by `docs/agents/domain.md` is a gap to note for `/domain-modeling`
+rather than one to fill in passing: the runtime now has a staging record with
+its own module, and "Promotion" is the only term that currently points at it.
 
 ### Verification
 
-`tests/test_packet.py` is 39 tests and `tests/test_proposal.py` is 30, both
+`tests/test_packet.py` is 43 tests and `tests/test_proposal.py` is 30, both
 against a recording connection, and both hold the module to its own statements:
 the compile's SQL is matched exactly rather than by substring, because two of
 its queries read `v_records` and differ only in what they select.
-`MissionPacketTest` in `tests/test_database.py` is 18 tests against the live
+`MissionPacketTest` in `tests/test_database.py` is 19 tests against the live
 database with two Programs open at once, and it is where every criterion is
 measured rather than argued -- the cross-Program reads, the proxy-internal lane
 that is absent rather than refused, the digests checked against `v_records`, the

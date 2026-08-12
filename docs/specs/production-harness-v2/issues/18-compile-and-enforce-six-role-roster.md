@@ -220,6 +220,12 @@ intersected with what the launch actually serves, so a tool nobody serves is not
 an entry that can never be exercised, and the intersection shrinks to nothing
 rather than lying when ticket 19 lands.
 
+(Ticket 19 landed and did exactly that. `runtime.ready` and `mcp__rk2__ready`
+are both gone -- a tool that reported the surface had opened was answering a
+question the state reads answer by answering at all -- and the six served tools
+are now `state.read` and `state.propose`. The intersection is unchanged as a
+mechanism; only its two sides moved.)
+
 *Nothing in `src/` starts a role other than the orchestrator yet.* The roster
 states all six and the gate enforces all six, but `agent.agent_run` is the only
 caller and ticket 20 is what gives it a task to run. The validator and reporter
