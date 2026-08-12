@@ -219,7 +219,10 @@ class CompileTest(unittest.TestCase):
         self.assertIn("groups and contracts disagree", str(raised.exception))
 
     def test_a_tool_in_two_groups_is_refused(self):
-        groups = {**roster.TOOL_GROUPS, "net.request": ("mcp__rk2__http_request", "mcp__rk2__ready")}
+        groups = {
+            **roster.TOOL_GROUPS,
+            "net.request": ("mcp__rk2__http_request", "mcp__rk2__get_receipts"),
+        }
         with mock.patch.object(roster, "TOOL_GROUPS", groups):
             with self.compiling() as raised:
                 roster._compile()
@@ -438,7 +441,7 @@ class GateTest(unittest.TestCase):
         )
 
     def test_a_call_within_the_roles_grants_is_allowed_and_nothing_is_recorded(self):
-        self.assertIsNone(self.gate.decide(call(agent_ready())))
+        self.assertIsNone(self.gate.decide(call(agent_read())))
         self.assertEqual([], self.gate.denials)
 
     def test_a_tool_the_role_does_not_hold_is_denied(self):
@@ -463,7 +466,7 @@ class GateTest(unittest.TestCase):
             with self.subTest(agent_id=identity, agent_type=kind):
                 denial = self.denied(
                     self.gate,
-                    roster.Call(tool=agent_ready(), agent_id=identity, agent_type=kind),
+                    roster.Call(tool=agent_read(), agent_id=identity, agent_type=kind),
                 )
                 self.assertEqual(roster.UNATTRIBUTED, denial.rule)
 
@@ -472,7 +475,7 @@ class GateTest(unittest.TestCase):
         # a call wearing it is a call from nothing this runtime started.
         denial = self.denied(
             self.gate,
-            roster.Call(tool=agent_ready(), agent_id="agent-1", agent_type="validator"),
+            roster.Call(tool=agent_read(), agent_id="agent-1", agent_type="validator"),
         )
 
         self.assertEqual(roster.UNATTRIBUTED, denial.rule)
@@ -482,7 +485,7 @@ class GateTest(unittest.TestCase):
         # a claim, so a call that arrives without one is refused rather than
         # believed and recorded. Fail-closed: a hook this runtime stopped
         # registering would close the gate, not open it.
-        unannounced = roster.Call(tool=agent_ready(), agent_id="agent-9", agent_type="recon")
+        unannounced = roster.Call(tool=agent_read(), agent_id="agent-9", agent_type="recon")
 
         denial = self.denied(self.gate, unannounced)
         self.assertEqual(roster.UNATTRIBUTED, denial.rule)
@@ -601,7 +604,7 @@ class GateTest(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 denial = self.denied(
-                    self.gate, roster.Call(tool=agent_ready(), arguments=arguments)
+                    self.gate, roster.Call(tool=agent_read(), arguments=arguments)
                 )
                 self.assertEqual(roster.FORBIDDEN_ARGUMENT, denial.rule)
 
@@ -631,8 +634,11 @@ class GateTest(unittest.TestCase):
             hunting("mcp__rk2__run_tool", tool="ffuf", argv="-u https://x"),
             # A string that does not match the pattern its argument declares.
             hunting("mcp__rk2__http_request", method="GET", url="file:///etc/passwd"),
+            # A string that is not a label the database has ever issued -- and
+            # in particular, a hash, which is what this argument used to take.
+            hunting("mcp__rk2__get_artifact", artifact_label="a" * 64),
             # A member of an array that does not match the item pattern.
-            hunting("mcp__rk2__get_artifact", artifact_hash="not-a-hash"),
+            hunting("mcp__rk2__get_receipts", receipt_labels=["R1", "not-a-label"]),
             # A header name outside the shape the roster bounds them to.
             hunting(
                 "mcp__rk2__http_request",
@@ -703,8 +709,8 @@ class SurfaceIntersectionTest(unittest.TestCase):
         # denies at every call instead of one nobody offered.
         orchestrator, validator = roster.ROLES["orchestrator"], roster.ROLES["validator"]
 
-        self.assertEqual(["mcp__rk2__ready"], orchestrator.allowed_tools(["mcp__rk2__ready"]))
-        self.assertEqual([], validator.allowed_tools(["mcp__rk2__ready"]))
+        self.assertEqual([agent_read()], orchestrator.allowed_tools([agent_read()]))
+        self.assertEqual([], validator.allowed_tools([agent_read()]))
         self.assertEqual([], orchestrator.allowed_tools([]))
 
     def test_what_a_role_is_shown_is_never_wider_than_what_it_holds(self):
@@ -786,9 +792,152 @@ class SchemaAgreementTest(unittest.TestCase):
         self.assertEqual(set(roster.TASK_KINDS), set(mapped))
 
 
-def agent_ready() -> str:
-    """The one tool a launch serves today, spelled the way the CLI spells it."""
-    return "mcp__rk2__ready"
+class ContractSchemaTest(unittest.TestCase):
+    """The schema a tool is served with, which binds before any handler runs.
+
+    The CLI validates a call against the served JSON Schema before `PreToolUse`
+    fires, so this is the earliest place an argument is refused -- earlier than
+    the gate, and earlier than the handler that would otherwise have to decide
+    what an unexpected key meant. The gate checks the same properties again
+    afterwards, which is two checks of one statement rather than two statements.
+    """
+
+    def test_every_served_schema_is_closed(self):
+        for name, contract in roster.CONTRACTS.items():
+            with self.subTest(tool=name):
+                schema = contract.schema()
+                self.assertEqual("object", schema["type"])
+                self.assertFalse(schema["additionalProperties"])
+
+    def test_no_served_schema_admits_a_program_or_a_credential(self):
+        # The compile already refuses a contract declaring one. This is the
+        # same claim read off the document the pair is actually handed.
+        for name, contract in roster.CONTRACTS.items():
+            with self.subTest(tool=name):
+                properties = set(contract.schema()["properties"])
+                self.assertEqual(set(), properties & roster.FORBIDDEN_ARGUMENTS)
+
+    def test_the_required_list_is_exactly_the_arguments_declared_required(self):
+        for name, contract in roster.CONTRACTS.items():
+            with self.subTest(tool=name):
+                self.assertEqual(
+                    sorted(
+                        argument
+                        for argument, spec in contract.arguments.items()
+                        if spec.required
+                    ),
+                    contract.schema()["required"],
+                )
+
+    def test_a_constrained_argument_carries_its_constraint_into_the_schema(self):
+        surface = roster.CONTRACTS["mcp__rk2__get_attack_surface"].schema()
+        receipts = roster.CONTRACTS["mcp__rk2__get_receipts"].schema()
+        artifact = roster.CONTRACTS["mcp__rk2__get_artifact"].schema()
+
+        self.assertEqual(list(roster.ENTITY_TYPES), surface["properties"]["entity_type"]["enum"])
+        self.assertEqual(
+            {"type": "string", "pattern": roster._label("R")},
+            receipts["properties"]["receipt_labels"]["items"],
+        )
+        self.assertEqual(["artifact_label"], artifact["required"])
+        # The rule `v_artifacts` states on itself, enforced where a model first
+        # meets it: the schema takes a label and has no property a hash fits.
+        self.assertEqual(
+            {"type": "string", "pattern": roster._label("AF")},
+            artifact["properties"]["artifact_label"],
+        )
+        self.assertEqual(
+            set(),
+            {name for name in artifact["properties"] if "hash" in name},
+        )
+
+    def test_an_argument_open_by_declaration_is_still_a_declared_argument(self):
+        # `free_text` says this roster constrains nothing about the *value*. It
+        # does not say the key is optional to declare: an undeclared key is
+        # refused by `additionalProperties` whatever the value would have been.
+        schema = roster.CONTRACTS["mcp__rk2__submit_mission_result"].schema()
+
+        for argument in roster.OPEN_ARGUMENTS["mcp__rk2__submit_mission_result"]:
+            with self.subTest(argument=argument):
+                self.assertIn(argument, schema["properties"])
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_a_label_pattern_matches_the_labels_the_database_issues(self):
+        # `next_label()` is `prefix || counter::text`: no separator, no padding.
+        pattern = re.compile(roster._label("H"))
+
+        for label in ("H1", "H7", "H4096"):
+            with self.subTest(label=label):
+                self.assertRegex(label, pattern)
+        for label in ("H", "H-0007", "h1", "HH1", "H1x"):
+            with self.subTest(label=label):
+                self.assertNotRegex(label, pattern)
+
+
+class RelationAgreementTest(unittest.TestCase):
+    """Every relation the roster names is one the schema corpus creates.
+
+    The roster's refusals are stated in relation names -- `CANONICAL` is what no
+    model-facing contract may write, and `reads`/`writes` are what each one
+    touches. A name with no table behind it makes those refusals unfalsifiable:
+    a contract declaring `writes=("entites",)` would pass the compile check that
+    is meant to stop exactly that write.
+    """
+
+    RELATION = re.compile(
+        r"CREATE (?:OR REPLACE )?(?:UNLOGGED |MATERIALIZED )?(?:TABLE|VIEW)"
+        r"(?: IF NOT EXISTS)? ([a-z_][a-z0-9_]*)"
+    )
+
+    #: The one name the corpus does not create yet. Ticket 23 owns the picking
+    #: relation; the exemption is by name so that adding a second one is an edit
+    #: to this list rather than a silent widening.
+    PENDING = frozenset({"task_picks"})
+
+    @classmethod
+    def setUpClass(cls):
+        corpus = ROOT / "src" / "redkraken" / "migrations"
+        cls.created = {
+            name
+            for migration in sorted(corpus.glob("*.sql"))
+            for name in cls.RELATION.findall(migration.read_text(encoding="utf-8"))
+        }
+
+    def named(self) -> dict[str, set[str]]:
+        """Every relation name in the roster, and where each one was named."""
+        where: dict[str, set[str]] = {}
+        for name in roster.CANONICAL:
+            where.setdefault(name, set()).add("CANONICAL")
+        for tool, contract in roster.CONTRACTS.items():
+            for relation in contract.reads:
+                where.setdefault(relation, set()).add(f"{tool}.reads")
+            for relation in contract.writes:
+                where.setdefault(relation, set()).add(f"{tool}.writes")
+        return where
+
+    def test_every_relation_the_roster_names_is_one_the_corpus_creates(self):
+        for name, sites in sorted(self.named().items()):
+            if name in self.PENDING:
+                continue
+            with self.subTest(relation=name, named_by=sorted(sites)):
+                self.assertIn(name, self.created)
+
+    def test_the_one_relation_that_does_not_exist_yet_is_named_here(self):
+        # A pending name that quietly started existing would leave an exemption
+        # standing for a check that could now be made.
+        for name in self.PENDING:
+            with self.subTest(relation=name):
+                self.assertNotIn(name, self.created)
+                self.assertIn(name, self.named())
+
+
+def agent_read() -> str:
+    """One tool a launch serves, spelled the way the CLI spells it.
+
+    Every argument of this one is optional, so a bare call is a call the gate
+    can only refuse for a reason the test is actually about.
+    """
+    return "mcp__rk2__get_attack_surface"
 
 
 if __name__ == "__main__":

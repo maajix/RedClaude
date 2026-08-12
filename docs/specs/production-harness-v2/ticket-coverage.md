@@ -16,8 +16,8 @@ and 71–73 by the ticket-18 review, all triaged into the graph.
 | Check | Result |
 | --- | --- |
 | Ticket files | 73, numbered continuously 01–73 |
-| Ticket status | 18 `resolved`, 55 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 424 total, 108 ticked |
+| Ticket status | 19 `resolved`, 54 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 424 total, 114 ticked |
 | Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -43,9 +43,9 @@ is also why none of them was fixed under 18.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–18 |
-| Unblocked and open | 19, 66, 67, 68, 70 |
-| Criteria ticked | 108 of 424 |
+| Resolved | 01–19 |
+| Unblocked and open | 20, 66, 67, 68, 70 |
+| Criteria ticked | 114 of 424 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -59,10 +59,13 @@ same container boundary, a startup refusal that is now an outcome rather
 than a crash -- the supervisor latches, the Task goes back to `pending` with its
 attempt intact, and one redacted Event records that it happened -- and the
 six-role roster, compiled against a measured SDK/CLI tool inventory and enforced
-at every tool call by a pre-tool gate the permission mode cannot overrule. The
-scheduler, the MCP handlers behind the roster's contracts, the epistemic
-pipeline, kill chains, the v1 knowledge migration and the operator surface are
-untouched.
+at every tool call by a pre-tool gate the permission mode cannot overrule, and
+the handlers behind that roster's read and write contracts -- a Program-scoped
+packet compiled outside the container and read inside it under bounds that state
+their own subtraction, and one Mission result that lands as staging rows with a
+recorded reason for every element whose provenance did not check out. The
+scheduler, the promotion and validation half of the epistemic pipeline, kill
+chains, the v1 knowledge migration and the operator surface are untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

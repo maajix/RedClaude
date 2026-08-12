@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import _startup, isolation, pg, roster
+from redkraken import packet as packet_module
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -99,13 +100,26 @@ DIAGNOSTIC = 1500
 #: `assess` reads and not a detail of the module that builds the server.
 SERVER = "rk2"
 SERVER_VERSION = "0.1.0"
-READY = "ready"
-TOOL = f"mcp__{SERVER}__{READY}"
 
-#: Everything this launch actually serves, which is one tool. The roster says
-#: what a role may call; this says what exists to be called, and the allowlist
-#: a launch carries is the intersection. Ticket 19 makes this list longer.
-SERVED = (TOOL,)
+#: The two groups `_launch` builds handlers for: the bounded state reads and
+#: the one outbound proposal. Named as groups rather than as tools so that
+#: moving a tool between groups in the roster moves it here too -- a served
+#: tool that had quietly changed authority class would otherwise be a hole the
+#: compile cannot see.
+SERVED_GROUPS = ("state.read", "state.propose")
+
+#: Everything this launch actually serves. The roster says what a role may
+#: call; this says what exists to be called, and the allowlist a launch carries
+#: is the intersection. It is derived rather than written because two hand-kept
+#: lists is how a tool comes to be granted and not served.
+SERVED = tuple(
+    sorted(name for group in SERVED_GROUPS for name in roster.TOOL_GROUPS[group])
+)
+
+#: The bare tool names, which is what the MCP server registers. The SDK
+#: prefixes `mcp__<server>__` on the way out, so these two lists are the same
+#: list seen from either side of that prefix.
+BARE = {name: name.removeprefix(f"mcp__{SERVER}__") for name in SERVED}
 
 #: How the child answers permission questions. `bypassPermissions` is the
 #: contained value here rather than the wide one: there is no human attached to
@@ -229,6 +243,14 @@ class AgentRunRequest:
     one case where it cannot be given: every Event belongs to a Program, so a
     run started before any Program exists is a run whose refusal can only be
     raised and rendered.
+
+    `packet` is everything the child may read, compiled before it starts. It is
+    a field on the request rather than something the child fetches because the
+    child cannot fetch: the container's one network reaches the capability
+    proxy and nothing else, so a bounded read served inside it can only be
+    served from what came in with the job. A request with no packet starts a
+    child whose state reads all answer "nothing", which is the honest answer
+    for a run the runtime compiled no state for.
     """
 
     agent_run_id: str
@@ -236,6 +258,7 @@ class AgentRunRequest:
     container: isolation.AgentContainer
     role: str
     program_id: str | None = None
+    packet: packet_module.Packet | None = None
     timeout: float = TIMEOUT
 
 
@@ -253,6 +276,12 @@ class AgentRunResult:
     said only which tools were served would not distinguish a model that never
     asked for a forbidden one from a model that asked and was refused, and the
     second is the more interesting run of the two.
+
+    `mission_result` is the raw submission, or nothing where the child never
+    made one. Raw is the operative word: it has been through a closed schema
+    and through the gate, and through nothing else. What its Observations cite
+    is checked on the runtime's own connection, by `proposal.stage`, because
+    the check reads canonical rows and the child cannot.
     """
 
     agent_run_id: str
@@ -266,6 +295,7 @@ class AgentRunResult:
     answers: int
     stop_reason: str | None
     text: str
+    mission_result: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -280,6 +310,9 @@ class AgentRunResult:
             "answers": self.answers,
             "stop_reason": self.stop_reason,
             "text": self.text,
+            "mission_result": (
+                None if self.mission_result is None else dict(self.mission_result)
+            ),
         }
 
 
@@ -317,6 +350,7 @@ def agent_run(
             "objective": request.objective,
             "role": request.role,
             "workspace": isolation.WORKSPACE,
+            "packet": (request.packet or packet_module.Packet()).as_dict(),
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:
@@ -760,6 +794,9 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
         answers=int(result.get("answers") or 0),
         stop_reason=result.get("stop_reason"),
         text=str(result.get("text") or ""),
+        mission_result=(
+            dict(mission) if isinstance(mission := result.get("mission_result"), Mapping) else None
+        ),
     )
 
 

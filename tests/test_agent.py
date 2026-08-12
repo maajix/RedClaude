@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, isolation, roster, tls
+from redkraken import _launch, _startup, agent, isolation, packet, roster, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -47,6 +47,11 @@ NEEDS_CONTAINERS = "set RK_TEST_CONTAINERS=1 to run the contained Agent child"
 #: to start answering before the run that needs it is abandoned.
 UPSTREAM_PORT = 18443
 UPSTREAM_READY = 30.0
+
+#: The served read the contained child is scripted to call. Any one of the six
+#: would do; this is the one whose arguments are all optional, so the call the
+#: model is told to make is a call the CLI's schema check cannot reject first.
+READ = "mcp__rk2__get_attack_surface"
 
 #: Where the repository is mounted in the upstream peer. It is the repository
 #: rather than the application because the upstream is a test fixture: it
@@ -427,10 +432,10 @@ class AssertionTest(unittest.TestCase):
             "launch:cwd": {"cwd": str(fixtures.scratch())},
             "launch:builtin_tools": {"tools": ["Bash"]},
             # What the child may call. `bypassPermissions` is only contained
-            # while the roster is the runtime's own one tool, so a roster that
+            # while the roster is the runtime's own tools, so a roster that
             # grew is refused by the same rule that lets the mode stand.
             "launch:permission_mode": {"permission_mode": "acceptEdits"},
-            "launch:allowed_tools": {"allowed_tools": [agent.TOOL, "Bash"]},
+            "launch:allowed_tools": {"allowed_tools": [*agent.SERVED, "Bash"]},
             "launch:mcp_servers": {"mcp_servers": {agent.SERVER: object(), "other": object()}},
         }
 
@@ -576,22 +581,236 @@ class RefusalTest(unittest.TestCase):
 class SurfaceTest(unittest.TestCase):
     def test_the_tool_surface_serves_nothing_until_it_has_opened_exactly_once(self):
         surface = _launch.Surface()
+        served = agent.BARE[agent.SERVED[0]]
 
         self.assertFalse(surface.ready)
         with self.assertRaises(_launch.Closed):
-            surface.serve(agent.READY)
+            surface.serve(served)
 
         surface.open()
-        surface.serve(agent.READY)
+        surface.serve(served)
 
         self.assertTrue(surface.ready)
-        self.assertEqual([agent.READY], surface.served)
+        self.assertEqual([served], surface.served)
 
         surface.open()
 
         self.assertFalse(surface.ready)
         with self.assertRaises(_launch.Closed):
-            surface.serve(agent.READY)
+            surface.serve(served)
+
+
+@contextlib.contextmanager
+def packaged():
+    """The SDK's two constructors, recorded instead of imported.
+
+    `claude_agent_sdk.tool` returns an `SdkMcpTool` carrying exactly the name,
+    description, input schema and handler it was given, and
+    `create_sdk_mcp_server` collects those into one server value. Standing in
+    for both is what lets the handlers be exercised on a checkout with no SDK --
+    and what the handlers do is this application's code, not the pair's: refuse
+    while the surface is closed, rename the one wire argument that is a Python
+    builtin, and answer from the packet.
+
+    The launch itself is still measured against the real SDK. This substitutes
+    two decorators, not the runtime pair, and every rule in `assess` is
+    untouched by it.
+    """
+    served: dict[str, types.SimpleNamespace] = {}
+
+    def stand_in(name: str, description: str, schema: dict):
+        def decorator(handler):
+            served[name] = types.SimpleNamespace(
+                name=name, description=description, input_schema=schema, handler=handler
+            )
+            return served[name]
+
+        return decorator
+
+    def collect(*, name, version, tools):
+        return types.SimpleNamespace(name=name, version=version, tools=tools)
+
+    with (
+        mock.patch.object(_launch, "tool", stand_in, create=True),
+        mock.patch.object(_launch, "create_sdk_mcp_server", collect, create=True),
+    ):
+        yield served
+
+
+class MissionTest(unittest.TestCase):
+    """One Mission result per run, and the count that makes a second visible."""
+
+    def test_the_first_submission_is_accepted_and_kept_as_it_arrived(self):
+        mission = _launch.Mission()
+
+        answer = mission.submit({"completion_claim": {"status": "partial"}})
+
+        self.assertTrue(answer["accepted"])
+        self.assertEqual(1, answer["attempts"])
+        self.assertEqual({"completion_claim": {"status": "partial"}}, mission.result)
+
+    def test_a_second_submission_is_refused_rather_than_merged_or_overwritten(self):
+        # A later contradiction is the run arguing with its own output. The
+        # first is what it proposed.
+        mission = _launch.Mission()
+        mission.submit({"observations": ["first"]})
+
+        answer = mission.submit({"observations": ["second"]})
+
+        self.assertFalse(answer["accepted"])
+        self.assertEqual("already_submitted", answer["reason"])
+        self.assertEqual(2, answer["attempts"])
+        self.assertEqual({"observations": ["first"]}, mission.result)
+
+    def test_the_answer_does_not_tell_the_model_anything_was_staged(self):
+        # Nothing is staged yet: the row is written by the runtime after this
+        # process ends and after provenance is checked. A handler saying
+        # otherwise would be promising something it is not the one to do.
+        answer = _launch.Mission().submit({})
+
+        self.assertNotIn("staged", json.dumps(answer).replace("staging", ""))
+
+    def test_a_run_that_submitted_nothing_has_nothing_to_carry_back(self):
+        mission = _launch.Mission()
+
+        self.assertFalse(mission.submitted)
+        self.assertIsNone(mission.result)
+        self.assertEqual(0, mission.attempts)
+
+
+class ServedToolTest(unittest.TestCase):
+    """What the child offers the model, and what each handler does with a call."""
+
+    def served(self, stack, reader=None, mission=None):
+        surface = _launch.Surface()
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface, reader or packet.Reader(packet.Packet()), mission or _launch.Mission()
+        )
+        return surface, offered
+
+    def test_the_offered_tools_are_exactly_the_ones_the_roster_serves(self):
+        with contextlib.ExitStack() as stack:
+            _, offered = self.served(stack)
+
+        self.assertEqual(sorted(agent.BARE.values()), sorted(offered))
+
+    def test_every_tool_is_offered_with_its_roster_schema_and_one_description(self):
+        # The schema is the pair's promise and the gate is ours, so the served
+        # document has to be the roster's own -- a second copy here would be a
+        # second contract, and the gate would be checking the other one.
+        with contextlib.ExitStack() as stack:
+            _, offered = self.served(stack)
+
+        for name, packaged_tool in offered.items():
+            with self.subTest(tool=name):
+                contract = roster.CONTRACTS[f"mcp__{agent.SERVER}__{name}"]
+                self.assertEqual(contract.schema(), packaged_tool.input_schema)
+                self.assertFalse(packaged_tool.input_schema["additionalProperties"])
+                self.assertTrue(packaged_tool.description.strip())
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        self.assertEqual("text", wire["content"][0]["type"])
+        return json.loads(wire["content"][0]["text"])
+
+    def test_no_tool_answers_before_the_surface_has_opened(self):
+        # A state read answered before init would be a read served by a child
+        # whose authentication this runtime had not corroborated.
+        with contextlib.ExitStack() as stack:
+            _, offered = self.served(stack)
+
+            for name, packaged_tool in offered.items():
+                with self.subTest(tool=name):
+                    with self.assertRaises(_launch.Closed):
+                        asyncio.run(packaged_tool.handler({}))
+
+    def test_a_read_is_answered_from_the_packet_the_run_was_started_with(self):
+        document = packet.Packet(
+            revision=5,
+            sections={
+                "surface": packet.Section(
+                    name="surface",
+                    total=3,
+                    rows=(
+                        packet.Row(
+                            section="surface",
+                            label="EP1",
+                            revision=5,
+                            digest="0" * 64,
+                            record={"kind": "entity", "label": "EP1", "type": "endpoint"},
+                        ),
+                    ),
+                )
+            },
+        )
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack, reader=packet.Reader(document))
+            surface.open()
+
+            answer = self.answer(offered["get_attack_surface"], {})
+
+        self.assertEqual(5, answer["revision"])
+        self.assertEqual(["EP1"], [row["label"] for row in answer["records"]])
+        self.assertEqual([{"reason": "packet_bound", "count": 2}], answer["omitted"])
+
+    def test_the_wire_name_that_is_a_python_builtin_is_renamed_on_the_way_in(self):
+        document = packet.Packet(
+            sections={
+                "artifacts": packet.Section(
+                    name="artifacts",
+                    total=1,
+                    rows=(
+                        packet.Row(
+                            section="artifacts",
+                            label="AF1",
+                            revision=0,
+                            digest="a" * 64,
+                            record={
+                                "kind": "artifact",
+                                "label": "AF1",
+                                "sha256": "a" * 64,
+                                "byte_size": 11,
+                            },
+                        ),
+                    ),
+                )
+            },
+            excerpts={"AF1": "hello world"},
+        )
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack, reader=packet.Reader(document))
+            surface.open()
+
+            answer = self.answer(
+                offered["get_artifact"], {"artifact_label": "AF1", "range": "0-5"}
+            )
+
+        self.assertEqual("hello", answer["records"][0]["content"])
+        self.assertIn("range", _launch._schema("get_artifact")["properties"])
+
+    def test_a_mission_result_is_accumulated_in_the_child_and_written_by_nobody_here(self):
+        mission = _launch.Mission()
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack, mission=mission)
+            surface.open()
+
+            answer = self.answer(
+                offered["submit_mission_result"], {"observations": [{"summary": "seen"}]}
+            )
+
+        self.assertTrue(answer["accepted"])
+        self.assertEqual({"observations": [{"summary": "seen"}]}, mission.result)
+
+    def test_every_call_that_was_answered_is_on_the_surfaces_record(self):
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack)
+            surface.open()
+
+            self.answer(offered["get_hypotheses"], {})
+            self.answer(offered["get_receipts"], {"receipt_labels": ["R1"]})
+
+        self.assertEqual(["get_hypotheses", "get_receipts"], surface.served)
 
 
 class ChildTest(unittest.TestCase):
@@ -718,7 +937,7 @@ class OptionsTest(unittest.TestCase):
         value = _launch.options_for(
             job(launch.parent, role=role),
             runtime,
-            _launch.server(_launch.Surface()),
+            _launch.server(_launch.Surface(), packet.Reader(packet.Packet()), _launch.Mission()),
             launch,
             roster.Gate(role),
         )
@@ -730,7 +949,10 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual((), agent.assess(value, {}, runtime, launch_dir=launch,
                                           role=fixtures.ROLE, managed_settings=()))
         self.assertEqual(str(agent.bundled_executable(runtime)), value.cli_path)
-        self.assertEqual([agent.TOOL], value.allowed_tools)
+        self.assertEqual(
+            sorted(roster.ROLES[fixtures.ROLE].tools.intersection(agent.SERVED)),
+            value.allowed_tools,
+        )
 
     def test_every_field_the_roster_decides_is_read_from_the_roster(self):
         # The point is not that these are good numbers. It is that there is one
@@ -806,7 +1028,7 @@ class ContainedChildTest(unittest.TestCase):
         cls.authority = tls.authority(cls.root / "authority")
         try:
             docker("network", "create", "--internal", cls.network)
-            cls._serve(cls.upstream, cls.network, agent.TOOL)
+            cls._serve(cls.upstream, cls.network, READ)
         except BaseException:
             cls.tearDownClass()
             raise
@@ -932,7 +1154,7 @@ class ContainedChildTest(unittest.TestCase):
             agent.AgentRunRequest(
                 agent_run_id="agent-run-1",
                 objective=(
-                    f"Call the {agent.READY} tool, then say "
+                    f"Call the {READ} tool, then say "
                     f"{fixtures.ControlUpstream.SPOKEN}."
                 ),
                 container=self.boundary(),
@@ -944,7 +1166,7 @@ class ContainedChildTest(unittest.TestCase):
         self.assertEqual(_startup.KNOWN_RUNTIME, (result.sdk_version, result.cli_version))
         self.assertEqual(agent.EXPECTED_KEY_SOURCE, result.api_key_source)
         self.assertEqual(1, result.tool_ready)
-        self.assertEqual((agent.READY,), result.tools_served)
+        self.assertEqual((agent.BARE[READ],), result.tools_served)
         self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
         self.assertEqual(("end_turn", 2), (result.stop_reason, result.answers))
         # Every byte the child sent went through the runtime's door, to the one
@@ -965,7 +1187,8 @@ class ContainedChildTest(unittest.TestCase):
         Everything that would let this call through is deliberately left open.
         `Task` is in the role's own `tools`, so the model can see it and the
         CLI will dispatch it -- and it is *not* in the options value's
-        `allowed_tools`, which is exactly `[mcp__rk2__ready]`, so this call is
+        `allowed_tools`, which holds only the roster's own served tools, so
+        this call is
         also the demonstration that the list the launch hands the SDK is not
         the boundary. The permission mode is `bypassPermissions`, so there is
         no prompt and nothing consulted. The subagent type is one the pair

@@ -90,8 +90,10 @@ described there: `R-ARGVALUE` refuses a call that does not fit its contract.
 child's own home. The credential the harness mounts there, the settings
 document the launch writes, and the Skills the roster grants are all files a
 role with `Read` could read. Its legitimate use -- looking at a downloaded
-artifact -- is served by `mcp__rk2__get_artifact`, which takes a content hash
-and no path.
+artifact -- is served by `mcp__rk2__get_artifact`, which takes a label and no
+path. (It took a content hash when this was written; ticket 19 moved it to a
+label, because a hash is a key the caller can construct for bytes it was never
+told about. The argument here is unaffected: neither shape takes a path.)
 
 ### The gate's rules, and what each is for
 

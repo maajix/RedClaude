@@ -82,19 +82,90 @@ SKILL_NAME = "skill"
 #: directly. `verdicts` is the one exception and it is not a general one: the
 #: validator's closed verdict tool writes it, which `_check_contracts` allows
 #: for that direction and for no other.
+#:
+#: Every name here is a relation the migration corpus creates, and
+#: `tests/test_roster.py` holds the list to the corpus. A prohibition naming a
+#: table that does not exist is the same defect as a grant naming a tool the
+#: pair does not serve: it reads as a closed door and is a door that was never
+#: in the wall.
 CANONICAL = (
     "entities",
-    "entity_endpoint",
-    "entity_host",
-    "entity_param",
+    "domains",
+    "hosts",
+    "services",
+    "applications",
+    "endpoints",
+    "parameters",
+    "technologies",
+    "identities",
     "relationships",
     "hypotheses",
+    "hypothesis_evidence",
     "findings",
-    "evidence",
+    "finding_evidence",
+    "finding_hypotheses",
     "observations",
     "tasks",
-    "test_specs",
+    "tests",
     "playbooks",
+)
+
+#: The label prefixes the database assigns, from `label_prefixes` in migration
+#: 0015 and the three later migrations that add one. A label is the prefix and
+#: a decimal with nothing between them -- `H7`, `EP12`, `R903` -- because that
+#: is what `next_label()` returns, and a contract pattern that says otherwise
+#: is a gate that denies every label the database has ever issued.
+#:
+#: Entities are the awkward kind and deliberately so: `entities.label` is keyed
+#: off the row's `type`, so "an entity label" is one of eight prefixes rather
+#: than one, and there is no prefix that means "entity".
+LABEL_PREFIXES = {
+    "domain": "DOM",
+    "host": "HST",
+    "service": "SVC",
+    "application": "APP",
+    "endpoint": "EP",
+    "parameter": "PRM",
+    "technology": "TEC",
+    "identity": "IDN",
+    "hypotheses": "H",
+    "observations": "O",
+    "receipts": "R",
+    "tool_runs": "TR",
+    "tasks": "T",
+    "agent_runs": "AR",
+    "tests": "TST",
+    "findings": "F",
+    "proposals": "PR",
+    "pending_decisions": "D",
+    "artifact_references": "AF",
+    "callback_interactions": "CB",
+}
+
+#: `entities.type`, from migration 0003's check constraint. The eight kinds a
+#: Surface row can be, which is also the eight label prefixes an entity label
+#: can carry.
+ENTITY_TYPES = (
+    "application",
+    "domain",
+    "endpoint",
+    "host",
+    "identity",
+    "parameter",
+    "service",
+    "technology",
+)
+
+#: `hypotheses.status`, from migration 0007's check constraint. Six, and
+#: `retest_due` is not among them: migration 0007 calls it "re-entry, not a
+#: sixth state" and spells it as a transition back to `testable`.
+HYPOTHESIS_STATUSES = (
+    "proposed",
+    "testable",
+    "testing",
+    "supported",
+    "refuted",
+    "inconclusive",
 )
 
 #: Argument names no model-facing tool may carry, whatever the tool. Program
@@ -190,6 +261,29 @@ class Argument:
     def constrained(self) -> bool:
         return bool(self.enum or self.pattern or self.items_pattern or self.bounds)
 
+    def schema(self) -> dict:
+        """This argument as JSON Schema, which is the earliest place it binds.
+
+        The CLI validates a tool call against the served schema before
+        `PreToolUse` runs, so a value refused here never reaches the gate and
+        never reaches a handler. The gate checks the same properties again
+        afterwards, and that is deliberate: the schema is the pair's promise
+        and the gate is ours.
+        """
+        body: dict = {"type": self.kind}
+        if self.enum:
+            body["enum"] = list(self.enum)
+        if self.pattern:
+            body["pattern"] = self.pattern
+        if self.bounds:
+            body["minimum"], body["maximum"] = self.bounds
+        if self.items_pattern and self.kind == "object":
+            # A pattern over an object's *keys*, which is what a header name is.
+            body["propertyNames"] = {"pattern": self.items_pattern}
+        elif self.items_pattern:
+            body["items"] = {"type": "string", "pattern": self.items_pattern}
+        return body
+
 
 @dataclass(frozen=True, slots=True)
 class Contract:
@@ -206,6 +300,26 @@ class Contract:
     reads: tuple[str, ...] = ()
     writes: tuple[str, ...] = ()
     arguments: Mapping[str, Argument] = field(default_factory=dict)
+
+    def schema(self) -> dict:
+        """The closed JSON Schema this tool is served with.
+
+        Closed by `additionalProperties: false`, which is the whole point. Every
+        name in `FORBIDDEN_ARGUMENTS` is absent from `properties` -- the compile
+        refuses a contract that declares one -- so a call carrying `program_id`
+        is rejected by the schema before the handler exists to be confused by
+        it, and so is any other invented field a model might try.
+        """
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                name: argument.schema() for name, argument in self.arguments.items()
+            },
+            "required": sorted(
+                name for name, argument in self.arguments.items() if argument.required
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,14 +390,14 @@ class Role:
 
 
 #: The tool groups. What this partition fixes is which *class* of authority a
-#: role may hold; ticket 19 owns the handlers behind the names. Move a member
-#: between groups and a role's authority changes, which is why the group is the
-#: unit a role holds rather than the tool.
+#: role may hold. Move a member between groups and a role's authority changes,
+#: which is why the group is the unit a role holds rather than the tool.
+#:
+#: `state.read` and `state.propose` are served today, by `_launch.server`. The
+#: rest are contracts the compile enforces and later tickets implement, and a
+#: role holding one of those groups holds nothing until then: `allowed_tools`
+#: intersects the roster with what the launch actually serves.
 TOOL_GROUPS: dict[str, tuple[str, ...]] = {
-    # The one tool `_launch` serves today: it reports that the runtime's tool
-    # surface opened, and nothing else. Ticket 19 replaces it with the bounded
-    # state reads, at which point this group stops existing.
-    "runtime.ready": ("mcp__rk2__ready",),
     "state.read": (
         "mcp__rk2__get_attack_surface",
         "mcp__rk2__get_hypotheses",
@@ -329,49 +443,58 @@ OPEN_ARGUMENTS = {
     ),
 }
 
-_LABEL = "^{}-[0-9]{{4}}$"
+def _label(*prefixes: str) -> str:
+    """The pattern one of these label prefixes and a decimal will match.
+
+    `next_label()` in migration 0002 returns `prefix || counter::text`: no
+    separator and no zero padding, so `H7` and `H4096` are both well formed and
+    `H-0007` is not a label this system has ever issued. The digit ceiling is
+    generous rather than meaningful -- it is there so the pattern is bounded,
+    not because a Program is expected to reach nine digits of anything.
+    """
+    return "^(" + "|".join(sorted(prefixes)) + ")[0-9]{1,9}$"
+
+
+#: An entity label is any of the eight `entities.type` prefixes, because
+#: `assign_entity_label` keys the prefix off the row's type. There is no single
+#: prefix that means "entity", which is why this is built rather than written.
+_ENTITY_LABEL = _label(*(LABEL_PREFIXES[kind] for kind in ENTITY_TYPES))
 _HASH = "^[0-9a-f]{64}$"
 
+#: The largest page a bounded read may be asked for. The handler bounds the
+#: response by serialized bytes as well, so this is the coarse half of the
+#: ceiling and the byte budget is the half that binds.
+_PAGE = (1, 200)
+
 CONTRACTS: dict[str, Contract] = {
-    "mcp__rk2__ready": Contract("runtime.ready", READ),
     "mcp__rk2__get_attack_surface": Contract(
         "state.read",
         READ,
-        reads=("entities", "entity_endpoint", "entity_host", "entity_param"),
+        reads=("entities", "domains", "hosts", "services", "applications",
+               "endpoints", "parameters", "technologies", "identities"),
         arguments={
-            "scope_label": Argument("string", pattern=_LABEL.format("S")),
-            "kind": Argument("string", enum=("host", "endpoint", "param")),
-            "limit": Argument("integer", bounds=(1, 200)),
+            "entity_type": Argument("string", enum=ENTITY_TYPES),
+            "limit": Argument("integer", bounds=_PAGE),
         },
     ),
     "mcp__rk2__get_hypotheses": Contract(
         "state.read",
         READ,
-        reads=("hypotheses", "hypothesis_near_matches"),
+        reads=("hypotheses", "entities"),
         arguments={
-            "entity_label": Argument("string", pattern=_LABEL.format("E")),
-            "status": Argument(
-                "string",
-                enum=(
-                    "proposed",
-                    "testable",
-                    "testing",
-                    "supported",
-                    "refuted",
-                    "inconclusive",
-                    "retest_due",
-                ),
-            ),
-            "limit": Argument("integer", bounds=(1, 200)),
+            "subject_label": Argument("string", pattern=_ENTITY_LABEL),
+            "status": Argument("string", enum=HYPOTHESIS_STATUSES),
+            "limit": Argument("integer", bounds=_PAGE),
         },
     ),
     "mcp__rk2__get_evidence": Contract(
         "state.read",
         READ,
-        reads=("evidence", "observations"),
+        reads=("hypothesis_evidence", "finding_evidence", "observations"),
         arguments={
-            "hypothesis_label": Argument("string", pattern=_LABEL.format("H")),
-            "finding_label": Argument("string", pattern=_LABEL.format("F")),
+            "hypothesis_label": Argument("string", pattern=_label("H")),
+            "finding_label": Argument("string", pattern=_label("F")),
+            "limit": Argument("integer", bounds=_PAGE),
         },
     ),
     "mcp__rk2__get_receipts": Contract(
@@ -379,17 +502,25 @@ CONTRACTS: dict[str, Contract] = {
         READ,
         reads=("receipts",),
         arguments={
-            "receipt_ids": Argument(
-                "array", required=True, items_pattern="^R-[0-9]{6}$"
+            "receipt_labels": Argument(
+                "array", required=True, items_pattern=_label("R")
             )
         },
     ),
+    # By label, not by hash. `v_artifacts` says why on the view itself: "the
+    # hash is reported and is never an argument: a verb taking one would read
+    # across Programs whenever the caller could guess the bytes". The store is
+    # one content-addressed namespace shared by every Program, so a hash
+    # argument is a lookup key an agent can construct without ever having been
+    # told the Artifact exists.
     "mcp__rk2__get_artifact": Contract(
         "state.read",
         READ,
-        reads=("artifacts", "artifact_refs"),
+        reads=("v_artifacts", "artifact_references", "artifacts"),
         arguments={
-            "artifact_hash": Argument("string", required=True, pattern=_HASH),
+            "artifact_label": Argument(
+                "string", required=True, pattern=_label(LABEL_PREFIXES["artifact_references"])
+            ),
             "range": Argument("string", pattern="^[0-9]+-[0-9]+$"),
         },
     ),
@@ -412,33 +543,38 @@ CONTRACTS: dict[str, Contract] = {
     # A pick, not a claim. The row it writes is the orchestrator's choice; the
     # claim transaction that re-evaluates every filter and moves the Task is the
     # runtime's, and it falls through to the next slate entry when the choice
-    # has gone stale.
+    # has gone stale. `task_picks` is the one relation named here that the
+    # migration corpus does not yet create: ticket 23 owns both the table and
+    # this handler, and `tests/test_roster.py` records the exemption by name so
+    # it stays one deliberate absence rather than a class of them.
     "mcp__rk2__pick_task": Contract(
         "sched.pick",
         REQUEST,
         writes=("task_picks",),
-        arguments={"task_label": Argument("string", required=True, pattern=_LABEL.format("T"))},
+        arguments={"task_label": Argument("string", required=True, pattern=_label("T"))},
     ),
     "mcp__rk2__request_validation": Contract(
         "sched.pick",
         REQUEST,
         writes=("validation_queue",),
         arguments={
-            "finding_label": Argument("string", required=True, pattern=_LABEL.format("F"))
+            "finding_label": Argument("string", required=True, pattern=_label("F"))
         },
     ),
+    # No arguments. `report_queue` is one row per Program with a state and a
+    # timestamp and nothing to narrow by, so an argument here would be a filter
+    # the table cannot honour.
     "mcp__rk2__request_report": Contract(
         "sched.pick",
         REQUEST,
         writes=("report_queue",),
-        arguments={"scope_label": Argument("string", pattern=_LABEL.format("S"))},
     ),
     "mcp__rk2__park_for_human": Contract(
         "sched.pick",
         REQUEST,
         writes=("pending_decisions",),
         arguments={
-            "task_label": Argument("string", required=True, pattern=_LABEL.format("T")),
+            "task_label": Argument("string", required=True, pattern=_label("T")),
             "question_code": Argument(
                 "string",
                 required=True,
@@ -499,9 +635,9 @@ CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_validation_packet": Contract(
         "validate.judge",
         READ,
-        reads=("findings", "hypotheses", "test_specs", "replay_runs", "receipts"),
+        reads=("findings", "hypotheses", "tests", "test_runs", "receipts"),
         arguments={
-            "finding_label": Argument("string", required=True, pattern=_LABEL.format("F"))
+            "finding_label": Argument("string", required=True, pattern=_label("F"))
         },
     ),
     # The one direction that writes a row of its own rather than asking for
@@ -513,7 +649,7 @@ CONTRACTS: dict[str, Contract] = {
         JUDGE,
         writes=("verdicts",),
         arguments={
-            "finding_label": Argument("string", required=True, pattern=_LABEL.format("F")),
+            "finding_label": Argument("string", required=True, pattern=_label("F")),
             "verdict": Argument(
                 "string", required=True, enum=("confirmed", "refuted", "insufficient")
             ),
@@ -569,7 +705,7 @@ ROLES: dict[str, Role] = {
         # target. No Skill: a technique is executed by the role that holds the
         # task, and the SDK reads an empty skill list as every skill, so the
         # tool is absent rather than granted with a bound that does not bind.
-        tool_groups=("runtime.ready", "state.read", "sched.pick"),
+        tool_groups=("state.read", "sched.pick"),
         skills=(),
         max_concurrent=1,
     ),
@@ -582,7 +718,7 @@ ROLES: dict[str, Role] = {
         effort="medium",
         max_turns=60,
         builtin_tools=(SKILL,),
-        tool_groups=("runtime.ready", "state.read", "state.propose", "net.request", "exec.tool_run"),
+        tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
         skills=("recon-surface", "recon-endpoints"),
         # Two recons on one surface collide on the same deduplication cell.
         max_concurrent=1,
@@ -596,7 +732,7 @@ ROLES: dict[str, Role] = {
         effort="high",
         max_turns=120,
         builtin_tools=(SKILL,),
-        tool_groups=("runtime.ready", "state.read", "state.propose", "net.request", "exec.tool_run"),
+        tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
         skills=("access-control", "injection", "business-logic", "auth-session"),
         max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:
@@ -618,7 +754,7 @@ ROLES: dict[str, Role] = {
         # quota. Its inputs are content-addressed artifacts, which arrive
         # through state.read and are analysed through exec.tool_run, so the
         # record of what it looked at is a row rather than a claim.
-        tool_groups=("runtime.ready", "state.read", "state.propose", "exec.tool_run"),
+        tool_groups=("state.read", "state.propose", "exec.tool_run"),
         skills=("js-bundle-analysis", "source-map-recovery"),
         max_concurrent=2,
     ),
@@ -631,7 +767,7 @@ ROLES: dict[str, Role] = {
         # A validator false negative costs more than the tokens the effort buys.
         effort="max",
         max_turns=30,
-        # Not one built-in, and not even the readiness probe: the packet is its
+        # Not one built-in, and not one state read either: the packet is its
         # whole world, and a second tool is a second thing in it.
         builtin_tools=(),
         tool_groups=("validate.judge",),

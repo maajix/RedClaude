@@ -30,6 +30,7 @@ survives the transaction is their subject.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import json
 import os
@@ -56,8 +57,10 @@ from redkraken import (
     identity,
     integrity,
     migrate,
+    packet,
     pg,
     program,
+    proposal,
     proxy,
     scope,
     seal,
@@ -2652,6 +2655,612 @@ class StateReadTest(DatabaseCase):
 
 
 ARTIFACT_SLUG = "selftest-artifact"
+
+#: The two Programs the mission packet is compiled and staged against.
+PACKET_SLUG = "selftest-packet"
+
+#: What one seeded Artifact holds, before the Program's own name is appended to
+#: it. Short, and text, because what is under test is that a head crosses the
+#: boundary at all; how much of it does is `Limits`.
+PACKET_BODY = b"the Program stored these bytes: "
+
+#: What the canonical half of the database is, in the terms criterion 4 is
+#: about. A Mission result that promoted anything, set a Task's lifecycle, or
+#: queued a report or a validation would move one of these numbers.
+CANONICAL_SNAPSHOT = """
+SELECT (SELECT count(*) FROM entities),
+       (SELECT count(*) FROM hypotheses),
+       (SELECT count(*) FROM observations),
+       (SELECT count(*) FROM hypothesis_evidence),
+       (SELECT count(*) FROM findings),
+       (SELECT count(*) FROM tasks),
+       (SELECT coalesce(md5(string_agg(t.status, '|' ORDER BY t.id)), '') FROM tasks t),
+       (SELECT count(*) FROM validation_queue),
+       (SELECT count(*) FROM report_queue),
+       (SELECT count(*) FROM verdicts)
+"""
+
+
+class MissionPacketTest(DatabaseCase):
+    """PH2-19: what one Agent may read about its Program, and what it may write.
+
+    Both halves need a server and neither can be faked. The compile runs on the
+    `rk2_state` connection because every bound it honours is a bound row level
+    security and the column grants impose -- a packet compiled as the owner
+    would return every Program's rows and prove nothing. The staging write runs
+    as `rk2_runtime` because that is the role the supervisor holds, and because
+    `rk2_runtime` is the only role that can see another Program's Receipt, which
+    is what makes `receipt_other_program` provable rather than
+    indistinguishable from a Receipt that does not exist.
+
+    Two Programs, seeded alike, so that every refusal here is about which
+    Program a label resolves in rather than about a row one of them happens not
+    to have. This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.configurations = {}
+        cls.identifiers = {}
+        for name in ("a", "b"):
+            slug = f"{PACKET_SLUG}-{name}"
+            path = write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+        cls.seeded = {name: cls._populate(name) for name in ("a", "b")}
+        cls.exclusive = cls._exclusive("b")
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            # `hypothesis_evidence` first, and only because of how its two keys
+            # differ: the hypothesis side cascades and the observation side does
+            # not, so dropping the Program takes the Observation out from under
+            # an edge that still cites it. Deliberate in the schema -- an
+            # Observation may not be deleted while something rests on it -- and
+            # therefore an ordering a purge has to supply.
+            cls.connection.execute(
+                "DELETE FROM hypothesis_evidence WHERE program_id = ANY($1::uuid[])",
+                (pg.quote_array([cls.identifiers[name] for name in ("a", "b")]),),
+            )
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{PACKET_SLUG}-%",)
+            )
+            # `artifacts` is content-addressed across Programs, so deleting the
+            # Programs takes the references and leaves the blobs. They are only
+            # deletable now that nothing holds them.
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                (pg.quote_array([cls.seeded[name]["artifact"] for name in ("a", "b")]),),
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def _populate(cls, name: str) -> dict:
+        """One of everything an Agent reads, in each Program.
+
+        Each Program gets its own Task, run, Tool Run and Receipts, because the
+        interesting refusals are all about a label that resolves in the wrong
+        one -- and a label only resolves somewhere if something wrote it there.
+        """
+        program_id = cls.identifiers[name]
+        seeded: dict[str, object] = {"program_id": program_id}
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            seeded["task"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, claimed_at,"
+                    " lease_expires_at) VALUES ($1::uuid, 'recon', 'claimed', now(),"
+                    " now() + interval '10 minutes') RETURNING id::text",
+                    (program_id,),
+                ).scalar()
+            )
+            # No `kind`: migration 019 derives it from the Task, and stating it
+            # here would be a second opinion about what the run is serving.
+            seeded["run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, runs_as, model,"
+                    " effort, mission_packet) VALUES ($1::uuid, $2::uuid, 'recon',"
+                    " 'subagent', 'selftest', 'low', '{}'::jsonb) RETURNING id::text",
+                    (program_id, seeded["task"]),
+                ).scalar()
+            )
+            seeded["tool_run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'mcp__rk2__http_request', '{}'::jsonb, 'success', 'runtime')"
+                    " RETURNING id::text",
+                    (program_id, seeded["run"], seeded["task"]),
+                ).scalar()
+            )
+            # The bytes. The store is one content-addressed namespace shared by
+            # every Program, so what makes a blob this Program's is an
+            # `artifact_references` row -- and that row is not written here.
+            # `hold_receipt_transcripts` writes it from the Receipt below,
+            # which is the point of that trigger: holding follows from the
+            # record rather than from each writer remembering.
+            body = PACKET_BODY + f"{name}\n".encode()
+            digest = artifact.digest(body)
+            cls.connection.execute(
+                "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+                " VALUES ($1, $2, 'text/plain', 'agent_visible')",
+                (digest, len(body)),
+            )
+            seeded["artifact"], seeded["body"] = digest, body
+            # A refusal, which is the one Receipt shape that needs no live
+            # capability behind it: migration 040 requires a running Tool Run,
+            # an unexpired egress token and a leased Task before an `allowed`
+            # agent-lane Receipt may exist. What is under test here is what a
+            # Receipt is readable as, not what earned one.
+            seeded["receipt"] = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host, method, scheme,"
+                    " path, request_agent_sha)"
+                    " VALUES ($1::uuid, 'agent', 'blocked', 'refused before contact',"
+                    " now(), 'target', 1, 'example.test', 'GET', 'https', '/', $2)"
+                    " RETURNING label",
+                    (program_id, digest),
+                ).scalar()
+            )
+            # The label the Receipt's trigger just minted, which is the only
+            # handle a child is ever given for these bytes.
+            seeded["artifact_label"] = str(
+                cls.connection.execute(
+                    "SELECT label FROM artifact_references"
+                    " WHERE program_id = $1::uuid AND sha256 = $2",
+                    (program_id, digest),
+                ).scalar()
+            )
+            # The proxy's own traffic. Migration 020's restrictive policy hides
+            # this lane from `rk2_state`, so it is here to be *absent* from the
+            # packet a child is given.
+            seeded["internal"] = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1::uuid, 'proxy_internal', 'allowed', 'a csrf token',"
+                    " now(), 'target', 1, 'example.test') RETURNING label",
+                    (program_id,),
+                ).scalar()
+            )
+            subject, subject_label = cls.connection.execute(
+                "INSERT INTO entities (program_id, type, dedup_key)"
+                " VALUES ($1::uuid, 'technology', $2) RETURNING id::text, label",
+                (program_id, f"tech:{PACKET_SLUG}-{name}"),
+            ).rows[0]
+            seeded["subject"], seeded["subject_label"] = str(subject), str(subject_label)
+            hypothesis, hypothesis_label = cls.connection.execute(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement) VALUES ($1::uuid, $2::uuid,"
+                " (SELECT id FROM property_classes ORDER BY id LIMIT 1), $3)"
+                " RETURNING id::text, label",
+                (program_id, subject, f"a self test in {name}"),
+            ).rows[0]
+            seeded["hypothesis"] = str(hypothesis)
+            seeded["hypothesis_label"] = str(hypothesis_label)
+            observation, observation_label = cls.connection.execute(
+                "INSERT INTO observations (program_id, agent_run_id, subject_entity_id,"
+                " kind, summary, provenance_kind, tool_run_id)"
+                " VALUES ($1::uuid, $2::uuid, $3::uuid, 'technology_identified', $4,"
+                " 'tool_run', $5::uuid) RETURNING id::text, label",
+                (
+                    program_id,
+                    seeded["run"],
+                    subject,
+                    f"the self test in {name} identified a technology",
+                    seeded["tool_run"],
+                ),
+            ).rows[0]
+            seeded["observation"] = str(observation)
+            seeded["observation_label"] = str(observation_label)
+            # `context`, because migration 018 makes `technology_identified`
+            # non-evidential: it populates the surface and settles nothing, and
+            # the trigger refuses to let it be cited as a baseline.
+            cls.connection.execute(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id,"
+                " polarity, role) VALUES ($1::uuid, $2::uuid, 'supports', 'context')",
+                (seeded["hypothesis"], seeded["observation"]),
+            )
+            seeded["tool_run_label"] = str(
+                cls.connection.execute(
+                    "SELECT label FROM tool_runs WHERE id = $1::uuid",
+                    (seeded["tool_run"],),
+                ).scalar()
+            )
+        return seeded
+
+    @classmethod
+    def _exclusive(cls, name: str) -> dict:
+        """Two labels that resolve in this Program and in no other.
+
+        Labels are per-Program counters -- `next_label` counts within
+        `program_id` -- so two Programs seeded alike hold the same labels, and
+        "another Program's R1" is also this Program's R1. That collision is
+        correct behaviour and it makes the cross-Program refusals untestable
+        against the identical halves: a proposal citing R1 from Program a is
+        citing a Receipt Program a really has.
+
+        So one Program gets one more of each. The extra Receipt and the extra
+        Entity take the next counter values, which the other Program has not
+        reached, and citing those from the other Program is the citation the
+        refusal is about.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            receipt = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host, method, scheme,"
+                    " path) VALUES ($1::uuid, 'agent', 'blocked', 'out of scope',"
+                    " now(), 'target', 1, 'only-in-b.test', 'GET', 'https', '/')"
+                    " RETURNING label",
+                    (program_id,),
+                ).scalar()
+            )
+            subject = str(
+                cls.connection.execute(
+                    "INSERT INTO entities (program_id, type, dedup_key)"
+                    " VALUES ($1::uuid, 'technology', $2) RETURNING label",
+                    (program_id, f"tech:{PACKET_SLUG}-{name}-only"),
+                ).scalar()
+            )
+        return {"program": name, "receipt": receipt, "subject_label": subject}
+
+    # -- the two connections -------------------------------------------------
+
+    @classmethod
+    @contextlib.contextmanager
+    def agent_session(cls, name: str):
+        """The connection a child's world is compiled on, bound to one Program.
+
+        The binding is transaction-scoped by design -- `state.bind_agent_session`
+        says why -- so it is held open around whatever reads through it. A read
+        outside the transaction would be a read of no Program at all.
+        """
+        with pg.connect(cls.harness.state) as session:
+            with session.transaction():
+                assert state.bind_agent_session(state.Ledger(), session, cls.identifiers[name])
+                yield session
+
+    def compiled(self, name: str, **options) -> packet.Packet:
+        with self.agent_session(name) as session:
+            return packet.compile(session, **options)
+
+    def staged(self, name: str, result: proposal.Result) -> proposal.Staged:
+        """One Mission result, written the way the supervisor writes one."""
+        seeded = self.seeded[name]
+        with self.connection.transaction():
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return proposal.stage(
+                self.connection,
+                result,
+                program_id=seeded["program_id"],
+                agent_run_id=seeded["run"],
+                task_id=seeded["task"],
+            )
+
+    def canonical(self) -> tuple:
+        return tuple(self.connection.execute(CANONICAL_SNAPSHOT).rows[0])
+
+    # -- what the packet carries ---------------------------------------------
+
+    def test_a_packet_carries_this_programs_rows_and_no_other_programs(self):
+        # Criterion 1. Both Programs hold the same shapes and their labels
+        # collide, so a compile that leaked would show up as a second
+        # descriptor rather than only as a larger count.
+        for name in ("a", "b"):
+            other = "b" if name == "a" else "a"
+            with self.subTest(program=name):
+                compiled = self.compiled(name)
+
+                descriptors = {
+                    row.record["descriptor"] for row in compiled.section("surface").rows
+                }
+                self.assertIn(f"tech:{PACKET_SLUG}-{name}", descriptors)
+                self.assertNotIn(f"tech:{PACKET_SLUG}-{other}", descriptors)
+                expected = {self.seeded[name]["receipt"]}
+                if name == self.exclusive["program"]:
+                    expected.add(self.exclusive["receipt"])
+                self.assertEqual(
+                    expected,
+                    {row.label for row in compiled.section("receipts").rows},
+                )
+                self.assertEqual(
+                    [self.seeded[name]["artifact_label"]],
+                    [row.label for row in compiled.section("artifacts").rows],
+                )
+                self.assertEqual(
+                    [self.seeded[name]["artifact"]],
+                    [row.record["sha256"] for row in compiled.section("artifacts").rows],
+                )
+
+    def test_every_section_a_read_tool_answers_from_is_compiled(self):
+        compiled = self.compiled("a")
+
+        for name in packet.SECTIONS:
+            with self.subTest(section=name):
+                self.assertTrue(compiled.section(name).rows, name)
+
+    def test_the_proxys_own_traffic_is_not_in_the_packet_at_all(self):
+        # Migration 020's restrictive policy, read from the side that matters:
+        # the child cannot cite what it was never given.
+        compiled = self.compiled("a")
+
+        self.assertNotIn(
+            self.seeded["a"]["internal"],
+            [row.label for row in compiled.section("receipts").rows],
+        )
+
+    def test_every_digest_is_the_one_the_database_computes(self):
+        # Criterion 2's other half. A digest an agent cites has to be
+        # re-checkable against the database later, so it is the database's
+        # digest that is staged -- a second implementation of the hash in
+        # Python would be a second answer to that check.
+        compiled = self.compiled("a")
+        with self.agent_session("a") as session:
+            held = {
+                str(label): str(digest)
+                for label, digest in session.execute(
+                    "SELECT label, digest FROM v_records"
+                ).rows
+            }
+
+        for name in ("surface", "hypotheses", "receipts"):
+            for row in compiled.section(name).rows:
+                with self.subTest(section=name, label=row.label):
+                    self.assertEqual(held[row.label], row.digest)
+
+    def test_the_revision_is_the_programs_own_high_water_mark(self):
+        compiled = self.compiled("a")
+
+        self.assertGreater(compiled.revision, 0)
+        self.assertGreaterEqual(
+            int(self.connection.execute("SELECT max(seq) FROM events").scalar()),
+            compiled.revision,
+        )
+
+    def test_a_row_limit_leaves_behind_the_count_of_what_it_left_out(self):
+        # Criterion 2. The staged rows come from a capped read and the total
+        # comes from the database in the same compile, so the marker is the
+        # subtraction: a caller is told the size of what it was not shown.
+        compiled = self.compiled("a", limits=packet.Limits(rows=1))
+        answer = packet.Reader(compiled).attack_surface()
+
+        self.assertEqual(1, answer["counts"]["staged"])
+        self.assertGreater(answer["counts"]["total"], 1)
+        self.assertEqual(
+            answer["counts"]["total"] - answer["counts"]["staged"],
+            sum(
+                marker["count"]
+                for marker in answer["omitted"]
+                if marker["reason"] == "packet_bound"
+            ),
+        )
+
+    def test_a_byte_ceiling_is_honoured_by_the_compiled_document(self):
+        compiled = self.compiled("a", limits=packet.Limits(byte_limit=600))
+
+        self.assertLessEqual(compiled.bytes, 600)
+        self.assertLess(
+            len(compiled.rows()),
+            sum(compiled.section(name).total for name in packet.SECTIONS),
+        )
+
+    def test_an_artifacts_head_is_staged_only_when_the_runtime_can_load_it(self):
+        seeded = self.seeded["a"]
+        held = {seeded["artifact"]: seeded["body"]}
+
+        compiled = self.compiled("a", load=held.get)
+        answer = packet.Reader(compiled).artifact(
+            artifact_label=seeded["artifact_label"], span="0-4"
+        )
+
+        self.assertEqual(seeded["body"][:4].decode(), answer["records"][0]["content"])
+        self.assertEqual([], answer["omitted"])
+
+    def test_an_artifact_the_runtime_cannot_load_is_metadata_and_says_so(self):
+        seeded = self.seeded["a"]
+
+        answer = packet.Reader(self.compiled("a")).artifact(
+            artifact_label=seeded["artifact_label"]
+        )
+
+        self.assertIsNone(answer["records"][0]["content"])
+        self.assertEqual(
+            [{"reason": "not_staged", "byte_size": len(seeded["body"])}],
+            answer["omitted"],
+        )
+
+    def test_an_artifact_is_addressed_by_label_and_its_hash_is_only_reported(self):
+        # Ticket 06's rule on `v_artifacts`, from the side that would break it:
+        # the store is one content-addressed namespace shared by every Program,
+        # so a verb taking a hash is a verb an agent can call for bytes it was
+        # never shown. There is no such verb -- the hash comes back in the
+        # record, where it is checkable against bytes the caller already holds.
+        seeded = self.seeded["a"]
+
+        answer = packet.Reader(self.compiled("a")).artifact(
+            artifact_label=seeded["artifact_label"]
+        )
+
+        self.assertEqual(seeded["artifact"], answer["records"][0]["record"]["sha256"])
+        with self.assertRaises(TypeError):
+            packet.Reader(self.compiled("a")).artifact(artifact_hash=seeded["artifact"])
+
+    def test_another_programs_artifact_is_not_reachable_by_its_label(self):
+        # The labels of the two Programs collide by construction, so this is
+        # the strongest form of the question: Program a asks for the label its
+        # own reference happens to share with Program b's, and gets its own
+        # bytes rather than a choice of two.
+        answer = packet.Reader(self.compiled("a")).artifact(
+            artifact_label=self.seeded["b"]["artifact_label"]
+        )
+
+        self.assertEqual(
+            [self.seeded["a"]["artifact"]],
+            [record["record"]["sha256"] for record in answer["records"]],
+        )
+        self.assertNotIn(
+            self.seeded["b"]["artifact"],
+            [record["record"]["sha256"] for record in answer["records"]],
+        )
+
+    # -- what the Mission result writes --------------------------------------
+
+    def test_a_mission_result_writes_a_staging_row_and_moves_nothing_canonical(self):
+        # Criterion 4, measured rather than argued: the canonical half of the
+        # database is identical either side of the write, including the Task's
+        # lifecycle, the validation queue and the report queue.
+        seeded = self.seeded["a"]
+        before = self.canonical()
+
+        written = self.staged(
+            "a",
+            proposal.Result(
+                payload={
+                    "observations": [
+                        {
+                            "summary": "the header was absent",
+                            "tool_run_label": seeded["tool_run_label"],
+                            "subject_label": seeded["subject_label"],
+                        }
+                    ],
+                    "new_entities": [{"type": "endpoint", "value": "/admin"}],
+                    "hypotheses": [{"statement": "the endpoint is unauthenticated"}],
+                    "evidence": [{"hypothesis": 0, "observation": 0}],
+                    "suggested_tasks": [{"kind": "hunt"}],
+                    "completion_claim": {"status": "partial"},
+                }
+            ),
+        )
+
+        self.assertEqual(before, self.canonical())
+        self.assertEqual("staged", written.status)
+        self.assertEqual("partial", written.completion)
+        self.assertEqual([], list(written.drops))
+        self.assertEqual(
+            1,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM proposals WHERE id = $1::uuid",
+                    (written.proposal_id,),
+                ).scalar()
+            ),
+        )
+
+    def test_the_staging_row_is_labelled_by_the_database_like_every_other_row(self):
+        written = self.staged("a", proposal.Result(payload={"observations": []}))
+
+        self.assertRegex(written.label, r"^PR[0-9]+$")
+        self.assertEqual(
+            written.label,
+            str(
+                self.connection.execute(
+                    "SELECT label FROM proposals WHERE id = $1::uuid",
+                    (written.proposal_id,),
+                ).scalar()
+            ),
+        )
+
+    def test_a_receipt_of_another_program_is_kept_as_a_rejected_element(self):
+        # Criterion 5. `rk2_runtime` sees every Program, which is the only way
+        # this is `receipt_other_program` rather than `no_such_receipt`. The
+        # label has to be one only the other Program reached, per `_exclusive`.
+        foreign = self.exclusive["receipt"]
+        self.assertNotIn(
+            foreign, [row.label for row in self.compiled("a").section("receipts").rows]
+        )
+
+        written = self.staged(
+            "a",
+            proposal.Result(
+                payload={"observations": [{"summary": "seen", "receipt_label": foreign}]}
+            ),
+        )
+
+        self.assertEqual("staged", written.status)
+        self.assertEqual(["receipt_other_program"], [drop.reason for drop in written.drops])
+        self.assertEqual(
+            [("observations[0]", "receipt_other_program", foreign)],
+            [
+                (str(path), str(reason), str(cited))
+                for path, reason, cited in self.connection.execute(
+                    "SELECT element_path, reason, cited FROM proposal_drops"
+                    " WHERE proposal_id = $1::uuid ORDER BY ordinal",
+                    (written.proposal_id,),
+                ).rows
+            ],
+        )
+
+    def test_a_proxy_internal_receipt_cannot_back_an_observation_either(self):
+        written = self.staged(
+            "a",
+            proposal.Result(
+                payload={
+                    "observations": [
+                        {"summary": "seen", "receipt_label": self.seeded["a"]["internal"]}
+                    ]
+                }
+            ),
+        )
+
+        self.assertEqual(["receipt_proxy_internal"], [drop.reason for drop in written.drops])
+
+    def test_an_observation_about_another_programs_entity_is_kept_as_rejected(self):
+        # The subject, unlike the provenance, is a label of a canonical row the
+        # other Program holds and this one does not -- again `_exclusive`, for
+        # the same reason.
+        written = self.staged(
+            "a",
+            proposal.Result(
+                payload={
+                    "observations": [
+                        {
+                            "summary": "seen",
+                            "tool_run_label": self.seeded["a"]["tool_run_label"],
+                            "subject_label": self.exclusive["subject_label"],
+                        }
+                    ]
+                }
+            ),
+        )
+
+        self.assertEqual(["label_other_program"], [drop.reason for drop in written.drops])
+
+    def test_a_receipt_no_program_holds_is_kept_as_a_rejected_element(self):
+        written = self.staged(
+            "a",
+            proposal.Result(
+                payload={"observations": [{"summary": "seen", "receipt_label": "R999999"}]}
+            ),
+        )
+
+        self.assertEqual(["no_such_receipt"], [drop.reason for drop in written.drops])
+
+    def test_the_read_role_cannot_write_a_proposal_or_anything_else(self):
+        # The roster refuses a canonical write at compile time and the child has
+        # no database at all; this is the third, independent statement of the
+        # same thing, made where a bug in either of the other two would still be
+        # caught.
+        for table in ("proposals", "proposal_drops", "entities", "tasks", "report_queue"):
+            with self.subTest(table=table):
+                self.assertFalse(
+                    self.connection.execute(
+                        "SELECT bool_or(has_table_privilege('rk2_state', $1, p))"
+                        "  FROM unnest(ARRAY['INSERT','UPDATE','DELETE']) AS p",
+                        (table,),
+                    ).scalar()
+                )
+
 
 #: The bytes both Programs store. Long enough that a bounded range leaves
 #: something out at both ends, and numbered so a range that came back shifted

@@ -44,7 +44,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import NoReturn
 
-from redkraken import agent, roster
+from redkraken import agent, packet, roster
 
 
 try:
@@ -156,21 +156,144 @@ def runtime_facts() -> dict[str, str | None]:
     return facts
 
 
-def server(surface: Surface):
-    """The runtime's MCP server, whose tools refuse until the surface opens.
+class Mission:
+    """The one Mission result a run may submit, and the count of the tries.
 
-    One tool, and it answers with nothing but the state of the surface it is
-    served from: the point at ticket 16 is that a tool surface exists, opens
-    once and opens after init. Ticket 19 replaces it with bounded state reads
-    and proposals.
+    One, because the Spec says one: "Agents submit one Mission result". A
+    second submission is not merged and does not overwrite -- the first is what
+    the run proposed, and a later contradiction of it is the run arguing with
+    its own output. The attempt is still counted, so a model that tried twice
+    is distinguishable from one that submitted once.
     """
 
-    @tool(agent.READY, "Report that the runtime's tool surface is open.", {})
-    async def ready(arguments: dict) -> dict:
-        surface.serve(agent.READY)
-        return {"content": [{"type": "text", "text": json.dumps({"tool_surface": "open"})}]}
+    def __init__(self) -> None:
+        self.result: dict | None = None
+        self.attempts = 0
 
-    return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=[ready])
+    @property
+    def submitted(self) -> bool:
+        return self.result is not None
+
+    def submit(self, arguments: Mapping[str, object]) -> dict:
+        self.attempts += 1
+        if self.result is not None:
+            return {
+                "accepted": False,
+                "reason": "already_submitted",
+                "attempts": self.attempts,
+            }
+        self.result = dict(arguments)
+        return {
+            "accepted": True,
+            "attempts": self.attempts,
+            # Not "staged". Nothing is staged yet: the row is written by the
+            # runtime after this process ends and after its provenance is
+            # checked, and telling the model otherwise would be this handler
+            # promising something it is not the one to do.
+            "note": "received; staging and provenance are the runtime's step",
+        }
+
+
+#: What each served tool tells the model it is for. One sentence each, and each
+#: one says the bound out loud: a description that promised the whole Program
+#: would be a description of a tool this runtime does not have.
+DESCRIPTIONS = {
+    "get_attack_surface": (
+        "List this Program's known Entities -- hosts, endpoints, parameters and the "
+        "rest -- from the bounded packet this run was started with. Returns record "
+        "revisions, digests, counts and omission markers."
+    ),
+    "get_hypotheses": (
+        "List this Program's Hypotheses, optionally for one subject Entity or one "
+        "status, from the bounded packet this run was started with."
+    ),
+    "get_evidence": (
+        "List the evidence edges tying Observations to one Hypothesis or one Finding, "
+        "with each Observation's provenance label."
+    ),
+    "get_receipts": (
+        "Fetch named Receipts. A label that is not in this run's packet comes back as "
+        "an omission marker rather than as an error."
+    ),
+    "get_artifact": (
+        "Fetch one reachable Artifact by its label -- its metadata and, where its head "
+        "was staged as text, a byte range of it. The hash is reported, never asked "
+        "for. Whole large Artifacts are analysed by a tool run, not read into this "
+        "context."
+    ),
+    "submit_mission_result": (
+        "Submit this Mission's one result: proposed Entities, Hypotheses, "
+        "Observations with the Receipt or Tool Run each cites, evidence edges, "
+        "suggested Tasks and a completion claim. It is staging data. The runtime "
+        "checks provenance and decides what becomes canonical; nothing here is true "
+        "because it was submitted."
+    ),
+}
+
+
+def server(surface: Surface, reader: packet.Reader, mission: Mission):
+    """The runtime's MCP server: five bounded reads and one proposal.
+
+    Every handler goes through `surface.serve` first, which refuses while the
+    surface is not open. That is ticket 16's property and it is load-bearing
+    here for a new reason: a state read answered before init would be a read
+    served by a child whose authentication this runtime had not corroborated.
+
+    The schemas come from `roster.CONTRACTS` rather than from here. They are
+    closed -- `additionalProperties: false` -- and the CLI validates against
+    them before `PreToolUse` runs, so an argument the roster does not declare
+    is refused before the gate and long before a handler. The gate checks the
+    same properties again afterwards. Two checks of one statement, which is the
+    arrangement, rather than two statements.
+    """
+    reads = {
+        "get_attack_surface": reader.attack_surface,
+        "get_hypotheses": reader.hypotheses,
+        "get_evidence": reader.evidence,
+        "get_receipts": reader.receipts,
+        "get_artifact": reader.artifact,
+    }
+    tools = [_read(surface, name, answer) for name, answer in reads.items()]
+    tools.append(_propose(surface, mission))
+    return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
+
+
+def _read(surface: Surface, name: str, answer):
+    """One state read, wired to the reader method that answers it.
+
+    `range` is the one wire name that is a Python builtin, so it is renamed on
+    the way in. Renaming it in the contract instead would have made the roster
+    describe a tool by a name the tool is not served under.
+    """
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        given = dict(arguments or {})
+        if "range" in given:
+            given["span"] = given.pop("range")
+        return _content(answer(**given))
+
+    return handler
+
+
+def _propose(surface: Surface, mission: Mission):
+    name = "submit_mission_result"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(mission.submit(dict(arguments or {})))
+
+    return handler
+
+
+def _schema(name: str) -> dict:
+    return roster.CONTRACTS[f"mcp__{agent.SERVER}__{name}"].schema()
+
+
+def _content(answer: Mapping[str, object]) -> dict:
+    return {"content": [{"type": "text", "text": json.dumps(answer, separators=(",", ":"))}]}
 
 
 def gate_hooks(gate: roster.Gate) -> dict:
@@ -301,6 +424,8 @@ async def run(
     launch = agent.launch_directory(str(job["workspace"]), str(job["agent_run_id"]))
     agent.write_settings(launch)
     surface = Surface()
+    reader = packet.Reader(packet.Packet.from_dict(dict(job.get("packet") or {})))
+    mission = Mission()
     role = str(job.get("role") or "")
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
@@ -311,7 +436,7 @@ async def run(
     options = (
         None
         if claude_agent_sdk is None or gate is None
-        else options_for(job, runtime, server(surface), launch, gate)
+        else options_for(job, runtime, server(surface, reader, mission), launch, gate)
     )
 
     violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)
@@ -350,6 +475,8 @@ async def run(
         "answers": answers,
         "stop_reason": stop_reason,
         "text": text,
+        "mission_result": mission.result,
+        "mission_attempts": mission.attempts,
     }
 
 

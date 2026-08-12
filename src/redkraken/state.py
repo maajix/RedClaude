@@ -40,7 +40,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import config, migrate, pg, program
+from redkraken import config, migrate, packet, pg, program
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -169,20 +169,15 @@ def bound(
 ) -> Compact:
     """Fit the entries under the byte ceiling, dropping the stalest first.
 
-    Which entry goes matters. Spending the whole ceiling on the first kind
-    would answer with a Program that has entities and no findings, which is a
-    claim rather than an omission — so each drop comes from whichever kind is
-    currently largest, and within a kind from the tail, which is the end the
-    caller ordered as least recently changed.
+    The rule itself is `packet.fit`, because the mission packet needs the same
+    one and two implementations of "which row goes first" would eventually
+    answer differently for an operator read and for an Agent's read of the same
+    Program. What is local here is only the unit: this bounds compact entries
+    by kind, and a packet bounds records by section.
     """
-    remaining = list(entries)
-    while remaining and _size(remaining) > byte_limit:
-        held = _per_kind(remaining)
-        crowded = max(held.items(), key=lambda item: (item[1], item[0]))[0]
-        for index in range(len(remaining) - 1, -1, -1):
-            if remaining[index].kind == crowded:
-                del remaining[index]
-                break
+    remaining = packet.fit(
+        entries, byte_limit=byte_limit, group=lambda entry: entry.kind, size=_size
+    )
     return Compact(
         entries=tuple(remaining), counts=dict(counts), bytes=_size(remaining)
     )
