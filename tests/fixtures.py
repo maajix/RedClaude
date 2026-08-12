@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from redkraken import agent, isolation, tls
+from redkraken import _startup, agent, isolation, tls
 
 
 VALID = """\
@@ -605,6 +605,31 @@ def boundary(**overrides) -> isolation.AgentContainer:
     }
     fields.update(overrides)
     return isolation.AgentContainer(**fields)
+
+
+#: A credential a launch under test really is given, so "never its value" is a
+#: claim about output that had something in it to leak. One string for every
+#: suite: two would let a leak through the module that did not name the one
+#: being grepped for.
+EXPORTED = "exported-into-the-launch"
+
+
+def startup_refusal(environment: dict | None = None, phase: str = "pre_spawn"):
+    """One refusal, measured on inputs rather than on the machine underneath.
+
+    The options value is nothing and the runtime facts are empty, so what comes
+    back is the credential matrix's own verdict on the environment given plus
+    the unmeasured runtime that says so -- the same records a child would carry
+    home, without needing a child or an SDK to produce them.
+    """
+    violations = agent.assess(
+        None,
+        {"ANTHROPIC_API_KEY": EXPORTED} if environment is None else environment,
+        {},
+        launch_dir=scratch(),
+        managed_settings=(),
+    )
+    return agent.StartupRefusal(violations, phase, *_startup.KNOWN_RUNTIME)
 
 
 @contextlib.contextmanager

@@ -18,7 +18,7 @@ from unittest import mock
 from redkraken import _launch, _startup, agent, isolation, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
-from tests.fixtures import docker, unlatched
+from tests.fixtures import EXPORTED, docker, unlatched
 
 
 PACKAGE = ROOT / "src" / "redkraken"
@@ -54,10 +54,6 @@ UPSTREAM_READY = 30.0
 REPOSITORY = "/opt/rk2-repo"
 AUTHORITY = "/opt/rk2-authority"
 
-#: A credential the child really is given, so "never its value" is a claim
-#: about output that had something in it to leak.
-EXPORTED = "exported-into-the-child"
-
 #: A child that reads the managed settings locations this suite names instead of
 #: the platform's. The rebinding is done in the child because that is the only
 #: place it means anything: `_launch.run` reads `agent.MANAGED_SETTINGS` when the
@@ -70,6 +66,61 @@ from pathlib import Path
 from redkraken import _launch, agent
 agent.MANAGED_SETTINGS = (Path(sys.argv[1]),)
 raise SystemExit(_launch.main())
+"""
+
+#: A child that gets as far as init and is answered there by a transport this
+#: suite holds. The transport is the one thing about this phase a launch cannot
+#: arrange honestly: on the measured runtime pair, no input makes the real CLI
+#: report a key source other than `none` without a credential vector the
+#: pre-spawn phase has already refused. Everything else is the real thing -- a
+#: process, the environment and filesystem it was given, `_launch.run` in the
+#: order it runs, and the refusal written where a child writes one.
+INIT_CHILD = """
+import asyncio, json, sys
+from pathlib import Path
+from redkraken import _launch, agent
+
+
+class Stream:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.closed = 0
+
+    def __call__(self, **_):
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+    async def aclose(self):
+        self.closed += 1
+
+
+def announcement(**data):
+    return _launch.SystemMessage(_launch.INIT, data)
+
+
+FAMILIES = {
+    "absent": [],
+    "first_message": [_launch.SystemMessage("compact_boundary", {})],
+    "unexpected": [announcement(apiKeySource="ANTHROPIC_API_KEY")],
+    "unreported": [announcement()],
+}
+
+stream = Stream(FAMILIES[sys.argv[1]])
+status = 0
+try:
+    asyncio.run(_launch.run(json.loads(sys.stdin.read()), transport=stream))
+except agent.StartupRefusal as refusal:
+    print(json.dumps({_launch.REFUSAL: refusal.as_dict()}), file=sys.stderr, flush=True)
+    status = agent.REFUSED
+Path(sys.argv[2]).write_text(json.dumps({"closed": stream.closed}), encoding="utf-8")
+raise SystemExit(status)
 """
 
 #: A supervisor that refuses one Agent run and then asks for another. `_spawn`
@@ -969,9 +1020,18 @@ class VectorChildTest(unittest.TestCase):
                 )
 
     def test_a_settings_helper_and_a_settings_variable_are_read_where_they_load(self):
+        # Every watched name again, in the other place a launch can inherit one.
+        # A document's `env` block is exported by the CLI into the process the
+        # CLI starts, so a vector named there is the same vector arriving by a
+        # route the process environment cannot be searched for.
+        exported = [
+            (f"{name}, exported by a document the runtime never asked for",
+             {"env": {name: EXPORTED}})
+            for name in _startup.WATCHED_ENV_VECTORS
+        ]
         for description, document in (
+            *exported,
             ("a helper the CLI would run for a key", {"apiKeyHelper": "/usr/local/bin/key"}),
-            ("a variable the document exports", {"env": {"ANTHROPIC_API_KEY": EXPORTED}}),
             (
                 "both at once, in the file the runtime never asked for",
                 {"apiKeyHelper": "/usr/local/bin/key", "env": {"ANTHROPIC_AUTH_TOKEN": EXPORTED}},
@@ -1009,16 +1069,46 @@ class VectorChildTest(unittest.TestCase):
                     f"settings:managed:{self.settings}#document", sources(refusal.violations)
                 )
 
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_each_unexpected_init_refuses_in_the_child_that_read_it(self):
+        # The fourth vector family, through a launch like the other three. What
+        # `INIT_CHILD` supplies is the transport and nothing else, because a
+        # measured CLI cannot be made to answer this way -- see its note.
+        for family, source in (
+            ("absent", "init:absent"),
+            ("first_message", "init:first_message"),
+            ("unexpected", "init:apiKeySource"),
+            ("unreported", "init:apiKeySource"),
+        ):
+            with self.subTest(family):
+                evidence = fixtures.scratch() / "transport.json"
+                child = launched(
+                    {}, arguments=("-c", INIT_CHILD, family, str(evidence))
+                )
+
+                self.assertEqual(agent.REFUSED, child.returncode, child.stderr)
+                self.assertEqual("", child.stdout.strip())
+                refusal = agent._refusal(child.stderr)
+                self.assertIsNotNone(refusal, child.stderr)
+                self.assertEqual("init", refusal.phase)
+                self.assertEqual([source], sources(refusal.violations))
+                # The child closed the transport before writing the refusal, so
+                # the run it could not corroborate was not still going when the
+                # supervisor was told about it.
+                self.assertEqual(
+                    {"closed": 1}, json.loads(evidence.read_text(encoding="utf-8"))
+                )
+
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
 class InitRefusalTest(unittest.TestCase):
     """The phase only a running CLI can fail, and what is left when it does.
 
-    Provoked at the transport seam rather than through a child, and that is a
-    property of the system rather than a shortcut: on this runtime pair no input
-    makes the real CLI report a key source other than `none` without a
-    credential vector the pre-spawn phase has already refused. So the way to
-    reach this phase is to answer as a CLI that did.
+    The seam rather than a child, and one level in from
+    `VectorChildTest.test_each_unexpected_init_refuses_in_the_child_that_read_it`,
+    which launches the same four families as processes. What is left after a
+    refusal -- a surface that never opened, a transport that was closed -- is
+    state inside the run, and this is where it can be read.
     """
 
     def corroborate(self, stream: Stream) -> agent.StartupRefusal:

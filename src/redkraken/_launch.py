@@ -223,9 +223,9 @@ async def run(
     wrongly. A child supplies none of them: it reads its own environment, its
     own runtime facts and the SDK's own transport, which is the whole reason
     the assertion is made here rather than in the supervisor. The settings
-    locations are the fourth of those seams and are named below rather than
-    taken as an argument, because a caller choosing them would be a caller
-    choosing which documents the assertion reads.
+    locations are not one of those seams and are not passed on: `assess` reads
+    `agent.MANAGED_SETTINGS` in the process doing the asserting, which is this
+    one, and a caller naming them would be a caller choosing what it sees.
     """
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
@@ -240,18 +240,7 @@ async def run(
         None if claude_agent_sdk is None else options_for(job, runtime, server(surface), launch)
     )
 
-    # The managed locations are named here rather than defaulted inside
-    # `assess`, so they are the ones this module holds when the child runs
-    # rather than the ones it held when the supervisor imported it. The child
-    # asserts against the machine it is in, and this is the last place that
-    # machine can still be said to be a different one.
-    violations = agent.assess(
-        options,
-        environment,
-        runtime,
-        launch_dir=launch,
-        managed_settings=agent.MANAGED_SETTINGS,
-    )
+    violations = agent.assess(options, environment, runtime, launch_dir=launch)
     if violations:
         raise agent.StartupRefusal(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")

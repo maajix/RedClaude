@@ -77,6 +77,7 @@ from redkraken.outcome import (
 )
 from redkraken.store import Store
 from tests.fixtures import (
+    EXPORTED,
     PINNED,
     SCOPE_ENTITIES,
     SCOPE_REQUESTS,
@@ -87,6 +88,7 @@ from tests.fixtures import (
     boundary,
     counterparty,
     scratch,
+    startup_refusal,
     tls_counterparty,
     unlatched,
     write,
@@ -7335,11 +7337,6 @@ class ProxyEgressTest(DatabaseCase):
 #: refusal must not be able to do is close a run another Program opened.
 REFUSAL_SLUG = "selftest-refusal"
 
-#: A credential the assertion really did measure. `redacted` is only a claim
-#: worth making about a payload that had something to leak, and a record written
-#: out by hand has nothing in it that anybody put there.
-EXPORTED = "exported-into-the-supervisor"
-
 
 class StartupRefusalTest(DatabaseCase):
     """PH2-17: what a refused Agent run leaves behind, and what it does not.
@@ -7397,23 +7394,6 @@ class StartupRefusalTest(DatabaseCase):
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{REFUSAL_SLUG}-%",)
             )
         super().tearDownClass()
-
-    def refusal(self, phase: str = "pre_spawn") -> agent.StartupRefusal:
-        """One refusal, assessed rather than written out.
-
-        The inputs are the pair an operator actually produces: a machine with a
-        key exported into it and an SDK this harness has not measured. What
-        reaches the payload is then what the assertion chose to keep about them,
-        rather than a record shaped to pass the transaction's own check.
-        """
-        violations = agent.assess(
-            None,
-            {"ANTHROPIC_API_KEY": EXPORTED},
-            {},
-            launch_dir=scratch(),
-            managed_settings=(),
-        )
-        return agent.StartupRefusal(violations, phase, *_startup.KNOWN_RUNTIME)
 
     def opened(self, name: str) -> tuple[str, str]:
         """One Agent run the way the scheduler opens one, and the Task under it.
@@ -7506,7 +7486,7 @@ class StartupRefusalTest(DatabaseCase):
         before = self.state(run, task)
 
         closed = agent.close_refusal(
-            self.runtime, self.identifiers["closed"], run, self.refusal()
+            self.runtime, self.identifiers["closed"], run, startup_refusal()
         )
 
         self.assertEqual(
@@ -7532,7 +7512,7 @@ class StartupRefusalTest(DatabaseCase):
 
     def test_exactly_one_redacted_event_is_written_and_a_repeat_writes_none(self):
         run, task = self.opened("recorded")
-        refusal = self.refusal()
+        refusal = startup_refusal()
 
         first = agent.close_refusal(self.runtime, self.identifiers["recorded"], run, refusal)
         settled = self.state(run, task)
@@ -7558,7 +7538,7 @@ class StartupRefusalTest(DatabaseCase):
         run, task = self.opened("unowned")
 
         closed = agent.close_refusal(
-            self.runtime, self.identifiers["onlooker"], run, self.refusal()
+            self.runtime, self.identifiers["onlooker"], run, startup_refusal()
         )
 
         self.assertFalse(closed)
@@ -7594,7 +7574,7 @@ class StartupRefusalTest(DatabaseCase):
     def test_the_cleanup_leaves_the_log_accounting_for_every_row_it_touched(self):
         run, _ = self.opened("accounted")
 
-        agent.close_refusal(self.runtime, self.identifiers["accounted"], run, self.refusal())
+        agent.close_refusal(self.runtime, self.identifiers["accounted"], run, startup_refusal())
 
         self.assertEqual(
             (),
@@ -7614,7 +7594,7 @@ class StartupRefusalTest(DatabaseCase):
         )
 
         with unlatched():
-            with mock.patch.object(agent, "_spawn", side_effect=self.refusal()):
+            with mock.patch.object(agent, "_spawn", side_effect=startup_refusal()):
                 with self.assertRaises(agent.StartupRefusal):
                     agent.agent_run(request, self.runtime)
 

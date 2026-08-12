@@ -179,6 +179,11 @@ class Latched(StartupRefusal):
     process that would have spawned it has already been told what it would find.
     """
 
+    @classmethod
+    def of(cls, refusal: StartupRefusal) -> "Latched":
+        """The same measurement, raised again at the run it now refuses."""
+        return cls(refusal.violations, refusal.phase, refusal.sdk_version, refusal.cli_version)
+
 
 #: The refusal this process made, and the reason it will attempt no other run.
 #: Module state, because what it remembers belongs to the process rather than to
@@ -282,12 +287,10 @@ def agent_run(
     the directory the assertion reads can be the directory the CLI is given.
     """
     global _LATCH
-    program_id = _recordable(request, connection)
+    program_id = _recording_program(request, connection)
     try:
         if _LATCH is not None:
-            raise Latched(
-                _LATCH.violations, _LATCH.phase, _LATCH.sdk_version, _LATCH.cli_version
-            )
+            raise Latched.of(_LATCH)
         job = {
             "agent_run_id": request.agent_run_id,
             "objective": request.objective,
@@ -302,7 +305,15 @@ def agent_run(
         # the run it has just refused.
         _LATCH = _LATCH or refusal
         if program_id is not None and connection is not None:
-            close_refusal(connection, program_id, request.agent_run_id, refusal)
+            try:
+                close_refusal(connection, program_id, request.agent_run_id, refusal)
+            except Exception as failure:
+                # A cleanup that could not run is a row left open, which the
+                # lease expiry is what reclaims. What must not happen is the
+                # database's error replacing the refusal on the way out: the
+                # caller would be told the run failed rather than that this
+                # machine may not start one, and would exit as something else.
+                raise refusal from failure
         raise
 
 
@@ -371,7 +382,7 @@ def diagnostics(refusal: StartupRefusal) -> Report:
     )
 
 
-def _recordable(request: AgentRunRequest, connection: pg.Connection | None) -> str | None:
+def _recording_program(request: AgentRunRequest, connection: pg.Connection | None) -> str | None:
     """The Program a refusal of this run would be recorded against, if any.
 
     Asked before the child starts rather than in the refusal path. An
@@ -425,7 +436,7 @@ def assess(
     runtime: Mapping[str, object],
     *,
     launch_dir: Path | str,
-    managed_settings: Sequence[Path] = MANAGED_SETTINGS,
+    managed_settings: Sequence[Path] | None = None,
 ) -> tuple[dict, ...]:
     """Everything about this launch that can be decided before it happens.
 
@@ -437,10 +448,14 @@ def assess(
 
     `managed_settings` is a parameter so that the negative outcomes stay
     reachable from tests without writing to `/etc` on the machine running them.
-    A launch supplies none: the CLI reads exactly the locations the default
+    A launch supplies none: the CLI reads exactly the locations `MANAGED_SETTINGS`
     names, and a caller choosing them would be choosing what the assertion sees.
+    Nothing rather than that tuple is the default, so the locations are the ones
+    this module holds in the process that is asserting rather than the ones it
+    held when some other process imported it.
     """
     launch = Path(launch_dir).resolve()
+    managed = MANAGED_SETTINGS if managed_settings is None else managed_settings
     configuration: list[dict] = []
 
     unmeasured = _runtime_violations(options, runtime)
@@ -454,7 +469,7 @@ def assess(
         # facts about the machine, and an operator fixing the runtime pair
         # should learn about their exported key in the same breath.
         configuration.extend(_option_violations(options, launch))
-    settings, settings_violations = _settings_documents(options, launch, managed_settings)
+    settings, settings_violations = _settings_documents(options, launch, managed)
     configuration.extend(settings_violations)
 
     if not isinstance(environment, Mapping):
