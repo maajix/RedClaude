@@ -15,8 +15,14 @@ from redkraken import _startup, isolation, tls
 
 
 LIVE = os.environ.get("RK_TEST_CONTAINERS") == "1"
-IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.13-alpine")
 REASON = "set RK_TEST_CONTAINERS=1 to run the disposable Docker isolation proof"
+
+#: The image every container proof here starts from. It is a glibc one because
+#: an Agent image has to be: the CLI the SDK bundles is a glibc-linked
+#: executable, so a musl image is one no Agent child can start in, and the
+#: topology this module proves is only worth proving about an image an Agent
+#: run could actually use.
+IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.14-slim")
 
 
 def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -31,6 +37,104 @@ def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
     if check and result.returncode:
         raise AssertionError((result.stderr or result.stdout).strip())
     return result
+
+
+def described(**overrides) -> isolation.AgentContainer:
+    """A described boundary, with no engine needed to describe it."""
+    fields = {
+        "image": IMAGE,
+        "network": "rk2-agent-network",
+        "proxy_container": "rk2-proxy",
+        "proxy_url": "http://rk2-proxy:18080",
+        "certificate": Path("/run/root.pem"),
+    }
+    fields.update(overrides)
+    return isolation.AgentContainer(**fields)
+
+
+class ContainerEnvironmentTest(unittest.TestCase):
+    """What a child is told about the world, and what it is not told.
+
+    No engine required. The environment is the half of the boundary that is
+    decidable without one, and the machine that has to prove nothing crosses is
+    not always the machine that can start something for it not to cross into.
+    """
+
+    def test_the_child_environment_is_a_copied_list_plus_the_runtime_door(self):
+        operator = {name: f"operator-{name}" for name in isolation.INHERITED}
+        operator.update(
+            {name: "leaked" for name in _startup.WATCHED_ENV_VECTORS},
+            ANTHROPIC_SMALL_FAST_MODEL="leaked",
+            SSH_AUTH_SOCK="/leaked/agent.sock",
+            AWS_PROFILE="leaked",
+            PATH="/leaked/bin",
+        )
+
+        child = isolation.container_environment(
+            described(application=Path("/src"), runtime=Path("/sdk")), operator
+        )
+
+        for family in (
+            _startup.WATCHED_ENV_VECTORS,
+            ("ANTHROPIC_SMALL_FAST_MODEL", "SSH_AUTH_SOCK", "AWS_PROFILE", "PATH"),
+        ):
+            for name in family:
+                self.assertNotIn(name, child)
+        supplied = {"HOME", "TMPDIR", isolation.IMPORT_PATH}
+        self.assertEqual(
+            set(isolation.INHERITED) | supplied,
+            set(child) - set(tls.PROXY_VARIABLES) - set(tls.BYPASS_VARIABLES)
+            - set(tls.TRUST_VARIABLES) - set(tls.STORE_VARIABLES),
+        )
+        self.assertEqual(f"{isolation.APPLICATION}:{isolation.RUNTIME}", child["PYTHONPATH"])
+
+    def test_the_operator_home_never_crosses_and_neither_does_their_import_path(self):
+        # Where the CLI looks for the operator's own subscription, and where an
+        # interpreter looks for the SDK the assertion measures. Both are the
+        # runtime's own, and neither has a source outside this function.
+        child = isolation.container_environment(
+            described(), {"HOME": "/home/operator", "PYTHONPATH": "/home/operator/lib"}
+        )
+
+        self.assertEqual(isolation.HOME_DIR, child["HOME"])
+        self.assertEqual(isolation.TMPDIR, child["TMPDIR"])
+        self.assertNotIn(isolation.IMPORT_PATH, child)
+
+    def test_the_child_has_no_route_out_that_the_runtime_does_not_own(self):
+        child = isolation.container_environment(described(), dict(os.environ))
+
+        for name in tls.PROXY_VARIABLES:
+            self.assertEqual("http://rk2-proxy:18080", child[name])
+        for name in tls.BYPASS_VARIABLES + tls.STORE_VARIABLES:
+            self.assertEqual("", child[name])
+        for name in tls.TRUST_VARIABLES:
+            self.assertEqual(isolation.CA_FILE, child[name])
+
+    def test_only_what_the_runtime_mounts_is_inside_and_the_signing_key_is_not(self):
+        root = Path(tempfile.mkdtemp(prefix="rk2-mounts-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        authority = tls.authority(root / "authority")
+
+        mounts = isolation._mounts(
+            described(application=root, runtime=root, home=root), authority.certificate
+        )
+
+        destinations = [
+            item.partition("dst=")[2].partition(",")[0] for item in mounts if item != "--mount"
+        ]
+        self.assertEqual(
+            [isolation.CA_FILE, isolation.APPLICATION, isolation.RUNTIME, isolation.HOME_DIR],
+            destinations,
+        )
+        # The application and the SDK are what a launch is measured as, and the
+        # home is the one place a child may write. Nothing carries the signing
+        # key that certificate was issued from.
+        self.assertEqual(3, sum(1 for item in mounts if item.endswith(",readonly")))
+        self.assertNotIn(str(authority.key), " ".join(mounts))
+
+    def test_a_mount_that_is_not_a_directory_is_refused_before_launch(self):
+        with self.assertRaisesRegex(isolation.Unavailable, "not a directory"):
+            isolation._mounts(described(home=Path("/etc/hostname")), Path("/etc/hostname"))
 
 
 @unittest.skipUnless(LIVE, REASON)

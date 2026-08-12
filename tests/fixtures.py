@@ -8,6 +8,7 @@ import ssl
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -373,17 +374,35 @@ class ControlUpstream:
     #: on, so a run that finished for some other reason cannot look like this.
     SPOKEN = "CONTROL_OK"
 
-    def __init__(self, tool: str) -> None:
+    def __init__(
+        self,
+        tool: str,
+        *,
+        authority: tls.Authority | None = None,
+        bind: tuple[str, int] = ("127.0.0.1", 0),
+        watch: Callable[[str, str], None] | None = None,
+    ) -> None:
+        """The upstream, on loopback by default and anywhere it is asked.
+
+        `bind`, `authority` and `watch` are what it takes to be a *peer* rather
+        than a thread. The Agent boundary verifies that the proxy named in the
+        URL is the one other container on an internal network, so the far end
+        of a contained run reaches every address rather than loopback, is
+        handed the run authority from outside instead of minting one only it
+        can see, and reports what arrived on its own standard output because
+        the process asserting on it is not this one.
+        """
         self.tool = tool
-        self.authority = tls.authority(scratch() / "control-authority")
+        self.authority = authority or tls.authority(scratch() / "control-authority")
         self.certificate = self.authority.certificate
         #: One entry per request that arrived, as (host, request line).
         self.seen: list[tuple[str, str]] = []
+        self._watch = watch
         self._listener = socket.socket()
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        self._listener.bind(bind)
         self._listener.listen(32)
-        self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+        self.url = f"http://{bind[0]}:{self._listener.getsockname()[1]}"
         self._running = True
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -430,6 +449,8 @@ class ControlUpstream:
                 if not line:
                     return
                 self.seen.append((host, line))
+                if self._watch is not None:
+                    self._watch(host, line)
                 if line.startswith("POST /v1/messages"):
                     answer = self._completion(body)
                     kind = b"text/event-stream"

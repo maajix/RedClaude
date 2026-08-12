@@ -6,10 +6,14 @@ SDK constructed somewhere else would be an Agent run started without crossing
 `agent_run`, and the assertion would be a check on one launch path out of two.
 
 This runs as a child process -- `python -m redkraken._launch`, one job document
-on standard input -- for a reason that is not stylistic. The assertion has to
-be made against the environment the child *actually* inherited, and the only
-way to be sure nothing leaked in is to build that environment from a list in
-the parent and then measure it here, in the process that will use it.
+on standard input, inside the container `redkraken.isolation` verifies -- for a
+reason that is not stylistic. The assertion has to be made against the
+environment and the filesystem the child *actually* got, and the only way to be
+sure nothing leaked in is to build them from a list out there and then measure
+them here, in the process that will use them. It is also why the launch
+directory is created here rather than by the supervisor: the supervisor's
+filesystem is not this one, so a directory it made would be a directory this
+child could not be given.
 
 The order is the whole point. Facts, then one options value, then the pre-spawn
 assertion against that value, then the transport built from the same value,
@@ -168,13 +172,17 @@ def server(surface: Surface):
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=[ready])
 
 
-def options_for(job: Mapping[str, object], runtime: Mapping[str, object], mcp_server) -> object:
+def options_for(
+    job: Mapping[str, object], runtime: Mapping[str, object], mcp_server, launch: Path
+) -> object:
     """The one options value this launch is assessed with and started from.
 
     Built here and handed on unchanged. `cli_path` is whatever the installed
     SDK resolved to and nothing when it resolved to nothing -- the assertion
     refuses that case rather than this function substituting a name the SDK
-    would look for on `PATH`.
+    would look for on `PATH`. `settings` is the one document in `launch` for
+    the same reason: naming the directory and naming the file in it separately
+    would be two answers to which document loaded.
     """
     executable = agent.bundled_executable(runtime)
     return ClaudeAgentOptions(
@@ -185,10 +193,10 @@ def options_for(job: Mapping[str, object], runtime: Mapping[str, object], mcp_se
         allowed_tools=[agent.TOOL],
         setting_sources=[],
         permission_mode=agent.PERMISSION_MODE,
-        cwd=str(job["launch_dir"]),
+        cwd=str(launch),
         env={},
         sandbox=None,
-        settings=None if job.get("settings") is None else str(job["settings"]),
+        settings=str(launch / agent.SETTINGS),
         cli_path=None if executable is None else str(executable),
     )
 
@@ -200,7 +208,8 @@ async def run(
     runtime: Mapping[str, object] | None = None,
     transport=None,
 ) -> dict:
-    """Assert, start, corroborate, serve. In that order, or not at all.
+    """Make the launch directory, assert, start, corroborate, serve. In that
+    order, or not at all.
 
     `environment`, `runtime` and `transport` are parameters so that a refusal
     can be provoked without provoking the machine that would have to be broken
@@ -211,16 +220,18 @@ async def run(
     """
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
+    launch = agent.launch_directory(str(job["workspace"]), str(job["agent_run_id"]))
+    agent.write_settings(launch)
     surface = Surface()
     # Nothing, when there is no SDK to build it from. An options value is a
     # description of what one SDK version would do, so an absent SDK has no
     # description rather than a broken one -- and `assess` refuses the absence
     # as an unmeasured runtime, which is where that refusal already lives.
-    options = None if claude_agent_sdk is None else options_for(job, runtime, server(surface))
-
-    violations = agent.assess(
-        options, environment, runtime, launch_dir=str(job["launch_dir"])
+    options = (
+        None if claude_agent_sdk is None else options_for(job, runtime, server(surface), launch)
     )
+
+    violations = agent.assess(options, environment, runtime, launch_dir=launch)
     if violations:
         raise agent.StartupRefusal(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")

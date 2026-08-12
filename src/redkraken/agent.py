@@ -1,8 +1,8 @@
 """The one door an Agent run is started through.
 
 `agent_run` is the whole external surface of the Agent runtime. Everything the
-child runs with -- the environment it inherits, the directory it works in, the
-settings document that loads, the executable that is spawned -- is built here
+child runs with -- the boundary it starts in, the directory it works in, the
+settings document that loads, the executable that is spawned -- is decided here
 and nowhere else, because the alternative is a caller that validates one
 description of a launch and then starts a different one.
 
@@ -13,13 +13,13 @@ child then hands the *same* options object it was assessed with to the
 transport. Two values would be two configurations, and the second one would be
 the one that ran.
 
-What the child is told about the world is a positive list. `INHERITED` names
-the variables that cross; everything else -- every credential vector, every
-provider switch, every base URL -- is absent because it was never copied, not
-because it was removed. `HOME` is not on that list either, because it is where
-the CLI goes looking for a credential: the runtime is told one per run rather
-than passing on the operator's. It then adds the proxy and trust settings
-itself, so the only route out of the child is the door this harness owns.
+There is one launch mechanism, and it is `isolation.run`: the child is a
+process in a container attached to one internal network whose only peer is the
+runtime's proxy. That is what makes the environment a positive list rather than
+a filtered copy -- nothing about the operator's machine is in the child's
+filesystem to be inherited in the first place -- and it is what makes "no
+direct path to a target" a property of the network rather than a request made
+of a cooperative client through proxy variables.
 
 Nothing here is durable. A refusal raised by this module is an exception and a
 non-zero child status; closing the Agent run, returning its Task and emitting
@@ -30,19 +30,20 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, tls
+from redkraken import _startup, isolation
 
 
-#: The module the child process runs as. Named rather than pathed: the child
-#: imports the application the supervisor is running, so a checkout and an
-#: installed wheel start the same code.
+#: The module the child process runs as, and the interpreter that runs it.
+#: The module is named rather than pathed, so a checkout and an installed wheel
+#: start the same code. The interpreter is the image's, not this process's:
+#: `sys.executable` names a file on the supervisor's machine, and the child's
+#: machine is a container that has never seen it.
 CHILD = "redkraken._launch"
+PYTHON = "python3"
 
 #: What the child exits with when the startup assertion refused. `78` is
 #: `EX_CONFIG`: the launch was not attempted because its configuration was
@@ -53,29 +54,6 @@ REFUSED = 78
 #: everything decidable before the SDK transport exists; `init` is the one
 #: question only the running CLI can answer.
 PHASES = ("pre_spawn", "init")
-
-#: What crosses from the supervisor's environment into the child's, and the
-#: reason this is a list of names rather than a list of removals: a variable
-#: absent from here cannot reach the child by being forgotten, only by being
-#: added on purpose. `HOME` is deliberately not here. It is the variable the
-#: CLI resolves the operator's own subscription through, so inheriting it would
-#: hand every child the credential this runtime exists to keep away from it --
-#: `AgentRunRequest.home` names the home a run gets, and it is required.
-INHERITED = (
-    "LANG",
-    "LC_ALL",
-    "LOGNAME",
-    "PATH",
-    "SHELL",
-    "TMPDIR",
-    "USER",
-    "XDG_RUNTIME_DIR",
-)
-
-#: Where the child finds the application. Set by the runtime rather than
-#: inherited, because an inherited import path is a way to decide which
-#: `claude_agent_sdk` the assertion measures.
-IMPORT_PATH = "PYTHONPATH"
 
 #: Settings the CLI loads whatever `setting_sources` says, so they are read
 #: whether or not this runtime asked for them. Both platform locations are
@@ -188,12 +166,12 @@ class AgentRunRequest:
     identity leases, allowed skills, stop conditions -- is ticket 18's, and it
     arrives here as more fields rather than a different door.
 
-    `proxy_url`, `certificate` and `home` are required rather than optional
-    because each one is a way for a child to be given something the runtime did
-    not choose. A request that could omit the first two would be a request that
-    could start a child with a direct path to a target; one that could omit the
-    third would fall back to the operator's own home, which is where the CLI
-    finds the operator's own subscription.
+    `container` is required rather than optional, and it is the whole of what
+    the child can reach: the network it is attached to, the proxy that is the
+    only peer on it, the root it is told to trust, and the three directories
+    that are mounted into it. A request that could omit it would be a request
+    that could start a child on the supervisor's own machine, with the
+    supervisor's own home and a direct route to any target it can name.
 
     `model` and `max_turns` keep the SDK's own spelling: they set one option
     each and are not translated on the way, so a reader can check them against
@@ -202,10 +180,7 @@ class AgentRunRequest:
 
     agent_run_id: str
     objective: str
-    workspace: Path
-    proxy_url: str
-    certificate: Path
-    home: Path
+    container: isolation.AgentContainer
     model: str | None = None
     max_turns: int = MAX_TURNS
     timeout: float = TIMEOUT
@@ -249,31 +224,27 @@ class AgentRunResult:
 def agent_run(request: AgentRunRequest) -> AgentRunResult:
     """Start one isolated Agent child and return what it reported.
 
-    The only external launch interface. It builds the effective configuration,
-    starts the child that asserts and then uses it, and translates a refused
-    child back into the refusal it raised. It does not decide what the run
-    should do, and it does not write state.
+    The only external launch interface. It describes the run, starts the child
+    that asserts and then uses it, and translates a refused child back into the
+    refusal it raised. It does not decide what the run should do, and it does
+    not write state.
+
+    The launch directory is not made here. The filesystem the child works in is
+    the container's, not this process's, so the runtime states where the
+    directory goes and the child creates it there -- which is also the only way
+    the directory the assertion reads can be the directory the CLI is given.
     """
-    launch = launch_directory(request)
-    settings = write_settings(launch)
-    environment = child_environment(
-        os.environ,
-        proxy_url=request.proxy_url,
-        certificate=request.certificate,
-        home=request.home,
-    )
     job = {
         "agent_run_id": request.agent_run_id,
         "objective": request.objective,
         "model": request.model,
         "max_turns": request.max_turns,
-        "launch_dir": str(launch),
-        "settings": str(settings),
+        "workspace": isolation.WORKSPACE,
     }
-    return _spawn(request, job, environment)
+    return _spawn(request, job)
 
 
-def launch_directory(request: AgentRunRequest) -> Path:
+def launch_directory(workspace: Path | str, agent_run_id: str) -> Path:
     """The runtime-owned directory this run works in, made private.
 
     The identifier is one path component and is checked to be one. A run
@@ -281,8 +252,8 @@ def launch_directory(request: AgentRunRequest) -> Path:
     the runtime writes, and the settings document the assertion trusts lives in
     exactly this directory.
     """
-    root = Path(request.workspace).resolve()
-    launch = (root / request.agent_run_id).resolve()
+    root = Path(workspace).resolve()
+    launch = (root / agent_run_id).resolve()
     if launch.parent != root or launch == root:
         raise ValueError("an agent run identifier must be one path component")
     launch.mkdir(parents=True, exist_ok=True)
@@ -296,26 +267,6 @@ def write_settings(launch: Path) -> Path:
     settings.write_text(json.dumps(SETTINGS_DOCUMENT), encoding="utf-8")
     settings.chmod(0o600)
     return settings
-
-
-def child_environment(
-    source: Mapping[str, str],
-    *,
-    proxy_url: str,
-    certificate: Path | str,
-    home: Path | str,
-) -> dict[str, str]:
-    """The environment the child actually gets: a copy of a list, plus the door.
-
-    Built rather than filtered. `tls.agent_environment` then adds where to send
-    traffic and which root to believe, `HOME` is the one the caller named, and
-    `PYTHONPATH` names the application the supervisor is running -- the facts
-    the runtime supplies, and the only ones that are not on the inherited list.
-    """
-    child = {name: source[name] for name in INHERITED if name in source}
-    child["HOME"] = str(home)
-    child[IMPORT_PATH] = str(Path(__file__).resolve().parent.parent)
-    return tls.agent_environment(child, proxy_url=proxy_url, certificate=certificate)
 
 
 def assess(
@@ -530,23 +481,18 @@ def _read_settings(path: Path, kind: str) -> tuple[dict | None, dict | None]:
     return {"kind": kind, "path": str(path), "document": document}, None
 
 
-def _spawn(
-    request: AgentRunRequest, job: Mapping[str, object], environment: Mapping[str, str]
-) -> AgentRunResult:
-    """Run the child, and read back either its result or its refusal.
+def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResult:
+    """Run the child in its boundary, and read back its result or its refusal.
 
-    The job crosses on standard input rather than the command line: a mission
-    packet is not a thing to put where every process on the machine can read
-    it, and it is not a thing to size against `ARG_MAX`.
+    `-P` because the child's import path is the runtime's statement about which
+    application and which SDK this launch is measured against, and a working
+    directory on that path is a second answer to a question that has one.
     """
-    child = subprocess.run(
-        [sys.executable, "-P", "-m", CHILD],
-        input=json.dumps(job),
-        env=dict(environment),
-        capture_output=True,
-        text=True,
+    child = isolation.run(
+        request.container,
+        (PYTHON, "-P", "-m", CHILD),
+        stdin=json.dumps(job),
         timeout=request.timeout,
-        check=False,
     )
     refusal = _refusal(child.stderr)
     if refusal is not None:

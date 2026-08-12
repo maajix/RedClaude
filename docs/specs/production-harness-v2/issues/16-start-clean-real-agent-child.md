@@ -4,21 +4,21 @@
 
 **Blocked by:** 10 — Send HTTPS through the same capability path; 12 — Use an Identity without exposing credentials; 15 — Replay auth-resolution evidence in production.
 
-**Status:** needs-triage
+**Status:** resolved
 
 - [x] `agent_run(request)` is the only external SDK launch interface and static checks reject direct SDK construction elsewhere.
 - [x] The supervisor builds a positive environment allowlist plus runtime-owned proxy and CA settings, and the child assesses the environment it actually inherited.
 - [x] One runtime-owned settings directory, bundled CLI path and SDK options value is used by both assessment and transport construction.
-- [ ] A real isolated child starts against a synthetic local control upstream, emits the expected first init message and becomes tool-ready exactly once.
-- [ ] The child has no API key, usable subscription credential, unrelated user/project settings or direct target network path.
+- [x] A real isolated child starts against a synthetic local control upstream, emits the expected first init message and becomes tool-ready exactly once.
+- [x] The child has no API key, usable subscription credential, unrelated user/project settings or direct target network path.
 - [x] Missing bundled metadata, executable or supported runtime pair refuses before transport construction without falling back to `PATH`.
 
 ## Comments
 
 Implemented on branch `implementation/startup-assertion` in commit `5290efe` on
-2026-08-12. Four of the six criteria are ticked; the two that are not are
-recorded below, which is why the status is `needs-triage` rather than
-`resolved`.
+2026-08-12, and finished in the commit that follows this note. The first commit
+ticked four criteria and named the two it did not; the second one joined the
+launch to the container boundary and closed those two.
 
 `agent.py` is the supervisor and the only external launch interface;
 `_launch.py` is the child and the only module in the application that
@@ -94,35 +94,64 @@ announcement, so a child that announced itself twice closes its own surface and
 the count crosses back as the evidence. `AgentRunRequest.program` was
 speculative -- it crossed to the child and nothing read it -- and is gone.
 
-### The two criteria that are not ticked
+### Closing the last two criteria
 
-Both turn on the same missing half, and it is the half this repo already has a
-name for. `redkraken.isolation.run` starts a process in a verified one-peer
-container: internal network, DNS blackholed, one attached peer, no capabilities,
-read-only root, the run certificate mounted and nothing else. Ticket 11 proved
-raw TCP, external DNS, target and control ports are unreachable from inside it.
-The child this ticket starts does not go through it.
+Both turned on the same missing half, and the repo already had a name for it.
+`redkraken.isolation.run` starts a process in a verified one-peer container:
+internal network, DNS blackholed, one attached peer, no capabilities, read-only
+root, the run certificate mounted and nothing else. Ticket 11 proved that raw
+TCP, external DNS, and the target and control ports are all unreachable from
+inside it. The child now goes through it, and that is the whole of the second
+commit: there is one launch mechanism, and it is that one.
 
-*Criterion 4* is met at the process level -- own process, `-P`, a positive-list
-environment, a runtime-owned home, working directory and settings document, one
-bundled executable, and a first init message and single tool-ready opening
-observed live -- but `isolated` has a stronger meaning in this codebase than
-the one the launch currently satisfies.
+What the boundary had to learn is what an Agent needs in order to exist at all.
+`AgentContainer` gained three host directories -- the application, the SDK the
+pair is measured against, the home the credential resolves from -- and decides
+itself where each is mounted and which may be written: the first two read-only
+because a child that could write to them could choose what the next child is
+measured as, the home writable because the CLI keeps session state in it. All
+three default to absent, and absent is the contained value: a container with no
+home mounted has no credential at all rather than somebody else's, and one with
+no SDK mounted refuses at the assertion rather than starting a session. `run`
+also gained a `stdin`, so the job crosses on a pipe rather than in `argv`.
 
-*Criterion 5* holds on three of its four clauses, each with a test: no API key,
-no unrelated user or project settings, and no usable subscription credential
-now that `HOME` is off the inherited list and `AgentRunRequest.home` is
-required, so no launch can reach the operator's own credential by omission. The
-fourth clause, no direct target network path, is closed only by proxy variables
-today. Those ask a cooperative client to use the door; they do not stop
-model-controlled code from opening its own socket, which is the exact gap
-`isolation.py` was written to close.
+`agent.child_environment` and `agent.INHERITED` are gone. They were the second
+positive list, and the boundary's is narrower -- three usability variables,
+plus `HOME`, `TMPDIR` and `PYTHONPATH`, which the runtime sets because each one
+decides what a child resolves. Not `PATH` any more either: it comes from the
+image. `AgentRunRequest` lost `workspace`, `proxy_url`, `certificate` and
+`home` to one required `container` field, which is now the whole of what a
+child can reach. The launch directory moved to the child, because the
+supervisor's filesystem is not the child's, and a directory it made would be
+one the child could not be given.
 
-Joining them needs an image carrying the application and the measured SDK pair,
-and a control upstream that is a container peer rather than a loopback thread,
-since `isolation.run` verifies that the proxy named in the URL *is* the one
-other peer on an internal network. That is a ticket's worth of work and it is
-not this ticket's, so it is left named rather than half-built. Ticket 20 is the
-first one that runs a real Agent run and a real network Tool run together, and
-ticket 62's third criterion is the release gate that reads the container tests;
-whichever of those takes it, criteria 4 and 5 should be closed there.
+*Criterion 4* is met by `ContainedChildTest`: a real child, `python3 -P -m
+redkraken._launch` inside the boundary, against `fixtures.ControlUpstream`
+running as the network's one peer -- a container now rather than a loopback
+thread, because `isolation.run` verifies that the proxy named in the URL *is*
+that peer. The measured pair comes back from inside the container,
+`apiKeySource` is `none`, the tool surface opens exactly once and the one tool
+is served once. Every request the child made is read back out of the peer's own
+log, and each one is addressed to `api.anthropic.com`.
+
+*Criterion 5* now holds on all four clauses. No API key and no unrelated
+settings were already tested. No usable subscription credential is stronger
+than it was: the operator's home is not merely un-inherited, it is not in the
+child's filesystem, and the only home there is the one the runtime mounted. No
+direct target network path is the ticket-11 property, unchanged and now applied
+to this child -- a property of the network rather than a request made of a
+cooperative client through proxy variables.
+
+Two test-side notes. `RK_TEST_AGENT_IMAGE` now defaults to `python:3.14-slim`
+rather than `python:3.13-alpine`: the bundled CLI is a glibc-linked executable,
+so a musl image is one no Agent child can start in, and a default that is not a
+possible Agent image makes the topology proof about nothing. And
+`isolation.container_environment` and `isolation._mounts` are split out of
+`run`, so the half of the boundary that needs no engine is asserted on machines
+that have none -- which is the same reasoning that keeps `assess` pure.
+
+The suite is 651 tests. The two failures are the same pre-existing
+environmental ones (`test_identity` and `test_proxy` need `os.memfd_create`,
+absent from the uv CPython builds this machine runs). With
+`RK_TEST_CONTAINERS=1`, `tests.test_agent` and `tests.test_isolation` are 40
+tests green on the measured interpreter, one skip.

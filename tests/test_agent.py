@@ -4,11 +4,17 @@ import contextlib
 import io
 import json
 import os
+import shutil
+import tempfile
+import time
 import types
 import unittest
+import uuid
+from pathlib import Path
 
-from redkraken import _launch, _startup, agent
-from tests import ROOT, fixtures
+from redkraken import _launch, _startup, agent, isolation, tls
+from tests import ROOT, control_upstream, fixtures
+from tests.test_isolation import IMAGE, docker
 
 
 PACKAGE = ROOT / "src" / "redkraken"
@@ -24,6 +30,23 @@ SDK = "claude_agent_sdk"
 INSTALLED = _launch.claude_agent_sdk is not None
 NEEDS_SDK = f"{SDK} is not installed in this interpreter"
 NEEDS_NO_SDK = f"{SDK} is installed, so this interpreter is a measured runtime"
+
+#: And why the launch tests are conditional too. There is one launch mechanism
+#: and it is a container, so a machine with no engine can assert every rule and
+#: start nothing.
+LIVE = os.environ.get("RK_TEST_CONTAINERS") == "1"
+NEEDS_CONTAINERS = "set RK_TEST_CONTAINERS=1 to run the contained Agent child"
+
+#: Where the model API answers inside the run network, and how long a peer has
+#: to start answering before the run that needs it is abandoned.
+UPSTREAM_PORT = 18443
+UPSTREAM_READY = 30.0
+
+#: Where the repository is mounted in the upstream peer. It is the repository
+#: rather than the application because the upstream is a test fixture: it
+#: imports `tests.fixtures`, which the wheel does not carry.
+REPOSITORY = "/opt/rk2-repo"
+AUTHORITY = "/opt/rk2-authority"
 
 
 def executable() -> str:
@@ -67,17 +90,17 @@ def options(launch, cli_path: str, **overrides) -> types.SimpleNamespace:
     return types.SimpleNamespace(**fields)
 
 
-def request(**overrides) -> agent.AgentRunRequest:
+def job(launch_workspace, **overrides) -> dict:
+    """One job document, as the supervisor writes it to the child's input."""
     fields = {
         "agent_run_id": "agent-run-1",
         "objective": "Say nothing.",
-        "workspace": fixtures.scratch(),
-        "proxy_url": "http://127.0.0.1:1",
-        "certificate": fixtures.scratch() / "root.pem",
-        "home": fixtures.scratch() / "run-home",
+        "model": None,
+        "max_turns": 3,
+        "workspace": str(launch_workspace),
     }
     fields.update(overrides)
-    return agent.AgentRunRequest(**fields)
+    return fields
 
 
 def codes(violations) -> list[str]:
@@ -116,12 +139,12 @@ class BoundaryTest(unittest.TestCase):
 
 class LaunchDirectoryTest(unittest.TestCase):
     def test_a_launch_directory_is_one_private_component_holding_one_document(self):
-        made = request()
+        workspace = fixtures.scratch()
 
-        launch = agent.launch_directory(made)
+        launch = agent.launch_directory(workspace, "agent-run-1")
         settings = agent.write_settings(launch)
 
-        self.assertEqual(made.workspace.resolve() / made.agent_run_id, launch)
+        self.assertEqual(workspace.resolve() / "agent-run-1", launch)
         self.assertEqual(agent.PRIVATE, launch.stat().st_mode & 0o777)
         self.assertEqual(launch / agent.SETTINGS, settings)
         self.assertEqual(0o600, settings.stat().st_mode & 0o777)
@@ -131,79 +154,19 @@ class LaunchDirectoryTest(unittest.TestCase):
         for identifier in ("../escape", "nested/run", ".", "", "sub/../../out"):
             with self.subTest(identifier=identifier):
                 with self.assertRaises(ValueError):
-                    agent.launch_directory(request(agent_run_id=identifier))
+                    agent.launch_directory(fixtures.scratch(), identifier)
 
 
-class EnvironmentTest(unittest.TestCase):
-    """What the child is told about the world, and what it is not told."""
+class RequestTest(unittest.TestCase):
+    """What a run cannot be asked for without."""
 
-    def test_the_child_environment_is_a_copied_list_plus_the_runtime_door(self):
-        operator = {name: f"operator-{name}" for name in agent.INHERITED}
-        operator.update(
-            {name: "leaked" for name in _startup.WATCHED_ENV_VECTORS},
-            ANTHROPIC_SMALL_FAST_MODEL="leaked",
-            SSH_AUTH_SOCK="/leaked/agent.sock",
-            AWS_PROFILE="leaked",
-        )
-        home = fixtures.scratch() / "run-home"
-
-        child = agent.child_environment(
-            operator, proxy_url="http://127.0.0.1:9", certificate="/run/root.pem", home=home
-        )
-
-        supplied = {agent.IMPORT_PATH, "HOME"}
-        for family in (
-            _startup.WATCHED_ENV_VECTORS,
-            ("ANTHROPIC_SMALL_FAST_MODEL", "SSH_AUTH_SOCK", "AWS_PROFILE"),
-        ):
-            for name in family:
-                self.assertNotIn(name, child)
-        self.assertNotIn("HOME", agent.INHERITED)
-        self.assertEqual(str(home), child["HOME"])
-        self.assertEqual(str(ROOT / "src"), child[agent.IMPORT_PATH])
-        self.assertEqual(
-            {name for name in agent.INHERITED if name in operator} | supplied,
-            set(child) - set(agent.tls.PROXY_VARIABLES) - set(agent.tls.BYPASS_VARIABLES)
-            - set(agent.tls.TRUST_VARIABLES) - set(agent.tls.STORE_VARIABLES),
-        )
-
-    def test_the_child_has_no_route_out_that_the_runtime_does_not_own(self):
-        child = agent.child_environment(
-            dict(os.environ),
-            proxy_url="http://127.0.0.1:9",
-            certificate="/run/root.pem",
-            home="/run/home",
-        )
-
-        for name in agent.tls.PROXY_VARIABLES:
-            self.assertEqual("http://127.0.0.1:9", child[name])
-        for name in agent.tls.BYPASS_VARIABLES + agent.tls.STORE_VARIABLES:
-            self.assertEqual("", child[name])
-        for name in agent.tls.TRUST_VARIABLES:
-            self.assertEqual("/run/root.pem", child[name])
-
-    def test_the_operator_home_never_crosses_and_a_run_cannot_be_asked_for_without_one(self):
-        # Where the CLI looks for the operator's own subscription. A run gets
-        # the home the request names or the request is not one -- there is no
-        # default, so no launch can reach that credential by omission.
-        child = agent.child_environment(
-            {"HOME": "/home/operator"},
-            proxy_url="http://x",
-            certificate="/c",
-            home="/run/home",
-        )
-
-        self.assertEqual("/run/home", child["HOME"])
+    def test_a_run_cannot_be_asked_for_without_a_boundary_to_run_it_in(self):
+        # There is no default. A request that could omit the boundary would be
+        # a request that could run on the supervisor's own machine, with the
+        # supervisor's own home -- which is where the CLI resolves the
+        # operator's own subscription -- and a route to any target it can name.
         with self.assertRaises(TypeError):
-            agent.child_environment({}, proxy_url="http://x", certificate="/c")
-        with self.assertRaises(TypeError):
-            agent.AgentRunRequest(
-                agent_run_id="agent-run-1",
-                objective="Say nothing.",
-                workspace=fixtures.scratch(),
-                proxy_url="http://x",
-                certificate=fixtures.scratch() / "root.pem",
-            )
+            agent.AgentRunRequest(agent_run_id="agent-run-1", objective="Say nothing.")
 
 
 class AssertionTest(unittest.TestCase):
@@ -211,7 +174,7 @@ class AssertionTest(unittest.TestCase):
 
     def setUp(self):
         self.cli = executable()
-        self.launch = agent.launch_directory(request())
+        self.launch = agent.launch_directory(fixtures.scratch(), "agent-run-1")
         agent.write_settings(self.launch)
         self.runtime = measured(self.cli)
 
@@ -447,16 +410,7 @@ class ChildTest(unittest.TestCase):
     """The child's own order of operations, without a supervisor around it."""
 
     def setUp(self):
-        self.launch = agent.launch_directory(request())
-        agent.write_settings(self.launch)
-        self.job = {
-            "agent_run_id": "agent-run-1",
-            "objective": "Say nothing.",
-            "model": None,
-            "max_turns": 3,
-            "launch_dir": str(self.launch),
-            "settings": str(self.launch / agent.SETTINGS),
-        }
+        self.job = job(fixtures.scratch())
 
     def transport(self, **_):
         raise AssertionError("a transport was constructed for a refused launch")
@@ -542,39 +496,142 @@ class ReadbackTest(unittest.TestCase):
         self.assertIsNone(agent._last_document("\n  \n"))
 
 
-@unittest.skipIf(INSTALLED, NEEDS_NO_SDK)
-class UnmeasuredSupervisorTest(unittest.TestCase):
-    """One real child, on an interpreter the credential matrix does not cover."""
-
-    def test_a_child_that_refuses_raises_the_refusal_in_the_caller(self):
-        with self.assertRaises(agent.StartupRefusal) as raised:
-            agent.agent_run(request(timeout=120.0))
-
-        self.assertEqual("pre_spawn", raised.exception.phase)
-        self.assertEqual([agent.UNMEASURED_RUNTIME], codes(raised.exception.violations))
-
-
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
-class RealChildTest(unittest.TestCase):
-    """One real child, one real transport, and a model API on loopback.
+class OptionsTest(unittest.TestCase):
+    """The one options value, built the way a child builds it."""
+
+    def test_the_one_options_value_is_the_one_that_was_assessed(self):
+        launch = agent.launch_directory(fixtures.scratch(), "agent-run-1")
+        agent.write_settings(launch)
+        runtime = _launch.runtime_facts()
+
+        value = _launch.options_for(
+            job(launch.parent), runtime, _launch.server(_launch.Surface()), launch
+        )
+
+        self.assertEqual((), agent.assess(value, {}, runtime, launch_dir=launch,
+                                          managed_settings=()))
+        self.assertEqual(str(agent.bundled_executable(runtime)), value.cli_path)
+        self.assertEqual([agent.TOOL], value.allowed_tools)
+
+
+@unittest.skipUnless(LIVE, NEEDS_CONTAINERS)
+class ContainedChildTest(unittest.TestCase):
+    """One real child, in the boundary, against a model API that is a peer.
 
     The far end is `fixtures.ControlUpstream` rather than Anthropic, so the
-    session is real in every respect the assertion is about -- process,
-    environment, settings, bundled executable, init handshake, tool surface --
-    and costs nothing, needs no subscription and cannot reach a target.
+    session is real in every respect the assertion is about -- container,
+    network, process, environment, settings, bundled executable, init
+    handshake, tool surface -- and costs nothing, needs no subscription and
+    cannot reach a target.
+
+    It is a container rather than a thread on loopback because it has to be:
+    `isolation.run` verifies that the proxy named in the URL is the one other
+    peer on an internal network, and an internal network is exactly what the
+    test process is not on.
     """
 
-    def test_a_real_child_starts_clean_and_opens_its_tool_surface_exactly_once(self):
-        upstream = fixtures.ControlUpstream(agent.TOOL)
-        self.addCleanup(upstream.stop)
-        home = fixtures.subscription(fixtures.scratch() / "home")
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {IMAGE}")
 
+        suffix = uuid.uuid4().hex[:12]
+        cls.network = f"rk2-agent-{suffix}"
+        cls.upstream = f"rk2-upstream-{suffix}"
+        cls.root = Path(tempfile.mkdtemp(prefix="rk2-contained-"))
+        cls.authority = tls.authority(cls.root / "authority")
+        try:
+            docker("network", "create", "--internal", cls.network)
+            cls._serve()
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "upstream", ""):
+            docker("rm", "--force", cls.upstream, check=False)
+        if getattr(cls, "network", ""):
+            docker("network", "rm", cls.network, check=False)
+        root = getattr(cls, "root", None)
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+
+    @classmethod
+    def _serve(cls) -> None:
+        """Start the model API as a peer, and wait for it to be one."""
+        docker(
+            "run", "--detach", "--rm", "--pull", "never",
+            "--name", cls.upstream,
+            "--network", cls.network,
+            "--mount", f"type=bind,src={ROOT},dst={REPOSITORY},readonly",
+            "--mount", f"type=bind,src={cls.authority.directory},dst={AUTHORITY}",
+            "--env", f"PYTHONPATH={REPOSITORY}/src:{REPOSITORY}",
+            "--entrypoint", "",
+            IMAGE,
+            "python3", "-m", control_upstream.__name__,
+            agent.TOOL, AUTHORITY, str(UPSTREAM_PORT),
+        )
+        deadline = time.monotonic() + UPSTREAM_READY
+        while time.monotonic() < deadline:
+            if control_upstream.LISTENING in docker("logs", cls.upstream, check=False).stdout:
+                return
+            time.sleep(0.2)
+        raise AssertionError(docker("logs", cls.upstream, check=False).stderr)
+
+    def boundary(self, **overrides) -> isolation.AgentContainer:
+        fields = {
+            "image": IMAGE,
+            "network": self.network,
+            "proxy_container": self.upstream,
+            "proxy_url": f"http://{self.upstream}:{UPSTREAM_PORT}",
+            "certificate": self.authority.certificate,
+            "application": ROOT / "src",
+            "runtime": self.installed_sdk(),
+            "home": self.home(),
+        }
+        fields.update(overrides)
+        return isolation.AgentContainer(**fields)
+
+    def installed_sdk(self) -> Path | None:
+        """Where this machine keeps the SDK, so the container can be measured."""
+        if _launch.claude_agent_sdk is None:
+            return None
+        return Path(_launch.claude_agent_sdk.__file__).resolve().parent.parent
+
+    def home(self) -> Path:
+        """A home of this run's own, holding a credential that is not one.
+
+        Writable by the container's unprivileged user rather than by this one:
+        the CLI keeps session state in it, and a home the child cannot write is
+        a session that never starts.
+        """
+        home = fixtures.subscription(fixtures.scratch() / "home")
+        home.chmod(0o777)
+        return home
+
+    def requests_seen(self) -> list[tuple[str, str]]:
+        """What arrived at the far end, read back across the boundary."""
+        seen = []
+        for line in docker("logs", self.upstream).stdout.splitlines():
+            host, tab, request = line.partition("\t")
+            if tab:
+                seen.append((host, request))
+        return seen
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_a_contained_child_starts_clean_and_opens_its_tool_surface_exactly_once(self):
         result = agent.agent_run(
-            request(
-                objective=f"Call the {agent.READY} tool, then say {upstream.SPOKEN}.",
-                proxy_url=upstream.url,
-                certificate=upstream.certificate,
-                home=home,
+            agent.AgentRunRequest(
+                agent_run_id="agent-run-1",
+                objective=(
+                    f"Call the {agent.READY} tool, then say "
+                    f"{fixtures.ControlUpstream.SPOKEN}."
+                ),
+                container=self.boundary(),
                 max_turns=3,
                 timeout=300.0,
             )
@@ -584,33 +641,35 @@ class RealChildTest(unittest.TestCase):
         self.assertEqual(agent.EXPECTED_KEY_SOURCE, result.api_key_source)
         self.assertEqual(1, result.tool_ready)
         self.assertEqual((agent.READY,), result.tools_served)
-        self.assertEqual(upstream.SPOKEN, result.text)
+        self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
         self.assertEqual(("end_turn", 2), (result.stop_reason, result.answers))
         # Every byte the child sent went through the runtime's door, to the one
-        # host the door presents a certificate for. A floor rather than a count
-        # of completions: the CLI makes background requests of its own, and the
-        # number of them is not this ticket's business.
-        self.assertEqual({"api.anthropic.com"}, {host for host, _ in upstream.seen})
-        self.assertGreaterEqual(upstream.completions, result.answers)
+        # host the door presents a certificate for -- and the door was the only
+        # peer it had. A floor rather than a count of completions: the CLI makes
+        # background requests of its own, and how many is not this ticket's
+        # business.
+        seen = self.requests_seen()
+        self.assertEqual({"api.anthropic.com"}, {host for host, _ in seen})
+        self.assertGreaterEqual(
+            sum(1 for _, line in seen if line.startswith("POST /v1/messages")), result.answers
+        )
 
-    def test_the_one_options_value_is_the_one_that_was_assessed(self):
-        launch = agent.launch_directory(request())
-        agent.write_settings(launch)
-        job = {
-            "launch_dir": str(launch),
-            "settings": str(launch / agent.SETTINGS),
-            "model": None,
-            "max_turns": 3,
-            "objective": "Say nothing.",
-        }
-        runtime = _launch.runtime_facts()
+    def test_a_boundary_without_the_measured_sdk_refuses_in_the_caller(self):
+        # The child is measured against what was mounted, not against what the
+        # supervisor's own interpreter happens to have installed. Nothing
+        # mounted is an unmeasured runtime, and it refuses before a transport.
+        with self.assertRaises(agent.StartupRefusal) as raised:
+            agent.agent_run(
+                agent.AgentRunRequest(
+                    agent_run_id="agent-run-1",
+                    objective="Say nothing.",
+                    container=self.boundary(runtime=None),
+                    timeout=120.0,
+                )
+            )
 
-        value = _launch.options_for(job, runtime, _launch.server(_launch.Surface()))
-
-        self.assertEqual((), agent.assess(value, {}, runtime, launch_dir=launch,
-                                          managed_settings=()))
-        self.assertEqual(str(agent.bundled_executable(runtime)), value.cli_path)
-        self.assertEqual([agent.TOOL], value.allowed_tools)
+        self.assertEqual("pre_spawn", raised.exception.phase)
+        self.assertEqual([agent.UNMEASURED_RUNTIME], codes(raised.exception.violations))
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
@@ -628,19 +687,16 @@ class AnnouncementTest(unittest.TestCase):
             yield announced
             yield announced
 
-        launch = agent.launch_directory(request())
-        agent.write_settings(launch)
         runtime = _launch.runtime_facts()
-        job = {
-            "launch_dir": str(launch),
-            "settings": str(launch / agent.SETTINGS),
-            "objective": "Say nothing.",
-            "model": None,
-            "max_turns": 1,
-        }
 
-        result = asyncio.run(_launch.run(job, environment={}, runtime=runtime,
-                                         transport=transport))
+        result = asyncio.run(
+            _launch.run(
+                job(fixtures.scratch(), max_turns=1),
+                environment={},
+                runtime=runtime,
+                transport=transport,
+            )
+        )
 
         # Two openings, and `Surface.ready` is `opened == 1`: the tools stopped
         # answering the moment the second announcement arrived.
