@@ -1,6 +1,7 @@
 import dataclasses
 import hashlib
 import json
+import re
 import unittest
 from unittest import mock
 
@@ -50,6 +51,16 @@ class InventoryTest(unittest.TestCase):
         # is not an inventory.
         self.assertGreaterEqual(measured["observation"]["repetitions"], 2)
 
+    def test_the_inventory_says_what_each_alias_a_role_names_resolves_to(self):
+        # What a role names is an alias; what it runs is what the pair resolves
+        # that alias to, and the second is the one that had to be measured.
+        models = roster.inventory()["models"]
+
+        self.assertEqual("claude-opus-5", models["opus"])
+        for name, role in roster.ROLES.items():
+            with self.subTest(role=name):
+                self.assertTrue(role.rendered or role.model in models)
+
     def test_the_inventory_is_the_file_on_disk_and_not_a_second_copy(self):
         source = ROOT / "src" / "redkraken" / roster.INVENTORY
 
@@ -63,6 +74,9 @@ class InventoryTest(unittest.TestCase):
             b'{"schema_version": 2}',
             b'{"schema_version": 1, "builtin_tools": "Read"}',
             b'{"schema_version": 1, "builtin_tools": [1]}',
+            json.dumps(
+                {**roster.inventory(), "models": ["opus"]}
+            ).encode(),
         ):
             with self.subTest(broken=broken):
                 with self.assertRaises(roster.RosterError):
@@ -91,8 +105,8 @@ class CompileTest(unittest.TestCase):
     def test_a_grant_naming_a_tool_the_pair_does_not_serve_is_refused(self):
         # This is the silent failure the inventory exists for. An unknown name
         # in `tools` is dropped rather than rejected, so without this check the
-        # role would run with one capability fewer than the roster says it has
-        # and nothing would say so.
+        # role would run with one tool fewer than the roster says it has and
+        # nothing would say so.
         with mock.patch.dict(roster.ROLES, altered("recon", builtin_tools=("Grep",))):
             with self.compiling() as raised:
                 roster._compile()
@@ -222,19 +236,73 @@ class CompileTest(unittest.TestCase):
 
     def test_an_argument_that_is_neither_constrained_nor_declared_open_is_refused(self):
         contract = dataclasses.replace(
-            roster.CONTRACTS["mcp__rk2__claim_task"],
+            roster.CONTRACTS["mcp__rk2__pick_task"],
             arguments={"task_label": roster.Argument("string", required=True)},
         )
-        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__claim_task": contract}):
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__pick_task": contract}):
             with self.compiling():
                 roster._compile()
 
+    def test_a_contract_that_writes_a_canonical_table_is_refused(self):
+        # The rule that keeps promotion the runtime's. A tool reaching one of
+        # these would be an agent writing canonical truth directly, and the
+        # group it was filed under would not change that.
+        for table in ("findings", "hypotheses", "tasks"):
+            with self.subTest(table=table):
+                contract = dataclasses.replace(
+                    roster.CONTRACTS["mcp__rk2__pick_task"], writes=(table,)
+                )
+                with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__pick_task": contract}):
+                    with self.compiling() as raised:
+                        roster._compile()
+                self.assertIn("writes canonical state directly", str(raised.exception))
+
+    def test_a_verdict_written_by_anything_but_a_judgement_is_refused(self):
+        contract = dataclasses.replace(
+            roster.CONTRACTS["mcp__rk2__request_validation"], writes=("verdicts",)
+        )
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__request_validation": contract}):
+            with self.compiling() as raised:
+                roster._compile()
+        self.assertIn("a judgement's and no other's", str(raised.exception))
+
+    def test_a_direction_this_roster_does_not_have_is_refused(self):
+        for direction in ("commit", "write", ""):
+            with self.subTest(direction=direction):
+                contract = dataclasses.replace(
+                    roster.CONTRACTS["mcp__rk2__get_slate"], direction=direction
+                )
+                with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__get_slate": contract}):
+                    with self.compiling() as raised:
+                        roster._compile()
+                self.assertIn("is not a direction", str(raised.exception))
+
+    def test_an_argument_shape_the_gate_cannot_check_is_refused(self):
+        # `kind` is load-bearing: the gate types a value against it, so a shape
+        # nothing implements would be an argument nothing checks.
+        contract = dataclasses.replace(
+            roster.CONTRACTS["mcp__rk2__get_slate"],
+            arguments={"limit": roster.Argument("number", bounds=(1, 5))},
+        )
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__get_slate": contract}):
+            with self.compiling() as raised:
+                roster._compile()
+        self.assertIn("is not a value shape", str(raised.exception))
+
+    def test_a_model_alias_the_pair_does_not_resolve_is_refused(self):
+        # An alias is a request. A role naming one the pair does not know would
+        # still start -- on some other model, and without saying which.
+        with mock.patch.dict(roster.ROLES, altered("recon", model="claude-3")):
+            with self.compiling() as raised:
+                roster._compile()
+        self.assertIn("is not a model alias this pair resolves", str(raised.exception))
+
     def test_an_unconstrained_argument_nobody_declared_is_refused(self):
         contract = dataclasses.replace(
-            roster.CONTRACTS["mcp__rk2__claim_task"],
+            roster.CONTRACTS["mcp__rk2__pick_task"],
             arguments={"note": roster.Argument("string", free_text=True)},
         )
-        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__claim_task": contract}):
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__pick_task": contract}):
             with self.compiling() as raised:
                 roster._compile()
         self.assertIn("states why it is one", str(raised.exception))
@@ -258,26 +326,36 @@ class SurfaceTest(unittest.TestCase):
         # `Bash` is forbidden to every role, and the constrained form that
         # replaces it takes a binary from a closed list rather than a name.
         self.assertIn("Bash", roster.FORBIDDEN_BUILTINS)
-        self.assertNotIn("Bash", roster.builtin_grants())
+        self.assertNotIn("Bash", roster.granted_builtins())
 
         runner = roster.CONTRACTS["mcp__rk2__run_tool"]
         self.assertTrue(runner.arguments["tool"].enum)
         self.assertFalse(runner.arguments["tool"].free_text)
 
-    def test_a_canonical_row_is_only_ever_written_by_a_commit(self):
-        # An agent cannot write canonical state by acting or by proposing. The
-        # two tools that reach these tables are the promotion verb and the
-        # verdict, and both are decisions rather than observations.
-        canonical = {"entities", "hypotheses", "findings", "observations", "verdicts"}
-        reached = set()
+    def test_no_model_facing_tool_writes_canonical_state_at_all(self):
+        # Nothing an agent returns is true before promotion, and promotion is a
+        # runtime step -- so there is no model-facing verb for it, not a
+        # narrow one. The strongest thing on this surface asks the runtime.
         for name, contract in roster.CONTRACTS.items():
-            if not canonical & set(contract.writes):
-                continue
             with self.subTest(tool=name):
-                self.assertEqual("commit", contract.direction)
-                reached.add(name)
+                self.assertEqual((), tuple(set(contract.writes) & set(roster.CANONICAL)))
+                self.assertIn(contract.direction, roster.DIRECTIONS)
+        self.assertNotIn("commit", roster.DIRECTIONS)
+        self.assertNotIn(
+            "mcp__rk2__promote",
+            {member for group in roster.TOOL_GROUPS.values() for member in group},
+        )
 
-        self.assertEqual({"mcp__rk2__promote", "mcp__rk2__submit_verdict"}, reached)
+    def test_the_one_row_this_surface_decides_is_the_validators_verdict(self):
+        # The exception, and it is not a general one: a verdict is the
+        # validator's own output, and what the Finding's status becomes is
+        # still a runtime step taken from this row and a holding replay.
+        writers = {
+            name for name, contract in roster.CONTRACTS.items() if "verdicts" in contract.writes
+        }
+
+        self.assertEqual({"mcp__rk2__submit_verdict"}, writers)
+        self.assertEqual(roster.JUDGE, roster.CONTRACTS["mcp__rk2__submit_verdict"].direction)
 
     def test_a_proposal_reaches_staging_and_stops_there(self):
         proposal = roster.CONTRACTS["mcp__rk2__submit_mission_result"]
@@ -286,7 +364,7 @@ class SurfaceTest(unittest.TestCase):
         for name, role in roster.ROLES.items():
             with self.subTest(role=name):
                 self.assertFalse(
-                    {"state.propose", "sched.commit"}.issubset(role.tool_groups),
+                    {"state.propose", "sched.pick"}.issubset(role.tool_groups),
                     f"{name} promotes its own proposals",
                 )
 
@@ -306,7 +384,7 @@ class AuthorityTest(unittest.TestCase):
 
         self.assertEqual((), orchestrator.task_kinds)
         self.assertFalse(orchestrator.executes_tasks)
-        self.assertIn("mcp__rk2__offer_slate", orchestrator.tools)
+        self.assertIn("mcp__rk2__get_slate", orchestrator.tools)
         self.assertIn("mcp__rk2__get_attack_surface", orchestrator.tools)
         self.assertNotIn("mcp__rk2__http_request", orchestrator.tools)
         self.assertNotIn("mcp__rk2__run_tool", orchestrator.tools)
@@ -335,7 +413,7 @@ class AuthorityTest(unittest.TestCase):
     def test_every_role_is_started_by_something_that_may_start_it(self):
         for name, role in roster.ROLES.items():
             with self.subTest(role=name):
-                if role.runs_as == roster.SUBAGENT:
+                if role.delegated:
                     self.assertEqual(("orchestrator",), role.invocable_by)
                 else:
                     self.assertEqual((roster.RUNTIME,), role.invocable_by)
@@ -399,16 +477,33 @@ class GateTest(unittest.TestCase):
 
         self.assertEqual(roster.UNATTRIBUTED, denial.rule)
 
-    def test_a_delegated_call_is_decided_against_its_own_roles_grants(self):
+    def test_a_call_from_an_agent_the_runtime_never_saw_start_is_denied(self):
+        # `SubagentStart` is what makes an agent id an attribution rather than
+        # a claim, so a call that arrives without one is refused rather than
+        # believed and recorded. Fail-closed: a hook this runtime stopped
+        # registering would close the gate, not open it.
+        unannounced = roster.Call(tool=agent_ready(), agent_id="agent-9", agent_type="recon")
+
+        denial = self.denied(self.gate, unannounced)
+        self.assertEqual(roster.UNATTRIBUTED, denial.rule)
+        self.assertIn("before the runtime saw it start", denial.reason)
+
+        self.gate.bind("agent-9", "recon")
+        self.assertIsNone(self.gate.decide(unannounced))
+
+    def test_a_delegated_call_is_decided_against_its_own_roles_tools(self):
+        self.gate.bind("agent-1", "recon")
+        self.gate.bind("agent-2", "js_analyst")
         recon = roster.Call(
-            tool="mcp__rk2__http_request", agent_id="agent-1", agent_type="recon"
+            tool="mcp__rk2__http_request",
+            arguments={"method": "GET", "url": "https://example.test/"},
+            agent_id="agent-1",
+            agent_type="recon",
         )
         self.assertIsNone(self.gate.decide(recon))
 
         # The same call from the analyst, which holds no network group.
-        analyst = roster.Call(
-            tool="mcp__rk2__http_request", agent_id="agent-2", agent_type="js_analyst"
-        )
+        analyst = dataclasses.replace(recon, agent_id="agent-2", agent_type="js_analyst")
         denial = self.denied(self.gate, analyst)
         self.assertEqual((roster.UNLISTED_TOOL, "js_analyst"), (denial.rule, denial.role))
 
@@ -416,18 +511,25 @@ class GateTest(unittest.TestCase):
         self.gate.bind("agent-1", "recon")
 
         self.assertIsNone(self.gate.bind("agent-1", "recon"))
-        denial = self.gate.bind("agent-1", "web_hunter")
-        self.assertEqual(roster.IMPERSONATION, denial.rule)
+        announced = self.gate.bind("agent-1", "web_hunter")
+        self.assertEqual(roster.IMPERSONATION, announced.rule)
 
         claimed = roster.Call(
             tool="mcp__rk2__http_request", agent_id="agent-1", agent_type="web_hunter"
         )
-        self.assertEqual(roster.IMPERSONATION, self.denied(self.gate, claimed).rule)
+        called = self.denied(self.gate, claimed)
+        self.assertEqual(roster.IMPERSONATION, called.rule)
+        # One violation seen from two hooks is one denial: the same sentence
+        # and the same role, so an operator reading two records reads one fact.
+        self.assertEqual(
+            (announced.role, announced.reason), (called.role, called.reason)
+        )
+        self.assertEqual("recon", called.role)
 
     def test_a_builtin_agent_type_is_not_a_role_and_is_denied(self):
         # The hole this closes: the pair ships agent types of its own, and one
         # of them started through the delegation tool would be a session with
-        # no roster row and therefore no allowlist at all.
+        # no roster row and therefore nothing to decide it against.
         for built_in in roster.inventory()["agent_types"]:
             with self.subTest(agent_type=built_in):
                 denial = self.denied(self.gate, self.delegating(built_in, built_in))
@@ -474,6 +576,22 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(self.gate.decide(self.delegating("recon", "a")))
         self.assertEqual(1, self.gate.outstanding)
 
+    def test_a_delegation_with_no_ticket_still_holds_a_slot_of_its_own(self):
+        # The key a ticketless admission gets has to be new every time. Keyed
+        # by the current count, an admission either side of a release would
+        # take the key the released one had, and two running hunters would be
+        # counted as one.
+        ticketless = roster.Call(
+            tool=roster.DELEGATION, arguments={roster.SUBAGENT_TYPE: "web_hunter"}
+        )
+        self.assertIsNone(self.gate.decide(ticketless))
+        self.assertIsNone(self.gate.decide(self.delegating("web_hunter", "a")))
+        self.gate.release("a")
+        self.assertIsNone(self.gate.decide(ticketless))
+
+        self.assertEqual(2, self.gate.outstanding)
+        self.assertEqual(roster.OVERFLOW, self.denied(self.gate, ticketless).rule)
+
     def test_an_argument_naming_a_program_or_a_credential_is_denied_at_any_depth(self):
         for arguments in (
             {"program_id": "p"},
@@ -486,6 +604,58 @@ class GateTest(unittest.TestCase):
                     self.gate, roster.Call(tool=agent_ready(), arguments=arguments)
                 )
                 self.assertEqual(roster.FORBIDDEN_ARGUMENT, denial.rule)
+
+    def test_a_call_that_does_not_fit_its_contract_is_denied(self):
+        # The contract is the tool's whole surface, so the enum on `run_tool`
+        # is a rule the gate carries rather than a description of a handler's
+        # own check. Every one of these is a call the CLI would have dispatched.
+        hunter = roster.Gate("web_hunter")
+        hunter.bind("agent-1", "web_hunter")
+
+        def hunting(name: str, **arguments) -> roster.Call:
+            return roster.Call(
+                tool=name, arguments=arguments, agent_id="agent-1", agent_type="web_hunter"
+            )
+
+        self.assertIsNone(
+            hunter.decide(hunting("mcp__rk2__run_tool", tool="ffuf", argv=["-u", "https://x"]))
+        )
+        for one_call in (
+            # A binary the roster did not enumerate.
+            hunting("mcp__rk2__run_tool", tool="bash", argv=[]),
+            # A required argument that is not there.
+            hunting("mcp__rk2__run_tool", tool="ffuf"),
+            # An argument no contract declares.
+            hunting("mcp__rk2__run_tool", tool="ffuf", argv=[], shell=True),
+            # A value of the wrong shape.
+            hunting("mcp__rk2__run_tool", tool="ffuf", argv="-u https://x"),
+            # A string that does not match the pattern its argument declares.
+            hunting("mcp__rk2__http_request", method="GET", url="file:///etc/passwd"),
+            # A member of an array that does not match the item pattern.
+            hunting("mcp__rk2__get_artifact", artifact_hash="not-a-hash"),
+            # A header name outside the shape the roster bounds them to.
+            hunting(
+                "mcp__rk2__http_request",
+                method="GET",
+                url="https://x",
+                headers={"X Bad Name": "v"},
+            ),
+            # A number outside its bounds.
+            hunting("mcp__rk2__get_attack_surface", limit=0),
+        ):
+            with self.subTest(arguments=dict(one_call.arguments)):
+                denial = self.denied(hunter, one_call)
+                self.assertEqual(roster.INVALID_ARGUMENT, denial.rule)
+                self.assertEqual("web_hunter", denial.role)
+
+    def test_a_flag_where_a_count_belongs_is_not_an_integer(self):
+        # `True` is an `int` in Python and is not one here.
+        self.assertIsNotNone(
+            roster._value_fault(roster.Argument("integer", bounds=(1, 200)), True)
+        )
+
+    def test_a_builtin_tool_is_not_argument_checked_against_a_contract_it_has_none_of(self):
+        self.assertIsNone(roster._argument_fault(roster.DELEGATION, {"anything": 1}))
 
     def test_an_argument_deeper_than_the_scan_is_not_searched_forever(self):
         document = {"api_key": "x"}
@@ -527,20 +697,20 @@ class GateTest(unittest.TestCase):
 class SurfaceIntersectionTest(unittest.TestCase):
     """What a launch offers, against what the roster grants."""
 
-    def test_the_allowlist_is_the_grants_intersected_with_what_is_served(self):
+    def test_the_enforced_list_is_the_roles_tools_intersected_with_what_is_served(self):
         # Naming a tool no server provides would be an entry that can never be
         # exercised; serving one the roster withholds would be a tool the gate
         # denies at every call instead of one nobody offered.
-        self.assertEqual(
-            ["mcp__rk2__ready"], roster.allowed_tools("orchestrator", ["mcp__rk2__ready"])
-        )
-        self.assertEqual([], roster.allowed_tools("validator", ["mcp__rk2__ready"]))
-        self.assertEqual([], roster.allowed_tools("orchestrator", []))
+        orchestrator, validator = roster.ROLES["orchestrator"], roster.ROLES["validator"]
+
+        self.assertEqual(["mcp__rk2__ready"], orchestrator.allowed_tools(["mcp__rk2__ready"]))
+        self.assertEqual([], validator.allowed_tools(["mcp__rk2__ready"]))
+        self.assertEqual([], orchestrator.allowed_tools([]))
 
     def test_what_a_role_is_shown_is_never_wider_than_what_it_holds(self):
         for name, role in roster.ROLES.items():
             with self.subTest(role=name):
-                self.assertTrue(set(roster.visible_tools(name)).issubset(role.tools))
+                self.assertTrue(set(role.visible_tools).issubset(role.tools))
 
     def test_a_visible_tool_is_still_denied_when_the_roster_withholds_it(self):
         # The claim the deny canary proves against a running child, stated here
@@ -551,6 +721,69 @@ class SurfaceIntersectionTest(unittest.TestCase):
         self.assertEqual(
             roster.UNLISTED_TOOL, gate.decide(call("mcp__rk2__http_request")).rule
         )
+
+
+class SchemaAgreementTest(unittest.TestCase):
+    """The roster and migration 0019 are two statements of one thing.
+
+    The migration is generated from a roster and the database enforces its
+    copy, so the two drifting apart is a scheduler admitting a role this file
+    would refuse. Read as text rather than through a connection: the claim is
+    that the two documents agree, and that is true with or without a database.
+    """
+
+    ROWS = re.compile(
+        r"\('(?P<role>\w+)', '(?P<runs_as>\w+)', "
+        r"ARRAY\['(?P<invocable_by>\w+)'\]::text\[\], "
+        r"(?P<executes_tasks>true|false), (?P<max_concurrent>\d+), (?P<clamp>true|false)\)"
+    )
+    KINDS = re.compile(r"\('(?P<role>\w+)', '(?P<kind>\w+)'\)")
+
+    @classmethod
+    def setUpClass(cls):
+        migration = ROOT / "src" / "redkraken" / "migrations" / "0019_role_kinds.sql"
+        cls.sql = migration.read_text(encoding="utf-8")
+
+    def statement(self, prefix: str) -> str:
+        start = self.sql.index(prefix)
+        return self.sql[start : self.sql.index(";", start)]
+
+    def test_every_role_row_the_schema_carries_is_this_rosters_row(self):
+        rows = self.ROWS.finditer(self.statement("INSERT INTO roles"))
+        stated = {}
+        for row in rows:
+            role = roster.ROLES[row["role"]]
+            stated[row["role"]] = (
+                row["runs_as"],
+                (row["invocable_by"],),
+                row["executes_tasks"] == "true",
+                int(row["max_concurrent"]),
+                row["clamp"] == "true",
+            )
+            with self.subTest(role=row["role"]):
+                self.assertEqual(
+                    stated[row["role"]],
+                    (
+                        role.runs_as,
+                        role.invocable_by,
+                        role.executes_tasks,
+                        role.max_concurrent,
+                        role.clamp_to_identity_leases,
+                    ),
+                )
+        self.assertEqual(set(roster.ROLES), set(stated))
+
+    def test_the_task_kind_mapping_is_the_schemas(self):
+        mapped = {
+            row["kind"]: row["role"]
+            for row in self.KINDS.finditer(self.statement("INSERT INTO role_task_kinds"))
+        }
+        owned = {
+            kind: name for name, role in roster.ROLES.items() for kind in role.task_kinds
+        }
+
+        self.assertEqual(mapped, owned)
+        self.assertEqual(set(roster.TASK_KINDS), set(mapped))
 
 
 def agent_ready() -> str:

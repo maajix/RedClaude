@@ -3,23 +3,23 @@
 This module is the roster. It states, in one place, every property that
 distinguishes one role from another -- how it runs, who may start it, which
 task kinds it executes, its model, effort and turn ceiling, the built-in tools
-and capability groups it holds, the Skills it may execute and how many of it
-may run at once -- and it compiles that statement at import, against the tool
-inventory the SDK/CLI pair was observed to have. A roster that named a tool the
-pair does not serve would not fail loudly: `tools=["Nonexistent"]` is accepted
-and silently produces no tool, so a typo in a grant is a role quietly missing a
-capability, and a typo in a *prohibition* is a prohibition that never applied.
-The inventory is what makes both of those a startup error instead.
+and tool groups it holds, the Skills it may execute and how many of it may run
+at once -- and it compiles that statement at import, against the tool inventory
+the SDK/CLI pair was observed to have. A roster that named a tool the pair does
+not serve would not fail loudly: `tools=["Nonexistent"]` is accepted and
+silently produces no tool, so a typo in a listed tool is a role quietly missing
+one, and a typo in a *prohibition* is a prohibition that never applied. The
+inventory is what makes both of those a startup error instead.
 
 The second half is the enforcement point, and the separation is the design.
 `AgentDefinition.tools` and `ClaudeAgentOptions.allowed_tools` narrow what a
 model can see; they are not a boundary, because the permission mode this
 runtime uses is `bypassPermissions` and a visible tool under that mode is a
 tool that runs. `Gate.decide` is the boundary: it attributes the call to
-exactly one role, checks that role's compiled grants, and returns a denial the
-launch turns into `permissionDecision: "deny"`. That decision is the one the
-permission mode cannot overrule, which is why the allowlist lives here rather
-than in the options value.
+exactly one role, checks what that role was compiled to hold, and returns a
+denial the launch turns into `permissionDecision: "deny"`. That decision is the
+one the permission mode cannot overrule, which is why the enforced list lives
+here rather than in the options value.
 
 Nothing in this module imports the SDK, touches the network or reads the
 environment. It is a pure function of the constants below and the pinned
@@ -43,7 +43,7 @@ from typing import Any
 #: makes it evidence rather than a list somebody edited. Produced by
 #: `tools/probe_tool_inventory.py` against the pair in `_startup.KNOWN_RUNTIME`.
 INVENTORY = "measurements/tool-inventory-sdk-0.2.132-cli-2.1.224.json"
-INVENTORY_SHA256 = "eba17fab0d3b34e90760c74a4df3fe99cb454a4b7a3bca8d2e8c8b14815ee8ba"
+INVENTORY_SHA256 = "50a8d08ed1be62b93f7ad5e1a76d127ebd28eaee84aac3dd5d7b7f2cd503f296"
 
 #: How a role runs. A `session` is a top-level query the runtime drives itself,
 #: a `subagent` is reached through the delegation tool, and a `renderer` is not
@@ -65,7 +65,7 @@ TASK_KINDS = ("recon", "hunt", "analyze", "validate", "report")
 #: The delegation tool, and the older name of the same tool. The pair announces
 #: `Task` in its init frame and has been observed to spell the same tool `Agent`
 #: in permission denials, so the gate resolves one to the other before deciding
-#: rather than holding an allowlist that half of the CLI's spellings miss.
+#: rather than holding a list that half of the CLI's spellings miss.
 DELEGATION = "Task"
 ALIASES = {"Agent": DELEGATION}
 
@@ -75,6 +75,27 @@ SUBAGENT_TYPE = "subagent_type"
 #: The argument that names what a `Skill` call would execute.
 SKILL = "Skill"
 SKILL_NAME = "skill"
+
+#: The tables no model-facing tool may write, whatever its group. "Nothing an
+#: agent returns is true before promotion", and promotion is a runtime step, so
+#: a tool that reached one of these would be an agent writing canonical truth
+#: directly. `verdicts` is the one exception and it is not a general one: the
+#: validator's closed verdict tool writes it, which `_check_contracts` allows
+#: for that direction and for no other.
+CANONICAL = (
+    "entities",
+    "entity_endpoint",
+    "entity_host",
+    "entity_param",
+    "relationships",
+    "hypotheses",
+    "findings",
+    "evidence",
+    "observations",
+    "tasks",
+    "test_specs",
+    "playbooks",
+)
 
 #: Argument names no model-facing tool may carry, whatever the tool. Program
 #: selection is the first: every canonical table is program-scoped and the
@@ -113,6 +134,21 @@ FORBIDDEN_ARGUMENTS = frozenset(
 #: and every contract on this surface is far shallower than this.
 DEPTH = 8
 
+#: The directions a model-facing tool can have. There is no `commit` among
+#: them, and that absence is the point: claiming a Task, promoting a proposal
+#: and changing epistemic state are the runtime's, so the strongest thing this
+#: surface can do to canonical state is `request` that the runtime do it.
+READ = "read"
+PROPOSE = "propose"
+REQUEST = "request"
+JUDGE = "judge"
+ACT = "act"
+DIRECTIONS = (READ, PROPOSE, REQUEST, JUDGE, ACT)
+
+#: The value shapes an argument may declare. Small and closed, so `kind` is a
+#: property the gate checks rather than a note about one.
+KINDS = ("string", "integer", "array", "object", "boolean")
+
 #: The rules the gate can refuse under, as the identifiers a denial carries.
 #: One per distinguishable finding, because an operator reading a denial should
 #: learn which property was violated and not merely that one was.
@@ -122,7 +158,8 @@ UNLISTED_TOOL = "R-TOOL"
 UNKNOWN_AGENT_TYPE = "R-AGENTTYPE"
 SESSION_ROLE = "R-SESSIONROLE"
 OVERFLOW = "R-CAP"
-FORBIDDEN_ARGUMENT = "R-PROGRAM"
+FORBIDDEN_ARGUMENT = "R-ARGNAME"
+INVALID_ARGUMENT = "R-ARGVALUE"
 UNGRANTED_SKILL = "R-SKILL"
 
 
@@ -134,7 +171,7 @@ class RosterError(ValueError):
 class Argument:
     """One argument of one model-facing tool, and what constrains its value.
 
-    An argument is a capability, so the roster states the shape of every one
+    An argument is authority, so the roster states the shape of every one
     rather than leaving it to the handler. `free_text` is the explicit
     admission that this roster constrains nothing about a value; it is allowed
     only where `OPEN_ARGUMENTS` says why, and never on a tool the validator can
@@ -186,6 +223,12 @@ class Role:
     tool_groups: tuple[str, ...]
     skills: tuple[str, ...]
     max_concurrent: int
+    #: Migration 0019's column of the same name. True where the role's real
+    #: ceiling is the number of free Identity leases rather than the number
+    #: above: two hunters sharing one upstream slot is the session mixing the
+    #: Identity model exists to prevent. The clamp itself is the scheduler's,
+    #: which is the only party that knows how many leases are free.
+    clamp_to_identity_leases: bool = False
 
     @property
     def executes_tasks(self) -> bool:
@@ -193,16 +236,49 @@ class Role:
         return bool(self.task_kinds)
 
     @property
+    def delegated(self) -> bool:
+        """Reached through the delegation tool rather than started by the runtime."""
+        return self.runs_as == SUBAGENT
+
+    @property
+    def rendered(self) -> bool:
+        """Not an agent at all: no model, no turn, no tool."""
+        return self.runs_as == RENDERER
+
+    @property
     def tools(self) -> frozenset[str]:
         """Everything this role may call, built-in and served, as one set."""
         members = (member for group in self.tool_groups for member in TOOL_GROUPS[group])
         return frozenset(self.builtin_tools) | frozenset(members)
 
+    @property
+    def visible_tools(self) -> list[str]:
+        """The built-in tools this role's options value offers, in a stable order.
 
-#: The capability groups. What this partition fixes is which *class* of
-#: capability a role may hold; ticket 19 owns the handlers behind the names.
-#: Move a member between groups and a role's authority changes, which is why
-#: the group is the unit a role is granted rather than the tool.
+        Visibility, not authority. It is here so the options value and the gate
+        are derived from one statement rather than agreeing by inspection, and
+        so a role's frame is the role's real surface: a tool the gate would
+        deny is not offered, and the model does not spend a turn discovering
+        that.
+        """
+        return sorted(self.builtin_tools)
+
+    def allowed_tools(self, served: Iterable[str]) -> list[str]:
+        """This role's tools, intersected with what one launch actually serves.
+
+        Two lists rather than one, because they answer different questions: the
+        roster says what the role may call and the launch says what exists to
+        be called. Naming a tool no server provides would be an entry that can
+        never be exercised, and serving a tool the roster withholds would be a
+        tool the gate has to deny at every call instead of one nobody offered.
+        """
+        return sorted(self.tools.intersection(served))
+
+
+#: The tool groups. What this partition fixes is which *class* of authority a
+#: role may hold; ticket 19 owns the handlers behind the names. Move a member
+#: between groups and a role's authority changes, which is why the group is the
+#: unit a role holds rather than the tool.
 TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     # The one tool `_launch` serves today: it reports that the runtime's tool
     # surface opened, and nothing else. Ticket 19 replaces it with the bounded
@@ -216,10 +292,16 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "mcp__rk2__get_artifact",
     ),
     "state.propose": ("mcp__rk2__submit_mission_result",),
-    "sched.commit": (
-        "mcp__rk2__offer_slate",
-        "mcp__rk2__claim_task",
-        "mcp__rk2__promote",
+    # Scheduling as the orchestrator sees it, which is not scheduling as the
+    # runtime does it. "The runtime decides what may be chosen; the orchestrator
+    # decides which; the runtime commits the claim" -- so the model reads a
+    # slate and picks from it, and every other member is a request the runtime
+    # is free to refuse. There is no `promote` here at all: promotion is the
+    # runtime step that turns a raw result into canonical rows, and a model-
+    # facing verb for it would be the agent promoting its own conclusions.
+    "sched.pick": (
+        "mcp__rk2__get_slate",
+        "mcp__rk2__pick_task",
         "mcp__rk2__request_validation",
         "mcp__rk2__request_report",
         "mcp__rk2__park_for_human",
@@ -231,10 +313,10 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
 
 #: Where an unconstrained value is allowed, and why. Two entries, both
 #: deliberate: a question whose recipient is a human rather than another agent,
-#: and the staging packet, whose contents become canonical only through
-#: `promote` and whose observations are dropped when the receipt they cite does
-#: not exist. Nothing else on this surface takes a value the roster cannot
-#: describe.
+#: and the staging packet, whose contents become canonical only through the
+#: runtime's promotion step and whose observations are dropped when the receipt
+#: they cite does not exist. Nothing else on this surface takes a value the
+#: roster cannot describe.
 OPEN_ARGUMENTS = {
     "mcp__rk2__park_for_human": ("question",),
     "mcp__rk2__submit_mission_result": (
@@ -251,10 +333,10 @@ _LABEL = "^{}-[0-9]{{4}}$"
 _HASH = "^[0-9a-f]{64}$"
 
 CONTRACTS: dict[str, Contract] = {
-    "mcp__rk2__ready": Contract("runtime.ready", "read"),
+    "mcp__rk2__ready": Contract("runtime.ready", READ),
     "mcp__rk2__get_attack_surface": Contract(
         "state.read",
-        "read",
+        READ,
         reads=("entities", "entity_endpoint", "entity_host", "entity_param"),
         arguments={
             "scope_label": Argument("string", pattern=_LABEL.format("S")),
@@ -264,7 +346,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__get_hypotheses": Contract(
         "state.read",
-        "read",
+        READ,
         reads=("hypotheses", "hypothesis_near_matches"),
         arguments={
             "entity_label": Argument("string", pattern=_LABEL.format("E")),
@@ -285,7 +367,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__get_evidence": Contract(
         "state.read",
-        "read",
+        READ,
         reads=("evidence", "observations"),
         arguments={
             "hypothesis_label": Argument("string", pattern=_LABEL.format("H")),
@@ -294,7 +376,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__get_receipts": Contract(
         "state.read",
-        "read",
+        READ,
         reads=("receipts",),
         arguments={
             "receipt_ids": Argument(
@@ -304,7 +386,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__get_artifact": Contract(
         "state.read",
-        "read",
+        READ,
         reads=("artifacts", "artifact_refs"),
         arguments={
             "artifact_hash": Argument("string", required=True, pattern=_HASH),
@@ -313,7 +395,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__submit_mission_result": Contract(
         "state.propose",
-        "propose",
+        PROPOSE,
         writes=("proposals",),
         arguments={
             "observations": Argument("array", required=True, free_text=True),
@@ -324,43 +406,37 @@ CONTRACTS: dict[str, Contract] = {
             "completion_claim": Argument("object", required=True, free_text=True),
         },
     ),
-    "mcp__rk2__offer_slate": Contract(
-        "sched.commit", "read", reads=("tasks", "task_slate")
+    "mcp__rk2__get_slate": Contract(
+        "sched.pick", READ, reads=("tasks", "task_slate")
     ),
-    "mcp__rk2__claim_task": Contract(
-        "sched.commit",
-        "commit",
-        writes=("tasks", "events"),
+    # A pick, not a claim. The row it writes is the orchestrator's choice; the
+    # claim transaction that re-evaluates every filter and moves the Task is the
+    # runtime's, and it falls through to the next slate entry when the choice
+    # has gone stale.
+    "mcp__rk2__pick_task": Contract(
+        "sched.pick",
+        REQUEST,
+        writes=("task_picks",),
         arguments={"task_label": Argument("string", required=True, pattern=_LABEL.format("T"))},
     ),
-    "mcp__rk2__promote": Contract(
-        "sched.commit",
-        "commit",
-        writes=("entities", "hypotheses", "findings", "evidence", "observations", "events"),
-        arguments={
-            "proposal_label": Argument("string", required=True, pattern=_LABEL.format("P")),
-            "decision": Argument("string", required=True, enum=("accept", "reject", "merge")),
-            "merge_into_label": Argument("string", pattern="^[EHF]-[0-9]{4}$"),
-        },
-    ),
     "mcp__rk2__request_validation": Contract(
-        "sched.commit",
-        "commit",
-        writes=("validation_queue", "events"),
+        "sched.pick",
+        REQUEST,
+        writes=("validation_queue",),
         arguments={
             "finding_label": Argument("string", required=True, pattern=_LABEL.format("F"))
         },
     ),
     "mcp__rk2__request_report": Contract(
-        "sched.commit",
-        "commit",
-        writes=("report_queue", "events"),
+        "sched.pick",
+        REQUEST,
+        writes=("report_queue",),
         arguments={"scope_label": Argument("string", pattern=_LABEL.format("S"))},
     ),
     "mcp__rk2__park_for_human": Contract(
-        "sched.commit",
-        "commit",
-        writes=("pending_decisions", "events"),
+        "sched.pick",
+        REQUEST,
+        writes=("pending_decisions",),
         arguments={
             "task_label": Argument("string", required=True, pattern=_LABEL.format("T")),
             "question_code": Argument(
@@ -379,7 +455,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__http_request": Contract(
         "net.request",
-        "act",
+        ACT,
         writes=("receipts", "artifacts", "artifact_refs"),
         arguments={
             "method": Argument(
@@ -395,12 +471,12 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__run_tool": Contract(
         "exec.tool_run",
-        "act",
+        ACT,
         writes=("tool_runs", "artifacts", "artifact_refs"),
         arguments={
-            # An enum, because an open binary name is an open allowlist, and an
-            # open allowlist on a tool that starts a process is the arbitrary
-            # process creation this surface does not have.
+            # An enum, because an open binary name is an unbounded set of
+            # programs, and an unbounded set on a tool that starts a process is
+            # the arbitrary process creation this surface does not have.
             "tool": Argument(
                 "string",
                 required=True,
@@ -412,7 +488,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__run_skill_script": Contract(
         "exec.tool_run",
-        "act",
+        ACT,
         writes=("tool_runs", "artifacts", "artifact_refs"),
         arguments={
             "skill_name": Argument("string", required=True, pattern="^[a-z0-9][a-z0-9-]{0,63}$"),
@@ -422,16 +498,20 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "mcp__rk2__get_validation_packet": Contract(
         "validate.judge",
-        "read",
+        READ,
         reads=("findings", "hypotheses", "test_specs", "replay_runs", "receipts"),
         arguments={
             "finding_label": Argument("string", required=True, pattern=_LABEL.format("F"))
         },
     ),
+    # The one direction that writes a row of its own rather than asking for
+    # one. A verdict is the validator's output, not an edit to the Finding it
+    # is about: what the Finding's status becomes is still the runtime's step,
+    # taken from this row and from a holding replay of the Finding's own Test.
     "mcp__rk2__submit_verdict": Contract(
         "validate.judge",
-        "commit",
-        writes=("verdicts", "events"),
+        JUDGE,
+        writes=("verdicts",),
         arguments={
             "finding_label": Argument("string", required=True, pattern=_LABEL.format("F")),
             "verdict": Argument(
@@ -443,7 +523,7 @@ CONTRACTS: dict[str, Contract] = {
 }
 
 #: Built-in tools no role holds, each with the reason it holds none. Together
-#: with the grants below this partitions the observed inventory exactly: a tool
+#: with the roles below this partitions the observed inventory exactly: a tool
 #: that is neither granted nor refused here is a tool this roster has not
 #: classified, and the compile refuses rather than defaulting it either way.
 FORBIDDEN_BUILTINS: dict[str, str] = {
@@ -489,7 +569,7 @@ ROLES: dict[str, Role] = {
         # target. No Skill: a technique is executed by the role that holds the
         # task, and the SDK reads an empty skill list as every skill, so the
         # tool is absent rather than granted with a bound that does not bind.
-        tool_groups=("runtime.ready", "state.read", "sched.commit"),
+        tool_groups=("runtime.ready", "state.read", "sched.pick"),
         skills=(),
         max_concurrent=1,
     ),
@@ -518,10 +598,12 @@ ROLES: dict[str, Role] = {
         builtin_tools=(SKILL,),
         tool_groups=("runtime.ready", "state.read", "state.propose", "net.request", "exec.tool_run"),
         skills=("access-control", "injection", "business-logic", "auth-session"),
+        max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:
         # two hunters sharing one upstream slot is the session mixing that the
-        # identity model exists to prevent.
-        max_concurrent=2,
+        # identity model exists to prevent. Migration 0019 carries the same
+        # `true`, and the clamp itself is the scheduler's.
+        clamp_to_identity_leases=True,
     ),
     "js_analyst": Role(
         name="js_analyst",
@@ -635,6 +717,7 @@ class Gate:
         self.denials: list[Denial] = []
         self._bindings: dict[str, str] = {}
         self._outstanding: dict[str, str] = {}
+        self._admitted = 0
 
     @property
     def outstanding(self) -> int:
@@ -658,12 +741,7 @@ class Gate:
         """
         recorded = self._bindings.setdefault(agent_id, agent_type)
         if recorded != agent_type:
-            denial = Denial(
-                IMPERSONATION,
-                DELEGATION,
-                self.role.name,
-                f"agent {agent_id} was started as {recorded} and now claims {agent_type}",
-            )
+            denial = _impersonation(DELEGATION, agent_id, recorded, agent_type)
             self.denials.append(denial)
             return denial
         return None
@@ -693,6 +771,14 @@ class Gate:
                 f"no tool on this surface takes {forbidden}",
             )
 
+        # The contract is the tool's whole surface, so a call that does not fit
+        # it is refused here rather than by the handler. Without this the enum
+        # on `run_tool.tool` would be a description of the handler's own check,
+        # and a roster that only describes is a roster the gate does not carry.
+        fault = _argument_fault(tool, call.arguments)
+        if fault is not None:
+            return Denial(INVALID_ARGUMENT, tool, role.name, fault)
+
         if tool == SKILL:
             return self._skill(role, call)
         if tool == DELEGATION:
@@ -711,21 +797,27 @@ class Gate:
                 None,
                 "a delegated call carries both an agent id and an agent type",
             )
-        if kind not in ROLES or ROLES[kind].runs_as != SUBAGENT:
+        if kind not in ROLES or not ROLES[kind].delegated:
             return None, Denial(
                 UNATTRIBUTED,
                 call.tool,
                 None,
                 f"{kind} is not a role this runtime delegates to",
             )
+        # An identity the runtime never saw start is a claim, not an
+        # attribution, whatever type it carries. `SubagentStart` is what makes
+        # the difference, so a call that arrives before one is refused rather
+        # than believed and recorded.
         recorded = self._bindings.get(identity)
-        if recorded is not None and recorded != kind:
+        if recorded is None:
             return None, Denial(
-                IMPERSONATION,
+                UNATTRIBUTED,
                 call.tool,
-                recorded,
-                f"agent {identity} was started as {recorded} and now claims {kind}",
+                None,
+                f"agent {identity} called before the runtime saw it start",
             )
+        if recorded != kind:
+            return None, _impersonation(call.tool, identity, recorded, kind)
         return ROLES[kind], None
 
     def _skill(self, role: Role, call: Call) -> Denial | None:
@@ -751,7 +843,7 @@ class Gate:
                 role.name,
                 f"{wanted!r} is not a roster role",
             )
-        if target.runs_as != SUBAGENT:
+        if not target.delegated:
             return Denial(
                 SESSION_ROLE,
                 DELEGATION,
@@ -787,7 +879,11 @@ class Gate:
                 role.name,
                 f"this session is at its concurrency of {GLOBAL_SUBAGENTS}",
             )
-        self._outstanding[ticket or f"{target.name}:{self.outstanding}"] = target.name
+        # A monotonic key rather than the current count: two admissions either
+        # side of a release would otherwise be counted once, and the ceiling
+        # would be one delegation wider than it says.
+        self._admitted += 1
+        self._outstanding[ticket or f"{target.name}#{self._admitted}"] = target.name
         return None
 
 
@@ -817,38 +913,91 @@ def _forbidden_argument(arguments: Any, depth: int = 0) -> str | None:
     return None
 
 
+def _impersonation(tool: str, identity: str, recorded: str, claimed: str) -> Denial:
+    """One sentence for one finding, wherever the gate reaches it.
+
+    `bind` sees it when `SubagentStart` announces the same identity twice as
+    two roles; `_caller` sees it when a call arrives claiming a role that
+    identity was not started as. It is the same violation seen from two hooks,
+    so it is one denial with one wording and one role field.
+    """
+    return Denial(
+        IMPERSONATION,
+        tool,
+        recorded,
+        f"agent {identity} was started as {recorded} and now claims {claimed}",
+    )
+
+
+def _argument_fault(tool: str, arguments: Mapping[str, Any]) -> str | None:
+    """The first way this call does not fit the contract, or nothing.
+
+    A built-in tool has no contract here and is not constrained by this: `Task`
+    and `Skill` carry their own rules, and every other built-in a role holds is
+    already the empty set.
+    """
+    contract = CONTRACTS.get(tool)
+    if contract is None:
+        return None
+    for name in arguments:
+        if name not in contract.arguments:
+            return f"{tool} takes no argument named {name!r}"
+    for name, argument in contract.arguments.items():
+        if name not in arguments:
+            if argument.required:
+                return f"{tool} requires {name}"
+            continue
+        fault = _value_fault(argument, arguments[name])
+        if fault is not None:
+            return f"{tool}.{name} {fault}"
+    return None
+
+
+def _value_fault(argument: Argument, value: Any) -> str | None:
+    """One value against one argument's declared shape."""
+    if not _is_kind(argument.kind, value):
+        return f"is not {argument.kind}"
+    if argument.enum and value not in argument.enum:
+        return f"is not one of: {', '.join(argument.enum)}"
+    if argument.pattern is not None and not re.search(argument.pattern, value):
+        return f"does not match {argument.pattern}"
+    if argument.items_pattern is not None:
+        # An object's members are constrained by their names -- a header set is
+        # the case that matters, and its names are what the roster can bound.
+        members = value.keys() if isinstance(value, Mapping) else value
+        for member in members:
+            if not isinstance(member, str) or not re.search(argument.items_pattern, member):
+                return f"contains {member!r}, which does not match {argument.items_pattern}"
+    if argument.bounds is not None:
+        low, high = argument.bounds
+        measure = value if isinstance(value, int) else len(value)
+        if not low <= measure <= high:
+            return f"is outside {low}-{high}"
+    return None
+
+
+def _is_kind(kind: str, value: Any) -> bool:
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "integer":
+        # A bool is an int in Python and is not one here: a flag arriving where
+        # a count belongs is the confusion this check exists to catch.
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "array":
+        return isinstance(value, (list, tuple))
+    return isinstance(value, Mapping)
+
+
 def inventory() -> Mapping[str, Any]:
     """The observed tool inventory, read once and checked against its digest."""
     return _INVENTORY
 
 
-def builtin_grants() -> frozenset[str]:
+def granted_builtins() -> frozenset[str]:
     """Every built-in tool some role holds. The other half of the partition."""
     return frozenset(tool for role in ROLES.values() for tool in role.builtin_tools)
-
-
-def visible_tools(role: str) -> list[str]:
-    """The built-in tools a role's options value offers, in a stable order.
-
-    Visibility, not authority. It is here so the options value and the gate are
-    derived from one statement rather than agreeing by inspection, and so a
-    role's frame is the role's real surface: a tool the gate would deny is not
-    offered, and the model does not spend a turn discovering that.
-    """
-    return sorted(ROLES[role].builtin_tools)
-
-
-def allowed_tools(role: str, served: Iterable[str]) -> list[str]:
-    """The role's grants, intersected with what this launch actually serves.
-
-    Two lists rather than one, because they answer different questions: the
-    roster says what the role may call and the launch says what exists to be
-    called. Naming a tool no server provides would be an allowlist entry that
-    can never be exercised, and serving a tool the roster withholds would be a
-    tool the gate has to deny at every call instead of one nobody offered.
-    """
-    grants = ROLES[role].tools
-    return sorted(grants.intersection(served))
 
 
 def _load_inventory() -> Mapping[str, Any]:
@@ -866,20 +1015,26 @@ def _load_inventory() -> Mapping[str, Any]:
         value = measured.get(key)
         if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
             raise RosterError(f"tool inventory {key} must be an array of strings")
+    models = measured.get("models")
+    if not isinstance(models, Mapping) or not all(
+        isinstance(alias, str) and isinstance(resolved, str)
+        for alias, resolved in models.items()
+    ):
+        raise RosterError("tool inventory models must be an object of strings")
     return measured
 
 
 def _check_inventory(measured: Mapping[str, Any]) -> None:
     """Every built-in name this roster uses is one the pair actually serves.
 
-    Both halves matter and they fail differently. A grant naming a tool the
-    pair does not serve is a role that silently has one capability fewer than
-    the roster says, because an unknown name in `tools` is dropped rather than
-    rejected. A prohibition naming one is worse: it reads as a closed door and
-    is a door that was never in the wall.
+    Both halves matter and they fail differently. A role naming a tool the pair
+    does not serve silently holds one tool fewer than the roster says, because
+    an unknown name in `tools` is dropped rather than rejected. A prohibition
+    naming one is worse: it reads as a closed door and is a door that was never
+    in the wall.
     """
     observed = set(measured["builtin_tools"])
-    granted = builtin_grants()
+    granted = granted_builtins()
     forbidden = set(FORBIDDEN_BUILTINS)
 
     overlap = sorted(granted & forbidden)
@@ -908,6 +1063,7 @@ def _check_inventory(measured: Mapping[str, Any]) -> None:
 def _check_roles(measured: Mapping[str, Any]) -> None:
     """Each role, against the shape its `runs_as` and the SDK's vocabulary allow."""
     efforts = set(measured["effort_levels"])
+    models = measured["models"]
     for name, role in ROLES.items():
         if name != role.name:
             raise RosterError(f"{name} is filed under another name")
@@ -918,19 +1074,19 @@ def _check_roles(measured: Mapping[str, Any]) -> None:
         for caller in role.invocable_by:
             if caller != RUNTIME and caller not in ROLES:
                 raise RosterError(f"{name}: {caller} is neither the runtime nor a role")
-        if role.runs_as == SUBAGENT and RUNTIME in role.invocable_by:
+        if role.delegated and RUNTIME in role.invocable_by:
             raise RosterError(f"{name}: a subagent is reached through the delegation tool")
-        if role.runs_as != SUBAGENT and tuple(role.invocable_by) != (RUNTIME,):
+        if not role.delegated and tuple(role.invocable_by) != (RUNTIME,):
             raise RosterError(f"{name}: only the runtime starts a {role.runs_as}")
         if role.max_concurrent < 1:
             raise RosterError(f"{name}: a role runs at least once at a time")
         for group in role.tool_groups:
             if group not in TOOL_GROUPS:
-                raise RosterError(f"{name}: {group} is not a capability group")
+                raise RosterError(f"{name}: {group} is not a tool group")
         if len(set(role.tool_groups)) != len(role.tool_groups):
             raise RosterError(f"{name}: a group is granted twice")
 
-        if role.runs_as == RENDERER:
+        if role.rendered:
             # Not an agent. The schema says the same with a check constraint
             # that refuses a renderer holding a model, an effort or a token.
             if (role.model, role.effort, role.max_turns) != (None, None, 0):
@@ -938,8 +1094,11 @@ def _check_roles(measured: Mapping[str, Any]) -> None:
             if role.builtin_tools or role.tool_groups or role.skills:
                 raise RosterError(f"{name}: a renderer holds no tool and no skill")
             continue
-        if not role.model:
-            raise RosterError(f"{name}: a role that runs a model names one")
+        # An alias, against what the pair was measured to resolve it to. A role
+        # naming one the pair does not know would still start -- on some other
+        # model, and without saying which.
+        if role.model not in models:
+            raise RosterError(f"{name}: {role.model} is not a model alias this pair resolves")
         if role.effort not in efforts:
             raise RosterError(f"{name}: {role.effort} is not an effort this SDK accepts")
         if role.max_turns < 1:
@@ -972,12 +1131,13 @@ def _check_task_kinds() -> None:
 def _check_contracts() -> None:
     """Every group member has a contract, and every contract keeps its promises.
 
-    The three rules that run through the surface are checked here rather than
+    The four rules that run through the surface are checked here rather than
     described: nothing takes a program or a credential, a read writes nothing,
-    and nothing the validator can reach takes a value this roster does not
-    constrain. The last is what keeps a validator blind -- there is no field on
-    its surface that a hunter's sentence would fit in, so the packet builder is
-    not the only thing standing between the two.
+    no direction reaches a canonical table, and nothing the validator can reach
+    takes a value this roster does not constrain. The last is what keeps a
+    validator blind -- there is no field on its surface that a hunter's sentence
+    would fit in, so the packet builder is not the only thing standing between
+    the two.
     """
     members = [member for group in TOOL_GROUPS.values() for member in group]
     if len(set(members)) != len(members):
@@ -989,12 +1149,26 @@ def _check_contracts() -> None:
     for name, contract in CONTRACTS.items():
         if TOOL_GROUPS.get(contract.group) is None or name not in TOOL_GROUPS[contract.group]:
             raise RosterError(f"{name}: is not a member of the group it declares")
-        if contract.direction not in ("read", "propose", "commit", "act"):
+        if contract.direction not in DIRECTIONS:
             raise RosterError(f"{name}: {contract.direction} is not a direction")
-        if contract.direction == "read" and contract.writes:
+        if contract.direction == READ and contract.writes:
             raise RosterError(f"{name}: a read tool that writes is a proposal named as a getter")
-        if contract.direction == "propose" and set(contract.writes) != {"proposals"}:
+        if contract.direction == PROPOSE and set(contract.writes) != {"proposals"}:
             raise RosterError(f"{name}: a proposal writes staging and nothing else")
+        if contract.direction == REQUEST and not contract.writes:
+            raise RosterError(f"{name}: a request writes the row the runtime reads")
+        if contract.direction == JUDGE and set(contract.writes) != {"verdicts"}:
+            raise RosterError(f"{name}: a judgement writes its verdict and nothing else")
+        if contract.direction == ACT and not contract.writes:
+            raise RosterError(f"{name}: an act that records nothing leaves no receipt")
+        # Nothing an agent returns is true before promotion, and promotion is a
+        # runtime step. A model-facing tool that wrote one of these would be the
+        # agent writing canonical truth directly, whatever its group says.
+        canonical = sorted(set(contract.writes) & set(CANONICAL))
+        if canonical:
+            raise RosterError(f"{name}: writes canonical state directly: {canonical}")
+        if "verdicts" in contract.writes and contract.direction != JUDGE:
+            raise RosterError(f"{name}: a verdict row is a judgement's and no other's")
         for argument_name, argument in contract.arguments.items():
             _check_argument(name, contract, argument_name, argument)
 
@@ -1002,6 +1176,8 @@ def _check_contracts() -> None:
 def _check_argument(tool: str, contract: Contract, name: str, argument: Argument) -> None:
     if name.strip().lower() in FORBIDDEN_ARGUMENTS:
         raise RosterError(f"{tool}: no contract may declare {name}")
+    if argument.kind not in KINDS:
+        raise RosterError(f"{tool}.{name}: {argument.kind} is not a value shape")
     if argument.free_text == argument.constrained:
         raise RosterError(f"{tool}.{name}: is either constrained or declared unconstrained")
     if argument.free_text and name not in OPEN_ARGUMENTS.get(tool, ()):
@@ -1021,7 +1197,7 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
 def _check_authority() -> None:
     """The three sentences the ticket makes about who holds what, as checks."""
     orchestrator = ROLES["orchestrator"]
-    if not {"sched.commit", "state.read"}.issubset(orchestrator.tool_groups):
+    if not {"sched.pick", "state.read"}.issubset(orchestrator.tool_groups):
         raise RosterError("the orchestrator schedules and reads state")
     if {"net.request", "exec.tool_run"} & set(orchestrator.tool_groups):
         raise RosterError("the orchestrator does not contact targets")
@@ -1032,13 +1208,13 @@ def _check_authority() -> None:
     if tuple(validator.tool_groups) != ("validate.judge",) or validator.builtin_tools:
         raise RosterError("the validator holds only its judgement surface")
 
-    # Scheduling and promotion stay runtime authority, which here means one
-    # role that never executes a task holds them and the executing roles do not.
+    # Scheduling stays runtime authority, which here means one role that never
+    # executes a task does the choosing and the executing roles do not.
     for name, role in ROLES.items():
-        if "sched.commit" in role.tool_groups and role.executes_tasks:
-            raise RosterError(f"{name}: executes tasks and commits scheduling")
-        if "state.propose" in role.tool_groups and "sched.commit" in role.tool_groups:
-            raise RosterError(f"{name}: proposes and promotes its own proposals")
+        if "sched.pick" in role.tool_groups and role.executes_tasks:
+            raise RosterError(f"{name}: executes tasks and chooses which tasks run")
+        if "state.propose" in role.tool_groups and "sched.pick" in role.tool_groups:
+            raise RosterError(f"{name}: proposes results and schedules the work they justify")
 
 
 def _compile() -> Mapping[str, Any]:

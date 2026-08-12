@@ -3,10 +3,11 @@
 
 The roster is a closed list, and a closed list is only closed against
 something. This is that something: the built-in tools the CLI actually serves,
-the agent types it will start on its own, and the two vocabularies the SDK
-accepts for effort and permission mode. Every one is read off the running pair
-rather than off documentation, because what the roster has to be checked
-against is what a child would actually be offered.
+the agent types it will start on its own, what each model alias a role may name
+resolves to, and the two vocabularies the SDK accepts for effort and permission
+mode. Every one is read off the running pair rather than off documentation,
+because what the roster has to be checked against is what a child would
+actually be offered.
 
 It runs offline and bills nothing. The model API is `tests.fixtures`'
 `ControlUpstream` on loopback -- a real socket the real CLI reaches through
@@ -56,8 +57,14 @@ REPETITIONS = 2
 SETTINGS = {"env": {}}
 VOCABULARIES = (("effort_levels", "EffortLevel"), ("permission_modes", "PermissionMode"))
 
+#: The model aliases whose resolution is measured. A role names an alias, but
+#: what it runs is whatever the pair resolves that alias to, and the two are not
+#: the same claim: an alias the pair does not know resolves to something else
+#: without saying so. Read off the init frame for the same reason as the tools.
+MODEL_ALIASES = ("opus", "sonnet", "haiku")
 
-def observation(root: Path) -> dict:
+
+def observation(root: Path, model: str | None = None) -> dict:
     """One init message from one real child, as the facts it announced."""
     from redkraken import tls
     from tests import fixtures
@@ -83,12 +90,12 @@ def observation(root: Path) -> dict:
         }
     )
     try:
-        return asyncio.run(_announced(launch))
+        return asyncio.run(_announced(launch, model))
     finally:
         upstream.stop()
 
 
-async def _announced(launch: Path) -> dict:
+async def _announced(launch: Path, model: str | None) -> dict:
     """Start the pair, read its announcement, and stop before it does work."""
     import claude_agent_sdk
     from claude_agent_sdk import ClaudeAgentOptions, SystemMessage, query
@@ -104,6 +111,7 @@ async def _announced(launch: Path) -> dict:
         sandbox=None,
         settings=str(launch / "settings.json"),
         cli_path=str(bundled),
+        model=model,
     )
     messages = query(prompt="Say nothing.", options=options)
     try:
@@ -125,16 +133,22 @@ def vocabularies() -> dict[str, list[str]]:
     }
 
 
-def manifest(announcements: list[dict]) -> dict:
-    """One inventory, or nothing, when the pair did not answer the same twice."""
-    import claude_agent_sdk
-    from claude_agent_sdk import _cli_version
-
-    fields = ("tools", "agents", "model")
-    first, *rest = ({field: announcement[field] for field in fields} for announcement in announcements)
+def agreed(announcements: list[dict], fields: tuple[str, ...]) -> dict:
+    """The answer the pair gave every time, or nothing because it varied."""
+    first, *rest = (
+        {field: announcement[field] for field in fields} for announcement in announcements
+    )
     for other in rest:
         if other != first:
             raise SystemExit(f"the pair announced two inventories: {first} then {other}")
+    return first
+
+
+def manifest(announcements: list[dict], models: dict[str, str]) -> dict:
+    """One inventory, or nothing, when the pair did not answer the same twice."""
+    from claude_agent_sdk import _cli_version
+
+    first = agreed(announcements, ("tools", "agents", "model"))
     return {
         "schema_version": 1,
         "runtime": {
@@ -149,8 +163,18 @@ def manifest(announcements: list[dict]) -> dict:
         },
         "builtin_tools": sorted(first["tools"]),
         "agent_types": sorted(first["agents"]),
+        "models": models,
         **vocabularies(),
     }
+
+
+def resolutions(root: Path, repetitions: int) -> dict[str, str]:
+    """What each measured alias is, once the pair has been asked for it."""
+    resolved = {}
+    for alias in MODEL_ALIASES:
+        announcements = [observation(root, alias) for _ in range(repetitions)]
+        resolved[alias] = agreed(announcements, ("model",))["model"]
+    return resolved
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -168,9 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(tempfile.mkdtemp(prefix="rk2-inventory-"))
     try:
         announcements = [observation(root) for _ in range(arguments.repetitions)]
+        models = resolutions(root, arguments.repetitions)
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    print(json.dumps(manifest(announcements), indent=2, sort_keys=True))
+    print(json.dumps(manifest(announcements, models), indent=2, sort_keys=True))
     return 0
 
 

@@ -209,9 +209,9 @@ def options(launch, cli_path: str, role: str = fixtures.ROLE, **overrides):
         "setting_sources": [],
         "sandbox": None,
         "cwd": str(launch),
-        "tools": roster.visible_tools(role),
+        "tools": compiled.visible_tools,
         "permission_mode": agent.PERMISSION_MODE,
-        "allowed_tools": roster.allowed_tools(role, agent.SERVED),
+        "allowed_tools": compiled.allowed_tools(agent.SERVED),
         "mcp_servers": {agent.SERVER: object()},
         "settings": str(launch / agent.SETTINGS),
         "cli_path": cli_path,
@@ -738,7 +738,7 @@ class OptionsTest(unittest.TestCase):
         # the job document would be a second roster, and the assertion checking
         # them against the first would be checking a copy against itself.
         for name, role in roster.ROLES.items():
-            if role.runs_as == roster.RENDERER:
+            if role.rendered:
                 continue
             with self.subTest(role=name):
                 value, _, _ = self.built(name)
@@ -960,19 +960,26 @@ class ContainedChildTest(unittest.TestCase):
 
     @unittest.skipIf(not INSTALLED, NEEDS_SDK)
     def test_a_tool_the_child_can_see_and_run_is_still_refused_by_the_gate(self):
-        """The deny canary: visibility and permission mode are not the allowlist.
+        """The deny canary: what the options value says is not what decides.
 
         Everything that would let this call through is deliberately left open.
         `Task` is in the role's own `tools`, so the model can see it and the
-        CLI will dispatch it. The permission mode is `bypassPermissions`, so
-        there is no prompt and no allowlist consulted. The subagent type is one
-        the pair genuinely ships, so it is a type the CLI could start. The only
-        thing standing between the model and a session with no roster row is
+        CLI will dispatch it -- and it is *not* in the options value's
+        `allowed_tools`, which is exactly `[mcp__rk2__ready]`, so this call is
+        also the demonstration that the list the launch hands the SDK is not
+        the boundary. The permission mode is `bypassPermissions`, so there is
+        no prompt and nothing consulted. The subagent type is one the pair
+        genuinely ships, so it is a type the CLI could start. The only thing
+        standing between the model and a session with no roster row is
         `Gate.decide`, and this is the run that proves it is enough -- in the
         child, through the real hook, not against the decision function.
         """
         started = "Explore"
         self.assertIn(started, roster.inventory()["agent_types"])
+        # The widening this refutes, stated as the two lists it happens between.
+        role = roster.ROLES[fixtures.ROLE]
+        self.assertIn(roster.DELEGATION, role.visible_tools)
+        self.assertNotIn(roster.DELEGATION, role.allowed_tools(agent.SERVED))
         # A complete call, on purpose. The CLI validates a tool's input against
         # its schema before the hook runs, so an incomplete one is rejected
         # upstream of the gate and would prove nothing about the gate: dropping

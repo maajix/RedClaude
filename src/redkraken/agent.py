@@ -456,7 +456,7 @@ def assess(
     runtime: Mapping[str, object],
     *,
     launch_dir: Path | str,
-    role: object,
+    role: str,
     managed_settings: Sequence[Path] | None = None,
 ) -> tuple[dict, ...]:
     """Everything about this launch that can be decided before it happens.
@@ -490,13 +490,11 @@ def assess(
 
     unmeasured = _runtime_violations(options, runtime)
     configuration.extend(unmeasured)
-    launchable = isinstance(role, str) and role in roster.ROLES
-    if launchable and roster.ROLES[str(role)].runs_as == roster.RENDERER:
-        # A renderer is a role of this harness and not a session of this SDK.
-        # It has no model, no turn and no tool, so there is nothing here for it
-        # to be assessed as, and a door that started one would be a door that
-        # made it an agent.
-        launchable = False
+    # A renderer is a role of this harness and not a session of this SDK. It
+    # has no model, no turn and no tool, so there is nothing here for it to be
+    # assessed as, and a door that started one would be a door that made it an
+    # agent.
+    launchable = role in roster.ROLES and not roster.ROLES[role].rendered
     if not launchable:
         configuration.append(_violation(INVALID_LAUNCH, "launch:role"))
     elif not any(violation["code"] == UNMEASURED_RUNTIME for violation in unmeasured):
@@ -507,7 +505,7 @@ def assess(
         # The environment and the settings files are read either way: they are
         # facts about the machine, and an operator fixing the runtime pair
         # should learn about their exported key in the same breath.
-        configuration.extend(_option_violations(options, launch, str(role)))
+        configuration.extend(_option_violations(options, launch, role))
     settings, settings_violations = _settings_documents(options, launch, managed)
     configuration.extend(settings_violations)
 
@@ -631,10 +629,10 @@ def _option_violations(options: object, launch: Path, role: str) -> list[dict]:
         "setting_sources": getattr(options, "setting_sources", None) == [],
         "sandbox": getattr(options, "sandbox", "unset") is None,
         "cwd": getattr(options, "cwd", None) == str(launch) and launch.is_dir(),
-        "builtin_tools": getattr(options, "tools", None) == roster.visible_tools(role),
+        "builtin_tools": getattr(options, "tools", None) == expected.visible_tools,
         "permission_mode": getattr(options, "permission_mode", None) == PERMISSION_MODE,
         "allowed_tools": getattr(options, "allowed_tools", None)
-        == roster.allowed_tools(role, SERVED),
+        == expected.allowed_tools(SERVED),
         "mcp_servers": isinstance(served, Mapping) and set(served) == {SERVER},
         "model": getattr(options, "model", "unset") == expected.model,
         "effort": getattr(options, "effort", "unset") == expected.effort,

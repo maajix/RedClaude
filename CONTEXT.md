@@ -111,6 +111,36 @@ runtime decides what may be chosen; the orchestrator decides which; the runtime
 commits the claim.
 _Avoid_: Queue, candidates, shortlist, options
 
+**Roster**:
+The closed statement of every role this harness runs and what each one may call,
+compiled against a measured inventory of the SDK/CLI pair's own tools. One
+document, so the schema, the launch and the gate cannot each hold a different
+answer.
+_Avoid_: Registry, config, agent list, manifest
+
+**Role**:
+One row of the roster: how it runs, who may start it, which task kinds it
+executes, its model, effort and turn ceiling, its tools, its skills and how many
+of it may run at once. Not a persona and not a prompt — a bound.
+_Avoid_: Agent type, persona, profile, worker
+
+**Tool group**:
+The unit of authority a role holds, naming a class of tool rather than one tool.
+Moving a tool between groups changes what every role holding either can do,
+which is why the group is what a role is granted.
+_Avoid_: Scope, permission set, namespace, capability
+
+**Pre-tool gate**:
+The runtime's decision on one tool call, taken before the call runs and from the
+roster alone. It is the enforcement point: what the model is shown and what the
+permission mode allows are context management, and this is the boundary.
+_Avoid_: Filter, middleware, hook, policy engine
+
+**Denial**:
+One refusal by the pre-tool gate, carrying the rule it violated so a run's
+evidence distinguishes a call the model never made from one it made and lost.
+_Avoid_: Error, rejection, block, violation
+
 **Agent run**:
 One invocation of one subagent role, carrying the mission packet in and its raw,
 unpromoted result out.

@@ -11,26 +11,33 @@ the only thing that proves per-story implementation.
 ## Structural validation
 
 Re-measured 2026-08-12, after tickets 67–70 were raised by the ticket-14 review
-and triaged into the graph.
+and 71–73 by the ticket-18 review, all triaged into the graph.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 70, numbered continuously 01–70 |
-| Ticket status | 18 `resolved`, 52 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 414 total, 108 ticked |
-| Blocking edges | 131 exact title-and-number references |
+| Ticket files | 73, numbered continuously 01–73 |
+| Ticket status | 18 `resolved`, 55 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 424 total, 108 ticked |
+| Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
-| Release reachability | Every ticket except 67–70 has a dependency path to ticket 65 |
+| Release reachability | Every ticket except 67–73 has a dependency path to ticket 65 |
 | Absolute, scratch or issue-file paths in tickets | 0 |
 
 Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
 the plan's reachability property. Ticket 62 now lists it as a blocker, which
-restored it. Tickets 67–70 are in the same position and not yet resolved the
+restored it. Tickets 67–73 are in the same position and not yet resolved the
 same way: each names a blocker, so none of them is a way to start work early,
-but nothing downstream names them, so today they are four sinks beside 65 rather
+but nothing downstream names them, so today they are seven sinks beside 65 rather
 than work the release depends on. Whichever later ticket owns their outcome has
 to list them before that claim reads "every ticket" again.
+
+Tickets 71–73 are drift the ticket-18 review found between the compiled roster
+and the scheduler that will read it: the model and effort a claimed run records,
+the Identity a clamped role must hold, and the cross-role subagent cap that is
+written once in `roster.py` and once as a `scheduler_weights` column. Each is
+blocked by the scheduler ticket that owns the code it changes (23 and 24), which
+is also why none of them was fixed under 18.
 
 ## Implementation progress
 
@@ -38,7 +45,7 @@ to list them before that claim reads "every ticket" again.
 | --- | --- |
 | Resolved | 01–18 |
 | Unblocked and open | 19, 66, 67, 68, 70 |
-| Criteria ticked | 108 of 414 |
+| Criteria ticked | 108 of 424 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
