@@ -743,6 +743,19 @@ class Policy:
         """The time window the budgets are counted over, in seconds."""
         return dict(self.budgets)["window_seconds"]
 
+    def channel(self, name: str) -> Channel | None:
+        """The channel declared under that name, or nothing when none is.
+
+        Beside `channels` rather than in a caller, because both questions the
+        callback verbs ask -- whether this Program declares a channel by that
+        name, and which channel `decide_callback` named -- are the same lookup,
+        and two spellings of one lookup are two answers waiting to disagree.
+        """
+        for channel in self.channels:
+            if channel.name == name:
+                return channel
+        return None
+
     def document(self) -> dict:
         """The policy as `program_scope_versions.policy` holds it.
 
@@ -866,6 +879,7 @@ def compile_policy(
         )
 
     channels: list[Channel] = []
+    endpoints: dict[str, str] = {}
     for index, entry in enumerate(document["callback"]):
         source = f"callback[{index}]"
         if entry["host"].startswith("*."):
@@ -885,6 +899,21 @@ def compile_policy(
         except PolicyError as error:
             refusals.append(_refusal(f"{source}.host", error.detail))
             continue
+        if host in endpoints:
+            # One endpoint, one channel, which is what `program_callback_channels`
+            # keys on as well. Two names for one host would make "which channel
+            # admitted this arrival" a question about declaration order, and the
+            # projection would silently keep one row while the compiler reported
+            # two channels.
+            refusals.append(
+                _refusal(
+                    f"{source}.host",
+                    f"{host} is already the endpoint of callback {endpoints[host]}; "
+                    "one endpoint is one channel",
+                )
+            )
+            continue
+        endpoints[host] = entry["name"]
         channels.append(Channel(name=entry["name"], kind=entry["kind"], host=host))
         if entry["kind"] == "http":
             # A DNS channel is not an HTTP destination, so only this kind
@@ -1074,20 +1103,27 @@ def decide_callback(policy: Policy, host: object) -> Verdict:
     Never `target`, whatever else the policy says about the host: an interaction
     with the harness's own listener is evidence that something reached out, not
     evidence about a target surface.
+
+    Which channel is named, when a Program declares one beneath another, is the
+    most specific declaration -- the same rule `decide_request` applies to rules
+    and for the same reason. It also decides where the correlator ends: the
+    label beneath `a.oob.example.net` is a label of that channel and not a
+    longer canary on its parent.
     """
     try:
         observed = normalize_host(host)
     except PolicyError as error:
         return Verdict(scope_class=DENIED, reason=error.reason, detail=error.detail)
-    for channel in policy.channels:
-        if channel.admits(observed):
-            return Verdict(
-                scope_class=EGRESS_SUPPORT,
-                reason="matched_callback",
-                channel=channel.name,
-                detail=observed,
-            )
-    return Verdict(scope_class=DENIED, reason="unlisted", detail=observed)
+    admitting = [channel for channel in policy.channels if channel.admits(observed)]
+    if not admitting:
+        return Verdict(scope_class=DENIED, reason="unlisted", detail=observed)
+    channel = max(admitting, key=lambda entry: len(entry.host))
+    return Verdict(
+        scope_class=EGRESS_SUPPORT,
+        reason="matched_callback",
+        channel=channel.name,
+        detail=observed,
+    )
 
 
 def decide_action(policy: Policy, control: object) -> Permission:

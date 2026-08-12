@@ -18,6 +18,7 @@ from redkraken import (
     __version__,
     artifact,
     backup,
+    callback,
     decisions,
     doctor,
     header,
@@ -352,6 +353,124 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     header_provision.set_defaults(run=_header_provision)
+
+    callbacks = commands.add_parser(
+        "callback",
+        help="mint a correlator for a declared out-of-band channel, and admit what arrives",
+    )
+    callback_operations = callbacks.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+
+    callback_provision = callback_operations.add_parser(
+        "provision",
+        help=(
+            "mint one correlator for one subject on one declared callback "
+            f"channel (${DATABASE_URL})"
+        ),
+        description=(
+            "Mints a correlator and prints the address to embed. The correlator "
+            "is not a credential and holding it authorises nothing; it is what "
+            "makes an arrival attributable to this Program and this subject, and "
+            "it stops doing that when it expires. Only the digest is stored, so "
+            "the address is printed once and cannot be read back."
+        ),
+    )
+    _add_url(callback_provision, RUNTIME)
+    callback_provision.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and the callback channel",
+    )
+    callback_provision.add_argument(
+        "--channel",
+        required=True,
+        metavar="name",
+        help="the declared channel name to mint against",
+    )
+    callback_provision.add_argument(
+        "--subject",
+        required=True,
+        metavar="label",
+        help=(
+            "the entity label an arrival would be an Observation about; a "
+            "correlator has a subject because the Observation it produces has one"
+        ),
+    )
+    callback_provision.add_argument(
+        "--for",
+        dest="lifetime",
+        type=int,
+        default=callback.DEFAULT_LIFETIME,
+        metavar="seconds",
+        help=(
+            "how long the correlator stays live; an expired one confirms nothing "
+            f"(default: {callback.DEFAULT_LIFETIME})"
+        ),
+    )
+    callback_provision.add_argument(
+        "--tool-run",
+        dest="tool_run",
+        metavar="uuid",
+        help="bind the correlator to the Tool run that will carry it",
+    )
+    callback_provision.add_argument(
+        "--test-run",
+        dest="test_run",
+        metavar="uuid",
+        help="bind the correlator to the Test run that will carry it",
+    )
+    callback_provision.set_defaults(run=_callback_provision)
+
+    callback_accept = callback_operations.add_parser(
+        "accept",
+        help=(
+            "admit one interaction a listener recorded and promote it into an "
+            f"Observation (${DATABASE_URL})"
+        ),
+        description=(
+            "Takes an arrival the operator's own listener recorded. Contacts no "
+            "callback provider and opens no socket: the bytes are read from a "
+            "file and the admission decision is the database's. An arrival at a "
+            "name no declared channel admits, or one carrying a correlator that "
+            "is missing, expired, cleared or another Program's, is refused."
+        ),
+    )
+    _add_url(callback_accept, RUNTIME)
+    _add_root(callback_accept)
+    callback_accept.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and its callback channels",
+    )
+    callback_accept.add_argument(
+        "--host",
+        required=True,
+        metavar="name",
+        help="the name the interaction arrived at, which is where the correlator is",
+    )
+    callback_accept.add_argument(
+        "--from",
+        dest="source",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the exact inbound bytes the listener recorded; stored unmodified",
+    )
+    callback_accept.add_argument(
+        "--peer",
+        default="unknown",
+        choices=callback.PEERS,
+        help=(
+            "what the listener could tell about the peer; a DNS query arrives "
+            "from a resolver that may be nowhere near the target (default: unknown)"
+        ),
+    )
+    callback_accept.set_defaults(run=_callback_accept)
 
     artifacts = commands.add_parser(
         "artifact", help="store, read and verify this Program's content-addressed artifacts"
@@ -858,6 +977,48 @@ def _header_provision(arguments: argparse.Namespace) -> int:
                 arguments.header,
                 arguments.source,
                 key_path=key,
+            ),
+        )
+    )
+
+
+def _callback_provision(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, callback.PROVISION)
+    if runtime is None:
+        return _render(report(callback.PROVISION, ledger))
+    return _render(
+        _guarded(
+            callback.PROVISION,
+            lambda: callback.provision(
+                runtime,
+                arguments.config,
+                arguments.channel,
+                arguments.subject,
+                lifetime=arguments.lifetime,
+                tool_run=arguments.tool_run,
+                test_run=arguments.test_run,
+            ),
+        )
+    )
+
+
+def _callback_accept(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, callback.ACCEPT)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(callback.ACCEPT, ledger))
+    return _render(
+        _guarded(
+            callback.ACCEPT,
+            lambda: callback.accept(
+                runtime,
+                arguments.config,
+                arguments.host,
+                arguments.source,
+                root=root,
+                peer=arguments.peer,
             ),
         )
     )

@@ -144,6 +144,23 @@ blocked. Carries the hashes of what the agent saw and what actually crossed the
 wire, which differ by exactly the injected credentials.
 _Avoid_: Log entry, trace, request record
 
+**Callback channel**:
+One out-of-band endpoint the harness operates, declared by a Program under a
+name, a kind and a host. Never a target and never evidence about one: an arrival
+at it is evidence that something reached out. Declared per scope version, so a
+withdrawn channel stops admitting the moment the next version is live. One
+endpoint is one channel: a second name for the same host would make which
+channel admitted an arrival a question about declaration order.
+_Avoid_: Canary domain, collaborator, listener, OOB server
+
+**Correlator**:
+The runtime-minted label a canary is addressed by, and the whole of what makes
+an inbound arrival attributable to one Program and one subject. One lower-case
+DNS label, because that is the only shape it can arrive in. Not a credential:
+holding one authorises no read, no write and no request. Canonical state keeps
+only its digest, and it binds nothing once it expires.
+_Avoid_: Token, secret, canary token, callback id
+
 **Lane**:
 Which party caused a request: `agent` (a subagent acted), `replay` (the runtime
 re-executed a test), or `proxy_internal` (the proxy acted as a client of the

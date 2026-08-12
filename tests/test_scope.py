@@ -149,6 +149,20 @@ class CompilationTest(unittest.TestCase):
 
         self.assertEqual(("scope:callback[0].host",), refused(text))
 
+    def test_two_channels_at_one_endpoint_are_refused_rather_than_ranked(self):
+        # `decide_callback` answers with one channel name and the projection
+        # keys on the host, so two names for one endpoint would make "which
+        # channel admitted this arrival" a question about declaration order --
+        # and would leave the compiler reporting two channels where the database
+        # kept one row. Index 2 for the same reason the inclusion above is index
+        # 1: the loader sorted the entries, and this is the second of the two to
+        # arrive at that host.
+        text = SCOPED + (
+            '\n[[callback]]\nname = "oob-twin"\nkind = "dns"\nhost = "dns.example.org"\n'
+        )
+
+        self.assertEqual(("scope:callback[2].host",), refused(text))
+
     def test_a_pattern_is_a_suffix_test_and_never_a_glob(self):
         for pattern in ("ap*.example.com", "*.*.example.com", "app.*"):
             with self.subTest(pattern):
@@ -603,6 +617,24 @@ class VerdictTest(unittest.TestCase):
             with self.subTest(host):
                 verdict = scope.decide_callback(self.policy, host)
                 self.assertEqual(scope.DENIED, verdict.scope_class)
+
+    def test_the_channel_an_interaction_arrived_on_is_the_most_specific_one(self):
+        # Two channels, one beneath the other, and both admit the arrival. The
+        # child is the answer, the way the more specific rule is everywhere
+        # else: beneath it the extra label is a canary, while beneath the parent
+        # the same name reads as a canary one label longer.
+        policy = compiled(
+            SCOPED.replace(
+                '[[callback]]\nname = "oob-dns"',
+                '[[callback]]\nname = "oob-near"\nkind = "dns"\n'
+                'host = "a.dns.example.org"\n\n[[callback]]\nname = "oob-dns"',
+            )
+        )
+
+        verdict = scope.decide_callback(policy, "abc123.a.dns.example.org")
+
+        self.assertEqual(scope.EGRESS_SUPPORT, verdict.scope_class)
+        self.assertEqual("oob-near", verdict.channel)
 
     def test_a_host_that_is_both_a_channel_and_a_target_is_support(self):
         # The lower effect rank wins, so a callback endpoint the Program happens

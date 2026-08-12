@@ -16,8 +16,8 @@ triaged into the graph.
 | Check | Result |
 | --- | --- |
 | Ticket files | 66, numbered continuously 01–66 |
-| Ticket status | 14 `resolved`, 52 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 398 total, 84 ticked |
+| Ticket status | 15 `resolved`, 51 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 398 total, 90 ticked |
 | Blocking edges | 126 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -32,18 +32,19 @@ restores it: 65 is again the only ticket nothing depends on.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–13 and 15 |
-| Unblocked and open | 14, 16, 18, 66 |
-| Criteria ticked | 84 of 398 |
+| Resolved | 01–15 |
+| Unblocked and open | 16, 18, 66 |
+| Criteria ticked | 90 of 398 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
 bounded reads, redacted and encrypted Artifacts, compiled scope, the capability
 proxy over HTTP and HTTPS, the container network boundary, lease-gated encrypted
 Identities, the operator Halt and the aggregate request budget enforced at that
-same door, and the startup assertion imported as ticket 15. The scheduler, the
-role roster, the epistemic pipeline, kill chains, the v1 knowledge migration and
-the operator surface are untouched.
+same door, the startup assertion imported as ticket 15, and the first evidence
+that arrives rather than being fetched: one correlated callback on a declared
+channel. The scheduler, the role roster, the epistemic pipeline, kill chains, the
+v1 knowledge migration and the operator surface are untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

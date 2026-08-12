@@ -650,12 +650,21 @@ def _project_scope(
         and int(live_at) == revision
     )
     if unchanged:
+        # One exception to writing nothing, and it is the reason the helper
+        # takes a version rather than assuming a fresh one: a version compiled
+        # before callback channels existed carries none of its own, and the
+        # digest that makes this run a no-op is the digest of a policy that
+        # already declared them. Without this, a Program installed against an
+        # earlier corpus admits no arrival until the operator happens to change
+        # the configuration file. Idempotent, so a second run writes nothing.
+        _project_channels(connection, program_id, int(live), policy)
         return {
             "version": int(live),
             "configuration_revision": revision,
             "policy_sha256": digest,
             "rules": len(policy.rules),
             "required_headers": len(policy.headers),
+            "callback_channels": len(policy.channels),
             "compiled": False,
             "reprojected": 0,
         }
@@ -732,6 +741,7 @@ def _project_scope(
                 ),
             ),
         )
+    _project_channels(connection, program_id, version, policy)
     moved = int(
         connection.execute(
             "SELECT count(*) FROM set_scope_version($1::uuid, $2)", (program_id, version)
@@ -743,9 +753,49 @@ def _project_scope(
         "policy_sha256": digest,
         "rules": len(policy.rules),
         "required_headers": len(policy.headers),
+        "callback_channels": len(policy.channels),
         "compiled": True,
         "reprojected": moved,
     }
+
+
+def _project_channels(
+    connection: pg.Connection, program_id: str, version: int, policy: scope.Policy
+) -> None:
+    """The declared callback channels, beside the rules rather than inside them.
+
+    An http channel also compiles to an `egress_support` rule, which is what
+    stops the harness treating its own listener as a target; these rows answer
+    the other question -- which names an arrival may have come in on -- and they
+    are what `mint_callback_correlator` and the admission trigger join against. A
+    channel withdrawn from the configuration is therefore absent from the next
+    version, and stops admitting arrivals the moment that version goes live.
+
+    `DO NOTHING` because this is also called for a version already live, where
+    the rows are either already exactly these or missing entirely. It cannot
+    rewrite one: the ordinals and hosts are the compiler's, the version is
+    immutable under `callback_channels_immutable`, and a conflicting row would
+    mean two compilations of one digest disagreed.
+    """
+    if not policy.channels:
+        return
+    connection.execute(
+        "INSERT INTO program_callback_channels (program_id, version, ord, name, kind, host)"
+        " SELECT $1::uuid, $2, c.ord, c.name, c.kind, c.host"
+        "   FROM jsonb_to_recordset($3::jsonb) AS c("
+        "        ord integer, name text, kind text, host text)"
+        " ON CONFLICT DO NOTHING",
+        (
+            program_id,
+            version,
+            _encode(
+                [
+                    {"ord": index + 1, **channel.summary()}
+                    for index, channel in enumerate(policy.channels)
+                ]
+            ),
+        ),
+    )
 
 
 def _project_identities(

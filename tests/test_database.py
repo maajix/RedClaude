@@ -47,6 +47,7 @@ from unittest import mock
 from redkraken import (
     artifact,
     backup,
+    callback,
     config,
     decisions,
     header,
@@ -608,6 +609,39 @@ SEAL_CONTROL = (
 )
 
 
+#: One arrival that got in while the guard was off. Everything before the last
+#: statement is the ordinary shape -- a Program, the version it was running, the
+#: channel that version declared, a subject and a live correlator -- so the only
+#: falsification is the name in that statement, which is a host no channel of
+#: this Program admits. It takes the trigger with it because that is the only
+#: state this row exists in: a restore, where ORIGIN triggers do not fire and
+#: the check is the last thing that would notice.
+CALLBACK_CONTROL = (
+    "DROP TRIGGER callback_interactions_attribution ON callback_interactions;"
+    " DO $ctl$ DECLARE p uuid; e uuid; t uuid;"
+    " BEGIN"
+    "   PERFORM set_actor('runtime', 'selftest');"
+    "   INSERT INTO programs (slug, name) VALUES ('callback-control', 'Self test')"
+    "     RETURNING id INTO p;"
+    "   INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
+    "        VALUES (p, 1, '{}'::jsonb, repeat('c', 64));"
+    "   INSERT INTO program_callback_channels (program_id, version, ord, name, kind, host)"
+    "        VALUES (p, 1, 1, 'oob', 'dns', 'oob.example.test');"
+    "   INSERT INTO entities (program_id, type, dedup_key)"
+    "        VALUES (p, 'technology', 'tech:callback-control') RETURNING id INTO e;"
+    "   INSERT INTO callback_correlators (program_id, scope_version, channel_name,"
+    "                                      correlator_sha256, subject_entity_id, expires_at)"
+    "        VALUES (p, 1, 'oob', repeat('a', 64), e, now() + interval '1 hour')"
+    "     RETURNING id INTO t;"
+    "   INSERT INTO artifacts (sha256, byte_size, visibility)"
+    "        VALUES (repeat('d', 64), 4, 'agent_visible');"
+    "   INSERT INTO callback_interactions (program_id, correlator_id, channel_name, arrival_kind,"
+    "                                      observed_host, body_sha256, byte_size)"
+    "        VALUES (p, t, 'oob', 'dns', 'elsewhere.test', repeat('d', 64), 4);"
+    " END $ctl$"
+)
+
+
 #: Every check the gate runs, and the edit that makes it fail. Each runs in a
 #: transaction that is rolled back, so the database is unchanged afterwards --
 #: `test_the_database_is_unchanged_afterwards` is what says so.
@@ -1038,6 +1072,43 @@ CONTROLS = (
         " INSERT INTO secret_dek (scope_kind, scope_id, dek_gen, kek_gen, wrapped)"
         " VALUES ('program', '00000000-0000-4000-8000-000000000001'::uuid, 1, 1,"
         "         decode(repeat('63', 60), 'hex'))",
+    ),
+    # --- callback admission --------------------------------------------------
+    Control(
+        # The verb on the connection the model reads through. A session that can
+        # accept an interaction can write itself the evidence it wanted to have
+        # observed, which is the one thing an out-of-band Observation is trusted
+        # for: that nobody here caused it.
+        "standing:callback_admission",
+        "GRANT EXECUTE ON FUNCTION record_callback_interaction(text, jsonb, jsonb) TO rk2_state",
+    ),
+    Control(
+        # A correlator whose expiry can be moved is a correlator with no expiry.
+        "standing:callback_admission",
+        "GRANT UPDATE ON callback_correlators TO rk2_runtime",
+    ),
+    Control(
+        # The digest of a live correlator on the agent read surface. It is not
+        # the plaintext, and it is still the join that tells a session which of
+        # its own canaries is armed; the name an arrival came in at is worse.
+        # `apply_state_grants` turns a row here into a grant, so the row is the
+        # falsification rather than any GRANT statement.
+        "standing:callback_admission",
+        "INSERT INTO state_read_surface (table_name, column_name, added_by)"
+        " VALUES ('callback_correlators', 'correlator_sha256', '14-control')",
+    ),
+    Control(
+        # The invariant demoted to an ordinary trigger: still enforced on this
+        # connection, and skipped entirely by the one connection that replays
+        # rows nobody re-checks.
+        "standing:callback_admission",
+        "ALTER TABLE callback_interactions DISABLE TRIGGER callback_interactions_attribution",
+    ),
+    Control(
+        # And the stored rows, which is the arm that exists for exactly the
+        # state the control above leaves behind.
+        "standing:callback_admission",
+        CALLBACK_CONTROL,
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -2962,6 +3033,650 @@ class ArtifactStoreTest(DatabaseCase):
         )
         self.assertIn("hashes to", seeing.violations[0].detail)
         self.assertEqual(blind.facts["checks"], seeing.facts["checks"], "not a registered check")
+
+
+CALLBACK_SLUG = "selftest-callback"
+
+#: One recorded arrival. Not a DNS message anybody could parse: what is promoted
+#: into an Observation is the bytes the listener wrote, and a test whose bytes
+#: were well formed would be testing a parser this harness does not have.
+ARRIVAL = b"\x00\x01\x81\x80 an out-of-band query for a canary\n"
+
+
+class CallbackAdmissionTest(DatabaseCase):
+    """PH2-14: one interaction at a name this Program published, and nothing else.
+
+    The one Observation the harness does not fetch, which is why every claim
+    here is about attribution rather than about a request. A correlator the
+    runtime minted goes out in a payload; something the harness never spoke to
+    queries a name carrying it; the operator's own listener writes the bytes to
+    a file and hands them to `rk callback accept`. What must hold is that the
+    arrival is admitted only if it names a channel the live policy declares and
+    resolves a correlator of this Program that has not expired -- and that the
+    correlator, which is the whole of the binding, never becomes something the
+    agent can read.
+
+    Criterion 6 is structural rather than asserted: nothing here opens a socket
+    and no callback provider exists in this test. The listener is a file, which
+    is exactly what a listener hands over.
+
+    Everything runs as `rk2_runtime` and is read back as `rk2_state`, because a
+    claim about what the agent connection cannot reach is worth nothing when it
+    is made from the connection that owns the tables. This case commits, and
+    purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = scratch() / "artifacts"
+        cls.configurations = {}
+        cls.identifiers = {}
+        cls.opened = {}
+        for name in ("a", "b", "c", "d"):
+            slug = f"{CALLBACK_SLUG}-{name}"
+            path = write(SCOPED.replace('name = "matrix-web"', f'name = "{slug}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (slug, opened.violations)
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+            cls.opened[name] = opened
+
+        # One subject each, so that an Observation has something to be about.
+        # `TEC1` is what the label trigger calls the first technology entity of
+        # a Program, and all three hold that label for the reason `StateReadTest`
+        # gives: labels are per Program and colliding is the ordinary case.
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for name in cls.identifiers:
+                cls.connection.execute(
+                    "INSERT INTO entities (program_id, type, dedup_key)"
+                    " VALUES ($1::uuid, 'technology', $2)",
+                    (cls.identifiers[name], f"tech:{CALLBACK_SLUG}-{name}"),
+                )
+
+        cls.source = scratch() / "arrival.bin"
+        cls.source.write_bytes(ARRIVAL)
+        cls.minted = callback.provision(
+            cls.harness.runtime, cls.configurations["a"], "oob-dns", "TEC1"
+        )
+        assert cls.minted.ok, cls.minted.violations
+        cls.accepted = callback.accept(
+            cls.harness.runtime,
+            cls.configurations["a"],
+            cls.minted.facts["callback"]["address"],
+            cls.source,
+            root=cls.root,
+            peer="resolver",
+        )
+        assert cls.accepted.ok, cls.accepted.violations
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{CALLBACK_SLUG}-%",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = $1", (artifact.digest(ARRIVAL),)
+            )
+        super().tearDownClass()
+
+    @property
+    def correlator(self) -> str:
+        """The plaintext that went out in the payload, which nothing stored."""
+        return str(self.minted.facts["callback"]["address"]).partition(".")[0]
+
+    def subject(self, name: str) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT id FROM entities WHERE program_id = $1::uuid AND label = 'TEC1'",
+                (self.identifiers[name],),
+            ).scalar()
+        )
+
+    def mint(self, name: str, *, channel: str = "oob-dns", seconds: float = 3600) -> str:
+        """One correlator, minted through the verb rather than through the CLI.
+
+        The CLI refuses a lifetime under a second, which is the right answer for
+        an operator and the wrong one for a test about expiry.
+        """
+        correlator = secrets.token_hex(16)
+        with self.connection.transaction():
+            self.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (self.identifiers[name],)
+            )
+            self.connection.execute(
+                "SELECT mint_callback_correlator($1, $2, $3::uuid,"
+                "        make_interval(secs => $4::double precision))",
+                (channel, correlator, self.subject(name), str(seconds)),
+            )
+        return correlator
+
+    def arrive(self, name: str, host: str, **options: object) -> Report:
+        return callback.accept(
+            self.harness.runtime,
+            self.configurations[name],
+            host,
+            self.source,
+            root=self.root,
+            **options,
+        )
+
+    def refuse(self, name: str, sql: str, parameters: tuple) -> pg.DatabaseError:
+        """One statement, in a transaction of its own, expected to be refused.
+
+        Its own transaction because a refused statement aborts the one it was
+        in: a second attempt in the same block is answered `25P02` whatever it
+        asked, which would pass an assertion about being refused for a reason
+        that has nothing to do with callbacks.
+
+        The actor is declared as well, so that a statement put straight to the
+        table is answered by the guard under test rather than by the emitter for
+        writing anonymously.
+        """
+        with self.assertRaises(pg.DatabaseError) as refused:
+            with self.connection.transaction():
+                self.connection.execute(
+                    "SELECT set_config('rk2.program_id', $1, true)",
+                    (self.identifiers[name],),
+                )
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(sql, parameters)
+        return refused.exception
+
+    def channels(self, name: str) -> list[tuple[int, str, str, str]]:
+        """The channels of the live scope version, joined the way the guard joins."""
+        return [
+            (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
+            for row in self.connection.execute(
+                "SELECT c.ord, c.name, c.kind, c.host"
+                "  FROM program_callback_channels c"
+                "  JOIN programs p ON p.id = c.program_id AND p.scope_version = c.version"
+                " WHERE c.program_id = $1::uuid ORDER BY c.ord",
+                (self.identifiers[name],),
+            ).rows
+        ]
+
+    def bytes_json(self) -> str:
+        """The artifact half of an arrival: bytes that are registered already."""
+        return json.dumps(
+            {"sha256": artifact.digest(ARRIVAL), "byte_size": len(ARRIVAL)}
+        )
+
+    def counts(self) -> tuple[int, int]:
+        """How many arrivals and callback Observations exist, over every Program."""
+        return tuple(
+            int(value)
+            for value in self.connection.execute(
+                "SELECT (SELECT count(*) FROM callback_interactions),"
+                "       (SELECT count(*) FROM observations WHERE provenance_kind = 'callback')"
+            ).rows[0]
+        )
+
+    def test_the_channels_the_policy_declares_are_projected_with_its_version(self):
+        # Criterion 1's first half: what may be provisioned at all is what the
+        # live scope version says, and the version is what the configuration
+        # compiled to rather than anything a caller passed.
+        self.assertEqual(
+            [
+                (1, "oob-dns", "dns", "dns.example.org"),
+                (2, "oob-http", "http", "callback.example.org"),
+            ],
+            self.channels("a"),
+        )
+        self.assertEqual(2, self.opened["a"].facts["scope"]["callback_channels"])
+
+    def test_a_version_that_carries_no_channel_list_yet_is_given_one(self):
+        # The other half of criterion 1, and the case an installation upgraded
+        # into this corpus is actually in: a Program live on a scope version
+        # compiled before channels existed. Its digest has not changed, so the
+        # ordinary reprojection writes nothing at all, and without a backfill
+        # the Program would admit no arrival until the operator happened to edit
+        # the configuration file. `d` is used here and nowhere else, because
+        # this test takes its channels away.
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL app.purging = 'on'")
+            self.connection.execute(
+                "DELETE FROM program_callback_channels WHERE program_id = $1::uuid",
+                (self.identifiers["d"],),
+            )
+        emptied = self.channels("d")
+
+        again = program.run(self.harness.runtime, self.configurations["d"])
+
+        self.assertEqual([], emptied)
+        self.assertTrue(again.ok, again.violations)
+        # Nothing was recompiled: the rows arrived on the path that recompiles
+        # nothing, which is the only path this Program will ever take again.
+        self.assertFalse(again.facts["scope"]["compiled"])
+        self.assertEqual(
+            [
+                (1, "oob-dns", "dns", "dns.example.org"),
+                (2, "oob-http", "http", "callback.example.org"),
+            ],
+            self.channels("d"),
+        )
+
+    def test_a_correlator_is_an_address_beneath_the_channel_it_names(self):
+        # Criterion 2. The address is the whole product of provisioning: an
+        # operator who was told a token and not where to send it has nothing to
+        # embed.
+        minted = self.minted.facts["callback"]
+
+        self.assertEqual(("oob-dns", "dns"), (minted["channel"], minted["kind"]))
+        self.assertEqual(f"{self.correlator}.dns.example.org", minted["address"])
+        self.assertEqual(callback.CORRELATOR_BYTES * 2, len(self.correlator))
+        self.assertEqual("technology", minted["subject_type"])
+
+    def test_the_correlator_reaches_the_database_as_a_digest_and_never_as_itself(self):
+        # The other half of criterion 2: it binds without being stored. The row
+        # is compared whole rather than column by column, so a later migration
+        # that added somewhere to keep the plaintext would fail this.
+        row = str(
+            self.connection.execute(
+                "SELECT to_jsonb(t)::text FROM callback_correlators t WHERE id = $1::uuid",
+                (self.minted.facts["callback"]["correlator_id"],),
+            ).scalar()
+        )
+
+        self.assertNotIn(self.correlator, row)
+        self.assertIn(artifact.digest(self.correlator.encode()), row)
+        self.assertIn(str(self.identifiers["a"]), row)
+
+    def test_the_exact_inbound_bytes_are_the_artifact_the_observation_cites(self):
+        # Criterion 3, end to end: the bytes the listener recorded are in the
+        # content-addressed store under their own hash, the arrival names that
+        # hash, and the Observation names the arrival.
+        accepted = self.accepted.facts["callback"]
+        sha256 = artifact.digest(ARRIVAL)
+
+        self.assertEqual(sha256, accepted["sha256"])
+        self.assertEqual(len(ARRIVAL), accepted["byte_size"])
+        self.assertEqual(ARRIVAL, artifact.path_for(self.root, sha256).read_bytes())
+
+        row = self.connection.execute(
+            "SELECT o.kind, o.provenance_kind, o.subject_entity_id::text,"
+            "       ci.label, ci.body_sha256, ci.byte_size, ci.peer_class, ci.observed_host,"
+            "       ci.channel_name, ci.arrival_kind"
+            "  FROM observations o"
+            "  JOIN callback_interactions ci ON ci.id = o.callback_interaction_id"
+            " WHERE o.label = $1 AND o.program_id = $2::uuid",
+            (accepted["observation"], self.identifiers["a"]),
+        ).rows[0]
+
+        self.assertEqual("callback_interaction", str(row[0]))
+        self.assertEqual("callback", str(row[1]))
+        self.assertEqual(self.subject("a"), str(row[2]))
+        self.assertEqual(accepted["interaction"], str(row[3]))
+        self.assertEqual(sha256, str(row[4]))
+        self.assertEqual(len(ARRIVAL), int(row[5]))
+        self.assertEqual("resolver", str(row[6]))
+        self.assertEqual(self.minted.facts["callback"]["address"], str(row[7]))
+        self.assertEqual(("oob-dns", "dns"), (str(row[8]), str(row[9])))
+
+    def test_the_arrival_and_the_observation_it_produced_are_immutable(self):
+        # An Observation has no status and an arrival is what happened. Nothing
+        # rewrites either from the role that wrote them, which is the only role
+        # holding any DML on them at all. The two halves refuse for different
+        # reasons and both are worth asserting: the arrival because the verbs
+        # were never granted, the Observation because 0013's `ENABLE ALWAYS`
+        # trigger refuses it even where they were.
+        for sql in (
+            "UPDATE callback_interactions SET observed_host = 'elsewhere.test'"
+            " WHERE program_id = $1::uuid",
+            "DELETE FROM callback_interactions WHERE program_id = $1::uuid",
+            "UPDATE callback_correlators SET expires_at = now() + interval '1 year'"
+            " WHERE program_id = $1::uuid",
+        ):
+            with self.subTest(sql[:6]):
+                with self.assertRaises(pg.DatabaseError) as refused:
+                    self.connection.execute(sql, (self.identifiers["a"],))
+
+                self.assertEqual("42501", refused.exception.sqlstate)
+
+        observation = self.accepted.facts["callback"]["observation"]
+        for sql in (
+            "UPDATE observations SET summary = 'something else'"
+            " WHERE label = $1 AND program_id = $2::uuid",
+            "DELETE FROM observations WHERE label = $1 AND program_id = $2::uuid",
+        ):
+            with self.subTest(f"observation:{sql[:6]}"):
+                with self.assertRaises(pg.DatabaseError) as refused:
+                    self.connection.execute(sql, (observation, self.identifiers["a"]))
+
+                self.assertIn("immutable", str(refused.exception))
+
+        self.assertEqual(
+            1,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM observations"
+                    " WHERE label = $1 AND program_id = $2::uuid",
+                    (observation, self.identifiers["a"]),
+                ).scalar()
+            ),
+        )
+
+    def test_what_the_observation_says_names_the_channel_and_not_the_canary(self):
+        # The Observation is the one part of this record the agent reads, so it
+        # carries the channel, the size and the artifact label -- and neither the
+        # correlator nor the name it arrived at. Not a secrecy claim about the
+        # correlator, which is printed to the operator: a claim that reading the
+        # evidence does not hand a session the label another session's canary is
+        # armed at.
+        summary, metadata = self.connection.execute(
+            "SELECT o.summary, o.metadata::text FROM observations o"
+            " WHERE o.label = $1 AND o.program_id = $2::uuid",
+            (self.accepted.facts["callback"]["observation"], self.identifiers["a"]),
+        ).rows[0]
+
+        self.assertIn("oob-dns", str(summary))
+        self.assertIn(str(self.accepted.facts["callback"]["artifact"]), str(summary))
+        for text in (summary, metadata):
+            self.assertNotIn(self.correlator, str(text))
+            self.assertNotIn("dns.example.org", str(text))
+
+    def test_the_event_the_arrival_emitted_carries_no_name_and_no_correlator(self):
+        # The log is the other copy of everything, and a redacted column is the
+        # only reason the name is not in it twice.
+        logged = "".join(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT to_jsonb(e)::text FROM events e WHERE e.program_id = $1::uuid",
+                (self.identifiers["a"],),
+            ).rows
+        )
+
+        self.assertIn("callback.observed", logged)
+        self.assertNotIn(self.correlator, logged)
+        self.assertNotIn(self.minted.facts["callback"]["address"], logged)
+
+    def test_the_agent_connection_reaches_the_observation_and_neither_table(self):
+        # Criterion 2's last clause. The Observation is evidence and is read;
+        # the correlator and the name it arrived at are neither, and the absence
+        # of a `state_read_surface` row is what refuses them.
+        with pg.connect(self.harness.state) as session:
+            session.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers["a"],)
+            )
+            visible = session.execute(
+                "SELECT summary FROM observations WHERE label = $1",
+                (self.accepted.facts["callback"]["observation"],),
+            ).scalar()
+
+            for sql in (
+                "SELECT correlator_sha256 FROM callback_correlators",
+                "SELECT observed_host FROM callback_interactions",
+                "SELECT host FROM program_callback_channels",
+            ):
+                with self.subTest(sql[7:20]):
+                    with self.assertRaises(pg.DatabaseError) as refused:
+                        session.execute(sql)
+
+                    self.assertEqual("42501", refused.exception.sqlstate)
+
+        self.assertIn("oob-dns", str(visible))
+
+    def test_no_correlator_but_a_live_one_of_this_program_confirms_anything(self):
+        # Criterion 4, all four ways. Each is an arrival at a name the policy
+        # admits -- so nothing is refused for being off-channel -- carrying a
+        # correlator that is not one this Program has live.
+        expired = self.mint("a", seconds=0.001)
+        cleared = self.mint("a")
+        with self.connection.transaction():
+            self.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (self.identifiers["a"],)
+            )
+            self.connection.execute(
+                "SELECT clear_callback_correlator(id) FROM callback_correlators"
+                " WHERE correlator_sha256 = $1",
+                (artifact.digest(cleared.encode()),),
+            )
+        before = self.counts()
+
+        for reason, token in (
+            ("fabricated", secrets.token_hex(16)),
+            ("expired", expired),
+            ("cleared", cleared),
+            ("another Program's", self.mint("b")),
+        ):
+            with self.subTest(reason):
+                result = self.arrive("a", f"{token}.dns.example.org")
+
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+                self.assertIn("refused", result.violations[0].detail)
+
+        # And the fifth way, which the command cannot express because a name with
+        # no label beneath the endpoint is refused before the database is opened:
+        # an arrival stating no correlator at all, put straight to the writer.
+        for reason, token in (("empty", ""), ("absent", None)):
+            with self.subTest(reason):
+                refused = self.refuse(
+                    "a",
+                    "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)",
+                    (
+                        token,
+                        json.dumps({"host": "dns.example.org", "arrival_kind": "dns"}),
+                        self.bytes_json(),
+                    ),
+                )
+
+                self.assertEqual("23514", refused.sqlstate)
+
+        self.assertEqual(before, self.counts())
+
+    def test_a_name_no_channel_admits_is_refused_wherever_it_is_asked(self):
+        # Criterion 5, from both ends. The command refuses these without opening
+        # a connection, so the interesting half is the database's: the same
+        # arrival, put straight to the writer, is refused there too.
+        live = self.mint("a")
+        before = self.counts()
+
+        for host in (
+            "oob.example.net",  # a channel, but another Program's configuration
+            "dns.example.org.evil.test",  # adjacent infrastructure
+            "example.org",  # the parent the channel is beneath
+            "dns.example.org",  # the endpoint itself, carrying no correlator
+        ):
+            with self.subTest(host):
+                self.assertEqual(
+                    EXIT_INVALID_CONFIGURATION, self.arrive("a", host).exit_code
+                )
+
+        for host in ("elsewhere.test", "dns.example.org.evil.test"):
+            with self.subTest(f"writer:{host}"):
+                refused = self.refuse(
+                    "a",
+                    "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)",
+                    (
+                        live,
+                        json.dumps({"host": host, "arrival_kind": "dns"}),
+                        self.bytes_json(),
+                    ),
+                )
+
+                self.assertEqual("23514", refused.sqlstate)
+
+        self.assertEqual(before, self.counts())
+
+    def test_an_arrival_carries_the_correlator_it_is_filed_under(self):
+        # Criterion 2's binding, which the admitted-name arms do not make. Both
+        # correlators here are this Program's and both names are admitted by the
+        # same channel, so everything else about this arrival is in order: what
+        # is wrong is that the name carries one canary and the row is filed under
+        # the other. Without this the Observation would be a true fact about the
+        # wrong entity.
+        mine, other = self.mint("a"), self.mint("a")
+        before = self.counts()
+
+        refused = self.refuse(
+            "a",
+            "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)",
+            (
+                mine,
+                json.dumps(
+                    {"host": f"{other}.dns.example.org", "arrival_kind": "dns"}
+                ),
+                self.bytes_json(),
+            ),
+        )
+
+        self.assertEqual("23514", refused.sqlstate)
+        self.assertIn("does not carry the correlator", str(refused))
+
+        # And beneath the writer, which is where a restore or a fixture arrives.
+        beneath = self.refuse(
+            "a",
+            "INSERT INTO callback_interactions"
+            "     (program_id, correlator_id, channel_name, arrival_kind,"
+            "      observed_host, body_sha256, byte_size)"
+            " SELECT $1::uuid, t.id, 'oob-dns', 'dns', $2, $3, $4::bigint"
+            "  FROM callback_correlators t WHERE t.correlator_sha256 = $5",
+            (
+                self.identifiers["a"],
+                f"{other}.dns.example.org",
+                artifact.digest(ARRIVAL),
+                str(len(ARRIVAL)),
+                artifact.digest(mine.encode()),
+            ),
+        )
+
+        self.assertEqual("23514", beneath.sqlstate)
+        self.assertIn("does not carry the correlator", str(beneath))
+        self.assertEqual(before, self.counts())
+
+    def test_an_arrival_cannot_backdate_itself_into_a_dead_correlator(self):
+        # `received_at` is the row's own column, so an expiry arm that read it
+        # would be a guard the guarded row answers. This row states a time the
+        # correlator was demonstrably listening -- the instant it was minted --
+        # and the clock still says the canary is gone.
+        dead = self.mint("a", seconds=0.001)
+        before = self.counts()
+
+        refused = self.refuse(
+            "a",
+            "INSERT INTO callback_interactions"
+            "     (program_id, correlator_id, channel_name, arrival_kind,"
+            "      observed_host, received_at, body_sha256, byte_size)"
+            " SELECT $1::uuid, t.id, 'oob-dns', 'dns', $2, t.issued_at, $3, $4::bigint"
+            "  FROM callback_correlators t WHERE t.correlator_sha256 = $5",
+            (
+                self.identifiers["a"],
+                f"{dead}.dns.example.org",
+                artifact.digest(ARRIVAL),
+                str(len(ARRIVAL)),
+                artifact.digest(dead.encode()),
+            ),
+        )
+
+        self.assertEqual("23514", refused.sqlstate)
+        self.assertIn("was not live", str(refused))
+        self.assertEqual(before, self.counts())
+
+    def test_a_correlator_that_could_never_arrive_is_not_minted(self):
+        # A correlator is one DNS label or it is a canary nothing can query, and
+        # the admission trigger compares the digest of the label a name carries:
+        # a correlator with a dot in it, or a capital, would be minted and then
+        # never match anything that arrived.
+        live = int(
+            self.connection.execute("SELECT count(*) FROM callback_correlators").scalar()
+        )
+
+        for reason, correlator in (
+            ("a name rather than a label", "abc.def"),
+            ("upper case, which a name is not stored in", "ABC123"),
+            ("empty", ""),
+            ("longer than a label", "a" * 64),
+        ):
+            with self.subTest(reason):
+                refused = self.refuse(
+                    "a",
+                    "SELECT mint_callback_correlator($1, $2, $3::uuid,"
+                    "                                make_interval(secs => 60))",
+                    ("oob-dns", correlator, self.subject("a")),
+                )
+
+                self.assertEqual("23514", refused.sqlstate)
+                self.assertIn("one lower-case DNS label", str(refused))
+
+        self.assertEqual(
+            live,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM callback_correlators"
+                ).scalar()
+            ),
+        )
+
+    def test_a_wildcard_is_not_a_channel_and_never_becomes_a_program(self):
+        # The rest of criterion 5. A channel is one host: a wildcard would be a
+        # standing invitation to attribute an arrival at anything beneath a
+        # domain to this Program, which is the shape of the mistake that lets
+        # somebody else's infrastructure produce evidence here.
+        slug = f"{CALLBACK_SLUG}-wildcard"
+        source = write(
+            SCOPED.replace('name = "matrix-web"', f'name = "{slug}"').replace(
+                'host = "dns.example.org"', 'host = "*.example.org"'
+            )
+        )
+
+        opened = program.run(self.harness.runtime, source)
+
+        self.assertFalse(opened.ok)
+        self.assertEqual(
+            0,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM programs WHERE slug = $1", (slug,)
+                ).scalar()
+            ),
+        )
+
+    def test_a_channel_the_live_policy_withdrew_admits_nothing_it_used_to(self):
+        # Criterion 1's teeth, and the reason the channel list is projected per
+        # version rather than kept once. A correlator minted while the channel
+        # was declared stays in the table -- it is a record of what was armed --
+        # and stops admitting anything the moment the operator's next revision
+        # goes live.
+        live = self.mint("c")
+        withdrawn = write(
+            SCOPED.replace('name = "matrix-web"', f'name = "{CALLBACK_SLUG}-c"').replace(
+                '[[callback]]\nname = "oob-dns"\nkind = "dns"\nhost = "dns.example.org"\n',
+                "",
+            )
+        )
+
+        revised = program.run(self.harness.runtime, withdrawn, accept_change=True)
+
+        self.assertTrue(revised.ok, revised.violations)
+        self.assertEqual(1, revised.facts["scope"]["callback_channels"])
+        arriving = self.refuse(
+            "c",
+            "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)",
+            (
+                live,
+                json.dumps({"host": f"{live}.dns.example.org", "arrival_kind": "dns"}),
+                self.bytes_json(),
+            ),
+        )
+        minting = self.refuse(
+            "c",
+            "SELECT mint_callback_correlator('oob-dns', $1, $2::uuid, interval '1 hour')",
+            (secrets.token_hex(16), self.subject("c")),
+        )
+
+        self.assertEqual("23514", arriving.sqlstate)
+        self.assertEqual("23514", minting.sqlstate)
+
+    def test_the_gate_still_holds_over_the_rows_these_writes_made(self):
+        with pg.connect(self.harness.migrate) as connection:
+            result = integrity.verify(connection, self.harness.expected)
+
+        self.assertTrue(result.ok, result.violations)
 
 
 SEAL_SLUG = "selftest-sealed"
