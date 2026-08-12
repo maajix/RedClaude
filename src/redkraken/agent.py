@@ -37,13 +37,11 @@ from pathlib import Path
 from redkraken import _startup, isolation
 
 
-#: The module the child process runs as, and the interpreter that runs it.
-#: The module is named rather than pathed, so a checkout and an installed wheel
-#: start the same code. The interpreter is the image's, not this process's:
-#: `sys.executable` names a file on the supervisor's machine, and the child's
-#: machine is a container that has never seen it.
+#: The module the child process runs as. Named rather than pathed, so a
+#: checkout and an installed wheel start the same code. The interpreter that
+#: runs it is `isolation.INTERPRETER`, because which interpreter exists is a
+#: fact about the image and not about this module.
 CHILD = "redkraken._launch"
-PYTHON = "python3"
 
 #: What the child exits with when the startup assertion refused. `78` is
 #: `EX_CONFIG`: the launch was not attempted because its configuration was
@@ -490,7 +488,7 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
     """
     child = isolation.run(
         request.container,
-        (PYTHON, "-P", "-m", CHILD),
+        (isolation.INTERPRETER, "-P", "-m", CHILD),
         stdin=json.dumps(job),
         timeout=request.timeout,
     )

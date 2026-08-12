@@ -5,51 +5,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
 from redkraken import _startup, isolation, tls
+from tests import fixtures
+from tests.fixtures import docker
 
 
 LIVE = os.environ.get("RK_TEST_CONTAINERS") == "1"
 REASON = "set RK_TEST_CONTAINERS=1 to run the disposable Docker isolation proof"
-
-#: The image every container proof here starts from. It is a glibc one because
-#: an Agent image has to be: the CLI the SDK bundles is a glibc-linked
-#: executable, so a musl image is one no Agent child can start in, and the
-#: topology this module proves is only worth proving about an image an Agent
-#: run could actually use.
-IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.14-slim")
-
-
-def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["docker", *arguments],
-        env={"PATH": os.environ.get("PATH", "")},
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-    if check and result.returncode:
-        raise AssertionError((result.stderr or result.stdout).strip())
-    return result
-
-
-def described(**overrides) -> isolation.AgentContainer:
-    """A described boundary, with no engine needed to describe it."""
-    fields = {
-        "image": IMAGE,
-        "network": "rk2-agent-network",
-        "proxy_container": "rk2-proxy",
-        "proxy_url": "http://rk2-proxy:18080",
-        "certificate": Path("/run/root.pem"),
-    }
-    fields.update(overrides)
-    return isolation.AgentContainer(**fields)
 
 
 class ContainerEnvironmentTest(unittest.TestCase):
@@ -71,7 +38,7 @@ class ContainerEnvironmentTest(unittest.TestCase):
         )
 
         child = isolation.container_environment(
-            described(application=Path("/src"), runtime=Path("/sdk")), operator
+            fixtures.boundary(application=Path("/src"), sdk=Path("/sdk")), operator
         )
 
         for family in (
@@ -86,14 +53,14 @@ class ContainerEnvironmentTest(unittest.TestCase):
             set(child) - set(tls.PROXY_VARIABLES) - set(tls.BYPASS_VARIABLES)
             - set(tls.TRUST_VARIABLES) - set(tls.STORE_VARIABLES),
         )
-        self.assertEqual(f"{isolation.APPLICATION}:{isolation.RUNTIME}", child["PYTHONPATH"])
+        self.assertEqual(f"{isolation.APPLICATION}:{isolation.SDK}", child["PYTHONPATH"])
 
     def test_the_operator_home_never_crosses_and_neither_does_their_import_path(self):
         # Where the CLI looks for the operator's own subscription, and where an
         # interpreter looks for the SDK the assertion measures. Both are the
         # runtime's own, and neither has a source outside this function.
         child = isolation.container_environment(
-            described(), {"HOME": "/home/operator", "PYTHONPATH": "/home/operator/lib"}
+            fixtures.boundary(), {"HOME": "/home/operator", "PYTHONPATH": "/home/operator/lib"}
         )
 
         self.assertEqual(isolation.HOME_DIR, child["HOME"])
@@ -101,7 +68,7 @@ class ContainerEnvironmentTest(unittest.TestCase):
         self.assertNotIn(isolation.IMPORT_PATH, child)
 
     def test_the_child_has_no_route_out_that_the_runtime_does_not_own(self):
-        child = isolation.container_environment(described(), dict(os.environ))
+        child = isolation.container_environment(fixtures.boundary(), dict(os.environ))
 
         for name in tls.PROXY_VARIABLES:
             self.assertEqual("http://rk2-proxy:18080", child[name])
@@ -110,20 +77,26 @@ class ContainerEnvironmentTest(unittest.TestCase):
         for name in tls.TRUST_VARIABLES:
             self.assertEqual(isolation.CA_FILE, child[name])
 
-    def test_only_what_the_runtime_mounts_is_inside_and_the_signing_key_is_not(self):
+    def contained(self) -> Path:
+        """A directory the contained user could write, as a home has to be."""
         root = Path(tempfile.mkdtemp(prefix="rk2-mounts-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        root.chmod(0o777)
+        return root
+
+    def test_only_what_the_runtime_mounts_is_inside_and_the_signing_key_is_not(self):
+        root = self.contained()
         authority = tls.authority(root / "authority")
 
         mounts = isolation._mounts(
-            described(application=root, runtime=root, home=root), authority.certificate
+            fixtures.boundary(application=root, sdk=root, home=root), authority.certificate
         )
 
         destinations = [
             item.partition("dst=")[2].partition(",")[0] for item in mounts if item != "--mount"
         ]
         self.assertEqual(
-            [isolation.CA_FILE, isolation.APPLICATION, isolation.RUNTIME, isolation.HOME_DIR],
+            [isolation.CA_FILE, isolation.APPLICATION, isolation.SDK, isolation.HOME_DIR],
             destinations,
         )
         # The application and the SDK are what a launch is measured as, and the
@@ -134,7 +107,44 @@ class ContainerEnvironmentTest(unittest.TestCase):
 
     def test_a_mount_that_is_not_a_directory_is_refused_before_launch(self):
         with self.assertRaisesRegex(isolation.Unavailable, "not a directory"):
-            isolation._mounts(described(home=Path("/etc/hostname")), Path("/etc/hostname"))
+            isolation._mounts(fixtures.boundary(home=Path("/etc/hostname")), Path("/etc/hostname"))
+
+    def test_no_mount_may_carry_the_operator_home_however_it_is_named(self):
+        # The caller names the host directories, so "the child resolves the
+        # runtime's credential and not the operator's" is checked rather than
+        # trusted. Read-only is no defence: reading is what a credential file is
+        # for. A directory *under* the operator's home is fine and usual --
+        # the checkout and the installed SDK normally live there.
+        operator = Path(os.path.expanduser("~")).resolve()
+        root = self.contained()
+
+        for field in ("application", "sdk", "home"):
+            for named in (operator, operator.parent):
+                with self.subTest(field=field, named=str(named)):
+                    with self.assertRaisesRegex(isolation.Unavailable, "operator's home"):
+                        isolation._mounts(
+                            fixtures.boundary(**{field: named}), root / "authority.pem"
+                        )
+
+        inside = operator / "redkraken-not-a-real-checkout"
+        self.assertFalse(isolation._carries_operator_home(inside))
+
+    def test_a_home_the_contained_user_could_not_write_is_refused_before_launch(self):
+        private = Path(tempfile.mkdtemp(prefix="rk2-private-"))
+        self.addCleanup(shutil.rmtree, private, ignore_errors=True)
+        private.chmod(0o700)
+
+        # The child runs as nobody, and a home it cannot write is a session that
+        # never starts. Refused here rather than diagnosed from a CLI that
+        # failed inside a container the run has already thrown away.
+        with self.assertRaisesRegex(isolation.Unavailable, "cannot write"):
+            isolation._mounts(fixtures.boundary(home=private), private / "authority.pem")
+
+        # And a read-only mount is not asked the question at all: nothing writes
+        # to the SDK, so a directory nobody can write to is the contained one.
+        mounts = isolation._mounts(fixtures.boundary(sdk=private), private / "root.pem")
+
+        self.assertIn(f"type=bind,src={private},dst={isolation.SDK},readonly", mounts)
 
 
 @unittest.skipUnless(LIVE, REASON)
@@ -145,8 +155,8 @@ class AgentContainerIsolationTest(unittest.TestCase):
     def setUpClass(cls):
         if shutil.which("docker") is None:
             raise unittest.SkipTest("docker is not on PATH")
-        if docker("image", "inspect", IMAGE, check=False).returncode:
-            raise unittest.SkipTest(f"the local Agent test image is absent: {IMAGE}")
+        if docker("image", "inspect", fixtures.AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {fixtures.AGENT_IMAGE}")
 
         suffix = uuid.uuid4().hex[:12]
         cls.agent_network = f"rk2-agent-{suffix}"
@@ -207,7 +217,7 @@ class AgentContainerIsolationTest(unittest.TestCase):
             name,
             "--network",
             network,
-            IMAGE,
+            fixtures.AGENT_IMAGE,
             "python3",
             "-m",
             "http.server",
@@ -227,8 +237,8 @@ class AgentContainerIsolationTest(unittest.TestCase):
         return result.stdout.strip()
 
     def boundary(self, *, network: str | None = None) -> isolation.AgentContainer:
-        return isolation.AgentContainer(
-            image=IMAGE,
+        """The described boundary, with the names of things that exist."""
+        return fixtures.boundary(
             network=network or self.agent_network,
             proxy_container=self.proxy,
             proxy_url=f"http://{self.proxy}:18080",

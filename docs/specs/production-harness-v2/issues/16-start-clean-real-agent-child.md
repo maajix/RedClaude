@@ -119,11 +119,14 @@ also gained a `stdin`, so the job crosses on a pipe rather than in `argv`.
 positive list, and the boundary's is narrower -- three usability variables,
 plus `HOME`, `TMPDIR` and `PYTHONPATH`, which the runtime sets because each one
 decides what a child resolves. Not `PATH` any more either: it comes from the
-image. `AgentRunRequest` lost `workspace`, `proxy_url`, `certificate` and
-`home` to one required `container` field, which is now the whole of what a
-child can reach. The launch directory moved to the child, because the
-supervisor's filesystem is not the child's, and a directory it made would be
-one the child could not be given.
+image. `AgentRunRequest` lost `proxy_url`, `certificate` and `home` to one
+required `container` field, which is now the whole of what a child can reach,
+and lost `workspace` outright: where a child works is `isolation.WORKSPACE`, a
+constant of the container rather than a value a caller supplies. Because that
+list is now the boundary's, criterion 2's evidence is in
+`tests/test_isolation.py`: the module that tests the module. The launch
+directory moved to the child, because the supervisor's filesystem is not the
+child's, and a directory it made would be one the child could not be given.
 
 *Criterion 4* is met by `ContainedChildTest`: a real child, `python3 -P -m
 redkraken._launch` inside the boundary, against `fixtures.ControlUpstream`
@@ -135,23 +138,79 @@ is served once. Every request the child made is read back out of the peer's own
 log, and each one is addressed to `api.anthropic.com`.
 
 *Criterion 5* now holds on all four clauses. No API key and no unrelated
-settings were already tested. No usable subscription credential is stronger
-than it was: the operator's home is not merely un-inherited, it is not in the
-child's filesystem, and the only home there is the one the runtime mounted. No
-direct target network path is the ticket-11 property, unchanged and now applied
-to this child -- a property of the network rather than a request made of a
-cooperative client through proxy variables.
+settings were already tested. No usable subscription credential: the operator's
+home is not merely un-inherited, it is not in the child's filesystem, and no
+mount may carry it -- `_mounts` refuses the operator's home and anything
+containing it, read-only included, because reading is what a credentials file is
+for. No direct target network path is measured in the boundary an Agent child
+actually runs in, with the application, the SDK and the home mounted, rather
+than inherited from ticket 11's proof about a container built to prove topology:
+`api.anthropic.com` does not resolve, public TCP does not connect, the one peer
+does, and the only home inside is the one the runtime put there.
 
 Two test-side notes. `RK_TEST_AGENT_IMAGE` now defaults to `python:3.14-slim`
 rather than `python:3.13-alpine`: the bundled CLI is a glibc-linked executable,
 so a musl image is one no Agent child can start in, and a default that is not a
-possible Agent image makes the topology proof about nothing. And
-`isolation.container_environment` and `isolation._mounts` are split out of
-`run`, so the half of the boundary that needs no engine is asserted on machines
-that have none -- which is the same reasoning that keeps `assess` pure.
+possible Agent image makes the topology proof about nothing. That re-bases
+ticket 11's criterion 1, and is recorded there too. And
+`isolation.container_environment`, `isolation._supplied` and `isolation._mounts`
+are split out of `run`, so the half of the boundary that needs no engine is
+asserted on machines that have none -- which is the same reasoning that keeps
+`assess` pure.
 
-The suite is 651 tests. The two failures are the same pre-existing
+The suite is 655 tests. The two failures are the same pre-existing
 environmental ones (`test_identity` and `test_proxy` need `os.memfd_create`,
 absent from the uv CPython builds this machine runs). With
-`RK_TEST_CONTAINERS=1`, `tests.test_agent` and `tests.test_isolation` are 40
+`RK_TEST_CONTAINERS=1`, `tests.test_agent` and `tests.test_isolation` are 44
 tests green on the measured interpreter, one skip.
+
+That number is the qualification this ticket carries: the contained child is
+opt-in. It needs `RK_TEST_CONTAINERS=1`, an engine and the image already local,
+and it skips itself otherwise, so the default suite asserts every rule and
+starts no container. Opt-in rather than detected on purpose -- a suite that
+started a child whenever docker happened to be installed would be a suite whose
+meaning depended on the machine -- but it does mean criteria 4 and 5 are proved
+where someone asks for them, which is what `ticket-coverage.md` already records
+about the container suite generally. What holds everywhere is the join either
+side of the boundary: a real child process, refusing for itself, whose actual
+standard error the supervisor's own reader turns back into the refusal it made.
+
+### What the second review round changed
+
+The Standards axis found three hard breaches, all taken. `tests/test_agent.py`
+imported `IMAGE` and `docker` from `tests/test_isolation.py` -- the only
+test-module-to-test-module import in the suite, and `tests/__init__.py` says the
+sanctioned shared module is `fixtures`. Both moved there, along with the one
+`AgentContainer` builder, which had been written three times. Second,
+`AgentContainer.runtime` and `isolation.RUNTIME` drifted from the glossary:
+"the runtime" is the harness, and in this diff alone the same word was also the
+measured-facts mapping and a wall-clock duration. The field is `sdk` and the
+destination is `/opt/rk2-sdk`. Third, `CONTEXT.md` had no term for the thing
+`agent_run` now requires, so **Agent boundary** is defined there.
+
+Also from that axis: `PYTHON` moved to `isolation.INTERPRETER`, because which
+interpreter exists is a fact about the image and every other in-image constant
+already lives there; the destination table that `container_environment` and
+`_mounts` each carried a copy of is now `isolation._supplied`, read by both;
+`ControlUpstream.url` no longer builds `http://0.0.0.0:...` from a wildcard
+bind; and the docker arguments in `ContainedChildTest._serve` are one per line
+like every other engine call in the suite.
+
+The Spec axis found that two properties were argued rather than measured. Both
+are measured now, and both found something the argument had hidden. "No usable
+subscription credential" was call-site discipline -- nothing stopped
+`home=/home/operator` -- so `_mounts` refuses any mount that carries the
+operator's home. And the home is the one writable mount, which the docstring
+made a requirement and nothing enforced, so a home the container's own
+unprivileged user could not write is refused before launch rather than
+diagnosed from a CLI that failed inside a container the run has already thrown
+away. Its third finding, that "no direct target network path" was transferred
+from ticket 11 rather than measured here, is the probe described above.
+
+Two claims in this comment were wrong and are corrected in place: `workspace`
+did not move into `container`, it became a constant; and the launch directory
+is created *before* the assertion, not after, because the assertion's questions
+are about that directory -- `_launch.run`'s docstring said otherwise and now
+says what happens, which is that a refused launch leaves a directory behind and
+nothing else. `fixtures.subscription` no longer claims the credential is only
+ever presented on loopback.

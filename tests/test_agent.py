@@ -5,6 +5,8 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -14,7 +16,7 @@ from pathlib import Path
 
 from redkraken import _launch, _startup, agent, isolation, tls
 from tests import ROOT, control_upstream, fixtures
-from tests.test_isolation import IMAGE, docker
+from tests.fixtures import docker
 
 
 PACKAGE = ROOT / "src" / "redkraken"
@@ -31,9 +33,11 @@ INSTALLED = _launch.claude_agent_sdk is not None
 NEEDS_SDK = f"{SDK} is not installed in this interpreter"
 NEEDS_NO_SDK = f"{SDK} is installed, so this interpreter is a measured runtime"
 
-#: And why the launch tests are conditional too. There is one launch mechanism
-#: and it is a container, so a machine with no engine can assert every rule and
-#: start nothing.
+#: Why the launch tests are conditional too. There is one launch mechanism and
+#: it is a container, so a machine with no engine can assert every rule in this
+#: module and start nothing. Opt-in rather than detected, so a suite that ran
+#: green never quietly meant "no child was started": a machine that is meant to
+#: prove the contained child says so.
 LIVE = os.environ.get("RK_TEST_CONTAINERS") == "1"
 NEEDS_CONTAINERS = "set RK_TEST_CONTAINERS=1 to run the contained Agent child"
 
@@ -495,6 +499,42 @@ class ReadbackTest(unittest.TestCase):
         self.assertEqual({"answers": 2}, agent._last_document(stream))
         self.assertIsNone(agent._last_document("\n  \n"))
 
+    def test_a_real_child_that_refused_is_read_back_as_the_refusal_it_made(self):
+        """The two halves joined, on a machine with no engine at all.
+
+        `ReadbackTest` above reads stderr this suite wrote and `ChildTest`
+        refuses in-process; this is a child that is a process, refusing for
+        itself, whose actual standard error the supervisor's own reader turns
+        back into a refusal. A container would prove the same join and prove it
+        only where docker is, which is not everywhere the refusal has to hold.
+        """
+        workspace = fixtures.scratch()
+        child = subprocess.run(
+            [sys.executable, "-P", "-m", agent.CHILD],
+            input=json.dumps(job(workspace)),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                isolation.IMPORT_PATH: str(ROOT / "src"),
+                "ANTHROPIC_API_KEY": "exported-into-the-child",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(agent.REFUSED, child.returncode, child.stderr)
+        refusal = agent._refusal(child.stderr)
+        self.assertEqual("pre_spawn", refusal.phase)
+        self.assertIn("credential_vector", codes(refusal.violations))
+        if not INSTALLED:
+            # No SDK is an unmeasured runtime, and it is refused rather than
+            # resolved from `PATH`: nothing the child wrote names a second
+            # executable to have tried.
+            self.assertIn(agent.UNMEASURED_RUNTIME, codes(refusal.violations))
+        # And the value that caused it never crossed back out.
+        self.assertNotIn("exported-into-the-child", child.stderr + child.stdout)
+
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
 class OptionsTest(unittest.TestCase):
@@ -535,8 +575,10 @@ class ContainedChildTest(unittest.TestCase):
     def setUpClass(cls):
         if shutil.which("docker") is None:
             raise unittest.SkipTest("docker is not on PATH")
-        if docker("image", "inspect", IMAGE, check=False).returncode:
-            raise unittest.SkipTest(f"the local Agent test image is absent: {IMAGE}")
+        if docker("image", "inspect", fixtures.AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(
+                f"the local Agent test image is absent: {fixtures.AGENT_IMAGE}"
+            )
 
         suffix = uuid.uuid4().hex[:12]
         cls.network = f"rk2-agent-{suffix}"
@@ -564,16 +606,30 @@ class ContainedChildTest(unittest.TestCase):
     def _serve(cls) -> None:
         """Start the model API as a peer, and wait for it to be one."""
         docker(
-            "run", "--detach", "--rm", "--pull", "never",
-            "--name", cls.upstream,
-            "--network", cls.network,
-            "--mount", f"type=bind,src={ROOT},dst={REPOSITORY},readonly",
-            "--mount", f"type=bind,src={cls.authority.directory},dst={AUTHORITY}",
-            "--env", f"PYTHONPATH={REPOSITORY}/src:{REPOSITORY}",
-            "--entrypoint", "",
-            IMAGE,
-            "python3", "-m", control_upstream.__name__,
-            agent.TOOL, AUTHORITY, str(UPSTREAM_PORT),
+            "run",
+            "--detach",
+            "--rm",
+            "--pull",
+            "never",
+            "--name",
+            cls.upstream,
+            "--network",
+            cls.network,
+            "--mount",
+            f"type=bind,src={ROOT},dst={REPOSITORY},readonly",
+            "--mount",
+            f"type=bind,src={cls.authority.directory},dst={AUTHORITY}",
+            "--env",
+            f"PYTHONPATH={REPOSITORY}/src:{REPOSITORY}",
+            "--entrypoint",
+            "",
+            fixtures.AGENT_IMAGE,
+            "python3",
+            "-m",
+            control_upstream.__name__,
+            agent.TOOL,
+            AUTHORITY,
+            str(UPSTREAM_PORT),
         )
         deadline = time.monotonic() + UPSTREAM_READY
         while time.monotonic() < deadline:
@@ -583,18 +639,18 @@ class ContainedChildTest(unittest.TestCase):
         raise AssertionError(docker("logs", cls.upstream, check=False).stderr)
 
     def boundary(self, **overrides) -> isolation.AgentContainer:
+        """The boundary an Agent child runs in, with everything it needs in it."""
         fields = {
-            "image": IMAGE,
             "network": self.network,
             "proxy_container": self.upstream,
             "proxy_url": f"http://{self.upstream}:{UPSTREAM_PORT}",
             "certificate": self.authority.certificate,
             "application": ROOT / "src",
-            "runtime": self.installed_sdk(),
+            "sdk": self.installed_sdk(),
             "home": self.home(),
         }
         fields.update(overrides)
-        return isolation.AgentContainer(**fields)
+        return fixtures.boundary(**fields)
 
     def installed_sdk(self) -> Path | None:
         """Where this machine keeps the SDK, so the container can be measured."""
@@ -607,7 +663,10 @@ class ContainedChildTest(unittest.TestCase):
 
         Writable by the container's unprivileged user rather than by this one:
         the CLI keeps session state in it, and a home the child cannot write is
-        a session that never starts.
+        a session that never starts. The mode is wide because there is no other
+        way to hand a directory to uid 65534 without being root, and it is
+        contained anyway: the directory lives under this run's own private
+        scratch root, and the credential in it is a literal.
         """
         home = fixtures.subscription(fixtures.scratch() / "home")
         home.chmod(0o777)
@@ -654,6 +713,57 @@ class ContainedChildTest(unittest.TestCase):
             sum(1 for _, line in seen if line.startswith("POST /v1/messages")), result.answers
         )
 
+    def test_the_boundary_an_agent_child_runs_in_has_no_path_to_a_target(self):
+        """Measured in the Agent child's own boundary, not inherited from one.
+
+        `tests/test_isolation.py` proves the topology of a container built to
+        prove topology. This is the container an Agent child actually runs in --
+        the same `AgentContainer`, with the application, the SDK and the home
+        mounted -- so what is asserted is that adding the three things a child
+        needs to exist did not add a way out, and that the only home inside is
+        the one the runtime mounted.
+        """
+        probe = r"""
+import json, os, socket
+
+def reaches(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.6):
+            return True
+    except OSError:
+        return False
+
+def resolves(host):
+    try:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
+
+print(json.dumps({
+    'model_api': resolves('api.anthropic.com'),
+    'internet_tcp': reaches('1.1.1.1', 443),
+    'peer': reaches(%r, %d),
+    'home': sorted(os.listdir(os.environ['HOME'])),
+    'application': sorted(os.listdir(%r))[:1],
+}))
+""" % (self.upstream, UPSTREAM_PORT, isolation.APPLICATION)
+
+        result = isolation.run(
+            self.boundary(), (isolation.INTERPRETER, "-c", probe), timeout=30
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        facts = json.loads(result.stdout)
+        # The model API is not a name this child can resolve, let alone reach:
+        # every request it makes goes to the door, which is the only peer, and
+        # the door is what holds a certificate for that name.
+        self.assertFalse(facts["model_api"])
+        self.assertFalse(facts["internet_tcp"])
+        self.assertTrue(facts["peer"])
+        self.assertEqual([".claude", ".claude.json"], facts["home"])
+        self.assertEqual(["redkraken"], facts["application"])
+
     def test_a_boundary_without_the_measured_sdk_refuses_in_the_caller(self):
         # The child is measured against what was mounted, not against what the
         # supervisor's own interpreter happens to have installed. Nothing
@@ -663,7 +773,7 @@ class ContainedChildTest(unittest.TestCase):
                 agent.AgentRunRequest(
                     agent_run_id="agent-run-1",
                     objective="Say nothing.",
-                    container=self.boundary(runtime=None),
+                    container=self.boundary(sdk=None),
                     timeout=120.0,
                 )
             )

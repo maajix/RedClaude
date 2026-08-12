@@ -324,3 +324,13 @@ capability resolution and the allowed-Receipt trigger re-read current Halt
 state. The live two-request test keeps the Tool run and capability alive,
 halts between requests, proves the second request opens no target socket, then
 resumes only after a human clear; both state changes are human-authored Events.
+
+### The image the topology is proved on, 2026-08-12
+
+Ticket 16 changed the default `RK_TEST_AGENT_IMAGE` from `python:3.13-alpine` to
+`python:3.14-slim`, so criterion 1 is now proved on a different image and the
+change belongs here as well as there. The reason is that the first one was never
+a possible Agent image: the CLI the SDK bundles is a glibc-linked executable, so
+no Agent child can start in a musl image, and a topology proved about an image
+no run could use is a proof about nothing. Nothing else moved -- the same
+container proof runs, and every clause of it still holds.

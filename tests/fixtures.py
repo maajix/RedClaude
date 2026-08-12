@@ -2,9 +2,11 @@
 
 import atexit
 import json
+import os
 import shutil
 import socket
 import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -12,7 +14,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from redkraken import tls
+from redkraken import isolation, tls
 
 
 VALID = """\
@@ -402,7 +404,12 @@ class ControlUpstream:
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(bind)
         self._listener.listen(32)
-        self.url = f"http://{bind[0]}:{self._listener.getsockname()[1]}"
+        # Where the process holding this object reaches it, which is not the
+        # address it was bound to: a wildcard bind is reachable from everywhere,
+        # and everywhere's local name for it is loopback. A peer is reached by
+        # its container name instead, which only its supervisor knows.
+        host = "127.0.0.1" if bind[0] in ("", "0.0.0.0") else bind[0]
+        self.url = f"http://{host}:{self._listener.getsockname()[1]}"
         self._running = True
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -527,10 +534,10 @@ def subscription(home: Path) -> Path:
     The bundled CLI will not start a session without something that looks like
     an authenticated operator, so the run is given a fabricated one. It is
     inert by construction -- the token is a literal, and the only endpoint it
-    is ever presented to is `ControlUpstream` on loopback -- which is the point:
-    the child under test resolves *this*, not the operator's real credential,
-    and a test that leaked the operator's would be a test that spent their
-    tokens.
+    is ever presented to is `ControlUpstream`, whether that is a thread on
+    loopback or the one peer on an internal network -- which is the point: the
+    child under test resolves *this*, not the operator's real credential, and a
+    test that leaked the operator's would be a test that spent their tokens.
     """
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".claude" / ".credentials.json").write_text(
@@ -551,6 +558,51 @@ def subscription(home: Path) -> Path:
         json.dumps({"hasCompletedOnboarding": True}), encoding="utf-8"
     )
     return home
+
+
+#: The image every container proof starts from. It is a glibc one because an
+#: Agent image has to be: the CLI the SDK bundles is a glibc-linked executable,
+#: so a musl image is one no Agent child can start in, and a topology proved
+#: about an image no Agent run could use is a proof about nothing.
+AGENT_IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.14-slim")
+
+
+def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """One engine command, for the suites that arrange what `isolation` verifies.
+
+    Here rather than in either container suite because both need it, and a test
+    module that imported another test module would be a suite whose fixtures
+    moved when a test file was renamed.
+    """
+    result = subprocess.run(
+        ["docker", *arguments],
+        env={"PATH": os.environ.get("PATH", "")},
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if check and result.returncode:
+        raise AssertionError((result.stderr or result.stdout).strip())
+    return result
+
+
+def boundary(**overrides) -> isolation.AgentContainer:
+    """One described Agent boundary, with no engine needed to describe it.
+
+    The one builder: a described boundary and a live one differ by which names
+    are real, so a second builder would be a second answer to what a boundary
+    is made of.
+    """
+    fields = {
+        "image": AGENT_IMAGE,
+        "network": "rk2-agent-network",
+        "proxy_container": "rk2-proxy",
+        "proxy_url": "http://rk2-proxy:18080",
+        "certificate": Path("/run/root.pem"),
+    }
+    fields.update(overrides)
+    return isolation.AgentContainer(**fields)
 
 
 def scratch() -> Path:

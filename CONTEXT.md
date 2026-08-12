@@ -202,6 +202,17 @@ the set is bound to that runtime version.
 _Avoid_: API key, credential, auth source (an auth source is what the CLI
 reports having resolved, after the fact)
 
+**Agent boundary**:
+The container one agent run's process lives in: attached to a single internal
+network whose only peer is the capability proxy, external DNS blackholed, and
+holding only what the runtime mounts — the application, the SDK the startup
+assertion measures, the home a credential is resolved from, and the run's trust
+root. It is what makes "no direct path to a target" a property of the network
+rather than a request made of a cooperative client. Required to start an agent
+run and never defaulted: a default would be the operator's own machine, with the
+operator's own home.
+_Avoid_: Sandbox, jail, isolation layer, VM
+
 **Startup assertion**:
 The runtime's version-bound refusal to begin an agent run while any credential
 vector is present or the effective launch configuration cannot be verified,

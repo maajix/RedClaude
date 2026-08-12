@@ -208,8 +208,14 @@ async def run(
     runtime: Mapping[str, object] | None = None,
     transport=None,
 ) -> dict:
-    """Make the launch directory, assert, start, corroborate, serve. In that
-    order, or not at all.
+    """Make the launch directory, assert against it, start, corroborate, serve.
+
+    The directory and its settings document come first because they are part of
+    what is asserted: the assertion's questions are "is the working directory
+    the runtime's own" and "what will the CLI load from it", and neither can be
+    asked about a directory that does not exist yet. So a refused launch leaves
+    a directory behind and nothing else -- no transport, no session, no turn.
+    Everything after the assertion is a gate on the step after it.
 
     `environment`, `runtime` and `transport` are parameters so that a refusal
     can be provoked without provoking the machine that would have to be broken

@@ -46,15 +46,26 @@ INHERITED = ("LANG", "LC_ALL", "TZ")
 # SDK a child resolves is exactly what the startup assertion measures, so it is
 # a constant of this runtime rather than a value a caller supplies.
 APPLICATION = "/opt/rk2-app"
-RUNTIME = "/opt/rk2-runtime"
+SDK = "/opt/rk2-sdk"
 HOME_DIR = "/run/redkraken-home"
 WORKSPACE = "/run/rk2"
 TMPDIR = "/run"
+
+# The interpreter a child is started with.  The image's, not the supervisor's:
+# `sys.executable` names a file on the machine that decides to launch, and the
+# machine that runs is a container that has never seen it.
+INTERPRETER = "python3"
 
 # How the child is told where the application is.  Set here and never
 # inherited: an inherited import path is a way to choose which SDK the
 # assertion measures.
 IMPORT_PATH = "PYTHONPATH"
+
+# Who a child is inside its container.  Unprivileged and nameless, which is why
+# the one directory a child may write has to be one *this* user can write: the
+# supervisor's own access to it answers a question nobody asked.
+UID = 65534
+GID = 65534
 
 
 class Unavailable(RuntimeError):
@@ -79,7 +90,7 @@ class AgentContainer:
     proxy_url: str
     certificate: Path
     application: Path | None = None
-    runtime: Path | None = None
+    sdk: Path | None = None
     home: Path | None = None
     engine: str = ENGINE
 
@@ -103,12 +114,7 @@ def container_environment(
     child = {name: source[name] for name in INHERITED if source.get(name)}
     child.update({"HOME": HOME_DIR, "TMPDIR": TMPDIR})
     mounted = [
-        destination
-        for destination, host in (
-            (APPLICATION, container.application),
-            (RUNTIME, container.runtime),
-        )
-        if host is not None
+        destination for destination, _, _, imported in _supplied(container) if imported
     ]
     if mounted:
         # The container's separator, not this machine's: the value is read by
@@ -184,7 +190,7 @@ def run(
         "--pids-limit",
         "256",
         "--user",
-        "65534:65534",
+        f"{UID}:{GID}",
         "--entrypoint",
         "",
         *mounts,
@@ -218,6 +224,27 @@ def run(
         raise Unavailable(f"the Agent container exceeded its {timeout:g}s runtime") from error
 
 
+def _supplied(container: AgentContainer) -> list[tuple[str, Path, bool, bool]]:
+    """Where each host directory this container supplies lands inside it.
+
+    One table, read by everything that needs the answer.  Which application and
+    which SDK a child resolves is exactly what the startup assertion measures,
+    so two lists that had to agree about where a directory landed would be two
+    answers to one question.  Each row is the destination, the host directory,
+    whether it crosses read-only, and whether it is on the child's import path.
+    """
+    rows = (
+        (APPLICATION, container.application, True, True),
+        (SDK, container.sdk, True, True),
+        (HOME_DIR, container.home, False, False),
+    )
+    return [
+        (destination, Path(host), readonly, imported)
+        for destination, host, readonly, imported in rows
+        if host is not None
+    ]
+
+
 def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
     """Everything the runtime puts inside the boundary, and nothing else.
 
@@ -226,23 +253,53 @@ def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
     Agent that can be intercepted and an Agent that can intercept is exactly
     one file.  The application and the SDK cross read-only, because a child
     that could write to them could choose what the next child is measured as.
-    The home is the one writable mount -- the CLI keeps session state in it --
-    and it has to be a directory the container's own user can write.
+    The home is the one writable mount -- the CLI keeps session state in it.
+
+    A caller names the host directories, so the two properties that make them
+    contained are checked here rather than assumed of the caller: no mount may
+    carry the operator's own home, and the writable one has to be writable by
+    the user the child actually runs as.
     """
     arguments = ["--mount", f"type=bind,src={certificate},dst={CA_FILE},readonly"]
-    for destination, host, readonly in (
-        (APPLICATION, container.application, True),
-        (RUNTIME, container.runtime, True),
-        (HOME_DIR, container.home, False),
-    ):
-        if host is None:
-            continue
-        source = Path(host).resolve()
+    for destination, host, readonly, _ in _supplied(container):
+        source = host.resolve()
         if not source.is_dir():
             raise Unavailable(f"an Agent container mount is not a directory: {source}")
+        if _carries_operator_home(source):
+            raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
+        if not readonly and not _writable_by_the_child(source):
+            raise Unavailable(f"an Agent container home the child cannot write: {source}")
         mount = f"type=bind,src={source},dst={destination}"
         arguments.extend(("--mount", f"{mount},readonly" if readonly else mount))
     return arguments
+
+
+def _carries_operator_home(source: Path) -> bool:
+    """Whether mounting this directory would put the operator's home inside.
+
+    Asked of every mount and not only the writable one: read-only is enough to
+    read a credentials file, and the whole point of mounting a home is that the
+    CLI resolves a credential from it.  A directory *under* the operator's home
+    is fine and common -- the checkout and the installed SDK usually live there
+    -- so what is refused is the home itself and anything containing it.
+    """
+    home = Path(os.path.expanduser("~")).resolve()
+    return source == home or source in home.parents
+
+
+def _writable_by_the_child(source: Path) -> bool:
+    """Whether the container's own unprivileged user could write this directory.
+
+    Decided from the directory's ownership and mode rather than from
+    `os.access`, which would answer for the supervisor -- a different user, on
+    the machine that is not the one running the child.
+    """
+    status = source.stat()
+    if status.st_uid == UID:
+        return status.st_mode & 0o300 == 0o300
+    if status.st_gid == GID:
+        return status.st_mode & 0o030 == 0o030
+    return status.st_mode & 0o003 == 0o003
 
 
 def _engine(name: str) -> str:
