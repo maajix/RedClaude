@@ -89,8 +89,8 @@ ABSENT = "absent"
 REFUSAL = "startup_refusal"
 
 #: How much of the final answer crosses back. A bound rather than a budget: the
-#: result document travels through a pipe and this is proof the run
-#: finished, not a transcript. Ticket 17 owns what is kept durably.
+#: result document travels through a pipe and this is proof the run finished,
+#: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
 
 
@@ -222,7 +222,10 @@ async def run(
     to cause it -- an exported key, a downgraded SDK, a transport that answers
     wrongly. A child supplies none of them: it reads its own environment, its
     own runtime facts and the SDK's own transport, which is the whole reason
-    the assertion is made here rather than in the supervisor.
+    the assertion is made here rather than in the supervisor. The settings
+    locations are the fourth of those seams and are named below rather than
+    taken as an argument, because a caller choosing them would be a caller
+    choosing which documents the assertion reads.
     """
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
@@ -237,7 +240,18 @@ async def run(
         None if claude_agent_sdk is None else options_for(job, runtime, server(surface), launch)
     )
 
-    violations = agent.assess(options, environment, runtime, launch_dir=launch)
+    # The managed locations are named here rather than defaulted inside
+    # `assess`, so they are the ones this module holds when the child runs
+    # rather than the ones it held when the supervisor imported it. The child
+    # asserts against the machine it is in, and this is the last place that
+    # machine can still be said to be a different one.
+    violations = agent.assess(
+        options,
+        environment,
+        runtime,
+        launch_dir=launch,
+        managed_settings=agent.MANAGED_SETTINGS,
+    )
     if violations:
         raise agent.StartupRefusal(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")

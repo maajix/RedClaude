@@ -13,10 +13,12 @@ import types
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from redkraken import _launch, _startup, agent, isolation, tls
+from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
-from tests.fixtures import docker
+from tests.fixtures import docker, unlatched
 
 
 PACKAGE = ROOT / "src" / "redkraken"
@@ -51,6 +53,65 @@ UPSTREAM_READY = 30.0
 #: imports `tests.fixtures`, which the wheel does not carry.
 REPOSITORY = "/opt/rk2-repo"
 AUTHORITY = "/opt/rk2-authority"
+
+#: A credential the child really is given, so "never its value" is a claim
+#: about output that had something in it to leak.
+EXPORTED = "exported-into-the-child"
+
+#: A child that reads the managed settings locations this suite names instead of
+#: the platform's. The rebinding is done in the child because that is the only
+#: place it means anything: `_launch.run` reads `agent.MANAGED_SETTINGS` when the
+#: child runs, so a supervisor-side patch would patch another process's idea of
+#: where settings live. The alternative is writing to `/etc` on the machine
+#: running the suite, which is not one.
+SETTINGS_CHILD = """
+import sys
+from pathlib import Path
+from redkraken import _launch, agent
+agent.MANAGED_SETTINGS = (Path(sys.argv[1]),)
+raise SystemExit(_launch.main())
+"""
+
+#: A supervisor that refuses one Agent run and then asks for another. `_spawn`
+#: is replaced rather than a container started, because what is under test is
+#: the supervisor's memory rather than the child: the second run must be refused
+#: with nothing spawned, and the only way to see that nothing was spawned is to
+#: hold the thing that would have spawned it.
+LATCH_CHILD = """
+import json, sys
+from redkraken import _startup, agent
+from tests import fixtures
+
+spawned = []
+raised = []
+refusing = sys.argv[1] == "present"
+
+
+def spawn(request, job):
+    spawned.append(request.agent_run_id)
+    if refusing:
+        raise agent.StartupRefusal(
+            [{"code": "credential_vector", "vector": "ANTHROPIC_API_KEY",
+              "source": "env:ANTHROPIC_API_KEY", "effect": "off_subscription_auth"}],
+            "pre_spawn", *_startup.KNOWN_RUNTIME)
+    return request.agent_run_id
+
+
+agent._spawn = spawn
+status = 0
+for index in (1, 2):
+    try:
+        agent.agent_run(agent.AgentRunRequest(
+            agent_run_id="agent-run-%d" % index,
+            objective="Say nothing.",
+            container=fixtures.boundary(),
+        ))
+    except agent.StartupRefusal as refusal:
+        raised.append(type(refusal).__name__)
+        status = agent.diagnostics(refusal).exit_code
+print(json.dumps({"spawned": spawned, "raised": raised}))
+raise SystemExit(status)
+"""
 
 
 def executable() -> str:
@@ -105,6 +166,58 @@ def job(launch_workspace, **overrides) -> dict:
     }
     fields.update(overrides)
     return fields
+
+
+def launched(
+    environment: dict, arguments: tuple = ("-m", agent.CHILD), workspace=None
+) -> subprocess.CompletedProcess[str]:
+    """One real child launch: a job on standard input, one environment around it.
+
+    A process rather than a call into `_launch`, because the assertion's subject
+    is the environment and the filesystem a launch actually got. An in-process
+    version would assess this interpreter's, which is the one thing a test
+    cannot arrange honestly.
+    """
+    return subprocess.run(
+        [sys.executable, "-P", *arguments],
+        input=json.dumps(job(workspace or fixtures.scratch())),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            isolation.IMPORT_PATH: str(ROOT / "src"),
+            **environment,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+
+class Stream:
+    """A transport that answers a fixed script and counts its own closing.
+
+    Deliberately not an async generator: an exhausted generator cannot tell
+    `the runtime closed me` from `I ran out`, and what an init refusal has to
+    prove is the first one.
+    """
+
+    def __init__(self, *messages) -> None:
+        self.messages = list(messages)
+        self.closed = 0
+
+    def __call__(self, **_):
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+    async def aclose(self) -> None:
+        self.closed += 1
 
 
 def codes(violations) -> list[str]:
@@ -508,20 +621,7 @@ class ReadbackTest(unittest.TestCase):
         back into a refusal. A container would prove the same join and prove it
         only where docker is, which is not everywhere the refusal has to hold.
         """
-        workspace = fixtures.scratch()
-        child = subprocess.run(
-            [sys.executable, "-P", "-m", agent.CHILD],
-            input=json.dumps(job(workspace)),
-            env={
-                "PATH": os.environ.get("PATH", ""),
-                isolation.IMPORT_PATH: str(ROOT / "src"),
-                "ANTHROPIC_API_KEY": "exported-into-the-child",
-            },
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=60,
-        )
+        child = launched({"ANTHROPIC_API_KEY": EXPORTED})
 
         self.assertEqual(agent.REFUSED, child.returncode, child.stderr)
         refusal = agent._refusal(child.stderr)
@@ -533,7 +633,7 @@ class ReadbackTest(unittest.TestCase):
             # executable to have tried.
             self.assertIn(agent.UNMEASURED_RUNTIME, codes(refusal.violations))
         # And the value that caused it never crossed back out.
-        self.assertNotIn("exported-into-the-child", child.stderr + child.stdout)
+        self.assertNotIn(EXPORTED, child.stderr + child.stdout)
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
@@ -768,7 +868,7 @@ print(json.dumps({
         # The child is measured against what was mounted, not against what the
         # supervisor's own interpreter happens to have installed. Nothing
         # mounted is an unmeasured runtime, and it refuses before a transport.
-        with self.assertRaises(agent.StartupRefusal) as raised:
+        with unlatched(), self.assertRaises(agent.StartupRefusal) as raised:
             agent.agent_run(
                 agent.AgentRunRequest(
                     agent_run_id="agent-run-1",
@@ -812,6 +912,305 @@ class AnnouncementTest(unittest.TestCase):
         # answering the moment the second announcement arrived.
         self.assertEqual(2, result["tool_ready"])
         self.assertEqual([], result["tools_served"])
+
+
+class VectorChildTest(unittest.TestCase):
+    """Every vector an operator can leave lying about, through a real launch.
+
+    The rules themselves are `AssertionTest`'s, and they are asserted on inputs
+    a function was handed. What a child adds is the only thing a pure function
+    cannot say: that the environment and the files being measured are the ones
+    the launch actually got, that it refuses before it uses either, and that
+    what it writes back names the vector and never carries the value.
+
+    Each case is compared against `_startup.evaluate_inputs` for the same
+    symbolic input, so the child and the measured credential matrix are held to
+    one answer rather than to two that happen to agree.
+    """
+
+    def refused(self, child) -> agent.StartupRefusal:
+        """The refusal one child made, and the evidence it started nothing."""
+        self.assertEqual(agent.REFUSED, child.returncode, child.stderr)
+        self.assertEqual("", child.stdout.strip())
+        self.assertNotIn(EXPORTED, child.stderr + child.stdout)
+        refusal = agent._refusal(child.stderr)
+        self.assertIsNotNone(refusal, child.stderr)
+        self.assertEqual("pre_spawn", refusal.phase)
+        return refusal
+
+    def credentials(self, refusal: agent.StartupRefusal) -> list[dict]:
+        """The records the matrix decides, apart from what it could not measure.
+
+        An interpreter without the SDK also reports an unmeasured runtime, and
+        that is a fact about the machine the suite is running on rather than
+        about the vector under test.
+        """
+        return [
+            record for record in refusal.violations if record["code"] == "credential_vector"
+        ]
+
+    def settings_child(self, document: object) -> agent.StartupRefusal:
+        """One child whose managed settings location holds this document."""
+        settings = fixtures.scratch() / "managed-settings.json"
+        settings.write_text(
+            document if isinstance(document, str) else json.dumps(document), encoding="utf-8"
+        )
+        self.settings = settings
+        return self.refused(launched({}, arguments=("-c", SETTINGS_CHILD, str(settings))))
+
+    def test_every_watched_variable_refuses_the_launch_that_inherited_it(self):
+        for name in _startup.WATCHED_ENV_VECTORS:
+            with self.subTest(vector=name):
+                refusal = self.refused(launched({name: EXPORTED}))
+
+                self.assertEqual(
+                    _startup.evaluate_inputs({"environment": {name: EXPORTED}})["violations"],
+                    self.credentials(refusal),
+                )
+
+    def test_a_settings_helper_and_a_settings_variable_are_read_where_they_load(self):
+        for description, document in (
+            ("a helper the CLI would run for a key", {"apiKeyHelper": "/usr/local/bin/key"}),
+            ("a variable the document exports", {"env": {"ANTHROPIC_API_KEY": EXPORTED}}),
+            (
+                "both at once, in the file the runtime never asked for",
+                {"apiKeyHelper": "/usr/local/bin/key", "env": {"ANTHROPIC_AUTH_TOKEN": EXPORTED}},
+            ),
+        ):
+            with self.subTest(description):
+                refusal = self.settings_child(document)
+
+                self.assertEqual(
+                    _startup.evaluate_inputs(
+                        {
+                            "settings": [
+                                {
+                                    "kind": "managed",
+                                    "path": str(self.settings),
+                                    "document": document,
+                                }
+                            ]
+                        }
+                    )["violations"],
+                    self.credentials(refusal),
+                )
+
+    def test_a_managed_document_that_cannot_be_read_refuses_rather_than_being_skipped(self):
+        for description, document in (
+            ("a document that stops halfway", '{"apiKeyHelper": '),
+            ("a document that is not an object", "[]"),
+            ("an env member that is not one", '{"env": "ANTHROPIC_API_KEY=k"}'),
+        ):
+            with self.subTest(description):
+                refusal = self.settings_child(document)
+
+                self.assertIn(agent.SETTINGS_UNREADABLE, codes(refusal.violations))
+                self.assertIn(
+                    f"settings:managed:{self.settings}#document", sources(refusal.violations)
+                )
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class InitRefusalTest(unittest.TestCase):
+    """The phase only a running CLI can fail, and what is left when it does.
+
+    Provoked at the transport seam rather than through a child, and that is a
+    property of the system rather than a shortcut: on this runtime pair no input
+    makes the real CLI report a key source other than `none` without a
+    credential vector the pre-spawn phase has already refused. So the way to
+    reach this phase is to answer as a CLI that did.
+    """
+
+    def corroborate(self, stream: Stream) -> agent.StartupRefusal:
+        """What `_corroborate` refuses, with the surface it never opened."""
+        self.surface = _launch.Surface()
+        with self.assertRaises(agent.StartupRefusal) as raised:
+            asyncio.run(_launch._corroborate(stream, self.surface, _launch.runtime_facts()))
+        return raised.exception
+
+    def announcement(self, **data) -> object:
+        return _launch.SystemMessage(_launch.INIT, data)
+
+    def test_each_unexpected_init_refuses_and_names_what_it_read(self):
+        for description, stream, source in (
+            ("a run that ended without announcing itself", Stream(), "init:absent"),
+            (
+                "work produced before the runtime had assessed it",
+                Stream(_launch.SystemMessage("compact_boundary", {})),
+                "init:first_message",
+            ),
+            (
+                "a key resolved from somewhere this runtime did not expect",
+                Stream(self.announcement(apiKeySource="ANTHROPIC_API_KEY")),
+                "init:apiKeySource",
+            ),
+            (
+                "an announcement that reports no source at all",
+                Stream(self.announcement()),
+                "init:apiKeySource",
+            ),
+        ):
+            with self.subTest(description):
+                refusal = self.corroborate(stream)
+
+                self.assertEqual("init", refusal.phase)
+                self.assertEqual([source], sources(refusal.violations))
+                self.assertEqual(_startup.KNOWN_RUNTIME[0], refusal.sdk_version)
+
+    def test_an_init_refusal_serves_no_tool_and_leaves_no_transport_running(self):
+        stream = Stream(self.announcement(apiKeySource="ANTHROPIC_API_KEY"))
+
+        self.corroborate(stream)
+
+        # Zero, not one-and-closed: the surface opens after corroboration, so a
+        # refusal there is a run in which no tool was ever callable.
+        self.assertEqual((0, []), (self.surface.opened, self.surface.served))
+        self.assertEqual(1, stream.closed)
+
+    def test_the_launch_that_reaches_init_refuses_there_and_returns_nothing(self):
+        stream = Stream(self.announcement(apiKeySource="ANTHROPIC_API_KEY"))
+
+        with self.assertRaises(agent.StartupRefusal) as raised:
+            asyncio.run(
+                _launch.run(
+                    job(fixtures.scratch(), max_turns=1),
+                    environment={},
+                    runtime=_launch.runtime_facts(),
+                    transport=stream,
+                )
+            )
+
+        self.assertEqual("init", raised.exception.phase)
+        self.assertEqual([agent.AUTH_SOURCE_UNEXPECTED], codes(raised.exception.violations))
+        self.assertEqual(1, stream.closed)
+
+
+class LatchTest(unittest.TestCase):
+    """PH2-17: a process that has refused starts no further Agent run.
+
+    Two processes, because the latch is process state and a test that reset it
+    would be testing something else. What the supervisor does with the second
+    request is the whole claim: it is refused with the violations the first one
+    measured, nothing is spawned for it, and the process exits on the class the
+    refusal belongs to rather than on an unclassified error.
+    """
+
+    def supervise(self, credential: str) -> tuple[int, dict]:
+        """One supervisor process, asked for two Agent runs."""
+        child = subprocess.run(
+            [sys.executable, "-P", "-c", LATCH_CHILD, credential],
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                isolation.IMPORT_PATH: os.pathsep.join((str(ROOT / "src"), str(ROOT))),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertNotEqual("", child.stdout.strip(), child.stderr)
+        return child.returncode, json.loads(child.stdout)
+
+    def test_a_refused_process_refuses_the_next_run_without_spawning_it(self):
+        status, observed = self.supervise("present")
+
+        self.assertEqual(EXIT_STARTUP_REFUSED, status)
+        self.assertEqual(["agent-run-1"], observed["spawned"])
+        self.assertEqual(["StartupRefusal", "Latched"], observed["raised"])
+
+    def test_a_process_that_started_after_the_remediation_runs_both(self):
+        status, observed = self.supervise("gone")
+
+        self.assertEqual(0, status)
+        self.assertEqual(["agent-run-1", "agent-run-2"], observed["spawned"])
+        self.assertEqual([], observed["raised"])
+
+
+class DiagnosticsTest(unittest.TestCase):
+    """What an operator is told about a refusal, and what they are not."""
+
+    def refusal(self, environment: dict) -> agent.StartupRefusal:
+        violations = agent.assess(
+            None, environment, {}, launch_dir=fixtures.scratch(), managed_settings=()
+        )
+        return agent.StartupRefusal(violations, "pre_spawn", *_startup.KNOWN_RUNTIME)
+
+    def test_a_refusal_names_every_vector_its_phase_and_its_measured_effect(self):
+        refusal = self.refusal({name: EXPORTED for name in _startup.WATCHED_ENV_VECTORS})
+
+        rendered = agent.diagnostics(refusal).as_dict()
+
+        self.assertFalse(rendered["ok"])
+        self.assertEqual(EXIT_STARTUP_REFUSED, rendered["exit_code"])
+        self.assertEqual("pre_spawn", rendered["phase"])
+        self.assertEqual(_startup.KNOWN_RUNTIME[1], rendered["cli_version"])
+        self.assertEqual(
+            {STARTUP_REFUSED}, {violation["code"] for violation in rendered["violations"]}
+        )
+        self.assertEqual(
+            sorted(f"env:{name}" for name in _startup.WATCHED_ENV_VECTORS),
+            sorted(
+                violation["source"]
+                for violation in rendered["violations"]
+                if violation["source"].startswith("env:")
+            ),
+        )
+        for effect in ("off_subscription_auth", "startup_denial", "provider_reroute"):
+            self.assertIn(effect, json.dumps(rendered))
+
+    def test_no_rendering_of_a_refusal_carries_the_value_that_caused_it(self):
+        rendered = agent.diagnostics(self.refusal({"ANTHROPIC_API_KEY": EXPORTED})).as_dict()
+
+        self.assertNotIn(EXPORTED, json.dumps(rendered))
+
+
+class RecordingTest(unittest.TestCase):
+    """A refusal with nowhere to record it, and one that could not be recorded.
+
+    Both are the same question asked from either side: a refusal before there is
+    a Program is raised and written nowhere, and a run that names a Program the
+    cleanup could not use is refused before it is started rather than after.
+    """
+
+    class Untouched:
+        """A connection that fails the run if a refusal reaches a database."""
+
+        def execute(self, *arguments):
+            raise AssertionError("a refusal with no Program was recorded against one")
+
+    def request(self, **overrides) -> agent.AgentRunRequest:
+        fields = {
+            "agent_run_id": str(uuid.uuid4()),
+            "objective": "Say nothing.",
+            "container": fixtures.boundary(),
+        }
+        fields.update(overrides)
+        return agent.AgentRunRequest(**fields)
+
+    def refusing(self):
+        return mock.patch.object(
+            agent,
+            "_spawn",
+            side_effect=agent.StartupRefusal(
+                agent.uncorroborated(_launch.ABSENT), "init", *_startup.KNOWN_RUNTIME
+            ),
+        )
+
+    def test_a_refusal_before_any_program_exists_is_raised_and_written_nowhere(self):
+        with unlatched(), self.refusing():
+            with self.assertRaises(agent.StartupRefusal):
+                agent.agent_run(self.request(), self.Untouched())
+
+    def test_a_run_whose_refusal_could_not_be_recorded_is_never_started(self):
+        for description, overrides in (
+            ("a Program that is not an identifier", {"program_id": "the-one-we-opened"}),
+            ("a run that is not one", {"program_id": str(uuid.uuid4()), "agent_run_id": "run-1"}),
+        ):
+            with self.subTest(description):
+                spawn = mock.patch.object(agent, "_spawn", side_effect=AssertionError("spawned"))
+                with unlatched(), spawn:
+                    with self.assertRaises(ValueError):
+                        agent.agent_run(self.request(**overrides), self.Untouched())
 
 
 if __name__ == "__main__":

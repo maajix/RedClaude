@@ -30,6 +30,12 @@ BACKUP_FAILED = "backup_failed"
 #: minted and spent, and what failed is outside it. Reported as an invalid
 #: configuration it would send an operator to fix a file that is correct.
 TARGET_UNREACHABLE = "target_unreachable"
+#: The startup assertion refused an agent run: a credential vector was present,
+#: or the effective launch configuration could not be verified. Its own class
+#: because it is the only one here that is measured against a running version
+#: rather than read out of a file, and because it names a machine an agent run
+#: cannot start on at all rather than a command that could not finish.
+STARTUP_REFUSED = "startup_refused"
 #: The gate answered `ask`: this call is one a human decides, the question has
 #: been filed and nothing has gone wrong. Its own class because every other one
 #: names a fault an operator should go and fix, and the only action this one
@@ -50,10 +56,14 @@ EXIT_INTEGRITY_FAILED = 9
 EXIT_BACKUP_FAILED = 10
 EXIT_TARGET_UNREACHABLE = 11
 EXIT_AWAITING_DECISION = 12
+EXIT_STARTUP_REFUSED = 13
 
 #: Reported and exited first-to-last when several classes are observed at once.
 #: An unsupported runtime outranks a missing dependency, which outranks operator
-#: configuration, because the earlier fact explains the later ones. The database
+#: configuration, because the earlier fact explains the later ones. A refused
+#: startup sits between the last two: it is measured on the machine an agent run
+#: would have started on rather than read out of a file, so a configuration that
+#: is otherwise correct neither explains it nor lifts it. The database
 #: classes continue the same order: a connection string that was refused
 #: explains a database nobody reached, an unusable corpus explains a schema that
 #: does not match it, and a schema that does not match explains an invariant
@@ -68,6 +78,7 @@ EXIT_AWAITING_DECISION = 12
 PRECEDENCE = (
     (UNSUPPORTED_VERSION, EXIT_UNSUPPORTED_VERSION),
     (MISSING_DEPENDENCY, EXIT_MISSING_DEPENDENCY),
+    (STARTUP_REFUSED, EXIT_STARTUP_REFUSED),
     (INVALID_CONFIGURATION, EXIT_INVALID_CONFIGURATION),
     (DATABASE_UNREACHABLE, EXIT_DATABASE_UNREACHABLE),
     (INVALID_CORPUS, EXIT_INVALID_CORPUS),

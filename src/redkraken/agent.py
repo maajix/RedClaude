@@ -21,20 +21,26 @@ filesystem to be inherited in the first place -- and it is what makes "no
 direct path to a target" a property of the network rather than a request made
 of a cooperative client through proxy variables.
 
-Nothing here is durable. A refusal raised by this module is an exception and a
-non-zero child status; closing the Agent run, returning its Task and emitting
-the occurrence Event belong to ticket 17, which owns the transaction.
+A refusal is durable, and it is final. `agent_run` closes the Agent run,
+returns its Task to the queue with its attempt given back, releases what the
+run held and emits the one occurrence Event before the refusal reaches the
+caller. Then it latches: a process that has refused starts no further Agent
+run. The latch is process state on purpose -- what a refusal measured is a fact
+about the machine this process is running on, so the thing that clears it is a
+restart, which measures the machine again.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, isolation
+from redkraken import _startup, isolation, pg
+from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
 #: The module the child process runs as. Named rather than pathed, so a
@@ -116,6 +122,14 @@ AUTH_SOURCE_UNEXPECTED = "auth_source_unexpected"
 INIT_UNCORROBORATED = "init_uncorroborated"
 UNVERIFIABLE = "unverifiable"
 
+#: How one refusal is made durable: the Program this session speaks for, and the
+#: one call that closes the run. Everything the cleanup does -- the run, its
+#: Task, the session binding, the Identity Leases and the Event -- happens
+#: inside that call, so the cleanup is one statement and therefore one
+#: transaction, and a repeat of it is one statement that finds nothing open.
+BIND = "SELECT set_config('rk2.program_id', $1, false)"
+CLOSE = "SELECT close_startup_refusal($1::uuid, $2, $3, $4, $5::jsonb)"
+
 
 class StartupRefusal(RuntimeError):
     """The runtime would not start, or would not keep, this Agent run.
@@ -155,6 +169,24 @@ class StartupRefusal(RuntimeError):
         }
 
 
+class Latched(StartupRefusal):
+    """The refusal this process already made, raised at a run it will not start.
+
+    A subclass rather than an error of its own because it is not another
+    finding: the violations are the ones that were measured, and a caller that
+    knows what to do with a refusal knows what to do with this one. What it adds
+    is which attempt it refused -- this one was never spawned, because the
+    process that would have spawned it has already been told what it would find.
+    """
+
+
+#: The refusal this process made, and the reason it will attempt no other run.
+#: Module state, because what it remembers belongs to the process rather than to
+#: any one request: a second run started from a process that has already
+#: measured an exported key would be measured against the same key.
+_LATCH: StartupRefusal | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRunRequest:
     """One Agent run, described completely enough to be started.
@@ -171,6 +203,11 @@ class AgentRunRequest:
     that could start a child on the supervisor's own machine, with the
     supervisor's own home and a direct route to any target it can name.
 
+    `program_id` is what makes a refusal recordable, and it is optional for the
+    one case where it cannot be given: every Event belongs to a Program, so a
+    run started before any Program exists is a run whose refusal can only be
+    raised and rendered.
+
     `model` and `max_turns` keep the SDK's own spelling: they set one option
     each and are not translated on the way, so a reader can check them against
     the SDK's documentation rather than against this file.
@@ -179,6 +216,7 @@ class AgentRunRequest:
     agent_run_id: str
     objective: str
     container: isolation.AgentContainer
+    program_id: str | None = None
     model: str | None = None
     max_turns: int = MAX_TURNS
     timeout: float = TIMEOUT
@@ -219,27 +257,141 @@ class AgentRunResult:
         }
 
 
-def agent_run(request: AgentRunRequest) -> AgentRunResult:
+def agent_run(
+    request: AgentRunRequest, connection: pg.Connection | None = None
+) -> AgentRunResult:
     """Start one isolated Agent child and return what it reported.
 
     The only external launch interface. It describes the run, starts the child
-    that asserts and then uses it, and translates a refused child back into the
-    refusal it raised. It does not decide what the run should do, and it does
-    not write state.
+    that asserts and then uses it, and turns a refused child into the whole of
+    what that refusal means: the Agent run closed, its Task back in the queue
+    with its attempt returned, what it held released, one `startup.refused`
+    Event, and a process that will start no further run. It does not decide
+    what the run should do, and the only state it writes is that cleanup.
+
+    `connection` and `request.program_id` are optional together, because a
+    refusal can happen where there is nothing to record it against -- a run
+    started before any Program exists. When either is absent the refusal is
+    raised and nothing is written; when both are given they are checked before
+    the child is started, because a run whose refusal could not be recorded is
+    a run that should not have been started.
 
     The launch directory is not made here. The filesystem the child works in is
     the container's, not this process's, so the runtime states where the
     directory goes and the child creates it there -- which is also the only way
     the directory the assertion reads can be the directory the CLI is given.
     """
-    job = {
-        "agent_run_id": request.agent_run_id,
-        "objective": request.objective,
-        "model": request.model,
-        "max_turns": request.max_turns,
-        "workspace": isolation.WORKSPACE,
-    }
-    return _spawn(request, job)
+    global _LATCH
+    program_id = _recordable(request, connection)
+    try:
+        if _LATCH is not None:
+            raise Latched(
+                _LATCH.violations, _LATCH.phase, _LATCH.sdk_version, _LATCH.cli_version
+            )
+        job = {
+            "agent_run_id": request.agent_run_id,
+            "objective": request.objective,
+            "model": request.model,
+            "max_turns": request.max_turns,
+            "workspace": isolation.WORKSPACE,
+        }
+        return _spawn(request, job)
+    except StartupRefusal as refusal:
+        # Latched first. The cleanup talks to a database, and a database that
+        # is unreachable must not be the reason this process goes on to start
+        # the run it has just refused.
+        _LATCH = _LATCH or refusal
+        if program_id is not None and connection is not None:
+            close_refusal(connection, program_id, request.agent_run_id, refusal)
+        raise
+
+
+def close_refusal(
+    connection: pg.Connection,
+    program_id: str,
+    agent_run_id: str,
+    refusal: StartupRefusal,
+) -> bool:
+    """Make one refusal durable, and say whether this call was the one that did.
+
+    Closes the Agent run, returns its Task to pending with the attempt it never
+    spent, releases its Task and Identity Leases, unbinds its session and emits
+    the one redacted `startup.refused` Event. `False` says there was nothing
+    open to close -- a run that already finished, or one this Program does not
+    own -- which is what a repeat of the cleanup finds, and why repeating it
+    changes nothing rather than emitting a second Event.
+    """
+    connection.execute(BIND, (program_id,))
+    closed = connection.execute(
+        CLOSE,
+        (
+            agent_run_id,
+            refusal.phase,
+            refusal.sdk_version,
+            refusal.cli_version,
+            json.dumps(list(refusal.violations)),
+        ),
+    ).scalar()
+    return bool(closed)
+
+
+def diagnostics(refusal: StartupRefusal) -> Report:
+    """One refusal as the outcome an operator reads and a caller exits on.
+
+    Each record becomes a violation naming where the vector was found -- the
+    variable, the settings file and key, the launch field, the init report --
+    and the effect that was measured for it, and never the value: a diagnostic
+    that printed what it found would publish the credential it refused.
+
+    The report is the supervisor's rather than a command's, because the
+    supervisor is what refuses; the command that prints it belongs to whatever
+    later asks for an Agent run. What it fixes here is the status: a refused
+    startup exits `EXIT_STARTUP_REFUSED`, so a caller can tell it from a run
+    that started and went wrong.
+    """
+    ledger = Ledger()
+    ledger.refuse(
+        "startup_assertion",
+        f"refused in {refusal.phase} by {len(refusal.violations)} vector(s)",
+        [
+            Violation(
+                code=STARTUP_REFUSED,
+                source=str(record["source"]),
+                detail=f"{record['code']}, measured effect {record['effect']}",
+            )
+            for record in refusal.violations
+        ],
+    )
+    return report(
+        "agent run",
+        ledger,
+        phase=refusal.phase,
+        sdk_version=refusal.sdk_version,
+        cli_version=refusal.cli_version,
+    )
+
+
+def _recordable(request: AgentRunRequest, connection: pg.Connection | None) -> str | None:
+    """The Program a refusal of this run would be recorded against, if any.
+
+    Asked before the child starts rather than in the refusal path. An
+    identifier the cleanup could not use is a failure that would otherwise
+    arrive at the one moment there is durable state to clean up and no way left
+    to clean it.
+    """
+    if connection is None or request.program_id is None:
+        return None
+    for field, value in (
+        ("program_id", request.program_id),
+        ("agent_run_id", request.agent_run_id),
+    ):
+        try:
+            uuid.UUID(str(value))
+        except ValueError:
+            raise ValueError(
+                f"an agent run recorded against a Program needs a {field} that is a UUID"
+            ) from None
+    return request.program_id
 
 
 def launch_directory(workspace: Path | str, agent_run_id: str) -> Path:

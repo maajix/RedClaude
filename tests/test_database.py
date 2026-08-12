@@ -45,6 +45,8 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import (
+    _startup,
+    agent,
     artifact,
     backup,
     callback,
@@ -82,9 +84,11 @@ from tests.fixtures import (
     VALID,
     WITHDRAWN,
     Target,
+    boundary,
     counterparty,
     scratch,
     tls_counterparty,
+    unlatched,
     write,
 )
 
@@ -239,6 +243,26 @@ class DatabaseCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.connection.close()
+
+    def owner(self, sql: str, parameters: tuple = ()) -> None:
+        """One statement as the role that owns the tables, committed.
+
+        Shared rather than each case's own, because what the scheduler writes --
+        a claimed Task, a granted Identity Lease -- may be written by neither
+        the runtime nor the proxy, so every case that arranges one has to become
+        the owner in the same two lines.
+        """
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(sql, parameters)
+
+    def owned(self, sql: str, parameters: tuple = ()) -> str:
+        """The same as `owner`, for a statement whose one value is needed back."""
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(self.connection.execute(sql, parameters).scalar())
 
 
 class CleanCreationTest(DatabaseCase):
@@ -4674,13 +4698,6 @@ class ProxyEgressTest(DatabaseCase):
         answer = self.answered(capability, program_id, url, method, port)
         return answer.status, answer.headers.get(proxy.DECISION)
 
-    def owned(self, sql: str, parameters: tuple = ()) -> str:
-        """The same as `owner`, for a statement whose one value is needed back."""
-        with self.connection.transaction():
-            self.connection.execute("SET LOCAL ROLE rk2_owner")
-            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            return str(self.connection.execute(sql, parameters).scalar())
-
     def leased(
         self,
         name: str,
@@ -4775,13 +4792,6 @@ class ProxyEgressTest(DatabaseCase):
         """Point every name at these addresses, for the length of one test."""
         self.addCleanup(setattr, type(self), "answers", type(self).answers)
         type(self).answers = addresses
-
-    def owner(self, sql: str, parameters: tuple = ()) -> None:
-        """One statement as the role that owns the tables, committed."""
-        with self.connection.transaction():
-            self.connection.execute("SET LOCAL ROLE rk2_owner")
-            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            self.connection.execute(sql, parameters)
 
     def version(self, name: str) -> int:
         """The scope version the Program is on, which the Receipt cites by name."""
@@ -7319,6 +7329,297 @@ class ProxyEgressTest(DatabaseCase):
                 self.connection.execute(insert, (self.identifiers["a"], live_tool_run))
                 raise Rollback
         self.assertIsNotNone(live_capability)
+
+
+#: The Programs the refusal case opens. Two of them, because one thing a
+#: refusal must not be able to do is close a run another Program opened.
+REFUSAL_SLUG = "selftest-refusal"
+
+#: A credential the assertion really did measure. `redacted` is only a claim
+#: worth making about a payload that had something to leak, and a record written
+#: out by hand has nothing in it that anybody put there.
+EXPORTED = "exported-into-the-supervisor"
+
+
+class StartupRefusalTest(DatabaseCase):
+    """PH2-17: what a refused Agent run leaves behind, and what it does not.
+
+    The transaction is reached the way the supervisor reaches it --
+    `agent.close_refusal`, on a runtime connection bound to the Program -- and
+    the run it closes is opened the way the scheduler opens one: a claimed Task
+    with an attempt spent, a subagent run under it, the session binding a hook
+    resolves a tool call through, and a lease on the Program's one Identity.
+    Those four are what a refusal has to undo, and undoing all of them in one
+    statement is the difference between a refusal that is durable and one that
+    is half-applied.
+
+    Everything here is a question only a server can answer: whether the cleanup
+    commits as a whole, whether a repeat of it finds anything left, whether one
+    Program can close another's run, what the transaction does with a payload
+    that is not a refusal record, and whether the event log still accounts for
+    every row afterwards.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        cls.identifiers = {}
+        # One Program per test, because `tasks_live_dedup_idx` allows a Program
+        # one live recon task with no subject, and every test here needs that
+        # one. `onlooker` opens nothing: it is the second Program a refusal is
+        # tried from, and having written nothing is the whole of its part.
+        for name in (
+            "closed",
+            "recorded",
+            "unowned",
+            "onlooker",
+            "malformed",
+            "accounted",
+            "launched",
+        ):
+            source = SCOPED + '\n[[identity]]\nname = "member"\nslot_ref = "slot://identity/member"\n'
+            path = write(source.replace('name = "matrix-web"', f'name = "{REFUSAL_SLUG}-{name}"'))
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, opened.violations
+            cls.identifiers[name] = opened.facts["program_id"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{REFUSAL_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    def refusal(self, phase: str = "pre_spawn") -> agent.StartupRefusal:
+        """One refusal, assessed rather than written out.
+
+        The inputs are the pair an operator actually produces: a machine with a
+        key exported into it and an SDK this harness has not measured. What
+        reaches the payload is then what the assertion chose to keep about them,
+        rather than a record shaped to pass the transaction's own check.
+        """
+        violations = agent.assess(
+            None,
+            {"ANTHROPIC_API_KEY": EXPORTED},
+            {},
+            launch_dir=scratch(),
+            managed_settings=(),
+        )
+        return agent.StartupRefusal(violations, phase, *_startup.KNOWN_RUNTIME)
+
+    def opened(self, name: str) -> tuple[str, str]:
+        """One Agent run the way the scheduler opens one, and the Task under it.
+
+        The Task and the lease are written by the owner because granting either
+        is the scheduler's; the run and the session binding by the runtime,
+        because opening either is the supervisor's. The Task carries a spent
+        attempt and a priority so that giving them back is visible.
+        """
+        program_id = self.identifiers[name]
+        task = self.owned(
+            "INSERT INTO tasks (program_id, kind, status, attempts, claimed_at,"
+            " lease_expires_at, priority)"
+            " VALUES ($1::uuid, 'recon', 'claimed', 1, now(), now() + interval '10 minutes',"
+            " 4.5) RETURNING id::text",
+            (program_id,),
+        )
+        self.runtime.execute(agent.BIND, (program_id,))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = str(
+                self.runtime.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, kind, runs_as, model,"
+                    " effort, mission_packet)"
+                    " VALUES ($1::uuid, $2::uuid, 'recon', 'recon', 'subagent', 'operator',"
+                    " 'low', $3::jsonb) RETURNING id::text",
+                    (program_id, task, json.dumps({"objective": "Say nothing."})),
+                ).scalar()
+            )
+            self.runtime.execute(
+                "INSERT INTO agent_sessions (program_id, session_id, agent_run_id, task_id)"
+                " VALUES ($1::uuid, $2, $3::uuid, $4::uuid)",
+                (program_id, f"session-{run}", run, task),
+            )
+        self.owner(
+            "INSERT INTO identity_leases"
+            " (program_id, identity_entity_id, holder_agent_run_id, expires_at)"
+            " SELECT $1::uuid, i.entity_id, $2::uuid, now() + interval '10 minutes'"
+            "   FROM identities i"
+            "  WHERE i.program_id = $1::uuid AND i.slot_name = 'member'"
+            "    AND i.invalidated_at IS NULL",
+            (program_id, run),
+        )
+        return run, task
+
+    def state(self, run: str, task: str) -> dict:
+        """The four rows one refusal is about, read back as one answer."""
+        columns = (
+            "finished",
+            "stop_reason",
+            "result",
+            "status",
+            "attempts",
+            "claimed_at",
+            "lease_expires_at",
+            "priority",
+            "bound",
+            "leased",
+        )
+        row = self.connection.execute(
+            "SELECT r.finished_at IS NOT NULL, r.stop_reason, r.result,"
+            "       t.status, t.attempts, t.claimed_at, t.lease_expires_at, t.priority,"
+            "       (SELECT count(*) FROM agent_sessions s"
+            "         WHERE s.agent_run_id = r.id AND s.unbound_at IS NULL),"
+            "       (SELECT count(*) FROM identity_leases l"
+            "         WHERE l.holder_agent_run_id = r.id AND l.released_at IS NULL)"
+            "  FROM agent_runs r JOIN tasks t ON t.id = r.task_id"
+            " WHERE r.id = $1::uuid AND t.id = $2::uuid",
+            (run, task),
+        ).rows[0]
+        return dict(zip(columns, row, strict=True))
+
+    def refusals(self, run: str) -> list[str]:
+        """Every `startup.refused` payload written for one run, as text.
+
+        Text rather than parsed, because half of what is asked of it is that a
+        string is *not* in it.
+        """
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT payload::text FROM events"
+                " WHERE agent_run_id = $1::uuid AND type = 'startup.refused' ORDER BY seq",
+                (run,),
+            ).rows
+        ]
+
+    def test_one_call_closes_the_run_returns_its_task_and_releases_what_it_held(self):
+        run, task = self.opened("closed")
+        before = self.state(run, task)
+
+        closed = agent.close_refusal(
+            self.runtime, self.identifiers["closed"], run, self.refusal()
+        )
+
+        self.assertEqual(
+            ("claimed", 1, 1, 1),
+            (before["status"], before["attempts"], before["bound"], before["leased"]),
+        )
+        self.assertTrue(closed)
+        self.assertEqual(
+            {
+                "finished": True,
+                "stop_reason": "refusal",
+                "result": None,
+                "status": "pending",
+                "attempts": 0,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "priority": None,
+                "bound": 0,
+                "leased": 0,
+            },
+            self.state(run, task),
+        )
+
+    def test_exactly_one_redacted_event_is_written_and_a_repeat_writes_none(self):
+        run, task = self.opened("recorded")
+        refusal = self.refusal()
+
+        first = agent.close_refusal(self.runtime, self.identifiers["recorded"], run, refusal)
+        settled = self.state(run, task)
+        again = agent.close_refusal(self.runtime, self.identifiers["recorded"], run, refusal)
+
+        self.assertEqual((True, False), (first, again))
+        self.assertEqual(settled, self.state(run, task))
+        written = self.refusals(run)
+        self.assertEqual(1, len(written))
+        self.assertEqual(
+            {
+                "schema_version": 1,
+                "phase": "pre_spawn",
+                "sdk_version": _startup.KNOWN_RUNTIME[0],
+                "cli_version": _startup.KNOWN_RUNTIME[1],
+                "violations": [dict(record) for record in refusal.violations],
+            },
+            json.loads(written[0]),
+        )
+        self.assertNotIn(EXPORTED, written[0])
+
+    def test_a_run_another_program_opened_is_not_one_this_session_may_close(self):
+        run, task = self.opened("unowned")
+
+        closed = agent.close_refusal(
+            self.runtime, self.identifiers["onlooker"], run, self.refusal()
+        )
+
+        self.assertFalse(closed)
+        self.assertEqual([], self.refusals(run))
+        self.assertEqual("claimed", self.state(run, task)["status"])
+
+    def test_a_payload_that_is_not_refusal_records_closes_nothing(self):
+        run, task = self.opened("malformed")
+        self.runtime.execute(agent.BIND, (self.identifiers["malformed"],))
+        records = '[{"code": "c", "vector": "v", "source": "s", "effect": "e"}]'
+
+        for description, phase, violations in (
+            ("a phase this runtime has no assertion in", "spawned", records),
+            ("a refusal that refused nothing", "pre_spawn", "[]"),
+            ("one record short of the shape", "pre_spawn", '[{"code": "c", "vector": "v"}]'),
+            (
+                "one record carrying the value it found",
+                "pre_spawn",
+                '[{"code": "c", "vector": "v", "source": "s", "effect": "e",'
+                f' "value": "{EXPORTED}"}}]',
+            ),
+            ("records that are not a list", "pre_spawn", '{"code": "c"}'),
+        ):
+            with self.subTest(description):
+                with self.assertRaises(pg.DatabaseError):
+                    self.runtime.execute(
+                        agent.CLOSE, (run, phase, *_startup.KNOWN_RUNTIME, violations)
+                    )
+
+        self.assertEqual([], self.refusals(run))
+        self.assertEqual("claimed", self.state(run, task)["status"])
+
+    def test_the_cleanup_leaves_the_log_accounting_for_every_row_it_touched(self):
+        run, _ = self.opened("accounted")
+
+        agent.close_refusal(self.runtime, self.identifiers["accounted"], run, self.refusal())
+
+        self.assertEqual(
+            (),
+            self.connection.execute(
+                "SELECT problem, detail, count FROM check_event_log_integrity($1::uuid)",
+                (self.identifiers["accounted"],),
+            ).rows,
+        )
+
+    def test_a_refused_launch_is_cleaned_up_before_the_refusal_reaches_its_caller(self):
+        run, task = self.opened("launched")
+        request = agent.AgentRunRequest(
+            agent_run_id=run,
+            objective="Say nothing.",
+            container=boundary(),
+            program_id=self.identifiers["launched"],
+        )
+
+        with unlatched():
+            with mock.patch.object(agent, "_spawn", side_effect=self.refusal()):
+                with self.assertRaises(agent.StartupRefusal):
+                    agent.agent_run(request, self.runtime)
+
+        self.assertEqual("pending", self.state(run, task)["status"])
+        self.assertEqual(1, len(self.refusals(run)))
 
 
 class ArchiveTest(DatabaseCase):

@@ -1,6 +1,7 @@
 """The Program configuration the runtime tests are written against."""
 
 import atexit
+import contextlib
 import json
 import os
 import shutil
@@ -13,8 +14,9 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
-from redkraken import isolation, tls
+from redkraken import agent, isolation, tls
 
 
 VALID = """\
@@ -603,6 +605,20 @@ def boundary(**overrides) -> isolation.AgentContainer:
     }
     fields.update(overrides)
     return isolation.AgentContainer(**fields)
+
+
+@contextlib.contextmanager
+def unlatched():
+    """Provoke a startup refusal without becoming the process that refused.
+
+    The latch is process state, and a suite is one process that refuses many
+    times on purpose. Every test that lets a refusal reach `agent.agent_run`
+    says so here, so the next one measures the machine rather than this
+    process's memory of an earlier test. What proves the latch is
+    `test_agent.LatchTest`, which uses processes of its own for this reason.
+    """
+    with mock.patch.object(agent, "_LATCH", None):
+        yield
 
 
 def scratch() -> Path:
