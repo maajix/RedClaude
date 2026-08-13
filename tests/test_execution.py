@@ -12,6 +12,7 @@ answers every statement and remembers all of them.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import time
 import unittest
@@ -20,6 +21,7 @@ from unittest import mock
 from redkraken import (
     agent,
     execution,
+    integrity,
     isolation,
     packet,
     pg,
@@ -38,6 +40,7 @@ TASK = "33333333-3333-4333-8333-333333333333"
 TOOL_RUN = "44444444-4444-4444-8444-444444444444"
 PROPOSAL = "55555555-5555-4555-8555-555555555555"
 SESSION = "66666666-6666-4666-8666-666666666666"
+CAMPAIGN = "77777777-7777-4777-8777-777777777777"
 
 #: What `Launcher.picks` means when nobody said, named here for the tests that
 #: pass it. The sentinel itself is `fixtures`', because the launcher fixture in
@@ -176,6 +179,37 @@ def slate_entry(ordinal: int) -> dict:
     return execution._slate_entry(dict(zip(SLATE_COLUMNS, slate_row(ordinal))))
 
 
+#: What the capsule's four read statements answer here: one row each, in the
+#: `(label, revision, digest, record)` shape every section shares. The records
+#: are thin on purpose -- what this file tests is the sequence and what the
+#: request carries, and the server is where a record's contents are decided.
+CAPSULE_READS = {
+    execution.capsule_module.PROGRAM: ("matrix-web", 12, {"kind": "program"}),
+    execution.capsule_module.CAMPAIGN: ("OS1", 0, {"kind": "session"}),
+    execution.capsule_module.CAPACITY: ("program", 0, {"kind": "capacity"}),
+    execution.capsule_module.LANES: ("recon", 0, {"kind": "lane"}),
+    execution.capsule_module.WORK: ("T9", 8, {"kind": "work"}),
+}
+
+#: The one statement the standing family is read with. Spelled from `integrity`'s
+#: own names rather than written out, so a recorder answering it is answering
+#: the statement the capsule actually sends.
+STANDING = f"SELECT name, problems, detail FROM {integrity.STANDING}()"
+
+
+def digested(document: object) -> list[tuple]:
+    """The server's own digest answer, for records this process built.
+
+    A real one hashes the canonical text of each element; this hashes the text
+    it was sent. The capsule's rule is that the hash comes from SQL, and a fake
+    that answered a constant would let a compile that never asked pass.
+    """
+    return [
+        (position, hashlib.sha256(json.dumps(element).encode()).hexdigest())
+        for position, element in enumerate(json.loads(str(document)), start=1)
+    ]
+
+
 class Recorder:
     """A connection that answers every statement the slice issues, and keeps them.
 
@@ -200,8 +234,25 @@ class Recorder:
                 "effort": "xhigh",
                 "subagent_cap": roster.DEFAULT_SUBAGENTS,
                 "token_cap": 40_000,
+                # The campaign this turn belongs to, and what its capsule may
+                # cost. A first generation with nothing rotated, which is the
+                # answer for a Program whose first pass this is.
+                "session": CAMPAIGN,
+                "session_label": "OS1",
+                "generation": 1,
+                "capsule_bytes": packet.DEFAULT_BYTES,
+                "capsule_tokens": packet.DEFAULT_TOKENS,
+                "rotated": None,
             },
         )
+        # What the capsule reads around the choice: the Program's high-water
+        # Event sequence, how many Tasks are already running, and the standing
+        # checks as `run_standing_checks` answers them -- name, problems,
+        # detail. One sound check by default, because a capsule compiled over a
+        # broken Program is a case a test says it is about.
+        self.revision = answers.get("revision", 12)
+        self.working = answers.get("working", 1)
+        self.standing = answers.get("standing", [("orchestrator_rotation", 0, "")])
         # Labels this recorder's `record_choice` says the Slate no longer
         # carries. The downgrade is the server's to make -- the runtime never
         # writes `off_slate` itself -- so it is answered here rather than
@@ -319,6 +370,17 @@ class Recorder:
         raise AssertionError(f"{run_id} was never closed: {self.statements}")
 
     def _answer(self, sql: str, parameters: tuple) -> list[tuple]:
+        if sql in CAPSULE_READS:
+            label, revision, record = CAPSULE_READS[sql]
+            return [(label, revision, f"{label}-digest", json.dumps(record))]
+        if sql == execution.capsule_module.REVISION:
+            return [(self.revision,)]
+        if sql == execution.capsule_module.WORK_COUNT:
+            return [(self.working,)]
+        if sql == execution.capsule_module.DIGESTS:
+            return digested(parameters[0])
+        if sql == STANDING:
+            return list(self.standing)
         if sql in (execution.RANK, execution.QUOTA):
             return [("{}",)]
         if sql == execution.OFFER:
@@ -445,7 +507,9 @@ class Launcher:
         self.choices.append(request)
         if self.planning is not None:
             raise self.planning
-        latch = fixtures.latched(request.slate, self.picks)
+        latch = fixtures.latched(
+            () if request.capsule is None else request.capsule.slate(), self.picks
+        )
         return result(
             agent_run_id=request.agent_run_id,
             role=request.role,
@@ -776,7 +840,9 @@ class ChoiceTest(unittest.TestCase):
         self.assertEqual(roster.ORCHESTRATOR, planning.role)
         self.assertIsNone(planning.egress)
         self.assertEqual(SESSION, planning.agent_run_id)
-        self.assertEqual(["T1", "T2", "T3"], [entry["task"] for entry in planning.slate])
+        self.assertEqual(
+            ["T1", "T2", "T3"], [entry["task"] for entry in planning.capsule.slate()]
+        )
         self.assertIn("3 Task(s) on offer", planning.objective)
         self.assertEqual(roster.DEFAULT_SUBAGENTS, planning.subagent_cap)
         self.assertEqual(40_000, planning.token_cap)
@@ -880,6 +946,7 @@ class ChoiceTest(unittest.TestCase):
         self.assertEqual([(SESSION, "completed", 1200, 300)], connection.finished(SESSION))
         self.assertLess(connection.closing(SESSION), connection.statements.index(execution.CLAIM))
 
+
     def test_a_session_whose_child_never_answered_is_closed_as_aborted(self):
         connection = Recorder()
         self.choice(connection, Launcher(planning=isolation.Unavailable("no such image")))
@@ -947,6 +1014,167 @@ class ChoiceTest(unittest.TestCase):
             sorted(roster.TASK_KINDS), sorted(roster.ROLE_FOR_KIND), roster.ROLE_FOR_KIND
         )
 
+
+class CapsuleTest(unittest.TestCase):
+    """PH2-28 at the seam: what a turn of a campaign is started with.
+
+    The rotation itself is the database's -- `open_orchestrator_session` closes
+    a spent campaign before it opens a turn -- so what is asserted here is what
+    this runtime does with the answer: it says so, it compiles the capsule under
+    the ceilings the campaign was opened with, and it treats a capsule it could
+    not build as one more way of nobody being asked.
+    """
+
+    def choice(self, connection: Recorder, launcher: Launcher | None = None) -> dict:
+        launcher = launcher or Launcher()
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
+        self.ledger, self.launcher = ledger, launcher
+        return facts
+
+    def stated(self, name: str) -> list:
+        """Every assertion one step of the pass made, in order."""
+        return [
+            assertion for assertion in self.ledger.assertions if assertion.name == name
+        ]
+
+    def rotated(self, **overrides) -> dict:
+        """A session row that says the campaign before it reached a ceiling."""
+        return dict(
+            Recorder().session,
+            session_label="OS4",
+            generation=4,
+            rotated="OS3",
+            **overrides,
+        )
+
+    def test_the_capsule_carries_the_five_sections_a_session_resumes_from(self):
+        # Criterion 3. Compiled rather than remembered: the previous session's
+        # turns are rows, and this process holds nothing of them.
+        connection = Recorder(slate=3)
+        self.choice(connection)
+        resumed = self.launcher.planned.capsule
+
+        self.assertEqual(
+            ["lifecycle", "budget", "integrity", "work", "slate"],
+            list(resumed.as_dict()["sections"]),
+        )
+        self.assertEqual("OS1", resumed.session)
+        self.assertEqual(12, resumed.revision)
+        self.assertEqual(
+            ["matrix-web", "OS1"],
+            [row.label for row in resumed.section("lifecycle").rows],
+        )
+        self.assertEqual(["T1", "T2", "T3"], [e["task"] for e in resumed.slate()])
+
+    def test_every_row_carries_the_revision_and_the_digest_the_server_gave_it(self):
+        # The Spec's "revisions, digests and omission markers", and the rule
+        # that comes with them: a digest this process computed would be a second
+        # answer to a question the database already answers.
+        connection = Recorder()
+        self.choice(connection)
+        resumed = self.launcher.planned.capsule
+        program_row = resumed.section("lifecycle").rows[0]
+        checked = resumed.section("integrity").rows[0]
+
+        self.assertEqual(12, program_row.revision)
+        self.assertEqual("matrix-web-digest", program_row.digest)
+        self.assertEqual(
+            digested(json.dumps([dict(checked.record)]))[0][1], checked.digest
+        )
+        self.assertEqual(0, checked.revision)
+        self.assertEqual(
+            0, self.launcher.planned.capsule.as_dict()["sections"]["work"]["omitted"]
+        )
+
+    def test_a_standing_check_that_failed_is_the_first_row_of_its_section(self):
+        # Ordered so that a section cut down to its last rows keeps the ones
+        # that say something is wrong: `fit` drops from the tail.
+        connection = Recorder(
+            standing=[("event_coverage", 0, ""), ("lease_discipline", 2, "two open")]
+        )
+        self.choice(connection)
+        rows = self.launcher.planned.capsule.section("integrity").rows
+
+        self.assertEqual(["standing:lease_discipline", "standing:event_coverage"],
+                         [row.label for row in rows])
+        self.assertEqual(False, rows[0].record["ok"])
+        self.assertIn("two open", rows[0].record["detail"])
+
+    def test_the_objective_states_the_campaign_and_leaves_the_slate_to_the_tool(self):
+        # Criterion 3 says the replacement *receives* the capsule, so it is in
+        # the prompt rather than behind a call it may never make. The Slate is
+        # not, because `get_slate` already serves it from the same document.
+        connection = Recorder(slate=3, session=self.rotated())
+        self.choice(connection)
+        objective = self.launcher.planned.objective
+
+        self.assertIn("You are OS4, generation 4", objective)
+        self.assertIn('"lifecycle"', objective)
+        self.assertIn('"integrity"', objective)
+        self.assertNotIn('"slate"', objective)
+        self.assertNotIn("T2", objective)
+
+    def test_a_closed_campaign_is_reported_by_the_pass_that_replaced_it(self):
+        # The one thing about a rotation an operator cannot read anywhere else
+        # in the Ledger: the Events are the database's and the pass looks
+        # otherwise identical to any other.
+        connection = Recorder(session=self.rotated())
+        self.choice(connection)
+        holds = self.stated("rotation")
+
+        self.assertEqual([], self.ledger.violations)
+        self.assertEqual(1, len(holds))
+        self.assertIn("OS3 reached a ceiling and was closed", holds[0].detail)
+        self.assertIn("OS4 continues it at generation 4", holds[0].detail)
+
+    def test_a_first_generation_campaign_reports_no_rotation(self):
+        connection = Recorder()
+        self.choice(connection)
+
+        self.assertEqual([], self.stated("rotation"))
+        self.assertIn(
+            f"OS1 resumes at generation 1 from "
+            f"{len(self.launcher.planned.capsule.rows())} row(s)",
+            self.stated("capsule")[0].detail,
+        )
+
+    def test_the_capsule_is_compiled_under_the_ceilings_the_campaign_opened_with(self):
+        # Criterion 6's configuration half: the numbers are columns on the
+        # weights row the campaign was opened under, not constants here.
+        connection = Recorder(
+            session=dict(Recorder().session, capsule_bytes=4096, capsule_tokens=512)
+        )
+        self.choice(connection)
+        limits = self.launcher.planned.capsule.limits
+
+        self.assertEqual((4096, 512), (limits.byte_limit, limits.token_limit))
+        self.assertLessEqual(self.launcher.planned.capsule.bytes, limits.byte_ceiling)
+
+    def test_a_capsule_that_cannot_fit_its_ceiling_is_refused_and_not_sent(self):
+        # The other half: refused, and the pass carries on without a choice --
+        # which is the same place every other failure on this path leaves it.
+        connection = Recorder(
+            session=dict(Recorder().session, capsule_bytes=64, capsule_tokens=16)
+        )
+        facts = self.choice(connection)
+
+        self.assertEqual([], self.launcher.choices)
+        self.assertEqual("unavailable", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual(execution.INVALID_CONFIGURATION, self.ledger.violations[0].code)
+        self.assertIn("could not be given what it inherits", self.ledger.violations[0].detail)
+
+    def test_a_capsule_the_database_refused_leaves_the_pass_where_it_was(self):
+        connection = Recorder(
+            raises={execution.capsule_module.WORK: database_error("permission denied")}
+        )
+        facts = self.choice(connection)
+
+        self.assertEqual([], self.launcher.choices)
+        self.assertEqual("unavailable", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual(1, len(self.ledger.violations))
 
 class AttemptTest(unittest.TestCase):
     """One claimed Task, from the capability to the closing."""

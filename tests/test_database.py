@@ -52,6 +52,7 @@ from redkraken import (
     artifact,
     backup,
     callback,
+    capsule,
     config,
     decisions,
     execution,
@@ -1129,6 +1130,61 @@ CONTROLS = (
         "   INSERT INTO events (program_id, type, actor_kind, payload)"
         '        VALUES (p, \'scheduler.chose\', \'llm\', \'{"outcome": "chosen"}\'::jsonb);'
         " END $ctl$",
+    ),
+    Control(
+        # A campaign that kept going. Two turns in a session admitted for one is
+        # what a ceiling looks like when it is guidance rather than a bound, and
+        # it is a state no verb in the corpus can reach -- which is the point of
+        # writing it by hand: the arm exists for the restore, the repair and the
+        # edit that stop asking.
+        "standing:orchestrator_rotation",
+        "DO $ctl$ DECLARE p uuid; s uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('overrun-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO orchestrator_sessions (program_id, weights_version, max_turns,"
+        "                                      max_tokens, max_decisions)"
+        "        SELECT p, w.version, 1, 1000, 1 FROM scheduler_weights w WHERE w.active"
+        "     RETURNING id INTO s;"
+        "   INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+        "                           mission_packet, orchestrator_session_id)"
+        "        VALUES (p, 'orchestrator', 'session', 'opus', 'high', '{}'::jsonb, s),"
+        "               (p, 'orchestrator', 'session', 'opus', 'high', '{}'::jsonb, s);"
+        " END $ctl$",
+    ),
+    Control(
+        # A campaign that ended and never said so. The session row knows why it
+        # closed; an operator reading the Event log finds the campaign simply
+        # stopping, which is the gap exactly where the interesting part was.
+        "standing:orchestrator_rotation",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('unrecorded-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO orchestrator_sessions (program_id, weights_version, max_turns,"
+        "                                      max_tokens, max_decisions, closed_at,"
+        "                                      close_reason)"
+        "        SELECT p, w.version, 100, 1000, 10, now(), 'turns'"
+        "          FROM scheduler_weights w WHERE w.active;"
+        " END $ctl$",
+    ),
+    Control(
+        # The open path with the rotation taken out of it. Structural for the
+        # slate clock's reason: every row stays exactly as it is until a campaign
+        # has already run past a ceiling, so the row arms cannot catch this one
+        # until it is too late to be worth catching.
+        "standing:orchestrator_rotation",
+        "CREATE OR REPLACE FUNCTION open_orchestrator_session() RETURNS jsonb"
+        " LANGUAGE plpgsql AS $ctl$ BEGIN RETURN '{}'::jsonb; END $ctl$",
+    ),
+    Control(
+        # The grant 029's default privileges would have made on their own, on the
+        # verb that ends a session. A model that could call it would decide when
+        # its own ceilings apply, which is every ceiling in the file.
+        "standing:orchestrator_rotation",
+        "GRANT EXECUTE ON FUNCTION rotate_orchestrator_session() TO rk2_state",
     ),
     Control(
         "standing:purge_reachability",
@@ -8338,7 +8394,9 @@ class Child:
         returned rather than what this fixture would like it to be.
         """
         self.choices.append(request)
-        latch = latched(request.slate, self.picks)
+        latch = latched(
+            () if request.capsule is None else request.capsule.slate(), self.picks
+        )
         return agent.AgentRunResult(
             agent_run_id=request.agent_run_id,
             role=request.role,
@@ -14086,8 +14144,14 @@ class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
         self.assertEqual(token_cap, self.opened["token_cap"])
 
     def test_a_session_says_what_it_is_and_nothing_more(self):
+        # The turn, and the campaign it is a turn of. PH2-28 added the second
+        # half: a session that could not say which campaign it belongs to could
+        # not be rotated, because there would be nothing to carry a generation.
         self.assertEqual(
-            {"agent_run", "label", "model", "effort", "subagent_cap", "token_cap"},
+            {"agent_run", "label", "model", "effort", "subagent_cap", "token_cap"}
+            | {"session", "session_label", "generation", "rotated"}
+            | {"turns", "max_turns", "decisions", "max_decisions"}
+            | {"capsule_bytes", "capsule_tokens"},
             set(self.opened),
         )
 
@@ -14291,6 +14355,536 @@ class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
             ("orchestrator_dispatch",),
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: The Programs of `OrchestratorRotationTest`, one per way a campaign can end.
+ROTATION_SLUG = "selftest-rotation"
+
+ROTATION_SCENARIOS = ("resume", "turns", "tokens", "decisions", "capsule")
+
+
+class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
+    """PH2-28: one campaign, bounded, closed at a ceiling, and resumed from rows.
+
+    What only a server can answer here is the whole of it. The ceilings are
+    columns, the usage is three sums over rows written for other reasons, and
+    the resume is a compile against a database rather than a handover in memory
+    -- so a suite without one could assert that the runtime intends to rotate
+    and nothing about whether a rotation happens.
+
+    One Program per scenario, because each ends a campaign a different way and a
+    session closed on turns is not available to be closed again on tokens.
+    `resume` is the pass that changes nothing: a second turn of a session that
+    is still inside its ceilings. `turns`, `tokens` and `decisions` are the
+    three closes, one each. `capsule` is the successor's half -- what a session
+    that never saw the closed one is handed, and that a second runtime compiling
+    the same moment is handed the same thing.
+
+    Ceilings are lowered on the open session rather than on the weights row: the
+    session copied them when it opened and the copy is what the rotation reads,
+    so this is a session admitted under tighter settings and not a rule bent
+    around it. That the copy happens at all is asserted separately, against the
+    active weights.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in ROTATION_SCENARIOS:
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{ROTATION_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_resume()
+        cls.arrange_turns()
+        cls.arrange_tokens()
+        cls.arrange_decisions()
+        cls.arrange_capsule()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{ROTATION_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the moves a scenario is made of ---------------------------------------
+
+    @classmethod
+    def session(cls, name: str) -> dict:
+        """One turn, opened by the statement the runtime sends."""
+        cls.bind(name)
+        return json.loads(str(cls.call(execution.OPEN_SESSION)))
+
+    @classmethod
+    def tighten(cls, name: str, ceiling: str, value: int) -> None:
+        """Lower one ceiling of the open session, which is where a ceiling binds.
+
+        Reaching a real ceiling would take a hundred passes, a million tokens or
+        eighty choices. What is under test is what the runtime does at one, and
+        the session's own copy is the number it reads -- so a session with a
+        lowered copy is exactly a session that was admitted under settings an
+        operator had already tightened.
+        """
+        assert ceiling in ("max_turns", "max_tokens", "max_decisions"), ceiling
+        cls.as_owner(
+            f"UPDATE orchestrator_sessions SET {ceiling} = $2"
+            "  WHERE program_id = $1::uuid AND closed_at IS NULL",
+            (cls.identifiers[name], value),
+        )
+
+    @classmethod
+    def spend(cls, name: str, tokens: int) -> None:
+        """What the turns of the open session recorded, as the runs record it."""
+        cls.as_owner(
+            "UPDATE agent_runs SET input_tokens = $2, output_tokens = 0"
+            "  WHERE program_id = $1::uuid AND orchestrator_session_id ="
+            "        (SELECT id FROM orchestrator_sessions"
+            "          WHERE program_id = $1::uuid AND closed_at IS NULL)",
+            (cls.identifiers[name], tokens),
+        )
+
+    # -- reading a campaign back -----------------------------------------------
+
+    @classmethod
+    def campaign(cls, name: str) -> list[dict]:
+        """Every session of one Program, oldest generation first.
+
+        The predecessor is joined in by label rather than by identifier, because
+        what makes a chain readable is that a rotation names the session it
+        continues in the same word the Event and the capsule use.
+        """
+        return [
+            {
+                "label": str(row["label"]),
+                "generation": int(str(row["generation"])),
+                "rotated_from": None if row["prev"] is None else str(row["prev"]),
+                "closed": bool(row["closed"]),
+                "reason": None if row["close_reason"] is None else str(row["close_reason"]),
+                "weights_version": int(str(row["weights_version"])),
+                "ceilings": (
+                    int(str(row["max_turns"])),
+                    int(str(row["max_tokens"])),
+                    int(str(row["max_decisions"])),
+                ),
+            }
+            for row in cls.as_owner(
+                "SELECT s.label, s.generation, prev.label AS prev,"
+                "       s.closed_at IS NOT NULL AS closed, s.close_reason,"
+                "       s.weights_version, s.max_turns, s.max_tokens, s.max_decisions"
+                "  FROM orchestrator_sessions s"
+                "  LEFT JOIN orchestrator_sessions prev ON prev.id = s.rotated_from"
+                " WHERE s.program_id = $1::uuid"
+                " ORDER BY s.generation",
+                (cls.identifiers[name],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def spent(cls, name: str, label: str) -> dict:
+        """What one session spent, from the view that derives it."""
+        row = cls.as_owner(
+            "SELECT u.turns, u.tokens, u.decisions,"
+            "       orchestrator_session_spent(u.session_id) AS ceiling"
+            "  FROM orchestrator_session_usage u"
+            " WHERE u.program_id = $1::uuid AND u.label = $2",
+            (cls.identifiers[name], label),
+        ).dicts()[0]
+        return {
+            "turns": int(str(row["turns"])),
+            "tokens": int(str(row["tokens"])),
+            "decisions": int(str(row["decisions"])),
+            "ceiling": None if row["ceiling"] is None else str(row["ceiling"]),
+        }
+
+    @classmethod
+    def rotations(cls, name: str) -> list[dict]:
+        """Every `scheduler.rotated` Event of one Program, oldest first."""
+        return [
+            json.loads(str(row["payload"]))
+            for row in cls.as_owner(
+                "SELECT payload::text AS payload FROM events"
+                " WHERE program_id = $1::uuid AND type = 'scheduler.rotated'"
+                " ORDER BY seq",
+                (cls.identifiers[name],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def weights(cls) -> tuple[int, int, int]:
+        """The three ceilings a session opening now would copy."""
+        row = cls.as_owner(
+            "SELECT session_max_turns, session_max_tokens, session_max_decisions"
+            "  FROM scheduler_weights WHERE active"
+        ).dicts()[0]
+        return (
+            int(str(row["session_max_turns"])),
+            int(str(row["session_max_tokens"])),
+            int(str(row["session_max_decisions"])),
+        )
+
+    @classmethod
+    def resumed(cls, name: str, offered, **settings) -> capsule.Capsule:
+        """The capsule a session opening now would inherit, on a new connection.
+
+        A connection of its own because that is the claim: nothing of the closed
+        session is in this process, so a compile that reached for something the
+        pass was holding would work here and fail after a restart. Opened and
+        closed per call, so that two capsules of the same moment are two
+        runtimes rather than one asked twice.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            with connection.transaction():
+                return capsule.compile(
+                    connection,
+                    cls.identifiers[name],
+                    session="OS1",
+                    generation=1,
+                    slate=offered,
+                    **settings,
+                )
+        finally:
+            connection.close()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_resume(cls):
+        """Two passes of one campaign that has reached nothing."""
+        cls.seed("resume", 2)
+        cls.resume_first = cls.session("resume")
+        cls.resume_again = cls.session("resume")
+        cls.resume_campaign = cls.campaign("resume")
+        cls.resume_usage = cls.spent("resume", cls.resume_first["session_label"])
+        cls.resume_weights = cls.weights()
+
+    @classmethod
+    def arrange_turns(cls):
+        """A session that has taken every turn it was admitted for."""
+        cls.seed("turns", 1)
+        cls.turns_first = cls.session("turns")
+        cls.tighten("turns", "max_turns", 1)
+        cls.turns_spent = cls.spent("turns", cls.turns_first["session_label"])
+        cls.turns_second = cls.session("turns")
+        cls.turns_campaign = cls.campaign("turns")
+        cls.turns_events = cls.rotations("turns")
+        # A third pass, to say that a campaign rotates once per ceiling reached
+        # and not once per pass afterwards.
+        cls.turns_third = cls.session("turns")
+        cls.turns_events_after = cls.rotations("turns")
+
+    @classmethod
+    def arrange_tokens(cls):
+        """A session whose turns have spent what the session was admitted with.
+
+        The remainder is read before the ceiling is crossed, because the token
+        ceiling the child is handed is the session's remainder when that is the
+        smaller of the two -- and after the rotation there is no remainder to
+        read, only a new session with the whole of one.
+        """
+        cls.seed("tokens", 1)
+        cls.tokens_first = cls.session("tokens")
+        cls.tighten("tokens", "max_tokens", 30_000)
+        cls.spend("tokens", 25_000)
+        cls.tokens_remainder = cls.session("tokens")
+        cls.spend("tokens", 30_000)
+        cls.tokens_spent = cls.spent("tokens", cls.tokens_first["session_label"])
+        cls.tokens_second = cls.session("tokens")
+        cls.tokens_campaign = cls.campaign("tokens")
+        cls.tokens_events = cls.rotations("tokens")
+
+    @classmethod
+    def arrange_decisions(cls):
+        """A session that has recorded every choice it was admitted for.
+
+        The choice is recorded through `record_choice`, so the decision this
+        counts is the one 27 writes rather than an Event written here. A count
+        that agreed with a hand-written row and not with the verb would be a
+        ceiling nothing reaches.
+        """
+        cls.seed("decisions", 2)
+        cls.bind("decisions")
+        cls.decisions_slate = cls.offer()
+        cls.decisions_first = cls.session("decisions")
+        cls.call(
+            execution.CHOICE,
+            (
+                cls.decisions_first["agent_run"],
+                "chosen",
+                str(cls.decisions_slate[0]["task_label"]),
+                "the first entry",
+            ),
+        )
+        cls.tighten("decisions", "max_decisions", 1)
+        cls.decisions_spent = cls.spent("decisions", cls.decisions_first["session_label"])
+        cls.decisions_second = cls.session("decisions")
+        cls.decisions_campaign = cls.campaign("decisions")
+        cls.decisions_events = cls.rotations("decisions")
+
+    @classmethod
+    def arrange_capsule(cls):
+        """One Program with something to say, compiled twice by two runtimes."""
+        cls.capsule_tasks = cls.seed("capsule", 3)
+        cls.bind("capsule")
+        cls.capsule_slate = [
+            execution._slate_entry(dict(row)) for row in cls.offer()
+        ]
+        cls.capsule_session = cls.session("capsule")
+        cls.capsule_first = cls.resumed("capsule", cls.capsule_slate)
+        cls.capsule_again = cls.resumed("capsule", cls.capsule_slate)
+        # The same moment under a ceiling too small for everything in it.
+        cls.capsule_tight = cls.resumed(
+            "capsule", cls.capsule_slate, limits=packet.Limits(byte_limit=1400)
+        )
+
+    # -- criterion 1: the ceilings are settings, and they bind ------------------
+
+    def test_a_session_copies_the_ceilings_the_weights_row_states(self):
+        # Copied and not joined, so that an operator moving a ceiling mid-
+        # campaign does not retroactively rotate a session that already ran.
+        [first] = self.resume_campaign
+
+        self.assertEqual(self.resume_weights, first["ceilings"])
+        self.assertEqual(
+            int(
+                str(
+                    self.scalar("SELECT version FROM scheduler_weights WHERE active")
+                )
+            ),
+            first["weights_version"],
+        )
+
+    def test_a_session_inside_its_ceilings_is_resumed_rather_than_replaced(self):
+        # The pass is a restart -- `rk run` is one attempt per invocation -- so
+        # this is the property that makes a campaign longer than a process.
+        self.assertEqual(
+            self.resume_first["session"], self.resume_again["session"]
+        )
+        self.assertEqual(1, self.resume_again["generation"])
+        self.assertEqual(1, len(self.resume_campaign))
+        self.assertIsNone(self.resume_again["rotated"])
+
+    def test_a_turn_is_counted_when_it_starts_and_not_when_it_ends(self):
+        # A pass that opened a child and died is a turn the session spent. The
+        # runs are still open here, and the usage already counts both.
+        self.assertEqual(2, self.resume_usage["turns"])
+        self.assertIsNone(self.resume_usage["ceiling"])
+        self.assertEqual((1, 2), (self.resume_first["turns"], self.resume_again["turns"]))
+
+    def test_a_spent_session_names_the_ceiling_it_reached(self):
+        self.assertEqual("turns", self.turns_spent["ceiling"])
+        self.assertEqual(1, self.turns_spent["turns"])
+
+    def test_the_token_ceiling_is_the_tighter_of_the_run_and_the_remainder(self):
+        # 5000 left of the session against the Program's per-run allowance,
+        # which `AFFORDABLE` makes the larger of the two. A child handed the
+        # per-run number alone could spend a whole campaign's remainder in one
+        # turn and be inside its own ceiling throughout.
+        self.assertEqual(5_000, int(str(self.tokens_remainder["token_cap"])))
+
+    # -- criterion 2: closed cleanly, and recorded once -------------------------
+
+    def test_each_ceiling_closes_the_campaign_and_opens_its_successor(self):
+        for scenario, reason, campaign in (
+            ("turns", "turns", self.turns_campaign),
+            ("tokens", "tokens", self.tokens_campaign),
+            ("decisions", "decisions", self.decisions_campaign),
+        ):
+            with self.subTest(scenario):
+                first, second = campaign
+                self.assertEqual((True, reason), (first["closed"], first["reason"]))
+                self.assertEqual((False, None), (second["closed"], second["reason"]))
+                self.assertEqual(2, second["generation"])
+                self.assertEqual(first["label"], second["rotated_from"])
+
+    def test_the_successor_is_the_session_the_pass_runs_in(self):
+        self.assertEqual(
+            self.turns_campaign[1]["label"], self.turns_second["session_label"]
+        )
+        self.assertEqual(2, self.turns_second["generation"])
+        self.assertEqual(0, self.turns_second["turns"] - 1)
+
+    def test_the_rotation_is_reported_to_the_pass_that_replaced_the_session(self):
+        # The runtime cannot say "this campaign rotated" from anything else it
+        # holds: the close happened inside the open, and reading it back would
+        # be a second question about a moment that has already passed.
+        rotated = self.turns_second["rotated"]
+
+        self.assertEqual(self.turns_campaign[0]["label"], rotated["session"])
+        self.assertEqual("turns", rotated["reason"])
+        self.assertEqual(1, rotated["generation"])
+
+    def test_the_event_carries_what_was_spent_against_what_was_allowed(self):
+        # Both halves, because "why did this rotate" is a comparison: a reader
+        # holding only the reason would have to go and find the numbers the
+        # decision was made on, and by then the ceilings may have moved.
+        [event] = self.tokens_events
+
+        self.assertEqual("tokens", event["reason"])
+        self.assertEqual(self.tokens_spent["tokens"], event["usage"]["tokens"])
+        self.assertGreaterEqual(event["usage"]["tokens"], 30_000)
+        self.assertEqual(30_000, event["ceilings"]["tokens"])
+        self.assertEqual(self.tokens_spent["turns"], event["usage"]["turns"])
+        self.assertEqual(self.weights()[0], event["ceilings"]["turns"])
+
+    def test_a_decision_is_a_recorded_choice_of_any_of_the_five_words(self):
+        [event] = self.decisions_events
+
+        self.assertEqual(1, self.decisions_spent["decisions"])
+        self.assertEqual("decisions", event["reason"])
+        self.assertEqual(1, event["usage"]["decisions"])
+
+    def test_one_ceiling_reached_is_one_rotation_and_not_one_per_pass(self):
+        # The open rotates before it resumes, so every later pass calls it
+        # again. Idempotence is the property: a second Event would make the
+        # campaign's history report a rotation that never happened.
+        self.assertEqual(1, len(self.turns_events))
+        self.assertEqual(1, len(self.turns_events_after))
+        self.assertEqual(
+            self.turns_second["session"], self.turns_third["session"]
+        )
+        self.assertIsNone(self.turns_third["rotated"])
+
+    # -- criteria 3 and 4: the capsule, compiled and not remembered -------------
+
+    def test_the_capsule_carries_the_five_sections_out_of_live_rows(self):
+        sections = self.capsule_first.as_dict()["sections"]
+
+        self.assertEqual(list(capsule.SECTIONS), list(sections))
+        self.assertEqual(
+            f"{ROTATION_SLUG}-capsule",
+            self.capsule_first.section("lifecycle").rows[0].record["slug"],
+        )
+        self.assertEqual(
+            [self.capsule_session["session_label"]],
+            [
+                row.label
+                for row in self.capsule_first.section("lifecycle").rows
+                if row.record["kind"] == "session"
+            ],
+        )
+        # The Slate in the order it was ranked in, which is the order the entries
+        # were offered in and not the order the Tasks were seeded in. A capsule
+        # that re-sorted them would be handing the successor a different Slate
+        # from the one the pass is holding.
+        self.assertEqual(
+            [str(entry["task"]) for entry in self.capsule_slate],
+            [str(entry["task"]) for entry in self.capsule_first.slate()],
+        )
+        self.assertEqual(sorted(self.capsule_tasks),
+                         sorted(str(entry["task"]) for entry in self.capsule_first.slate()))
+
+    def test_the_budget_section_states_the_program_and_each_of_its_lanes(self):
+        budget = self.capsule_first.section("budget")
+        kinds = [str(row.record["kind"]) for row in budget.rows]
+
+        self.assertEqual("capacity", kinds[0])
+        self.assertEqual({"lane"}, set(kinds[1:]))
+        self.assertGreater(len(kinds), 1)
+        self.assertIn("run_tokens", budget.rows[0].record)
+
+    def test_the_integrity_section_is_the_standing_gate_of_this_moment(self):
+        # Read inside the compile rather than carried from the pass's own gate,
+        # which ran before the scheduler did. Every check sound, because the
+        # database this runs against is one the gate holds on.
+        checks = self.capsule_first.section("integrity")
+
+        self.assertGreater(len(checks.rows), 1)
+        self.assertEqual([], [row.label for row in checks.rows if not row.record["ok"]])
+        self.assertIn("orchestrator_rotation", [row.record["check"] for row in checks.rows])
+
+    def test_every_digest_is_the_servers_and_agrees_across_two_runtimes(self):
+        # Criterion 5. Two connections, one moment, one document: a compile that
+        # depended on anything the first process held would differ here, and a
+        # digest computed in Python would agree with itself while agreeing with
+        # no row.
+        self.assertEqual(self.capsule_first.as_dict(), self.capsule_again.as_dict())
+        for row in self.capsule_first.rows():
+            with self.subTest(row.label):
+                self.assertEqual(64, len(row.digest))
+                self.assertEqual(row.digest, row.digest.lower())
+
+    def test_a_row_digest_is_the_one_the_database_computes_for_that_record(self):
+        row = self.capsule_first.section("lifecycle").rows[0]
+
+        self.assertEqual(
+            self.owned(
+                "SELECT encode(sha256(convert_to($1::jsonb::text, 'utf8')), 'hex')",
+                (json.dumps(dict(row.record)),),
+            ),
+            row.digest,
+        )
+
+    def test_the_capsule_names_no_turn_of_the_session_it_resumes(self):
+        # Criterion 4: no transcript. The closed session's runs are rows, and
+        # the one thing carried forward about them is the count in the usage
+        # record -- not a word any of them said.
+        document = json.dumps(self.capsule_first.as_dict())
+
+        self.assertNotIn(self.capsule_session["agent_run"], document)
+        self.assertNotIn(self.capsule_session["label"], document)
+
+    # -- criterion 6: measured, then compacted or refused -----------------------
+
+    def test_a_capsule_states_its_size_and_stays_under_its_ceiling(self):
+        built = self.capsule_first
+
+        self.assertLessEqual(built.bytes, built.limits.byte_ceiling)
+        self.assertLessEqual(built.tokens, built.limits.token_limit)
+        self.assertEqual(
+            [0, 0, 0, 0, 0],
+            [body["omitted"] for body in built.as_dict()["sections"].values()],
+        )
+
+    def test_a_capsule_over_its_ceiling_is_compacted_and_says_by_how_much(self):
+        tight = self.capsule_tight
+        omitted = {
+            name: body["omitted"] for name, body in tight.as_dict()["sections"].items()
+        }
+
+        self.assertLessEqual(tight.bytes, 1400)
+        self.assertGreater(sum(omitted.values()), 0)
+        self.assertLess(len(tight.rows()), len(self.capsule_first.rows()))
+        self.assertEqual(
+            self.capsule_first.section("slate").total, tight.section("slate").total
+        )
+
+    def test_a_ceiling_nothing_fits_under_is_refused(self):
+        with self.assertRaises(capsule.CapsuleError):
+            self.resumed(
+                "capsule", self.capsule_slate, limits=packet.Limits(byte_limit=100)
+            )
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = $1",
+            ("orchestrator_rotation",),
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
+            ("orchestrator_rotation",),
         ).rows
 
         self.assertEqual(1, int(registered[0]))

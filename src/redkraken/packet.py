@@ -304,15 +304,26 @@ def _size(rows: Sequence[Row]) -> int:
     return sent_bytes(rows, lambda row: row.as_dict())
 
 
-def bound(sections: Mapping[str, Section], *, byte_limit: int) -> dict[str, Section]:
+def bound(
+    sections: Mapping[str, Section],
+    *,
+    byte_limit: int,
+    order: Sequence[str] = SECTIONS,
+) -> dict[str, Section]:
     """Apply the packet's byte ceiling across every section at once.
 
     Across, not within: a per-section ceiling would let five sections that each
     fit add up to a packet that does not, and the ceiling the Spec names is on
     the packet.
+
+    `order` is a parameter because the capsule is a second document with the
+    same rows-under-a-ceiling problem and different sections. It is only the
+    order the rows are gathered in -- which section a drop comes out of is
+    `fit`'s decision either way -- so a caller passing its own section names
+    gets this policy rather than a copy of it.
     """
     kept = fit(
-        [row for name in SECTIONS for row in sections.get(name, Section(name, 0)).rows],
+        [row for name in order for row in sections.get(name, Section(name, 0)).rows],
         byte_limit=byte_limit,
         group=lambda row: row.section,
         size=_size,

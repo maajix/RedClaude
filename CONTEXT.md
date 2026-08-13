@@ -167,6 +167,25 @@ Task's kind. Never the model's: a Choice asks for a Task, and this is the step
 that either happens against exactly that Task or does not happen.
 _Avoid_: Launch, schedule, assignment, handoff
 
+**Campaign**:
+One orchestrator's continuous line of decision for a program, made of the
+sessions that replaced each other. A session is a turn of it and ends at the
+ceilings it was admitted under; the campaign carries on in the successor that
+points back at it. Durable rather than held: every pass is already a restart, so
+a campaign that lived in a process would last exactly as long as the weakest
+thing in it.
+_Avoid_: Conversation, thread, context window, run
+
+**Capsule**:
+Everything a replacement session inherits, compiled from durable state at the
+moment it starts: program lifecycle, budget, integrity, active work and the next
+Slate, each row with its revision and the database's own digest, and each
+section saying how much of itself it is not carrying. Bounded in bytes and
+estimated tokens, and refused rather than sent when it cannot be fitted. Never a
+transcript and never a model-authored summary — what a rotation preserves is
+what can be recomputed.
+_Avoid_: Summary, handoff, memory, snapshot
+
 **Roster**:
 The closed statement of every role this harness runs and what each one may call,
 compiled against a measured inventory of the SDK/CLI pair's own tools. One

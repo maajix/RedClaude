@@ -37,7 +37,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import agent, isolation, migrate, packet as packet_module, pg
+from redkraken import agent, capsule as capsule_module, isolation, migrate
+from redkraken import packet as packet_module, pg
 from redkraken import program, proposal, proxy, roster, state as state_module
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
 
@@ -174,8 +175,18 @@ CHOICE = "SELECT record_choice($1::uuid, $2, $3, $4)"
 #: prefer. What this does say is the bound -- one call, the runtime re-checks
 #: it, and choosing nothing is an answer with a defined consequence rather than
 #: a failure.
+#:
+#: The capsule is repeated into it, and that is ticket 28's criterion rather than
+#: an exception to the rule above: a rotated session "receives" what it inherits,
+#: and a document behind a tool call is a document a model can decline to read.
+#: Its Slate section is dropped on the way in -- `Capsule.brief` -- so the one
+#: copy of the entries is still the one `get_slate` serves.
 PLANNING = (
     "Choose the Task this harness runs next.\n\n"
+    "You are {session}, generation {generation} of this campaign. What the "
+    "sessions before you left is below, and it is all of it: there is no "
+    "transcript, and every session before this one has been closed.\n\n"
+    "{capsule}\n\n"
     "Call mcp__rk2__get_slate for the {count} Task(s) on offer, each with its kind, "
     "subject, priority and the factors behind that priority. Read what the Program "
     "already knows with the state tools where it helps you tell them apart. Then "
@@ -458,6 +469,11 @@ class Session:
     label: str
     subagent_cap: int
     token_cap: int | None
+    session_label: str = ""
+    generation: int = 1
+    capsule_bytes: int = packet_module.DEFAULT_BYTES
+    capsule_tokens: int = packet_module.DEFAULT_TOKENS
+    rotated: str | None = None
 
     @classmethod
     def from_row(cls, row: dict) -> Session:
@@ -468,6 +484,26 @@ class Session:
             token_cap=(
                 None if row.get("token_cap") is None else int(row["token_cap"])
             ),
+            session_label=str(row.get("session_label") or ""),
+            generation=int(row.get("generation") or 1),
+            capsule_bytes=int(row.get("capsule_bytes") or packet_module.DEFAULT_BYTES),
+            capsule_tokens=int(
+                row.get("capsule_tokens") or packet_module.DEFAULT_TOKENS
+            ),
+            rotated=None if row.get("rotated") is None else str(row["rotated"]),
+        )
+
+    def limits(self) -> packet_module.Limits:
+        """What this session's capsule may cost, from the weights it opened under.
+
+        The row count is the packet default and is not configured beside the two
+        ceilings: the sections a capsule carries are the Program's shape rather
+        than its contents -- one lifecycle, one budget, the standing checks, what
+        is running, the Slate -- and none of them is long enough for a row cap to
+        be the bound that bites. The bytes are.
+        """
+        return packet_module.Limits(
+            byte_limit=self.capsule_bytes, token_limit=self.capsule_tokens
         )
 
 
@@ -894,7 +930,7 @@ class Slice:
         if session is None:
             return None
 
-        result = self._planner(ledger, program_id, session, offered)
+        result = self._planner(ledger, connection, program_id, session, offered)
         outcome, task, detail = self._answered(result)
         try:
             return self._record(ledger, connection, session, outcome, task, detail, result)
@@ -910,11 +946,18 @@ class Slice:
 
         A failure here is reported and is not the pass failing. The one thing
         it costs is the choice, and the claim below covers exactly that case.
+
+        One statement, and the rotation is inside it: `open_orchestrator_session`
+        closes a campaign that has reached a ceiling before it opens the turn, so
+        this runtime neither decides when to rotate nor has a second place where
+        it could forget to. What it does with the answer is say so, because a
+        closed campaign is the one thing about this pass an operator reading the
+        Ledger cannot see anywhere else in it.
         """
         try:
             with connection.transaction():
                 _actor(connection)
-                return Session.from_row(
+                opened = Session.from_row(
                     proxy.as_object(connection.execute(OPEN_SESSION).scalar())
                 )
         except pg.DatabaseError as error:
@@ -925,15 +968,23 @@ class Slice:
                 source="database",
             )
             return None
+        if opened.rotated:
+            ledger.hold(
+                "rotation",
+                f"{opened.rotated} reached a ceiling and was closed; "
+                f"{opened.session_label} continues it at generation {opened.generation}",
+            )
+        return opened
 
     def _planner(
         self,
         ledger: Ledger,
+        connection: pg.Connection,
         program_id: str,
         session: Session,
         offered: list[dict],
     ) -> agent.AgentRunResult | None:
-        """The one child that chooses, started with the Slate and no capability.
+        """The one child that chooses, started with the capsule and no capability.
 
         No `egress`, and that is a property of the run rather than of the
         request: the roster withholds `net.request` from the orchestrator, so
@@ -948,9 +999,17 @@ class Slice:
         mission = self._packet(ledger, program_id)
         if mission is None:
             return None
+        resume = self._capsule(ledger, connection, program_id, session, offered)
+        if resume is None:
+            return None
         request = agent.AgentRunRequest(
             agent_run_id=session.agent_run_id,
-            objective=PLANNING.format(count=len(offered)),
+            objective=PLANNING.format(
+                count=len(offered),
+                session=resume.session or session.label,
+                generation=resume.generation,
+                capsule=json.dumps(resume.brief(), separators=(",", ":"), default=str),
+            ),
             container=self.boundary,
             role=roster.ORCHESTRATOR,
             program_id=program_id,
@@ -959,7 +1018,7 @@ class Slice:
             timeout=self.timeout,
             subagent_cap=session.subagent_cap,
             token_cap=session.token_cap,
-            slate=tuple(offered),
+            capsule=resume,
         )
         try:
             return self.launch(request)
@@ -1402,6 +1461,58 @@ class Slice:
                 if not state_module.bind_agent_session(ledger, session, program_id):
                     return None
                 return packet_module.compile(session)
+
+    def _capsule(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        program_id: str,
+        session: Session,
+        offered: list[dict],
+    ) -> capsule_module.Capsule | None:
+        """What this session inherits, compiled because nothing else survives.
+
+        On the runtime connection and not the agent one, unlike the packet: the
+        campaign, the budgets and the Task queue are not on the state read
+        surface, and a session choosing between Tasks is not reading inside one.
+
+        The standing checks are asked here rather than carried from the pass's
+        own gate. The gate ran before the scheduler did -- before this pass
+        ranked, offered and opened a session -- so quoting it would put a
+        sentence about an earlier moment inside a document that says it
+        describes this one. The cost is one more `run_standing_checks()` per
+        pass, which is the price of the capsule's integrity section meaning what
+        it says.
+
+        A capsule that cannot be built is the choice not happening, like every
+        other failure on this path: the pass keeps its Slate, `claim_task` walks
+        it, and the Ledger says why nobody was asked.
+        """
+        try:
+            with connection.transaction():
+                built = capsule_module.compile(
+                    connection,
+                    program_id,
+                    session=session.session_label,
+                    generation=session.generation,
+                    limits=session.limits(),
+                    slate=offered,
+                )
+        except (capsule_module.CapsuleError, pg.DatabaseError) as error:
+            ledger.fail(
+                "capsule",
+                f"{session.label} could not be given what it inherits: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return None
+        ledger.hold(
+            "capsule",
+            f"{built.session or session.label} resumes at generation "
+            f"{built.generation} from {len(built.rows())} row(s), "
+            f"{built.bytes} byte(s), about {built.tokens} token(s)",
+        )
+        return built
 
     def _authorize(
         self,

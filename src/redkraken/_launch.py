@@ -46,7 +46,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import NoReturn
 
-from redkraken import agent, packet, proxy, roster, scope, tls
+from redkraken import agent, capsule, packet, proxy, roster, scope, tls
 
 
 try:
@@ -679,8 +679,11 @@ async def run(
     # not the job's -- and the tool answers that it has nothing to spend.
     door = agent.Egress.from_dict(job.get("egress"))
     # Empty for every run that was offered no Slate, which is every run that is
-    # executing a Task rather than choosing one.
-    choice = Choice(_slate_entries(job.get("slate")))
+    # executing a Task rather than choosing one. The entries come out of the
+    # capsule because that is where they crossed: the runtime compiles the Slate
+    # into it as one section, so this process reads the one copy it was given
+    # rather than a field beside it that could say something else.
+    choice = Choice(_slate_entries(job.get("capsule")))
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
     # SDK version would do for one role, so an absent SDK and an unknown role
@@ -768,17 +771,23 @@ async def run(
 
 
 def _slate_entries(stated: object) -> list[Mapping[str, object]]:
-    """The offered entries a job carried, or none where it carried none.
+    """The offered entries a job's capsule carried, or none where it carried none.
 
-    Anything that is not a list of objects is no Slate rather than an error.
-    A malformed one leaves the session with nothing to choose from, which the
-    runtime reads back as a session that chose nothing and falls back on its
-    own walk -- and that is a working pass, where a raise here would be a run
-    that never started.
+    A capsule that is not one is no Slate rather than an error, and so is a
+    capsule with no Slate section. A malformed one leaves the session with
+    nothing to choose from, which the runtime reads back as a session that chose
+    nothing and falls back on its own walk -- and that is a working pass, where a
+    raise here would be a run that never started.
+
+    `Capsule.from_dict` is the same rebuild the packet gets, so the shape is
+    checked once by the value that owns it rather than field by field here.
     """
-    if not isinstance(stated, list):
+    if not isinstance(stated, Mapping):
         return []
-    return [entry for entry in stated if isinstance(entry, Mapping)]
+    try:
+        return capsule.Capsule.from_dict(stated).slate()
+    except capsule.CapsuleError:
+        return []
 
 
 def _usage(stated: object) -> tuple[int, int]:

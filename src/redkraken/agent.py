@@ -39,7 +39,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, isolation, packet as packet_module, pg, roster
+from redkraken import _startup, capsule as capsule_module, isolation
+from redkraken import packet as packet_module, pg, roster
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -366,11 +367,14 @@ class AgentRunRequest:
     bounded by its turns alone. A number invented here would be a ceiling no
     Program's capacity was held against.
 
-    `slate` is the bounded set of Tasks this run may choose between, and it
-    travels for the third time for the same reason: the child has no database,
-    so a Slate it was not given is a Slate it cannot be shown. Empty for every
-    run that is executing a Task rather than choosing one -- a worker offered a
-    Slate would be a worker told what else it could have been doing.
+    `capsule` is what an orchestrator session resumes from, and it travels for
+    the third time for the same reason: the child has no database, so what it
+    was not given is what it cannot be shown. The Slate is a section of it --
+    the bounded set of Tasks this run may choose between -- which is why there
+    is no separate field for one: two fields carrying the same entries would be
+    two answers to what a session was offered. None for every run that is
+    executing a Task rather than choosing one, and a run with none has an empty
+    Slate, which is the honest answer for a worker nobody offered a choice.
     """
 
     agent_run_id: str
@@ -383,7 +387,7 @@ class AgentRunRequest:
     timeout: float = TIMEOUT
     subagent_cap: int = roster.DEFAULT_SUBAGENTS
     token_cap: int | None = None
-    slate: tuple[Mapping[str, object], ...] = ()
+    capsule: capsule_module.Capsule | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,7 +511,7 @@ def agent_run(
             "egress": None if request.egress is None else request.egress.as_dict(),
             "subagent_cap": request.subagent_cap,
             "token_cap": request.token_cap,
-            "slate": [dict(entry) for entry in request.slate],
+            "capsule": (request.capsule or capsule_module.Capsule()).as_dict(),
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:
