@@ -11394,21 +11394,26 @@ class SlateClaimTest(DatabaseCase):
         cls.offer()
         cls.cap_before = cls.cap()
 
-        # One subagent Task claimed and running, which is the whole of the
-        # Program's count. The recon lane admits one at a time, so what refuses
-        # the hunt below cannot be this Task's lane.
-        cls.set_cap(1)
-        cls.capped_at_one = cls.started(
-            "capped", cls.call("SELECT claim_task($1)", (first,))
-        )
-        cls.capped_refusal = cls.refusal("SELECT claim_task($1)", (second,))
+        # `finally`, because the number is global: an arrangement that raised
+        # between the two claims would leave every case after it -- in this
+        # class and in every other -- scheduled at whatever this one last set,
+        # and the test that checks the row was restored would never run.
+        try:
+            # One subagent Task claimed and running, which is the whole of the
+            # Program's count. The recon lane admits one at a time, so what
+            # refuses the hunt below cannot be this Task's lane.
+            cls.set_cap(1)
+            cls.capped_at_one = cls.started(
+                "capped", cls.call("SELECT claim_task($1)", (first,))
+            )
+            cls.capped_refusal = cls.refusal("SELECT claim_task($1)", (second,))
 
-        cls.set_cap(2)
-        cls.capped_at_two = cls.started(
-            "capped", cls.call("SELECT claim_task($1)", (second,))
-        )
-
-        cls.set_cap(cls.cap_before)
+            cls.set_cap(2)
+            cls.capped_at_two = cls.started(
+                "capped", cls.call("SELECT claim_task($1)", (second,))
+            )
+        finally:
+            cls.set_cap(cls.cap_before)
         cls.cap_after = cls.cap()
 
     @classmethod
@@ -11421,12 +11426,12 @@ class SlateClaimTest(DatabaseCase):
         )
 
     @classmethod
-    def set_cap(cls, subagents: int) -> None:
+    def set_cap(cls, subagent_cap: int) -> None:
         """The operator's edit, which is the only place this number is set."""
         cls.as_owner(
             "UPDATE scheduler_weights SET max_concurrent_subagents = $1::smallint"
             " WHERE active",
-            (str(subagents),),
+            (str(subagent_cap),),
         )
 
     @classmethod
@@ -11921,7 +11926,7 @@ class SlateClaimTest(DatabaseCase):
         # closes: the gate is built from what the claim read, so both numbers
         # here came out of one row that this fixture moved once.
         for claimed in (self.capped_at_one, self.capped_at_two):
-            with self.subTest(subagents=claimed.subagent_cap):
+            with self.subTest(subagent_cap=claimed.subagent_cap):
                 gate = roster.Gate("orchestrator", claimed.subagent_cap)
                 # Alternating targets, because both roles run two at a time:
                 # every delegation here is inside its own role's ceiling, so

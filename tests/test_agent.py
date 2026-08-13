@@ -1080,20 +1080,25 @@ class ChildTest(unittest.TestCase):
         # and it arrives on the job because this process cannot ask for it: the
         # container's one network reaches the capability proxy and no database.
         capped = job(fixtures.scratch(), subagent_cap=5)
-        gate = _launch._gate(fixtures.ROLE, _launch._subagent_cap(capped))
+        gate = _launch._gate(fixtures.ROLE, capped.get("subagent_cap"))
 
-        self.assertEqual(5, gate.subagents)
+        self.assertEqual(5, gate.subagent_cap)
 
     def test_a_job_that_carries_no_cap_gets_the_rosters_default(self):
         # A job written before the number travelled, not a value this process
         # prefers to the one the claim read.
-        self.assertEqual(roster.GLOBAL_SUBAGENTS, _launch._subagent_cap(self.job))
+        self.assertEqual(roster.DEFAULT_SUBAGENTS, _launch._subagent_cap(None))
 
     def test_a_cap_the_roster_refuses_leaves_the_child_with_no_gate(self):
         # The same answer an unknown role gets, and for the same reason: no
         # gate is no options value, and a launch that cannot be described is
         # one `assess` refuses field by field rather than one that crashes.
-        self.assertIsNone(_launch._gate(fixtures.ROLE, 0))
+        # A cap that is not a number at all is the same refusal: this process
+        # cannot read what the claim sent, and guessing would be the second
+        # statement of the number this ticket exists to have one of.
+        for stated in (0, -1, "three", object()):
+            with self.subTest(subagent_cap=stated):
+                self.assertIsNone(_launch._gate(fixtures.ROLE, stated))
 
     def test_a_credential_vector_in_the_inherited_environment_refuses_the_same_way(self):
         with self.assertRaises(agent.StartupRefusal) as raised:

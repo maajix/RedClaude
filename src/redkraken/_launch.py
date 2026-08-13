@@ -564,7 +564,7 @@ async def run(
     # SDK version would do for one role, so an absent SDK and an unknown role
     # both leave it without a description rather than with a broken one --
     # and `assess` already refuses each of them by name.
-    gate = _gate(role, _subagent_cap(job))
+    gate = _gate(role, job.get("subagent_cap"))
     options = (
         None
         if claude_agent_sdk is None or gate is None
@@ -612,32 +612,34 @@ async def run(
     }
 
 
-def _subagent_cap(job: Mapping[str, object]) -> int:
+def _subagent_cap(stated: object) -> int:
     """How many delegations this session may hold, as the claim read it.
 
     `scheduler_weights.max_concurrent_subagents` travels on the job because
     this process cannot ask: the container's one network reaches the capability
-    proxy and no database. A job that carries no cap gets the roster's default,
-    which is the schema's own -- that is a job written before the number
-    travelled, not a value this process may prefer to the one the claim read.
+    proxy and no database. Nothing stated gets the roster's default, which is
+    the schema's own -- that is a job written before the number travelled, not
+    a value this process may prefer to the one the claim read. Anything else
+    is converted and not sanitised: a cap this process cannot read is a job it
+    cannot honour, and `_gate` turns that into a refusal rather than a guess.
     """
-    stated = job.get("subagent_cap")
-    return roster.GLOBAL_SUBAGENTS if stated is None else int(stated)
+    return roster.DEFAULT_SUBAGENTS if stated is None else int(stated)
 
 
-def _gate(role: str, subagents: int = roster.GLOBAL_SUBAGENTS) -> roster.Gate | None:
-    """The gate for this role and cap, or nothing when the roster refuses one.
+def _gate(role: str, subagent_cap: object) -> roster.Gate | None:
+    """The gate for this role and cap, or nothing when neither can be had.
 
     Nothing rather than an exception, because an unknown role is a refusal the
     assertion makes with every other finding beside it, and a traceback here
     would be one finding reported as a crash. A cap the roster refuses -- below
-    the one the schema's own CHECK admits -- arrives at the same answer for the
-    same reason: without a gate there is no options value, and a launch that
-    cannot be described is one `assess` refuses field by field.
+    the one the schema's own CHECK admits, or not a number at all -- arrives at
+    the same answer for the same reason: without a gate there is no options
+    value, and a launch that cannot be described is one `assess` refuses field
+    by field.
     """
     try:
-        return roster.Gate(role, subagents)
-    except roster.RosterError:
+        return roster.Gate(role, _subagent_cap(subagent_cap))
+    except (roster.RosterError, TypeError, ValueError):
         return None
 
 

@@ -61,7 +61,7 @@ def claimed(**overrides) -> execution.Claimed:
         "subject_label": "GET /login",
         "method": "GET",
         "url": "https://app.example.com/login",
-        "subagent_cap": roster.GLOBAL_SUBAGENTS,
+        "subagent_cap": roster.DEFAULT_SUBAGENTS,
     }
     fields.update(overrides)
     return execution.Claimed(**fields)
@@ -549,6 +549,22 @@ class SlateTest(unittest.TestCase):
         self.assertIsNone(facts["task"])
         self.assertEqual(1, connection.statements.count(execution.CLAIM))
 
+    def test_a_scheduler_with_no_active_weights_row_is_named_not_misreported(self):
+        # PH2-73. The cap is read as a scalar subquery, so a scheduler with no
+        # active weights row answers the run and a NULL rather than no row at
+        # all -- and the refusal is the configuration it is, not a claimed run
+        # that cannot be read back. `claim_task` cannot say this itself: it
+        # reads the row into an all-NULL record and compares against nothing.
+        connection = Recorder(started=(started_row(subagent_cap=None),))
+        launcher = Launcher()
+        ledger, facts = attempt(connection, launcher)
+
+        self.assertEqual(1, len(ledger.violations))
+        self.assertEqual(execution.INVALID_CONFIGURATION, ledger.violations[0].code)
+        self.assertIn("scheduler_weights", ledger.violations[0].detail)
+        self.assertIsNone(facts["task"])
+        self.assertEqual([], launcher.requests)
+
     def test_the_session_is_bound_to_the_program_before_the_scheduler_is_asked(self):
         connection = Recorder(slate=0)
         attempt(connection)
@@ -622,9 +638,9 @@ class AttemptTest(unittest.TestCase):
         # PH2-73. `max_concurrent_subagents` comes back with the claim and goes
         # out with the child, so the gate inside refuses at the number the
         # Slate was offered and the Task was claimed under. A default in the
-        # child would be a second statement of a weight an operator sets per
-        # Program -- offered at four and denied at three, with the Task claimed
-        # and no child ever started.
+        # child would be a second statement of a weight an operator versions
+        # for the whole scheduler -- offered at four and denied at three, with
+        # the Task claimed and no child ever started.
         launcher = Launcher()
         with compiled():
             attempt(Recorder(started=(started_row(subagent_cap=4),)), launcher)

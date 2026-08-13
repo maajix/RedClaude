@@ -171,12 +171,18 @@ CLAIM = "SELECT claim_task()"
 #: Program's run.
 #:
 #: The cross-role subagent cap comes back with the run for the same reason the
-#: Lease TTL is read rather than assumed: it is a weights column an operator
-#: sets per Program, and the gate inside the child has to refuse at the number
-#: the scheduler offered and claimed under. Read here rather than in a second
-#: statement so that it is the row this claim ran against -- a weights version
-#: activated between the claim and the launch would otherwise start a child
-#: under a cap no part of this attempt was scheduled by.
+#: Lease TTL is read rather than assumed: it is a column on the one active
+#: weights row, which an operator versions for the whole scheduler, and the
+#: gate inside the child has to refuse at the number the scheduler offered and
+#: claimed under. Read here rather than in a second statement so that it is the
+#: row this claim ran against -- a weights version activated between the claim
+#: and the launch would otherwise start a child under a cap no part of this
+#: attempt was scheduled by.
+#:
+#: A scalar subquery and not a join, so that a scheduler with no active row
+#: answers NULL here rather than no rows at all: the claim would otherwise be
+#: reported as a run that cannot be read back, which is the wrong rule for a
+#: configuration this query can name exactly.
 STARTED = (
     "SELECT ar.id::text, ar.label, ar.role,"
     " t.id::text, t.label, t.kind, t.attempts,"
@@ -188,11 +194,10 @@ STARTED = (
     "             ELSE '/' || ep.path_template END"
     "   WHEN ap.entity_id IS NOT NULL THEN ap.base_url"
     " END,"
-    " w.max_concurrent_subagents"
+    " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active)"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
-    " JOIN scheduler_weights w ON w.active"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
     " LEFT JOIN applications ap ON ap.entity_id = e.id"
@@ -721,6 +726,19 @@ class Slice:
                 "claim",
                 f"{label} was claimed and no run of that name can be read back",
                 code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        # A scheduler with no active weights row, named as the configuration it
+        # is. The claim itself does not refuse one -- `claim_task` reads the row
+        # into an all-NULL record and every comparison against it is unknown --
+        # so the first place it can be said out loud is here, where the cap the
+        # child would run under is missing rather than wrong.
+        if rows[0][11] is None:
+            ledger.fail(
+                "claim",
+                f"{label} was claimed with no active scheduler_weights row to cap it",
+                code=INVALID_CONFIGURATION,
                 source="database",
             )
             return None

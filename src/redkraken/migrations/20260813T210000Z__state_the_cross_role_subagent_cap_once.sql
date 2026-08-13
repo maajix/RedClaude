@@ -4,12 +4,13 @@
 -- The number 3 was written twice. `scheduler_weights.max_concurrent_subagents`
 -- is what `claimable_for` filters the Slate by and refuses the claim by, and
 -- what `check_lane_quota_closure()` bounds the sum of lane entitlements
--- against. `roster.GLOBAL_SUBAGENTS` was the same number again, in a Python
--- constant, and the pre-tool gate refused a delegation by that one. They were
--- equal by coincidence, and one of them is a weights column an operator sets
--- per Program: raised to 4, the Slate offers a fourth hunt, the orchestrator
--- delegates it and the gate denies it -- the Task claimed, the run row open,
--- the child never started. Lowered to 2, the gate is dead code.
+-- against. `roster.GLOBAL_SUBAGENTS`, now `roster.DEFAULT_SUBAGENTS`, was the
+-- same number again in a Python constant, and the pre-tool gate refused a
+-- delegation by that one. They were equal by coincidence, and one of them is a
+-- column on the one active weights row, which an operator versions: raised to
+-- 4, the Slate offers a fourth hunt, the orchestrator delegates it and the
+-- gate denies it -- the Task claimed, the run row open, the child never
+-- started. Lowered to 2, the gate is dead code.
 --
 -- The runtime now reads this column with the claim (`execution.STARTED`) and
 -- hands it to `roster.Gate`, so this row is the one statement and the constant
@@ -23,14 +24,23 @@
 -- 1. What the number means, on the column that holds it
 -- ---------------------------------------------------------------------------
 
--- Both populations, because they are not the same one and two equal constants
--- were what made that look like agreement. The scheduler counts across the
--- Program and outlives any one orchestrator; the gate counts inside one
--- session and is a subset of it -- during a rotation the old session's
--- delegations are gone while its Tasks are still claimed, so the two disagree
--- by design and one number still bounds both.
+-- Both populations, because two equal constants were what made two different
+-- counts look like agreement. Said once here and once on `roster.Gate`, which
+-- are the two places a reader of either count arrives at.
 COMMENT ON COLUMN scheduler_weights.max_concurrent_subagents IS
-  'How many subagents may run at once, across every lane. Counted twice, over two populations: the scheduler counts Tasks in claimed or running whose lane role runs as a subagent, across the whole Program and across orchestrator rotations, and refuses an offer and a claim past this (claimable_for); the runtime reads this column with the claim and gives it to the pre-tool gate, which counts the delegations one orchestrator session is holding, which is that SDK''s concurrency and that machine''s containers. The session''s population is a subset of the Program''s, which is why one number bounds both. Set per Program and per weights version: this is the row an operator moves, and the runtime carries no copy of it.';
+  'How many subagents may run at once, across every lane. Counted twice, over two populations: the scheduler counts Tasks in claimed or running whose lane role runs as a subagent, across the whole Program and across orchestrator rotations, and refuses an offer and a claim past this (claimable_for); the runtime reads this column with the claim and gives it to the pre-tool gate, which counts the delegations one orchestrator session is holding, which is that SDK''s concurrency and that machine''s containers. The session''s population is a subset of the Program''s, which is why one number bounds both, and why they disagree during a rotation. Set on the one active weights row, which an operator versions for the whole scheduler: that row is the one statement of it, and the runtime carries no copy.';
+
+-- And once where the scheduler spends it. `claimable_for` is not rewritten
+-- here -- the comment is replaced whole, because a comment cannot be appended
+-- to, so the sentence 170000Z wrote is restated with the population added.
+COMMENT ON FUNCTION claimable_for(tasks, scheduler_weights) IS
+    'NULL when this Task may be claimed, else the name of the condition that '
+    'refuses it. The offer filters on it and the claim re-asks it, so the list '
+    'the orchestrator was given and the decision the runtime commits cannot be '
+    'answers to two different questions. Its global_subagent_cap arm counts '
+    'the Program''s claimed and running subagent Tasks, which is the wider of '
+    'the two populations max_concurrent_subagents bounds: the pre-tool gate '
+    'counts one session''s outstanding delegations against the same number.';
 
 
 -- ---------------------------------------------------------------------------

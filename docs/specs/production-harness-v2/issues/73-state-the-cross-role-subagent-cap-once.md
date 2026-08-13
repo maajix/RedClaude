@@ -63,15 +63,16 @@ Implemented on 2026-08-13. The number now travels: `execution.STARTED` reads
 `max_concurrent_subagents` off the active weights row in the same transaction
 as the claim, it lands on `Claimed.subagent_cap`, goes out on
 `AgentRunRequest.subagent_cap` and then on the job document, and `_launch`
-gives it to `roster.Gate(role, subagents)`. One migration,
+gives it to `roster.Gate(role, subagent_cap)`. One migration,
 `20260813T210000Z__state_the_cross_role_subagent_cap_once.sql`, adds no column
 and changes no function: what it adds is the comment saying what the number
 means on each side, and one standing check, `subagent_cap`.
 
 ### The shape the How named, and the constant that stayed
 
-`GLOBAL_SUBAGENTS` is still there, and it is no longer a cap: it is the default
-argument of `Gate.__init__` and the value `_launch._subagent_cap` falls back to
+The constant is still there and is no longer a cap, so it is no longer named
+for one: `roster.GLOBAL_SUBAGENTS` is now `roster.DEFAULT_SUBAGENTS`, the
+default argument of `Gate.__init__` and what `_launch._subagent_cap` answers
 for a job carrying no cap. `SchemaAgreementTest` holds it equal to 019's
 `DEFAULT 3` by reading the `ALTER TABLE` text, which is what makes the fallback
 the schema's answer rather than a second opinion. A gate built without a cap is
@@ -84,7 +85,19 @@ raises `RosterError`, the same exception an unknown role raises, so `_gate`
 already turned it into "no gate" -- and no gate is no options value, which
 `assess` refuses field by field. That path was checked rather than assumed: a
 launch with no options value is refused by `_option_violations` on `env` alone,
-so an unusable cap cannot reach the `assert gate is not None` below it.
+so an unusable cap cannot reach the `assert gate is not None` below it. A cap
+that is not a number at all takes the same path: `_gate` takes the job's value
+raw and converts inside its own `try`, so a malformed cap is a refusal with
+every other finding beside it rather than a `ValueError` out of `run`.
+
+The gate that this cap will refuse a delegation at is the orchestrator's, and
+nothing in the tree launches an orchestrator yet: `Slice._child` is the only
+`AgentRunRequest` there is, and the roles it starts are the subagents, which
+hold no delegation tool. So today the number reaches every gate the runtime
+builds and refuses in none of them; when the orchestrator's own launch lands it
+goes through this same seam and reads the cap off the same job field.
+`SlateClaimTest` builds the orchestrator's gate by hand for that reason, from
+the cap the claim carried.
 
 ### The claim's own transaction, not a second read
 
@@ -96,6 +109,14 @@ scheduled by is the failure this ticket is about, one transaction later.
 `execution.LEASE_TTL` is the precedent and not the model here: the TTL is read
 once per pass and belongs to the pass, while the cap belongs to one claim.
 
+It is read as a scalar subquery and not as a join. As a join, a scheduler with
+no active weights row makes `STARTED` return no rows at all, and the claim is
+then reported as a run that cannot be read back -- `INTEGRITY_FAILED`, naming
+the wrong rule for a configuration the query can name exactly. As a subquery
+the cap comes back NULL, and `_claim` refuses with `INVALID_CONFIGURATION` and
+says which row is missing. `claim_task` cannot say this itself: it selects the
+weights row into an all-NULL record and every comparison against it is unknown.
+
 ### What the two counters count
 
 The comment on the column says both populations, because that is where a reader
@@ -106,7 +127,17 @@ that SDK's concurrency and that machine's containers. The session's population
 is a subset of the Program's, which is why one number bounds both and why they
 disagree during a rotation -- the old session's delegations are gone while its
 Tasks are still claimed. The same sentence is on `roster.Gate`, for the reader
-who arrives from the Python side.
+who arrives from the Python side, and one sentence of it is on
+`claimable_for`'s own comment, which is where the How asked for it: a comment
+cannot be appended to, so 170000Z's text is restated with the population added.
+
+The Why and the How both say the row is set "per Program". It is not.
+`scheduler_weights` has no `program_id` -- 0012 keys it on `version`, and 0017
+registers it as a Program-global table, "one active policy version for the
+whole scheduler". What an operator versions is one active row for every
+Program; what is per Program is the population the scheduler counts against it.
+The implementation followed the spec's wording into five comments before the
+review caught it, and all five now say what the schema says.
 
 ### One arm, and the reason it is textual
 
@@ -121,6 +152,14 @@ honest code is one that gets worked around. Comments are stripped first, as
 both of 71's arms do. The runtime's half cannot be checked from SQL at all;
 `SchemaAgreementTest` and `tests/test_agent.py` are what hold that side.
 
+The How asked for a comment and this file adds a check as well, which is the
+corpus's standing convention rather than this ticket's invention: 21, 22, 23,
+24 and 71 each left the invariant they established as a `standing_checks` row
+with a negative control, and a comment nobody runs is the shape this ticket was
+written to stop trusting. The same reading covers `Gate`'s refusal of a cap
+below 1 -- 019's `CHECK` already says it, and the gate is where the number is
+spent.
+
 ### The test that moves the number
 
 `SlateClaimTest.arrange_subagent_cap` is an eleventh Program, `capped`, with one
@@ -130,10 +169,11 @@ With the cap at 1 and the recon claimed, the hunt is refused
 taken. Both runs are read back through `execution.STARTED` itself, so what the
 test asserts is the number the runtime would carry to a child, and
 `roster.Gate` is then built from each one and refuses at it. The row is put
-back to what the fixture found, and one test says so:
-`scheduler_weights` is one global row, and a scenario that
-moved it and left it would schedule every case after it, in this file and every
-other, under a cap this fixture chose.
+back to what the fixture found in a `finally`, and one test says so:
+`scheduler_weights` is one global row, and an arrangement that moved it and
+raised before restoring it would schedule every case after it, in this file and
+every other, under a cap this fixture chose -- and the test that checks the
+restoration would never run to notice.
 
 The refusal at cap 1 is also PH2-75 in passing: the count that refuses the hunt
 is the recon's, and the arm would have refused a validate or a report the same
