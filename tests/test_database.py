@@ -1030,6 +1030,30 @@ CONTROLS = (
         "            AND r.runs_as = 'subagent') >= 3 $ctl$",
     ),
     Control(
+        # Capacity held out of the pool for a run that has already ended. Written
+        # by hand because no call reaches it: the trigger on `finished_at`
+        # settles the reservation in the same statement that closes the run, so
+        # this is what a restore or a hand-written row leaves behind -- and it is
+        # a Program that has silently shrunk, since nothing will ever give the
+        # tokens back. The run is inserted already finished for that reason: a
+        # closure would have settled it on the way past.
+        "standing:budget_reservations",
+        "DO $ctl$ DECLARE p uuid; t uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('reserved-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO tasks (program_id, kind, status, finished_at)"
+        "        VALUES (p, 'recon', 'done', now()) RETURNING id INTO t;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, runs_as, model, effort,"
+        "                           mission_packet, finished_at, stop_reason)"
+        "        VALUES (p, t, 'recon', 'subagent', 'selftest', 'low', '{}'::jsonb,"
+        "                now(), 'completed') RETURNING id INTO r;"
+        "   INSERT INTO budget_reservations (program_id, agent_run_id, task_id, kind, tokens)"
+        "        VALUES (p, r, t, 'recon', 1000);"
+        " END $ctl$",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -5077,19 +5101,44 @@ class HeldTarget(Target):
     do_HEAD = do_GET
 
 
+#: The limits `SCOPED` states, in the order it states them. Written as a table
+#: and rendered rather than copied nine times: every fragment below differs from
+#: this one in a limit or two, and nine literal numbers per fragment is nine
+#: chances for an unrelated ceiling to drift when the loader gains a key.
+SCOPED_LIMITS = {
+    "requests": 100,
+    "tokens": 10000,
+    "run_tokens": 2000,
+    "run_requests": 10,
+    "lane_tokens": 5000,
+    "lane_requests": 50,
+    "concurrency": 1,
+    "burst": 100,
+    "window_seconds": 60,
+}
+
+
+def budgets(**overrides: int) -> str:
+    """One `[budgets]` block, `SCOPED`'s limits with the named ones moved."""
+    limits = SCOPED_LIMITS | overrides
+    return "\n".join(f"{limit} = {limits[limit]}" for limit in SCOPED_LIMITS)
+
+
 #: The `[budgets]` block `SCOPED` carries, so that a Program built from it can be
 #: given a different one. Matched as the whole block rather than line by line: a
 #: partial replacement would leave a document whose limits half agree.
-SCOPED_BUDGETS = (
-    "requests = 100\ntokens = 10000\nconcurrency = 1\nburst = 100\nwindow_seconds = 60"
-)
+SCOPED_BUDGETS = budgets()
 
 #: What every Program in the suite below gets unless it is a Program about
 #: budgets. Wide on purpose: a limit shared by tests that are not about it is a
 #: limit that makes adding an unrelated test break an unrelated assertion, and
-#: `SCOPED` is tight enough that the suite would run into its own ceiling.
-WIDE_ENOUGH = (
-    "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+#: `SCOPED` is tight enough that the suite would run into its own ceiling. The
+#: per-run and per-Lane ceilings are the whole of the aggregate for the same
+#: reason: what these Programs are stopped by has to be the limit each is named
+#: for, and 25's admission arms are not it.
+WIDE_ENOUGH = budgets(
+    requests=500, lane_requests=500, concurrency=4, burst=500, window_seconds=3600,
+    lane_tokens=10000,
 )
 
 #: And the Programs that exist to be stopped, each named for the limit it hits.
@@ -5097,20 +5146,25 @@ WIDE_ENOUGH = (
 #: hour, which is what makes `throttle` a test of the limit rather than of how
 #: fast the suite runs.
 BUDGETS = {
-    "budget": (
-        "requests = 2\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+    "budget": budgets(
+        requests=2, run_requests=1, lane_requests=2, concurrency=4, burst=500,
+        window_seconds=3600, lane_tokens=10000,
     ),
-    "throttle": (
-        "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 2\nwindow_seconds = 3600"
+    "throttle": budgets(
+        requests=500, lane_requests=500, concurrency=4, burst=2, window_seconds=3600,
+        lane_tokens=10000,
     ),
-    "concurrent": (
-        "requests = 500\ntokens = 10000\nconcurrency = 1\nburst = 500\nwindow_seconds = 3600"
+    "concurrent": budgets(
+        requests=500, lane_requests=500, concurrency=1, burst=500, window_seconds=3600,
+        lane_tokens=10000,
     ),
-    "race": (
-        "requests = 3\ntokens = 10000\nconcurrency = 8\nburst = 500\nwindow_seconds = 3600"
+    "race": budgets(
+        requests=3, run_requests=1, lane_requests=3, concurrency=8, burst=500,
+        window_seconds=3600, lane_tokens=10000,
     ),
-    "halted": (
-        "requests = 500\ntokens = 10000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+    "halted": budgets(
+        requests=500, lane_requests=500, concurrency=4, burst=500, window_seconds=3600,
+        lane_tokens=10000,
     ),
 }
 
@@ -8123,8 +8177,14 @@ PATH = "/notes"
 #: history to shrink towards costs the 0.30 prior of a 200000-token reference.
 #: Under `SCOPED`'s own 10000 no Task in this suite would ever be offered, and
 #: that reads as an idle queue rather than as a budget that is too small.
-AFFORDABLE = (
-    "requests = 500\ntokens = 1000000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+#: The per-run and per-Lane ceilings are wide for the same reason and one more:
+#: what a claim reserves is the per-run number, so a Lane ceiling near it would
+#: admit one claim and refuse the next -- which is 25's own subject and not the
+#: subject of any suite that carries this.
+AFFORDABLE = budgets(
+    requests=500, tokens=1000000, run_tokens=40000, run_requests=50,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
 )
 
 
@@ -10894,8 +10954,10 @@ SLATE_SLUG = "selftest-slate"
 #: recon Task with no run history to shrink its 0.30 prior -- so 100000 opens
 #: and `SLATE_SPEND` closes it while leaving the budget itself unexhausted,
 #: which is a refusal with a different name.
-SLATE_TIGHT = (
-    "requests = 500\ntokens = 100000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+SLATE_TIGHT = budgets(
+    requests=500, tokens=100000, run_tokens=2000, run_requests=50,
+    lane_tokens=100000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
 )
 
 #: What one Agent run spends to take that Program under the line.
@@ -10922,7 +10984,218 @@ FINDING_CLASS = "idor"
 SLATE_KINDS = ("recon", "hunt", "analyze", "validate", "report")
 
 
-class SlateClaimTest(DatabaseCase):
+class SchedulerFixture:
+    """The moves every scheduler scenario is built out of, on live rows.
+
+    Seeding a Program, ranking it, offering the slate and claiming off it are
+    the same six statements whatever the scenario is about, and the classes
+    below are about different things: 23 is about the gap between an offer and
+    a claim, 25 about the capacity a claim holds out of the pool. Shared here
+    so that a change to how a Task is seeded is one edit rather than one per
+    ticket that ever seeded one.
+
+    It assumes what both cases set up: `cls.connection` as the migrate
+    connection, `cls.runtime` as a runtime one, and `cls.identifiers` mapping a
+    scenario name to a Program.
+    """
+
+    @classmethod
+    def started(cls, name: str, run: object) -> execution.Claimed:
+        """The claimed run as the runtime reads it back, through its own query.
+
+        `execution.STARTED` rather than a statement written here: what is under
+        test is that the number the runtime carries to the child is the one the
+        claim ran against, and a second query would only prove that the column
+        can be selected.
+        """
+        rows = cls.runtime.execute(
+            execution.STARTED, (str(run), cls.identifiers[name])
+        ).rows
+        return execution.Claimed.from_row(rows[0])
+
+    @classmethod
+    def hypothesis(cls, name: str, subject: str, worth: str) -> str:
+        """One testable Hypothesis on the subject.
+
+        The shape a hunt needs under it and the shape a Finding is a finding
+        of are the same shape, so both take it from here. `worth` is what
+        distinguishes them when a row is read back by hand.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " property_class, statement, status)"
+                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
+                " $3, 'testable') RETURNING id::text",
+                (cls.identifiers[name], subject, f"a hypothesis {worth}"),
+            )
+        )
+
+    # -- what the scenarios are built out of -----------------------------------
+
+    @classmethod
+    def seed(cls, name: str, count: int, kind: str = "recon") -> list[str]:
+        """`count` endpoints under one application, and one Task about each.
+
+        The Tasks differ only in what they promise -- the i-th is worth 0.1*i in
+        both gain and impact -- so the order the ranking should reach is known
+        here without this file recomputing the weights it is testing. Written as
+        the owner and in one transaction, because an endpoint whose application
+        did not commit with it is a Task with no resolvable subject.
+        """
+        program_id = cls.identifiers[name]
+        labels = []
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (application, BASE_URL),
+            )
+            for index in range(1, count + 1):
+                path = f"{PATH}/{index}"
+                endpoint = str(
+                    cls.connection.execute(
+                        "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
+                        (program_id, HOST, f"endpoint:GET {path}"),
+                    ).scalar()
+                )
+                cls.connection.execute(
+                    "INSERT INTO endpoints (entity_id, application_id, method,"
+                    " path_template) VALUES ($1::uuid, $2::uuid, 'GET', $3)",
+                    (endpoint, application, path),
+                )
+                labels.append(
+                    str(
+                        cls.connection.execute(
+                            "INSERT INTO tasks (program_id, kind, status,"
+                            " subject_entity_id, expected_information_gain,"
+                            " potential_impact) VALUES ($1::uuid, $2, 'pending',"
+                            " $3::uuid, $4, $4) RETURNING label",
+                            (program_id, kind, endpoint, str(round(0.1 * index, 2))),
+                        ).scalar()
+                    )
+                )
+        return labels
+
+    @classmethod
+    def bind(cls, name: str):
+        """Which Program the runtime connection is speaking for from here on."""
+        cls.runtime.execute(agent.BIND, (cls.identifiers[name],))
+
+    @classmethod
+    def offer(cls) -> tuple[dict[str, object], ...]:
+        """One Ranking pass, one Lane quota, and the slate they leave."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.runtime.execute("SELECT rank_pass('runtime')")
+            cls.runtime.execute("SELECT advance_lane_quota('runtime')")
+            return cls.runtime.execute("SELECT * FROM offer_slate()").dicts()
+
+    @classmethod
+    def call(cls, sql: str, parameters: tuple = ()) -> object:
+        """One statement as the runtime, in its own transaction."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.runtime.execute(sql, parameters).scalar()
+
+    @classmethod
+    def refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        """What one refused statement raised, insisting that it did."""
+        try:
+            cls.call(sql, parameters)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError(f"not refused: {sql} {parameters}")
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()):
+        """One statement as the role that owns the rows the scheduler reads."""
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.connection.execute(sql, parameters)
+
+    @classmethod
+    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
+        """One reading as the owner, which every Program's rows are visible to.
+
+        `DatabaseCase.owned` is the same statement, and this is not it: that one
+        stringifies its answer, and half of what is read here is a count or a
+        boolean that a string would flatten into something always true.
+        """
+        return cls.as_owner(sql, parameters).scalar()
+
+    @classmethod
+    def claimed_by(cls, name: str, run: object) -> str | None:
+        """The Task an Agent run was opened against, by label."""
+        claimed = cls.scalar(
+            "SELECT t.label FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[name], str(run)),
+        )
+        return None if claimed is None else str(claimed)
+
+    @classmethod
+    def counted(cls, name: str) -> tuple[int, int]:
+        """How much of a Program has moved: Tasks off pending, and Agent runs."""
+        program_id = cls.identifiers[name]
+        return (
+            int(
+                cls.scalar(
+                    "SELECT count(*) FROM tasks"
+                    " WHERE program_id = $1::uuid AND status <> 'pending'",
+                    (program_id,),
+                )
+            ),
+            int(
+                cls.scalar(
+                    "SELECT count(*) FROM agent_runs WHERE program_id = $1::uuid",
+                    (program_id,),
+                )
+            ),
+        )
+
+    @classmethod
+    def tokens_left(cls, name: str) -> int:
+        return int(
+            cls.scalar(
+                "SELECT tokens_left FROM program_budget WHERE program_id = $1::uuid",
+                (cls.identifiers[name],),
+            )
+        )
+
+    @classmethod
+    def contend(cls, name: str, gate: threading.Barrier, guard: threading.Lock):
+        """One orchestrator's whole part in a race, on its own connection.
+
+        A refusal is recorded rather than raised, because most of these are
+        supposed to lose and a loser that raised in a thread would fail nothing.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            connection.execute(agent.BIND, (cls.identifiers[name],))
+            gate.wait()
+            try:
+                with connection.transaction():
+                    connection.execute("SELECT set_actor('runtime', 'selftest')")
+                    outcome = connection.execute("SELECT claim_task()").scalar()
+            except pg.DatabaseError as refused:
+                outcome = f"refused: {refused}"
+            with guard:
+                cls.outcomes.append(None if outcome is None else str(outcome))
+        finally:
+            connection.close()
+
+
+class SlateClaimTest(SchedulerFixture, DatabaseCase):
     """PH2-23: a Slate is offered, and exactly one Task is claimed off it.
 
     Every question here is one only a server can answer, because what ticket 23
@@ -11226,7 +11499,7 @@ class SlateClaimTest(DatabaseCase):
         guard = threading.Lock()
         cls.outcomes: list[str | None] = []
         contenders = [
-            threading.Thread(target=cls.contend, args=(gate, guard))
+            threading.Thread(target=cls.contend, args=("contended", gate, guard))
             for _ in range(SLATE_CONTENDERS)
         ]
         for contender in contenders:
@@ -11435,38 +11708,6 @@ class SlateClaimTest(DatabaseCase):
         )
 
     @classmethod
-    def started(cls, name: str, run: object) -> execution.Claimed:
-        """The claimed run as the runtime reads it back, through its own query.
-
-        `execution.STARTED` rather than a statement written here: what is under
-        test is that the number the runtime carries to the child is the one the
-        claim ran against, and a second query would only prove that the column
-        can be selected.
-        """
-        rows = cls.runtime.execute(
-            execution.STARTED, (str(run), cls.identifiers[name])
-        ).rows
-        return execution.Claimed.from_row(rows[0])
-
-    @classmethod
-    def hypothesis(cls, name: str, subject: str, worth: str) -> str:
-        """One testable Hypothesis on the subject.
-
-        The shape a hunt needs under it and the shape a Finding is a finding
-        of are the same shape, so both take it from here. `worth` is what
-        distinguishes them when a row is read back by hand.
-        """
-        return str(
-            cls.scalar(
-                "INSERT INTO hypotheses (program_id, subject_entity_id,"
-                " property_class, statement, status)"
-                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
-                " $3, 'testable') RETURNING id::text",
-                (cls.identifiers[name], subject, f"a hypothesis {worth}"),
-            )
-        )
-
-    @classmethod
     def finding(cls, name: str, subject: str, status: str) -> str:
         """One Finding of the given status, with everything that status needs.
 
@@ -11512,169 +11753,6 @@ class SlateClaimTest(DatabaseCase):
             (finding, hypothesis),
         )
         return finding
-
-    @classmethod
-    def contend(cls, gate: threading.Barrier, guard: threading.Lock):
-        """One orchestrator's whole part in the race, on its own connection.
-
-        A refusal is recorded rather than raised, because three of these are
-        supposed to lose and a loser that raised in a thread would fail nothing.
-        """
-        connection = pg.connect(cls.harness.runtime)
-        try:
-            connection.execute(agent.BIND, (cls.identifiers["contended"],))
-            gate.wait()
-            try:
-                with connection.transaction():
-                    connection.execute("SELECT set_actor('runtime', 'selftest')")
-                    outcome = connection.execute("SELECT claim_task()").scalar()
-            except pg.DatabaseError as refused:
-                outcome = f"refused: {refused}"
-            with guard:
-                cls.outcomes.append(None if outcome is None else str(outcome))
-        finally:
-            connection.close()
-
-    # -- what the scenarios are built out of -----------------------------------
-
-    @classmethod
-    def seed(cls, name: str, count: int, kind: str = "recon") -> list[str]:
-        """`count` endpoints under one application, and one Task about each.
-
-        The Tasks differ only in what they promise -- the i-th is worth 0.1*i in
-        both gain and impact -- so the order the ranking should reach is known
-        here without this file recomputing the weights it is testing. Written as
-        the owner and in one transaction, because an endpoint whose application
-        did not commit with it is a Task with no resolvable subject.
-        """
-        program_id = cls.identifiers[name]
-        labels = []
-        with cls.connection.transaction():
-            cls.connection.execute("SET LOCAL ROLE rk2_owner")
-            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            application = str(
-                cls.connection.execute(
-                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
-                    (program_id, HOST, f"application:{BASE_URL}"),
-                ).scalar()
-            )
-            cls.connection.execute(
-                "INSERT INTO applications (entity_id, base_url, kind)"
-                " VALUES ($1::uuid, $2, 'web')",
-                (application, BASE_URL),
-            )
-            for index in range(1, count + 1):
-                path = f"{PATH}/{index}"
-                endpoint = str(
-                    cls.connection.execute(
-                        "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
-                        (program_id, HOST, f"endpoint:GET {path}"),
-                    ).scalar()
-                )
-                cls.connection.execute(
-                    "INSERT INTO endpoints (entity_id, application_id, method,"
-                    " path_template) VALUES ($1::uuid, $2::uuid, 'GET', $3)",
-                    (endpoint, application, path),
-                )
-                labels.append(
-                    str(
-                        cls.connection.execute(
-                            "INSERT INTO tasks (program_id, kind, status,"
-                            " subject_entity_id, expected_information_gain,"
-                            " potential_impact) VALUES ($1::uuid, $2, 'pending',"
-                            " $3::uuid, $4, $4) RETURNING label",
-                            (program_id, kind, endpoint, str(round(0.1 * index, 2))),
-                        ).scalar()
-                    )
-                )
-        return labels
-
-    @classmethod
-    def bind(cls, name: str):
-        """Which Program the runtime connection is speaking for from here on."""
-        cls.runtime.execute(agent.BIND, (cls.identifiers[name],))
-
-    @classmethod
-    def offer(cls) -> tuple[dict[str, object], ...]:
-        """One Ranking pass, one Lane quota, and the slate they leave."""
-        with cls.runtime.transaction():
-            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
-            cls.runtime.execute("SELECT rank_pass('runtime')")
-            cls.runtime.execute("SELECT advance_lane_quota('runtime')")
-            return cls.runtime.execute("SELECT * FROM offer_slate()").dicts()
-
-    @classmethod
-    def call(cls, sql: str, parameters: tuple = ()) -> object:
-        """One statement as the runtime, in its own transaction."""
-        with cls.runtime.transaction():
-            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
-            return cls.runtime.execute(sql, parameters).scalar()
-
-    @classmethod
-    def refusal(cls, sql: str, parameters: tuple = ()) -> str:
-        """What one refused statement raised, insisting that it did."""
-        try:
-            cls.call(sql, parameters)
-        except pg.DatabaseError as refused:
-            return str(refused)
-        raise AssertionError(f"not refused: {sql} {parameters}")
-
-    @classmethod
-    def as_owner(cls, sql: str, parameters: tuple = ()):
-        """One statement as the role that owns the rows the scheduler reads."""
-        with cls.connection.transaction():
-            cls.connection.execute("SET LOCAL ROLE rk2_owner")
-            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            return cls.connection.execute(sql, parameters)
-
-    @classmethod
-    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
-        """One reading as the owner, which every Program's rows are visible to.
-
-        `DatabaseCase.owned` is the same statement, and this is not it: that one
-        stringifies its answer, and half of what is read here is a count or a
-        boolean that a string would flatten into something always true.
-        """
-        return cls.as_owner(sql, parameters).scalar()
-
-    @classmethod
-    def claimed_by(cls, name: str, run: object) -> str | None:
-        """The Task an Agent run was opened against, by label."""
-        claimed = cls.scalar(
-            "SELECT t.label FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
-            " WHERE a.program_id = $1::uuid AND a.label = $2",
-            (cls.identifiers[name], str(run)),
-        )
-        return None if claimed is None else str(claimed)
-
-    @classmethod
-    def counted(cls, name: str) -> tuple[int, int]:
-        """How much of a Program has moved: Tasks off pending, and Agent runs."""
-        program_id = cls.identifiers[name]
-        return (
-            int(
-                cls.scalar(
-                    "SELECT count(*) FROM tasks"
-                    " WHERE program_id = $1::uuid AND status <> 'pending'",
-                    (program_id,),
-                )
-            ),
-            int(
-                cls.scalar(
-                    "SELECT count(*) FROM agent_runs WHERE program_id = $1::uuid",
-                    (program_id,),
-                )
-            ),
-        )
-
-    @classmethod
-    def tokens_left(cls, name: str) -> int:
-        return int(
-            cls.scalar(
-                "SELECT tokens_left FROM program_budget WHERE program_id = $1::uuid",
-                (cls.identifiers[name],),
-            )
-        )
 
     # -- criterion 1: the same rows and weights reach the same order -----------
 
@@ -11973,6 +12051,642 @@ class SlateClaimTest(DatabaseCase):
 
                 self.assertEqual(1, int(registered[0]))
                 self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: The Programs of the reservation case. One per scenario for the reason the
+#: slate case has one per scenario: capacity is a Program's own, and two
+#: scenarios sharing a Program would be one scenario about whichever ceiling
+#: happened to bind first.
+BUDGET_SLUG = "selftest-budget"
+
+#: Wide enough that nothing refuses for capacity. `run_tokens` is 60000, which
+#: is what a recon Task's 0.30 prior costs against the 200000-token reference:
+#: the worst case a claim holds and the estimate that made it affordable are
+#: then the same number, so a reservation written at anything other than the
+#: configured ceiling is visible as one.
+BUDGET_WIDE = budgets(
+    requests=500, tokens=2000000, run_tokens=60000, run_requests=10,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
+)
+
+#: A total that admits exactly one claim: 150000 held out of 200000 leaves
+#: 50000, and the next claim would have to promise 150000 again. The total is
+#: still over the 60000 a recon estimate needs, so `unaffordable` -- which asks
+#: only about what has been spent -- says yes, and what refuses is the arm that
+#: counts the claim already in flight.
+BUDGET_CAPPED = budgets(
+    requests=500, tokens=200000, run_tokens=150000, run_requests=10,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
+)
+
+#: A Program whose whole engagement is five requests and whose per-run ceiling
+#: is ten. Nothing has been sent and the first claim is still refused: a run
+#: that may send ten cannot be admitted against a total of five.
+BUDGET_METERED = budgets(
+    requests=5, tokens=2000000, run_tokens=60000, run_requests=10,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=5,
+    window_seconds=3600,
+)
+
+#: A Lane ceiling that admits one claim while the Program's total admits many,
+#: so what the second Task of that kind is refused for is the Lane and the
+#: Task of another kind beside it stays claimable.
+BUDGET_LANED = budgets(
+    requests=500, tokens=2000000, run_tokens=60000, run_requests=10,
+    lane_tokens=100000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
+)
+
+#: The race's Program: 400000 total against a 250000 worst case, so a second
+#: claim cannot fit however the four interleave. Its Tasks are hunts because
+#: the hunt Lane admits two at once and the recon Lane admits one -- a race
+#: that concurrency decides would prove nothing about capacity.
+BUDGET_TIGHT = budgets(
+    requests=500, tokens=400000, run_tokens=250000, run_requests=10,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
+)
+
+#: One request per run at a door whose rate, concurrency and total are wide, so
+#: what refuses the second request is the run's own ceiling and nothing else.
+BUDGET_DOOR = budgets(
+    requests=500, tokens=2000000, run_tokens=60000, run_requests=1,
+    lane_tokens=1000000, lane_requests=500, concurrency=4, burst=500,
+    window_seconds=3600,
+)
+
+#: How many orchestrators race for a capacity that admits one of them.
+BUDGET_CONTENDERS = 4
+
+#: What the happy path's run turns out to have cost, and what its reservation
+#: is therefore settled against. Far under the 60000 it promised, which is the
+#: point: the difference is what comes back to the pool.
+BUDGET_SPENT = (5000, 1000)
+
+
+class BudgetReservationTest(SchedulerFixture, DatabaseCase):
+    """PH2-25: capacity is reserved before a Task runs and reconciled after.
+
+    A budget that is only checked is a budget four simultaneous claims walk
+    past, so what this case asks is not "was the ceiling read" but "was it held
+    out of the pool while the run that promised it was in flight". Only a server
+    can answer that: the question is about two claims that overlap in time and
+    about rows that survive the process which wrote them.
+
+    Each Program is one scenario, and each is disturbed in exactly one way -- a
+    total that admits one claim, an engagement whose requests are fewer than one
+    run may send, a Lane that fills while the Program has room, four
+    orchestrators at once, a run that ends five different ways, a door that has
+    already sent the one request its run was admitted for.
+
+    Everything runs in `setUpClass` because all of it commits, and because the
+    refusals only mean anything against the state the claims before them left.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        # The door is the one caller entitled to reserve egress, so the arm
+        # that refuses a run past its request ceiling can only be asked as the
+        # role that holds it. A runtime session asking would be testing a grant
+        # that ticket 13 revoked.
+        cls.door_connection = pg.connect(cls.harness.proxy)
+
+        cls.identifiers = {}
+        for name, limits in (
+            ("reserved", BUDGET_WIDE),
+            ("endings", BUDGET_WIDE),
+            ("capped", BUDGET_CAPPED),
+            ("metered", BUDGET_METERED),
+            ("laned", BUDGET_LANED),
+            ("contended", BUDGET_TIGHT),
+            ("door", BUDGET_DOOR),
+        ):
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, limits).replace(
+                    'name = "matrix-web"', f'name = "{BUDGET_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_reserved()
+        cls.arrange_endings()
+        cls.arrange_capped()
+        cls.arrange_metered()
+        cls.arrange_laned()
+        cls.arrange_contended()
+        cls.arrange_door()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.door_connection.close()
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{BUDGET_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_reserved(cls):
+        """One claim holds its worst case; closing gives back what it cost."""
+        cls.seed("reserved", 3)
+        cls.bind("reserved")
+        cls.offer()
+        cls.free_before = cls.capacity("reserved")
+        cls.reserved_run = str(cls.call("SELECT claim_task()"))
+        cls.held = cls.reservation("reserved", cls.reserved_run)
+        cls.free_while_held = cls.capacity("reserved")
+        cls.lane_while_held = cls.lane("reserved", "recon")
+        cls.other_lane_while_held = cls.lane("reserved", "hunt")
+        # Read back through the runtime's own query, because what the child is
+        # told it may spend has to be the number the claim ran against.
+        cls.carried = cls.started("reserved", cls.reserved_run)
+        cls.settled = cls.close("reserved", cls.reserved_run, "completed", *BUDGET_SPENT)
+        cls.free_after = cls.capacity("reserved")
+
+    @classmethod
+    def arrange_endings(cls):
+        """Four runs, four ways of ending, and the reservation after each.
+
+        Success is the scenario above. These are the other four the ticket
+        names, and the last of them ends without anybody closing it: the lease
+        lapses and `resume_program` finds the run, which is what a crash leaves
+        behind and the one path no `finish_task_attempt` runs on.
+        """
+        cls.seed("endings", 4)
+        cls.bind("endings")
+        cls.offer()
+        cls.ended = {}
+        for stop in ("refusal", "error", "aborted"):
+            label = str(cls.call("SELECT claim_task()"))
+            cls.ended[stop] = cls.close("endings", label, stop)
+
+        crashed = str(cls.call("SELECT claim_task()"))
+        cls.crash_held = cls.reservation("endings", crashed)
+        cls.as_owner(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 hour'"
+            " WHERE program_id = $1::uuid AND status IN ('claimed','running')",
+            (cls.identifiers["endings"],),
+        )
+        cls.call("SELECT resume_program($1::uuid)", (cls.identifiers["endings"],))
+        cls.ended["crash"] = cls.reservation("endings", crashed)
+        cls.endings_capacity = cls.capacity("endings")
+
+    @classmethod
+    def arrange_capped(cls):
+        """The second claim would promise past the total the first one left."""
+        labels = cls.seed("capped", 2)
+        cls.bind("capped")
+        cls.offer()
+        cls.capped_run = str(cls.call("SELECT claim_task()"))
+        taken = cls.claimed_by("capped", cls.capped_run)
+        [cls.capped_left] = [label for label in labels if label != taken]
+        cls.capped_reason = cls.claimable("capped", cls.capped_left)
+        # Named rather than left to the walk, so the refusal is about this Task
+        # and not about a slate that ran out of entries.
+        cls.capped_refusal = cls.refusal("SELECT claim_task($1)", (cls.capped_left,))
+        cls.capped_counts = cls.counted("capped")
+        cls.capped_capacity = cls.capacity("capped")
+
+    @classmethod
+    def arrange_metered(cls):
+        """A run's request ceiling is wider than the engagement's own total."""
+        [cls.metered_task] = cls.seed("metered", 1)
+        cls.bind("metered")
+        cls.metered_slate = cls.offer()
+        cls.metered_reason = cls.claimable("metered", cls.metered_task)
+        cls.metered_counts = cls.counted("metered")
+        cls.metered_capacity = cls.capacity("metered")
+
+    @classmethod
+    def arrange_laned(cls):
+        """One Lane fills while the Program it belongs to has room to spare."""
+        labels = cls.seed("laned", 3)
+        cls.hunts("laned", labels[2:])
+        cls.bind("laned")
+        cls.offer()
+        cls.laned_run = str(cls.call("SELECT claim_task($1)", (labels[0],)))
+        cls.laned_reason = cls.claimable("laned", labels[1])
+        cls.laned_other_lane = cls.claimable("laned", labels[2])
+        cls.laned_recon = cls.lane("laned", "recon")
+        cls.laned_hunt = cls.lane("laned", "hunt")
+        cls.laned_capacity = cls.capacity("laned")
+
+    @classmethod
+    def arrange_contended(cls):
+        """Four orchestrators claim at once against room for one of them."""
+        cls.hunts("contended", cls.seed("contended", BUDGET_CONTENDERS))
+        cls.bind("contended")
+        cls.offer()
+
+        gate = threading.Barrier(BUDGET_CONTENDERS)
+        guard = threading.Lock()
+        cls.outcomes: list[str | None] = []
+        contenders = [
+            threading.Thread(target=cls.contend, args=("contended", gate, guard))
+            for _ in range(BUDGET_CONTENDERS)
+        ]
+        for contender in contenders:
+            contender.start()
+        for contender in contenders:
+            contender.join()
+
+        cls.contended_capacity = cls.capacity("contended")
+        cls.contended_reserved = int(
+            cls.scalar(
+                "SELECT count(*) FROM budget_reservations"
+                " WHERE program_id = $1::uuid AND settled_at IS NULL",
+                (cls.identifiers["contended"],),
+            )
+        )
+        cls.contended_counts = cls.counted("contended")
+        # The Lane the losers could still have been admitted into. Read after
+        # the race, because a headroom of zero would mean concurrency decided
+        # this and the capacity arm was never reached.
+        cls.contended_headroom = int(
+            cls.scalar(
+                "SELECT headroom FROM scheduler_lane_state"
+                " WHERE program_id = $1::uuid AND kind = 'hunt'",
+                (cls.identifiers["contended"],),
+            )
+        )
+        cls.contended_reason = str(
+            cls.scalar(
+                "SELECT claimable_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+                " WHERE w.active AND t.program_id = $1::uuid AND t.status = 'pending'"
+                " LIMIT 1",
+                (cls.identifiers["contended"],),
+            )
+        )
+
+    @classmethod
+    def arrange_door(cls):
+        """A run admitted for one request, at a door it asks twice."""
+        cls.seed("door", 1)
+        cls.bind("door")
+        cls.offer()
+        cls.door_run = str(cls.call("SELECT claim_task()"))
+        run = cls.run_id("door", cls.door_run)
+        task = str(
+            cls.scalar(
+                "SELECT task_id::text FROM agent_runs WHERE id = $1::uuid", (run,)
+            )
+        )
+        # The Tool run carries the Task the run was claimed against, which is
+        # what `authorize_tool_run` requires of a run that has one: a Tool call
+        # made under a claimed Task and not naming it is not an active call.
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            tool_run = str(
+                cls.runtime.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " $4, $5::jsonb, 'running', 'runtime') RETURNING id::text",
+                    (
+                        cls.identifiers["door"],
+                        run,
+                        task,
+                        proxy.TOOL,
+                        json.dumps({"url": URL, "method": "GET", "identity_slot": ""}),
+                    ),
+                ).scalar()
+            )
+        gate = cls.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (tool_run,)).scalar()
+        answer = proxy.as_object(gate)
+        capability = answer.get("capability")
+        assert capability, answer
+
+        cls.door_connection.execute(proxy.BIND, (cls.identifiers["door"],))
+        cls.first_request = cls.through_the_door(str(capability))
+        cls.second_request = cls.through_the_door(str(capability))
+        cls.door_event = cls.as_owner(
+            "SELECT payload FROM events WHERE program_id = $1::uuid"
+            " AND type = 'egress.budget_exhausted' ORDER BY seq DESC LIMIT 1",
+            (cls.identifiers["door"],),
+        ).dicts()
+        cls.door_settled = cls.close("door", cls.door_run, "completed", 100, 20)
+
+    # -- what the scenarios are built out of -----------------------------------
+
+    @classmethod
+    def hunts(cls, name: str, labels: list[str]) -> None:
+        """Turn seeded Tasks into hunts, each ready with a Hypothesis under it.
+
+        Converted rather than seeded as hunts, because `seed` writes one
+        application per call and a Program that seeded twice would write the
+        same deduplication cell twice.
+        """
+        for label in labels:
+            subject = str(
+                cls.scalar(
+                    "SELECT subject_entity_id::text FROM tasks"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (cls.identifiers[name], label),
+                )
+            )
+            cls.as_owner(
+                "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (
+                    cls.identifiers[name],
+                    label,
+                    cls.hypothesis(name, subject, "worth hunting"),
+                ),
+            )
+
+    @classmethod
+    def capacity(cls, name: str) -> dict[str, object]:
+        """What one Program may still promise, as the admission arm reads it."""
+        return cls.as_owner(
+            "SELECT * FROM program_capacity WHERE program_id = $1::uuid",
+            (cls.identifiers[name],),
+        ).dicts()[0]
+
+    @classmethod
+    def lane(cls, name: str, kind: str) -> dict[str, object]:
+        """The same question about one Lane of it."""
+        return cls.as_owner(
+            "SELECT * FROM lane_budget WHERE program_id = $1::uuid AND kind = $2",
+            (cls.identifiers[name], kind),
+        ).dicts()[0]
+
+    @classmethod
+    def reservation(cls, name: str, label: str) -> dict[str, object] | None:
+        """What one Agent run has promised, or None if it never promised."""
+        rows = cls.as_owner(
+            "SELECT br.* FROM budget_reservations br"
+            "  JOIN agent_runs ar ON ar.id = br.agent_run_id"
+            " WHERE ar.program_id = $1::uuid AND ar.label = $2",
+            (cls.identifiers[name], label),
+        ).dicts()
+        return rows[0] if rows else None
+
+    @classmethod
+    def claimable(cls, name: str, label: str) -> str | None:
+        """Why one Task may not be claimed, in the scheduler's own vocabulary."""
+        answer = cls.scalar(
+            "SELECT claimable_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.label = $2",
+            (cls.identifiers[name], label),
+        )
+        return None if answer is None else str(answer)
+
+    @classmethod
+    def run_id(cls, name: str, label: str) -> str:
+        """The identifier behind a run label, which is what the verbs take."""
+        return str(
+            cls.scalar(
+                "SELECT id::text FROM agent_runs"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], label),
+            )
+        )
+
+    @classmethod
+    def close(
+        cls,
+        name: str,
+        label: str,
+        stop: str = "completed",
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+    ) -> dict[str, object] | None:
+        """End one run the way the runtime ends it, and read what it settled.
+
+        `execution.FINISH` rather than a statement written here: the parameters
+        the reconciliation depends on are the ones production sends, and a
+        second spelling of them would pass while production's did not.
+        """
+        cls.bind(name)
+        cls.call(execution.FINISH, (cls.run_id(name, label), stop, input_tokens,
+                                    output_tokens))
+        return cls.reservation(name, label)
+
+    @classmethod
+    def through_the_door(cls, capability: str) -> dict[str, object]:
+        """One request at the egress door, as the role that holds it."""
+        with cls.door_connection.transaction():
+            return cls.door_connection.execute(
+                "SELECT granted, reason, retry_at FROM"
+                " reserve_egress_slot($1, 'http', $2, 80, $3, $3)",
+                (capability, HOST, PATH),
+            ).dicts()[0]
+
+    # -- criterion 1: the configuration states the ceilings --------------------
+
+    def test_the_program_carries_every_ceiling_its_configuration_stated(self):
+        [row] = self.as_owner(
+            "SELECT token_budget, run_token_budget, run_request_budget,"
+            " lane_token_budget, lane_request_budget FROM programs WHERE id = $1::uuid",
+            (self.identifiers["reserved"],),
+        ).rows
+        self.assertEqual(
+            (2000000, 60000, 10, 1000000, 500), tuple(int(value) for value in row)
+        )
+
+    def test_the_concurrency_and_request_limits_are_the_compiled_scope_versions(self):
+        # The other half of the same sentence, and it lands somewhere else: a
+        # request ceiling is per scope version because it is spent against a
+        # scope, while a token ceiling is the Program's own.
+        [row] = self.as_owner(
+            "SELECT sv.budget_requests, sv.budget_concurrency"
+            "  FROM program_scope_versions sv JOIN programs p"
+            "    ON p.id = sv.program_id AND p.scope_version = sv.version"
+            " WHERE p.id = $1::uuid",
+            (self.identifiers["reserved"],),
+        ).rows
+        self.assertEqual((500, 4), tuple(int(value) for value in row))
+        self.assertEqual(500, int(self.free_before["request_budget"]))
+
+    def test_no_program_here_disagrees_with_the_document_it_was_opened_from(self):
+        # `check_program_configuration` compares every ceiling on the row with
+        # the configuration it was written from, so a column this ticket added
+        # and forgot to write is a problem here rather than a silent zero.
+        problems = self.connection.execute(
+            "SELECT problem, object, detail FROM check_program_configuration()"
+        ).rows
+        self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
+
+    # -- criterion 2: the claim reserves the worst case ------------------------
+
+    def test_the_claim_writes_one_reservation_for_the_run_it_opened(self):
+        self.assertIsNotNone(self.held)
+        self.assertEqual("recon", str(self.held["kind"]))
+        self.assertIsNone(self.held["settled_at"])
+        self.assertIsNone(self.held["tokens_spent"])
+        self.assertEqual(
+            self.identifiers["reserved"], str(self.held["program_id"])
+        )
+
+    def test_the_reservation_is_the_configured_worst_case_and_not_the_estimate(self):
+        self.assertEqual(60000, int(self.held["tokens"]))
+        self.assertEqual(10, int(self.held["requests"]))
+
+    def test_the_capacity_the_next_claim_reads_is_short_by_what_this_one_promised(self):
+        self.assertEqual(0, int(self.free_before["tokens_reserved"]))
+        self.assertEqual(60000, int(self.free_while_held["tokens_reserved"]))
+        self.assertEqual(
+            int(self.free_before["tokens_free"]) - 60000,
+            int(self.free_while_held["tokens_free"]),
+        )
+        self.assertEqual(10, int(self.free_while_held["requests_reserved"]))
+
+    def test_the_lane_the_task_belongs_to_is_the_only_one_that_moved(self):
+        self.assertEqual(60000, int(self.lane_while_held["tokens_reserved"]))
+        self.assertEqual(0, int(self.other_lane_while_held["tokens_reserved"]))
+
+    def test_the_runtime_carries_the_reserved_ceiling_into_the_child(self):
+        # Read through `execution.STARTED`, so what is asserted is the number
+        # the launcher will stop the model at and not a column that exists.
+        self.assertEqual(60000, self.carried.token_cap)
+
+    # -- criterion 3: concurrent claims cannot promise past the ceiling --------
+
+    def test_four_claims_at_once_reserve_once_against_room_for_one(self):
+        self.assertEqual(BUDGET_CONTENDERS, len(self.outcomes))
+        self.assertEqual(1, len([taken for taken in self.outcomes if taken]))
+        self.assertEqual(1, self.contended_reserved)
+        self.assertEqual((1, 1), self.contended_counts)
+
+    def test_the_race_left_no_more_promised_than_the_program_may_spend(self):
+        self.assertEqual(250000, int(self.contended_capacity["tokens_reserved"]))
+        self.assertLessEqual(
+            int(self.contended_capacity["tokens_reserved"]),
+            int(self.contended_capacity["token_budget"]),
+        )
+        self.assertEqual(150000, int(self.contended_capacity["tokens_free"]))
+
+    def test_the_losers_were_refused_by_capacity_and_not_by_the_lane(self):
+        # The hunt Lane admits two at once and one is running, so a claim
+        # refused here was refused for what it would have promised.
+        self.assertGreater(self.contended_headroom, 0)
+        self.assertEqual("program_tokens_reserved", self.contended_reason)
+
+    def test_the_losers_come_back_empty_rather_than_refused(self):
+        self.assertEqual(
+            [None] * (BUDGET_CONTENDERS - 1),
+            [taken for taken in self.outcomes if not taken],
+        )
+
+    # -- criterion 4: every ending reconciles what it promised -----------------
+
+    def test_a_run_that_completes_settles_against_what_it_actually_spent(self):
+        self.assertIsNotNone(self.settled["settled_at"])
+        self.assertEqual(sum(BUDGET_SPENT), int(self.settled["tokens_spent"]))
+        self.assertEqual(0, int(self.settled["requests_spent"]))
+
+    def test_what_the_run_did_not_spend_goes_back_to_the_pool(self):
+        self.assertEqual(0, int(self.free_after["tokens_reserved"]))
+        self.assertEqual(sum(BUDGET_SPENT), int(self.free_after["tokens_spent"]))
+        self.assertEqual(
+            int(self.free_before["tokens_free"]) - sum(BUDGET_SPENT),
+            int(self.free_after["tokens_free"]),
+        )
+
+    def test_a_refusal_an_error_and_an_abort_all_settle_their_reservation(self):
+        for stop in ("refusal", "error", "aborted"):
+            with self.subTest(stop=stop):
+                self.assertIsNotNone(self.ended[stop]["settled_at"])
+                self.assertEqual(0, int(self.ended[stop]["tokens_spent"]))
+
+    def test_a_run_nobody_closed_settles_when_the_crash_is_recovered(self):
+        # The one ending with no caller behind it. Its reservation was open
+        # while the lease was live, which is what makes this a reconciliation
+        # rather than a row that was never written.
+        self.assertIsNone(self.crash_held["settled_at"])
+        self.assertIsNotNone(self.ended["crash"]["settled_at"])
+        self.assertEqual(0, int(self.ended["crash"]["tokens_spent"]))
+
+    def test_nothing_is_still_promised_once_every_run_has_ended(self):
+        self.assertEqual(0, int(self.endings_capacity["tokens_reserved"]))
+        self.assertEqual(0, int(self.endings_capacity["requests_reserved"]))
+
+    def test_a_proxy_exchange_settles_against_the_requests_it_made(self):
+        # The request side of the same reconciliation: the run promised one
+        # request, sent one, and the settled row says so.
+        self.assertEqual(1, int(self.door_settled["requests_spent"]))
+        self.assertEqual(120, int(self.door_settled["tokens_spent"]))
+
+    # -- criterion 5: exhausted capacity is a typed refusal --------------------
+
+    def test_a_task_the_reserved_total_no_longer_covers_is_ineligible(self):
+        self.assertEqual("program_tokens_reserved", self.capped_reason)
+        self.assertIn("program_tokens_reserved", self.capped_refusal)
+
+    def test_a_refused_claim_opened_no_run_and_promised_nothing(self):
+        self.assertEqual((1, 1), self.capped_counts)
+        self.assertEqual(150000, int(self.capped_capacity["tokens_reserved"]))
+
+    def test_a_run_that_may_send_more_than_the_engagement_has_is_ineligible(self):
+        self.assertEqual("program_requests_reserved", self.metered_reason)
+        self.assertEqual((0, 0), self.metered_counts)
+        # And it is ineligible before it is offered, not after it is claimed:
+        # the slate filters on the same answer the claim re-asks.
+        self.assertEqual((), self.metered_slate)
+        self.assertEqual(0, int(self.metered_capacity["requests_reserved"]))
+
+    def test_a_lane_that_is_full_refuses_its_own_kind_and_no_other(self):
+        self.assertEqual("lane_tokens_reserved", self.laned_reason)
+        self.assertIsNone(self.laned_other_lane)
+
+    def test_the_lane_that_refused_is_the_one_holding_the_reservation(self):
+        self.assertEqual(60000, int(self.laned_recon["tokens_reserved"]))
+        self.assertEqual(40000, int(self.laned_recon["tokens_free"]))
+        self.assertEqual(100000, int(self.laned_hunt["tokens_free"]))
+        # The Program itself has room for many more, which is what makes this
+        # refusal the Lane's rather than the total's.
+        self.assertGreater(int(self.laned_capacity["tokens_free"]), 60000)
+
+    # -- criterion 6: the door's refusal is durable and bounded ----------------
+
+    def test_the_one_request_the_run_was_admitted_for_is_granted(self):
+        self.assertTrue(self.first_request["granted"])
+        self.assertEqual("reserved", str(self.first_request["reason"]))
+
+    def test_the_next_request_is_refused_by_the_ceiling_the_claim_reserved(self):
+        self.assertFalse(self.second_request["granted"])
+        self.assertEqual("run budget exhausted", str(self.second_request["reason"]))
+
+    def test_an_exhausted_run_budget_is_refused_without_a_time_to_retry(self):
+        # Exhaustion is not a wait. A retry time here would be this door
+        # promising the run gets more, and a caller that read one would come
+        # back around a loop it can never leave.
+        self.assertIsNone(self.second_request["retry_at"])
+
+    def test_the_refusal_is_recorded_with_the_limit_that_caused_it(self):
+        [event] = self.door_event
+        payload = json.loads(str(event["payload"]))
+        self.assertEqual("run_requests", payload["limit"])
+        self.assertEqual(1, int(payload["requests"]))
+        self.assertEqual(1, int(payload["contacted"]))
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = $1",
+            ("budget_reservations",),
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
+            ("budget_reservations",),
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
 
 
 #: The Programs of `LeaseTest`, which share a prefix so one DELETE retires them.

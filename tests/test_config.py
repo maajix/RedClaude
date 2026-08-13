@@ -39,7 +39,8 @@ class ValidConfigurationTest(unittest.TestCase):
         configuration, found = config.load(write(
             "schema_version = 1\n"
             '[program]\nname = "acme-web"\n'
-            "[budgets]\nrequests = 1\ntokens = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
+            "[budgets]\nrequests = 1\ntokens = 1\nrun_tokens = 1\nrun_requests = 1\n"
+                "lane_tokens = 1\nlane_requests = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
             '[[scope.include]]\nhost = "app.example.com"\n'
             'ports = [443]\nprotocols = ["https"]\npaths = ["/"]\n'
         ))
@@ -141,7 +142,8 @@ class ScopeTest(unittest.TestCase):
             violations(
                 "schema_version = 1\n"
                 '[program]\nname = "acme-web"\n'
-                "[budgets]\nrequests = 1\ntokens = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
+                "[budgets]\nrequests = 1\ntokens = 1\nrun_tokens = 1\nrun_requests = 1\n"
+                "lane_tokens = 1\nlane_requests = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
             ),
         )
 
@@ -151,7 +153,8 @@ class ScopeTest(unittest.TestCase):
             violations(
                 "schema_version = 1\n"
                 '[program]\nname = "acme-web"\n'
-                "[budgets]\nrequests = 1\ntokens = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
+                "[budgets]\nrequests = 1\ntokens = 1\nrun_tokens = 1\nrun_requests = 1\n"
+                "lane_tokens = 1\nlane_requests = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
                 "[scope]\ninclude = []\n"
             ),
         )
@@ -166,7 +169,8 @@ class ScopeTest(unittest.TestCase):
             sorted(sources(
                 "schema_version = 1\n"
                 '[program]\nname = "acme-web"\n'
-                "[budgets]\nrequests = 1\ntokens = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
+                "[budgets]\nrequests = 1\ntokens = 1\nrun_tokens = 1\nrun_requests = 1\n"
+                "lane_tokens = 1\nlane_requests = 1\nconcurrency = 1\nburst = 1\nwindow_seconds = 1\n"
                 '[[scope.include]]\nhost = "app.example.com"\n'
             )),
         )
@@ -310,12 +314,17 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(
             [
                 (INVALID_CONFIGURATION, "config:budgets.burst", "required key is absent"),
+                (INVALID_CONFIGURATION, "config:budgets.lane_requests", "required key is absent"),
                 (INVALID_CONFIGURATION, "config:budgets.requests", "must be a positive integer"),
+                (INVALID_CONFIGURATION, "config:budgets.run_tokens", "must be a positive integer"),
                 (INVALID_CONFIGURATION, "config:budgets.window_seconds", "required key is absent"),
             ],
             sorted(violations(VALID.replace(
-                "requests = 5000\ntokens = 2000000\nconcurrency = 2\nburst = 500\nwindow_seconds = 3600",
-                "requests = 0\ntokens = 2000000\nconcurrency = 2",
+                "requests = 5000\ntokens = 2000000\nrun_tokens = 40000\nrun_requests = 50\n"
+                "lane_tokens = 500000\nlane_requests = 1000\nconcurrency = 2\nburst = 500\n"
+                "window_seconds = 3600",
+                "requests = 0\ntokens = 2000000\nrun_tokens = -1\nrun_requests = 50\n"
+                "lane_tokens = 500000\nconcurrency = 2",
             ))),
         )
 

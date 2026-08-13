@@ -48,7 +48,23 @@ RULES_OF_ENGAGEMENT = (
     "pivoting",
     "sensitive_data_access",
 )
-BUDGET_LIMITS = ("burst", "concurrency", "requests", "tokens", "window_seconds")
+#: Every ceiling the engagement states, in one table. Nine keys over three
+#: scopes: the aggregate the campaign may spend (`requests`, `tokens`), what one
+#: Agent run may spend of it (`run_*`), and what one Lane may (`lane_*`), plus
+#: the shape of the request stream (`burst`, `concurrency`, `window_seconds`).
+#: All required, because the per-run ceiling is the worst case a claim reserves
+#: and a Program that states none can only be read as reserving everything left.
+BUDGET_LIMITS = (
+    "burst",
+    "concurrency",
+    "lane_requests",
+    "lane_tokens",
+    "requests",
+    "run_requests",
+    "run_tokens",
+    "tokens",
+    "window_seconds",
+)
 SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
 IDENTITY_KEYS = ("name", "slot_ref")

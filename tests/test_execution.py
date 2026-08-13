@@ -62,6 +62,7 @@ def claimed(**overrides) -> execution.Claimed:
         "method": "GET",
         "url": "https://app.example.com/login",
         "subagent_cap": roster.DEFAULT_SUBAGENTS,
+        "token_cap": 40_000,
     }
     fields.update(overrides)
     return execution.Claimed(**fields)
@@ -83,6 +84,7 @@ def started_row(**overrides) -> tuple:
         subject.method,
         subject.url,
         subject.subagent_cap,
+        subject.token_cap,
     )
 
 
@@ -98,6 +100,8 @@ def result(**overrides) -> agent.AgentRunResult:
         "denials": (),
         "answers": 2,
         "stop_reason": "completed",
+        "input_tokens": 1200,
+        "output_tokens": 300,
         "text": "the login form is served over HTTPS",
         "mission_result": {
             "completion": "complete",
@@ -752,7 +756,7 @@ class AttemptTest(unittest.TestCase):
         with compiled():
             _, facts = attempt(connection, Launcher(answer=result(stop_reason="end_turn")))
         self.assertEqual("completed", facts["agent_run"]["stop_reason"])
-        self.assertEqual([(RUN, "completed")], connection.sent(execution.FINISH))
+        self.assertEqual([(RUN, "completed", 1200, 300)], connection.sent(execution.FINISH))
 
 
 class RefusalTest(unittest.TestCase):
@@ -840,7 +844,7 @@ class RefusalTest(unittest.TestCase):
             ledger, facts = attempt(connection, launcher)
         self.assertTrue(ledger.violations)
         self.assertEqual("refusal", facts["agent_run"]["stop_reason"])
-        self.assertEqual([(RUN, "refusal")], connection.sent(execution.FINISH))
+        self.assertEqual([(RUN, "refusal", None, None)], connection.sent(execution.FINISH))
 
     def test_an_unavailable_boundary_is_a_violation_and_not_a_traceback(self):
         connection = Recorder()

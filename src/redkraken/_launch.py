@@ -581,9 +581,15 @@ async def run(
     messages = (transport or query)(prompt=str(job["objective"]), options=options)
     api_key_source = await _corroborate(messages, surface, runtime)
 
+    # What the claim reserved for this run, or nothing when it reserved nothing.
+    # Read the same way the cap is: off the job, because this process has no
+    # database to ask.
+    ceiling = _token_cap(job.get("token_cap"))
     text = ""
     answers = 0
     stop_reason = None
+    spent_in = 0
+    spent_out = 0
     async for message in messages:
         if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == INIT:
             # A second announcement is a second startup, and the assertion was
@@ -593,9 +599,26 @@ async def run(
             surface.open()
         if isinstance(message, AssistantMessage):
             answers += 1
+            turn_in, turn_out = _usage(getattr(message, "usage", None))
+            spent_in += turn_in
+            spent_out += turn_out
+            # The ceiling stops the run. Not a warning and not a log line: the
+            # tokens past it are ones the Program did not reserve, and a session
+            # asked politely to stop is a session that decides whether to.
+            if ceiling is not None and spent_in + spent_out > ceiling:
+                stop_reason = "budget"
+                break
         if isinstance(message, ResultMessage):
             text = str(getattr(message, "result", "") or "")[:ANSWER]
             stop_reason = getattr(message, "stop_reason", None)
+            # The session's own totals, which is the number to report when there
+            # is one: the per-turn sum is what this loop could see, and a turn
+            # the SDK accounted for after the last message it sent is in the
+            # result and not in the sum. A result reporting nothing leaves the
+            # sum alone rather than overwriting a measurement with a zero.
+            result_in, result_out = _usage(getattr(message, "usage", None))
+            if result_in or result_out:
+                spent_in, spent_out = result_in, result_out
     return {
         "role": gate.role.name,
         "sdk_version": runtime.get("sdk_version"),
@@ -609,7 +632,39 @@ async def run(
         "text": text,
         "mission_result": submission.result,
         "mission_attempts": submission.attempts,
+        "input_tokens": spent_in,
+        "output_tokens": spent_out,
     }
+
+
+def _usage(stated: object) -> tuple[int, int]:
+    """One message's tokens, as the two numbers the run row records.
+
+    Everything the model was charged for reading counts as input, cache included:
+    a cached read is cheaper, not free, and a ceiling that ignored the cache
+    would be a ceiling a long session walks straight through. Absent fields are
+    zero rather than an error, because a transport that reports usage partially
+    still reports a run that spent something.
+    """
+    usage = stated if isinstance(stated, Mapping) else {}
+    return (
+        int(usage.get("input_tokens") or 0)
+        + int(usage.get("cache_read_input_tokens") or 0)
+        + int(usage.get("cache_creation_input_tokens") or 0),
+        int(usage.get("output_tokens") or 0),
+    )
+
+
+def _token_cap(stated: object) -> int | None:
+    """The most this run may spend, as the claim reserved it.
+
+    Nothing stated is no ceiling: a Program with no total and no per-run number
+    reserved nothing, and this process must not invent a bound the scheduler did
+    not admit the Task under. A stated value that is not a number raises, which
+    fails the run: unlike an unreadable subagent cap, this one cannot degrade to
+    a refusal without also degrading to running unbounded.
+    """
+    return None if stated is None else int(stated)
 
 
 def _subagent_cap(stated: object) -> int:

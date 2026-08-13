@@ -32,6 +32,10 @@ mutation = true
 [budgets]
 requests = 5000
 tokens = 2000000
+run_tokens = 40000
+run_requests = 50
+lane_tokens = 500000
+lane_requests = 1000
 concurrency = 2
 burst = 500
 window_seconds = 3600
@@ -81,6 +85,10 @@ mutation = true
 [budgets]
 requests = 100
 tokens = 10000
+run_tokens = 2000
+run_requests = 10
+lane_tokens = 5000
+lane_requests = 50
 concurrency = 1
 burst = 100
 window_seconds = 60

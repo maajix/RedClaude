@@ -194,7 +194,9 @@ STARTED = (
     "             ELSE '/' || ep.path_template END"
     "   WHEN ap.entity_id IS NOT NULL THEN ap.base_url"
     " END,"
-    " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active)"
+    " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active),"
+    " (SELECT br.tokens FROM budget_reservations br"
+    "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL)"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
@@ -239,7 +241,7 @@ EXCHANGE = (
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
 PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
-FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
+FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3, $4)"
 
 #: The Lease this run was given, and the one call that moves both halves of it.
 #: The TTL is read rather than assumed: it is a weights column, so a harness
@@ -346,6 +348,12 @@ class Claimed:
     ranked and claimed under it, and the gate in the child refuses under it, so
     a copy carried anywhere else would be a second statement of the one number
     ticket 73 exists to have only one of.
+
+    `token_cap` travels for the same reason and is read the same way: it is what
+    the claim reserved out of the Program's capacity, so it is the number this
+    child may spend and no other. NULL is a Program that stated no ceiling and
+    has no total to derive one from, which is the one case where nothing was
+    reserved and nothing bounds the run but its turn count.
     """
 
     agent_run_id: str
@@ -360,6 +368,7 @@ class Claimed:
     method: str
     url: str | None
     subagent_cap: int
+    token_cap: int | None
 
     @classmethod
     def from_row(cls, row) -> Claimed:
@@ -376,6 +385,7 @@ class Claimed:
             method=str(row[9]),
             url=None if row[10] is None else str(row[10]),
             subagent_cap=int(row[11]),
+            token_cap=None if row[12] is None else int(row[12]),
         )
 
     def objective(self) -> str:
@@ -414,6 +424,14 @@ class Claimed:
                 "label": self.agent_run_label,
                 "role": self.role,
                 "stop_reason": None,
+                # What the claim reserved, and what the run turned out to cost.
+                # Nothing rather than zero until a child reports: a run whose
+                # child never answered spent an amount nobody measured, and the
+                # closing leaves the column alone rather than recording a zero
+                # the reservation would then be settled against.
+                "token_cap": self.token_cap,
+                "input_tokens": None,
+                "output_tokens": None,
             },
         }
 
@@ -830,6 +848,8 @@ class Slice:
                 facts["agent_run"]["stop_reason"] = "refusal"
                 return
             facts["agent_run"]["stop_reason"] = stopped_as(result.stop_reason)
+            facts["agent_run"]["input_tokens"] = result.input_tokens
+            facts["agent_run"]["output_tokens"] = result.output_tokens
             outcome = self._exchange(ledger, connection, program_id, tool_run_id, facts)
             self._promote(ledger, connection, program_id, claimed, result, facts)
         finally:
@@ -1073,6 +1093,7 @@ class Slice:
             egress=door,
             timeout=timeout,
             subagent_cap=claimed.subagent_cap,
+            token_cap=claimed.token_cap,
         )
         try:
             result = self.launch(request)
@@ -1253,14 +1274,27 @@ class Slice:
         status comes from whether a proposal was promoted, and a runtime that
         reported what it hoped for would be reporting the one thing the trigger
         exists to stop it deciding.
+
+        The usage goes in the same call because the reservation this run was
+        claimed under is settled off the row that call closes. Reported here and
+        not written separately: a second statement afterwards is a window in
+        which the reservation has already been given back against a run whose
+        cost had not been recorded yet.
         """
-        stop_reason = (facts.get("agent_run") or {}).get("stop_reason") or "error"
+        run = facts.get("agent_run") or {}
+        stop_reason = run.get("stop_reason") or "error"
         try:
             with connection.transaction():
                 _actor(connection)
                 closure = proxy.as_object(
                     connection.execute(
-                        FINISH, (claimed.agent_run_id, stop_reason)
+                        FINISH,
+                        (
+                            claimed.agent_run_id,
+                            stop_reason,
+                            run.get("input_tokens"),
+                            run.get("output_tokens"),
+                        ),
                     ).scalar()
                 )
         except pg.DatabaseError as error:

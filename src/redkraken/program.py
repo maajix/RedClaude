@@ -574,25 +574,60 @@ def _existing(connection: pg.Connection, slug: str) -> Program | None:
     )
 
 
-def _policy(configuration: config.Configuration) -> tuple[str | None, int]:
-    """The two values the root `programs` row carries as columns of its own.
+@dataclass(frozen=True)
+class _Projected:
+    """What the root `programs` row carries as columns of its own.
 
-    Read in one place because they are written in three -- the row, the row's
-    update and the revision that records both -- and three readings of the same
-    document are three chances for them to stop being the same two values.
+    Read in one place because it is written in three -- the row, the row's
+    update and the revision that records it -- and three readings of the same
+    document are three chances for them to stop being the same values.
+
+    A type rather than a widening tuple: 25 took this from two values to six,
+    and six positional values threaded through three call sites is one
+    transposition away from a Program running a per-Lane ceiling as its per-run
+    one. The revision row still records only the first two, which is why they
+    are named rather than splatted at every site.
     """
+
+    platform: str | None
+    token_budget: int
+    run_token_budget: int
+    run_request_budget: int
+    lane_token_budget: int
+    lane_request_budget: int
+
+
+def _policy(configuration: config.Configuration) -> _Projected:
     document = configuration.document
-    return document["program"]["platform"], document["budgets"]["tokens"]
+    budgets = document["budgets"]
+    return _Projected(
+        platform=document["program"]["platform"],
+        token_budget=budgets["tokens"],
+        run_token_budget=budgets["run_tokens"],
+        run_request_budget=budgets["run_requests"],
+        lane_token_budget=budgets["lane_tokens"],
+        lane_request_budget=budgets["lane_requests"],
+    )
 
 
 def _create(connection: pg.Connection, configuration: config.Configuration, slug: str) -> str:
     """The root row. The slug is the identity; the rest is policy it carries."""
-    platform, token_budget = _policy(configuration)
+    policy = _policy(configuration)
     return str(
         connection.execute(
-            "INSERT INTO programs (slug, name, platform, token_budget)"
-            " VALUES ($1, $2, $3, $4) RETURNING id::text",
-            (slug, slug, platform, token_budget),
+            "INSERT INTO programs (slug, name, platform, token_budget,"
+            " run_token_budget, run_request_budget, lane_token_budget, lane_request_budget)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id::text",
+            (
+                slug,
+                slug,
+                policy.platform,
+                policy.token_budget,
+                policy.run_token_budget,
+                policy.run_request_budget,
+                policy.lane_token_budget,
+                policy.lane_request_budget,
+            ),
         ).scalar()
     )
 
@@ -605,13 +640,23 @@ def _revise(connection: pg.Connection, configuration: config.Configuration, prog
 
     `programs` emits no event, so this update is invisible in the log on its
     own. What makes it auditable is that the revision recorded in the same
-    transaction states the same two values, and `check_program_configuration()`
+    transaction states the same values, and `check_program_configuration()`
     fails the gate when the row and the newest revision disagree.
     """
-    platform, token_budget = _policy(configuration)
+    policy = _policy(configuration)
     connection.execute(
-        "UPDATE programs SET platform = $2, token_budget = $3 WHERE id = $1::uuid",
-        (program_id, platform, token_budget),
+        "UPDATE programs SET platform = $2, token_budget = $3, run_token_budget = $4,"
+        " run_request_budget = $5, lane_token_budget = $6, lane_request_budget = $7"
+        " WHERE id = $1::uuid",
+        (
+            program_id,
+            policy.platform,
+            policy.token_budget,
+            policy.run_token_budget,
+            policy.run_request_budget,
+            policy.lane_token_budget,
+            policy.lane_request_budget,
+        ),
     )
 
 
@@ -633,10 +678,13 @@ def _record(
     anyway, since it re-runs the rule rather than trusting a stored string.
 
     `platform` and `token_budget` are restated out of the document because they
-    are the two values also written onto the `programs` row, and stating them
-    here is what puts that projection in the event log.
+    are values also written onto the `programs` row, and stating them here is
+    what puts that projection in the event log. The four ceilings 25 added get
+    no columns of their own here: the document is on this row already, and
+    `check_program_configuration()` compares the row against it, so a second
+    copy would be a third place the same number lives.
     """
-    platform, token_budget = _policy(configuration)
+    policy = _policy(configuration)
     connection.execute(
         "INSERT INTO program_configurations"
         " (program_id, revision, schema_version, source_path,"
@@ -650,8 +698,8 @@ def _record(
             configuration.source_sha256,
             configuration.canonical_sha256,
             config.canonical_bytes(configuration.document).decode("utf-8"),
-            platform,
-            token_budget,
+            policy.platform,
+            policy.token_budget,
             reason,
         ),
     )

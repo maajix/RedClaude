@@ -326,6 +326,12 @@ class AgentRunRequest:
     on, and the gate inside the child refuses at the same number the scheduler
     offered under. The default is the roster's, which is the schema's default,
     for a caller with no weights row to read.
+
+    `token_cap` travels for the same reason and has no default worth writing:
+    it is what the claim reserved out of the Program's capacity for this one
+    run, so a caller that reserved nothing states nothing, and the child runs
+    bounded by its turns alone. A number invented here would be a ceiling no
+    Program's capacity was held against.
     """
 
     agent_run_id: str
@@ -337,6 +343,7 @@ class AgentRunRequest:
     egress: Egress | None = None
     timeout: float = TIMEOUT
     subagent_cap: int = roster.DEFAULT_SUBAGENTS
+    token_cap: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +373,11 @@ class AgentRunResult:
     not how many results it got to make. One result and three attempts is a
     model that argued with its own output and was refused twice, and that is
     worth being able to see from the row rather than only from the transcript.
+
+    `input_tokens` and `output_tokens` are what the session cost, and they are
+    the numbers the reservation this run was claimed under is settled against.
+    Zero is what a run that never reached the model reports, and it is a
+    measurement rather than an absence: nothing was spent because nothing ran.
     """
 
     agent_run_id: str
@@ -381,6 +393,8 @@ class AgentRunResult:
     text: str
     mission_result: Mapping[str, object] | None = None
     mission_attempts: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -399,6 +413,8 @@ class AgentRunResult:
                 None if self.mission_result is None else dict(self.mission_result)
             ),
             "mission_attempts": self.mission_attempts,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
         }
 
 
@@ -439,6 +455,7 @@ def agent_run(
             "packet": (request.packet or packet_module.Packet()).as_dict(),
             "egress": None if request.egress is None else request.egress.as_dict(),
             "subagent_cap": request.subagent_cap,
+            "token_cap": request.token_cap,
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:
@@ -897,6 +914,8 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
             dict(mission) if isinstance(mission := result.get("mission_result"), Mapping) else None
         ),
         mission_attempts=int(result.get("mission_attempts") or 0),
+        input_tokens=int(result.get("input_tokens") or 0),
+        output_tokens=int(result.get("output_tokens") or 0),
     )
 
 
