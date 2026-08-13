@@ -1054,6 +1054,30 @@ CONTROLS = (
         " END $ctl$",
     ),
     Control(
+        # An unlock term that pays for every edge pointed at a Task, including
+        # the ones a model wrote about itself. The arithmetic is otherwise
+        # correct and the result is still bounded, so nothing downstream can
+        # tell -- the priority simply becomes a number anyone with INSERT on
+        # `task_dependencies` can raise. The basis table is the whole defence,
+        # and this is what its absence looks like.
+        "standing:task_ranking",
+        "CREATE OR REPLACE FUNCTION unlock_for(t tasks, w scheduler_weights)"
+        " RETURNS numeric LANGUAGE sql STABLE AS $ctl$"
+        " SELECT least(coalesce(sum(value_for(b, w)), 0), 1.0)"
+        "   FROM task_dependencies d"
+        "   JOIN tasks b ON b.id = d.task_id"
+        "  WHERE d.unlocked_by_task_id = t.id"
+        "    AND d.program_id = t.program_id"
+        "    AND b.status = 'pending' $ctl$",
+    ),
+    Control(
+        # The grant 029's default privileges would have made on their own. It is
+        # one statement, it leaves the function working, and it hands the
+        # scheduler's weights to the connection a model reaches through.
+        "standing:task_ranking",
+        "GRANT EXECUTE ON FUNCTION version_scheduler_weights(jsonb) TO rk2_runtime",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -11014,20 +11038,35 @@ class SchedulerFixture:
         return execution.Claimed.from_row(rows[0])
 
     @classmethod
-    def hypothesis(cls, name: str, subject: str, worth: str) -> str:
+    def hypothesis(
+        cls,
+        name: str,
+        subject: str,
+        worth: str,
+        property_class: str = "authorization.object_ownership",
+    ) -> str:
         """One testable Hypothesis on the subject.
 
         The shape a hunt needs under it and the shape a Finding is a finding
         of are the same shape, so both take it from here. `worth` is what
         distinguishes them when a row is read back by hand.
+
+        `property_class` is a parameter because `hypotheses_dedup_idx` is
+        unique over `(subject, identity_a, identity_b, property_class)`: two
+        Hypotheses about one subject have to disagree about what property is at
+        stake, which is the point the index is making.
         """
         return str(
             cls.scalar(
                 "INSERT INTO hypotheses (program_id, subject_entity_id,"
                 " property_class, statement, status)"
-                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
-                " $3, 'testable') RETURNING id::text",
-                (cls.identifiers[name], subject, f"a hypothesis {worth}"),
+                " VALUES ($1::uuid, $2::uuid, $3, $4, 'testable') RETURNING id::text",
+                (
+                    cls.identifiers[name],
+                    subject,
+                    property_class,
+                    f"a hypothesis {worth}",
+                ),
             )
         )
 
@@ -11114,6 +11153,23 @@ class SchedulerFixture:
         except pg.DatabaseError as refused:
             return str(refused)
         raise AssertionError(f"not refused: {sql} {parameters}")
+
+    @classmethod
+    def operator(cls, sql: str, parameters: tuple = ()) -> object:
+        """One statement as the operator, on a connection of its own.
+
+        PH2-26 grants the weights verb to `rk2_human` and to nothing else, so a
+        test that versioned the weights as the owner would be exercising a path
+        no operator has. Opened per call rather than held: the scenarios that
+        need it move the weights twice each, and a connection kept open across
+        a class that commits is one more thing to close on a failure path.
+        """
+        connection = pg.connect(cls.harness.human)
+        try:
+            with connection.transaction():
+                return connection.execute(sql, parameters).scalar()
+        finally:
+            connection.close()
 
     @classmethod
     def as_owner(cls, sql: str, parameters: tuple = ()):
@@ -11700,10 +11756,16 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
 
     @classmethod
     def set_cap(cls, subagent_cap: int) -> None:
-        """The operator's edit, which is the only place this number is set."""
-        cls.as_owner(
-            "UPDATE scheduler_weights SET max_concurrent_subagents = $1::smallint"
-            " WHERE active",
+        """The operator's move, which is the only place this number is set.
+
+        A new version rather than an edit, since PH2-26: a weights row is what
+        a recorded Ranking pass points at, so the trigger refuses an UPDATE of
+        anything but `active`. Everything else about the row is carried over,
+        which is what keeps this a change to the cap and not to the formula.
+        """
+        cls.operator(
+            "SELECT version_scheduler_weights("
+            " jsonb_build_object('max_concurrent_subagents', $1::smallint))",
             (str(subagent_cap),),
         )
 
@@ -11794,7 +11856,18 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
     def test_every_entry_breaks_its_priority_into_factors(self):
         for row in self.first:
             self.assertEqual(
-                {"novelty", "confidence", "gain", "impact", "cost"},
+                {
+                    "novelty",
+                    "confidence",
+                    "gain",
+                    "impact",
+                    "value",
+                    "cost",
+                    "time",
+                    "safety",
+                    "unlock",
+                    "weights_version",
+                },
                 set(json.loads(str(row["factors"]))),
             )
 
@@ -12031,9 +12104,11 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                 self.assertIn(str(claimed.subagent_cap), denial.reason)
 
     def test_the_weights_row_is_back_where_this_fixture_found_it(self):
-        # `scheduler_weights` is one global row, so a scenario that moved it and
-        # did not put it back would schedule every case after this one -- in
-        # this file and in every other -- under a cap this fixture chose.
+        # The active `scheduler_weights` row is global, so a scenario that moved
+        # it and did not put it back would schedule every case after this one --
+        # in this file and in every other -- under a cap this fixture chose.
+        # The version number is not restored and is not meant to be: PH2-26 says
+        # a change is a new version, so putting the cap back is one more of them.
         self.assertEqual(self.cap_before, self.cap_after)
 
     # -- the invariant ---------------------------------------------------------
@@ -12768,6 +12843,663 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
             ("budget_reservations",),
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: The Programs of `TaskRankingTest`, sharing a prefix so one DELETE retires them.
+RANK_SLUG = "selftest-rank"
+
+#: What the three analyze Tasks in the unlock scenarios each promise. High enough
+#: that one of them alone outweighs the recon Task that unblocks them, so the
+#: assertion is about the unlock term and not about the sum being large.
+UNLOCKED_WORTH = "0.9"
+
+#: One Program per disturbance, so no scenario is read through another's rows.
+SCENARIOS = ("greedy", "unlock", "tied", "missing", "fresh", "proposed", "reweighted")
+
+#: Three property classes, because three Hypotheses about one subject have to
+#: disagree about something for `hypotheses_dedup_idx` to admit them.
+BLOCKED_CLASSES = (
+    "authorization.object_ownership",
+    "authorization.function_access",
+    "authorization.tenant_isolation",
+)
+
+
+class TaskRankingTest(SchedulerFixture, DatabaseCase):
+    """PH2-26: a priority made of components, and only sound edges move it.
+
+    The formula is arithmetic and could be checked anywhere. What cannot is
+    everything around it: the components come from this Program's own run
+    history, the unlock term comes from edges the pass derives and withdraws
+    against live rows, and the weights are a version that a trigger refuses to
+    let anyone rewrite. All three are properties of a server.
+
+    Each Program is one scenario, disturbed in exactly one way -- nothing at all
+    (greedy), three Tasks waiting on one (unlock), two Tasks that promise the
+    same thing (tied), one Task that promises nothing (missing), no history to
+    estimate from (fresh), an edge nothing derived (proposed).
+
+    Everything runs in `setUpClass` because all of it commits, and because a
+    Ranking pass only means anything against the rows the step before it left.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in SCENARIOS:
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{RANK_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_greedy()
+        cls.arrange_unlock()
+        cls.arrange_tied()
+        cls.arrange_missing()
+        cls.arrange_fresh()
+        cls.arrange_proposed()
+        cls.arrange_reweighted()
+        cls.arrange_weights()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{RANK_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- reading a Program back ------------------------------------------------
+
+    @classmethod
+    def components(cls, name: str) -> dict[str, tuple]:
+        """Every ranked component of every pending Task, by label."""
+        rows = cls.as_owner(
+            "SELECT label, priority, direct_value, unlock_value, estimated_cost,"
+            "       estimated_time, safety_cost, novelty, confidence_of_execution,"
+            "       ranked_weights_version"
+            "  FROM tasks WHERE program_id = $1::uuid AND status = 'pending'"
+            " ORDER BY priority DESC NULLS LAST, created_at, id",
+            (cls.identifiers[name],),
+        ).dicts()
+        return {str(row["label"]): row for row in rows}
+
+    @classmethod
+    def ordering(cls, name: str, kind: str | None = None) -> list[str]:
+        """The labels of a Program's pending Tasks in the order the pass left.
+
+        `kind` narrows it, because the unlock scenarios keep two populations in
+        one Program: the recon Tasks whose order is the claim, and the blocked
+        analyze Tasks that are only there to be waiting. The blocked ones are
+        worth 0.9 each and would lead any ordering that included them, which
+        says nothing -- they are unready and will never be offered.
+        """
+        return [
+            str(row["label"])
+            for row in cls.as_owner(
+                "SELECT label FROM tasks"
+                "  WHERE program_id = $1::uuid AND status = 'pending'"
+                "    AND ($2::text IS NULL OR kind = $2::text)"
+                " ORDER BY priority DESC NULLS LAST, created_at, id",
+                (cls.identifiers[name], kind),
+            ).dicts()
+        ]
+
+    @classmethod
+    def subject_of(cls, name: str, label: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT subject_entity_id::text FROM tasks"
+                "  WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], label),
+            )
+        )
+
+    @classmethod
+    def blocked_on(cls, name: str, subject: str, count: int) -> None:
+        """`count` analyze Tasks about a subject no artifact has been seen on.
+
+        Each gets a Hypothesis of its own, and not because analyze reads one --
+        `ready_for` does not. `tasks_live_dedup_idx` is unique over
+        `(program, kind, subject, hypothesis, finding)` with NULLs not
+        distinct, so three live analyze Tasks about one subject are three rows
+        the schema calls one. Distinct Hypotheses are the honest way to have
+        several paths waiting on the same reconnaissance.
+        """
+        for index in range(count):
+            cls.as_owner(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " hypothesis_id, expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'analyze', 'pending', $2::uuid, $3::uuid, $4, $4)",
+                (
+                    cls.identifiers[name],
+                    subject,
+                    cls.hypothesis(
+                        name, subject, f"blocking {name} {index}", BLOCKED_CLASSES[index]
+                    ),
+                    UNLOCKED_WORTH,
+                ),
+            )
+
+    @classmethod
+    def edges(cls, name: str) -> list[tuple[str, str, str, str]]:
+        """The dependency edges of a Program, as (blocked, unlocker, basis, why)."""
+        return [
+            (str(row["blocked"]), str(row["unlocker"]), str(row["basis"]), str(row["predicate"]))
+            for row in cls.as_owner(
+                "SELECT b.label AS blocked, u.label AS unlocker, d.basis, d.predicate"
+                "  FROM task_dependencies d"
+                "  JOIN tasks b ON b.id = d.task_id"
+                "  JOIN tasks u ON u.id = d.unlocked_by_task_id"
+                " WHERE d.program_id = $1::uuid"
+                " ORDER BY b.label, u.label",
+                (cls.identifiers[name],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def rank(cls, name: str) -> dict:
+        """One Ranking pass on one Program, as the runtime, committed."""
+        cls.bind(name)
+        return json.loads(str(cls.call("SELECT rank_pass('runtime')")))
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_greedy(cls):
+        """Four Tasks, nothing between them, ranked twice."""
+        cls.greedy = cls.seed("greedy", 4)
+        cls.rank("greedy")
+        cls.greedy_first = cls.components("greedy")
+        cls.greedy_events_before = cls.ranked_events("greedy")
+        cls.rank("greedy")
+        cls.greedy_again = cls.components("greedy")
+        cls.greedy_order = cls.ordering("greedy")
+        cls.greedy_slate = cls.offer()
+
+    @classmethod
+    def arrange_unlock(cls):
+        """One cheap Task that three valuable ones are waiting on.
+
+        Ranked three times, because the claim is comparative: the same two recon
+        Tasks in the same Program have to change places when the edges appear
+        and change back when they are withdrawn. A single ordering would be
+        consistent with the unlock term doing nothing at all.
+        """
+        cls.unlock = cls.seed("unlock", 2)
+        cls.rank("unlock")
+        cls.unlock_greedy_order = cls.ordering("unlock", "recon")
+
+        # The cheaper of the two -- 0.1 against 0.2 -- is the one the analyze
+        # Tasks are made to wait on, so anything that puts it first has to have
+        # come from what it unblocks.
+        cls.blocked_on("unlock", cls.subject_of("unlock", cls.unlock[0]), 3)
+        cls.unlock_pass = cls.rank("unlock")
+        cls.unlock_order = cls.ordering("unlock", "recon")
+        cls.unlock_components = cls.components("unlock")
+        cls.unlock_edges = cls.edges("unlock")
+
+        # Withdrawal, in the shape the pass itself writes: an abandoned Task is
+        # not pending, and an edge to it is a priority being paid for work that
+        # will never be done.
+        cls.as_owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            " finished_at = now(), priority = NULL"
+            " WHERE program_id = $1::uuid AND kind = 'analyze'",
+            (cls.identifiers["unlock"],),
+        )
+        cls.withdrawn_pass = cls.rank("unlock")
+        cls.withdrawn_order = cls.ordering("unlock", "recon")
+        cls.withdrawn_components = cls.components("unlock")
+        cls.withdrawn_edges = cls.edges("unlock")
+
+    @classmethod
+    def arrange_tied(cls):
+        """Two Tasks that promise exactly the same thing."""
+        cls.tied = cls.seed("tied", 2)
+        cls.as_owner(
+            "UPDATE tasks SET expected_information_gain = 0.5, potential_impact = 0.5"
+            " WHERE program_id = $1::uuid",
+            (cls.identifiers["tied"],),
+        )
+        cls.rank("tied")
+        cls.tied_components = cls.components("tied")
+        cls.tied_order = cls.ordering("tied")
+        cls.tied_created = [
+            str(row["label"])
+            for row in cls.as_owner(
+                "SELECT label FROM tasks WHERE program_id = $1::uuid"
+                " ORDER BY created_at, id",
+                (cls.identifiers["tied"],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def arrange_missing(cls):
+        """The Task that would have been first, with one estimate taken away."""
+        cls.missing = cls.seed("missing", 2)
+        cls.as_owner(
+            "UPDATE tasks SET expected_information_gain = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers["missing"], cls.missing[-1]),
+        )
+        cls.rank("missing")
+        cls.missing_components = cls.components("missing")
+        cls.missing_order = cls.ordering("missing")
+        cls.missing_slate = cls.offer()
+
+    @classmethod
+    def arrange_fresh(cls):
+        """One Task in a Program with no run history behind it."""
+        cls.fresh = cls.seed("fresh", 1)
+        cls.rank("fresh")
+        cls.fresh_components = cls.components("fresh")
+        cls.fresh_priors = cls.as_owner(
+            "SELECT (w.cost_prior ->> 'recon')::numeric AS cost,"
+            "       (w.time_prior ->> 'recon')::numeric AS time,"
+            "       w.safety_prior AS safety, w.version"
+            "  FROM scheduler_weights w WHERE w.active"
+        ).dicts()[0]
+
+    @classmethod
+    def arrange_proposed(cls):
+        """An edge nobody derived, between two Tasks no rule relates."""
+        cls.proposed = cls.seed("proposed", 2)
+        cls.rank("proposed")
+        cls.proposed_greedy_order = cls.ordering("proposed")
+        # recon unblocking recon is a claim no rule in the corpus makes, so this
+        # edge cannot be re-derived as sound underneath the assertion.
+        cls.as_owner(
+            "INSERT INTO task_dependencies (program_id, task_id, unlocked_by_task_id,"
+            " basis, predicate)"
+            " SELECT $1::uuid, b.id, u.id, 'proposed', 'recon.no_subject'"
+            "   FROM tasks b, tasks u"
+            "  WHERE b.program_id = $1::uuid AND b.label = $2"
+            "    AND u.program_id = $1::uuid AND u.label = $3",
+            (cls.identifiers["proposed"], cls.proposed[-1], cls.proposed[0]),
+        )
+        cls.rank("proposed")
+        cls.proposed_order = cls.ordering("proposed")
+        cls.proposed_components = cls.components("proposed")
+
+    @classmethod
+    def arrange_reweighted(cls):
+        """The unlock scenario again, left standing for the weights to move.
+
+        Its own Program because the unlock one has had its edges withdrawn, and
+        an ordering that flips when `w_unlock` goes to zero proves nothing if
+        the term was already zero. Here the edges are live and sound when the
+        operator changes the weights, so the only thing that moves the order is
+        the weights.
+        """
+        cls.reweighted = cls.seed("reweighted", 2)
+        cls.blocked_on("reweighted", cls.subject_of("reweighted", cls.reweighted[0]), 3)
+        cls.rank("reweighted")
+        cls.reweighted_order = cls.ordering("reweighted", "recon")
+        cls.reweighted_components = cls.components("reweighted")
+
+    @classmethod
+    def arrange_weights(cls):
+        """The operator's move, and what it does not touch.
+
+        Restored in a `finally`, because the active weights row is global: a
+        scenario that left this Program's version behind would rank every case
+        after it -- in this file and in every other -- under weights this one
+        chose.
+        """
+        cls.weights_before = cls.active_weights()
+        cls.rewrite_refusal = cls.owner_refusal(
+            "UPDATE scheduler_weights SET w_unlock = 0 WHERE version = $1",
+            (str(cls.weights_before["version"]),),
+        )
+        cls.delete_refusal = cls.owner_refusal(
+            "DELETE FROM scheduler_weights WHERE version = $1",
+            (str(cls.weights_before["version"]),),
+        )
+        cls.unknown_key_refusal = cls.operator_refusal(
+            "SELECT version_scheduler_weights('{\"w_greed\": 1}'::jsonb)"
+        )
+        cls.reserved_key_refusal = cls.operator_refusal(
+            "SELECT version_scheduler_weights('{\"version\": 99}'::jsonb)"
+        )
+        cls.runtime_refusal = cls.refusal(
+            "SELECT version_scheduler_weights('{\"w_unlock\": 0}'::jsonb)"
+        )
+
+        try:
+            cls.new_version = int(
+                str(
+                    cls.operator(
+                        "SELECT version_scheduler_weights('{\"w_unlock\": 0}'::jsonb)"
+                    )
+                )
+            )
+            cls.weights_after = cls.active_weights()
+            cls.superseded = cls.weights_row(cls.weights_before["version"])
+            # The same rows, ranked again under the new version: the unlock term
+            # is switched off, so the Program that changed places changes back
+            # without a single row of its own moving.
+            cls.rank("reweighted")
+            cls.reranked_order = cls.ordering("reweighted", "recon")
+            cls.reranked_components = cls.components("reweighted")
+        finally:
+            cls.operator(
+                "SELECT version_scheduler_weights("
+                " jsonb_build_object('w_unlock', $1::numeric))",
+                (str(cls.weights_before["w_unlock"]),),
+            )
+        cls.weights_restored = cls.active_weights()
+        cls.greedy_events_after = cls.ranked_events("greedy")
+
+    # -- reading the weights ---------------------------------------------------
+
+    @classmethod
+    def active_weights(cls) -> dict:
+        return cls.as_owner(
+            "SELECT version, w_unlock, w_tokens, w_time, w_safety,"
+            "       max_concurrent_subagents, slate_size"
+            "  FROM scheduler_weights WHERE active"
+        ).dicts()[0]
+
+    @classmethod
+    def weights_row(cls, version: object) -> dict:
+        return cls.as_owner(
+            "SELECT version, active, w_unlock FROM scheduler_weights WHERE version = $1",
+            (str(version),),
+        ).dicts()[0]
+
+    @classmethod
+    def ranked_events(cls, name: str) -> list[tuple[str, str]]:
+        """Every Ranking pass this Program has recorded, oldest first."""
+        return [
+            (int(str(row["seq"])), str(row["weights_version"]))
+            for row in cls.as_owner(
+                "SELECT e.seq, e.payload ->> 'weights_version' AS weights_version"
+                "  FROM events e"
+                " WHERE e.program_id = $1::uuid AND e.type = 'scheduler.ranked'"
+                " ORDER BY e.seq",
+                (cls.identifiers[name],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def owner_refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        try:
+            cls.as_owner(sql, parameters)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError(f"not refused: {sql}")
+
+    @classmethod
+    def operator_refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        try:
+            cls.operator(sql, parameters)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError(f"not refused: {sql}")
+
+    # -- criterion 1: every component is exposed -------------------------------
+
+    def test_every_ranked_task_carries_all_seven_components(self):
+        for label, row in self.greedy_first.items():
+            with self.subTest(task=label):
+                for column in (
+                    "novelty",
+                    "confidence_of_execution",
+                    "direct_value",
+                    "estimated_cost",
+                    "estimated_time",
+                    "safety_cost",
+                    "unlock_value",
+                    "ranked_weights_version",
+                ):
+                    self.assertIsNotNone(row[column], column)
+
+    def test_the_offer_reports_the_components_the_row_was_ranked_on(self):
+        # Rounded on both sides because the offer rounds: an orchestrator is
+        # being shown these, and six places is what `task_rank_factors` decided
+        # a reader needs. The claim is that the numbers are the row's, not that
+        # they are unrounded.
+        for entry in self.greedy_slate:
+            factors = json.loads(str(entry["factors"]))
+            row = self.greedy_again[str(entry["task_label"])]
+            with self.subTest(task=entry["task_label"]):
+                self.assertEqual(
+                    {
+                        name: round(float(str(row[column])), 6)
+                        for name, column in (
+                            ("value", "direct_value"),
+                            ("cost", "estimated_cost"),
+                            ("time", "estimated_time"),
+                            ("safety", "safety_cost"),
+                            ("unlock", "unlock_value"),
+                            ("novelty", "novelty"),
+                            ("confidence", "confidence_of_execution"),
+                        )
+                    }
+                    | {"weights_version": int(str(row["ranked_weights_version"]))},
+                    {
+                        name: round(float(factors[name]), 6)
+                        for name in ("value", "cost", "time", "safety", "unlock",
+                                     "novelty", "confidence")
+                    }
+                    | {"weights_version": factors["weights_version"]},
+                )
+
+    # -- criterion 2: the same rows reach the same numbers ---------------------
+
+    def test_two_passes_over_the_same_rows_reach_the_same_priorities(self):
+        self.assertEqual(
+            {label: row["priority"] for label, row in self.greedy_first.items()},
+            {label: row["priority"] for label, row in self.greedy_again.items()},
+        )
+
+    def test_a_program_nothing_unlocks_is_ranked_greedily(self):
+        # Seeded ascending in worth, so the order should be the reverse.
+        self.assertEqual(list(reversed(self.greedy)), self.greedy_order)
+
+    def test_equal_scores_are_broken_by_age_and_not_by_chance(self):
+        [first, second] = self.tied_order
+        self.assertEqual(
+            self.tied_components[first]["priority"],
+            self.tied_components[second]["priority"],
+        )
+        self.assertEqual(self.tied_created, self.tied_order)
+
+    # -- criterion 3: what a Task unlocks can outrank what it is worth ---------
+
+    def test_the_cheaper_task_loses_until_it_unblocks_something(self):
+        self.assertEqual(list(reversed(self.unlock)), self.unlock_greedy_order)
+
+    def test_a_task_that_unblocks_several_valuable_paths_comes_first(self):
+        self.assertEqual(self.unlock[0], self.unlock_order[0])
+        self.assertGreater(
+            self.unlock_components[self.unlock[0]]["priority"],
+            self.unlock_components[self.unlock[1]]["priority"],
+        )
+
+    def test_only_the_unlocking_task_is_credited(self):
+        self.assertEqual(
+            1.0, float(str(self.unlock_components[self.unlock[0]]["unlock_value"]))
+        )
+        self.assertEqual(
+            0.0, float(str(self.unlock_components[self.unlock[1]]["unlock_value"]))
+        )
+
+    def test_the_pass_derives_one_edge_per_blocked_task(self):
+        self.assertEqual(3, self.unlock_pass["edges_derived"])
+        self.assertEqual(3, len(self.unlock_edges))
+        for _, unlocker, basis, predicate in self.unlock_edges:
+            self.assertEqual(
+                (self.unlock[0], "runtime_rule", "analyze.no_agent_visible_artifact"),
+                (unlocker, basis, predicate),
+            )
+
+    def test_an_edge_stops_being_paid_for_when_its_task_stops_waiting(self):
+        self.assertEqual(3, self.withdrawn_pass["edges_withdrawn"])
+        self.assertEqual([], self.withdrawn_edges)
+        self.assertEqual(
+            0.0, float(str(self.withdrawn_components[self.unlock[0]]["unlock_value"]))
+        )
+        self.assertEqual(list(reversed(self.unlock)), self.withdrawn_order)
+
+    # -- criterion 4: an edge nothing derived is worth nothing -----------------
+
+    def test_an_unsound_edge_moves_no_priority(self):
+        self.assertEqual(self.proposed_greedy_order, self.proposed_order)
+        for label in self.proposed:
+            with self.subTest(task=label):
+                self.assertEqual(
+                    0.0, float(str(self.proposed_components[label]["unlock_value"]))
+                )
+
+    def test_the_unsound_edge_is_still_recorded(self):
+        # Zero unlock value is not the same as a claim nobody may make: the row
+        # is kept, visible and answerable, and only its arithmetic is refused.
+        self.assertEqual(
+            [(self.proposed[-1], self.proposed[0], "proposed", "recon.no_subject")],
+            self.edges("proposed"),
+        )
+
+    # -- criterion 5: weights are versioned, and versions are not rewritten ----
+
+    def test_a_weights_version_cannot_be_edited_or_deleted(self):
+        self.assertIn("not rewritten", self.rewrite_refusal)
+        self.assertIn("named by every Ranking pass", self.delete_refusal)
+
+    def test_the_operator_verb_supersedes_rather_than_edits(self):
+        self.assertEqual(
+            self.weights_before["version"] + 1, self.weights_after["version"]
+        )
+        self.assertEqual(self.new_version, self.weights_after["version"])
+        self.assertEqual(0.0, float(str(self.weights_after["w_unlock"])))
+        # Everything the operator did not name comes with it.
+        for column in ("w_tokens", "w_time", "w_safety", "max_concurrent_subagents",
+                       "slate_size"):
+            with self.subTest(column=column):
+                self.assertEqual(
+                    str(self.weights_before[column]), str(self.weights_after[column])
+                )
+
+    def test_the_superseded_version_keeps_its_numbers(self):
+        self.assertEqual(False, self.superseded["active"])
+        self.assertEqual(
+            str(self.weights_before["w_unlock"]), str(self.superseded["w_unlock"])
+        )
+
+    def test_a_new_version_makes_a_new_pass_and_rewrites_no_old_one(self):
+        # Every pass this class ran before the change still names the version it
+        # ran under, and there are more of them than there were.
+        self.assertEqual(
+            self.greedy_events_before,
+            self.greedy_events_after[: len(self.greedy_events_before)],
+        )
+        self.assertGreater(len(self.greedy_events_after), 0)
+        self.assertEqual(
+            {str(self.weights_before["version"])},
+            {version for _, version in self.greedy_events_before},
+        )
+
+    def test_the_new_weights_change_the_order_without_moving_a_row(self):
+        # Under version N the unlocker leads; under N+1, which prices unlocking
+        # at zero, the richer Task does. Same rows, same edges, same components
+        # -- only the version that combined them differs.
+        self.assertEqual(self.reweighted[0], self.reweighted_order[0])
+        self.assertEqual(list(reversed(self.reweighted)), self.reranked_order)
+        for label in self.reweighted:
+            with self.subTest(task=label):
+                self.assertEqual(
+                    str(self.reweighted_components[label]["unlock_value"]),
+                    str(self.reranked_components[label]["unlock_value"]),
+                )
+        self.assertEqual(
+            self.new_version,
+            int(str(self.reranked_components[self.reweighted[0]]["ranked_weights_version"])),
+        )
+
+    def test_only_the_operator_may_version_the_weights(self):
+        self.assertIn("permission denied", self.runtime_refusal)
+
+    def test_a_weight_this_table_does_not_have_is_refused(self):
+        self.assertIn("w_greed", self.unknown_key_refusal)
+        self.assertIn("version", self.reserved_key_refusal)
+
+    def test_the_weights_row_is_back_where_this_fixture_found_it(self):
+        self.assertEqual(
+            str(self.weights_before["w_unlock"]), str(self.weights_restored["w_unlock"])
+        )
+
+    # -- criterion 6: missing estimates and bounded fallbacks ------------------
+
+    def test_a_task_with_a_missing_estimate_sinks_and_is_offered_last(self):
+        unestimated = self.missing[-1]
+        self.assertIsNone(self.missing_components[unestimated]["priority"])
+        self.assertIsNone(self.missing_components[unestimated]["direct_value"])
+        self.assertEqual(unestimated, self.missing_order[-1])
+        self.assertEqual(
+            unestimated, [row["task_label"] for row in self.missing_slate][-1]
+        )
+
+    def test_the_other_components_are_still_measured_for_it(self):
+        # Unestimated is not unranked: what the runtime can measure about the
+        # Task is measured, and only the model's half is absent.
+        row = self.missing_components[self.missing[-1]]
+        for column in ("novelty", "estimated_cost", "estimated_time", "safety_cost",
+                       "unlock_value", "ranked_weights_version"):
+            with self.subTest(column=column):
+                self.assertIsNotNone(row[column])
+
+    def test_a_program_with_no_history_falls_back_to_its_priors(self):
+        row = self.fresh_components[self.fresh[0]]
+        self.assertEqual(
+            (
+                float(str(self.fresh_priors["cost"])),
+                float(str(self.fresh_priors["time"])),
+                float(str(self.fresh_priors["safety"])),
+            ),
+            (
+                float(str(row["estimated_cost"])),
+                float(str(row["estimated_time"])),
+                float(str(row["safety_cost"])),
+            ),
+        )
+
+    def test_every_fallback_is_inside_its_bound(self):
+        for name in SCENARIOS:
+            for label, row in self.components(name).items():
+                with self.subTest(program=name, task=label):
+                    for column in ("estimated_cost", "estimated_time", "safety_cost",
+                                   "unlock_value"):
+                        value = float(str(row[column]))
+                        self.assertGreaterEqual(value, 0.0, column)
+                        self.assertLessEqual(value, 1.0, column)
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = $1", ("task_ranking",)
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
+            ("task_ranking",),
         ).rows
 
         self.assertEqual(1, int(registered[0]))

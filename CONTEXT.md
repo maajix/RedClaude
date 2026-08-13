@@ -133,6 +133,12 @@ program. Deterministic given the rows and the weights version; it never reads th
 clock.
 _Avoid_: Scoring, sort, tick, cycle
 
+**Dependency edge**:
+One claim that finishing a task would settle what another is waiting for, naming
+the readiness predicate it settles and the basis it was derived from. Only a
+sound basis moves a priority; an edge nobody derived is worth zero, not a guess.
+_Avoid_: Blocker, link, prerequisite, graph edge
+
 **Slate**:
 The bounded set of tasks the runtime offers the orchestrator to choose from. The
 runtime decides what may be chosen; the orchestrator decides which; the runtime
