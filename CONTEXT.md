@@ -133,11 +133,15 @@ program. Deterministic given the rows and the weights version; it never reads th
 clock.
 _Avoid_: Scoring, sort, tick, cycle
 
-**Dependency edge**:
+**Task dependency**:
 One claim that finishing a task would settle what another is waiting for, naming
 the readiness predicate it settles and the basis it was derived from. Only a
-sound basis moves a priority; an edge nobody derived is worth zero, not a guess.
-_Avoid_: Blocker, link, prerequisite, graph edge
+sound basis moves a priority; a dependency nobody derived is worth zero, not a
+guess, and one dependent's value is shared between the tasks that could settle
+it rather than paid to each of them.
+_Avoid_: Blocker, link, prerequisite, dependency edge (an edge between two
+entities is a Relationship; the word is fine in prose about this table, the noun
+in this system is Task dependency)
 
 **Slate**:
 The bounded set of tasks the runtime offers the orchestrator to choose from. The

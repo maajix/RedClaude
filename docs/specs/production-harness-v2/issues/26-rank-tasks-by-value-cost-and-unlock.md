@@ -40,11 +40,26 @@ now `value_for(tasks, scheduler_weights)` and lands on `tasks.direct_value`,
 because a component the criterion says must be exposed cannot be an expression
 nobody can read back.
 
+`value_for` clamps into `[0, 1]`, which is criterion 1's word "normalized" and
+not decoration: nothing has ever constrained `expected_information_gain` or
+`potential_impact` to a scale, so without the clamp the numerator is whatever a
+model wrote. The NULL arm is spelled out separately because `greatest(NULL, 0)`
+is 0 in SQL -- folding the two together would report a Task nobody estimated as
+one worth nothing, which is the distinction criterion 6 turns on.
+
 Cost was one number and is now three. `time_for` is `cost_for` over
 `extract(epoch FROM (finished_at - started_at))` instead of tokens; `safety_for`
 is the maximum `risk_rank(risk_class)` of an Agent run's Tool runs, divided by
-three, averaged over the same window. Both shrink toward a prior with the same
-`shrinkage_n0`, and both are bounded into `[cost_floor, 1]` the way cost is.
+three, averaged over the same window. All three shrink toward a prior through
+one function, `shrunk_toward`, rather than three copies of the same expression:
+the argument for reusing ticket 34's estimator is that the components agree
+about what "little evidence" means, and three copies are three things free to
+stop agreeing. 023's `cost_for` is rewritten around it and otherwise untouched.
+
+Cost and time are bounded into `[cost_floor, 1]`; safety into `[0, 1]`. The
+difference is deliberate and the comment on the shares constraint says so: a
+kind whose runs have never needed a privileged call cost the operator no
+attention, and a floor would charge it for attention nobody paid.
 
 The Agent run is the unit for all three deliberately. Safety could have been
 measured per Tool run, and then `shrinkage_n0` would mean "runs" in two of the
@@ -55,9 +70,22 @@ is the shape of a constant nobody can tune.
 
 `task_dependencies` is the edge, `task_dependency_bases` is what makes an edge
 count. Two bases ship: `runtime_rule` is sound, `proposed` is not, and
-`unlock_for` joins the basis table and filters on `sound`. That join is the
-whole of criterion 4. Without it every edge is worth its full value, and the
-edges a model can write are the ones that would be worth the most.
+`unlock_for` joins the basis table and filters on `sound`. That join is half of
+criterion 4. Without it every edge is worth its full value, and the edges a
+model can write are the ones that would be worth the most.
+
+The other half is a trigger, and the first version of this file did not have it.
+The derivation runs as `rk2_runtime`, so the runtime holds INSERT and DELETE on
+the table -- and `basis` was a foreign key and nothing else, which made
+`runtime_rule` a string anything holding that connection could write. One INSERT
+buys a fabricated edge the full value of whatever it claims to unblock; one
+DELETE suppresses a real one. The vocabulary was bindable on every role except
+the one it had to bind. `task_dependencies_runtime_rule_is_derived` now holds a
+sound basis to the derivation, which takes the licence for its own two
+statements through a transaction-local `app.deriving_dependencies` -- the shape
+013 uses for `app.purging`, because the privilege belongs to a step and not to a
+role. The DELETE arm consults `app.purging` too, which 030 requires of every
+BEFORE DELETE trigger on a program-scoped table.
 
 Two rules derive edges today, both from `ready_for`'s own vocabulary:
 
@@ -85,6 +113,17 @@ keeps the blocked Task from being counted twice.
 The sum is capped at 1.0. Uncapped, a Task that unblocks twelve things outranks
 everything for the rest of the engagement regardless of what it costs.
 
+A dependent's value is SHARED between the pending Tasks that could settle it.
+The report rule is where that stops being a nicety: `report.
+no_validated_finding` is settled by any one validation, so ten pending validate
+Tasks all name the same report Task, and paying each of them the whole of it
+hands that value out ten times for work one Task does -- every validate Task in
+the engagement ahead of everything else on the strength of a report nobody has
+written. Shared, the total credit paid for a blocked Task is its value exactly
+once, however many Tasks could settle it. The share is equal and not weighted by
+who is likelier to get there first; that is what a Task adds over the unlocks
+already coming, and it is ticket 41's question.
+
 ### Weights are a version and versions are not rewritten
 
 `scheduler_weights_is_immutable` refuses UPDATE and DELETE on the row, with one
@@ -109,16 +148,32 @@ true, because a later DROP/CREATE of the function would re-apply the default.
 The same default has already given `rk2_runtime` EXECUTE on 026's
 `answer_decision`; that is a separate hole and not this ticket's to close.
 
+What the verb deliberately does not do is run the passes. "Changing them creates
+a new Ranking pass" is satisfied by the next `rank_pass`, which recomputes every
+pending Task under whichever version is active and records itself as a pass of
+its own; the loop ranks before it offers, so nothing is chosen under weights no
+pass has applied. The verb cannot be the thing that runs them: a pass is scoped
+to one Program by `rk2_program_required` and the policies under it, the
+operator's connection is bound to no Program, and nothing bounds how many are
+open. A verb that ranked all of them would be one person changing a number while
+holding write locks across every Program in the installation.
+
 ### The check
 
-`check_task_ranking()` has eight arms. Three are textual and guard code:
-Decision 12's no-clock rule extended to the four new factors, no scheduler
-function executable by PUBLIC, and `unlock_for` still naming
-`task_dependency_bases`. Two are about the vocabulary and the grants: a basis
-table that has lost either answer, and the weights verb reachable from a
-model-facing role. Three are about rows: a stored priority with no weights
-version beside it, a stored priority with a component missing under it, and a
-runtime-derived edge whose predicate the blocked Task no longer reports.
+`check_task_ranking()` has nine arms. Three are textual and guard code:
+Decision 12's no-clock rule extended to the new factors, the shrinkage under
+them and the derivation the pass runs first; no scheduler function executable by
+PUBLIC; and `unlock_for` still naming `task_dependency_bases`. Three are about
+the vocabulary and what may write to it: a basis table that has lost either
+answer, the weights verb reachable from a model-facing role, and the trigger
+that holds a sound basis to the derivation. Three are about rows: a stored
+priority with no weights version beside it, a stored priority with a component
+missing under it, and a runtime-derived edge whose predicate the blocked Task no
+longer reports.
+
+`derive_task_dependencies` is in the no-clock arm and its rows carry
+`derived_at`, which is not a contradiction: the column default stamps when the
+pass ran, and no branch of the function reads it.
 
 Arms (e) and (f) key on `priority IS NOT NULL` rather than on the Task being
 pending. A Task with a missing model estimate has a NULL priority and NULL
@@ -133,11 +188,33 @@ have to be tuned with a tolerance nobody can justify.
 
 ### The test
 
-`TaskRankingTest` is seven Programs, one per disturbance, in the shape 23 and 25
+`TaskRankingTest` is eight Programs, one per disturbance, in the shape 23 and 25
 established: everything commits in `setUpClass`, the assertions read what the
 passes left, and the Programs are purged at the end. `SchedulerFixture` gained
 `operator()`, because the weights verb is `rk2_human`'s and a test that versioned
 them as the owner would exercise a path no operator has.
+
+`shared` is the eighth: one report Task and two pending validate Tasks, which is
+the smallest shape in which two Tasks settle the same thing. It is what says the
+credit is halved rather than paid twice, and the analyze scenarios cannot say it
+-- every blocked Task there has exactly one unlocker, so the divisor is 1 and
+the sharing is unexercised.
+
+The blocked analyze Tasks are worth 0.2 each and not 0.9. At 0.9 the sum
+saturated against the 1.0 cap at two of them, so "unblocks several paths" and
+"unblocks one" produced the same number and the criterion-3 assertion was about
+the cap. At 0.2 the three sum to 0.6, and the test asserts the credit equals the
+sum of what is waiting rather than asserting the ceiling.
+
+The tie-break is read off the Slate and not off an `ORDER BY` this file writes.
+Comparing two clauses the test itself spells is a claim about Postgres; the
+claim worth making is that `rank_candidates` breaks ties by age, so the tied
+Program is offered twice and both offers are the creation order.
+
+The criterion-5 test ranks `greedy` again while the new version is active. Until
+it did, the assertion that the pre-change events were unchanged was a prefix
+check against a list nothing had appended to, which holds however the versioning
+behaves.
 
 The unlock scenario is ranked three times and not once. A single ordering is
 consistent with the unlock term doing nothing: the claim is that the same two
@@ -160,7 +237,19 @@ layer down.
 lead any ordering that includes them, which says nothing -- they are unready and
 `rank_candidates` will never offer them. The claim is about the two recon Tasks.
 
-Two Controls, both structural: `unlock_for` rewritten without the basis join,
-which is the one edit that makes every proposed edge move a priority; and the
-grant on the weights verb that 029's default privileges would have made on their
-own.
+Three Controls, all structural: `unlock_for` rewritten without the basis join,
+which is the one edit that makes every proposed edge move a priority; the grant
+on the weights verb that 029's default privileges would have made on their own;
+and a DROP of the trigger that holds `runtime_rule` to the derivation, which
+leaves every row, every grant and every other arm of the check exactly as they
+were.
+
+### The term in CONTEXT.md
+
+`**Task dependency**` and not `**Dependency edge**`: `**Relationship**` lists
+`_Avoid_: Edge`, and a new entry whose name is another entry's banned noun is
+the synonym problem the file exists to prevent. The schema already spelled it
+the other way -- `task_dependencies`, `task_dependency_bases`,
+`derive_task_dependencies` -- so the rename is the vocabulary agreeing with the
+tables. "Edge" in prose about the table gets the treatment `**Surface**` gives
+"attack surface": fine in a sentence, not the noun.

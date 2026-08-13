@@ -65,11 +65,20 @@ ALTER TABLE scheduler_weights
     ADD COLUMN safety_prior           numeric NOT NULL DEFAULT 0.5;
 
 -- The shares are constrained to sum to one, and that is what makes the
--- priority's denominator bounded by construction: each of the three factors is
--- in [cost_floor, 1], so any convex combination of them is too. Without it an
--- operator can set three weights of 5 and produce a formula whose numbers no
--- longer compare across Programs, which is the failure mode a normalised
--- component was introduced to prevent.
+-- priority's denominator bounded by construction: `cost_for` and `time_for`
+-- return a number in [cost_floor, 1] and `safety_for` one in [0, 1], so any
+-- convex combination of the three is in [0, 1] -- and the `greatest(...,
+-- cost_floor)` around the whole denominator is what keeps it off zero when the
+-- only term with weight is the one that may be zero. Safety is floored at zero
+-- and not at `cost_floor` deliberately: a kind whose runs have never needed a
+-- privileged call cost the operator no attention, and a floor would charge it
+-- for attention it never took.
+--
+-- Without the sum an operator can set three weights of 5 and produce a formula
+-- whose numbers no longer compare across Programs, which is the failure mode a
+-- normalised component was introduced to prevent. `w_gain + w_impact = 1` is
+-- the same constraint on the numerator, and it is what makes `value_for` a
+-- normalised value rather than a weighted sum that happens to be small.
 ALTER TABLE scheduler_weights
     ADD CONSTRAINT scheduler_weights_value_shares_ck
         CHECK (w_gain + w_impact = 1),
@@ -190,11 +199,33 @@ REVOKE ALL ON FUNCTION version_scheduler_weights(jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION version_scheduler_weights(jsonb) FROM rk2_runtime, rk2_state;
 GRANT EXECUTE ON FUNCTION version_scheduler_weights(jsonb) TO rk2_human;
 
+-- What the verb deliberately does NOT do is run the passes. Criterion 5 says
+-- changing the weights creates a new Ranking pass, and it does: `rank_pass`
+-- recomputes every pending Task in the Program it is bound to under whichever
+-- version is active, so the first pass after this statement is that new pass,
+-- and it records itself as one.
+--
+-- The verb cannot be the thing that runs them. A pass is scoped to one Program
+-- by `rk2_program_required` and by the row policies under it; the operator's
+-- connection is bound to no Program, and there is no bound on how many are
+-- open. A verb that ranked all of them would be an operator's UPDATE holding
+-- write locks across every Program in the installation, taken by someone
+-- changing a number. The loop already ranks before it offers, which is the
+-- other half of why: a Task cannot be chosen under weights no pass has applied.
+
 -- Version 2: the configuration this ticket exists to make possible. Tokens
 -- still dominate effort, elapsed time and safety carry the rest, and an
 -- unlocked path is worth half of a direct one. Version 1 keeps its numbers and
 -- stops being active, which is the whole difference between versioning weights
 -- and editing them.
+--
+-- Shipping it is not a policy this file invented for itself: version 1 prices
+-- unlocking at zero, so an installation left on it can never satisfy criterion
+-- 3 -- no Task ever outranks a richer one for what it unblocks, whatever the
+-- edges say. The feature would be reachable only by an operator who read this
+-- file. The numbers are the defensible ones and not the tuned ones: tokens keep
+-- the majority they had, and half is what "an unlocked path counts, and counts
+-- for less than the work in front of you" comes to.
 -- Through the verb, not through an INSERT of its own: the operator's path and
 -- the corpus's path being the same statement is what stops the two drifting,
 -- and applying this file is then the first exercise of it.
@@ -217,12 +248,16 @@ ALTER TABLE tasks
     ADD COLUMN unlock_value           numeric,
     ADD COLUMN ranked_weights_version integer REFERENCES scheduler_weights(version);
 
--- The three the runtime constructs are bounded by construction and say so. The
--- fourth is not: `direct_value` is a combination of two numbers a model wrote,
--- and `tasks` has never constrained those to a scale. Constraining the
--- combination here would make a bad estimate an error at ranking time, several
--- statements away from the row that carries it.
+-- All four are bounded, because criterion 1 says a rank result exposes a
+-- NORMALISED value and an unbounded number is not one. `tasks` has never
+-- constrained `expected_information_gain` or `potential_impact` to a scale, so
+-- the bound cannot be asserted of the estimates -- it is applied by `value_for`,
+-- which clamps, and recorded here, which is the assertion that it did. Clamping
+-- and not rejecting: a model's bad estimate should sink a Task's ranking, not
+-- fail the pass that ranks every other Task in the Program.
 ALTER TABLE tasks
+    ADD CONSTRAINT tasks_direct_value_ck
+        CHECK (direct_value IS NULL OR (direct_value >= 0 AND direct_value <= 1)),
     ADD CONSTRAINT tasks_estimated_time_ck
         CHECK (estimated_time IS NULL OR (estimated_time >= 0 AND estimated_time <= 1)),
     ADD CONSTRAINT tasks_safety_cost_ck
@@ -231,7 +266,7 @@ ALTER TABLE tasks
         CHECK (unlock_value IS NULL OR (unlock_value >= 0 AND unlock_value <= 1));
 
 COMMENT ON COLUMN tasks.direct_value IS
-  'The value of this Task on its own: the weighted combination of the model''s information-gain and impact estimates. NULL when either estimate is absent, which is what sinks an unestimated Task rather than scoring it.';
+  'The value of this Task on its own: the weighted combination of the model''s information-gain and impact estimates, normalised into [0, 1]. NULL when either estimate is absent, which is what sinks an unestimated Task rather than scoring it.';
 COMMENT ON COLUMN tasks.estimated_time IS
   'Normalised elapsed time, from the median of what this kind has taken in this Program, shrunk toward the kind''s prior. The half of cost that tokens do not measure.';
 COMMENT ON COLUMN tasks.safety_cost IS
@@ -247,15 +282,27 @@ COMMENT ON COLUMN tasks.ranked_weights_version IS
 -- ---------------------------------------------------------------------------
 -- Split out of `rank_pass` so that `unlock_for` can ask it of the OTHER Task,
 -- which is the question the whole unlock term is made of.
-
+--
+-- The clamp is criterion 1's word "normalized". With `w_gain + w_impact = 1`
+-- and estimates in [0, 1] it never fires; nothing constrains those estimates,
+-- so it is what makes the claim true rather than customary.
+--
+-- The NULL arm is explicit and cannot be folded into the clamp: `greatest(NULL,
+-- 0)` is 0 in SQL, not NULL, so clamping an absent estimate would silently
+-- report a Task nobody estimated as one worth nothing -- which is the exact
+-- distinction criterion 6 turns on.
 CREATE FUNCTION value_for(t tasks, w scheduler_weights) RETURNS numeric
 LANGUAGE sql STABLE AS $fn$
-    SELECT w.w_gain * t.expected_information_gain
-         + w.w_impact * t.potential_impact;
+    SELECT CASE
+        WHEN t.expected_information_gain IS NULL OR t.potential_impact IS NULL
+            THEN NULL
+        ELSE least(greatest(w.w_gain * t.expected_information_gain
+                          + w.w_impact * t.potential_impact, 0), 1.0)
+        END;
 $fn$;
 
 COMMENT ON FUNCTION value_for(tasks, scheduler_weights) IS
-  'The Task''s own value under these weights, or NULL when either estimate is missing -- NULL and not zero, because an unestimated Task is a different statement from a worthless one.';
+  'The Task''s own value under these weights, normalised into [0, 1], or NULL when either estimate is missing -- NULL and not zero, because an unestimated Task is a different statement from a worthless one.';
 
 
 -- ---------------------------------------------------------------------------
@@ -267,6 +314,64 @@ COMMENT ON FUNCTION value_for(tasks, scheduler_weights) IS
 -- `shrinkage_n0` pseudo-observations, then normalised and bounded. A second
 -- estimator with different behaviour at small N would make two components of
 -- one formula disagree about what "little evidence" means.
+--
+-- Which is why the shrinkage itself is one function and not three copies of an
+-- expression. 023 wrote it inline in `cost_for`; this file would have written it
+-- twice more, and the three would then have been free to drift -- a `+ 1` in one
+-- of them is a change no test compares against the other two, and every
+-- component would still look bounded and behave differently at N = 0.
+CREATE FUNCTION shrunk_toward(
+    p_n integer, p_observed numeric, p_prior numeric, p_n0 numeric
+) RETURNS numeric
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT (coalesce(p_n, 0) * coalesce(p_observed, 0) + p_n0 * p_prior)
+         / (coalesce(p_n, 0) + p_n0);
+$fn$;
+
+COMMENT ON FUNCTION shrunk_toward(integer, numeric, numeric, numeric) IS
+  'One measurement of N observations, pulled toward a prior worth p_n0 pseudo-observations. The single definition of what "little evidence" means, so cost, time and safety cannot disagree about it.';
+
+REVOKE ALL ON FUNCTION shrunk_toward(integer, numeric, numeric, numeric) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION shrunk_toward(integer, numeric, numeric, numeric)
+    TO rk2_runtime;
+
+-- 023's `cost_for`, rewritten around the helper and otherwise untouched: the
+-- claim above is that all three components shrink the same way, and a claim
+-- with one exception in it is not one.
+CREATE OR REPLACE FUNCTION cost_for(t tasks, w scheduler_weights) RETURNS numeric
+LANGUAGE plpgsql STABLE AS $fn$
+DECLARE
+    v_role text;
+    med    numeric;
+    n      integer;
+    est    numeric;
+BEGIN
+    -- Ticket 34 made this a lookup: role_task_kinds is UNIQUE (kind), so
+    -- "(role, kind)" is well defined and the window can no longer be polluted
+    -- by a taskless orchestrator run, which is what ticket 34's D28 measured.
+    SELECT m.role INTO v_role FROM role_task_kinds m WHERE m.kind = t.kind;
+
+    SELECT count(*), percentile_cont(0.5) WITHIN GROUP (ORDER BY r.total)
+      INTO n, med
+      FROM (SELECT (ar.input_tokens + ar.output_tokens) AS total
+              FROM agent_runs ar
+             WHERE ar.program_id = t.program_id
+               AND ar.stop_reason = 'completed'
+               AND ar.role = v_role
+               AND ar.kind = t.kind
+               AND ar.input_tokens IS NOT NULL
+               AND ar.output_tokens IS NOT NULL
+             -- deterministic: started_at ties are broken by id, exactly as the
+             -- queue order is, so two passes read the same N rows
+             ORDER BY ar.started_at DESC, ar.id DESC
+             LIMIT w.history_window_n) r;
+
+    est := shrunk_toward(n, med,
+                         coalesce((w.cost_prior ->> t.kind)::numeric, 0.5)
+                             * w.cost_reference_tokens,
+                         w.shrinkage_n0);
+    RETURN least(greatest(est / w.cost_reference_tokens, w.cost_floor), 1.0);
+END $fn$;
 
 CREATE FUNCTION time_for(t tasks, w scheduler_weights) RETURNS numeric
 LANGUAGE plpgsql STABLE AS $fn$
@@ -274,7 +379,6 @@ DECLARE
     v_role text;
     med    numeric;
     n      integer;
-    prior  numeric;
     est    numeric;
 BEGIN
     SELECT m.role INTO v_role FROM role_task_kinds m WHERE m.kind = t.kind;
@@ -293,10 +397,10 @@ BEGIN
              ORDER BY ar.started_at DESC, ar.id DESC
              LIMIT w.history_window_n) r;
 
-    prior := coalesce((w.time_prior ->> t.kind)::numeric, 0.5);
-    est := (coalesce(n, 0) * coalesce(med, 0)
-            + w.shrinkage_n0 * prior * w.time_reference_seconds)
-           / (coalesce(n, 0) + w.shrinkage_n0);
+    est := shrunk_toward(n, med,
+                         coalesce((w.time_prior ->> t.kind)::numeric, 0.5)
+                             * w.time_reference_seconds,
+                         w.shrinkage_n0);
     RETURN least(greatest(est / w.time_reference_seconds, w.cost_floor), 1.0);
 END $fn$;
 
@@ -339,9 +443,11 @@ BEGIN
              ORDER BY ar.started_at DESC, ar.id DESC
              LIMIT w.history_window_n) r;
 
-    RETURN least(greatest((coalesce(n, 0) * coalesce(mean, 0)
-                           + w.shrinkage_n0 * w.safety_prior)
-                          / (coalesce(n, 0) + w.shrinkage_n0), 0), 1.0);
+    -- Floored at zero and not at `cost_floor`: a kind whose runs have never
+    -- needed a privileged call costs the operator no attention, and charging it
+    -- a floor would price attention nobody paid.
+    RETURN least(greatest(shrunk_toward(n, mean, w.safety_prior, w.shrinkage_n0),
+                          0), 1.0);
 END $fn$;
 
 COMMENT ON FUNCTION safety_for(tasks, scheduler_weights) IS
@@ -424,6 +530,47 @@ INSERT INTO event_table_exempt (table_name, exempt_kind, reason, owner_ticket) V
 
 GRANT SELECT, INSERT, DELETE ON task_dependencies TO rk2_runtime;
 
+-- The runtime needs INSERT and DELETE here because the derivation runs as the
+-- runtime. That grant, on its own, hands the whole of criterion 4 to whatever
+-- can reach that connection: `basis` is a foreign key and nothing else, so one
+-- INSERT naming `runtime_rule` buys a fabricated edge the full value of
+-- everything it claims to unblock, and one DELETE suppresses a real one. The
+-- vocabulary would be bound on exactly the role it has to bind.
+--
+-- So a sound basis is the derivation's to write, and the derivation says so by
+-- setting a transaction-local flag around its own two statements -- the shape
+-- 013 uses for `app.purging`, and for the same reason: the privilege is held by
+-- a step, not by a role. A caller that wants to record a claim writes it with
+-- basis `proposed`, which is what that basis is for.
+--
+-- DELETE has to consult `app.purging` as well, because a program-scoped table
+-- with a BEFORE DELETE trigger that does not is a program nobody can purge --
+-- 030 checks for precisely that.
+CREATE FUNCTION task_dependencies_runtime_rule_is_derived() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_basis text := CASE WHEN TG_OP = 'DELETE' THEN OLD.basis ELSE NEW.basis END;
+BEGIN
+    IF v_basis <> 'runtime_rule'
+       OR coalesce(current_setting('app.deriving_dependencies', true), 'off') = 'on'
+       OR (TG_OP = 'DELETE'
+           AND coalesce(current_setting('app.purging', true), 'off') = 'on') THEN
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END IF;
+
+    RAISE EXCEPTION
+        'a runtime_rule dependency is derive_task_dependencies''s to write, not a caller''s'
+        USING ERRCODE = 'insufficient_privilege',
+              HINT = 'record the claim with basis ''proposed''; a rule derives the sound edge when the rows support it';
+END $fn$;
+
+CREATE TRIGGER task_dependencies_sound_basis_is_derived
+    BEFORE INSERT OR UPDATE OR DELETE ON task_dependencies
+    FOR EACH ROW EXECUTE FUNCTION task_dependencies_runtime_rule_is_derived();
+
+COMMENT ON FUNCTION task_dependencies_runtime_rule_is_derived() IS
+  'A sound basis is written by the derivation and by nothing else. Without this the GRANT the derivation needs is a way for anything holding the runtime connection to mint the unlock value of its choice.';
+
 -- The derivation. Two rules today, both of them a restatement of a branch of
 -- `ready_for`, and the table is the extension point for the rest.
 --
@@ -437,13 +584,18 @@ DECLARE
     n_dropped bigint := 0;
     n_added   bigint := 0;
 BEGIN
+    -- Transaction-local, and switched back off below rather than left on for
+    -- whatever the rest of the pass does. The licence belongs to these two
+    -- statements.
+    PERFORM set_config('app.deriving_dependencies', 'on', true);
+
     WITH gone AS (
         DELETE FROM task_dependencies d
          USING tasks b, tasks u
          WHERE d.program_id = p
            AND d.basis = 'runtime_rule'
-           AND b.id = d.task_id
-           AND u.id = d.unlocked_by_task_id
+           AND b.id = d.task_id           AND b.program_id = d.program_id
+           AND u.id = d.unlocked_by_task_id AND u.program_id = d.program_id
            AND (b.status <> 'pending'
              OR u.status <> 'pending'
              OR ready_for(b) IS DISTINCT FROM d.predicate)
@@ -492,6 +644,7 @@ BEGIN
     )
     SELECT count(*) INTO n_added FROM added;
 
+    PERFORM set_config('app.deriving_dependencies', 'off', true);
     RETURN jsonb_build_object('derived', n_added, 'withdrawn', n_dropped);
 END $fn$;
 
@@ -510,20 +663,44 @@ GRANT EXECUTE ON FUNCTION derive_task_dependencies() TO rk2_runtime;
 -- an unmeasured dependent is not evidence of value, and inventing a number for
 -- it would let unestimated work inflate the thing that is supposed to be
 -- earned.
+--
+-- A dependent's value is SHARED between the pending Tasks that would settle it.
+-- The report rule is where this stops being a nicety: `report.
+-- no_validated_finding` is settled by any one validation, so ten pending
+-- validate Tasks all name the same report Task, and crediting each of them with
+-- the whole of it would hand out that value ten times for work one Task does.
+-- Every validate Task in the Program would then outrank everything else on the
+-- strength of a report nobody has written. Shared, the total credit paid for a
+-- blocked Task is its value exactly once, however many Tasks could settle it.
+--
+-- The share is equal and not weighted by which unlocker is likelier to get
+-- there: that is what a Task adds over the unlocks already coming, and it is
+-- ticket 41's question, not this one's.
 CREATE FUNCTION unlock_for(t tasks, w scheduler_weights) RETURNS numeric
 LANGUAGE sql STABLE AS $fn$
-    SELECT least(coalesce(sum(s.v), 0), 1.0)
-      FROM (SELECT DISTINCT b.id, value_for(b, w) AS v
+    SELECT least(coalesce(sum(s.share), 0), 1.0)
+      FROM (SELECT DISTINCT b.id,
+                   value_for(b, w)
+                     / greatest((SELECT count(DISTINCT d2.unlocked_by_task_id)
+                                   FROM task_dependencies d2
+                                   JOIN task_dependency_bases k2
+                                     ON k2.basis = d2.basis AND k2.sound
+                                   JOIN tasks u2
+                                     ON u2.id = d2.unlocked_by_task_id
+                                    AND u2.program_id = d2.program_id
+                                  WHERE d2.task_id = b.id
+                                    AND d2.program_id = b.program_id
+                                    AND u2.status = 'pending'), 1) AS share
               FROM task_dependencies d
               JOIN task_dependency_bases k ON k.basis = d.basis AND k.sound
-              JOIN tasks b ON b.id = d.task_id
+              JOIN tasks b ON b.id = d.task_id AND b.program_id = d.program_id
              WHERE d.unlocked_by_task_id = t.id
                AND d.program_id = t.program_id
                AND b.status = 'pending') s;
 $fn$;
 
 COMMENT ON FUNCTION unlock_for(tasks, scheduler_weights) IS
-  'The value of the still-pending Tasks that sound edges say this one unblocks, capped at one. An edge whose basis is not sound is not counted, and a dependent with no estimates contributes nothing rather than a guess.';
+  'The value of the still-pending Tasks that sound edges say this one unblocks, each shared between the pending Tasks that could settle it, capped at one. An edge whose basis is not sound is not counted, and a dependent with no estimates contributes nothing rather than a guess.';
 
 REVOKE ALL ON FUNCTION value_for(tasks, scheduler_weights) FROM PUBLIC;
 REVOKE ALL ON FUNCTION time_for(tasks, scheduler_weights) FROM PUBLIC;
@@ -782,16 +959,22 @@ END $fn$;
 CREATE FUNCTION check_task_ranking()
 RETURNS TABLE (problem text, subject text, detail text)
 LANGUAGE sql STABLE AS $fn$
-    -- (a) decision 12, extended to the four factors this file adds. Comments
-    --     are stripped first, as check_scheduler_closure's arm (g) does: the
-    --     first version of that check fired on a comment explaining why the
-    --     clock is absent.
+    -- (a) decision 12, extended to everything this file puts inside a pass --
+    --     the four factors, the shrinkage under three of them, and the
+    --     derivation the pass runs before it ranks. Comments are stripped
+    --     first, as check_scheduler_closure's arm (g) does: the first version of
+    --     that check fired on a comment explaining why the clock is absent.
+    --
+    --     `derive_task_dependencies` is in the list and its rows carry
+    --     `derived_at`, which is not a contradiction: the default on the column
+    --     stamps when the pass ran, and no branch of the function reads it.
     SELECT 'ranking_factor_reads_the_clock'::text, p.proname::text,
-           'a Ranking pass factor reads the clock; two replays of one set of rows would disagree'::text
+           'a Ranking pass step reads the clock; two replays of one set of rows would disagree'::text
       FROM pg_proc p
      WHERE p.pronamespace = 'public'::regnamespace
        AND p.proname IN ('value_for','time_for','safety_for','unlock_for',
-                         'task_rank_factors')
+                         'task_rank_factors','shrunk_toward',
+                         'derive_task_dependencies')
        AND regexp_replace(p.prosrc, '--[^' || chr(10) || ']*', '', 'g')
            ~* '(now\(\)|current_timestamp|clock_timestamp)'
 UNION ALL
@@ -802,7 +985,8 @@ UNION ALL
       FROM pg_proc p
      WHERE p.pronamespace = 'public'::regnamespace
        AND p.proname IN ('value_for','time_for','safety_for','unlock_for',
-                         'task_rank_factors','derive_task_dependencies')
+                         'task_rank_factors','shrunk_toward',
+                         'derive_task_dependencies','check_task_ranking')
        AND has_function_privilege('public', p.oid, 'EXECUTE')
 UNION ALL
     -- (c) criterion 4, as a property of the code rather than of today's rows.
@@ -845,7 +1029,7 @@ UNION ALL
     SELECT 'dependency_edge_predicate_stale', t.label,
            'a runtime-derived edge claims a predicate the blocked Task does not report'
       FROM task_dependencies d
-      JOIN tasks t ON t.id = d.task_id
+      JOIN tasks t ON t.id = d.task_id AND t.program_id = d.program_id
      WHERE d.basis = 'runtime_rule'
        AND t.status = 'pending'
        AND ready_for(t) IS DISTINCT FROM d.predicate
@@ -862,10 +1046,26 @@ UNION ALL
        AND p.proname = 'version_scheduler_weights'
        AND (has_function_privilege('rk2_runtime', p.oid, 'EXECUTE')
          OR has_function_privilege('rk2_state', p.oid, 'EXECUTE'))
+UNION ALL
+    -- (i) criterion 4 again, against the grant that makes it necessary. The
+    --     runtime holds INSERT and DELETE on the edges because the derivation
+    --     runs as the runtime; without the trigger, that grant is a way to mint
+    --     a sound basis, and the vocabulary the other arms guard would be
+    --     decoration.
+    SELECT 'sound_basis_is_writable_by_hand', 'task_dependencies',
+           'no trigger holds runtime_rule to the derivation; any holder of the runtime connection could mint unlock value'
+     WHERE NOT EXISTS (
+        SELECT 1 FROM pg_trigger g
+          JOIN pg_proc p ON p.oid = g.tgfoid
+         WHERE g.tgrelid = 'task_dependencies'::regclass
+           AND NOT g.tgisinternal
+           AND p.proname = 'task_dependencies_runtime_rule_is_derived')
 $fn$;
 
 COMMENT ON FUNCTION check_task_ranking() IS
   'The Ranking pass is a function of rows and a weights version: no factor reads the clock, no priority is stored without the version and the components that produced it, and only a basis something derives can move one.';
+
+REVOKE ALL ON FUNCTION check_task_ranking() FROM PUBLIC;
 
 INSERT INTO standing_checks (name, query, owner_ticket, note) VALUES
     ('task_ranking', 'SELECT * FROM check_task_ranking()', '26',

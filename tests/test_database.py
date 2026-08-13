@@ -1078,6 +1078,15 @@ CONTROLS = (
         "GRANT EXECUTE ON FUNCTION version_scheduler_weights(jsonb) TO rk2_runtime",
     ),
     Control(
+        # Dropping the trigger leaves every row, every grant and every other arm
+        # of the check exactly as they were, and turns `basis` back into a
+        # column anything holding the runtime connection can write
+        # `runtime_rule` into. The soundness vocabulary is then a lookup table
+        # that agrees with whatever it is told.
+        "standing:task_ranking",
+        "DROP TRIGGER task_dependencies_sound_basis_is_derived ON task_dependencies",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -12852,13 +12861,18 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
 #: The Programs of `TaskRankingTest`, sharing a prefix so one DELETE retires them.
 RANK_SLUG = "selftest-rank"
 
-#: What the three analyze Tasks in the unlock scenarios each promise. High enough
-#: that one of them alone outweighs the recon Task that unblocks them, so the
-#: assertion is about the unlock term and not about the sum being large.
-UNLOCKED_WORTH = "0.9"
+#: What the three analyze Tasks in the unlock scenarios each promise. Low enough
+#: that all three together stay under the 1.0 cap: at 0.9 each the sum saturated
+#: at two of them, and "unblocks several paths" was indistinguishable from
+#: "unblocks one". Still high enough that the three together outweigh the richer
+#: recon Task -- 0.1 + 0.5*0.6 against 0.2 -- so the flip is the unlock term's.
+UNLOCKED_WORTH = "0.2"
 
 #: One Program per disturbance, so no scenario is read through another's rows.
-SCENARIOS = ("greedy", "unlock", "tied", "missing", "fresh", "proposed", "reweighted")
+SCENARIOS = (
+    "greedy", "unlock", "tied", "missing", "fresh", "proposed", "reweighted",
+    "shared",
+)
 
 #: Three property classes, because three Hypotheses about one subject have to
 #: disagree about something for `hypotheses_dedup_idx` to admit them.
@@ -12914,6 +12928,7 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         cls.arrange_fresh()
         cls.arrange_proposed()
         cls.arrange_reweighted()
+        cls.arrange_shared()
         cls.arrange_weights()
 
     @classmethod
@@ -12948,8 +12963,8 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         `kind` narrows it, because the unlock scenarios keep two populations in
         one Program: the recon Tasks whose order is the claim, and the blocked
         analyze Tasks that are only there to be waiting. The blocked ones are
-        worth 0.9 each and would lead any ordering that included them, which
-        says nothing -- they are unready and will never be offered.
+        unready and will never be offered, so where they land says nothing about
+        the ordering under test.
         """
         return [
             str(row["label"])
@@ -13082,6 +13097,13 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         cls.rank("tied")
         cls.tied_components = cls.components("tied")
         cls.tied_order = cls.ordering("tied")
+        # Offered twice, and read through the offer rather than through an
+        # ORDER BY of this file's own: a tie broken by a clause the test writes
+        # is a claim about Postgres, not about the scheduler. `offer_slate`
+        # orders by `rank_candidates`, which is where the tie-break lives, and
+        # two identical offers are what "not by chance" means.
+        cls.tied_slate = [str(row["task_label"]) for row in cls.offer()]
+        cls.tied_slate_again = [str(row["task_label"]) for row in cls.offer()]
         cls.tied_created = [
             str(row["label"])
             for row in cls.as_owner(
@@ -13139,6 +13161,20 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         cls.proposed_order = cls.ordering("proposed")
         cls.proposed_components = cls.components("proposed")
 
+        # The same claim written with the basis that would make it count. The
+        # runtime holds INSERT here because the derivation runs as the runtime,
+        # and that grant is the whole of criterion 4 unless a sound basis is
+        # the derivation's alone to write.
+        cls.forged_refusal = cls.refusal(
+            "INSERT INTO task_dependencies (program_id, task_id,"
+            " unlocked_by_task_id, basis, predicate)"
+            " SELECT $1::uuid, b.id, u.id, 'runtime_rule', 'recon.no_subject'"
+            "   FROM tasks b, tasks u"
+            "  WHERE b.program_id = $1::uuid AND b.label = $2"
+            "    AND u.program_id = $1::uuid AND u.label = $3",
+            (cls.identifiers["proposed"], cls.proposed[-1], cls.proposed[0]),
+        )
+
     @classmethod
     def arrange_reweighted(cls):
         """The unlock scenario again, left standing for the weights to move.
@@ -13154,6 +13190,39 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         cls.rank("reweighted")
         cls.reweighted_order = cls.ordering("reweighted", "recon")
         cls.reweighted_components = cls.components("reweighted")
+
+        # The other half of the same grant: deleting a sound edge suppresses an
+        # unlock as surely as forging one invents it, and this Program is where
+        # there are live ones to delete.
+        cls.unwritten_refusal = cls.refusal(
+            "DELETE FROM task_dependencies"
+            " WHERE program_id = $1::uuid AND basis = 'runtime_rule'",
+            (cls.identifiers["reweighted"],),
+        )
+
+    @classmethod
+    def arrange_shared(cls):
+        """One report Task, and the two validations either of which settles it.
+
+        The unlock term's other shape, and the one the report rule makes
+        ordinary: `report.no_validated_finding` is asked of the Program, so
+        every pending validate Task unblocks the same report Task. Paying each
+        of them the whole of its value would hand that value out twice for work
+        one Task does, and would put every validate Task in an engagement ahead
+        of everything else on the strength of a report nobody has written.
+        """
+        cls.shared = cls.seed("shared", 2, kind="validate")
+        cls.shared_report = str(
+            cls.as_owner(
+                "INSERT INTO tasks (program_id, kind, status,"
+                " expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'report', 'pending', $2, $2) RETURNING label",
+                (cls.identifiers["shared"], UNLOCKED_WORTH),
+            ).scalar()
+        )
+        cls.rank("shared")
+        cls.shared_components = cls.components("shared")
+        cls.shared_edges = cls.edges("shared")
 
     @classmethod
     def arrange_weights(cls):
@@ -13199,6 +13268,13 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
             cls.rank("reweighted")
             cls.reranked_order = cls.ordering("reweighted", "recon")
             cls.reranked_components = cls.components("reweighted")
+            # A Program the change does not otherwise touch, ranked again while
+            # the new version is the active one. Without this the "and a new
+            # pass happened" half of criterion 5 is a list of events nothing
+            # appended to, and the assertion about it holds vacuously.
+            cls.greedy_events_at_change = cls.ranked_events("greedy")
+            cls.rank("greedy")
+            cls.greedy_events_after = cls.ranked_events("greedy")
         finally:
             cls.operator(
                 "SELECT version_scheduler_weights("
@@ -13206,7 +13282,6 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
                 (str(cls.weights_before["w_unlock"]),),
             )
         cls.weights_restored = cls.active_weights()
-        cls.greedy_events_after = cls.ranked_events("greedy")
 
     # -- reading the weights ---------------------------------------------------
 
@@ -13321,7 +13396,12 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
             self.tied_components[first]["priority"],
             self.tied_components[second]["priority"],
         )
-        self.assertEqual(self.tied_created, self.tied_order)
+        # The order the runtime offers them in, twice, and it is the order they
+        # were created in. Read off the Slate because that is the ordering the
+        # system acts on; the two offers are what says it was not a coin toss
+        # that happened to land the same way as `created_at`.
+        self.assertEqual(self.tied_slate, self.tied_slate_again)
+        self.assertEqual(self.tied_created, self.tied_slate)
 
     # -- criterion 3: what a Task unlocks can outrank what it is worth ---------
 
@@ -13335,13 +13415,46 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
             self.unlock_components[self.unlock[1]]["priority"],
         )
 
+    def test_several_is_counted_as_several_and_not_capped_to_one(self):
+        # Every waiting Task is in the credit, and the sum is theirs -- not the
+        # 1.0 ceiling, which at a high enough worth would saturate at two and
+        # make "unblocks three paths" indistinguishable from "unblocks one".
+        waiting = [
+            float(str(row["direct_value"]))
+            for label, row in self.unlock_components.items()
+            if label not in self.unlock
+        ]
+        self.assertEqual(3, len(waiting))
+        self.assertAlmostEqual(
+            sum(waiting),
+            float(str(self.unlock_components[self.unlock[0]]["unlock_value"])),
+        )
+
     def test_only_the_unlocking_task_is_credited(self):
-        self.assertEqual(
-            1.0, float(str(self.unlock_components[self.unlock[0]]["unlock_value"]))
+        self.assertGreater(
+            float(str(self.unlock_components[self.unlock[0]]["unlock_value"])), 0.0
         )
         self.assertEqual(
             0.0, float(str(self.unlock_components[self.unlock[1]]["unlock_value"]))
         )
+
+    def test_a_dependent_is_paid_for_once_however_many_could_settle_it(self):
+        worth = float(str(self.shared_components[self.shared_report]["direct_value"]))
+        credited = [
+            float(str(self.shared_components[label]["unlock_value"]))
+            for label in self.shared
+        ]
+
+        self.assertEqual(
+            [(self.shared_report, label, "runtime_rule", "report.no_validated_finding")
+             for label in sorted(self.shared)],
+            sorted(self.shared_edges),
+        )
+        # Half each, and the two halves are the report Task's value exactly
+        # once. Whole-value-each would be two Tasks credited with one report.
+        for share in credited:
+            self.assertAlmostEqual(worth / 2, share)
+        self.assertAlmostEqual(worth, sum(credited))
 
     def test_the_pass_derives_one_edge_per_blocked_task(self):
         self.assertEqual(3, self.unlock_pass["edges_derived"])
@@ -13369,6 +13482,15 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
                 self.assertEqual(
                     0.0, float(str(self.proposed_components[label]["unlock_value"]))
                 )
+
+    def test_a_sound_basis_is_the_derivations_to_write(self):
+        # The runtime may record a claim and may not dress one as derived, in
+        # either direction: minting an edge invents unlock value and deleting
+        # one suppresses it, and both are reachable from the grant the
+        # derivation needs.
+        for refused in (self.forged_refusal, self.unwritten_refusal):
+            with self.subTest(refused=refused[:40]):
+                self.assertIn("derive_task_dependencies", refused)
 
     def test_the_unsound_edge_is_still_recorded(self):
         # Zero unlock value is not the same as a claim nobody may make: the row
@@ -13406,16 +13528,26 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
 
     def test_a_new_version_makes_a_new_pass_and_rewrites_no_old_one(self):
         # Every pass this class ran before the change still names the version it
-        # ran under, and there are more of them than there were.
+        # ran under, byte for byte.
         self.assertEqual(
             self.greedy_events_before,
             self.greedy_events_after[: len(self.greedy_events_before)],
         )
-        self.assertGreater(len(self.greedy_events_after), 0)
         self.assertEqual(
             {str(self.weights_before["version"])},
             {version for _, version in self.greedy_events_before},
         )
+        # And the pass that ran after it is a new one, naming the new version.
+        # Everything recorded before the change is still there unchanged and one
+        # event longer is the whole of it: two passes, two versions, both
+        # readable, neither restated as the other.
+        self.assertEqual(
+            self.greedy_events_at_change, self.greedy_events_after[:-1]
+        )
+        self.assertEqual(
+            len(self.greedy_events_at_change) + 1, len(self.greedy_events_after)
+        )
+        self.assertEqual(str(self.new_version), self.greedy_events_after[-1][1])
 
     def test_the_new_weights_change_the_order_without_moving_a_row(self):
         # Under version N the unlocker leads; under N+1, which prices unlocking
@@ -13486,7 +13618,9 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
             for label, row in self.components(name).items():
                 with self.subTest(program=name, task=label):
                     for column in ("estimated_cost", "estimated_time", "safety_cost",
-                                   "unlock_value"):
+                                   "unlock_value", "direct_value"):
+                        if row[column] is None:  # criterion 6's unestimated Task
+                            continue
                         value = float(str(row[column]))
                         self.assertGreaterEqual(value, 0.0, column)
                         self.assertLessEqual(value, 1.0, column)
