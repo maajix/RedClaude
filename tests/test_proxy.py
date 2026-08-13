@@ -37,6 +37,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -828,6 +829,21 @@ class ExchangeTest(unittest.TestCase):
         client.endheaders(body)
         return client.getresponse()
 
+    def refunds(self, count: int = 1) -> list[tuple]:
+        """The slots the door gave back, waited for rather than sampled.
+
+        `_serve` releases in a `finally`, which runs after the response has been
+        written, so a client that has read its body has not necessarily seen the
+        refund recorded yet. Sampling `fence.released` the instant `read()`
+        returns tests this machine's scheduler; waiting for the count tests the
+        door. The wait is bounded so a release that never comes fails as an
+        empty list rather than as a hang.
+        """
+        deadline = time.monotonic() + 5
+        while len(self.fence.released) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.fence.released
+
     def test_an_authorized_request_reaches_the_target_and_answers_with_a_receipt(self):
         # Criteria 2 and 4 on the happy path: the target answers, the fence wrote
         # exactly one allowed Receipt, and the caller is handed its label.
@@ -1501,9 +1517,8 @@ class ExchangeTest(unittest.TestCase):
         self.through("http://target.example.test/v1/notes").read()
 
         self.assertEqual(1, len(self.fence.reserved))
-        self.assertEqual(1, len(self.fence.released))
         self.assertEqual(
-            ("11111111-1111-1111-1111-111111111111", SLOT, True), self.fence.released[0]
+            [("11111111-1111-1111-1111-111111111111", SLOT, True)], self.refunds()
         )
 
     def test_a_slot_taken_for_a_request_that_never_left_is_given_back_unspent(self):
@@ -1518,7 +1533,7 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(407, response.status)
         self.assertEqual([], self.dialled)
         self.assertEqual(
-            ("11111111-1111-1111-1111-111111111111", SLOT, False), self.fence.released[0]
+            ("11111111-1111-1111-1111-111111111111", SLOT, False), self.refunds()[0]
         )
 
     def test_a_request_with_no_capability_reserves_nothing(self):

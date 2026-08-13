@@ -174,11 +174,24 @@ class Recorder:
             },
         )
         self.lifetime = answers.get("lifetime", 300.0)
+        # An idle reconciliation: nothing had lapsed, and the one Task this
+        # recorder's slate is about is this run's own to claim.
+        self.reconciliation = answers.get(
+            "reconciliation",
+            {
+                "tasks_left_to_live_owners": 0,
+                "tasks_returned": 0,
+                "tasks_retired": 0,
+                "runs_aborted": 0,
+                "leases_released": 0,
+                "hypotheses_returned_to_testable": 0,
+            },
+        )
         # Half an hour, which is the weights' own TTL, so the interval is ten
         # minutes and no beat fires while a stand-in child returns instantly.
         # A test that wants one shortens it.
         self.lease_ttl = answers.get("lease_ttl", 1800.0)
-        self.heartbeat = answers.get(
+        beat = answers.get(
             "heartbeat",
             {
                 "agent_run": "AR7",
@@ -188,6 +201,7 @@ class Recorder:
                 "identity_leases": 1,
             },
         )
+        self.beats = list(answers.get("heartbeats", [beat]))
         self.receipt = answers.get("receipt", ("RC1", "allowed", 200))
         self.promotion = answers.get(
             "promotion",
@@ -259,10 +273,15 @@ class Recorder:
             return [(json.dumps(self.gate),)]
         if sql == execution.LIFETIME:
             return [(self.lifetime,)]
+        if sql == execution.RECONCILE:
+            return [(json.dumps(self.reconciliation),)]
         if sql == execution.LEASE_TTL:
             return [(self.lease_ttl,)]
         if sql == execution.HEARTBEAT:
-            return [(json.dumps(self.heartbeat),)]
+            # Answered in order and then repeated, so a test can say what the
+            # second beat found without saying it about the first.
+            beat = min(len(self.sent(sql)) - 1, len(self.beats) - 1)
+            return [(json.dumps(self.beats[beat]),)]
         if sql == execution.EXCHANGE:
             return [self.receipt] if self.receipt else []
         if sql == execution.PROMOTE:
@@ -277,6 +296,7 @@ class Recorder:
             return [(PROPOSAL, "PR1", proposal.STAGED)]
         if sql in (
             proxy.BIND,
+            execution.BEAT_TIMEOUT,
             execution.CAUSE,
             proxy.CLOSE_TOOL_RUN,
             proposal.INSERT_DROP,
@@ -857,7 +877,7 @@ class HeartbeatTest(unittest.TestCase):
         self.assertLessEqual(1, facts["heartbeat"]["beats"])
         self.assertEqual(
             (None, None),
-            (facts["heartbeat"]["lapsed"], facts["heartbeat"]["failed"]),
+            (facts["heartbeat"]["lapsed"], facts["heartbeat"]["failure"]),
         )
         self.assertEqual([], [step.name for step in ledger.assertions if not step.ok])
 
@@ -904,7 +924,7 @@ class HeartbeatTest(unittest.TestCase):
         with compiled():
             ledger, facts = attempt(connection, Waiting(connection))
         self.assertEqual(1, len(connection.sent(execution.HEARTBEAT)))
-        self.assertIn("the server went away", str(facts["heartbeat"]["failed"]))
+        self.assertIn("the server went away", str(facts["heartbeat"]["failure"]))
         # Reported, and the attempt still finished: what a failed beat costs is
         # the Lease, which expires on its own, and the child was still running.
         self.assertIn(execution.FINISH, connection.statements)
@@ -920,6 +940,94 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(
             ["heartbeat"], [step.name for step in ledger.assertions if not step.ok]
         )
+        # One assertion under that name and not two: a run that never beat must
+        # not also be told its Leases were held through nothing.
+        self.assertEqual(
+            1, len([step for step in ledger.assertions if step.name == "heartbeat"])
+        )
+
+    def test_a_ttl_of_zero_is_a_configuration_this_runtime_refuses_to_beat_on(self):
+        # Read, and unusable: an interval of zero beats is not a shorter Lease,
+        # it is a Lease nothing renews, and reporting it as a read TTL would
+        # hide the one thing about it that matters.
+        connection = Recorder(lease_ttl=0.0)
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual([], connection.sent(execution.HEARTBEAT))
+        self.assertEqual(
+            ["heartbeat"], [step.name for step in ledger.assertions if not step.ok]
+        )
+
+    def test_the_identity_half_going_missing_stops_the_beating(self):
+        # The Task lease renewed and the Identity leases did not come with it.
+        # Half a hold is the disagreement the Lease exists to prevent, so it is
+        # reported the way a lapse is and the beating stops.
+        held = {
+            "agent_run": "AR7", "beat": True, "reason": None,
+            "expires_at": "2026-08-13 19:30:00+00", "identity_leases": 2,
+        }
+        connection = Recorder(
+            lease_ttl=self.QUICK, heartbeats=[held, {**held, "identity_leases": 0}]
+        )
+        with compiled():
+            ledger, facts = attempt(connection, Waiting(connection, beats=2))
+        self.assertEqual(1, facts["heartbeat"]["beats"])
+        self.assertIn("Identity half", str(facts["heartbeat"]["lapsed"]))
+        self.assertEqual(
+            ["heartbeat"], [step.name for step in ledger.assertions if not step.ok]
+        )
+
+
+class ReconciliationTest(unittest.TestCase):
+    """PH2-24: what a sibling that stopped beating left, before anything is offered.
+
+    The pass this slice makes is the first reader that would otherwise walk past
+    a crashed run's Tasks, so it asks first. What is asserted here is the order,
+    the report, and that a reconciliation this runtime cannot make does not stop
+    it from doing its own work.
+    """
+
+    def test_reconciliation_happens_before_the_slate_is_offered(self):
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        statements = connection.statements
+        self.assertLess(
+            statements.index(execution.RECONCILE), statements.index(execution.RANK)
+        )
+
+    def test_what_was_recovered_and_what_was_left_alone_are_both_reported(self):
+        connection = Recorder(
+            reconciliation={
+                "tasks_left_to_live_owners": 2,
+                "tasks_returned": 1,
+                "tasks_retired": 1,
+                "runs_aborted": 2,
+                "leases_released": 3,
+                "hypotheses_returned_to_testable": 1,
+            }
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual(2, facts["reconciliation"]["tasks_left_to_live_owners"])
+        held = [step for step in ledger.assertions if step.name == "reconciliation"]
+        self.assertEqual(1, len(held))
+        self.assertIn("2 Task(s) recovered", held[0].detail)
+        self.assertIn("2 left to the runs", held[0].detail)
+
+    def test_a_reconciliation_that_fails_does_not_stop_the_pass(self):
+        connection = Recorder(
+            raises={execution.RECONCILE: database_error("deadlock detected")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIsNone(facts["reconciliation"])
+        self.assertEqual(
+            ["reconciliation"], [step.name for step in ledger.assertions if not step.ok]
+        )
+        # The claim still happened: recovering somebody else's work and doing
+        # this run's own are two things, and only one of them failed.
+        self.assertIn(execution.CLAIM, connection.statements)
 
 
 if __name__ == "__main__":

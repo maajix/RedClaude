@@ -8230,6 +8230,14 @@ STRUCTURAL = ("completion_guard_detached", "promotion_writes_no_event")
 #: that differed between two identically seeded Programs would mean the ranking
 #: pass read something other than its rows and its weights version.
 DECIDED = {
+    #: Counts, all of them, and on a seeded Program all of them zero. Kept
+    #: whole because a reconciliation that recovered something here would mean
+    #: one of the two Programs had a lapsed Lease the other did not.
+    "reconciliation": None,
+    #: `beats` and the `identities` the last beat saw are how long the child
+    #: took divided by the interval, which is this machine's load and not a
+    #: decision. `every` is, and so is either way it can stop.
+    "heartbeat": ("every", "lapsed", "failure"),
     "slate": ("ordinal", "task", "kind", "subject", "priority", "factors",
               "entitled"),
     "task": ("label", "kind", "attempts", "subject", "subject_type"),
@@ -11652,8 +11660,20 @@ class LeaseTest(DatabaseCase):
         # Settled after the releases, because a Task left `claimed` with no
         # Lease is a row the standing check refuses -- correctly. Releasing is
         # not deciding what the Task becomes, and this is the caller deciding.
+        cls.before_closure = cls.high_water("released")
         cls.released_closure = cls.call(
             "SELECT finish_task_attempt($1::uuid, 'error')", cls.holder("released")
+        )
+        # The other direction of the same question: the closing declares its own
+        # cause before it calls the release, and everything the transaction
+        # writes after that must still be about the run it named.
+        cls.closure_causes = set(
+            str(row["agent_run_id"])
+            for row in cls.as_owner(
+                "SELECT DISTINCT agent_run_id::text AS agent_run_id FROM events"
+                " WHERE program_id = $1::uuid AND seq > $2",
+                (cls.identifiers["released"], cls.before_closure),
+            ).dicts()
         )
 
     @classmethod
@@ -11662,7 +11682,19 @@ class LeaseTest(DatabaseCase):
         cls.claim("crashed")
         cls.under_test("crashed")
         cls.lapse("crashed")
+        cls.before_recovery = cls.high_water("crashed")
         cls.recovered, cls.recovered_again = cls.twice("SELECT reconcile_leases()")
+        # What the recovery said it was caused by. `release_leases` used to
+        # declare a cause of its own, and a cause is transaction-local: the
+        # loop's last dead run then stood as the reason for every Task the
+        # sweep settled afterwards.
+        cls.recovery_causes = int(
+            cls.scalar(
+                "SELECT count(*) FROM events"
+                " WHERE program_id = $1::uuid AND seq > $2 AND agent_run_id IS NOT NULL",
+                (cls.identifiers["crashed"], cls.before_recovery),
+            )
+        )
         cls.after_recovery = cls.lease("crashed")
         cls.recovered_hypothesis = str(
             cls.scalar(
@@ -11697,12 +11729,56 @@ class LeaseTest(DatabaseCase):
             "SELECT resume_program($1::uuid)", (cls.identifiers["alive"],)
         )
         cls.after_resume = cls.lease("alive")
+        # A second Task about the same Hypothesis, and therefore about the same
+        # Identity. Without it the competition below proves only that a claimed
+        # Task cannot be claimed twice; criterion 3 also says the Identity under
+        # it cannot be taken, and that is a different Task being refused.
+        # A second endpoint, because `tasks_live_dedup_idx` is what stops two
+        # Tasks about the same subject and the same Hypothesis -- the Identity
+        # is what these two share, and it has to be the only thing.
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            rival = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
+                    (cls.identifiers["alive"], HOST, "endpoint:GET /rival"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method, path_template)"
+                " SELECT $1::uuid, e.application_id, 'GET', '/rival'"
+                "   FROM endpoints e JOIN entities x ON x.id = e.entity_id"
+                "  WHERE x.program_id = $2::uuid LIMIT 1",
+                (rival, cls.identifiers["alive"]),
+            )
+            cls.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " hypothesis_id, expected_information_gain, potential_impact)"
+                " SELECT $1::uuid, 'hunt', 'pending', $2::uuid, h.id, 0.9, 0.9"
+                "   FROM hypotheses h WHERE h.program_id = $1::uuid",
+                (cls.identifiers["alive"], rival),
+            )
         # The competing claim, made the way a second `rk run` makes it: a fresh
         # pass over the Program's own rows, and a claim off whatever it offers.
         cls.bind("alive")
         cls.competing_slate = cls.offer()
         cls.competing_claim = cls.claimed_label("SELECT claim_task()")
         cls.after_competition = cls.lease("alive")
+        cls.rival_refusal = str(
+            cls.scalar(
+                "SELECT claimable_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+                " WHERE w.active AND t.program_id = $1::uuid AND t.status = 'pending'",
+                (cls.identifiers["alive"],),
+            )
+        )
+        cls.identities_held = int(
+            cls.scalar(
+                "SELECT count(*) FROM identity_leases"
+                " WHERE program_id = $1::uuid AND released_at IS NULL",
+                (cls.identifiers["alive"],),
+            )
+        )
 
     # -- what the scenarios are built out of -----------------------------------
 
@@ -11884,6 +11960,18 @@ class LeaseTest(DatabaseCase):
             )
 
     @classmethod
+    def high_water(cls, name: str) -> int:
+        """The last Event this Program had written, so a later read is a delta."""
+        return int(
+            str(
+                cls.scalar(
+                    "SELECT coalesce(max(seq), 0) FROM events WHERE program_id = $1::uuid",
+                    (cls.identifiers[name],),
+                )
+            )
+        )
+
+    @classmethod
     def as_owner(cls, sql: str, parameters: tuple = ()):
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
@@ -11908,7 +11996,7 @@ class LeaseTest(DatabaseCase):
             "       a.finished_at, a.stop_reason,"
             "       t.lease_expires_at IS NOT DISTINCT FROM l.expires_at AS agree"
             "  FROM tasks t"
-            "  JOIN agent_runs a ON a.id = $2::uuid"
+            "  JOIN agent_runs a ON a.id = $2::uuid AND a.task_id = t.id"
             "  LEFT JOIN identity_leases l ON l.holder_agent_run_id = a.id"
             " WHERE t.program_id = $1::uuid",
             (cls.identifiers[name], cls.runs[name][1]),
@@ -12013,6 +12101,13 @@ class LeaseTest(DatabaseCase):
     def test_the_competing_claim_left_the_lease_exactly_as_it_found_it(self):
         self.assertEqual(self.after_resume, self.after_competition)
 
+    def test_the_identity_under_a_live_lease_refuses_a_second_task_too(self):
+        # The other half of criterion 3, and the one an empty slate cannot
+        # show: a Task nobody has claimed, ready in every other respect, and
+        # refused for the Identity its Hypothesis names being held elsewhere.
+        self.assertEqual("identity_held", self.rival_refusal)
+        self.assertEqual(1, self.identities_held)
+
     # -- criterion 4: release, twice, and attributed --------------------------
 
     def test_the_release_gives_both_halves_back(self):
@@ -12036,6 +12131,15 @@ class LeaseTest(DatabaseCase):
     def test_the_closing_finds_the_leases_already_given_back(self):
         self.assertEqual(0, self.released_closure["leases_released"])
         self.assertEqual("pending", self.released_closure["task_status"])
+
+    def test_the_release_keeps_the_cause_its_caller_declared(self):
+        # A shared verb declaring its own cause would overwrite the closing's,
+        # and a cause is transaction-local: every row the closing settles after
+        # the release would then name whatever the release last said.
+        self.assertEqual({self.runs["released"][1]}, self.closure_causes)
+
+    def test_reconciliation_attributes_nothing_to_the_run_it_ended(self):
+        self.assertEqual(0, self.recovery_causes)
 
     # -- criterion 5: reconciliation, and what it declines to touch -----------
 

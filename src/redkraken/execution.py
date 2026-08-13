@@ -233,11 +233,25 @@ FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
 LEASE_TTL = "SELECT extract(epoch FROM lease_ttl) FROM scheduler_weights WHERE active"
 HEARTBEAT = "SELECT heartbeat_leases($1::uuid)"
 
+#: What a beat may not outlast. This connection has no timeout of its own -- no
+#: statement in this module does -- so a server that stops answering blocks the
+#: caller forever, and for every other statement here that is the caller's own
+#: thread and its own problem. For a beat it is a second thread the closing has
+#: to join before it may use the connection again, so the beat is the one
+#: statement that says how long it is willing to wait.
+BEAT_TIMEOUT = "SET LOCAL statement_timeout = '20s'"
+
+#: Recovery for what an owner that stopped beating left in flight, asked once
+#: per pass and before anything is offered. A crashed sibling's Tasks are not
+#: this run's to wait for, and the offer that follows is the first reader that
+#: would otherwise skip them.
+RECONCILE = "SELECT reconcile_leases()"
+
 #: How many beats fit in one TTL. Three, so two may be lost -- to a slow
 #: statement, a paused container, a machine that swapped -- before the Lease
 #: lapses and this run's work becomes something another one may take. One would
 #: make every missed beat fatal; ten would spend the log on saying nothing.
-HEARTBEAT_SHARE = 3
+BEATS_PER_TTL = 3
 
 #: The three answers the gate can give, and the two this runtime may act on.
 ALLOW = "allow"
@@ -391,6 +405,12 @@ class Heartbeat:
     whole life of this thread and touches nothing until `__exit__` has joined
     it. Overlap is not avoided by a lock here, it is not possible.
 
+    That join is unbounded, and `BEAT_TIMEOUT` is why it can be. Bounding the
+    join instead would trade a wait for two threads on one stream, which is the
+    one thing the paragraph above rules out; bounding the statement leaves the
+    beat to fail like any other, and a thread with an error to report stops on
+    its own.
+
     A beat that comes back refused stops the beating and is not retried. The
     database answers `beat: false` when the Task Lease has already lapsed, and
     at that point some reconciliation is entitled to this run's work -- may have
@@ -416,6 +436,7 @@ class Heartbeat:
         self.facts = facts
         self.every = every
         self.beats = 0
+        self.identities: int | None = None
         self.lapsed: str | None = None
         self.failure: str | None = None
         self._stop = threading.Event()
@@ -437,8 +458,9 @@ class Heartbeat:
         self.facts["heartbeat"] = {
             "every": self.every,
             "beats": self.beats,
+            "identities": self.identities,
             "lapsed": self.lapsed,
-            "failed": self.failure,
+            "failure": self.failure,
         }
         self._report()
         return False
@@ -450,18 +472,38 @@ class Heartbeat:
         while not self._stop.wait(self.every):
             try:
                 with self.connection.transaction():
+                    self.connection.execute(BEAT_TIMEOUT)
                     _actor(self.connection)
                     answer = proxy.as_object(
                         self.connection.execute(
                             HEARTBEAT, (self.claimed.agent_run_id,)
                         ).scalar()
                     )
-            except pg.DatabaseError as error:
+            except (pg.DatabaseError, pg.ConnectionError_) as error:
+                # Both, because they are siblings rather than one deriving from
+                # the other: the server refusing is a `DatabaseError` and the
+                # stream going away is a `ConnectionError_`, and a thread that
+                # caught only the first would die with its exception unread,
+                # leaving the closing to report a Lease it did not renew.
                 self.failure = str(error)
                 return
             if not answer.get("beat"):
                 self.lapsed = str(answer.get("reason"))
                 return
+            held = int(answer.get("identity_leases") or 0)
+            if self.identities is not None and held < self.identities:
+                # The Task half renewed and the Identity half did not come with
+                # it. Nothing in this corpus should be able to do that, which is
+                # exactly why it is worth saying: what a run holds is one hold,
+                # and half of one is the disagreement the Lease exists to
+                # prevent. Stopping is the same answer as a lapse, for the same
+                # reason -- this process no longer holds what it claimed as.
+                self.lapsed = (
+                    f"the Identity half of the Lease went from {self.identities} "
+                    f"hold(s) to {held}"
+                )
+                return
+            self.identities = held
             self.beats += 1
 
     def _report(self) -> None:
@@ -483,10 +525,16 @@ class Heartbeat:
                 source="database",
             )
             return
+        if not self._started:
+            # Nothing beat and nothing was going to: `_heartbeat` already failed
+            # the same assertion saying why. A hold here would be a second
+            # assertion under the same name contradicting the first.
+            return
         self.ledger.hold(
             "heartbeat",
-            f"{self.claimed.task_label} and every Identity leased with it were held "
-            f"through {self.beats} beat(s), one every {self.every:.0f}s",
+            f"{self.claimed.task_label} and the {self.identities or 0} Identity Lease(s) "
+            f"taken with it were held through {self.beats} beat(s), "
+            f"one every {self.every:.0f}s",
         )
 
 
@@ -509,13 +557,14 @@ class Slice:
     timeout: float = agent.TIMEOUT
 
     def attempt(self, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
-        """Offer, claim, run, promote, close. Once, and closed either way.
+        """Reconcile, offer, claim, run, promote, close. Once, and closed either way.
 
         The session is bound to the Program first and stays bound: every
         scheduler function refuses an unbound session, and binding per statement
         would be four chances to bind the wrong one.
         """
         facts = {
+            "reconciliation": None,
             "slate": [],
             "task": None,
             "agent_run": None,
@@ -529,6 +578,7 @@ class Slice:
             "closure": None,
         }
         connection.execute(proxy.BIND, (program_id,))
+        facts["reconciliation"] = self._reconcile(ledger, connection)
 
         offered = self._offer(ledger, connection)
         if offered is None:
@@ -555,6 +605,42 @@ class Slice:
         return facts
 
     # -- the queue ---------------------------------------------------------
+
+    def _reconcile(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
+        """What an owner that stopped beating left behind, before anything is offered.
+
+        Here rather than in the restart sweep, and explicitly rather than inside
+        a read. `resume_program` runs once per `rk run` and answers the question
+        for what was in flight when this process started; a sibling that dies
+        while this one is working is nobody's restart, and the pass that is
+        about to ask what is ready is the first thing that would otherwise walk
+        past its Tasks. It reports what it declined to touch as well as what it
+        recovered -- a live owner is an answer, not an absence.
+
+        A failure is reported and does not stop the pass. Reconciliation is
+        recovery of somebody else's work; this run can still do its own.
+        """
+        with connection.transaction():
+            _actor(connection)
+            try:
+                answer = proxy.as_object(connection.execute(RECONCILE).scalar())
+            except pg.DatabaseError as error:
+                ledger.fail(
+                    "reconciliation",
+                    f"expired Leases could not be reconciled: {error}",
+                    code=INTEGRITY_FAILED,
+                    source="database",
+                )
+                return None
+        recovered = int(answer.get("tasks_returned") or 0) + int(
+            answer.get("tasks_retired") or 0
+        )
+        ledger.hold(
+            "reconciliation",
+            f"{recovered} Task(s) recovered from lapsed Leases, "
+            f"{answer.get('tasks_left_to_live_owners')} left to the runs still holding them",
+        )
+        return answer
 
     def _offer(self, ledger: Ledger, connection: pg.Connection) -> list[dict] | None:
         """One scheduler pass: rank, advance the quota, offer.
@@ -730,7 +816,9 @@ class Slice:
         """
         try:
             ttl = float(str(connection.execute(LEASE_TTL).scalar()))
-        except (pg.DatabaseError, TypeError, ValueError) as error:
+            if ttl <= 0:
+                raise ValueError(f"the active weights declare a TTL of {ttl}s")
+        except (pg.DatabaseError, pg.ConnectionError_, TypeError, ValueError) as error:
             ledger.fail(
                 "heartbeat",
                 f"the Lease TTL could not be read, so {claimed.agent_run_label} will "
@@ -739,7 +827,7 @@ class Slice:
                 source="database",
             )
             ttl = 0.0
-        return Heartbeat(connection, ledger, claimed, facts, ttl / HEARTBEAT_SHARE)
+        return Heartbeat(connection, ledger, claimed, facts, ttl / BEATS_PER_TTL)
 
     def _close(
         self,

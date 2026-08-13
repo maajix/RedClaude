@@ -48,6 +48,13 @@
 -- tell a deliberate non-event from a trigger somebody disabled. `released_at`
 -- is untouched by this and stays an event, which is the asymmetry that matters
 -- -- renewing a hold is bookkeeping, ending one is a fact about the Program.
+--
+-- The cost is paid on the INSERT: 016 strips ignored keys from the created
+-- payload too, so `identity_lease.created` stops carrying the expiry it was
+-- created with. That is the same trade 014 made for `tasks.lease_expires_at`
+-- and it is made the same way here, because a column whose value the heartbeat
+-- rewrites every few minutes is not a fact the log can hold -- the row holds
+-- it, and the log holds when the hold began and when it ended.
 UPDATE event_table_config
    SET ignored_columns = ignored_columns || '{expires_at}'
  WHERE table_name = 'identity_leases';
@@ -156,8 +163,20 @@ BEGIN
             USING ERRCODE = 'check_violation';
     END IF;
 
-    PERFORM set_actor('runtime');
-    PERFORM set_cause(v_run.id, v_run.task_id);
+    -- Declared only when this transaction has not declared one already, and
+    -- that condition is the whole of what makes this safe to call from inside
+    -- another verb. `set_actor` defaults the id to `session_user`, so a bare
+    -- call here would overwrite the closing's `rk run` with a role name, and
+    -- `set_cause` is transaction-local and outlives the call -- so the version
+    -- of this that always set it left `reconcile_leases`'s later writes
+    -- attributed to whichever dead run its loop happened to end on. A verb
+    -- that is sometimes the whole transaction and sometimes one statement of
+    -- it has to ask which it is.
+    IF current_setting('app.actor_xact', true)
+       IS DISTINCT FROM pg_current_xact_id()::text THEN
+        PERFORM set_actor('runtime');
+        PERFORM set_cause(v_run.id, v_run.task_id);
+    END IF;
 
     -- `IS NOT NULL` is what makes the second call a no-op rather than a second
     -- identical write: without it the row is updated to the value it already
@@ -281,6 +300,25 @@ END $fn$;
 -- liveness this system has and the only one it needs: a process that died
 -- stops beating, and a process that is alive and not beating has nothing to
 -- distinguish it from one that died.
+--
+-- Said once, in the shape 023 says `ready_for` and `identity_held_for` in:
+-- the reconciler, the restart sweep and two arms of the standing check all
+-- have to agree about what "still held" means, and three of them asking it
+-- with their own WHERE clause is three chances to drift. In flight is part of
+-- it, not a separate question -- a lease on a Task nobody is executing is not
+-- a live hold, it is arm (d)'s leftover.
+CREATE FUNCTION lease_live_for(t tasks) RETURNS boolean
+LANGUAGE sql STABLE AS $fn$
+    SELECT t.status IN ('claimed','running')
+       AND t.lease_expires_at IS NOT NULL
+       AND t.lease_expires_at > now()
+$fn$;
+
+COMMENT ON FUNCTION lease_live_for(tasks) IS
+    'Whether some run still holds this Task: it is in flight and its Lease has '
+    'not lapsed. The only liveness this system has, because a process that '
+    'died stops beating and nothing else distinguishes it from one that lives.';
+
 DROP FUNCTION sweep_expired_leases();
 
 CREATE FUNCTION reconcile_leases() RETURNS jsonb
@@ -305,8 +343,7 @@ BEGIN
     SELECT count(*) FILTER (WHERE live),
            coalesce(array_agg(id) FILTER (WHERE NOT live), '{}'::uuid[])
       INTO n_live, v_dead
-      FROM (SELECT t.id,
-                   t.lease_expires_at IS NOT NULL AND t.lease_expires_at > now() AS live
+      FROM (SELECT t.id, lease_live_for(t) AS live
               FROM tasks t
              WHERE t.program_id = p AND t.status IN ('claimed','running')) x;
 
@@ -334,12 +371,19 @@ BEGIN
     -- child ran against it -- and a recovery that gave it back would loop
     -- forever on work that fails the same way each time, while one that spent a
     -- second would retire a Task for having crashed once.
+    -- `lease_expires_at` is nulled here as well as in `release_leases`, and the
+    -- repetition is deliberate rather than redundant: the release reaches the
+    -- Task through the run holding it, and a Task in flight whose `agent_runs`
+    -- row is gone has no such path. Leaving it settled with an expiry is arm
+    -- (d)'s own `task_lease_outlives_its_flight`, so the statement that settles
+    -- it is the statement that clears it.
     UPDATE tasks t SET status = 'abandoned', abandoned_reason = 'attempts_exhausted',
-                       finished_at = now(), priority = NULL
+                       finished_at = now(), priority = NULL, lease_expires_at = NULL
      WHERE t.id = ANY (v_dead) AND t.attempts >= w.max_attempts;
     GET DIAGNOSTICS n_gone = ROW_COUNT;
 
-    UPDATE tasks t SET status = 'pending', claimed_at = NULL, priority = NULL
+    UPDATE tasks t SET status = 'pending', claimed_at = NULL, priority = NULL,
+                       lease_expires_at = NULL
      WHERE t.id = ANY (v_dead) AND t.attempts < w.max_attempts;
     GET DIAGNOSTICS n_task = ROW_COUNT;
 
@@ -386,8 +430,7 @@ BEGIN
     SELECT count(*) FILTER (WHERE live),
            coalesce(array_agg(id) FILTER (WHERE NOT live), '{}'::uuid[])
       INTO n_live, v_dead
-      FROM (SELECT t.id,
-                   t.lease_expires_at IS NOT NULL AND t.lease_expires_at > now() AS live
+      FROM (SELECT t.id, lease_live_for(t) AS live
               FROM tasks t
              WHERE t.program_id = p_program AND t.status IN ('claimed','running')) x;
 
@@ -407,10 +450,7 @@ BEGIN
        SET finished_at = now(), stop_reason = 'aborted', result = NULL
      WHERE a.program_id = p_program AND a.finished_at IS NULL
        AND NOT EXISTS (SELECT 1 FROM tasks t
-                        WHERE t.id = a.task_id
-                          AND t.status IN ('claimed','running')
-                          AND t.lease_expires_at IS NOT NULL
-                          AND t.lease_expires_at > now());
+                        WHERE t.id = a.task_id AND lease_live_for(t));
     GET DIAGNOSTICS n_runs = ROW_COUNT;
 
     UPDATE agent_sessions s SET unbound_at = now()
@@ -433,10 +473,7 @@ BEGIN
       FROM hypotheses h
      WHERE h.program_id = p_program AND h.status = 'testing'
        AND NOT EXISTS (SELECT 1 FROM tasks t
-                        WHERE t.hypothesis_id = h.id
-                          AND t.status IN ('claimed','running')
-                          AND t.lease_expires_at IS NOT NULL
-                          AND t.lease_expires_at > now());
+                        WHERE t.hypothesis_id = h.id AND lease_live_for(t));
     GET DIAGNOSTICS n_hyp = ROW_COUNT;
 
     RETURN jsonb_build_object('tasks_unclaimed', n_tasks,
@@ -466,7 +503,8 @@ DO $$
 DECLARE f text;
 BEGIN
     FOREACH f IN ARRAY ARRAY[
-        'heartbeat_leases(uuid)', 'release_leases(uuid)', 'reconcile_leases()']
+        'lease_live_for(tasks)', 'heartbeat_leases(uuid)',
+        'release_leases(uuid)', 'reconcile_leases()']
     LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO rk2_runtime', f);
@@ -552,6 +590,15 @@ LANGUAGE sql STABLE AS $fn$
            ~ 'reconcile_leases'
 
   UNION ALL
+    -- A view is the other way a read could reach it: Postgres will happily let
+    -- a VOLATILE function be selected from one, and then "run the reconciler"
+    -- and "read the queue" are the same statement.
+    SELECT 'reconciliation_is_reachable_from_a_view', v.viewname,
+           'a view selects reconcile_leases()'
+      FROM pg_views v
+     WHERE v.schemaname = 'public' AND v.definition ~ 'reconcile_leases'
+
+  UNION ALL
     -- (g) every lease write declares an actor. The emitter raises without one,
     --     so this is not what makes attribution true -- it is what stops a
     --     verb from being written that can only be called inside somebody
@@ -570,17 +617,38 @@ LANGUAGE sql STABLE AS $fn$
            'an agent-reachable role can call a lease verb'
       FROM pg_proc p
      WHERE p.pronamespace = 'public'::regnamespace
-       AND p.proname IN ('heartbeat_leases','release_leases','reconcile_leases')
+       AND p.proname IN ('lease_live_for','heartbeat_leases','release_leases',
+                         'reconcile_leases')
        AND has_function_privilege('public', p.oid, 'EXECUTE')
+
+  UNION ALL
+    -- (i) the glossary's sentence in the direction the row arms miss. Arm (a)
+    --     compares the two expiries and an Identity Lease that was released
+    --     out from under a live Task Lease has no row left to compare -- so a
+    --     clamped run would go on beating, holding work it can no longer
+    --     execute as the Identity it claimed as. Asked of the same three
+    --     things `claim_task` asks before it writes the leases: the role
+    --     clamps, the Hypothesis names an Identity, the Task is held.
+    SELECT 'task_lease_alive_without_its_identity_hold', t.label,
+           'a clamped run holds a live Task Lease and no Identity Lease'
+      FROM tasks t
+      JOIN role_task_kinds m ON m.kind = t.kind
+      JOIN roles r ON r.role = m.role AND r.clamp_to_identity_leases
+      JOIN hypotheses h ON h.id = t.hypothesis_id
+     WHERE lease_live_for(t)
+       AND coalesce(h.identity_a_entity_id, h.identity_b_entity_id) IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM identity_leases l
+                        JOIN agent_runs a ON a.id = l.holder_agent_run_id
+                       WHERE a.task_id = t.id AND l.released_at IS NULL)
 $fn$;
 
 REVOKE ALL ON FUNCTION check_lease_liveness() FROM PUBLIC;
 
 COMMENT ON FUNCTION check_lease_liveness() IS
     'What a Lease can get wrong: two halves of one hold disagreeing about when '
-    'it ends, a hold outliving its holder, a Task in flight with nothing '
-    'holding it or holding one it is not in, a second clock, and a '
-    'reconciliation something else can trigger.';
+    'it ends or one half missing entirely, a hold outliving its holder, a Task '
+    'in flight with nothing holding it or holding one it is not in, a second '
+    'clock, and a reconciliation something else can trigger.';
 
 INSERT INTO standing_checks(name, query, owner_ticket, note) VALUES
     ('lease_liveness', 'SELECT * FROM check_lease_liveness()', '24',
