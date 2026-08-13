@@ -57,8 +57,18 @@ _Avoid_: Lock, reservation, checkout
 **Surface fingerprint**:
 A value summarising an application's observable surface, recomputed after recon
 and compared against itself over time. A change is what makes a refuted
-hypothesis due again.
-_Avoid_: Hash, version, snapshot, signature
+hypothesis due again. The word for the value is the same as the word for the
+record: a column, a payload key or a view column that calls it something else
+is the same synonym problem with a new spelling.
+_Avoid_: Hash, digest, version, snapshot, signature
+
+**Surface delta**:
+One named difference between two fingerprints of one Application: an Endpoint,
+a Parameter, a Technology or an Identity relationship that appeared,
+disappeared or changed, carrying the element on both sides, the row it is about
+and the Property classes it puts back in question. It says what moved and what
+is worth asking again; it never says a refutation was wrong.
+_Avoid_: Diff, drift, regression, change event
 
 ## Epistemics
 
@@ -177,8 +187,11 @@ _Avoid_: Ingestion, commit, acceptance
 **Event**:
 An immutable record that something happened, appended in the same transaction as
 the row it describes. A *row event* mirrors one write and names its row; an
-*occurrence event* records something with no row at all, like a refusal or a
-resume. The log proves the state changes are complete and says why the system
+*occurrence event* records something no single row stands for: a refusal, a
+resume, or one act that wrote many rows, which it may still name. The
+distinction is what the event mirrors, not whether a row exists. A ranking pass
+and a fingerprint are each one thing that happened, whatever they
+wrote. The log proves the state changes are complete and says why the system
 thought what it thought — it is never the path state is rebuilt from.
 _Avoid_: Log entry, message, audit record, projection
 

@@ -216,6 +216,7 @@ EXCHANGE = (
 
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
 PROMOTE = "SELECT promote_proposal($1::uuid)"
+FINGERPRINT = "SELECT fingerprint_program_surface()"
 FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
 
 #: The three answers the gate can give, and the two this runtime may act on.
@@ -868,6 +869,11 @@ class Slice:
         emits no Event for a cause to name. `promote_proposal` sets its own,
         inside the transaction that writes the Observations, which is the only
         place one would survive to be read.
+
+        The fingerprint is the third call and shares the second one's
+        transaction: 022 asks for one after recon, and a promotion that
+        committed without one would leave the Surface changed and nothing
+        recording that it had.
         """
         if result.mission_result is None:
             ledger.hold(
@@ -913,6 +919,14 @@ class Slice:
                 promotion = proxy.as_object(
                     connection.execute(PROMOTE, (staged.proposal_id,)).scalar()
                 )
+                # In the same transaction, because "after recon" means after
+                # the rows exist and before anything reads them: a fingerprint
+                # taken in a later transaction would be a fingerprint of
+                # whatever else had happened by then. 022 makes it one Event per
+                # Application rather than a side effect of the promotion.
+                swept = proxy.as_object(
+                    connection.execute(FINGERPRINT).scalar()
+                )
         except pg.DatabaseError as error:
             ledger.fail(
                 "promotion",
@@ -928,10 +942,19 @@ class Slice:
             "observations": observations,
             "refused": int(promotion.get("refused") or 0),
         }
+        facts["fingerprint"] = {
+            "applications": int(swept.get("applications") or 0),
+            "changed": int(swept.get("changed") or 0),
+        }
         ledger.hold(
             "promotion",
             f"{staged.label} is {promotion.get('status')}: {len(observations)} "
             f"Observation(s) canonical, {promotion.get('refused')} refused",
+        )
+        ledger.hold(
+            "fingerprint",
+            f"{facts['fingerprint']['applications']} Application(s) fingerprinted, "
+            f"{facts['fingerprint']['changed']} changed",
         )
 
     def _finish(

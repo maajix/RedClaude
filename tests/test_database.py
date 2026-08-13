@@ -972,6 +972,15 @@ CONTROLS = (
         "ALTER TABLE relationships DISABLE TRIGGER relationships_follow_the_grammar",
     ),
     Control(
+        # A section registered without the three delta kinds derived from it.
+        # Structural for the same reason: a projection section nothing compares
+        # is a class of change that stops being detected silently, and every
+        # data arm of this check would still read as clean.
+        "standing:surface_fingerprint",
+        "INSERT INTO surface_projection_sections (section, delta_prefix, note)"
+        " VALUES ('selftest_section', 'selftest', 'a section with no delta kinds')",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -8204,6 +8213,7 @@ DECIDED = {
     "receipt": None,
     "proposal": ("label", "status", "completion", "drops"),
     "promotion": None,
+    "fingerprint": None,
     "closure": ("task_status", "accepted", "runs_closed", "tool_runs_closed",
                 "leases_released"),
 }
@@ -8606,6 +8616,29 @@ class ExecutionSliceTest(DatabaseCase):
         self.assertEqual("observations[0]", str(element))
         self.assertEqual("promoted", self.facts["promotion"]["status"])
         self.assertEqual(0, self.facts["promotion"]["refused"])
+
+    def test_the_promotion_fingerprinted_the_surface_it_changed(self):
+        # 022's "after recon", from this end: the promotion's own transaction
+        # is where the fingerprint is taken, so what a later reader compares
+        # against is the Surface as this attempt left it.
+        rows = self.connection.execute(
+            "SELECT count(*) FROM events WHERE program_id = $1::uuid"
+            "   AND type = 'surface.fingerprinted'",
+            (self.identifiers["grounded"],),
+        ).rows
+
+        self.assertEqual(
+            self.facts["fingerprint"]["applications"], int(rows[0][0])
+        )
+        self.assertEqual(
+            self.facts["fingerprint"]["applications"],
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM surface_fingerprints WHERE program_id = $1::uuid",
+                    (self.identifiers["grounded"],),
+                ).rows[0][0]
+            ),
+        )
 
     def test_the_observation_it_promoted_carries_its_own_event(self):
         rows = self.connection.execute(
@@ -9940,6 +9973,843 @@ class ArchiveTest(DatabaseCase):
                     connection.execute(ENTITY, (program,))
 
         self.assertIn("app.actor_kind is unset", refusal.exception.primary)
+
+
+#: The Program the fingerprint case opens. One Program holding both twins,
+#: because two Programs would make "the same surface" a claim about isolation
+#: rather than about the projection.
+FINGERPRINT_SLUG = "selftest-fingerprint"
+
+#: One small application's observable surface, as a shape rather than as rows.
+#: Both twins are built from this and differ only in the three things the
+#: projection deliberately does not carry: the Entity labels, the base URL and
+#: the per-Program slot name of every Identity. If a fingerprint could see any
+#: of them, no two deployments of one application could ever compare equal.
+TWIN = {
+    "kind": "web",
+    "endpoints": [
+        {
+            "method": "GET",
+            "path": "/notes",
+            "auth": True,
+            "content_type": None,
+            "parameters": [
+                {"name": "q", "location": "query", "value_class": "text",
+                 "reflected": False},
+                {"name": "page", "location": "query", "value_class": "number",
+                 "reflected": False},
+            ],
+        },
+        {
+            "method": "POST",
+            "path": "/notes",
+            "auth": True,
+            "content_type": "application/json",
+            "parameters": [
+                {"name": "body", "location": "body", "value_class": "text",
+                 "reflected": False},
+            ],
+        },
+    ],
+    "technologies": [("nginx", "1.24.0"), ("openssl", "3.0.13")],
+    "identities": [
+        {"ref": "guest", "class": "anonymous", "owns": ["application"]},
+        {"ref": "org", "class": "service", "owns": []},
+        {"ref": "member", "class": "user", "owns": ["GET /notes"], "member_of": "org"},
+    ],
+}
+
+
+class SurfaceFingerprintTest(DatabaseCase):
+    """PH2-22: the Surface gets a fingerprint, and its changes get names.
+
+    Everything the ticket asks for is a question about one projection and two
+    of them compared, and both are SQL: which rows are in, what they are
+    called, what the fingerprint is over, and which of twelve typed things happened
+    between two of them.
+
+    Two twins, built from one shape. The secure one is written in the order
+    `TWIN` lists and the vulnerable one in the reverse of it, so "identical
+    Surface produces the same fingerprint across runs and row insertion order" is
+    the same assertion as "these two applications are the same application".
+    Then the vulnerable twin gets what makes it vulnerable, and every kind of
+    delta the vocabulary has is produced by that one recompute.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = write(SCOPED.replace('name = "matrix-web"', f'name = "{FINGERPRINT_SLUG}"'))
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+
+        cls.secure = cls.build("secure", "http://secure.example.com", TWIN)
+        cls.vulnerable = cls.build(
+            "vuln", "http://vulnerable.example.com", TWIN, reverse=True
+        )
+
+        # The baselines. Neither has a predecessor, so neither produces a
+        # delta, and the two fingerprints are the whole of criterion 6's first half.
+        cls.first_secure = cls.compute(cls.secure)
+        cls.first_vulnerable = cls.compute(cls.vulnerable)
+        # Nothing moved in between, which is the run that has to repeat.
+        cls.again_secure = cls.compute(cls.secure)
+
+        # One refuted Hypothesis about a route the mutation is about to change,
+        # holding the fingerprint it was refuted under. Criterion 5's second half is
+        # that recomputing does not touch it.
+        cls.refuted = cls.refute(
+            cls.route(cls.vulnerable, "GET /notes"), cls.first_vulnerable["fingerprint"]
+        )
+
+        cls.mutate()
+        cls.changed = cls.compute(cls.vulnerable)
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (FINGERPRINT_SLUG,)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str, selector: str | None = None) -> str:
+        """One Entity, through the corpus's own door.
+
+        `add_entity` rather than an INSERT because 021 made an addressable
+        Entity carry the selector its scope is decided from, and a fixture that
+        wrote the row itself would be a fixture that had to keep remembering
+        that. Origin `observed`: these are the rows an instrument would have
+        left, and fingerprinting is downstream of who wrote them.
+        """
+        return str(
+            cls.connection.execute(
+                "SELECT add_entity($1::uuid, $2, '', $3, $4, NULL, $5, 'observed')::text",
+                (cls.program_id, kind, None if selector is None else "host",
+                 selector, dedup),
+            ).scalar()
+        )
+
+    @classmethod
+    def link(cls, kind: str, src: str, dst: str) -> None:
+        cls.connection.execute(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, $4)",
+            (cls.program_id, src, dst, kind),
+        )
+
+    @classmethod
+    def build(cls, prefix: str, base_url: str, spec: dict, reverse: bool = False) -> str:
+        """One twin's rows, written in the order the caller asks for.
+
+        The reversal is the point rather than decoration: it reverses the
+        routes, the parameters under each route, the stack and the Identities,
+        so every list the projection sorts was written into the database the
+        other way round.
+        """
+        def ordered(items: list) -> list:
+            return list(reversed(items)) if reverse else list(items)
+
+        host = base_url.split("//", 1)[1]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = cls.entity("application", base_url, host)
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, $3)",
+                (application, base_url, spec["kind"]),
+            )
+
+            reached = {"application": application}
+            for route in ordered(spec["endpoints"]):
+                key = f"{route['method']} {route['path']}"
+                endpoint = cls.entity("endpoint", f"{base_url}{key}", host)
+                cls.connection.execute(
+                    "INSERT INTO endpoints (entity_id, application_id, method,"
+                    " path_template, auth_required, request_content_type)"
+                    " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
+                    (endpoint, application, route["method"], route["path"],
+                     route["auth"], route["content_type"]),
+                )
+                reached[key] = endpoint
+                for field in ordered(route["parameters"]):
+                    parameter = cls.entity(
+                        "parameter",
+                        f"{base_url}{key}#{field['location']}:{field['name']}",
+                        host,
+                    )
+                    cls.connection.execute(
+                        "INSERT INTO parameters (entity_id, endpoint_id, name, location,"
+                        " value_class, reflected) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
+                        (parameter, endpoint, field["name"], field["location"],
+                         field["value_class"], field["reflected"]),
+                    )
+
+            for name, version in ordered(spec["technologies"]):
+                technology = cls.entity("technology", f"{base_url}{name}")
+                cls.connection.execute(
+                    "INSERT INTO technologies (entity_id, name, version)"
+                    " VALUES ($1::uuid, $2, $3)",
+                    (technology, name, version),
+                )
+                cls.link("runs", application, technology)
+
+            held = {}
+            for who in ordered(spec["identities"]):
+                held[who["ref"]] = cls.identity(prefix, who["ref"], who["class"])
+            for who in ordered(spec["identities"]):
+                for target in who["owns"]:
+                    cls.link("owns", held[who["ref"]], reached[target])
+                if who.get("member_of"):
+                    cls.link("member_of", held[who["ref"]], held[who["member_of"]])
+        return application
+
+    @classmethod
+    def identity(cls, prefix: str, ref: str, class_: str) -> str:
+        """One Identity, under a slot name no other twin can hold.
+
+        `identities_slot_idx` is unique per Program since 017, so two
+        Applications of one Program cannot share a slot -- which is why the
+        projection carries the class and not the slot.
+        """
+        slot = f"{prefix}-{ref}"
+        who = cls.entity("identity", slot)
+        cls.connection.execute(
+            "INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
+            " VALUES ($1::uuid, $2, $3, $4)",
+            (who, slot, class_,
+             None if class_ == "anonymous" else f"slot://identity/{slot}"),
+        )
+        return who
+
+    @classmethod
+    def mutate(cls) -> None:
+        """What makes the vulnerable twin vulnerable, in one recompute.
+
+        Deliberately every kind at once: an export route nobody has to
+        authenticate for, the write route retired, the read route's session
+        requirement dropped, a search term that now comes back in the page, the
+        server upgraded, TLS no longer attributed, a framework newly attributed,
+        an administrator who holds the new route, and the anonymous holder gone.
+        Twelve delta kinds exist and this produces all twelve, because a kind
+        nothing can produce is a kind nothing has to be right about.
+        """
+        application = cls.vulnerable
+        host = "vulnerable.example.com"
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            admin = cls.entity(
+                "endpoint", "http://vulnerable.example.com/admin/export", host
+            )
+            cls.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method,"
+                " path_template, auth_required) VALUES ($1::uuid, $2::uuid,"
+                " 'GET', '/admin/export', false)",
+                (admin, application),
+            )
+            leak = cls.entity(
+                "parameter",
+                "http://vulnerable.example.com/admin/export#query:next",
+                host,
+            )
+            cls.connection.execute(
+                "INSERT INTO parameters (entity_id, endpoint_id, name, location,"
+                " value_class, reflected) VALUES ($1::uuid, $2::uuid, 'next',"
+                " 'query', 'url', true)",
+                (leak, admin),
+            )
+            # The parameter first: 017 gave the containment its composite key
+            # and no cascade, so a route cannot be retired out from under its
+            # own inputs.
+            cls.connection.execute(
+                "DELETE FROM entities WHERE id = $1::uuid",
+                (cls.route(application, "POST /notes#body:body"),),
+            )
+            cls.connection.execute(
+                "DELETE FROM entities WHERE id = $1::uuid",
+                (cls.route(application, "POST /notes"),),
+            )
+            cls.connection.execute(
+                "UPDATE endpoints SET auth_required = false WHERE entity_id = $1::uuid",
+                (cls.route(application, "GET /notes"),),
+            )
+            cls.connection.execute(
+                "UPDATE parameters SET reflected = true WHERE entity_id = $1::uuid",
+                (cls.route(application, "GET /notes#query:q"),),
+            )
+            cls.connection.execute(
+                "UPDATE technologies SET version = '1.27.0'"
+                " WHERE entity_id = $1::uuid",
+                (cls.technology(application, "nginx"),),
+            )
+            cls.connection.execute(
+                "DELETE FROM relationships WHERE src_entity_id = $1::uuid"
+                "   AND dst_entity_id = $2::uuid AND type = 'runs'",
+                (application, cls.technology(application, "openssl")),
+            )
+            express = cls.entity("technology", "http://vulnerable.example.comexpress")
+            cls.connection.execute(
+                "INSERT INTO technologies (entity_id, name, version)"
+                " VALUES ($1::uuid, 'express', '4.19.2')",
+                (express,),
+            )
+            cls.link("runs", application, express)
+
+            operator = cls.identity("vuln", "operator", "privileged")
+            cls.link("owns", operator, admin)
+            cls.link("member_of", operator, cls.slot("vuln-org"))
+            cls.link("owns", cls.slot("vuln-member"), admin)
+            cls.connection.execute(
+                "DELETE FROM relationships WHERE src_entity_id = $1::uuid"
+                "   AND dst_entity_id = $2::uuid AND type = 'owns'",
+                (cls.slot("vuln-guest"), application),
+            )
+
+    @classmethod
+    def route(cls, application: str, key: str) -> str:
+        """The Entity one projection key names, through the corpus's own lookup."""
+        return str(
+            cls.connection.execute(
+                "SELECT entity_id::text FROM rk2_surface_reach($1::uuid) WHERE key = $2",
+                (application, key),
+            ).scalar()
+        )
+
+    @classmethod
+    def technology(cls, application: str, name: str) -> str:
+        return str(
+            cls.connection.execute(
+                "SELECT t.entity_id::text FROM technologies t"
+                "  JOIN relationships r ON r.dst_entity_id = t.entity_id"
+                " WHERE r.src_entity_id = $1::uuid AND r.type = 'runs' AND t.name = $2",
+                (application, name),
+            ).scalar()
+        )
+
+    @classmethod
+    def slot(cls, name: str) -> str:
+        """One Identity by the slot name this fixture gave it.
+
+        By slot rather than by class, because the slot is what a fixture holds
+        and the class is what the projection carries -- and a helper that
+        looked one up by the other would be the projection's own rule, restated
+        in the test that is supposed to check it.
+        """
+        return str(
+            cls.connection.execute(
+                "SELECT entity_id::text FROM identities WHERE slot_name = $1", (name,)
+            ).scalar()
+        )
+
+    @classmethod
+    def refute(cls, subject: str, fingerprint: str) -> str:
+        """One refuted Hypothesis, holding the fingerprint it was refuted under."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(
+                cls.connection.execute(
+                    "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                    " property_class, statement, status, observed_fingerprint)"
+                    " VALUES ($1::uuid, $2::uuid, 'authorization.function_access',"
+                    " 'the export route refuses an anonymous caller', 'refuted', $3)"
+                    " RETURNING id::text",
+                    (cls.program_id, subject, fingerprint),
+                ).scalar()
+            )
+
+    @classmethod
+    def compute(cls, application: str) -> dict:
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            return proxy.as_object(
+                cls.connection.execute(
+                    "SELECT compute_surface_fingerprint($1::uuid)", (application,)
+                ).scalar()
+            )
+
+    def projection(self, application: str) -> dict:
+        return proxy.as_object(
+            self.connection.execute(
+                "SELECT rk2_surface_projection($1::uuid)", (application,)
+            ).scalar()
+        )
+
+    def deltas(self) -> dict:
+        """The last recompute's deltas, by kind, each with its subject key."""
+        found: dict[str, list] = {}
+        for row in self.connection.execute(
+            "SELECT kind, subject_key, subject, property_classes::text"
+            "  FROM v_surface_deltas WHERE fingerprint = $1 ORDER BY kind, subject_key",
+            (self.changed["fingerprint"],),
+        ).rows:
+            found.setdefault(str(row[0]), []).append(
+                (str(row[1]), None if row[2] is None else str(row[2]),
+                 json.loads(str(row[3])))
+            )
+        return found
+
+    # -- criterion 1: a documented canonical projection -----------------------
+
+    def test_the_projection_is_the_sections_the_registry_names(self):
+        registered = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT section FROM surface_projection_sections"
+            ).rows
+        }
+        projection = self.projection(self.secure)
+
+        self.assertEqual(registered | {"application_kind"}, set(projection))
+        self.assertEqual("web", projection["application_kind"])
+        # And an Application that is not there still carries every section, so
+        # the standing check can ask the function what its shape is rather than
+        # asking one stored row that may predate the answer.
+        empty = self.projection(None)
+
+        self.assertEqual(registered | {"application_kind"}, set(empty))
+        self.assertEqual([[] for _ in registered], [empty[s] for s in sorted(registered)])
+
+    def test_the_projection_carries_no_identifier_no_label_and_no_timestamp(self):
+        # The three the criterion names, plus the two the twins would differ by.
+        written = json.dumps(self.projection(self.vulnerable))
+        labels = [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT label FROM entities WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ).rows
+        ]
+
+        self.assertNotRegex(written, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}")
+        self.assertNotRegex(written, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+        self.assertNotIn("vulnerable.example.com", written)
+        self.assertNotIn("vuln-member", written)
+        for label in labels:
+            self.assertNotIn(f'"{label}"', written)
+
+    def test_the_projection_says_what_it_carries_rather_than_which_rows(self):
+        # Every element is keyed, and the key is what a delta is about. An
+        # element without one would be a change nothing could name.
+        projection = self.projection(self.secure)
+
+        for section in ("endpoints", "parameters", "technologies",
+                        "identity_relationships"):
+            keys = [element["key"] for element in projection[section]]
+            self.assertEqual(sorted(keys), keys, section)
+            self.assertEqual(len(set(keys)), len(keys), section)
+        self.assertEqual(
+            ["GET /notes", "POST /notes"],
+            [element["key"] for element in projection["endpoints"]],
+        )
+        self.assertEqual(
+            ["anonymous|owns", "user|member_of", "user|owns"],
+            [element["key"] for element in projection["identity_relationships"]],
+        )
+
+    # -- criterion 2: same surface, same fingerprint --------------------------
+
+    def test_two_twins_written_in_opposite_orders_fingerprint_the_same(self):
+        self.assertEqual(
+            self.first_secure["fingerprint"], self.first_vulnerable["fingerprint"]
+        )
+        self.assertEqual(
+            self.projection(self.secure),
+            proxy.as_object(
+                self.connection.execute(
+                    "SELECT inputs FROM surface_fingerprints WHERE id = $1::uuid",
+                    (self.first_vulnerable["fingerprint_id"],),
+                ).scalar()
+            ),
+        )
+
+    def test_recomputing_an_unchanged_surface_repeats_the_fingerprint(self):
+        self.assertTrue(self.first_secure["baseline"])
+        self.assertFalse(self.again_secure["baseline"])
+        self.assertEqual(self.first_secure["fingerprint"], self.again_secure["fingerprint"])
+        self.assertFalse(self.again_secure["changed"])
+        self.assertEqual(0, self.again_secure["deltas"])
+
+    def test_an_unchanged_recompute_is_still_a_row(self):
+        # "We looked and it was the same" is a fact, and a function that only
+        # wrote when something moved could not tell it from nobody looking.
+        [row] = self.connection.execute(
+            "SELECT count(*) FROM surface_fingerprints WHERE application_entity_id = $1::uuid",
+            (self.secure,),
+        ).rows
+
+        self.assertEqual(2, int(row[0]))
+
+    # -- criterion 3: typed deltas, and a new fingerprint ---------------------
+
+    def test_the_mutation_moved_the_fingerprint(self):
+        self.assertTrue(self.changed["changed"])
+        self.assertNotEqual(
+            self.first_vulnerable["fingerprint"], self.changed["fingerprint"]
+        )
+        self.assertEqual(
+            self.first_vulnerable["fingerprint"], self.changed["previous_fingerprint"]
+        )
+
+    def test_every_kind_of_change_the_vocabulary_has_is_reachable(self):
+        vocabulary = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT kind FROM surface_delta_kinds"
+            ).rows
+        }
+
+        self.assertEqual(12, len(vocabulary))
+        self.assertEqual(vocabulary, set(self.deltas()))
+
+    def test_the_added_route_and_its_parameter_are_typed_additions(self):
+        found = self.deltas()
+
+        self.assertEqual(
+            ["GET /admin/export"], [key for key, _, _ in found["endpoint_added"]]
+        )
+        self.assertEqual(
+            ["GET /admin/export#query:next"],
+            [key for key, _, _ in found["parameter_added"]],
+        )
+
+    def test_a_retired_route_takes_its_parameter_with_it(self):
+        found = self.deltas()
+
+        self.assertEqual(
+            ["POST /notes"], [key for key, _, _ in found["endpoint_removed"]]
+        )
+        self.assertEqual(
+            ["POST /notes#body:body"],
+            [key for key, _, _ in found["parameter_removed"]],
+        )
+
+    def test_a_changed_route_is_one_delta_carrying_both_sides(self):
+        [row] = self.connection.execute(
+            "SELECT before_element, after_element FROM v_surface_deltas"
+            " WHERE kind = 'endpoint_changed'"
+        ).rows
+        before, after = proxy.as_object(row[0]), proxy.as_object(row[1])
+
+        self.assertEqual("GET /notes", after["key"])
+        self.assertTrue(before["auth_required"])
+        self.assertFalse(after["auth_required"])
+
+    def test_a_parameter_that_started_reflecting_is_a_change_not_a_pair(self):
+        found = self.deltas()
+
+        self.assertEqual(
+            ["GET /notes#query:q"], [key for key, _, _ in found["parameter_changed"]]
+        )
+        self.assertNotIn(
+            "GET /notes#query:q", [key for key, _, _ in found["parameter_added"]]
+        )
+
+    def test_a_version_bump_is_one_technology_change(self):
+        found = self.deltas()
+        [row] = self.connection.execute(
+            "SELECT before_element, after_element FROM v_surface_deltas"
+            " WHERE kind = 'technology_changed'"
+        ).rows
+
+        self.assertEqual(["nginx"], [key for key, _, _ in found["technology_changed"]])
+        self.assertEqual(["1.24.0"], proxy.as_object(row[0])["versions"])
+        self.assertEqual(["1.27.0"], proxy.as_object(row[1])["versions"])
+        self.assertEqual(["express"], [key for key, _, _ in found["technology_added"]])
+        self.assertEqual(["openssl"], [key for key, _, _ in found["technology_removed"]])
+
+    def test_a_new_class_of_holder_and_a_holder_that_gained_a_route(self):
+        found = self.deltas()
+        [row] = self.connection.execute(
+            "SELECT before_element, after_element FROM v_surface_deltas"
+            " WHERE kind = 'identity_relationship_changed'"
+        ).rows
+
+        self.assertEqual(
+            ["privileged|member_of", "privileged|owns"],
+            [key for key, _, _ in found["identity_relationship_added"]],
+        )
+        self.assertEqual(
+            ["anonymous|owns"],
+            [key for key, _, _ in found["identity_relationship_removed"]],
+        )
+        self.assertEqual(["user|owns"], [key for key, _, _ in found["identity_relationship_changed"]])
+        self.assertEqual(["GET /notes"], proxy.as_object(row[0])["targets"])
+        self.assertEqual(
+            ["GET /admin/export", "GET /notes"], proxy.as_object(row[1])["targets"]
+        )
+
+    # -- criterion 4: an operation, with an Event, never a read ---------------
+
+    def test_every_fingerprint_is_an_event_somebody_caused(self):
+        [row] = self.connection.execute(
+            "SELECT (SELECT count(*) FROM surface_fingerprints WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM events WHERE program_id = $1::uuid"
+            "         AND type = 'surface.fingerprinted')",
+            (self.program_id,),
+        ).rows
+
+        self.assertEqual(4, int(row[0]))
+        self.assertEqual(int(row[0]), int(row[1]))
+
+    def test_the_event_says_what_moved_and_by_how_much(self):
+        payload = proxy.as_object(
+            self.connection.execute(
+                "SELECT payload FROM events WHERE type = 'surface.fingerprinted'"
+                "   AND payload ->> 'fingerprint_id' = $1"
+                " ORDER BY seq DESC LIMIT 1",
+                (self.changed["fingerprint_id"],),
+            ).scalar()
+        )
+
+        self.assertTrue(payload["changed"])
+        self.assertFalse(payload["baseline"])
+        self.assertEqual(13, payload["deltas"])
+        self.assertEqual(2, payload["by_kind"]["identity_relationship_added"])
+        # The Event and the caller get the same account of the same act, which
+        # is one object in the function rather than two that agree today.
+        self.assertEqual(self.changed, payload)
+
+    def test_the_program_wide_verb_is_what_recon_calls(self):
+        # "After recon" is the Program rather than one Application: a promotion
+        # returns labels, not which Application each one landed under, so the
+        # runtime asks for all of them and an untouched one gets the row that
+        # says it was untouched. Rolled back, because every other test in this
+        # case counts the rows the fixture wrote.
+        self.connection.execute("BEGIN")
+        try:
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (self.program_id,)
+            )
+            swept = proxy.as_object(
+                self.connection.execute("SELECT fingerprint_program_surface()").scalar()
+            )
+            written = self.connection.execute(
+                "SELECT count(*) FROM events WHERE program_id = $1::uuid"
+                "   AND type = 'surface.fingerprinted'",
+                (self.program_id,),
+            ).rows[0][0]
+        finally:
+            self.connection.execute("ROLLBACK")
+
+        self.assertEqual(2, swept["applications"])
+        self.assertEqual(0, swept["changed"])
+        self.assertEqual(6, int(written))
+        self.assertEqual(
+            sorted([self.first_secure["fingerprint"], self.changed["fingerprint"]]),
+            sorted(one["fingerprint"] for one in swept["fingerprints"]),
+        )
+
+    def test_reading_the_surface_recomputes_nothing(self):
+        def counted() -> tuple[int, int]:
+            [row] = self.connection.execute(
+                "SELECT (SELECT count(*) FROM surface_fingerprints WHERE program_id = $1::uuid),"
+                "       (SELECT count(*) FROM surface_deltas WHERE program_id = $1::uuid)",
+                (self.program_id,),
+            ).rows
+            return int(row[0]), int(row[1])
+
+        before = counted()
+        self.connection.execute("SELECT * FROM v_surface_deltas").rows
+        self.connection.execute(
+            "SELECT rk2_surface_projection($1::uuid)", (self.vulnerable,)
+        ).scalar()
+        self.connection.execute(
+            "SELECT record FROM v_records WHERE kind = 'entity'"
+        ).rows
+
+        self.assertEqual(before, counted())
+
+    def test_nothing_else_in_the_corpus_writes_a_fingerprint(self):
+        # The verb is the only writer, so the fingerprint cannot become a function
+        # of who looked. A trigger on the table would be the way that stopped
+        # being true without anybody deciding it.
+        [row] = self.connection.execute(
+            "SELECT count(*) FROM pg_trigger t"
+            " WHERE t.tgrelid = 'surface_fingerprints'::regclass"
+            "   AND NOT t.tgisinternal"
+        ).rows
+        writers = [
+            str(other[0])
+            for other in self.connection.execute(
+                "SELECT p.proname FROM pg_proc p"
+                "  JOIN pg_namespace n ON n.oid = p.pronamespace"
+                " WHERE n.nspname = 'public'"
+                "   AND p.prosrc ILIKE '%INSERT INTO surface_fingerprints%'"
+            ).rows
+        ]
+
+        self.assertEqual(0, int(row[0]))
+        self.assertEqual(["compute_surface_fingerprint"], writers)
+
+    # -- criterion 5: subjects and classes, as rows ---------------------------
+
+    def test_a_delta_names_the_row_it_is_about(self):
+        found = self.deltas()
+        [(_, subject, _)] = found["endpoint_added"]
+        [(_, gone, _)] = found["endpoint_removed"]
+
+        self.assertEqual(
+            subject,
+            str(
+                self.connection.execute(
+                    "SELECT label FROM entities WHERE id = $1::uuid",
+                    (self.route(self.vulnerable, "GET /admin/export"),),
+                ).scalar()
+            ),
+        )
+        # And a subject that is gone is null rather than a label that no longer
+        # resolves: the key still says what changed.
+        self.assertIsNone(gone)
+
+    def test_each_delta_carries_the_classes_it_puts_back_in_question(self):
+        found = self.deltas()
+        [(_, _, added)] = found["endpoint_added"]
+        [(_, _, reflected)] = found["parameter_changed"]
+        [(_, _, holder)] = found["identity_relationship_changed"]
+
+        self.assertIn("authorization.function_access", added)
+        self.assertIn("injection.markup", reflected)
+        self.assertIn("authorization.tenant_isolation", holder)
+        # And no kind that says something appeared or changed maps to nothing:
+        # a delta with an empty class list is one ticket 34 would find and then
+        # have no reason to act on.
+        silent = self.connection.execute(
+            "SELECT k.kind FROM surface_delta_kinds k"
+            " WHERE k.change <> 'removed' AND NOT EXISTS ("
+            "   SELECT 1 FROM surface_delta_property_classes pc WHERE pc.kind = k.kind)"
+        ).rows
+
+        self.assertEqual([], list(silent))
+
+    def test_a_removal_puts_no_class_back_in_question(self):
+        # The decision, not an omission: a route that is gone tests nothing,
+        # and a refutation about it is not made due by its subject vanishing.
+        found = self.deltas()
+
+        for kind, rows in found.items():
+            if kind.endswith("_removed"):
+                for _, _, classes in rows:
+                    self.assertEqual([], classes, kind)
+
+    def test_recomputing_declares_no_previous_refutation_invalid(self):
+        [row] = self.connection.execute(
+            "SELECT status, observed_fingerprint, superseded_by FROM hypotheses"
+            " WHERE id = $1::uuid",
+            (self.refuted,),
+        ).rows
+
+        self.assertEqual("refuted", str(row[0]))
+        self.assertEqual(self.first_vulnerable["fingerprint"], str(row[1]))
+        self.assertIsNone(row[2])
+        # What makes it retestable is the join a later ticket can make: this
+        # subject, this class, and a delta that names both.
+        [joined] = self.connection.execute(
+            "SELECT count(*) FROM hypotheses h"
+            "  JOIN surface_deltas d ON d.subject_entity_id = h.subject_entity_id"
+            "  JOIN surface_delta_property_classes pc"
+            "    ON pc.kind = d.kind AND pc.property_class_id = h.property_class"
+            " WHERE h.id = $1::uuid",
+            (self.refuted,),
+        ).rows
+
+        self.assertEqual(1, int(joined[0]))
+
+    def test_a_section_with_no_subject_rule_is_a_refusal_and_not_a_null(self):
+        # A fifth section registered and not answered would give every one of
+        # its deltas a null subject, and criterion 5 would quietly stop being
+        # true for a whole section without a single arm noticing.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.connection.execute(
+                "SELECT rk2_surface_subject($1::uuid, 'selftest_section', 'x')",
+                (self.vulnerable,),
+            )
+
+        self.assertIn("no subject rule", str(refused.exception))
+
+    def test_two_methods_that_differ_only_in_case_are_two_keys(self):
+        # `endpoints` is unique on (application, method, path) case-sensitively,
+        # so a projection that folded the case would give one key to two rows:
+        # the comparison would cross-join them and the delta's own unique key
+        # would abort the recompute.
+        self.connection.execute("BEGIN")
+        try:
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            lower = self.entity(
+                "endpoint", "http://vulnerable.example.com/get /notes",
+                "vulnerable.example.com",
+            )
+            self.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method,"
+                " path_template, auth_required) VALUES ($1::uuid, $2::uuid,"
+                " 'get', '/notes', false)",
+                (lower, self.vulnerable),
+            )
+            keys = [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT key FROM rk2_surface_reach($1::uuid) ORDER BY key",
+                    (self.vulnerable,),
+                ).rows
+            ]
+        finally:
+            self.connection.execute("ROLLBACK")
+
+        self.assertIn("get /notes", keys)
+        self.assertIn("GET /notes", keys)
+        self.assertEqual(len(set(keys)), len(keys))
+
+    # -- criterion 6: the twins ----------------------------------------------
+
+    def test_the_twins_differ_by_exactly_what_the_vulnerable_one_gained(self):
+        secure = self.projection(self.secure)
+        vulnerable = self.projection(self.vulnerable)
+
+        self.assertNotEqual(
+            self.fingerprint_of(secure), self.fingerprint_of(vulnerable)
+        )
+        self.assertEqual(
+            {"GET /notes", "POST /notes"},
+            {element["key"] for element in secure["endpoints"]},
+        )
+        self.assertEqual(
+            {"GET /notes", "GET /admin/export"},
+            {element["key"] for element in vulnerable["endpoints"]},
+        )
+        # And the secure twin has not moved while the vulnerable one did.
+        self.assertEqual(self.first_secure["fingerprint"], self.fingerprint_of(secure))
+
+    def fingerprint_of(self, projection: dict) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT rk2_surface_fingerprint($1::jsonb)", (json.dumps(projection),)
+            ).scalar()
+        )
+
+    # -- the invariant --------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'surface_fingerprint'"
+        ).rows
+        problems = self.connection.execute(
+            "SELECT problem, subject FROM check_surface_fingerprint()"
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual([], list(problems))
 
 
 if __name__ == "__main__":

@@ -147,6 +147,9 @@ class Recorder:
                 "refused": 0,
             },
         )
+        self.fingerprint = answers.get(
+            "fingerprint", {"applications": 1, "changed": 1, "fingerprints": []}
+        )
         self.closure = answers.get(
             "closure",
             {
@@ -205,6 +208,8 @@ class Recorder:
             return [self.receipt] if self.receipt else []
         if sql == execution.PROMOTE:
             return [(json.dumps(self.promotion),)]
+        if sql == execution.FINGERPRINT:
+            return [(json.dumps(self.fingerprint),)]
         if sql == execution.FINISH:
             return [(json.dumps(self.closure),)]
         if sql == proxy.PARK_TOOL_RUN:
@@ -541,6 +546,10 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual([], facts["proposal"]["drops"])
         self.assertEqual(["OB1"], facts["promotion"]["observations"])
         self.assertEqual([(PROPOSAL,)], connection.sent(execution.PROMOTE))
+        # And the Surface it just changed is fingerprinted before the promotion
+        # commits, which is 022's "after recon" from the caller's side.
+        self.assertEqual([()], connection.sent(execution.FINGERPRINT))
+        self.assertEqual({"applications": 1, "changed": 1}, facts["fingerprint"])
 
     def test_a_child_that_submitted_nothing_stages_nothing_and_still_closes(self):
         connection = Recorder()
