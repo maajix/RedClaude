@@ -246,12 +246,27 @@ DESCRIPTIONS = {
         "bounded excerpt of the body; a refusal names the door's decision rather "
         "than pretending the request happened."
     ),
+    # The element lists stay open -- `roster.OPEN_ARGUMENTS` says why -- so this
+    # sentence is the only place a child is told which fields promotion reads
+    # out of them. A field name it has to guess is a drop row with
+    # `malformed_field` on it and no way for the model to learn the spelling.
     "submit_mission_result": (
         "Submit this run's one result: proposed Entities, Relationships, "
         "Hypotheses, Observations with the Receipt or Tool Run each cites, evidence "
         "edges, suggested Tasks and a completion claim. It is staging data. The "
         "runtime checks provenance and decides what becomes canonical; nothing here "
-        "is true because it was submitted."
+        "is true because it was submitted.\n\n"
+        "Every element cites its evidence with exactly one of receipt_label or "
+        "tool_run_label. An entity carries type and the typed fields of that type: "
+        "domain fqdn and wildcard; host hostname and address; service parent_ref "
+        "with port and protocol; application base_url and kind; endpoint parent_ref "
+        "with method and path_template; parameter parent_ref with name and "
+        "location; technology name and version; identity slot_name. A service, an "
+        "endpoint and a parameter name their containment parent by parent_ref or "
+        "parent_label; give an entity a ref of your own and later elements can "
+        "point at it by that name before it has a label. A relationship carries "
+        "type with src_ref or src_label and dst_ref or dst_label, and containment "
+        "is never one of them."
     ),
 }
 

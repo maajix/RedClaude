@@ -6,6 +6,14 @@ tables, the MCP tools, and the things agents are told about.
 
 ## Surface
 
+**Surface**:
+Everything this Program knows is out there: its Entities, the Relationships
+between them and the containment that holds them. What an agent reads before it
+acts and what promotion adds to. Not the code an agent can reach, which is the
+tool surface.
+_Avoid_: Inventory, graph, attack surface (the phrase is fine in prose; the
+noun in this system is Surface)
+
 **Program**:
 A bounty engagement with one scope policy and one lifecycle. The root of every
 other record; nothing exists outside a program.
@@ -22,6 +30,16 @@ A typed, directed edge between two entities that is not a containment
 (`resolves_to`, `serves`, `runs`, `owns`, `member_of`, `redirects_to`,
 `same_as`). Containment is a foreign key and is not a relationship.
 _Avoid_: Edge, link, association
+
+**Origin**:
+Who put a Surface row there: `configured` (an operator's scope), `imported` (a
+handover from outside the harness), `observed` (the runtime's own instruments)
+or `proposed` (a model's proposal the runtime promoted). One value on the row
+for whoever first caused it, and the set of everyone who has since said the
+same thing beside it. Not the lane of the request the evidence came over, and
+not the evidence itself.
+_Avoid_: Source, provenance (provenance is the row pointing at the evidence),
+lane
 
 **Identity**:
 An entity representing a way of being someone against the target — a proxy
@@ -195,7 +213,8 @@ _Avoid_: Token, secret, canary token, callback id
 Which party caused a request: `agent` (a subagent acted), `replay` (the runtime
 re-executed a test), or `proxy_internal` (the proxy acted as a client of the
 target on its own behalf). Only the first two can back an observation.
-_Avoid_: Channel, source, origin
+_Avoid_: Channel, source, origin (an origin is who put a Surface row there,
+which is a different question about a different record)
 
 **Artifact**:
 A content-addressed blob of raw evidence, identified by the hash of its

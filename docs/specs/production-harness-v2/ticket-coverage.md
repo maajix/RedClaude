@@ -10,14 +10,14 @@ the only thing that proves per-story implementation.
 
 ## Structural validation
 
-Re-measured 2026-08-12, after tickets 67–70 were raised by the ticket-14 review
+Re-measured 2026-08-13, after tickets 67–70 were raised by the ticket-14 review
 and 71–73 by the ticket-18 review, all triaged into the graph.
 
 | Check | Result |
 | --- | --- |
 | Ticket files | 73, numbered continuously 01–73 |
-| Ticket status | 19 `resolved`, 54 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 424 total, 114 ticked |
+| Ticket status | 21 `resolved`, 52 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 424 total, 126 ticked |
 | Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -43,9 +43,9 @@ is also why none of them was fixed under 18.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–19 |
-| Unblocked and open | 20, 66, 67, 68, 70 |
-| Criteria ticked | 114 of 424 |
+| Resolved | 01–21 |
+| Unblocked and open | 22, 23, 30, 31, 33, 66, 67, 68, 70 |
+| Criteria ticked | 126 of 424 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -63,9 +63,17 @@ at every tool call by a pre-tool gate the permission mode cannot overrule, and
 the handlers behind that roster's read and write contracts -- a Program-scoped
 packet compiled outside the container and read inside it under bounds that state
 their own subtraction, and one Mission result that lands as staging rows with a
-recorded reason for every element whose provenance did not check out. The
-scheduler, the promotion and validation half of the epistemic pipeline, kill
-chains, the v1 knowledge migration and the operator surface are untouched.
+recorded reason for every element whose provenance did not check out. On top of
+that spine, two slices that run: one seeded Task through a real Agent run and
+network Tool run to one grounded Observation, closing every lifecycle row it
+opened, and promotion of a recon run's raw result into typed Surface -- eight
+entity types with canonical dedup keys, a relationship grammar with its
+directions enforced as a trigger, containment kept as the foreign key it is,
+provenance kept per witness so parallel proposals converge without losing one,
+and a compact Entity record that carries its origins, its parent and its edges
+without the transcript. The scheduler, the hypothesis and validation half of the
+epistemic pipeline, kill chains, the v1 knowledge migration and the operator
+surface are untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

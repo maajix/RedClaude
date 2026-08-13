@@ -964,6 +964,14 @@ CONTROLS = (
     ),
     Control("standing:transport_claims", "DROP TRIGGER transport_hypothesis_guard ON hypotheses"),
     Control(
+        # Detached rather than falsified with a row, because the check's first
+        # business is structural: the grammar is what keeps an edge with an
+        # undefined direction from existing, and a disabled trigger is the state
+        # in which the other arms would have something to find.
+        "standing:surface_promotion",
+        "ALTER TABLE relationships DISABLE TRIGGER relationships_follow_the_grammar",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -5199,6 +5207,11 @@ class ProxyEgressTest(DatabaseCase):
             proxy_url=cls.proxy_url,
             ca_file=cls.authority.certificate,
         )
+        # Held for the same reason as `arrived` above, and for a sharper one: the
+        # https target is shared with the case that sends a POST through a human
+        # decision, and that case sorts first, so "the last thing it saw" is that
+        # POST rather than the tunnelled GET this report is about.
+        cls.secure_arrived = cls.secure_target.seen[-1]
 
     @classmethod
     def tearDownClass(cls):
@@ -6857,7 +6870,7 @@ class ProxyEgressTest(DatabaseCase):
         # PH2-10, criterion 5, against a target that actually ran behind TLS. The
         # capability crossed on the CONNECT this time -- a hop `forwardable` never
         # sees -- so this is not the http case restated.
-        method, path, headers = self.secure_target.seen[-1]
+        method, path, headers = self.secure_arrived
         names = [name for name, _ in headers]
 
         self.assertEqual(("GET", "/notes"), (method, path))
@@ -8744,6 +8757,793 @@ class ExecutionSliceTest(DatabaseCase):
         self.assertEqual(2, len(rows))
         for column in range(len(rows[0])):
             self.assertNotEqual(rows[0][column], rows[1][column])
+
+
+#: The Programs the promotion case opens. Two of them, seeded and promoted
+#: alike, because "one Program-scoped Entity" is a claim about two Programs
+#: finding the same thing and holding two rows for it.
+SURFACE_SLUG = "selftest-surface"
+
+#: The one Identity an operator declares, so that a configured origin exists to
+#: be told apart from a promoted one. `program.run` is the only writer that
+#: makes an Entity without a promotion behind it.
+DECLARED = "\n[[identity]]\nname = \"member\"\nslot_ref = \"slot://identity/member\"\n"
+
+
+class SurfacePromotionTest(DatabaseCase):
+    """PH2-21: one recon run's result, promoted into typed Surface.
+
+    Only a server can answer any of this. The canonical form of a URL, the
+    scope class of a subject that does not exist yet, a relationship's direction,
+    the key two proposals converge on and the compact read an agent gets back
+    are five things `promote_proposal` decides in SQL, in one transaction, and
+    the Python half of the ticket is a description of arguments rather than a
+    second opinion about any of them.
+
+    Everything runs on `rk2_runtime`, the role an operator points at the
+    database, and the compact read is taken through `rk2_state` bound to one
+    Program -- because a Surface read that only works for the role that wrote
+    the rows is not the read the criterion is about.
+
+    Four results are promoted in setup because they commit and because each
+    later one is about what the first one left behind: a full recon result, the
+    same subjects found again through different evidence, the same result in a
+    second Program, and a result in which every element is wrong in a different
+    way.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.configurations = {}
+        cls.identifiers = {}
+        for name in ("recon", "other"):
+            slug = f"{SURFACE_SLUG}-{name}"
+            path = write(SCOPED.replace('name = "matrix-web"', f'name = "{slug}"') + DECLARED)
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+        cls.seeded = {name: cls._populate(name) for name in ("recon", "other")}
+
+        # The result a recon run actually returns: nine typed subjects across
+        # the eight types, three relationships between them and one Observation
+        # about a subject that did not exist when the child wrote it.
+        cls.found, cls.promoted = cls.promote("recon", cls.recon("recon"))
+        # The same two subjects, found again through a Receipt rather than a
+        # Tool run. Convergence is measured against this: one Entity, two
+        # provenances, and the relationship already there rather than a second.
+        cls.again, cls.converged = cls.promote(
+            "recon",
+            {
+                "new_entities": [
+                    {
+                        "ref": "site",
+                        "type": "domain",
+                        "fqdn": "www.example.com",
+                        "receipt_label": cls.seeded["recon"]["receipt"],
+                    },
+                    {
+                        "ref": "machine",
+                        "type": "host",
+                        "hostname": "app.example.com",
+                        "receipt_label": cls.seeded["recon"]["receipt"],
+                    },
+                ],
+                "relationships": [
+                    {
+                        "type": "resolves_to",
+                        "src_ref": "site",
+                        "dst_ref": "machine",
+                        "receipt_label": cls.seeded["recon"]["receipt"],
+                    }
+                ],
+            },
+        )
+        # And the same recon result in the other Program, which has found the
+        # same host on the same internet and holds its own row for it.
+        cls.elsewhere, cls.parallel = cls.promote("other", cls.recon("other"))
+        cls.refusals, cls.refused = cls.promote("recon", cls.wrong())
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SURFACE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def _populate(cls, name: str) -> dict:
+        """One claimed Task, one run, and the two things evidence can be.
+
+        A Receipt as well as a Tool run because criterion 5 is about origins
+        staying distinguishable, and the two provenances of one converged Entity
+        are the sharpest form of that: same subject, same Program, two pieces of
+        evidence that are not each other.
+        """
+        program_id = cls.identifiers[name]
+        seeded: dict[str, str] = {"program_id": program_id}
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            seeded["task"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, claimed_at,"
+                    " lease_expires_at) VALUES ($1::uuid, 'recon', 'claimed', now(),"
+                    " now() + interval '30 minutes') RETURNING id::text",
+                    (program_id,),
+                ).scalar()
+            )
+            seeded["run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, runs_as, model,"
+                    " effort, mission_packet) VALUES ($1::uuid, $2::uuid, 'recon',"
+                    " 'subagent', 'selftest', 'low', '{}'::jsonb) RETURNING id::text",
+                    (program_id, seeded["task"]),
+                ).scalar()
+            )
+            seeded["tool_run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'mcp__rk2__http_request', '{}'::jsonb, 'success', 'runtime')"
+                    " RETURNING label",
+                    (program_id, seeded["run"], seeded["task"]),
+                ).scalar()
+            )
+            # A refusal, which is the one Receipt shape that needs no live
+            # capability behind it, and one with no Tool run of its own so that
+            # `receipt_other_run` is not what this fixture is testing.
+            seeded["receipt"] = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host, method, scheme,"
+                    " path) VALUES ($1::uuid, 'agent', 'blocked', 'refused before contact',"
+                    " now(), 'target', 1, 'app.example.com', 'GET', 'http', '/')"
+                    " RETURNING label",
+                    (program_id,),
+                ).scalar()
+            )
+        return seeded
+
+    @classmethod
+    def recon(cls, name: str) -> dict:
+        """What a recon run returns, in the spellings a model writes them in.
+
+        Deliberately not canonical: a trailing dot and mixed case on the name,
+        a lowercase method, a trailing slash on the route, an uppercase protocol
+        and location. Every one of them is a spelling the schema does not store,
+        so a promotion that wrote them through would be visible as a second
+        Entity the next time the same subject was found.
+        """
+        tool_run = cls.seeded[name]["tool_run"]
+        return {
+            "new_entities": [
+                {"ref": "site", "type": "domain", "fqdn": "WWW.Example.COM.",
+                 "tool_run_label": tool_run},
+                {"ref": "tree", "type": "domain", "fqdn": "example.com",
+                 "wildcard": True, "tool_run_label": tool_run},
+                {"ref": "machine", "type": "host", "hostname": "app.example.com",
+                 "address": PINNED, "tool_run_label": tool_run},
+                {"ref": "port", "type": "service", "parent_ref": "machine",
+                 "port": 80, "protocol": "TCP", "banner": "nginx",
+                 "tool_run_label": tool_run},
+                {"ref": "site_app", "type": "application",
+                 "base_url": "http://app.example.com/", "kind": "web",
+                 "tool_run_label": tool_run},
+                {"ref": "route", "type": "endpoint", "parent_ref": "site_app",
+                 "method": "get", "path_template": "/notes/", "auth_required": False,
+                 "tool_run_label": tool_run},
+                {"ref": "field", "type": "parameter", "parent_ref": "route",
+                 "name": "q", "location": "QUERY", "reflected": True,
+                 "tool_run_label": tool_run},
+                {"ref": "stack", "type": "technology", "name": "nginx",
+                 "version": "1.24.0", "tool_run_label": tool_run},
+                {"ref": "guest", "type": "identity", "slot_name": "anonymous-visitor",
+                 "tool_run_label": tool_run},
+            ],
+            "relationships": [
+                {"type": "resolves_to", "src_ref": "site", "dst_ref": "machine",
+                 "tool_run_label": tool_run},
+                {"type": "serves", "src_ref": "machine", "dst_ref": "site_app",
+                 "tool_run_label": tool_run},
+                {"type": "runs", "src_ref": "site_app", "dst_ref": "stack",
+                 "tool_run_label": tool_run},
+            ],
+            "observations": [
+                {"kind": DISCOVERED, "subject_ref": "route",
+                 "summary": "the route answered without a session",
+                 "tool_run_label": tool_run},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def wrong(cls) -> dict:
+        """One element per way of being wrong, and no two wrong the same way.
+
+        Read as a table: each element's reason is the one thing that element
+        gets wrong, and the promotion has to name that reason rather than the
+        first refusal the database happened to raise.
+        """
+        tool_run = cls.seeded["recon"]["tool_run"]
+        held = cls.held("recon")
+        return {
+            "new_entities": [
+                {"type": "host", "hostname": "admin.example.com",
+                 "tool_run_label": tool_run},
+                {"type": "application", "base_url": "http://app.example.com/a/../b",
+                 "tool_run_label": tool_run},
+                {"type": "service", "parent_label": held["technology"], "port": 443,
+                 "tool_run_label": tool_run},
+                {"type": "unicorn", "tool_run_label": tool_run},
+                {"type": "identity", "slot_name": "root", "class": "privileged",
+                 "secret_ref": "slot://identity/root", "tool_run_label": tool_run},
+                {"type": "domain", "fqdn": "one.example.com"},
+                {"type": "host", "hostname": "two.example.com",
+                 "address": "app.example.com", "tool_run_label": tool_run},
+            ],
+            "relationships": [
+                {"type": "serves", "src_label": held["application"],
+                 "dst_label": held["host"], "tool_run_label": tool_run},
+                {"type": "same_as", "src_label": held["service"],
+                 "dst_label": held["host"], "tool_run_label": tool_run},
+                {"type": "pwns", "src_label": held["host"],
+                 "dst_label": held["application"], "tool_run_label": tool_run},
+                {"type": "resolves_to", "src_label": "DOM999",
+                 "dst_label": held["host"], "tool_run_label": tool_run},
+            ],
+        }
+
+    @classmethod
+    def promote(cls, name: str, payload: dict) -> tuple[proposal.Staged, dict]:
+        """Stage one result and promote it, the way the supervisor does both.
+
+        Two transactions rather than one, because `proposal.stage` opens its own
+        and the Program a promotion runs against is transaction-local: bound in
+        the transaction the staging insert commits, it would be unbound by the
+        time `promote_proposal` asked which Program this is.
+        """
+        seeded = cls.seeded[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.identifiers[name],
+                agent_run_id=seeded["run"],
+                task_id=seeded["task"],
+            )
+        return staged, cls.promoted_now(name, staged.proposal_id)
+
+    @classmethod
+    def promoted_now(cls, name: str, proposal_id: str) -> dict:
+        with cls.connection.transaction():
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.identifiers[name],)
+            )
+            return proxy.as_object(
+                cls.connection.execute(
+                    "SELECT promote_proposal($1::uuid)", (proposal_id,)
+                ).scalar()
+            )
+
+    @classmethod
+    def held(cls, name: str) -> dict:
+        """This Program's Entities, by type, for the types it holds one of.
+
+        A type this Program holds twice is left out rather than resolved by
+        order: two Domains are two subjects, and a test that named one of them
+        by which label sorted higher would be asserting about the counter.
+        """
+        return {
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT type, min(label) FROM entities WHERE program_id = $1::uuid"
+                " GROUP BY type HAVING count(*) = 1",
+                (cls.identifiers[name],),
+            ).rows
+        }
+
+    @classmethod
+    def labels(cls, name: str) -> dict:
+        """This Program's Entities by the key they converge on."""
+        return {
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT dedup_key, label FROM entities WHERE program_id = $1::uuid",
+                (cls.identifiers[name],),
+            ).rows
+        }
+
+    def rows(self, sql: str, name: str = "recon") -> list:
+        return self.connection.execute(sql, (self.identifiers[name],)).rows
+
+    @contextlib.contextmanager
+    def agent_session(self, name: str):
+        """The connection a child reads through, bound to one Program."""
+        with pg.connect(self.harness.state) as session:
+            with session.transaction():
+                assert state.bind_agent_session(
+                    state.Ledger(), session, self.identifiers[name]
+                )
+                yield session
+
+    def record(self, name: str, label: str) -> dict:
+        with self.agent_session(name) as session:
+            return proxy.as_object(
+                session.execute(
+                    "SELECT record FROM v_records WHERE kind = 'entity' AND label = $1",
+                    (label,),
+                ).scalar()
+            )
+
+    # -- criterion 1: eight typed subjects, from one result -------------------
+
+    def test_one_recon_result_became_nine_typed_entities_and_three_relationships(self):
+        promoted = self.promoted
+
+        self.assertEqual("promoted", promoted["status"])
+        self.assertFalse(promoted["repeated"])
+        self.assertEqual(0, promoted["refused"])
+        self.assertEqual([], list(self.found.drops))
+        self.assertEqual(9, len(promoted["entities"]))
+        self.assertEqual(3, len(promoted["relationships"]))
+        self.assertEqual(1, len(promoted["observations"]))
+        self.assertEqual(
+            {"domain": 2, "host": 1, "service": 1, "application": 1, "endpoint": 1,
+             "parameter": 1, "technology": 1, "identity": 2},
+            {
+                str(row[0]): int(row[1])
+                for row in self.rows(
+                    "SELECT type, count(*) FROM entities WHERE program_id = $1::uuid"
+                    " GROUP BY type"
+                )
+            },
+        )
+
+    def test_every_promoted_subject_carries_the_typed_fields_it_was_given(self):
+        # The detail row, not the Entity: an `endpoints` row is what makes the
+        # subject an Endpoint rather than a label with a type column.
+        [row] = self.rows(
+            "SELECT e.label, ep.method, ep.path_template, ep.auth_required,"
+            "       app.base_url, app.kind, p.name, p.location, p.reflected"
+            "  FROM endpoints ep"
+            "  JOIN entities e ON e.id = ep.entity_id"
+            "  JOIN applications app ON app.entity_id = ep.application_id"
+            "  JOIN parameters p ON p.endpoint_id = ep.entity_id"
+            " WHERE e.program_id = $1::uuid"
+        )
+
+        self.assertRegex(str(row[0]), r"^EP[0-9]+$")
+        self.assertEqual(("GET", "/notes", False), (str(row[1]), str(row[2]), bool(row[3])))
+        self.assertEqual(("http://app.example.com", "web"), (str(row[4]), str(row[5])))
+        self.assertEqual(("q", "query", True), (str(row[6]), str(row[7]), bool(row[8])))
+
+    def test_the_service_and_the_host_it_is_on_are_two_rows_and_one_link(self):
+        [row] = self.rows(
+            "SELECT s.port, s.protocol, s.banner, h.hostname, host(h.address), e.label"
+            "  FROM services s JOIN hosts h ON h.entity_id = s.host_id"
+            "  JOIN entities e ON e.id = s.host_id"
+            " WHERE e.program_id = $1::uuid"
+        )
+
+        self.assertEqual((80, "tcp", "nginx"), (int(row[0]), str(row[1]), str(row[2])))
+        self.assertEqual(("app.example.com", PINNED), (str(row[3]), str(row[4])))
+        self.assertRegex(str(row[5]), r"^HST[0-9]+$")
+
+    def test_an_observation_may_be_about_a_subject_proposed_beside_it(self):
+        # The gap ticket 20 left: an Observation whose subject is proposed in
+        # the same result had no label to name, and naming it by `ref` is the
+        # only way a child can be about something it just found.
+        [row] = self.rows(
+            "SELECT o.label, o.kind, e.type, o.metadata ->> 'element'"
+            "  FROM observations o JOIN entities e ON e.id = o.subject_entity_id"
+            " WHERE o.program_id = $1::uuid"
+        )
+
+        self.assertEqual(self.promoted["observations"], [str(row[0])])
+        self.assertEqual((DISCOVERED, "endpoint"), (str(row[1]), str(row[2])))
+        self.assertEqual("observations[0]", str(row[3]))
+
+    # -- criterion 2: canonical form, and scope, before the row exists --------
+
+    def test_every_subject_was_canonicalized_before_it_was_written(self):
+        stored = {
+            str(row[0]): str(row[1])
+            for row in self.rows(
+                "SELECT e.type, e.dedup_key FROM entities e"
+                " WHERE e.program_id = $1::uuid AND e.type IN ('domain','endpoint','application')"
+                " AND e.dedup_key NOT LIKE '%*%'"
+            )
+        }
+
+        self.assertEqual("domain:www.example.com", stored["domain"])
+        self.assertEqual("application:http://app.example.com", stored["application"])
+        self.assertTrue(stored["endpoint"].endswith("|GET|/notes"), stored["endpoint"])
+
+    def test_a_subject_the_program_has_not_authorised_is_refused_before_it_exists(self):
+        # `admin.example.com` is excluded by the configuration, and the Spec
+        # forbids discovery outside it. So the refusal has to happen before the
+        # row: an Entity written and then projected denied is a record of the
+        # discovery this rule exists to prevent.
+        self.assertIn(("new_entities[0]", "out_of_scope"), self.dropped())
+        self.assertEqual(
+            0,
+            int(
+                self.connection.execute(
+                    "SELECT count(*) FROM entities WHERE program_id = $1::uuid"
+                    "   AND scope_selector = 'admin.example.com'",
+                    (self.identifiers["recon"],),
+                ).scalar()
+            ),
+        )
+
+    def test_a_url_the_schema_cannot_spell_is_refused_with_the_reason(self):
+        drops = dict(self.dropped())
+        cited = {
+            str(path): str(reason)
+            for path, reason in self.connection.execute(
+                "SELECT element_path, cited FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid AND element_path = 'new_entities[1]'",
+                (self.refusals.proposal_id,),
+            ).rows
+        }
+
+        self.assertEqual("malformed_field", drops["new_entities[1]"])
+        self.assertIn("normal form", cited["new_entities[1]"])
+
+    def test_a_field_the_schema_cannot_hold_refuses_the_element_it_is_on(self):
+        # A Host offered with a hostname for an address. Promoting it on the
+        # hostname alone would answer "what address is this" with nothing, while
+        # the child that sent one has been told the element landed.
+        [row] = self.connection.execute(
+            "SELECT reason, cited FROM proposal_drops"
+            " WHERE proposal_id = $1::uuid AND element_path = 'new_entities[6]'",
+            (self.refusals.proposal_id,),
+        ).rows
+
+        self.assertEqual("malformed_field", str(row[0]))
+        self.assertIn("address is not an IP address", str(row[1]))
+        self.assertEqual(
+            [],
+            list(
+                self.rows(
+                    "SELECT h.hostname FROM hosts h JOIN entities e ON e.id = h.entity_id"
+                    " WHERE e.program_id = $1::uuid AND h.hostname = 'two.example.com'"
+                )
+            ),
+        )
+
+    def test_each_wrong_element_is_refused_for_the_one_thing_it_gets_wrong(self):
+        self.assertEqual(
+            [
+                ("new_entities[0]", "out_of_scope"),
+                ("new_entities[1]", "malformed_field"),
+                ("new_entities[2]", "no_parent"),
+                ("new_entities[3]", "unknown_kind"),
+                ("new_entities[4]", "malformed_field"),
+                ("new_entities[5]", "no_provenance"),
+                ("new_entities[6]", "malformed_field"),
+                ("relationships[0]", "invalid_direction"),
+                ("relationships[1]", "is_containment"),
+                ("relationships[2]", "unknown_kind"),
+                ("relationships[3]", "no_subject"),
+            ],
+            self.dropped(),
+        )
+        self.assertEqual("rejected", self.refused["status"])
+        self.assertEqual(11, self.refused["refused"])
+        self.assertEqual([], self.refused["entities"])
+        self.assertEqual([], self.refused["relationships"])
+
+    def dropped(self) -> list[tuple[str, str]]:
+        return [
+            (str(path), str(reason))
+            for path, reason in self.connection.execute(
+                "SELECT element_path, reason FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid ORDER BY ordinal",
+                (self.refusals.proposal_id,),
+            ).rows
+        ]
+
+    # -- criterion 3: containment is not a relationship, and direction is a rule
+
+    def test_the_three_relationships_promoted_are_the_three_allowed(self):
+        self.assertEqual(
+            sorted(["resolves_to", "serves", "runs"]),
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT type FROM relationships WHERE program_id = $1::uuid"
+                )
+            ),
+        )
+
+    def test_a_containment_pair_is_refused_however_it_is_written(self):
+        cited = str(
+            self.connection.execute(
+                "SELECT cited FROM proposal_drops WHERE proposal_id = $1::uuid"
+                "   AND element_path = 'relationships[1]'",
+                (self.refusals.proposal_id,),
+            ).scalar()
+        )
+
+        self.assertIn("containment", cited)
+
+    def test_the_grammar_holds_against_a_writer_that_is_not_the_promotion(self):
+        # On the table rather than in the promotion, because promotion is one
+        # writer: an operator's session and a restore are the others, and a
+        # relationship with a direction nothing accepts is as wrong from either.
+        held = self.held("recon")
+        # As the owner, on its own connection: this case's connection is the
+        # runtime's, and the writer being answered here is the one that owns the
+        # table and could otherwise write what promotion refuses to.
+        with pg.connect(self.harness.superuser) as session, session.transaction():
+            session.execute("SET LOCAL ROLE rk2_owner")
+            session.execute("SELECT set_actor('runtime', 'selftest')")
+            with self.assertRaises(pg.DatabaseError) as refused:
+                session.execute(
+                    "INSERT INTO relationships (program_id, src_entity_id,"
+                    " dst_entity_id, type)"
+                    " SELECT $1::uuid, a.id, b.id, 'serves' FROM entities a, entities b"
+                    "  WHERE a.program_id = $1::uuid AND b.program_id = $1::uuid"
+                    "    AND a.label = $2 AND b.label = $3",
+                    (self.identifiers["recon"], held["application"], held["host"]),
+                )
+
+        self.assertIn("is not defined from application to host", str(refused.exception))
+        self.assertIn("reversed", str(refused.exception))
+
+    def test_the_standing_check_reports_nothing_about_this_installation(self):
+        # Through the registry rather than by calling the function, because a
+        # check nothing runs is a check that cannot fail: `run_standing_checks`
+        # is what the gate reads, and the row is what puts this one in it.
+        [row] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'surface_promotion'"
+        ).rows
+
+        self.assertEqual((0, ""), (int(row[0]), str(row[1])))
+
+    # -- criterion 4: one subject, one Entity, every provenance ---------------
+
+    def test_the_same_subject_found_twice_is_one_entity_with_two_provenances(self):
+        self.assertEqual("promoted", self.converged["status"])
+        self.assertEqual(2, len(self.converged["entities"]))
+        self.assertEqual(1, len(self.converged["relationships"]))
+        self.assertEqual(
+            sorted(self.converged["entities"]),
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT e.label FROM entities e WHERE e.program_id = $1::uuid"
+                    "   AND e.dedup_key IN ('domain:www.example.com','host:app.example.com')"
+                )
+            ),
+        )
+        self.assertEqual(
+            [2, 2],
+            [
+                int(row[0])
+                for row in self.rows(
+                    "SELECT count(*) FROM entity_provenance p"
+                    "  JOIN entities e ON e.id = p.entity_id"
+                    " WHERE p.program_id = $1::uuid"
+                    "   AND e.dedup_key IN ('domain:www.example.com','host:app.example.com')"
+                    " GROUP BY e.id ORDER BY count(*)"
+                )
+            ],
+        )
+
+    def test_the_second_sighting_added_a_provenance_rather_than_replacing_one(self):
+        rows = self.rows(
+            "SELECT p.element_path, p.receipt_id IS NOT NULL, p.tool_run_id IS NOT NULL"
+            "  FROM entity_provenance p JOIN entities e ON e.id = p.entity_id"
+            " WHERE p.program_id = $1::uuid AND e.dedup_key = 'domain:www.example.com'"
+            " ORDER BY p.observed_at"
+        )
+
+        self.assertEqual(
+            [("new_entities[0]", False, True), ("new_entities[0]", True, False)],
+            [(str(row[0]), bool(row[1]), bool(row[2])) for row in rows],
+        )
+
+    def test_the_relationship_found_twice_is_one_row_with_two_provenances(self):
+        [row] = self.rows(
+            "SELECT count(DISTINCT r.id), count(*) FROM relationship_provenance p"
+            "  JOIN relationships r ON r.id = p.relationship_id"
+            " WHERE p.program_id = $1::uuid AND r.type = 'resolves_to'"
+        )
+
+        self.assertEqual((1, 2), (int(row[0]), int(row[1])))
+
+    def test_two_programs_that_found_the_same_host_hold_two_entities(self):
+        rows = self.connection.execute(
+            "SELECT program_id::text, id::text FROM entities"
+            " WHERE dedup_key = 'host:app.example.com' AND program_id = ANY($1::uuid[])",
+            ("{" + ",".join(self.identifiers[name] for name in ("recon", "other")) + "}",),
+        ).rows
+
+        self.assertEqual(2, len(rows))
+        self.assertEqual(2, len({str(row[0]) for row in rows}))
+        self.assertEqual(2, len({str(row[1]) for row in rows}))
+        self.assertEqual(
+            9, len(self.parallel["entities"]), self.parallel
+        )
+
+    def test_no_provenance_row_reaches_across_the_program_boundary(self):
+        # Structural rather than incidental: every key on the two provenance
+        # tables carries `program_id`, so a row citing another Program's
+        # evidence is refused by the key. This is the query that would find one.
+        self.assertEqual(
+            [],
+            list(
+                self.connection.execute(
+                    "SELECT p.id::text FROM entity_provenance p"
+                    "  JOIN entities e ON e.id = p.entity_id"
+                    " WHERE e.program_id <> p.program_id"
+                ).rows
+            ),
+        )
+
+    # -- criterion 5: where a row came from stays readable --------------------
+
+    def test_a_configured_identity_and_a_promoted_one_are_told_apart(self):
+        origins = {
+            str(row[0]): str(row[1])
+            for row in self.rows(
+                "SELECT i.slot_name, e.origin FROM identities i"
+                "  JOIN entities e ON e.id = i.entity_id"
+                " WHERE e.program_id = $1::uuid"
+            )
+        }
+
+        self.assertEqual(
+            {"member": "configured", "anonymous-visitor": "proposed"}, origins
+        )
+
+    def test_an_agent_may_not_propose_an_identity_that_holds_a_secret(self):
+        cited = str(
+            self.connection.execute(
+                "SELECT cited FROM proposal_drops WHERE proposal_id = $1::uuid"
+                "   AND element_path = 'new_entities[4]'",
+                (self.refusals.proposal_id,),
+            ).scalar()
+        )
+
+        self.assertIn("only an anonymous identity", cited)
+        self.assertEqual(
+            [],
+            list(
+                self.rows(
+                    "SELECT i.slot_name FROM identities i"
+                    "  JOIN entities e ON e.id = i.entity_id"
+                    " WHERE e.program_id = $1::uuid AND i.slot_name = 'root'"
+                )
+            ),
+        )
+
+    def test_the_origin_vocabulary_covers_the_three_the_criterion_names(self):
+        self.assertEqual(
+            ["configured", "imported", "observed", "proposed"],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT unnest(rk2_origins()) ORDER BY 1"
+                ).rows
+            ],
+        )
+
+    # -- criterion 6: the compact read, without the transcript ----------------
+
+    def test_the_surface_record_names_the_parent_and_the_relationships(self):
+        held, labels = self.held("recon"), self.labels("recon")
+        endpoint = self.record("recon", held["endpoint"])
+        host = self.record("recon", held["host"])
+
+        self.assertEqual(held["application"], endpoint["parent_label"])
+        self.assertEqual("proposed", endpoint["origin"])
+        self.assertEqual([], endpoint["relationships"])
+        self.assertEqual(
+            sorted(
+                [
+                    {"type": "resolves_to", "direction": "in",
+                     "label": labels["domain:www.example.com"]},
+                    {"type": "serves", "direction": "out", "label": held["application"]},
+                ],
+                key=repr,
+            ),
+            sorted(host["relationships"], key=repr),
+        )
+
+    def test_the_surface_record_says_who_says_so_without_the_proposal(self):
+        domain = self.record("recon", self.labels("recon")["domain:www.example.com"])
+
+        self.assertEqual("proposed", domain["origin"])
+        self.assertEqual(["proposed"], domain["origins"])
+        self.assertEqual("target", domain["scope_class"])
+        self.assertTrue(domain["in_scope"])
+        self.assertNotIn(self.found.label, json.dumps(domain))
+        self.assertNotIn(self.again.label, json.dumps(domain))
+
+    def test_the_record_says_how_many_relationships_it_cut_the_list_down_from(self):
+        # The cap without the count would read as the whole list. `packet` says
+        # the same thing about every section it truncates; a record that carries
+        # twenty of two hundred and does not say so is the one shape of bounded
+        # read an agent cannot tell from a complete one.
+        held = self.held("recon")
+        host = self.record("recon", held["host"])
+        endpoint = self.record("recon", held["endpoint"])
+
+        self.assertEqual(len(host["relationships"]), host["relationship_count"])
+        self.assertEqual(2, host["relationship_count"])
+        self.assertEqual(0, endpoint["relationship_count"])
+
+    def test_the_record_revision_covers_the_relationships_the_record_carries(self):
+        # A Relationship is its own row with its own Events, and joining one
+        # changes this record. A revision that only counted `entities` would
+        # leave a reader ranking and comparing by a number the change did not
+        # move.
+        held = self.held("recon")
+        [row] = self.connection.execute(
+            "SELECT rk2_revision('entities', e.id) FROM entities e"
+            " WHERE e.program_id = $1::uuid AND e.label = $2",
+            (self.identifiers["recon"], held["host"]),
+        ).rows
+        with self.agent_session("recon") as session:
+            revision = int(
+                session.execute(
+                    "SELECT revision FROM v_records WHERE kind = 'entity' AND label = $1",
+                    (held["host"],),
+                ).scalar()
+            )
+
+        self.assertGreater(revision, int(row[0]))
+
+    def test_the_read_role_reads_the_origin_of_a_row_and_not_its_evidence(self):
+        # 033's registry is the grant, and section 5 names four columns in it.
+        # Which kinds of evidence stand behind a row is the agent's question;
+        # which Receipt, from which run, is the supervisor's, and answering it
+        # to a child would put another Program's label one join away.
+        granted = {
+            column: bool(
+                self.connection.execute(
+                    "SELECT has_column_privilege('rk2_state', 'entity_provenance',"
+                    " $1, 'SELECT')",
+                    (column,),
+                ).scalar()
+            )
+            for column in ("entity_id", "origin", "receipt_id", "agent_run_id")
+        }
+
+        self.assertEqual(
+            {"entity_id": True, "origin": True,
+             "receipt_id": False, "agent_run_id": False},
+            granted,
+        )
+
+    def test_promoting_the_same_result_again_changes_nothing_and_says_so(self):
+        before = self.labels("recon")
+
+        repeated = self.promoted_now("recon", self.found.proposal_id)
+
+        self.assertTrue(repeated["repeated"])
+        self.assertEqual("promoted", repeated["status"])
+        self.assertEqual(
+            sorted(self.promoted["entities"]), sorted(repeated["entities"])
+        )
+        self.assertEqual(
+            sorted(self.promoted["relationships"]), sorted(repeated["relationships"])
+        )
+        self.assertEqual(before, self.labels("recon"))
 
 
 #: The Programs the refusal case opens. Two of them, because one thing a
