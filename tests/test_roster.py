@@ -781,8 +781,9 @@ class SchemaAgreementTest(unittest.TestCase):
     #: two columns were added after 019 was applied and a migration cannot be
     #: edited once it has a recorded checksum, so the roster's statement of a
     #: role is spread over two documents and this test is what keeps that from
-    #: mattering.
-    NUMBERS = re.compile(
+    #: mattering. A seventh role has to be written into both, and a seventh
+    #: written into only one fails here rather than at its first claim.
+    MODEL_AND_EFFORT = re.compile(
         r"\('(?P<role>\w+)', +'(?P<model>[\w.-]+)', +'(?P<effort>\w+)'\)"
     )
 
@@ -790,7 +791,7 @@ class SchemaAgreementTest(unittest.TestCase):
     def setUpClass(cls):
         migrations = ROOT / "src" / "redkraken" / "migrations"
         cls.sql = (migrations / "0019_role_kinds.sql").read_text(encoding="utf-8")
-        cls.numbers_sql = (
+        cls.model_and_effort_sql = (
             migrations / "20260813T200000Z__a_role_runs_at_the_rosters_model_and_effort.sql"
         ).read_text(encoding="utf-8")
 
@@ -826,13 +827,13 @@ class SchemaAgreementTest(unittest.TestCase):
 
     def test_every_role_runs_at_the_model_and_effort_this_roster_gives_it(self):
         # PH2-71. The scheduler used to decide both from `runs_as`, so three of
-        # the five agent roles ran at numbers this file does not state. They are
-        # a roster row now, and this is the assertion that keeps them one
-        # statement: a roster edit the migration does not follow fails here
-        # rather than in a claim nobody is watching.
+        # the five agent roles ran at a model and an effort this file does not
+        # state. They are a roster row now, and this is the assertion that keeps
+        # them one statement: a roster edit the migration does not follow fails
+        # here rather than in a claim nobody is watching.
         stated = {}
-        for row in self.NUMBERS.finditer(
-            self.statement("UPDATE roles r SET", self.numbers_sql)
+        for row in self.MODEL_AND_EFFORT.finditer(
+            self.statement("UPDATE roles r SET", self.model_and_effort_sql)
         ):
             role = roster.ROLES[row["role"]]
             stated[row["role"]] = (row["model"], row["effort"])

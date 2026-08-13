@@ -1007,7 +1007,7 @@ CONTROLS = (
         # value that goes stale on the day the pair changes, without moving and
         # without anything reading it noticing. Structural for the same reason
         # the slate's is: no row is wrong, the text is.
-        "standing:roster_numbers",
+        "standing:roster_model_and_effort",
         "CREATE FUNCTION selftest_model_for_role() RETURNS text"
         " LANGUAGE sql IMMUTABLE AS $ctl$ SELECT 'claude-opus-5'::text $ctl$",
     ),
@@ -10888,15 +10888,20 @@ SLATE_SPEND = (40000, 10000)
 #: rather than partially claimed.
 SLATE_CONTENDERS = 4
 
-#: The bytes the analyze scenario's subject was observed through. Any 64 hex
+#: The bytes the analyze scenario's subject was seen through. Any 64 hex
 #: characters do: `artifacts` is content-addressed and nothing on the claim path
 #: hashes anything back, so what `ready_for` asks is that the row exists, is
 #: agent-visible, is unencrypted and is reachable from an Observation.
-ANALYSED_SHA = "7e" * 32
+ANALYZED_SHA = "7e" * 32
 
 #: What the seeded Findings are findings of. One of 034's seeded classes, chosen
 #: because it is the family the seeded Hypotheses' property class belongs to.
 FINDING_CLASS = "idor"
+
+#: Every Task kind, in the order the roster scenario seeds and claims them. One
+#: Task each, and all five claimed, because a role's model and effort are what
+#: the claim is being asked about and each kind reaches a different role.
+SLATE_KINDS = ("recon", "hunt", "analyze", "validate", "report")
 
 
 class SlateClaimTest(DatabaseCase):
@@ -10913,6 +10918,10 @@ class SlateClaimTest(DatabaseCase):
     slate that ages past its expiry, a choice whose entry is consumed under it,
     a second Program that owns the label being asked for. What the claim then
     does with the disturbance is the whole of the ticket.
+
+    One Program is not disturbed at all: the `roster` one carries a Task of
+    every kind, and what it asks is PH2-71's -- that the run each claim opens
+    carries the claimed role's own model and effort.
 
     Everything runs in `setUpClass` because all of it commits: a claim repeated
     per test would be a second claim on a Task the first one took, and the
@@ -10939,7 +10948,7 @@ class SlateClaimTest(DatabaseCase):
             ("spent", SLATE_TIGHT),
             ("held", AFFORDABLE),
             ("contended", AFFORDABLE),
-            ("numbers", AFFORDABLE),
+            ("roster", AFFORDABLE),
         ):
             path = write(
                 SCOPED.replace(SCOPED_BUDGETS, budgets).replace(
@@ -10958,7 +10967,7 @@ class SlateClaimTest(DatabaseCase):
         cls.arrange_spent()
         cls.arrange_held()
         cls.arrange_contended()
-        cls.arrange_numbers()
+        cls.arrange_model_and_effort()
 
     @classmethod
     def tearDownClass(cls):
@@ -10973,7 +10982,7 @@ class SlateClaimTest(DatabaseCase):
             # would have removed it, and `DELETE FROM programs` raises. It is a
             # purge that cannot travel its own edge in the order the catalogue
             # happens to hold, which is 031's failure in a place 031 does not
-            # repair. Recorded against PH2-71 and owed a ticket.
+            # repair. Filed as PH2-74; this delete comes out with that ticket.
             cls.connection.execute(
                 "DELETE FROM finding_hypotheses WHERE program_id IN"
                 " (SELECT id FROM programs WHERE slug LIKE $1)",
@@ -11213,28 +11222,31 @@ class SlateClaimTest(DatabaseCase):
         )
 
     @classmethod
-    def arrange_numbers(cls):
+    def arrange_model_and_effort(cls):
         """One Task of every kind, each claimed, each against its roster row.
 
         PH2-71's criterion 3. `claim_task` used to decide a run's model and
-        effort from `runs_as` alone, so three of the five agent roles ran at
-        numbers the roster does not give them -- and a fixture that claims only
-        recon Tasks cannot see that, because recon is one of the two the
-        constant happened to be right about. Every kind is seeded ready here,
-        which is also the first time `claimable_for` is asked about all five in
-        one Program.
+        effort from `runs_as` alone, so three of the five agent roles ran at a
+        model and an effort the roster does not give them -- and a fixture that
+        claims only recon Tasks cannot see that, because recon is one of the two
+        the constant happened to be right about. Every kind is seeded ready
+        here, which is also the first time `claimable_for` is asked about all
+        five in one Program.
 
-        Each run is closed before the next Task is claimed, which is not
-        tidiness: four of the five kinds are run by a subagent role and
-        `max_concurrent_subagents` is three, so five simultaneous claims would
-        have the last one refused `global_subagent_cap` -- a true refusal about
-        somebody else's concurrency, and nothing to do with what this fixture
-        asks. The closing hands the Task back to `pending` with the attempt
-        spent, which is what frees the lane and the count.
+        Each run is closed before the next Task is claimed, and that is not
+        tidiness. `global_subagent_cap` counts every claimed or running Task in
+        the Program whose lane role runs as a subagent and then refuses the
+        claim in front of it, whatever that claim would start: three of the
+        five kinds are subagent ones (recon, web_hunter, js_analyst -- the
+        validator holds a session and the reporter is a renderer), so with all
+        three left open the validate claim is refused for somebody else's
+        concurrency. Closing hands the Task back to `pending` with the attempt
+        spent, which frees both the lane and the count. That the cap also
+        refuses claims which start no subagent at all is real and is PH2-75.
         """
-        program_id = cls.identifiers["numbers"]
-        labels = cls.seed("numbers", 5)
-        by_kind = dict(zip(("recon", "hunt", "analyze", "validate", "report"), labels))
+        program_id = cls.identifiers["roster"]
+        labels = cls.seed("roster", 5)
+        by_kind = dict(zip(SLATE_KINDS, labels, strict=True))
         subjects = {
             kind: str(
                 cls.scalar(
@@ -11247,15 +11259,7 @@ class SlateClaimTest(DatabaseCase):
         }
 
         # A hunt is ready with a testable Hypothesis under it.
-        hypothesis = str(
-            cls.scalar(
-                "INSERT INTO hypotheses (program_id, subject_entity_id,"
-                " property_class, statement, status)"
-                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
-                " 'a hypothesis worth hunting', 'testable') RETURNING id::text",
-                (program_id, subjects["hunt"]),
-            )
-        )
+        hypothesis = cls.hypothesis("roster", subjects["hunt"], "worth hunting")
         cls.as_owner(
             "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
             " WHERE program_id = $1::uuid AND label = $2",
@@ -11269,7 +11273,7 @@ class SlateClaimTest(DatabaseCase):
         cls.as_owner(
             "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
             " VALUES ($1, 9, 'text/plain', 'agent_visible')",
-            (ANALYSED_SHA,),
+            (ANALYZED_SHA,),
         )
         receipt = str(
             cls.scalar(
@@ -11285,7 +11289,7 @@ class SlateClaimTest(DatabaseCase):
                 "         'target', (SELECT max(version) FROM program_scope_versions"
                 "                     WHERE program_id = $1::uuid))"
                 " RETURNING id::text",
-                (program_id, ANALYSED_SHA),
+                (program_id, ANALYZED_SHA),
             )
         )
         cls.as_owner(
@@ -11304,23 +11308,23 @@ class SlateClaimTest(DatabaseCase):
         # A validate is ready with a candidate Finding that has a test spec
         # behind it; a report is ready with a validated Finding anywhere in the
         # Program, and a validated Finding is one the runtime re-ran.
-        candidate = cls.finding("numbers", subjects["validate"], "candidate")
+        candidate = cls.finding("roster", subjects["validate"], "candidate")
         cls.as_owner(
             "UPDATE tasks SET kind = 'validate', finding_id = $3::uuid"
             " WHERE program_id = $1::uuid AND label = $2",
             (program_id, by_kind["validate"], candidate),
         )
-        cls.finding("numbers", subjects["report"], "validated")
+        cls.finding("roster", subjects["report"], "validated")
         cls.as_owner(
             "UPDATE tasks SET kind = 'report'"
             " WHERE program_id = $1::uuid AND label = $2",
             (program_id, by_kind["report"]),
         )
 
-        cls.bind("numbers")
-        cls.offered_numbers = cls.offer()
-        cls.claimed_numbers = {}
-        for kind in ("recon", "hunt", "analyze", "validate", "report"):
+        cls.bind("roster")
+        cls.offer()
+        cls.claimed_runs = {}
+        for kind in SLATE_KINDS:
             run = cls.call("SELECT claim_task($1)", (by_kind[kind],))
             claimed = cls.as_owner(
                 "SELECT a.id::text AS id, a.role, a.model, a.effort,"
@@ -11329,9 +11333,27 @@ class SlateClaimTest(DatabaseCase):
                 " WHERE a.program_id = $1::uuid AND a.label = $2",
                 (program_id, str(run)),
             ).dicts()[0]
-            cls.claimed_numbers[kind] = claimed
+            cls.claimed_runs[kind] = claimed
             cls.call("SELECT finish_task_attempt($1::uuid, 'completed')",
                      (claimed["id"],))
+
+    @classmethod
+    def hypothesis(cls, name: str, subject: str, worth: str) -> str:
+        """One testable Hypothesis on the subject.
+
+        The shape a hunt needs under it and the shape a Finding is a finding
+        of are the same shape, so both take it from here. `worth` is what
+        distinguishes them when a row is read back by hand.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " property_class, statement, status)"
+                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
+                " $3, 'testable') RETURNING id::text",
+                (cls.identifiers[name], subject, f"a hypothesis {worth}"),
+            )
+        )
 
     @classmethod
     def finding(cls, name: str, subject: str, status: str) -> str:
@@ -11344,15 +11366,7 @@ class SlateClaimTest(DatabaseCase):
         runtime re-ran it.
         """
         program_id = cls.identifiers[name]
-        hypothesis = str(
-            cls.scalar(
-                "INSERT INTO hypotheses (program_id, subject_entity_id,"
-                " property_class, statement, status)"
-                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
-                " 'a hypothesis worth judging', 'testable') RETURNING id::text",
-                (program_id, subject),
-            )
-        )
+        hypothesis = cls.hypothesis(name, subject, "worth judging")
         test = str(
             cls.scalar(
                 "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
@@ -11723,29 +11737,35 @@ class SlateClaimTest(DatabaseCase):
     def test_the_event_log_accounts_for_the_row_the_race_moved(self):
         self.assertEqual([], self.contended_integrity)
 
-    # -- the numbers the claim opens a run at (PH2-71) --------------------------
+    # -- the model and effort the claim opens a run at (PH2-71) ----------------
 
-    def test_every_kind_opens_its_run_at_the_roster_row_numbers(self):
+    def test_every_kind_opens_its_run_at_the_rosters_model_and_effort(self):
         # Criterion 3, and the whole of what the ticket moved: the claim reads
         # the role's model and effort off `roles` instead of deciding them from
         # `runs_as`. Asserted against the roster row rather than against five
         # literals, so a future roster edit the scheduler does not follow fails
-        # here without this file being touched.
+        # here without this file being touched. The kinds are asserted first,
+        # because two comprehensions over one dict agree with each other however
+        # few claims are in it.
+        self.assertEqual(set(SLATE_KINDS), set(self.claimed_runs))
         self.assertEqual(
             {kind: (row["roster_model"], row["roster_effort"])
-             for kind, row in self.claimed_numbers.items()},
+             for kind, row in self.claimed_runs.items()},
             {kind: (row["model"], row["effort"])
-             for kind, row in self.claimed_numbers.items()},
+             for kind, row in self.claimed_runs.items()},
         )
 
-    def test_the_kinds_do_not_all_run_at_one_number(self):
+    def test_the_kinds_do_not_all_run_at_one_effort(self):
         # The guard on the assertion above. Four of the five kinds ran at
         # `high` before this ticket, and a roster that gave every role the same
-        # effort would make agreeing with it prove nothing.
+        # effort would make agreeing with it prove nothing. The literals are
+        # deliberate: agreement is what the test above asks, and this one asks
+        # what the roster says, which is not something it can read off the row
+        # it is checking.
         self.assertEqual(
             {"recon": "medium", "hunt": "high", "analyze": "high",
              "validate": "max", "report": "none"},
-            {kind: row["effort"] for kind, row in self.claimed_numbers.items()},
+            {kind: row["effort"] for kind, row in self.claimed_runs.items()},
         )
 
     def test_the_run_the_renderer_opens_carries_no_model(self):
@@ -11754,9 +11774,9 @@ class SlateClaimTest(DatabaseCase):
         # branch that used to spell `'none'` here.
         self.assertEqual(
             ("reporter", "none", "none"),
-            (self.claimed_numbers["report"]["role"],
-             self.claimed_numbers["report"]["model"],
-             self.claimed_numbers["report"]["effort"]),
+            (self.claimed_runs["report"]["role"],
+             self.claimed_runs["report"]["model"],
+             self.claimed_runs["report"]["effort"]),
         )
 
     def test_no_run_was_opened_at_a_resolved_model_identifier(self):
@@ -11765,14 +11785,14 @@ class SlateClaimTest(DatabaseCase):
         # pair turns `opus` into -- belongs to the version-bound manifest, and a
         # copy of it here would go stale without moving.
         self.assertEqual(
-            [], [kind for kind, row in self.claimed_numbers.items()
+            [], [kind for kind, row in self.claimed_runs.items()
                  if str(row["model"]).startswith("claude-")]
         )
 
     # -- the invariant ---------------------------------------------------------
 
     def test_the_standing_checks_are_registered_and_hold(self):
-        for name in ("slate_claim", "roster_numbers"):
+        for name in ("slate_claim", "roster_model_and_effort"):
             with self.subTest(check=name):
                 [registered] = self.connection.execute(
                     "SELECT count(*) FROM standing_checks WHERE name = $1", (name,)

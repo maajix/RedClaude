@@ -11,27 +11,27 @@ the only thing that proves per-story implementation.
 ## Structural validation
 
 Re-measured 2026-08-13, after tickets 67–70 were raised by the ticket-14 review,
-71–73 by the ticket-18 review and 74 by the ticket-71 implementation, all triaged
-into the graph.
+71–73 by the ticket-18 review and 74–75 by the ticket-71 implementation and its
+review, all triaged into the graph.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 74, numbered continuously 01–74 |
-| Ticket status | 25 `resolved`, 49 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 427 total, 147 ticked |
+| Ticket files | 75, numbered continuously 01–75 |
+| Ticket status | 25 `resolved`, 50 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 430 total, 147 ticked |
 | Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
-| Release reachability | Every ticket except 67–74 has a dependency path to ticket 65 |
+| Release reachability | Every ticket except 67–75 has a dependency path to ticket 65 |
 | Absolute, scratch or issue-file paths in tickets | 0 |
 
 Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
 the plan's reachability property. Ticket 62 now lists it as a blocker, which
-restored it. Tickets 67–74 are in the same position and not yet resolved the
-same way: each except 74 names a blocker, so none of them is a way to start work
-early, but nothing downstream names them, so today they are eight sinks beside 65
-rather than work the release depends on. Whichever later ticket owns their outcome has
-to list them before that claim reads "every ticket" again.
+restored it. Tickets 67–75 are in the same position and not yet resolved the
+same way: each except 74 and 75 names a blocker, so none of them is a way to
+start work early, but nothing downstream names them, so today they are nine sinks
+beside 65 rather than work the release depends on. Whichever later ticket owns
+their outcome has to list them before that claim reads "every ticket" again.
 
 Tickets 71–73 are drift the ticket-18 review found between the compiled roster
 and the scheduler that will read it: the model and effort a claimed run records,
@@ -41,19 +41,23 @@ blocked by the scheduler ticket that owns the code it changes (23 and 24), which
 is also why none of them was fixed under 18. The first of the three, 71, is
 resolved.
 
-Ticket 74 is the one thing 71 found that was not 71's: the whole-program purge
+Tickets 74 and 75 are what 71 found that was not 71's, and both are defects the
+corpus has held since the migration that wrote them. 74: the whole-program purge
 fails for a Program holding a Finding that cites a Hypothesis, because the NO
 ACTION check on the rollup edge is queued ahead of the cascade that would satisfy
-it. It names no blocker because nothing blocks it -- the corpus has held the
-defect since 016 and no test had reached it.
+it. 75: `global_subagent_cap` counts the Tasks already claimed and never asks
+what the claim in front of it would start, so a Program running three subagents
+refuses a validate or a report that adds none. Neither names a blocker, because
+nothing blocks them -- no test had reached either until a fixture claimed one
+Task of every kind in one Program and then purged it.
 
 ## Implementation progress
 
 | Measure | Value |
 | --- | --- |
 | Resolved | 01–24, 71 |
-| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 72, 73, 74 |
-| Criteria ticked | 147 of 427 |
+| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 72, 73, 74, 75 |
+| Criteria ticked | 147 of 430 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -101,9 +105,10 @@ keeps what it holds. What that run is started at is now the roster's own: the
 model and effort a claim records are two columns on `roles` the claim reads,
 rather than one constant the scheduler spelled for every role that is not the
 renderer, and the model is the alias the SDK is handed rather than the
-resolution a version-bound manifest owns. The budgets and ranking policy the scheduler is measured
-by, the hypothesis and validation half of the epistemic pipeline, kill chains,
-the v1 knowledge migration and the operator surface are untouched.
+resolution a version-bound manifest owns. The budgets and ranking policy the
+scheduler is measured by, the hypothesis and validation half of the epistemic
+pipeline, kill chains, the v1 knowledge migration and the operator surface are
+untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

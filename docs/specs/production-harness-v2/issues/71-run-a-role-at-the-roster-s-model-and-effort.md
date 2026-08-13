@@ -7,7 +7,7 @@
 **Status:** resolved
 
 - [x] `claim_task()` writes the claimed role's own model and effort, not one constant for every non-renderer role.
-- [x] A role's model and effort are stated in exactly one place, and adding a role cannot leave the scheduler writing someone else's numbers.
+- [x] A role's model and effort are stated in exactly one place, and adding a role cannot leave the scheduler writing someone else's.
 - [x] A test claims a task of each kind and asserts the run row against the roster row, so a future roster edit that the scheduler does not follow fails.
 
 ## Why
@@ -68,17 +68,17 @@ renderer that spent a token.
 
 Implemented on 2026-08-13. One migration,
 `20260813T200000Z__a_role_runs_at_the_rosters_model_and_effort.sql`, two columns
-on `roles`, one standing check, `roster_numbers`, and a fifth scenario in
-`SlateClaimTest` that claims one Task of every kind.
+on `roles`, one standing check, `roster_model_and_effort`, and a tenth scenario
+in `SlateClaimTest` that claims one Task of every kind.
 
 ### The first shape, because the second leaves a run row that cannot be written
 
-The ticket offers two, and the second -- the runtime writing the numbers when it
+The ticket offers two, and the second -- the runtime writing both fields when it
 starts the child -- is closer to the truth about who picks a model. It is also
 not writable: `agent_runs.model` and `agent_runs.effort` are `NOT NULL`, so
 "unset at claim time" is not a state the row has. Making them nullable to hold a
 window open would weaken the record criterion 3 exists to assert against, so the
-numbers moved onto `roles`, beside `max_concurrent` and
+model and the effort moved onto `roles`, beside `max_concurrent` and
 `clamp_to_identity_leases`, which are there for the same reason and read the same
 way.
 
@@ -100,47 +100,64 @@ literally the string the child was started with, which is what criterion 1 asks
 the row to record. The resolution stays where the thing that performs it is
 named.
 
-Arm (b) of `check_roster_numbers()` is that rule as an invariant: no function
-body in `public`, comments stripped, may match `claude-[a-z]`. Arm (a) is the
-other half -- a `claim_task` whose source no longer selects `r.model` and
-`r.effort` has gone back to deciding a role's numbers itself. Both arms are
-textual on purpose, and the reason is stated in the migration: a run claimed
-under a literal that happens to match today's roster is indistinguishable, row by
-row, from one that read the roster, and they differ on exactly the day the roster
-changes. A row arm was considered and rejected for a second reason --
-`agent_runs.model` is also written by openers that are not agent runs
-(`proxy.OPEN_RUN` records `operator`), so a check comparing every run to its
-role's roster row would be asking those rows to lie. The negative control is the
-smallest way to say what the check is for: a function whose body spells
-`claude-opus-5`.
+Arm (b) of `check_roster_model_and_effort()` is that rule as an invariant: no
+function body in `public`, comments stripped, may match `claude-[a-z]`. Arm (a)
+is the other half -- a `claim_task` that no longer selects both fields into its
+locals from `roles`, or that assigns either of them with `:=`, has gone back to
+deciding. Both arms are textual on purpose, and the reason is stated in the
+migration: a run claimed under a literal that happens to match today's roster is
+indistinguishable, row by row, from one that read the roster, and they differ on
+exactly the day the roster changes. A row arm was considered and rejected for a
+second reason -- `agent_runs` is also written by openers that are not agent runs
+(`proxy.OPEN_RUN` records an orchestrator run at model `operator` and effort
+`low`, for a request a person made and no model served), so a check comparing
+every run to its role's roster row would be asking those rows to lie. The
+negative control is the smallest way to say what the check is for: a function
+whose body spells `claude-opus-5`.
+
+Both arms strip `--` comments before matching, and the review is what made that
+symmetric. Arm (b) needs it or it fires on the paragraph explaining itself. Arm
+(a) needs it for the opposite reason: it fires on absence, so an unstripped body
+would let a commented-out mention of the roster stand in for reading it, which
+is a false negative on the one defect the arm exists to catch.
 
 ### The claim reads one row where it used to run two CASEs
 
 `v_runs_as` is gone with the two `CASE` expressions that were its only readers.
 One `SELECT` over `role_task_kinds JOIN roles` now returns the role, whether it
-clamps, and both numbers -- so there is no longer any way to spell a role's
-numbers in the scheduler at all, which is criterion 2. `tests/test_roster.py`
+clamps, and both fields -- so there is no longer any way to spell a role's model
+or effort in the scheduler at all, which is criterion 2. `tests/test_roster.py`
 reads the migration's `UPDATE ... FROM (VALUES ...)` field by field against
 `roster.ROLES` and asserts the two sets of role names are equal, so a sixth role
 added to one side and not the other fails there rather than at the first claim.
+
+Criterion 2's "exactly one place" is true of the schema and not quite of the
+corpus: 019 is frozen by its checksum, so a role's row is now stated across two
+migrations, and the agreement test reads both. A seventh role has to be written
+into both files, and one written into only one fails in `test_roster.py`.
 
 ### A fixture that claims every kind, and what that took
 
 `SlateClaimTest` had nine Programs and every Task in all of them was a recon
 Task -- which is one of the two kinds the old constant happened to be right
-about. The tenth Program, `numbers`, seeds one Task of each kind with everything
+about. The tenth Program, `roster`, seeds one Task of each kind with everything
 `ready_for` asks of it: a testable Hypothesis under the hunt, an agent-visible
 Artifact reachable through 12's `artifact_refs` bridge under the analyze, a
 candidate Finding with a test spec under the validate, and a validated Finding in
 the Program for the report. It is the first time `claimable_for` is asked about
 all five kinds in one Program.
 
-Each run is closed before the next Task is claimed, and that is not tidiness.
-Four of the five kinds are run by a subagent role and `max_concurrent_subagents`
-is three, so five simultaneous claims have the last one refused
-`global_subagent_cap` -- a true refusal about somebody else's concurrency and
-nothing to do with what the fixture asks. The closing returns the Task to
-`pending` with the attempt spent, which frees both the lane and the count.
+Each run is closed before the next Task is claimed, and that is not tidiness --
+the fourth claim is refused `global_subagent_cap` if it is not. The review
+caught the first reading of why, which was wrong: three of the five kinds run as
+subagents, not four, and the cap of three is asked before the claim, so three
+concurrent hunts are admitted. What refuses the fourth claim is that the cap
+counts the Tasks already claimed and never looks at the role the claim in front
+of it would start -- so a validate, whose validator holds a session, is refused
+for three subagents it does not add to. The closing returns the Task to
+`pending` with the attempt spent, which frees both the lane and the count. The
+cap refusing claims that spend no subagent is a defect of its own and is
+PH2-75.
 
 ### A purge that cannot travel its own edge, found here and left open
 

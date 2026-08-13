@@ -5,7 +5,7 @@
 -- else: `'none'` for the renderer, `'claude-opus-5'` and `'high'` for everyone
 -- else. The roster disagrees with that for three of the five agent roles --
 -- `recon` runs at `medium`, the orchestrator at `xhigh`, the validator at
--- `max`, and the validator's number carries its reason in the roster ("a
+-- `max`, and the validator's effort carries its reason in the roster ("a
 -- validator false negative costs more than the tokens the effort buys"). A
 -- validate task claimed at `high` is that reason silently not in force.
 --
@@ -16,7 +16,7 @@
 -- something else the run row would say the old string and the child would run
 -- on the new model.
 --
--- So the two numbers move onto `roles`, beside `max_concurrent` and
+-- So the model and the effort move onto `roles`, beside `max_concurrent` and
 -- `clamp_to_identity_leases`, which are there for the same reason: the roster
 -- states them once and the scheduler reads them. What lands in
 -- `agent_runs.model` is the alias, not a resolution -- `_launch.options_for`
@@ -26,7 +26,7 @@
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- 1. The two numbers, on the table that already carries the rest of the row
+-- 1. The two fields, on the table that already carries the rest of the row
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE roles ADD COLUMN model  text;
@@ -49,8 +49,8 @@ UPDATE roles r SET model = v.model, effort = v.effort
 ALTER TABLE roles ALTER COLUMN model  SET NOT NULL;
 ALTER TABLE roles ALTER COLUMN effort SET NOT NULL;
 
--- Both vocabularies are `agent_runs`'s, because a role's numbers exist to be
--- written into a run row: a roster value that column would refuse is a claim
+-- Both vocabularies are `agent_runs`'s, because a role's model and effort exist
+-- to be written into a run row: a roster value that column would refuse is a claim
 -- that fails at INSERT time, on the first task of that kind, in production.
 ALTER TABLE roles ADD CONSTRAINT roles_effort_check
     CHECK (effort IN ('none','low','medium','high','xhigh','max'));
@@ -71,7 +71,7 @@ COMMENT ON COLUMN roles.effort IS
 -- One SELECT does what two did. `v_runs_as` is gone with the CASE expressions
 -- that were its only readers: the renderer's `'none'` is now a row in the
 -- roster rather than a branch in the scheduler, which is the whole of this
--- change -- there is no longer any way to spell a role's numbers here.
+-- change -- there is no longer any way to spell a role's model or effort here.
 CREATE OR REPLACE FUNCTION claim_task(p_task_label text DEFAULT NULL)
 RETURNS text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -219,31 +219,46 @@ COMMENT ON FUNCTION claim_task(text) IS
 -- ---------------------------------------------------------------------------
 
 -- Both arms are textual, and deliberately so. The property is about where a
--- number comes from, not about what any row holds: a run claimed under a
--- literal that happens to match today's roster is indistinguishable, row by
--- row, from one that read the roster -- and they differ on exactly the day the
--- roster changes. `agent_runs.model` is also written by openers that are not
--- agent runs at all (`proxy.OPEN_RUN` records `operator`), so a row arm
--- comparing every run to its role would be asking those rows to lie.
-CREATE FUNCTION check_roster_numbers()
+-- model and an effort come from, not about what any row holds: a run claimed
+-- under a literal that happens to match today's roster is indistinguishable,
+-- row by row, from one that read the roster -- and they differ on exactly the
+-- day the roster changes. `agent_runs` is also written by openers that are not
+-- agent runs at all (`proxy.OPEN_RUN` records an orchestrator run at model
+-- `operator` and effort `low`, for a request a person made and no model
+-- served), so a row arm comparing every run to its role would be asking those
+-- rows to lie.
+--
+-- Both arms strip `--` comments before matching. Arm (b) would otherwise fire
+-- on the paragraph explaining why it exists; arm (a) fires on absence, so an
+-- unstripped body would let a commented-out mention of the roster stand in for
+-- reading it -- a false negative on exactly the defect being closed.
+CREATE FUNCTION check_roster_model_and_effort()
 RETURNS TABLE (problem text, subject text, detail text)
 LANGUAGE sql STABLE AS $fn$
-    -- (a) the claim reads the roster. A `claim_task` that stops selecting
-    --     `r.model` has gone back to deciding a role's numbers itself, which
-    --     is the defect this file exists to close.
-    SELECT 'claim_decides_a_roles_numbers'::text, 'claim_task'::text,
+    -- (a) the claim reads the roster rather than deciding. Two halves, because
+    --     each catches a different way back: a body that no longer selects both
+    --     fields into its locals from `roles` has stopped reading, and a body
+    --     that assigns either local with `:=` has gone back to deciding. The
+    --     old defect was the second -- `v_model := CASE WHEN ... END`.
+    SELECT 'claim_decides_a_roles_model_or_effort'::text, 'claim_task'::text,
            'claim_task writes a model or an effort it did not read from roles'
       FROM pg_proc p
+     CROSS JOIN LATERAL (
+         SELECT regexp_replace(p.prosrc, '--[^' || chr(10) || ']*', '', 'g')
+     ) AS s(src)
      WHERE p.pronamespace = 'public'::regnamespace AND p.proname = 'claim_task'
-       AND (p.prosrc !~ 'r\.model' OR p.prosrc !~ 'r\.effort')
+       AND (s.src !~ 'roles'
+            OR s.src !~ 'INTO[^;]*v_model'
+            OR s.src !~ 'INTO[^;]*v_effort'
+            OR s.src ~ 'v_model[[:space:]]*:='
+            OR s.src ~ 'v_effort[[:space:]]*:=')
 
   UNION ALL
     -- (b) no function copies a resolution out of the manifest. `claude-opus-5`
     --     is what one measured SDK/CLI pair resolves `opus` to; the pair is
     --     what performs the resolution and the manifest is version-bound to it,
     --     so a copy in a function body is a value that goes stale silently and
-    --     without moving. Comments are stripped first, or this arm fires on the
-    --     paragraph explaining why it exists.
+    --     without moving.
     SELECT 'model_resolution_spelled_in_sql', p.proname,
            'a function body names a resolved model identifier the manifest owns'
       FROM pg_proc p
@@ -252,15 +267,15 @@ LANGUAGE sql STABLE AS $fn$
            ~ 'claude-[a-z]'
 $fn$;
 
-REVOKE ALL ON FUNCTION check_roster_numbers() FROM PUBLIC;
+REVOKE ALL ON FUNCTION check_roster_model_and_effort() FROM PUBLIC;
 
-COMMENT ON FUNCTION check_roster_numbers() IS
+COMMENT ON FUNCTION check_roster_model_and_effort() IS
     'Where a run''s model and effort come from: the claim reads the roster row '
     'rather than deciding, and no function body carries a model identifier the '
     'version-bound tool inventory manifest is what resolves.';
 
 INSERT INTO standing_checks(name, query, owner_ticket, note) VALUES
-    ('roster_numbers', 'SELECT * FROM check_roster_numbers()', '71',
+    ('roster_model_and_effort', 'SELECT * FROM check_roster_model_and_effort()', '71',
      'a role''s model and effort are stated once, on roles, and the claim reads them there');
 
 
@@ -272,7 +287,7 @@ DO $$
 DECLARE n integer; d text;
 BEGIN
     SELECT count(*), string_agg(problem || ': ' || detail, '; ')
-      INTO n, d FROM check_roster_numbers();
+      INTO n, d FROM check_roster_model_and_effort();
     IF n > 0 THEN
         RAISE EXCEPTION 'ph2-71 refuses to finish: % roster problem(s): %', n, d;
     END IF;
@@ -292,5 +307,14 @@ BEGIN
       INTO n, d FROM check_slate_claim();
     IF n > 0 THEN
         RAISE EXCEPTION 'ph2-71 breaks the slate and the claim (% problems): %', n, d;
+    END IF;
+
+    -- `roles` is readable by everyone and holds no program column, but the
+    -- claim rewritten above is the one function that reads it and writes a row
+    -- into a Program, so the isolation the claim runs under is asked here too.
+    SELECT count(*), string_agg(problem || ': ' || detail, '; ')
+      INTO n, d FROM check_program_isolation();
+    IF n > 0 THEN
+        RAISE EXCEPTION 'ph2-71 breaks program isolation (% problems): %', n, d;
     END IF;
 END $$;
