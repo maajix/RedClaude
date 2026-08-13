@@ -253,6 +253,11 @@ class Recorder:
         self.revision = answers.get("revision", 12)
         self.working = answers.get("working", 1)
         self.standing = answers.get("standing", [("orchestrator_rotation", 0, "")])
+        # What the end-of-pass rotation answers. `None` is the ordinary pass:
+        # the campaign has not reached a ceiling, so nothing was closed.
+        self.closed = answers.get("closed", None)
+        # The Task revisions the capsule's Slate section cites, keyed by label.
+        self.task_revisions = answers.get("task_revisions", {})
         # Labels this recorder's `record_choice` says the Slate no longer
         # carries. The downgrade is the server's to make -- the runtime never
         # writes `off_slate` itself -- so it is answered here rather than
@@ -389,6 +394,14 @@ class Recorder:
             return [(self.claim,)]
         if sql == execution.OPEN_SESSION:
             return [(json.dumps(self.session),)]
+        if sql == execution.ROTATE:
+            return [(None if self.closed is None else json.dumps(self.closed),)]
+        if sql == execution.capsule_module.SLATE_REVISIONS:
+            return [
+                (label, self.task_revisions[label])
+                for label in json.loads(parameters[1])
+                if label in self.task_revisions
+            ]
         if sql == execution.CHOICE:
             return [(json.dumps(self._choice(parameters)),)]
         if sql == execution.STARTED:
@@ -1039,12 +1052,24 @@ class CapsuleTest(unittest.TestCase):
         ]
 
     def rotated(self, **overrides) -> dict:
-        """A session row that says the campaign before it reached a ceiling."""
+        """A session row that says the campaign before it reached a ceiling.
+
+        `rotated` is the `scheduler.rotated` payload, because that is what
+        `open_orchestrator_session` returns under that key -- an object, not a
+        label. A fixture that put a label there would let a runtime that prints
+        the whole payload pass.
+        """
         return dict(
             Recorder().session,
             session_label="OS4",
             generation=4,
-            rotated="OS3",
+            rotated={
+                "session": "OS3",
+                "generation": 3,
+                "reason": "turns",
+                "usage": {"turns": 100, "tokens": 4096, "decisions": 12},
+                "ceilings": {"turns": 100, "tokens": 1000000, "decisions": 80},
+            },
             **overrides,
         )
 
@@ -1125,7 +1150,7 @@ class CapsuleTest(unittest.TestCase):
 
         self.assertEqual([], self.ledger.violations)
         self.assertEqual(1, len(holds))
-        self.assertIn("OS3 reached a ceiling and was closed", holds[0].detail)
+        self.assertIn("OS3 reached its turns ceiling and was closed", holds[0].detail)
         self.assertIn("OS4 continues it at generation 4", holds[0].detail)
 
     def test_a_first_generation_campaign_reports_no_rotation(self):
@@ -1149,7 +1174,9 @@ class CapsuleTest(unittest.TestCase):
         limits = self.launcher.planned.capsule.limits
 
         self.assertEqual((4096, 512), (limits.byte_limit, limits.token_limit))
-        self.assertLessEqual(self.launcher.planned.capsule.bytes, limits.byte_ceiling)
+        self.assertLessEqual(
+            self.launcher.planned.capsule.document_bytes, limits.byte_ceiling
+        )
 
     def test_a_capsule_that_cannot_fit_its_ceiling_is_refused_and_not_sent(self):
         # The other half: refused, and the pass carries on without a choice --
@@ -1175,6 +1202,63 @@ class CapsuleTest(unittest.TestCase):
         self.assertEqual("unavailable", facts["choice"]["outcome"])
         self.assertEqual("T1", facts["task"]["label"])
         self.assertEqual(1, len(self.ledger.violations))
+
+    def test_the_objective_promises_the_number_of_entries_the_tool_can_serve(self):
+        # `get_slate` is served from the capsule's slate section, and the fit
+        # may have dropped entries from it. An objective counting the offer
+        # would promise a model Tasks it is then not shown.
+        connection = Recorder(
+            slate=12,
+            session=dict(Recorder().session, capsule_bytes=2600, capsule_tokens=650),
+        )
+        self.choice(connection)
+        served = self.launcher.planned.capsule.slate()
+
+        self.assertLess(len(served), 12)
+        self.assertIn(f"get_slate for the {len(served)} Task(s)",
+                      self.launcher.planned.objective)
+
+    def test_a_capsule_left_with_no_entry_to_choose_from_is_refused(self):
+        # The quiet way to lose a choice: a capsule that fits its ceiling by
+        # dropping the whole Slate, and a session asked to pick from a list it
+        # cannot be shown. The runtime's own walk claims instead.
+        connection = Recorder(
+            slate=3,
+            session=dict(Recorder().session, capsule_bytes=900, capsule_tokens=225),
+        )
+        facts = self.choice(connection)
+
+        self.assertEqual([], self.launcher.choices)
+        self.assertEqual("unavailable", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertIn("was left no Slate entry", self.ledger.violations[0].detail)
+
+    def test_a_pass_that_spent_the_campaign_closes_it_before_it_ends(self):
+        # Criterion 2 does not say "at the start of the next pass". A session
+        # that reached a ceiling on the last pass a supervisor ever runs would
+        # otherwise stay open with no Event saying it ended.
+        connection = Recorder(
+            closed={"session": "OS1", "generation": 1, "reason": "turns"}
+        )
+        self.choice(connection)
+        holds = self.stated("rotation")
+
+        self.assertEqual([(),], [parameters for parameters in connection.sent(execution.ROTATE)])
+        self.assertEqual(1, len(holds))
+        self.assertIn("OS1 reached its turns ceiling", holds[0].detail)
+
+    def test_a_rotation_that_could_not_be_written_does_not_fail_the_pass(self):
+        # The pass is over and everything it did is committed. The next pass's
+        # open asks the same question, so the answer is reported and dropped.
+        connection = Recorder(
+            raises={execution.ROTATE: database_error("permission denied")}
+        )
+        facts = self.choice(connection)
+
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual([False], [stated.ok for stated in self.stated("rotation")])
+        self.assertIn("could not be rotated", self.ledger.violations[0].detail)
+
 
 class AttemptTest(unittest.TestCase):
     """One claimed Task, from the capability to the closing."""

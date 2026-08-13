@@ -169,12 +169,21 @@ _Avoid_: Launch, schedule, assignment, handoff
 
 **Campaign**:
 One orchestrator's continuous line of decision for a program, made of the
-sessions that replaced each other. A session is a turn of it and ends at the
-ceilings it was admitted under; the campaign carries on in the successor that
-points back at it. Durable rather than held: every pass is already a restart, so
-a campaign that lived in a process would last exactly as long as the weakest
-thing in it.
+orchestrator sessions that replaced each other. The campaign carries on in the
+successor that points back at the session it replaced. Durable rather than held:
+every pass is already a restart, so a campaign that lived in a process would last
+exactly as long as the weakest thing in it.
 _Avoid_: Conversation, thread, context window, run
+
+**Orchestrator session**:
+One stretch of a campaign, from the pass that opened it to the ceiling that
+closed it. Its turns are the agent runs made inside it, and the three ceilings it
+is measured against — turns, tokens and decisions — are copied onto it when it
+opens, so an operator editing the settings cannot move a bound the session has
+already been run against. One open at a time per program, because "what does this
+campaign resume into" must have one answer. The word is reserved for this: an
+agent run is not a session, and neither is a supervisor process.
+_Avoid_: Context window, chat, thread, process
 
 **Capsule**:
 Everything a replacement session inherits, compiled from durable state at the
@@ -218,8 +227,10 @@ _Avoid_: Error, rejection, block, violation
 
 **Agent run**:
 One invocation of one subagent role, carrying the mission packet in and its raw,
-unpromoted result out.
-_Avoid_: Session, mission, conversation, turn
+unpromoted result out. A planning run is additionally one _turn_ of the
+orchestrator session it was opened inside, which is what that session's turn
+ceiling counts — a relationship the run has, not a second name for it.
+_Avoid_: Session, mission, conversation, invocation
 
 **Mission packet**:
 The compiled input to an agent run — objective, scope, budget, identity leases,

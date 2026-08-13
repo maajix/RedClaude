@@ -1144,8 +1144,10 @@ CONTROLS = (
         "   INSERT INTO programs (slug, name) VALUES ('overrun-selftest', 'Self test')"
         "     RETURNING id INTO p;"
         "   INSERT INTO orchestrator_sessions (program_id, weights_version, max_turns,"
-        "                                      max_tokens, max_decisions)"
-        "        SELECT p, w.version, 1, 1000, 1 FROM scheduler_weights w WHERE w.active"
+        "                                      max_tokens, max_decisions,"
+        "                                      capsule_bytes, capsule_tokens)"
+        "        SELECT p, w.version, 1, 1000, 1, w.capsule_max_bytes,"
+        "               w.capsule_max_tokens FROM scheduler_weights w WHERE w.active"
         "     RETURNING id INTO s;"
         "   INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
         "                           mission_packet, orchestrator_session_id)"
@@ -1165,8 +1167,10 @@ CONTROLS = (
         "     RETURNING id INTO p;"
         "   INSERT INTO orchestrator_sessions (program_id, weights_version, max_turns,"
         "                                      max_tokens, max_decisions, closed_at,"
-        "                                      close_reason)"
-        "        SELECT p, w.version, 100, 1000, 10, now(), 'turns'"
+        "                                      close_reason, capsule_bytes,"
+        "                                      capsule_tokens)"
+        "        SELECT p, w.version, 100, 1000, 10, now(), 'turns',"
+        "               w.capsule_max_bytes, w.capsule_max_tokens"
         "          FROM scheduler_weights w WHERE w.active;"
         " END $ctl$",
     ),
@@ -14364,7 +14368,9 @@ class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
 #: The Programs of `OrchestratorRotationTest`, one per way a campaign can end.
 ROTATION_SLUG = "selftest-rotation"
 
-ROTATION_SCENARIOS = ("resume", "turns", "tokens", "decisions", "capsule")
+ROTATION_SCENARIOS = (
+    "resume", "turns", "tokens", "decisions", "capsule", "restart",
+)
 
 
 class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
@@ -14382,7 +14388,9 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
     is still inside its ceilings. `turns`, `tokens` and `decisions` are the
     three closes, one each. `capsule` is the successor's half -- what a session
     that never saw the closed one is handed, and that a second runtime compiling
-    the same moment is handed the same thing.
+    the same moment is handed the same thing. `restart` is the other half of
+    that claim: not one document compiled twice, but the same next Slate offered
+    on either side of a rotation taken by a process started afresh.
 
     Ceilings are lowered on the open session rather than on the weights row: the
     session copied them when it opened and the copy is what the rotation reads,
@@ -14416,6 +14424,7 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
         cls.arrange_tokens()
         cls.arrange_decisions()
         cls.arrange_capsule()
+        cls.arrange_restart()
 
     @classmethod
     def tearDownClass(cls):
@@ -14566,6 +14575,52 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
         finally:
             connection.close()
 
+    @classmethod
+    def restarted(cls, name: str) -> tuple[dict, tuple[dict[str, object], ...]]:
+        """A whole pass on a connection of its own: bind, open, rank, offer.
+
+        This is the supervisor started again. The connection is new, so nothing
+        the earlier pass bound, opened or ranked is reachable from it, and the
+        statements are the ones `execution` sends rather than a query written
+        here -- a restart that reached for the previous process's slate would
+        have no previous process to reach into.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            connection.execute(agent.BIND, (cls.identifiers[name],))
+            with connection.transaction():
+                connection.execute("SELECT set_actor('runtime', 'selftest')")
+                opened = json.loads(
+                    str(connection.execute(execution.OPEN_SESSION).scalar())
+                )
+            with connection.transaction():
+                connection.execute("SELECT set_actor('runtime', 'selftest')")
+                connection.execute("SELECT rank_pass('runtime')")
+                connection.execute("SELECT advance_lane_quota('runtime')")
+                offered = connection.execute("SELECT * FROM offer_slate()").dicts()
+            return opened, offered
+        finally:
+            connection.close()
+
+    @classmethod
+    def ordering(cls, offered) -> list[tuple[int, str, str, bool]]:
+        """A Slate reduced to what the orchestrator chooses between.
+
+        Which Tasks, in which order, at which priority, entitled or not. What is
+        left out is the two things a second offer may not be asked to repeat:
+        the slate's identifier, and the expiry, which is the moment it was
+        offered plus a TTL.
+        """
+        return [
+            (
+                int(str(row["ordinal"])),
+                str(row["task_label"]),
+                str(row["priority"]),
+                bool(row["entitled"]),
+            )
+            for row in offered
+        ]
+
     # -- the scenarios ---------------------------------------------------------
 
     @classmethod
@@ -14656,6 +14711,22 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
         cls.capsule_tight = cls.resumed(
             "capsule", cls.capsule_slate, limits=packet.Limits(byte_limit=1400)
         )
+
+    @classmethod
+    def arrange_restart(cls):
+        """One pass, a ceiling lowered under it, and the pass after the restart.
+
+        The two offers are made by two processes with a rotation between them,
+        which is the whole of criterion 5: what the successor is entitled to
+        pick from is decided by the Program's rows, so a campaign that ended
+        mid-hunt resumes where it was rather than starting the hunt again.
+        """
+        cls.seed("restart", 3)
+        cls.bind("restart")
+        cls.restart_session = cls.session("restart")
+        cls.restart_before = cls.offer()
+        cls.tighten("restart", "max_turns", 1)
+        cls.restart_opened, cls.restart_after = cls.restarted("restart")
 
     # -- criterion 1: the ceilings are settings, and they bind ------------------
 
@@ -14844,13 +14915,37 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
         self.assertNotIn(self.capsule_session["agent_run"], document)
         self.assertNotIn(self.capsule_session["label"], document)
 
+    # -- criterion 5: a restart lands on the same next Slate --------------------
+
+    def test_a_restart_across_a_rotation_is_offered_the_same_next_slate(self):
+        # The other half of the digest test: that one compares two compiles of
+        # one moment, and this one compares two moments with a rotation and a
+        # process boundary between them. Both offers are `offer_slate` on live
+        # rows, so nothing here is equal by construction -- the second pass
+        # ranks the Program again, from a connection that never saw the first.
+        before, after = (
+            self.ordering(self.restart_before), self.ordering(self.restart_after)
+        )
+
+        self.assertEqual(3, len(before))
+        self.assertEqual(before, after)
+
+    def test_the_restarted_pass_is_the_one_that_rotated_the_campaign(self):
+        # Without this the test above would pass just as well against a campaign
+        # that never rotated, which is the thing it is meant to be about.
+        rotated = self.restart_opened["rotated"]
+
+        self.assertEqual(self.restart_session["session_label"], rotated["session"])
+        self.assertEqual("turns", rotated["reason"])
+        self.assertEqual(2, self.restart_opened["generation"])
+
     # -- criterion 6: measured, then compacted or refused -----------------------
 
     def test_a_capsule_states_its_size_and_stays_under_its_ceiling(self):
         built = self.capsule_first
 
-        self.assertLessEqual(built.bytes, built.limits.byte_ceiling)
-        self.assertLessEqual(built.tokens, built.limits.token_limit)
+        self.assertLessEqual(built.document_bytes, built.limits.byte_ceiling)
+        self.assertLessEqual(built.document_tokens, built.limits.token_limit)
         self.assertEqual(
             [0, 0, 0, 0, 0],
             [body["omitted"] for body in built.as_dict()["sections"].values()],
@@ -14862,7 +14957,7 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
             name: body["omitted"] for name, body in tight.as_dict()["sections"].items()
         }
 
-        self.assertLessEqual(tight.bytes, 1400)
+        self.assertLessEqual(tight.document_bytes, 1400)
         self.assertGreater(sum(omitted.values()), 0)
         self.assertLess(len(tight.rows()), len(self.capsule_first.rows()))
         self.assertEqual(

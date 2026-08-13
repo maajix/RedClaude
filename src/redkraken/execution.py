@@ -167,6 +167,13 @@ CLAIM = "SELECT claim_task()"
 #: covers a session that chose nothing, and neither can name a Task the offer
 #: did not carry.
 OPEN_SESSION = "SELECT open_orchestrator_session()"
+
+#: The other half of criterion 2, asked once at the end of every pass. The open
+#: above asks it too, so this is not where rotation is decided -- it is where a
+#: campaign that reached a ceiling on what turns out to be the last pass of the
+#: day gets closed anyway, with its Event, instead of sitting open until a
+#: supervisor happens to run again.
+ROTATE = "SELECT rotate_orchestrator_session()"
 CHOICE = "SELECT record_choice($1::uuid, $2, $3, $4)"
 
 #: What one orchestrator session is told. The Slate is not repeated into it: the
@@ -473,7 +480,12 @@ class Session:
     generation: int = 1
     capsule_bytes: int = packet_module.DEFAULT_BYTES
     capsule_tokens: int = packet_module.DEFAULT_TOKENS
-    rotated: str | None = None
+    #: The `scheduler.rotated` payload the open handed back, or nothing when
+    #: this pass closed no campaign. Held whole rather than reduced to a label:
+    #: it is the Event's own object, and the two things this runtime says about
+    #: a rotation -- which session ended and which ceiling ended it -- are two
+    #: keys of it rather than two columns to keep in step.
+    rotated: Mapping[str, object] | None = None
 
     @classmethod
     def from_row(cls, row: dict) -> Session:
@@ -490,8 +502,18 @@ class Session:
             capsule_tokens=int(
                 row.get("capsule_tokens") or packet_module.DEFAULT_TOKENS
             ),
-            rotated=None if row.get("rotated") is None else str(row["rotated"]),
+            rotated=_rotation(row.get("rotated")),
         )
+
+    @property
+    def closed(self) -> str:
+        """The session this pass closed, as the Event named it."""
+        return "" if self.rotated is None else str(self.rotated.get("session") or "")
+
+    @property
+    def closed_reason(self) -> str:
+        """Which ceiling ended it, in the Event's own word."""
+        return "" if self.rotated is None else str(self.rotated.get("reason") or "")
 
     def limits(self) -> packet_module.Limits:
         """What this session's capsule may cost, from the weights it opened under.
@@ -777,6 +799,14 @@ class Slice:
         The session is bound to the Program first and stays bound: every
         scheduler function refuses an unbound session, and binding per statement
         would be four chances to bind the wrong one.
+
+        The campaign is rotated at the end in a `finally` and not on the way out
+        of the happy path, for the reason the attempt's own closing is: a
+        session that reached a ceiling during this pass should be closed while
+        this runtime is still awake. `open_orchestrator_session` asks again on
+        the way in, so a supervisor killed between the two loses nothing -- but
+        a supervisor that is never run again would otherwise leave the campaign
+        open at a ceiling with no Event saying it ended.
         """
         facts = {
             "reconciliation": None,
@@ -794,15 +824,29 @@ class Slice:
             "closure": None,
         }
         connection.execute(proxy.BIND, (program_id,))
+        try:
+            self._pass(ledger, connection, program_id, facts)
+        finally:
+            self._rotate(ledger, connection)
+        return facts
+
+    def _pass(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        program_id: str,
+        facts: dict,
+    ) -> None:
+        """The pass itself, written into `facts` because every step of it stops."""
         facts["reconciliation"] = self._reconcile(ledger, connection)
 
         offered = self._offer(ledger, connection)
         if offered is None:
-            return facts
+            return
         facts["slate"] = offered
         if not offered:
             ledger.hold("slate", "no Task is ready; nothing was claimed")
-            return facts
+            return
 
         chosen = self._choose(ledger, connection, program_id, offered)
         if chosen is not None:
@@ -820,11 +864,11 @@ class Slice:
                 f"{chosen.agent_run_label} chose {chosen.task_label}, which "
                 f"{REFUSED[chosen.outcome]}; nothing was claimed",
             )
-            return facts
+            return
 
         claimed = self._claim(ledger, connection, program_id, len(offered))
         if claimed is None:
-            return facts
+            return
         facts.update(claimed.facts())
         ledger.hold(
             "claim",
@@ -836,7 +880,37 @@ class Slice:
             self._run(ledger, connection, program_id, claimed, chosen, facts)
         finally:
             facts["closure"] = self._finish(ledger, connection, claimed, facts)
-        return facts
+
+    def _rotate(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
+        """Close the campaign if this pass spent the last of it.
+
+        Reported and never fatal: the pass is over, everything it did is
+        committed, and a rotation that could not be written is one the next
+        pass's open will write instead. What it must not do is take the pass
+        down with it -- the session is closed by arithmetic, and arithmetic that
+        cannot be recorded is not a reason to fail work that already succeeded.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                answer = connection.execute(ROTATE).scalar()
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "rotation",
+                f"the campaign could not be rotated at the end of the pass: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return None
+        if answer is None:
+            return None
+        closed = proxy.as_object(answer)
+        ledger.hold(
+            "rotation",
+            f"{closed.get('session')} reached its {closed.get('reason')} ceiling "
+            f"and was closed at the end of the pass",
+        )
+        return closed
 
     # -- the queue ---------------------------------------------------------
 
@@ -971,8 +1045,9 @@ class Slice:
         if opened.rotated:
             ledger.hold(
                 "rotation",
-                f"{opened.rotated} reached a ceiling and was closed; "
-                f"{opened.session_label} continues it at generation {opened.generation}",
+                f"{opened.closed} reached its {opened.closed_reason} ceiling and was "
+                f"closed; {opened.session_label} continues it at generation "
+                f"{opened.generation}",
             )
         return opened
 
@@ -1005,7 +1080,11 @@ class Slice:
         request = agent.AgentRunRequest(
             agent_run_id=session.agent_run_id,
             objective=PLANNING.format(
-                count=len(offered),
+                # What `get_slate` will actually serve, which is the capsule's
+                # slate section and not the offer it was compiled from: a
+                # compaction that dropped entries would otherwise have the
+                # objective promise a number the tool cannot produce.
+                count=len(resume.slate()),
                 session=resume.session or session.label,
                 generation=resume.generation,
                 capsule=json.dumps(resume.brief(), separators=(",", ":"), default=str),
@@ -1476,17 +1555,13 @@ class Slice:
         campaign, the budgets and the Task queue are not on the state read
         surface, and a session choosing between Tasks is not reading inside one.
 
-        The standing checks are asked here rather than carried from the pass's
-        own gate. The gate ran before the scheduler did -- before this pass
-        ranked, offered and opened a session -- so quoting it would put a
-        sentence about an earlier moment inside a document that says it
-        describes this one. The cost is one more `run_standing_checks()` per
-        pass, which is the price of the capsule's integrity section meaning what
-        it says.
-
         A capsule that cannot be built is the choice not happening, like every
         other failure on this path: the pass keeps its Slate, `claim_task` walks
-        it, and the Ledger says why nobody was asked.
+        it, and the Ledger says why nobody was asked. A capsule so tight that
+        the compaction dropped every Slate entry is the same failure by a
+        quieter route -- a session asked to choose from a list it cannot be
+        shown -- so it is refused here rather than sent, and the runtime's own
+        walk claims the entry a model was never offered.
         """
         try:
             with connection.transaction():
@@ -1506,11 +1581,20 @@ class Slice:
                 source="database",
             )
             return None
+        if offered and not built.slate():
+            ledger.fail(
+                "capsule",
+                f"{session.label} was left no Slate entry to choose from: "
+                f"{len(offered)} offered, {built.limits.byte_ceiling} byte(s) of capsule",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return None
         ledger.hold(
             "capsule",
             f"{built.session or session.label} resumes at generation "
             f"{built.generation} from {len(built.rows())} row(s), "
-            f"{built.bytes} byte(s), about {built.tokens} token(s)",
+            f"{built.document_bytes} byte(s), about {built.document_tokens} token(s)",
         )
         return built
 
@@ -1894,6 +1978,17 @@ class Slice:
 def _actor(connection: pg.Connection) -> None:
     """Who the database records as writing. Transaction-local by construction."""
     connection.execute("SELECT set_actor('runtime', $1)", (program.ACTOR,))
+
+
+def _rotation(value: object) -> Mapping[str, object] | None:
+    """The rotation payload the open answered with, or nothing.
+
+    A key of a jsonb object arrives here already decoded, so the ordinary answer
+    is a mapping. Anything else is a payload this runtime does not recognise,
+    and the honest reading of that is that nothing it can report was closed --
+    the Event is written and the campaign is rotated either way.
+    """
+    return value if isinstance(value, Mapping) else None
 
 
 def _slate_entry(row: Mapping[str, object]) -> dict:

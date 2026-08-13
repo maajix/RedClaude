@@ -43,10 +43,6 @@ def read_row(label: str, revision: int, **fields) -> tuple:
     return (label, revision, f"{label}-digest", json.dumps(document))
 
 
-def check(name: str, ok: bool = True, detail: str = "") -> integrity.Check:
-    return integrity.Check(integrity.STANDING_FAMILY, name, ok, detail)
-
-
 def entry(ordinal: int, kind: str = "recon") -> dict:
     """One Slate entry in the shape `offer_slate` hands the scheduler."""
     return {
@@ -84,6 +80,7 @@ class Recorder:
         working: int | None = None,
         digests: int | None = None,
         standing=None,
+        revisions=None,
         fails: tuple[str, ...] = (),
     ):
         self.calls: list[tuple[str, tuple]] = []
@@ -99,6 +96,9 @@ class Recorder:
         # to notice rather than zip past.
         self.digests = digests
         self.standing = [("orchestrator_rotation", 0, "")] if standing is None else standing
+        # What `rk2_revision` answers for the Tasks a carried Slate entry names.
+        # A label missing from it is a Task that went while the pass compiled.
+        self.revisions = {"T1": 3, "T2": 5} if revisions is None else revisions
         self.fails = fails
 
     def execute(self, sql: str, parameters: tuple = ()) -> pg.Result:
@@ -129,6 +129,13 @@ class Recorder:
             return list(self.work)[: parameters[1]]
         if sql == capsule.WORK_COUNT:
             return [(self.working,)]
+        if sql == capsule.SLATE_REVISIONS:
+            wanted = json.loads(parameters[1])
+            return [
+                (label, self.revisions[label])
+                for label in wanted
+                if label in self.revisions
+            ]
         if sql == capsule.DIGESTS:
             sent = json.loads(parameters[0])
             answered = [
@@ -145,7 +152,6 @@ def compiled(connection: Recorder, **overrides) -> capsule.Capsule:
     settings: dict = {
         "session": "OS4",
         "generation": 4,
-        "checks": (check("orchestrator_rotation"),),
         "slate": (entry(1),),
     }
     settings.update(overrides)
@@ -192,30 +198,25 @@ class CompileTest(unittest.TestCase):
             {str(row.record.get("kind")) for row in built.rows()},
         )
 
-    def test_the_checks_the_pass_already_ran_are_not_run_again(self):
-        connection = Recorder()
-        compiled(connection, checks=(check("lease_discipline"),))
-
-        self.assertNotIn(
-            f"SELECT name, problems, detail FROM {integrity.STANDING}()",
-            connection.statements,
-        )
-
-    def test_a_capsule_given_no_checks_reads_them_rather_than_saying_nothing(self):
-        # An empty integrity section reports a sound Program by omission, which
-        # is the one thing a section about soundness must not do.
+    def test_the_standing_checks_are_asked_here_and_asked_once(self):
+        # Not carried in from the pass's own gate: that ran before this pass
+        # reconciled, ranked and offered, so quoting it would put a sentence
+        # about an earlier moment inside a document that says it describes now.
         connection = Recorder(standing=[("event_coverage", 2, "two tables")])
-        built = compiled(connection, checks=None)
+        built = compiled(connection)
         stated = built.section("integrity").rows[0].record
 
+        self.assertEqual(
+            [f"SELECT name, problems, detail FROM {integrity.STANDING}()"],
+            [sql for sql in connection.statements if integrity.STANDING in sql],
+        )
         self.assertEqual("standing:event_coverage", built.section("integrity").rows[0].label)
         self.assertEqual(False, stated["ok"])
         self.assertIn("two tables", stated["detail"])
 
     def test_a_failed_check_sorts_ahead_of_a_sound_one(self):
         built = compiled(
-            Recorder(),
-            checks=(check("event_coverage"), check("lease_discipline", False, "1 open")),
+            Recorder(standing=[("event_coverage", 0, ""), ("lease_discipline", 1, "1 open")])
         )
 
         self.assertEqual(
@@ -251,8 +252,22 @@ class DigestTest(unittest.TestCase):
         staged = built.section("slate").rows[0]
 
         self.assertEqual(digest_of(dict(staged.record)), staged.digest)
-        self.assertEqual(0, staged.revision)
         self.assertEqual(2, len(connection.sent(capsule.DIGESTS)))
+
+    def test_a_slate_entry_cites_the_revision_of_the_task_it_ranks(self):
+        # Criterion 3 asks for revisions, and an entry has one to cite: the
+        # Task under it is a row, and it can go stale between the offer and the
+        # choice. A check result cannot -- it is an answer about the whole
+        # state -- so that is the section that stays at 0.
+        built = compiled(Recorder(), slate=(entry(1), entry(2)))
+
+        self.assertEqual([3, 5], [row.revision for row in built.section("slate").rows])
+        self.assertEqual([0], [row.revision for row in built.section("integrity").rows])
+
+    def test_an_entry_whose_task_went_while_the_pass_compiled_keeps_revision_zero(self):
+        built = compiled(Recorder(revisions={}), slate=(entry(1),))
+
+        self.assertEqual([0], [row.revision for row in built.section("slate").rows])
 
     def test_a_read_rows_digest_is_the_one_the_statement_returned(self):
         built = compiled(Recorder())
@@ -265,13 +280,13 @@ class DigestTest(unittest.TestCase):
         # would pair the first digests with the first records and drop the rest,
         # and every row left would still look correctly hashed.
         with self.assertRaises(capsule.CapsuleError) as refused:
-            compiled(Recorder(digests=0), checks=(), slate=(entry(1), entry(2)))
+            compiled(Recorder(digests=0, standing=[]), slate=(entry(1), entry(2)))
 
         self.assertIn("0 of 2 slate", str(refused.exception))
 
     def test_no_digest_is_asked_for_a_section_with_no_rows(self):
-        connection = Recorder()
-        compiled(connection, checks=(), slate=())
+        connection = Recorder(standing=[])
+        compiled(connection, slate=())
 
         self.assertEqual([], connection.sent(capsule.DIGESTS))
 
@@ -299,7 +314,9 @@ class SlateSectionTest(unittest.TestCase):
 
         self.assertEqual(
             {capsule.REVISION, capsule.PROGRAM, capsule.CAMPAIGN, capsule.CAPACITY,
-             capsule.LANES, capsule.WORK, capsule.WORK_COUNT, capsule.DIGESTS},
+             capsule.LANES, capsule.WORK, capsule.WORK_COUNT, capsule.DIGESTS,
+             capsule.SLATE_REVISIONS,
+             f"SELECT name, problems, detail FROM {integrity.STANDING}()"},
             set(connection.statements),
         )
 
@@ -321,7 +338,7 @@ class BoundTest(unittest.TestCase):
     def test_a_capsule_under_its_ceiling_omits_nothing(self):
         built = compiled(Recorder())
 
-        self.assertLessEqual(built.bytes, built.limits.byte_ceiling)
+        self.assertLessEqual(built.document_bytes, built.limits.byte_ceiling)
         self.assertEqual(
             [0, 0, 0, 0, 0],
             [body["omitted"] for body in built.as_dict()["sections"].values()],
@@ -345,7 +362,7 @@ class BoundTest(unittest.TestCase):
         connection = Recorder(work=[read_row(f"T{n}", 1, note="x" * 40) for n in range(12)])
         built = compiled(connection, limits=packet.Limits(byte_limit=2048))
 
-        self.assertLessEqual(built.bytes, 2048)
+        self.assertLessEqual(built.document_bytes, 2048)
         self.assertLess(len(built.section("work").rows), 12)
         self.assertEqual(12, built.section("work").total)
         self.assertGreater(built.as_dict()["sections"]["work"]["omitted"], 0)
@@ -359,8 +376,8 @@ class BoundTest(unittest.TestCase):
             connection, limits=packet.Limits(byte_limit=65536, token_limit=400)
         )
 
-        self.assertLessEqual(built.tokens, 400)
-        self.assertLessEqual(built.bytes, 1600)
+        self.assertLessEqual(built.document_tokens, 400)
+        self.assertLessEqual(built.document_bytes, 1600)
 
     def test_a_ceiling_below_the_empty_document_is_refused_not_emptied(self):
         # Nothing left to drop and still over: a capsule of no rows would be a
@@ -370,15 +387,20 @@ class BoundTest(unittest.TestCase):
 
         self.assertIn("does not fit", str(refused.exception))
         self.assertIn("64", str(refused.exception))
+        # Which of the two refusals this is: a ceiling below the framing is a
+        # setting to change, and a fit that will not converge is this module's
+        # fault. Telling an operator to raise a limit for the second would be
+        # advice about the wrong thing.
+        self.assertIn("framing", str(refused.exception))
 
     def test_the_measurement_is_of_the_document_that_is_actually_sent(self):
         built = compiled(Recorder())
 
         self.assertEqual(
             len(json.dumps(built.as_dict(), separators=(",", ":"), default=str)),
-            built.bytes,
+            built.document_bytes,
         )
-        self.assertEqual(-(-built.bytes // packet.BYTES_PER_TOKEN), built.tokens)
+        self.assertEqual(-(-built.document_bytes // packet.BYTES_PER_TOKEN), built.document_tokens)
 
 
 class DocumentTest(unittest.TestCase):

@@ -105,6 +105,12 @@ CREATE TABLE orchestrator_sessions (
     max_turns       integer NOT NULL CHECK (max_turns > 0),
     max_tokens      bigint  NOT NULL CHECK (max_tokens > 0),
     max_decisions   integer NOT NULL CHECK (max_decisions > 0),
+    -- Copied for the same reason as the three above, and copied at all so the
+    -- reason is one reason: what a session inherits is bounded by the settings
+    -- it was admitted under, not by whatever the active row says on the pass
+    -- that happens to compile the capsule.
+    capsule_bytes   integer NOT NULL CHECK (capsule_bytes > 0),
+    capsule_tokens  integer NOT NULL CHECK (capsule_tokens > 0),
     -- The session this one replaced, and how many replacements deep the
     -- campaign is. Generation is not derivable cheaply from the chain and is
     -- what an operator reads first, so it is a column with a check on it
@@ -140,6 +146,8 @@ COMMENT ON TABLE orchestrator_sessions IS
   'One logical orchestrator campaign: the ceilings it was admitted under, the sessions it replaced, and when and why it ended. The Agent runs inside it are its turns, and everything the successor needs is compiled out of durable state rather than handed over in memory.';
 COMMENT ON COLUMN orchestrator_sessions.weights_version IS
   'The weights row the ceilings were copied from. Copied and not joined: the ceilings are what this session was admitted under, and an operator editing the active row mid-campaign must not move a ceiling a running session is being measured against.';
+COMMENT ON COLUMN orchestrator_sessions.capsule_bytes IS
+  'The byte ceiling the capsule handed to this session is fitted to, copied from the same weights row as the three above so that every bound on one session comes from one moment.';
 COMMENT ON COLUMN orchestrator_sessions.rotated_from IS
   'The session this one replaced, NULL for the first of a campaign. The chain is what makes a rotation a continuation rather than two unrelated sessions.';
 COMMENT ON COLUMN orchestrator_sessions.close_reason IS
@@ -343,7 +351,6 @@ DECLARE
     v_effort  text;
     v_run     uuid;
     v_label   text;
-    v_cap     integer;
     v_tokens  bigint;
     v_weights scheduler_weights%ROWTYPE;
     v_session orchestrator_sessions%ROWTYPE;
@@ -358,6 +365,16 @@ BEGIN
             USING ERRCODE = 'check_violation';
     END IF;
 
+    -- One read of the active row, because two reads inside one statement are
+    -- two answers as soon as an operator commits between them. The ceilings a
+    -- new session copies and the cross-role cap every turn is handed both come
+    -- out of it.
+    SELECT * INTO v_weights FROM scheduler_weights WHERE active;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active scheduler weights row to take session ceilings from'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
     -- Before anything is read about the campaign, because everything read after
     -- this is read about the session the pass will actually run in.
     v_rotated := rotate_orchestrator_session();
@@ -367,12 +384,6 @@ BEGIN
        FOR UPDATE;
 
     IF v_session.id IS NULL THEN
-        SELECT * INTO v_weights FROM scheduler_weights WHERE active;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'no active scheduler weights row to take session ceilings from'
-                USING ERRCODE = 'check_violation';
-        END IF;
-
         SELECT * INTO v_prev FROM orchestrator_sessions
          WHERE program_id = p
          ORDER BY generation DESC, opened_at DESC
@@ -380,9 +391,10 @@ BEGIN
 
         INSERT INTO orchestrator_sessions
             (program_id, weights_version, max_turns, max_tokens, max_decisions,
-             rotated_from, generation)
+             capsule_bytes, capsule_tokens, rotated_from, generation)
         VALUES (p, v_weights.version, v_weights.session_max_turns,
                 v_weights.session_max_tokens, v_weights.session_max_decisions,
+                v_weights.capsule_max_bytes, v_weights.capsule_max_tokens,
                 v_prev.id, coalesce(v_prev.generation, 0) + 1)
         -- Two passes opening a campaign at once is one campaign: the partial
         -- unique index is the rule, and the loser reads the winner's row rather
@@ -405,11 +417,10 @@ BEGIN
     -- Both ceilings travel with the session for the reason the claim carries
     -- them: the container's one network reaches the capability proxy and no
     -- database, so a number the child is bounded by is a number that was read
-    -- here or not at all. The subagent cap is the same one active weights row
-    -- the claim reads; the token ceiling is the Program's own per-run one held
-    -- against what this session has left.
-    SELECT w.max_concurrent_subagents INTO v_cap
-      FROM scheduler_weights w WHERE w.active;
+    -- here or not at all. The subagent cap is the live cross-role one the claim
+    -- also reads -- it bounds how many children exist at once, which is a fact
+    -- about now and not about when this session opened; the token ceiling is
+    -- the Program's own per-run one held against what this session has left.
     SELECT c.run_tokens INTO v_tokens
       FROM program_capacity c WHERE c.program_id = p;
     SELECT * INTO v_usage FROM orchestrator_session_usage
@@ -423,14 +434,15 @@ BEGIN
     RETURN jsonb_build_object(
         'agent_run', v_run::text, 'label', v_label,
         'model', v_model, 'effort', v_effort,
-        'subagent_cap', v_cap, 'token_cap', v_tokens,
+        'subagent_cap', v_weights.max_concurrent_subagents,
+        'token_cap', v_tokens,
         'session', v_session.id::text, 'session_label', v_session.label,
         'generation', v_session.generation,
         'turns', v_usage.turns, 'decisions', v_usage.decisions,
         'max_turns', v_session.max_turns,
         'max_decisions', v_session.max_decisions,
-        'capsule_bytes', (SELECT w.capsule_max_bytes FROM scheduler_weights w WHERE w.active),
-        'capsule_tokens', (SELECT w.capsule_max_tokens FROM scheduler_weights w WHERE w.active),
+        'capsule_bytes', v_session.capsule_bytes,
+        'capsule_tokens', v_session.capsule_tokens,
         'rotated', v_rotated);
 END $fn$;
 

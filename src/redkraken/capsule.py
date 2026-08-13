@@ -120,20 +120,22 @@ class Capsule:
         return document
 
     @property
-    def bytes(self) -> int:
+    def document_bytes(self) -> int:
         """What the whole document costs, framing included.
 
-        The whole document and not the rows, because the ceiling is on what
-        crosses the boundary. `packet.bound` measures rows so it can decide
-        which to drop; this measures the thing that is actually sent, which is
-        the number the refusal is made on.
+        Named for what it measures because `packet.Packet.bytes` measures the
+        other thing: the rows alone, which is what a fitter needs in order to
+        decide which to drop. The ceiling here is on what crosses the boundary,
+        so this measures the thing that is actually sent, and one name meaning
+        two sizes across two documents is how a ceiling comes to be checked
+        against a number that is not the one it bounds.
         """
         return len(_encode(self.as_dict()))
 
     @property
-    def tokens(self) -> int:
+    def document_tokens(self) -> int:
         """The document's size in the same approximate tokens `Limits` bounds."""
-        return math.ceil(self.bytes / packet.BYTES_PER_TOKEN)
+        return math.ceil(self.document_bytes / packet.BYTES_PER_TOKEN)
 
     def as_dict(self) -> dict:
         return {
@@ -347,6 +349,21 @@ WORK_COUNT = (
     " WHERE program_id = $1::uuid AND status IN ('claimed', 'running')"
 )
 
+#: The revision of the Tasks a carried Slate entry names, read where the work
+#: section reads it. An entry is a ranking of a Task and not a row of its own,
+#: but the Task under it is a row and can go stale between the offer and the
+#: choice, so the entry cites the same sequence the work section would cite for
+#: the same Task. A label the read does not answer for keeps revision 0: the
+#: Task went while this pass was compiling, which is a staleness the digest and
+#: the capsule's own revision already describe.
+SLATE_REVISIONS = (
+    "SELECT t.label, rk2_revision('tasks', t.id) AS revision"
+    "  FROM tasks t"
+    "  JOIN jsonb_array_elements_text($2::jsonb) AS wanted(label)"
+    "    ON wanted.label = t.label"
+    " WHERE t.program_id = $1::uuid"
+)
+
 #: The digest of records this process built, computed where every other digest
 #: is computed. `value::text` is the same canonical rendering `rec::text` gives
 #: the three read sections, so a row hashed here and a row hashed there are
@@ -371,32 +388,30 @@ def compile(
     session: str = "",
     generation: int = 1,
     limits: packet.Limits | None = None,
-    checks: Sequence[integrity.Check] | None = None,
     slate: Sequence[Mapping[str, object]] = (),
 ) -> Capsule:
     """Compile one session's capsule on the runtime connection.
 
-    `checks` is what the pass already verified. Passing them is not an
-    optimisation: `integrity.verify` runs at the top of every pass against the
-    state this capsule describes, and a capsule that ran the standing checks a
-    second time would quote a second answer about a moment nobody else saw. When
-    no checks are given they are read here, because a section left empty would
-    report a sound Program by saying nothing about it.
+    The standing checks are read here rather than carried in from the pass's own
+    gate. The gate ran before the scheduler did -- before this pass reconciled,
+    ranked, offered and opened a session -- so quoting it would put a sentence
+    about an earlier moment inside a document that says it describes this one.
+    The cost is one more `run_standing_checks()` per pass, which is the price of
+    the integrity section meaning what it says.
 
-    `slate` is what the pass was offered, for the same reason: `offer_slate`
-    consumes the outstanding Slate and writes a new one, so a capsule that read
-    the Slate itself would either read the one this pass is about to hand out or
-    quietly offer a second.
+    `slate` is the one thing that is carried and not read, because reading it
+    would change it: `offer_slate` consumes the outstanding Slate and writes a
+    new one, so a capsule that read the Slate itself would either take the one
+    this pass is about to hand out or quietly offer a second.
     """
     limits = limits or packet.Limits()
-    if checks is None:
-        checks = integrity.run(connection, families=(integrity.STANDING_FAMILY,))
+    checks = integrity.run(connection, families=(integrity.STANDING_FAMILY,))
     staged = {
         "lifecycle": _lifecycle(connection, program_id),
         "budget": _budget(connection, program_id),
         "integrity": _integrity(connection, checks),
         "work": _work(connection, program_id, limits.rows),
-        "slate": _slate(connection, slate, limits.rows),
+        "slate": _slate(connection, program_id, slate, limits.rows),
     }
     revision = int(_scalar(connection.execute(REVISION, (program_id,))))
 
@@ -429,20 +444,32 @@ def _compacted(
     than the empty document, which no amount of compaction reaches. That is a
     configuration this cannot satisfy, and a refusal names it rather than
     starting a session against a bound the runtime quietly broke.
+
+    The two refusals are separate sentences because they are separate faults. A
+    ceiling below the framing is a setting to change; a fit that has not
+    converged in `COMPACTIONS` passes is this module not converging, and telling
+    an operator to raise a limit would be advice about the wrong thing.
     """
-    budget = limits.byte_ceiling - len(_encode(build(_emptied(staged)).as_dict()))
+    framing = len(_encode(build(_emptied(staged)).as_dict()))
+    budget = limits.byte_ceiling - framing
+    if budget < 0:
+        raise CapsuleError(
+            f"the capsule does not fit: {limits.byte_ceiling} bytes "
+            f"({limits.byte_limit} configured, {limits.token_limit} tokens) "
+            f"leaves no room for the {framing} byte(s) of document framing"
+        )
     for _ in range(COMPACTIONS):
-        if budget < 0:
-            break
         capsule = build(packet.bound(staged, byte_limit=budget, order=SECTIONS))
-        excess = capsule.bytes - limits.byte_ceiling
+        excess = capsule.document_bytes - limits.byte_ceiling
         if excess <= 0:
             return capsule
         budget -= excess
+        if budget < 0:
+            break
     raise CapsuleError(
-        f"the capsule does not fit: {limits.byte_ceiling} bytes "
-        f"({limits.byte_limit} configured, {limits.token_limit} tokens) "
-        f"leaves no room for the document itself"
+        f"the capsule does not fit: {COMPACTIONS} compaction(s) did not bring it "
+        f"under {limits.byte_ceiling} bytes "
+        f"({limits.byte_limit} configured, {limits.token_limit} tokens)"
     )
 
 
@@ -497,7 +524,10 @@ def _integrity(
 
 
 def _slate(
-    connection: pg.Connection, slate: Sequence[Mapping[str, object]], limit: int
+    connection: pg.Connection,
+    program_id: str,
+    slate: Sequence[Mapping[str, object]],
+    limit: int,
 ) -> packet.Section:
     """The Slate this pass was offered, carried rather than re-read.
 
@@ -511,10 +541,16 @@ def _slate(
     entries = [dict(entry) for entry in slate]
     kept = entries[:limit]
     labels = [str(entry.get("task", "")) for entry in kept]
+    revisions = {
+        str(label): int(revision)
+        for label, revision in connection.execute(
+            SLATE_REVISIONS, (program_id, json.dumps(labels))
+        ).rows
+    }
     return packet.Section(
         name="slate",
         total=len(entries),
-        rows=tuple(_staged(connection, "slate", labels, kept)),
+        rows=tuple(_staged(connection, "slate", labels, kept, revisions)),
     )
 
 
@@ -539,13 +575,15 @@ def _staged(
     section: str,
     labels: Sequence[str],
     records: Sequence[Mapping[str, object]],
+    revisions: Mapping[str, int] | None = None,
 ) -> list[packet.Row]:
     """Rows this process built, digested by the server in one statement.
 
-    Revision 0 for all of them, and for the same reason `packet.Row` gives: a
-    check result and a Slate entry are not canonical rows and have no Event
-    sequence to be stale against. What they are stale against is the capsule's
-    own revision, which is on the document.
+    `revisions` is the sequence each label's underlying row is at, where there is
+    one. A Slate entry has one -- it ranks a Task, and the Task is a row -- so it
+    cites it. A check result does not: it is an answer about the whole state and
+    has nothing to be individually stale against, so it keeps revision 0 and is
+    stale against the capsule's own revision, which is on the document.
     """
     if not records:
         return []
@@ -554,11 +592,12 @@ def _staged(
         raise CapsuleError(
             f"the server digested {len(digests)} of {len(records)} {section} records"
         )
+    at = revisions or {}
     return [
         packet.Row(
             section=section,
             label=label,
-            revision=0,
+            revision=int(at.get(label, 0)),
             digest=str(digest),
             record=record,
         )
