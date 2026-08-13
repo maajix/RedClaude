@@ -15,7 +15,7 @@
 -- to spend -- so the capacity has to leave the pool at the claim and come back
 -- when the run is closed and counted. That is what this file adds:
 --
---   * the ceilings a configuration states, per Agent run and per Lane, beside
+--   * the ceilings a configuration states, per Agent run and per lane, beside
 --     the total that has been on `programs` since 023;
 --   * `budget_reservations`, one row per claim, holding the worst case that
 --     claim could spend until the run it opened is settled;
@@ -40,7 +40,7 @@
 -- `programs.token_budget` is the total and has been since 023. These are the
 -- two ceilings a total cannot express: what one run may spend, which is what
 -- makes a worst case a number rather than "the rest of the campaign", and what
--- one Lane may spend, which is what stops a hunt lane consuming a budget that
+-- one lane may spend, which is what stops a hunt lane consuming a budget that
 -- was meant to reach a report.
 --
 -- Nullable, and NULL is not zero and not unbounded in the same way twice:
@@ -50,7 +50,7 @@
 --     reading and it has a visible consequence -- such a Program admits one
 --     claim at a time while its total is bounded -- which is why the key is
 --     required of every configuration this build accepts.
---   * `lane_token_budget` NULL means the Lane is bounded only by the total,
+--   * `lane_token_budget` NULL means the lane is bounded only by the total,
 --     which is what every Program did before this file.
 --
 -- Projected onto `programs` rather than read from the newest revision on every
@@ -72,10 +72,10 @@ COMMENT ON COLUMN programs.run_request_budget IS
   'The most target contacts one Agent run may make. Reserved at the claim against the Program''s aggregate and enforced at the door, which is the only place a request is counted. NULL states no worst case, read the same way `run_token_budget` reads it. `[budgets] run_requests`.';
 
 COMMENT ON COLUMN programs.lane_token_budget IS
-  'The most tokens one Lane may commit -- spent plus reserved -- across the campaign. One number for every Lane rather than one per kind: which kinds run more is `scheduler_lanes` and the quota profiles, and this is the ceiling that stops any single Lane consuming a total the others still need. NULL leaves the Lane bounded only by the total. `[budgets] lane_tokens`.';
+  'The most tokens one lane may commit -- spent plus reserved -- across the campaign. One number for every lane rather than one per kind: which kinds run more is `scheduler_lanes` and the quota profiles, and this is the ceiling that stops any single lane consuming a total the others still need. NULL leaves the lane bounded only by the total. `[budgets] lane_tokens`.';
 
 COMMENT ON COLUMN programs.lane_request_budget IS
-  'The most target contacts one Lane may commit, read exactly as `lane_token_budget` is. `[budgets] lane_requests`.';
+  'The most target contacts one lane may commit, read exactly as `lane_token_budget` is. `[budgets] lane_requests`.';
 
 
 -- ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ CREATE TABLE budget_reservations (
     program_id     uuid NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
     agent_run_id   uuid NOT NULL,
     task_id        uuid NOT NULL,
-    -- The Lane, copied from the Task at the claim. Copied and not joined: a
+    -- The lane, copied from the Task at the claim. Copied and not joined: a
     -- Task's kind cannot change, and the sums this column feeds run per
     -- candidate inside the claim's own lock.
     kind           text NOT NULL,
@@ -137,12 +137,38 @@ INSERT INTO purge_cascade_edges (table_name, column_name, rationale) VALUES
 
 -- Bookkeeping, for 13's reason: the claim and the closure each emit their own
 -- Event already, and this row is opened by one and settled by the other. An
--- Event per reservation would put a second copy of the run''s life in the log.
+-- Event per reservation would put a second copy of the run's life in the log.
 INSERT INTO event_table_exempt (table_name, exempt_kind, reason, owner_ticket) VALUES
     ('budget_reservations', 'bookkeeping',
      'the capacity one claim held out of the pool; the claim and the closure are the events', '25');
 
 GRANT SELECT, INSERT, UPDATE ON budget_reservations TO rk2_runtime;
+
+-- One question asked in three places -- what has this run already sent? -- and
+-- therefore one function. The views subtract it from what a run still holds in
+-- reserve, the settlement records it, and the door compares it to the ceiling
+-- the claim promised; three spellings of one join is three chances for the
+-- number the door enforces to stop being the number the pool believes.
+--
+-- A slot still in flight counts as a contact. The honest answer about a request
+-- that may already have left the machine is that it did, and the alternative
+-- lets a run hold its whole ceiling open at once.
+CREATE FUNCTION run_contacts(p_agent_run uuid) RETURNS bigint
+LANGUAGE sql STABLE AS $fn$
+    SELECT count(*)::bigint
+      FROM egress_reservations er
+      JOIN tool_runs tr ON tr.id = er.tool_run_id
+     WHERE tr.agent_run_id = p_agent_run
+       AND er.contacted IS NOT FALSE
+$fn$;
+
+REVOKE ALL ON FUNCTION run_contacts(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION run_contacts(uuid) TO rk2_runtime, rk2_proxy;
+
+COMMENT ON FUNCTION run_contacts(uuid) IS
+    'How many target contacts one Agent run has made, counting a reservation '
+    'still in flight as a contact. The one spelling of that count: the '
+    'capacity views, the settlement and the door all read it here.';
 
 
 -- ---------------------------------------------------------------------------
@@ -160,6 +186,13 @@ GRANT SELECT, INSERT, UPDATE ON budget_reservations TO rk2_runtime;
 -- request ceiling here and none at the door either -- `reserve_egress_slot`
 -- refuses every request with `budget not compiled` -- so there is nothing to
 -- reserve and no arm below fires.
+--
+-- It is also the side where the two sums would otherwise overlap. Tokens are
+-- written once, at the closing that settles the promise; contacts are counted
+-- as they happen, while the promise that covers them is still open. So what an
+-- open reservation still holds is what it has not yet sent, and `run_contacts`
+-- is subtracted from it -- otherwise every request in flight is charged twice
+-- and the pool refuses claims against capacity nobody holds.
 CREATE VIEW program_capacity AS
     SELECT p.id AS program_id,
            b.token_budget,
@@ -178,8 +211,17 @@ CREATE VIEW program_capacity AS
       FROM programs p
       JOIN program_budget b ON b.program_id = p.id
       CROSS JOIN LATERAL (
-          SELECT coalesce(sum(br.tokens),   0)::bigint AS tokens_reserved,
-                 coalesce(sum(br.requests), 0)::bigint AS requests_reserved
+          SELECT coalesce(sum(br.tokens), 0)::bigint AS tokens_reserved,
+                 -- What the promise has left, not what it was made for. Tokens
+                 -- need no such subtraction -- a run's tokens are written when
+                 -- it closes, in the statement that settles the promise, so the
+                 -- two sums cannot overlap -- but the door counts a contact the
+                 -- moment it makes it, so a run halfway through its ceiling is
+                 -- in `contacted` already. Subtracting the whole promise beside
+                 -- it would charge every request in flight twice and refuse
+                 -- claims against capacity nobody holds.
+                 coalesce(sum(greatest(br.requests - run_contacts(br.agent_run_id), 0)),
+                          0)::bigint AS requests_reserved
             FROM budget_reservations br
            WHERE br.program_id = p.id AND br.settled_at IS NULL
       ) r
@@ -205,8 +247,8 @@ CREATE VIEW program_capacity AS
 COMMENT ON VIEW program_capacity IS
   'One row per Program: what it may spend, what it has spent, what its claims in flight have promised, and what a further claim would therefore have to fit inside. `run_tokens` and `run_requests` are the worst case the next claim reserves, which is the stated per-run ceiling or the whole remainder when none is stated.';
 
--- The same question per Lane. The Lane of a run is the kind of its Task, so a
--- run opened without a Task -- `rk proxy send` opens one -- belongs to no Lane
+-- The same question per lane. The lane of a run is the kind of its Task, so a
+-- run opened without a Task -- `rk proxy send` opens one -- belongs to no lane
 -- and counts only against the Program.
 CREATE VIEW lane_budget AS
     SELECT p.id AS program_id,
@@ -227,24 +269,21 @@ CREATE VIEW lane_budget AS
       CROSS JOIN (SELECT DISTINCT kind FROM scheduler_lanes) k
       CROSS JOIN LATERAL (
           SELECT coalesce(sum(a.input_tokens + a.output_tokens), 0)::bigint AS tokens_spent,
-                 coalesce((SELECT count(*) FROM egress_reservations er
-                             JOIN tool_runs tr ON tr.id = er.tool_run_id
-                             JOIN agent_runs ar ON ar.id = tr.agent_run_id
-                             JOIN tasks t2 ON t2.id = ar.task_id
-                            WHERE t2.program_id = p.id AND t2.kind = k.kind
-                              AND er.contacted IS NOT FALSE), 0)::bigint AS requests_spent
+                 coalesce(sum(run_contacts(a.id)), 0)::bigint AS requests_spent
             FROM agent_runs a JOIN tasks t ON t.id = a.task_id
            WHERE a.program_id = p.id AND t.kind = k.kind
       ) s
       CROSS JOIN LATERAL (
-          SELECT coalesce(sum(br.tokens),   0)::bigint AS tokens_reserved,
-                 coalesce(sum(br.requests), 0)::bigint AS requests_reserved
+          SELECT coalesce(sum(br.tokens), 0)::bigint AS tokens_reserved,
+                 -- The Program's subtraction, per kind and for its reason.
+                 coalesce(sum(greatest(br.requests - run_contacts(br.agent_run_id), 0)),
+                          0)::bigint AS requests_reserved
             FROM budget_reservations br
            WHERE br.program_id = p.id AND br.kind = k.kind AND br.settled_at IS NULL
       ) r;
 
 COMMENT ON VIEW lane_budget IS
-  'One row per Program and Lane: what that Lane has spent and promised of the per-Lane ceiling. Not lane_capacity, which is how many Tasks of a kind may run at once; this is how much they may cost. One bounds the concurrency, the other the spend, and a Lane can be at neither, either or both. A request is counted for the Lane of the Task whose run opened the Tool run that contacted the target; a slot still in flight counts as a contact, because the honest answer about a request that may already have been sent is that it was.';
+  'One row per Program and lane: what that lane has spent and promised of the per-lane ceiling. Not lane_capacity, which is how many Tasks of a kind may run at once; this is how much they may cost. One bounds the concurrency, the other the spend, and a lane can be at neither, either or both. A request is counted for the lane of the Task whose run opened the Tool run that contacted the target; a slot still in flight counts as a contact, because the honest answer about a request that may already have been sent is that it was.';
 
 GRANT SELECT ON program_capacity, lane_budget TO rk2_runtime;
 
@@ -289,9 +328,9 @@ BEGIN
      WHERE program_id = t.program_id AND kind = t.kind;
     IF FOUND THEN
         -- With no worst case anywhere -- an unbounded total and no per-run
-        -- ceiling -- there is nothing to hold against a Lane in advance, and
-        -- the Lane bound degrades to what it was before this file: it refuses
-        -- once the Lane is spent rather than before it is. Stated here because
+        -- ceiling -- there is nothing to hold against a lane in advance, and
+        -- the lane bound degrades to what it was before this file: it refuses
+        -- once the lane is spent rather than before it is. Stated here because
         -- it is the one place a stated ceiling does less than it reads.
         v_worst := coalesce(c.run_tokens, 1);
         IF l.tokens_free IS NOT NULL AND v_worst > l.tokens_free THEN
@@ -307,10 +346,16 @@ BEGIN
     RETURN NULL;
 END $fn$;
 
+-- 23's discipline, for the arm this file adds to the rule it protects: a
+-- scheduler function is the runtime's and nobody else's, and a role the agent
+-- can reach must not be able to ask the scheduler anything.
+REVOKE ALL ON FUNCTION budget_refusal_for(tasks) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION budget_refusal_for(tasks) TO rk2_runtime;
+
 COMMENT ON FUNCTION budget_refusal_for(tasks) IS
     'NULL when the capacity this Task would need is free, else the name of the '
     'ceiling that is already promised: the Program''s tokens or requests, or '
-    'its Lane''s. Promised, not spent -- what a claim in flight may still spend '
+    'its lane''s. Promised, not spent -- what a claim in flight may still spend '
     'has left the pool, which is what stops concurrent claims each reading a '
     'pool the others are about to take from.';
 
@@ -548,21 +593,15 @@ COMMENT ON FUNCTION claim_task(text) IS
 -- somebody has to remember to extend -- including the ones this ticket has not
 -- been written yet to know about.
 --
--- What it settles against is what the run says it cost. A run whose tokens
--- were never written -- the child died, the reconciler closed it -- settles at
--- zero, which is not a claim that nothing was spent: it is the only number the
--- system has, and the alternative is holding the promise open forever against
--- a run nobody will ever count.
+-- What it settles against is what the run says it cost -- and a run that was
+-- killed says nothing, which is the case the trigger below it exists for.
 CREATE FUNCTION settle_budget_reservation() RETURNS trigger
 LANGUAGE plpgsql AS $fn$
 BEGIN
     UPDATE budget_reservations br
        SET settled_at     = now(),
            tokens_spent   = coalesce(NEW.input_tokens, 0) + coalesce(NEW.output_tokens, 0),
-           requests_spent = (SELECT count(*) FROM egress_reservations er
-                               JOIN tool_runs tr ON tr.id = er.tool_run_id
-                              WHERE tr.agent_run_id = NEW.id
-                                AND er.contacted IS NOT FALSE)
+           requests_spent = run_contacts(NEW.id)
      WHERE br.agent_run_id = NEW.id AND br.settled_at IS NULL;
     RETURN NULL;
 END $fn$;
@@ -571,6 +610,57 @@ COMMENT ON FUNCTION settle_budget_reservation() IS
     'Gives back what a claim promised, against what the run it opened turned '
     'out to cost. Fires on the transition every ending shares, so no terminal '
     'path has to remember to reconcile and a path added later cannot forget.';
+
+-- The run that cannot report. A child killed at its timeout and a run whose
+-- machine went away are the two endings with no usage behind them: the tokens
+-- were spent -- the model is not a process this system can interrupt mid-token
+-- -- and the only account of them died with the child. `aborted` is the
+-- column's word for exactly that ending, and both `resume_program` and the
+-- lease sweep already write it.
+--
+-- Settling such a run at zero was the first draft and it is wrong: it gives
+-- back capacity that was consumed, leaves `program_budget.tokens_spent` where
+-- it was, and makes a Program that loses every child immortal -- the one shape
+-- where a runaway costs nothing. What it is charged instead is what it
+-- promised, which is the only number anyone has a right to. Charged as input
+-- because the split is unknowable and the ceiling is the sum.
+--
+-- `BEFORE`, so the row the settlement reads is already the row that was
+-- charged, and the two never disagree about one run. Not a renderer: 0019's
+-- CHECK says a renderer spends nothing, and a renderer never held a promise
+-- to charge.
+CREATE FUNCTION charge_unmeasured_run() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE v_promised bigint;
+BEGIN
+    IF NEW.stop_reason = 'aborted'
+       AND NEW.input_tokens IS NULL AND NEW.output_tokens IS NULL
+       AND NEW.runs_as IS DISTINCT FROM 'renderer' THEN
+        SELECT br.tokens INTO v_promised
+          FROM budget_reservations br
+         WHERE br.agent_run_id = NEW.id AND br.settled_at IS NULL;
+        -- A promise of nothing is nothing to charge: an unbounded Program with
+        -- no per-run ceiling reserved NULL, and there is no number to write.
+        IF v_promised IS NOT NULL THEN
+            NEW.input_tokens  := v_promised;
+            -- Both columns, because `program_budget` sums `input + output` per
+            -- run and NULL + n is NULL: a charge written to one column alone
+            -- is a charge the Program's own budget never sees.
+            NEW.output_tokens := 0;
+        END IF;
+    END IF;
+    RETURN NEW;
+END $fn$;
+
+COMMENT ON FUNCTION charge_unmeasured_run() IS
+    'Charges a run that was killed or lost what its claim reserved, because a '
+    'run that cannot report is not a run that spent nothing. Only when nothing '
+    'was measured: a reported zero is a measurement and stands.';
+
+CREATE TRIGGER agent_runs_charge_unmeasured
+    BEFORE UPDATE OF finished_at ON agent_runs
+    FOR EACH ROW WHEN (OLD.finished_at IS NULL AND NEW.finished_at IS NOT NULL)
+    EXECUTE FUNCTION charge_unmeasured_run();
 
 CREATE TRIGGER agent_runs_settle_budget
     AFTER UPDATE OF finished_at ON agent_runs
@@ -690,9 +780,9 @@ COMMENT ON FUNCTION finish_task_attempt(uuid, text, bigint, bigint) IS
 -- promised 50. That is here, and only here -- the door is the one place a
 -- contact is counted.
 --
--- The Lane and the Program need no arm of their own. Admission has already
+-- The lane and the Program need no arm of their own. Admission has already
 -- held every claim's worst case out of both, and this arm holds each run to
--- its own: a Lane cannot exceed a ceiling that every run inside it is bounded
+-- its own: a lane cannot exceed a ceiling that every run inside it is bounded
 -- by and every claim into it was measured against.
 --
 -- No `retry_at`, for the reason 13 gives the aggregate: this is a limit no
@@ -839,14 +929,10 @@ BEGIN
      WHERE br.agent_run_id = v_auth.agent_run_id AND br.settled_at IS NULL;
 
     IF v_run_cap IS NOT NULL THEN
-        -- A slot still in flight counts as a contact. The honest answer about a
-        -- request that may already have left the machine is that it did, and
-        -- the alternative lets a run hold its whole ceiling open at once.
-        SELECT count(*) INTO v_run_hit
-          FROM egress_reservations er
-          JOIN tool_runs tr ON tr.id = er.tool_run_id
-         WHERE tr.agent_run_id = v_auth.agent_run_id
-           AND er.contacted IS NOT FALSE;
+        -- The same count the pool subtracted when it admitted this run, so what
+        -- the door refuses at is what the capacity views already stopped
+        -- offering.
+        v_run_hit := run_contacts(v_auth.agent_run_id);
 
         IF v_run_hit >= v_run_cap THEN
             UPDATE program_egress_spend SET exhausted = exhausted + 1
@@ -940,10 +1026,11 @@ COMMENT ON FUNCTION reserve_egress_slot(text,text,text,integer,text,text) IS
 -- 7. The invariants
 -- ---------------------------------------------------------------------------
 
--- Three arms, and all three are one property: a reservation is open exactly
--- while the run it was made for is. Structural rather than textual, unlike
--- 71's and 73's, because this one is about rows and not about where a number
--- came from -- and the rows are the whole mechanism.
+-- Three arms are one property: a reservation is open exactly while the run it
+-- was made for is. Structural rather than textual, unlike 71's and 73's,
+-- because this one is about rows and not about where a number came from -- and
+-- the rows are the whole mechanism. Two more arms guard the eligibility arm
+-- this file added, in 23's own words.
 --
 -- Deliberately not an arm: a Program whose committed tokens exceed its total.
 -- A run that spends more than its ceiling produces exactly that, the schema
@@ -975,20 +1062,42 @@ LANGUAGE sql STABLE AS $fn$
      WHERE br.settled_at IS NOT NULL
        AND br.tokens_spent IS DISTINCT FROM
            (coalesce(a.input_tokens, 0) + coalesce(a.output_tokens, 0))
+  UNION ALL
+    -- 23's two questions, asked of the arm this file added to its rule. They
+    -- are asked here rather than added to `check_slate_claim`'s two lists
+    -- because the function this file owns is the one they are about, and a
+    -- check that has to be edited in a neighbour's file to cover a new arm is
+    -- a check the next ticket forgets.
+    SELECT 'eligibility_reads_the_clock', p.proname,
+           'a function the ranking filter runs reads the wall clock'
+      FROM pg_proc p
+     WHERE p.pronamespace = 'public'::regnamespace
+       AND p.proname = 'budget_refusal_for'
+       AND regexp_replace(p.prosrc, '--[^' || chr(10) || ']*', '', 'g')
+           ~* '(now\(\)|current_timestamp|clock_timestamp)'
+  UNION ALL
+    SELECT 'scheduler_function_public_executable', p.proname,
+           'an agent-reachable role can call a scheduler function'
+      FROM pg_proc p
+     WHERE p.pronamespace = 'public'::regnamespace
+       AND p.proname IN ('budget_refusal_for', 'run_contacts')
+       AND has_function_privilege('public', p.oid, 'EXECUTE')
 $fn$;
 
 REVOKE ALL ON FUNCTION check_budget_reservations() FROM PUBLIC;
 
 COMMENT ON FUNCTION check_budget_reservations() IS
-    'A reservation is open exactly while the run it was made for is, and what '
-    'it settled against is what that run recorded. Capacity held for a run '
-    'nobody will ever count is a Program that shrinks every time something '
+    'A reservation is open exactly while the run it was made for is, what it '
+    'settled against is what that run recorded, and the arm that reads it is '
+    'still deterministic and still the runtime''s alone. Capacity held for a '
+    'run nobody will ever count is a Program that shrinks every time something '
     'crashes; capacity given back to a run still spending it is the overspend '
     'the reservation exists to prevent.';
 
 INSERT INTO standing_checks(name, query, owner_ticket, note) VALUES
     ('budget_reservations', 'SELECT * FROM check_budget_reservations()', '25',
-     'promised capacity is held exactly as long as the run it was promised to');
+     'promised capacity is held exactly as long as the run it was promised to, '
+     'and the eligibility arm that reads it stays deterministic and private');
 
 -- Arm 4 of 04's check, extended. The four new columns are projections of the
 -- same document `platform` and `token_budget` are projections of, and a
@@ -1066,10 +1175,36 @@ LANGUAGE sql STABLE AS $$
         OR p.run_request_budget  IS DISTINCT FROM (c.document #>> '{budgets,run_requests}')::bigint
         OR p.lane_token_budget   IS DISTINCT FROM (c.document #>> '{budgets,lane_tokens}')::bigint
         OR p.lane_request_budget IS DISTINCT FROM (c.document #>> '{budgets,lane_requests}')::bigint
+  UNION ALL
+    -- 5. Ceilings that cannot all be true at once. A per-run ceiling above the
+    --    lane's or the campaign's is a Program where every claim promises more
+    --    than there is, so `budget_refusal_for` refuses every Task from the
+    --    first one -- and reports it as an exhausted budget, which is the true
+    --    answer to the wrong question. The configuration is what is wrong, and
+    --    a Program that can never claim anything should say so where the
+    --    operator is already looking. Only the per-run ceiling is compared
+    --    upwards: a lane ceiling above the total is slack, because the total
+    --    binds first and the lane simply never does. A ceiling nobody stated
+    --    is not compared either: NULL is unbounded, and unbounded disagrees
+    --    with nothing.
+    SELECT 'configuration_ceilings_disagree', p.slug,
+           'per run ' || coalesce(p.run_token_budget::text, '(none)') || ' tokens/' ||
+           coalesce(p.run_request_budget::text, '(none)') || ' requests, per lane ' ||
+           coalesce(p.lane_token_budget::text, '(none)') || '/' ||
+           coalesce(p.lane_request_budget::text, '(none)') || ', campaign ' ||
+           coalesce(p.token_budget::text, '(none)') || '/' ||
+           coalesce(q.budget_requests::text, '(none)')
+      FROM programs p
+      LEFT JOIN LATERAL (SELECT sv.budget_requests FROM program_scope_versions sv
+                          WHERE sv.program_id = p.id AND sv.version = p.scope_version) q ON true
+     WHERE p.run_token_budget   > p.token_budget
+        OR p.run_token_budget   > p.lane_token_budget
+        OR p.run_request_budget > q.budget_requests
+        OR p.run_request_budget > p.lane_request_budget
 $$;
 
 COMMENT ON FUNCTION check_program_configuration() IS
-  'Every Program states the policy it runs under, the statement is complete, no revision claims a change that did not happen, and the Program runs every ceiling its newest revision states.';
+  'Every Program states the policy it runs under, the statement is complete, no revision claims a change that did not happen, the Program runs every ceiling its newest revision states, and those ceilings can all be true at once -- one run may not be promised more than its lane or its campaign has, which is a Program that admits nothing and blames its budget for it. A lane or campaign ceiling nobody can reach is slack, not a contradiction: the tighter one binds first.';
 
 DO $$
 DECLARE n integer; d text;

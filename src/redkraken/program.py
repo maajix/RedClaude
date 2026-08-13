@@ -575,8 +575,8 @@ def _existing(connection: pg.Connection, slug: str) -> Program | None:
 
 
 @dataclass(frozen=True)
-class _Projected:
-    """What the root `programs` row carries as columns of its own.
+class _Policy:
+    """The policy the root `programs` row carries as columns of its own.
 
     Read in one place because it is written in three -- the row, the row's
     update and the revision that records it -- and three readings of the same
@@ -597,10 +597,10 @@ class _Projected:
     lane_request_budget: int
 
 
-def _policy(configuration: config.Configuration) -> _Projected:
+def _policy(configuration: config.Configuration) -> _Policy:
     document = configuration.document
     budgets = document["budgets"]
-    return _Projected(
+    return _Policy(
         platform=document["program"]["platform"],
         token_budget=budgets["tokens"],
         run_token_budget=budgets["run_tokens"],

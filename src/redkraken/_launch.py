@@ -642,11 +642,22 @@ def _usage(stated: object) -> tuple[int, int]:
 
     Everything the model was charged for reading counts as input, cache included:
     a cached read is cheaper, not free, and a ceiling that ignored the cache
-    would be a ceiling a long session walks straight through. Absent fields are
-    zero rather than an error, because a transport that reports usage partially
-    still reports a run that spent something.
+    would be a ceiling a long session walks straight through. A turn's numbers
+    are that turn's own request, prefix and all, which is what the Program is
+    charged for making it -- so the session's cost is the sum of the turns, and
+    the `ResultMessage` total replaces the sum when the SDK reports one.
+
+    Nothing reported is zero: a message carrying no usage block still happened,
+    and absent fields inside a block that is there are zero for the same reason.
+    A block that is not a mapping raises, for the reason `_token_cap` raises:
+    usage this process cannot read is a ceiling it cannot enforce, and a quiet
+    zero here is a session running unbounded.
     """
-    usage = stated if isinstance(stated, Mapping) else {}
+    if stated is None:
+        return (0, 0)
+    if not isinstance(stated, Mapping):
+        raise TypeError(f"usage is {type(stated).__name__}, not a mapping")
+    usage = stated
     return (
         int(usage.get("input_tokens") or 0)
         + int(usage.get("cache_read_input_tokens") or 0)

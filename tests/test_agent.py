@@ -1100,6 +1100,52 @@ class ChildTest(unittest.TestCase):
             with self.subTest(subagent_cap=stated):
                 self.assertIsNone(_launch._gate(fixtures.ROLE, stated))
 
+    def test_a_job_that_carries_no_ceiling_leaves_the_run_unbounded(self):
+        # PH2-25. Nothing stated is no ceiling, not a default: a Program with no
+        # total and no per-run number reserved nothing, and inventing a bound
+        # here would stop a run the scheduler admitted without one.
+        self.assertIsNone(_launch._token_cap(None))
+        self.assertEqual(60000, _launch._token_cap(60000))
+
+    def test_a_ceiling_this_process_cannot_read_fails_the_run(self):
+        # Unlike the subagent cap, which degrades to the roster's default: a cap
+        # that cannot be read can still be refused, but a ceiling that cannot be
+        # read can only be ignored, and ignoring it is running unbounded.
+        for stated in ("sixty thousand", object(), [60000]):
+            with self.subTest(token_cap=stated):
+                with self.assertRaises((TypeError, ValueError)):
+                    _launch._token_cap(stated)
+
+    def test_every_read_the_model_was_charged_for_counts_as_input(self):
+        # A cached read is cheaper, not free. A ceiling that ignored the cache
+        # is one a long session walks straight through.
+        self.assertEqual(
+            (600, 20),
+            _launch._usage(
+                {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 300,
+                    "cache_creation_input_tokens": 200,
+                    "output_tokens": 20,
+                }
+            ),
+        )
+
+    def test_a_message_that_reports_no_usage_spends_nothing(self):
+        # A message with no usage block still happened, and so does a block with
+        # fields missing from it.
+        self.assertEqual((0, 0), _launch._usage(None))
+        self.assertEqual((0, 0), _launch._usage({}))
+        self.assertEqual((7, 0), _launch._usage({"input_tokens": 7}))
+
+    def test_usage_this_process_cannot_read_is_not_quietly_zero(self):
+        # The same reason `_token_cap` raises: a quiet zero here is a running
+        # sum that never grows, which is the ceiling silently switched off.
+        for stated in ("40 tokens", 4200, [{"input_tokens": 1}]):
+            with self.subTest(usage=stated):
+                with self.assertRaises(TypeError):
+                    _launch._usage(stated)
+
     def test_a_credential_vector_in_the_inherited_environment_refuses_the_same_way(self):
         with self.assertRaises(agent.StartupRefusal) as raised:
             asyncio.run(
@@ -1443,6 +1489,30 @@ class ContainedChildTest(unittest.TestCase):
         self.assertGreaterEqual(
             sum(1 for _, line in seen if line.startswith("POST /v1/messages")), result.answers
         )
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_a_child_stops_itself_at_the_ceiling_its_claim_reserved(self):
+        """PH2-25, where the ceiling is actually enforced: in the loop.
+
+        Nothing in the objective mentions a budget, because criterion 5 says a
+        prompt instruction is not an enforcement. The session ends because the
+        process summing the turns stopped reading them, and the word it ends
+        with is one `agent_runs.stop_reason` already accepts.
+        """
+        result = agent.agent_run(
+            agent.AgentRunRequest(
+                agent_run_id="agent-run-1",
+                objective=f"Say {fixtures.ControlUpstream.SPOKEN}.",
+                container=self.boundary(),
+                role=fixtures.ROLE,
+                timeout=300.0,
+                token_cap=1,
+            )
+        )
+
+        self.assertEqual("budget", result.stop_reason)
+        self.assertEqual(1, result.answers)
+        self.assertGreater(result.input_tokens + result.output_tokens, 1)
 
     @unittest.skipIf(not INSTALLED, NEEDS_SDK)
     def test_a_tool_the_child_can_see_and_run_is_still_refused_by_the_gate(self):

@@ -842,8 +842,25 @@ class Slice:
             # sequence resumes, which is what makes sharing the connection with
             # it safe -- and before the closing releases the Lease, which is the
             # one thing a late beat could contradict.
-            with self._heartbeat(ledger, connection, claimed, facts):
-                result = self._child(ledger, claimed, mission, door, lifetime, program_id)
+            try:
+                with self._heartbeat(ledger, connection, claimed, facts):
+                    result = self._child(ledger, claimed, mission, door, lifetime, program_id)
+            except RuntimeError as error:
+                # The container ran and its account of itself did not survive:
+                # a child killed at its timeout, or one that died mid-session.
+                # `aborted` and not `error`, because the two words settle
+                # differently -- what this run spent is real and unmeasurable,
+                # so the closing charges it what its claim reserved, and the
+                # word is how the trigger tells that ending from a run that
+                # never started.
+                facts["agent_run"]["stop_reason"] = "aborted"
+                ledger.fail(
+                    "agent_run",
+                    f"{claimed.agent_run_label} left no account of itself: {error}",
+                    code=INTEGRITY_FAILED,
+                    source="agent",
+                )
+                return
             if result is None:
                 facts["agent_run"]["stop_reason"] = "refusal"
                 return

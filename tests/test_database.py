@@ -12081,11 +12081,13 @@ BUDGET_CAPPED = budgets(
     window_seconds=3600,
 )
 
-#: A Program whose whole engagement is five requests and whose per-run ceiling
-#: is ten. Nothing has been sent and the first claim is still refused: a run
-#: that may send ten cannot be admitted against a total of five.
+#: A Program whose whole engagement is ten requests and whose per-run ceiling
+#: is the same ten. Coherent on its own -- one run may spend everything, which
+#: is a policy and not a contradiction -- and exhausted the moment one claim
+#: promises its worst case, so the second Task is refused for requests nobody
+#: has sent yet.
 BUDGET_METERED = budgets(
-    requests=5, tokens=2000000, run_tokens=60000, run_requests=10,
+    requests=10, tokens=2000000, run_tokens=60000, run_requests=10,
     lane_tokens=1000000, lane_requests=500, concurrency=4, burst=5,
     window_seconds=3600,
 )
@@ -12263,11 +12265,24 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
 
     @classmethod
     def arrange_metered(cls):
-        """A run's request ceiling is wider than the engagement's own total."""
-        [cls.metered_task] = cls.seed("metered", 1)
+        """One claim's promise is the whole engagement's requests.
+
+        The request side of `arrange_capped`, and it has to be its own Program
+        for the same reason: a total that binds first would refuse this Task
+        for tokens and prove nothing about requests.
+        """
+        labels = cls.seed("metered", 2)
         cls.bind("metered")
+        cls.offer()
+        cls.metered_run = str(cls.call("SELECT claim_task()"))
+        taken = cls.claimed_by("metered", cls.metered_run)
+        [cls.metered_left] = [label for label in labels if label != taken]
+        cls.metered_reason = cls.claimable("metered", cls.metered_left)
+        cls.metered_refusal = cls.refusal("SELECT claim_task($1)", (cls.metered_left,))
+        # Re-offered after the claim, because the slate and the claim have to
+        # refuse the same Task for the same reason: a Task the slate still
+        # offers is one an orchestrator would keep trying.
         cls.metered_slate = cls.offer()
-        cls.metered_reason = cls.claimable("metered", cls.metered_task)
         cls.metered_counts = cls.counted("metered")
         cls.metered_capacity = cls.capacity("metered")
 
@@ -12377,6 +12392,9 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
             " AND type = 'egress.budget_exhausted' ORDER BY seq DESC LIMIT 1",
             (cls.identifiers["door"],),
         ).dicts()
+        # Read with the run still open and one of its requests already sent,
+        # which is the only moment the promise and the spend overlap.
+        cls.door_capacity = cls.capacity("door")
         cls.door_settled = cls.close("door", cls.door_run, "completed", 100, 20)
 
     # -- what the scenarios are built out of -----------------------------------
@@ -12520,6 +12538,34 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         ).rows
         self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
 
+    def test_ceilings_that_cannot_all_be_true_are_reported_against_the_program(self):
+        # The Control for the assertion above, which would pass just as well
+        # against a check that never reports anything. A per-run ceiling over
+        # the campaign's total is a Program whose every claim promises more
+        # than there is, and it has to be named as a configuration problem
+        # rather than left to look like an exhausted budget.
+        found = []
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "UPDATE programs SET run_token_budget = token_budget + 1"
+                    " WHERE id = $1::uuid",
+                    (self.identifiers["door"],),
+                )
+                found.extend(
+                    self.connection.execute(
+                        "SELECT object FROM check_program_configuration()"
+                        " WHERE problem = 'configuration_ceilings_disagree'"
+                    ).rows
+                )
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual([f"{BUDGET_SLUG}-door"], [str(row[0]) for row in found])
+
     # -- criterion 2: the claim reserves the worst case ------------------------
 
     def test_the_claim_writes_one_reservation_for_the_run_it_opened(self):
@@ -12596,19 +12642,39 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
             int(self.free_after["tokens_free"]),
         )
 
-    def test_a_refusal_an_error_and_an_abort_all_settle_their_reservation(self):
-        for stop in ("refusal", "error", "aborted"):
+    def test_a_refusal_and_an_error_settle_against_the_nothing_they_spent(self):
+        # Both ended with a caller behind them that could say what they cost.
+        # A refusal never reached the model and an error is the harness's own,
+        # so nothing is what they report and nothing is what they are charged.
+        for stop in ("refusal", "error"):
             with self.subTest(stop=stop):
                 self.assertIsNotNone(self.ended[stop]["settled_at"])
                 self.assertEqual(0, int(self.ended[stop]["tokens_spent"]))
 
+    def test_a_run_that_left_no_account_of_itself_is_charged_what_it_promised(self):
+        # The killed child. Its tokens were spent and died with it, and a
+        # settlement at zero would give back capacity the model consumed.
+        self.assertIsNotNone(self.ended["aborted"]["settled_at"])
+        self.assertEqual(60000, int(self.ended["aborted"]["tokens_spent"]))
+
     def test_a_run_nobody_closed_settles_when_the_crash_is_recovered(self):
         # The one ending with no caller behind it. Its reservation was open
         # while the lease was live, which is what makes this a reconciliation
-        # rather than a row that was never written.
+        # rather than a row that was never written. Charged like the abort
+        # above, because it is the same ending arrived at from further away.
         self.assertIsNone(self.crash_held["settled_at"])
         self.assertIsNotNone(self.ended["crash"]["settled_at"])
-        self.assertEqual(0, int(self.ended["crash"]["tokens_spent"]))
+        self.assertEqual(60000, int(self.ended["crash"]["tokens_spent"]))
+
+    def test_what_an_unmeasured_run_was_charged_leaves_the_program_budget(self):
+        # Charging the reservation and not the run would be a number in one
+        # table nothing else reads: the Program's own spend has to move, or a
+        # Program that loses every child is a Program that never runs out.
+        self.assertEqual(120000, int(self.endings_capacity["tokens_spent"]))
+        self.assertEqual(
+            int(self.endings_capacity["token_budget"]) - 120000,
+            int(self.endings_capacity["tokens_free"]),
+        )
 
     def test_nothing_is_still_promised_once_every_run_has_ended(self):
         self.assertEqual(0, int(self.endings_capacity["tokens_reserved"]))
@@ -12620,6 +12686,18 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         self.assertEqual(1, int(self.door_settled["requests_spent"]))
         self.assertEqual(120, int(self.door_settled["tokens_spent"]))
 
+    def test_a_request_in_flight_is_counted_once_and_not_twice(self):
+        # The door counts a contact when it makes it, while the promise that
+        # covered it is still open. Charging both would refuse the next claim
+        # against capacity nobody holds, so what an open promise still holds is
+        # what it has not yet sent.
+        self.assertEqual(1, int(self.door_capacity["requests_spent"]))
+        self.assertEqual(0, int(self.door_capacity["requests_reserved"]))
+        self.assertEqual(
+            int(self.door_capacity["request_budget"]) - 1,
+            int(self.door_capacity["requests_free"]),
+        )
+
     # -- criterion 5: exhausted capacity is a typed refusal --------------------
 
     def test_a_task_the_reserved_total_no_longer_covers_is_ineligible(self):
@@ -12630,13 +12708,20 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         self.assertEqual((1, 1), self.capped_counts)
         self.assertEqual(150000, int(self.capped_capacity["tokens_reserved"]))
 
-    def test_a_run_that_may_send_more_than_the_engagement_has_is_ineligible(self):
+    def test_a_task_the_engagement_has_no_requests_left_to_promise_is_ineligible(self):
         self.assertEqual("program_requests_reserved", self.metered_reason)
-        self.assertEqual((0, 0), self.metered_counts)
+        self.assertIn("program_requests_reserved", self.metered_refusal)
+        self.assertEqual((1, 1), self.metered_counts)
         # And it is ineligible before it is offered, not after it is claimed:
         # the slate filters on the same answer the claim re-asks.
         self.assertEqual((), self.metered_slate)
-        self.assertEqual(0, int(self.metered_capacity["requests_reserved"]))
+
+    def test_the_requests_nobody_has_sent_yet_are_what_refused_it(self):
+        # The whole engagement is promised while nothing has been spent, which
+        # is the difference between this arm and the one 13 already had.
+        self.assertEqual(10, int(self.metered_capacity["requests_reserved"]))
+        self.assertEqual(0, int(self.metered_capacity["requests_spent"]))
+        self.assertEqual(0, int(self.metered_capacity["requests_free"]))
 
     def test_a_lane_that_is_full_refuses_its_own_kind_and_no_other(self):
         self.assertEqual("lane_tokens_reserved", self.laned_reason)
