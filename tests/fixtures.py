@@ -245,6 +245,18 @@ class Target(BaseHTTPRequestHandler):
     answer = b'{"note":"target answered"}'
     response_headers: tuple[tuple[str, str], ...] = ()
 
+    def date_time_string(self, timestamp: float | None = None) -> str:
+        """A fixed `Date`, so that one answer is one set of bytes.
+
+        `BaseHTTPRequestHandler` stamps every response with the current second,
+        which makes two identical answers two different transcripts whenever the
+        exchanges that asked for them straddle a second boundary. The store the
+        door writes to is content-addressed, so that difference is the
+        difference between holding one blob and holding two -- and a suite that
+        asserts the store deduped is then asserting how fast it ran.
+        """
+        return "Thu, 01 Jan 2026 00:00:00 GMT"
+
     def do_GET(self) -> None:
         self.server.seen.append(
             (
