@@ -40,8 +40,8 @@ ticket asks for the first still-valid entry.
 `claimable_for(t tasks, w scheduler_weights) RETURNS text` is the rule, said
 once: NULL when the Task may be claimed right now, else the name of the
 condition that refuses it -- `not_pending`, a cancel reason, a ready reason,
-`not_ranked`, `unaffordable`, `identity_held`, `lane_full`,
-`global_subagent_cap`. `rank_candidates` filters on it being NULL and
+`not_ranked`, `unaffordable`, `identity_held`, `no_role_runs_this_kind`,
+`lane_full`, `global_subagent_cap`. `rank_candidates` filters on it being NULL and
 `claim_task` re-asks it under `FOR UPDATE`. Criterion 3 says "rechecks every
 eligibility condition", and that is only checkable against a list of conditions
 that exists somewhere.
@@ -156,3 +156,72 @@ that one rule, that the claim enforces the expiry the offer advertises, that an
 offer is bounded and a Program has one of them, that a Task which is running is
 not still on offer, and that a recorded choice names a pair some slate actually
 carried.
+
+### What the review changed
+
+A two-axis review ran against the finished change. Eleven findings; eight
+applied, three answered.
+
+Two of them were the rule getting a condition wrong, and both were about
+failing open:
+
+- Affordability was `NOT EXISTS (... tokens_left IS NOT NULL AND tokens_left <
+  cost)`, which reads "no row says it cannot afford this". `program_budget` is a
+  view over `programs`, so it inherits `programs` RLS -- a caller that cannot
+  see the Program sees no row, and no row meant affordable. 023's `CROSS JOIN`
+  form failed closed on exactly that case. It now asks for a row that says it
+  *can* afford it: `NOT EXISTS (... tokens_left IS NULL OR tokens_left >=
+  cost)`, where the NULL is the unbounded budget it has always meant.
+- Criterion 2 names role-compatibility, and the rule had no such condition. A
+  Task of a kind no role runs fell out of `effective_lane_capacity` and was
+  refused as `lane_full`, which is a true refusal for a false reason: nothing is
+  occupying that lane and nothing ever will. `no_role_runs_this_kind` is its own
+  arm now, asked before the lane count, and the condition list in the file's
+  header is nine long rather than eight.
+
+`pick_task` did not check the slate's expiry. `claim_task` did, so nothing could
+be claimed off an expired slate either way, but the ticket asks that an expired
+choice be refused where the model can still be told about it -- which is at pick
+time, and is the whole reason `pick_task` refuses an off-slate label there too.
+
+`UPDATE task_picks SET consumed = true WHERE program_id = p AND NOT consumed`
+appeared three times, in three functions, for three different reasons. The
+reasons stay at their call sites; the statement is `supersede_pick(uuid)`. Which
+rows "the outstanding pick" means is the partial unique index's answer and now
+has one spelling, so a fourth site cannot get the predicate slightly wrong and
+leave a Program with two live choices.
+
+Three smaller ones. `COMMENT ON FUNCTION claimable_for` called the offer a
+snapshot, which is the word the ticket spends a criterion telling the claim not
+to trust. `execution.py` reported a failed claim as "the top of a N-Task slate
+could not be claimed" -- there is no top any more, the walk is inside the claim,
+and it now says the claim failed. `_offered(row)` read as a predicate and is
+`_slate_entry(row)`.
+
+And two in the test case. `SlateClaimTest.arranged()` sat among eight
+`arrange_*()` scenario builders while being neither -- it is `as_owner()`, which
+is what it does. `test_execution.py` passed `slate_row(1)`, a raw wire tuple,
+where production `facts["slate"]` carries decoded entries; a `slate_entry()`
+helper runs the fixture through the slice's own decoder, so the two shapes
+cannot drift apart. The spec axis also noted that criterion 4's "nothing was
+partially claimed" reading was asserted after the slate refusals and not after
+the three that come from the recheck. It is asserted after all six now.
+
+Answered rather than applied:
+
+- `why_ready` disappeared from `rank_candidates`, which reads as scope creep. It
+  was the constant `'ready'`: a column whose value did not depend on the row.
+  The rule that replaced it returns the name of the condition that refuses, and
+  the name of the condition that admits is not a thing.
+- The Event-integrity assertion after the four-way race covers `tasks` and
+  `agent_runs` and not the two tables this ticket added, because `task_slate` is
+  `derived`-exempt and `task_picks` `audit`-exempt. Those exemptions are
+  registered rows with stated reasons, which is the corpus's own mechanism for
+  saying a table does not emit; asserting Events for them would assert against
+  the registry.
+- `task_picks` and `pick_task` are not in the ticket's title, and criterion 4
+  asks that a *stale* choice be refused. A choice that can go stale is a choice
+  that outlives the turn that made it, which is a row. Ticket 18 compiled
+  `mcp__rk2__pick_task` with `writes=("task_picks",)` before the table existed,
+  and `tests/test_roster.py` has carried that name as a pending relation with
+  this ticket against it since.

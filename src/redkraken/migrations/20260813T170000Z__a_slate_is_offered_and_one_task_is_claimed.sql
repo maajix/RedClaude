@@ -131,8 +131,9 @@ END $fn$;
 --   4. `not_ranked`          -- no cost has been computed for it
 --   5. `unaffordable`        -- the run it would start does not fit the budget
 --   6. `identity_held`       -- another run holds an Identity it needs
---   7. `lane_full`           -- transient, and about the lane, not the Task
---   8. `global_subagent_cap` -- transient, and about the Program
+--   7. `no_role_runs_this_kind` -- nothing in the roster would run it
+--   8. `lane_full`           -- transient, and about the lane, not the Task
+--   9. `global_subagent_cap` -- transient, and about the Program
 --
 -- Cancellation is asked before readiness for 023's reason: both refuse, only
 -- one is permanent, and a hunt Task whose Hypothesis is refuted reading
@@ -166,14 +167,34 @@ BEGIN
 
     IF t.estimated_cost IS NULL THEN RETURN 'not_ranked'; END IF;
 
-    IF EXISTS (SELECT 1 FROM program_budget b
-                WHERE b.program_id = t.program_id
-                  AND b.tokens_left IS NOT NULL
-                  AND b.tokens_left < t.estimated_cost * w.cost_reference_tokens) THEN
+    -- Asked as "is there a row saying it fits", not as "is there a row saying
+    -- it does not". `program_budget` is a view over `programs`, and `programs`
+    -- carries RLS -- so a caller that reached here without a Program bound sees
+    -- no row at all, and the negative form would call that affordable. 023's
+    -- `CROSS JOIN` had the same property and this keeps it: no visible budget
+    -- is not an unbounded one. A NULL `tokens_left` IS the unbounded one, and
+    -- says so on the row.
+    IF NOT EXISTS (SELECT 1 FROM program_budget b
+                    WHERE b.program_id = t.program_id
+                      AND (b.tokens_left IS NULL
+                           OR b.tokens_left >= t.estimated_cost * w.cost_reference_tokens)) THEN
         RETURN 'unaffordable';
     END IF;
 
     IF identity_held_for(t) THEN RETURN 'identity_held'; END IF;
+
+    -- Criterion 2's fifth adjective, and the only one 023 never named. A kind
+    -- with no role behind it has no lane either, because a lane's capacity is
+    -- computed from the role that runs the kind -- so it used to come out as
+    -- `lane_full`, which says the lane is busy about a lane that does not
+    -- exist. Unreachable while the `role_kind_mapping` standing check holds,
+    -- which is the argument for naming it rather than for leaving it out: an
+    -- arm that fires only when another check has already failed still has to
+    -- say the true thing when it does.
+    IF NOT EXISTS (SELECT 1 FROM effective_lane_capacity lc
+                    WHERE lc.program_id = t.program_id AND lc.kind = t.kind) THEN
+        RETURN 'no_role_runs_this_kind';
+    END IF;
 
     IF NOT EXISTS (SELECT 1 FROM scheduler_lane_state s
                     WHERE s.program_id = t.program_id AND s.kind = t.kind
@@ -196,9 +217,9 @@ END $fn$;
 
 COMMENT ON FUNCTION claimable_for(tasks, scheduler_weights) IS
     'NULL when this Task may be claimed, else the name of the condition that '
-    'refuses it. The offer filters on it and the claim re-asks it, so the '
-    'snapshot the orchestrator was given and the decision the runtime commits '
-    'cannot be answers to two different questions.';
+    'refuses it. The offer filters on it and the claim re-asks it, so the list '
+    'the orchestrator was given and the decision the runtime commits cannot be '
+    'answers to two different questions.';
 
 
 -- ---------------------------------------------------------------------------
@@ -280,8 +301,7 @@ BEGIN
     UPDATE task_slate s SET consumed = true
      WHERE s.program_id = p AND NOT s.consumed;
 
-    UPDATE task_picks k SET consumed = true
-     WHERE k.program_id = p AND NOT k.consumed;
+    PERFORM supersede_pick(p);
 
     INSERT INTO task_slate (slate_id, program_id, task_id, ordinal, entitled)
     SELECT sid, p, c.task_id,
@@ -363,6 +383,21 @@ INSERT INTO event_table_exempt (table_name, exempt_kind, reason, owner_ticket) V
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON task_picks TO rk2_runtime;
 
+-- Three things end a choice's life -- a new list, a second choice, and the
+-- claim that acts on it -- and each of them says so at its own call site. What
+-- they must not each spell for themselves is which rows that means: the
+-- outstanding pick is defined by the partial unique index above, and a fourth
+-- site that got the predicate slightly wrong would leave a Program with two
+-- live choices and no index complaint until the next insert.
+CREATE FUNCTION supersede_pick(p uuid) RETURNS void
+LANGUAGE sql AS $fn$
+    UPDATE task_picks SET consumed = true WHERE program_id = p AND NOT consumed;
+$fn$;
+
+COMMENT ON FUNCTION supersede_pick(uuid) IS
+    'Ends the Program''s outstanding choice, whatever ended it. Consumed and '
+    'not deleted: what was chosen and never claimed is a reading ticket 16 asks for.';
+
 -- The orchestrator's verb. It refuses an off-slate label here, where the model
 -- is still running and can be told, as well as in `claim_task`, where the
 -- runtime is protected. Two checks of one statement, which is the arrangement
@@ -372,11 +407,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON task_picks TO rk2_runtime;
 CREATE FUNCTION pick_task(p_task_label text) RETURNS text
 LANGUAGE plpgsql AS $fn$
 DECLARE
-    p       uuid := rk2_program_required();
-    v_slate uuid;
-    v_task  uuid;
+    p         uuid := rk2_program_required();
+    v_slate   uuid;
+    v_task    uuid;
+    v_offered timestamptz;
+    v_ttl     interval;
 BEGIN
-    SELECT s.slate_id, s.task_id INTO v_slate, v_task
+    SELECT s.slate_id, s.task_id, s.offered_at INTO v_slate, v_task, v_offered
       FROM task_slate s JOIN tasks t ON t.id = s.task_id
      WHERE s.program_id = p AND NOT s.consumed AND t.label = p_task_label;
     IF NOT FOUND THEN
@@ -384,8 +421,18 @@ BEGIN
             USING ERRCODE = 'check_violation';
     END IF;
 
-    UPDATE task_picks k SET consumed = true
-     WHERE k.program_id = p AND NOT k.consumed;
+    -- The same expiry the claim enforces, for the same reason the off-slate
+    -- check is made twice: here the model is still running and can be told.
+    -- Recording a choice against a list that has already died would be
+    -- answered with an acceptance and then refused by a claim the model never
+    -- sees, which is the one arrangement worse than refusing it twice.
+    SELECT w.slate_ttl INTO v_ttl FROM scheduler_weights w WHERE w.active;
+    IF v_offered + v_ttl < now() THEN
+        RAISE EXCEPTION 'the slate offered at % expired after %', v_offered, v_ttl
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    PERFORM supersede_pick(p);
 
     INSERT INTO task_picks (program_id, slate_id, task_id)
     VALUES (p, v_slate, v_task);
@@ -394,7 +441,8 @@ END $fn$;
 
 COMMENT ON FUNCTION pick_task(text) IS
     'Records which offered Task the orchestrator chose, superseding any '
-    'earlier choice. Refuses a label the current Slate does not carry.';
+    'earlier choice. Refuses a label the current Slate does not carry, and a '
+    'Slate whose offer has expired.';
 
 
 -- ---------------------------------------------------------------------------
@@ -572,8 +620,7 @@ BEGIN
     -- The choice has been acted on, whichever entry the claim took. A pick left
     -- outstanding here would be read by the next claim as a choice about a Task
     -- that is already running.
-    UPDATE task_picks SET consumed = true
-     WHERE program_id = p AND NOT consumed;
+    PERFORM supersede_pick(p);
 
     RETURN (SELECT label FROM agent_runs WHERE id = v_run);
 END $fn$;
@@ -603,7 +650,7 @@ DECLARE f text;
 BEGIN
     FOREACH f IN ARRAY ARRAY[
         'identity_held_for(tasks)', 'claimable_for(tasks,scheduler_weights)',
-        'offer_slate()', 'pick_task(text)']
+        'offer_slate()', 'supersede_pick(uuid)', 'pick_task(text)']
     LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO rk2_runtime', f);
@@ -715,7 +762,8 @@ LANGUAGE sql STABLE AS $fn$
            'an agent-reachable role can call a scheduler function'
       FROM pg_proc p
      WHERE p.pronamespace = 'public'::regnamespace
-       AND p.proname IN ('identity_held_for','claimable_for','offer_slate','pick_task')
+       AND p.proname IN ('identity_held_for','claimable_for','offer_slate',
+                         'supersede_pick','pick_task')
        AND has_function_privilege('public', p.oid, 'EXECUTE')
 $fn$;
 

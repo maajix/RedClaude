@@ -448,7 +448,7 @@ class Slice:
             try:
                 connection.execute(RANK)
                 connection.execute(QUOTA)
-                return [_offered(row) for row in connection.execute(OFFER).dicts()]
+                return [_slate_entry(row) for row in connection.execute(OFFER).dicts()]
             except pg.DatabaseError as error:
                 ledger.fail(
                     "slate",
@@ -477,7 +477,7 @@ class Slice:
             except pg.DatabaseError as error:
                 ledger.fail(
                     "claim",
-                    f"the top of a {offered}-Task slate could not be claimed: {error}",
+                    f"the claim against a {offered}-Task slate failed: {error}",
                     code=INVALID_CONFIGURATION,
                     source="database",
                 )
@@ -1008,7 +1008,7 @@ def _actor(connection: pg.Connection) -> None:
     connection.execute("SELECT set_actor('runtime', $1)", (program.ACTOR,))
 
 
-def _offered(row: Mapping[str, object]) -> dict:
+def _slate_entry(row: Mapping[str, object]) -> dict:
     """One entry of the offered Slate, renamed for whoever is choosing.
 
     `factors` arrives as the text of a jsonb value -- this client decodes

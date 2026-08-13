@@ -10962,11 +10962,12 @@ class SlateClaimTest(DatabaseCase):
         cls.offered_fallback = cls.offer()
         cls.top = cls.offered_fallback[0]["task_label"]
         cls.second = cls.offered_fallback[1]["task_label"]
-        cls.arranged(
+        cls.as_owner(
             "UPDATE tasks SET attempts = 3 WHERE program_id = $1::uuid AND label = $2",
             (cls.identifiers["fallback"], cls.top),
         )
         cls.exhausted = cls.refusal("SELECT claim_task($1)", (cls.top,))
+        cls.after_exhausted = cls.counted("fallback")
         cls.fallback_run = cls.call("SELECT claim_task()")
         cls.fallback_task = cls.claimed_by("fallback", cls.fallback_run)
         # One claimed recon Task fills the recon Lane, whose role admits one at
@@ -10983,7 +10984,7 @@ class SlateClaimTest(DatabaseCase):
         cls.off_slate = cls.refusal("SELECT claim_task($1)", ("T99",))
         cls.cross_program = cls.refusal("SELECT claim_task($1)", (cls.elsewhere,))
         cls.off_slate_pick = cls.refusal("SELECT pick_task($1)", ("T99",))
-        cls.arranged(
+        cls.as_owner(
             "UPDATE task_slate SET offered_at = now() - interval '10 minutes'"
             " WHERE program_id = $1::uuid AND NOT consumed",
             (cls.identifiers["refused"],),
@@ -11026,7 +11027,7 @@ class SlateClaimTest(DatabaseCase):
         offered = cls.offer()
         cls.forgotten = offered[1]["task_label"]
         cls.call("SELECT pick_task($1)", (cls.forgotten,))
-        cls.arranged(
+        cls.as_owner(
             "UPDATE task_slate s SET consumed = true FROM tasks t"
             " WHERE t.id = s.task_id AND s.program_id = $1::uuid AND t.label = $2",
             (cls.identifiers["stale"], cls.forgotten),
@@ -11053,7 +11054,7 @@ class SlateClaimTest(DatabaseCase):
         # because the budget is a configured number and the ledger is the only
         # thing entitled to move what is left of it. The role is one that runs
         # no Task, which is what a run with no Task must name.
-        cls.arranged(
+        cls.as_owner(
             "INSERT INTO agent_runs (program_id, role, model, effort, mission_packet,"
             " input_tokens, output_tokens)"
             " VALUES ($1::uuid, 'orchestrator', 'operator', 'low', '{}', $2, $3)",
@@ -11063,6 +11064,9 @@ class SlateClaimTest(DatabaseCase):
         cls.unaffordable = cls.refusal(
             "SELECT claim_task($1)", (cls.offered_spent[0]["task_label"],)
         )
+        # One Agent run exists here and this fixture opened it, to spend the
+        # budget. What a refused claim must not have added is a second.
+        cls.after_unaffordable = cls.counted("spent")
         cls.offer_when_poor = cls.offer()
 
     @classmethod
@@ -11105,14 +11109,14 @@ class SlateClaimTest(DatabaseCase):
         cls.bind("held")
         cls.offered_held = cls.offer()
         holder = str(
-            cls.arranged(
+            cls.as_owner(
                 "INSERT INTO agent_runs (program_id, role, model, effort, mission_packet)"
                 " VALUES ($1::uuid, 'orchestrator', 'operator', 'low', '{}')"
                 " RETURNING id::text",
                 (program_id,),
             ).scalar()
         )
-        cls.arranged(
+        cls.as_owner(
             "INSERT INTO identity_leases (program_id, identity_entity_id,"
             " holder_agent_run_id, expires_at)"
             " VALUES ($1::uuid, $2::uuid, $3::uuid, now() + interval '10 minutes')",
@@ -11121,6 +11125,9 @@ class SlateClaimTest(DatabaseCase):
         cls.identity_held = cls.refusal(
             "SELECT claim_task($1)", (cls.offered_held[0]["task_label"],)
         )
+        # Same reading as the spent Program's: the one run is the lease holder
+        # this fixture opened, not a run the refused claim left behind.
+        cls.after_identity_held = cls.counted("held")
         cls.offer_while_held = cls.offer()
 
     @classmethod
@@ -11256,7 +11263,7 @@ class SlateClaimTest(DatabaseCase):
         raise AssertionError(f"not refused: {sql} {parameters}")
 
     @classmethod
-    def arranged(cls, sql: str, parameters: tuple = ()):
+    def as_owner(cls, sql: str, parameters: tuple = ()):
         """One statement as the role that owns the rows the scheduler reads."""
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
@@ -11271,7 +11278,7 @@ class SlateClaimTest(DatabaseCase):
         stringifies its answer, and half of what is read here is a count or a
         boolean that a string would flatten into something always true.
         """
-        return cls.arranged(sql, parameters).scalar()
+        return cls.as_owner(sql, parameters).scalar()
 
     @classmethod
     def claimed_by(cls, name: str, run: object) -> str | None:
@@ -11439,6 +11446,15 @@ class SlateClaimTest(DatabaseCase):
     def test_none_of_the_refusals_claimed_anything(self):
         self.assertEqual((0, 0), self.untouched)
         self.assertEqual((0, 0), self.stale_counts)
+
+    def test_a_recheck_that_refuses_leaves_the_task_and_the_run_log_alone(self):
+        # The other half of criterion 4, asked of the three refusals that come
+        # from the recheck rather than from the slate: a claim refused at the
+        # last condition is as whole a refusal as one refused at the first. The
+        # run counts are the runs the fixtures opened, not runs a claim left.
+        self.assertEqual((0, 0), self.after_exhausted)
+        self.assertEqual((0, 1), self.after_unaffordable)
+        self.assertEqual((0, 1), self.after_identity_held)
 
     # -- criterion 5: choosing, and not choosing -------------------------------
 

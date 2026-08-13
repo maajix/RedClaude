@@ -140,6 +140,15 @@ def slate_row(ordinal: int) -> tuple:
     )
 
 
+def slate_entry(ordinal: int) -> dict:
+    """The same entry after the slice decoded it, which is what `facts` carries.
+
+    Built from `slate_row` through the slice's own decoder rather than written
+    out again, so a slice that renamed a key renames it here too.
+    """
+    return execution._slate_entry(dict(zip(SLATE_COLUMNS, slate_row(ordinal))))
+
+
 class Recorder:
     """A connection that answers every statement the slice issues, and keeps them.
 
@@ -773,7 +782,7 @@ class ProgramHookTest(unittest.TestCase):
         )
         self.assertEqual(
             program.STOPPED_TASK_ATTEMPTED,
-            self.stopped({"slate": [slate_row(1)], "task": {"label": "T3"}}),
+            self.stopped({"slate": [slate_entry(1)], "task": {"label": "T3"}}),
         )
 
     def test_execution_is_one_of_the_facts_a_run_always_answers_with(self):
