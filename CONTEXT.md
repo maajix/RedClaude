@@ -149,6 +149,15 @@ runtime decides what may be chosen; the orchestrator decides which; the runtime
 commits the claim.
 _Avoid_: Queue, candidates, shortlist, options
 
+**Choice**:
+What one orchestrator answered over one Slate, made in a task-less agent run so
+that choosing never competes for a lane slot with the work being chosen between.
+Recorded whatever it turned out to be — a label, a label the Slate no longer
+carries, or nothing — because a pass that claimed nothing still has to say why.
+A request and not a decision: the claim re-asks every eligibility condition, and
+a stale choice is refused rather than replaced.
+_Avoid_: Selection, vote, assignment, dispatch
+
 **Roster**:
 The closed statement of every role this harness runs and what each one may call,
 compiled against a measured inventory of the SDK/CLI pair's own tools. One

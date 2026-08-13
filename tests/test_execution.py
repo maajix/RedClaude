@@ -17,7 +17,18 @@ import time
 import unittest
 from unittest import mock
 
-from redkraken import agent, execution, isolation, packet, pg, program, proposal, proxy, roster
+from redkraken import (
+    _launch,
+    agent,
+    execution,
+    isolation,
+    packet,
+    pg,
+    program,
+    proposal,
+    proxy,
+    roster,
+)
 from redkraken.outcome import Ledger
 from tests import fixtures
 
@@ -27,6 +38,12 @@ RUN = "22222222-2222-4222-8222-222222222222"
 TASK = "33333333-3333-4333-8333-333333333333"
 TOOL_RUN = "44444444-4444-4444-8444-444444444444"
 PROPOSAL = "55555555-5555-4555-8555-555555555555"
+SESSION = "66666666-6666-4666-8666-666666666666"
+
+#: What `Launcher.picks` means when nobody said: the first entry on offer. A
+#: sentinel rather than `None`, because `None` is already an answer -- a session
+#: that called no tool and chose nothing.
+FIRST = object()
 
 CAPABILITY = "c0ffee" * 10 + "cafe"
 
@@ -54,7 +71,11 @@ def claimed(**overrides) -> execution.Claimed:
         "agent_run_label": "AR7",
         "role": "recon",
         "task_id": TASK,
-        "task_label": "T3",
+        # The first entry `slate_row` offers, because that is the one the
+        # default launcher picks and the claim honours a pick it can still
+        # validate. A fixture that claimed something else would be a fixture
+        # about a substituted Task, which is what `_dispatchable` refuses.
+        "task_label": "T1",
         "kind": "recon",
         "attempts": 1,
         "subject_type": "endpoint",
@@ -169,6 +190,24 @@ class Recorder:
         self.calls: list[tuple[str, tuple]] = []
         self.slate = answers.get("slate", 1)
         self.claim = answers.get("claim", "AR7")
+        # The Task-less run one choice is made in, and the two ceilings the
+        # child has no database of its own to read.
+        self.session = answers.get(
+            "session",
+            {
+                "agent_run": SESSION,
+                "label": "AR6",
+                "model": "opus",
+                "effort": "xhigh",
+                "subagent_cap": roster.DEFAULT_SUBAGENTS,
+                "token_cap": 40_000,
+            },
+        )
+        # Labels this recorder's `record_choice` says the Slate no longer
+        # carries. The downgrade is the server's to make -- the runtime never
+        # writes `off_slate` itself -- so it is answered here rather than
+        # decided by the slice under test.
+        self.off_slate = frozenset(answers.get("off_slate", ()))
         self.started = answers.get("started", (started_row(),))
         self.gate = answers.get(
             "gate",
@@ -226,7 +265,7 @@ class Recorder:
             "closure",
             {
                 "agent_run": "AR7",
-                "task": "T3",
+                "task": "T1",
                 "task_status": "done",
                 "accepted": True,
                 "runs_closed": 1,
@@ -264,6 +303,22 @@ class Recorder:
     def sent(self, statement: str) -> list[tuple]:
         return [parameters for sql, parameters in self.calls if sql == statement]
 
+    def finished(self, run_id: str = RUN) -> list[tuple]:
+        """The closings of one run. A pass closes two, and only one is a Task.
+
+        `finish_task_attempt` closes the orchestrator session as well as the
+        attempt, so a count of the statement counts both. What a test asking
+        "was the attempt closed" means is this one.
+        """
+        return [parameters for parameters in self.sent(execution.FINISH) if parameters[0] == run_id]
+
+    def closing(self, run_id: str = RUN) -> int:
+        """Where in the sequence one run was closed, for the same reason."""
+        for position, (sql, parameters) in enumerate(self.calls):
+            if sql == execution.FINISH and parameters[0] == run_id:
+                return position
+        raise AssertionError(f"{run_id} was never closed: {self.statements}")
+
     def _answer(self, sql: str, parameters: tuple) -> list[tuple]:
         if sql in (execution.RANK, execution.QUOTA):
             return [("{}",)]
@@ -271,6 +326,10 @@ class Recorder:
             return [slate_row(n) for n in range(1, self.slate + 1)]
         if sql == execution.CLAIM:
             return [(self.claim,)]
+        if sql == execution.OPEN_SESSION:
+            return [(json.dumps(self.session),)]
+        if sql == execution.CHOICE:
+            return [(json.dumps(self._choice(parameters)),)]
         if sql == execution.STARTED:
             return list(self.started)
         if sql == execution.OPEN_TOOL_RUN:
@@ -314,6 +373,26 @@ class Recorder:
             return self._provenance(sql, parameters)
         raise AssertionError(f"an unplanned statement was issued: {sql}")
 
+    def _choice(self, parameters: tuple) -> dict:
+        """`record_choice`'s answer: what it was told, and what it made of it.
+
+        The shape matters more than the values. `task` is the pick that was
+        written and is present only when one was; `offered_task` is the label
+        the session named whether or not it survived, which is what an operator
+        reading a refusal needs to see.
+        """
+        _, outcome, task, detail = parameters
+        if outcome == "chosen" and task in self.off_slate:
+            outcome = "off_slate"
+            detail = f"{task} is not on the current slate"
+        return {
+            "outcome": outcome,
+            "task": task if outcome == "chosen" else None,
+            "offered_task": task,
+            "agent_run": self.session["label"],
+            "detail": detail,
+        }
+
     def _provenance(self, sql: str, parameters: tuple) -> list[tuple]:
         """Enough for one cited Receipt to ground: this Program, this run's lane."""
         if sql == proposal.RECEIPT and parameters[0] == "RC1":
@@ -322,23 +401,78 @@ class Recorder:
 
 
 class Launcher:
-    """A stand-in for `agent.agent_run` that records the request it was given."""
+    """A stand-in for `agent.agent_run` that records the request it was given.
 
-    def __init__(self, answer=None, error: Exception | None = None):
+    One pass starts two children -- the orchestrator session that chooses off
+    the Slate, and the worker that runs what was claimed -- and this keeps them
+    in separate lists rather than telling them apart by index. A test that said
+    `requests[1]` would be a test that silently moved to the planning run the
+    day the choice stopped happening.
+
+    `answer` and `error` are the worker's, because that is what every test that
+    passes them is about. What the session answers is `picks`, and `planning` is
+    the one exception it raises instead.
+    """
+
+    def __init__(
+        self,
+        answer=None,
+        error: Exception | None = None,
+        picks: object = FIRST,
+        planning: Exception | None = None,
+    ):
         self.requests: list[agent.AgentRunRequest] = []
+        self.choices: list[agent.AgentRunRequest] = []
         self.answer = answer
         self.error = error
+        self.picks = picks
+        self.planning = planning
 
     def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        if request.role == roster.ORCHESTRATOR:
+            return self.choose(request)
         self.requests.append(request)
         if self.error is not None:
             raise self.error
         return self.answer if self.answer is not None else result()
 
+    def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        """One session's answer, made through the latch a real child picks with.
+
+        `picks` is what it calls `mcp__rk2__pick_task` with: `FIRST` for the
+        first entry it was offered, a label for one it names itself, `""` for a
+        call that carried no label at all, and `None` for a session that calls
+        nothing. `_launch.Choice` is what a served tool would have answered
+        with, so a fixture that set `choice` directly would be reporting a pick
+        no tool accepted.
+        """
+        self.choices.append(request)
+        if self.planning is not None:
+            raise self.planning
+        latch = _launch.Choice(request.slate)
+        wanted = self.picks
+        if wanted is FIRST:
+            wanted = latch.offered[0] if latch.offered else None
+        if wanted is not None:
+            latch.pick({"task_label": wanted})
+        return result(
+            agent_run_id=request.agent_run_id,
+            role=request.role,
+            text=f"{len(latch.entries)} offered",
+            mission_result=None,
+            choice=latch.task,
+            pick_attempts=latch.attempts,
+        )
+
     @property
     def only(self) -> agent.AgentRunRequest:
         assert len(self.requests) == 1, self.requests
         return self.requests[0]
+
+    @property
+    def planned(self) -> agent.AgentRunRequest:
+        assert len(self.choices) == 1, self.choices
+        return self.choices[0]
 
 
 class Waiting(Launcher):
@@ -357,6 +491,11 @@ class Waiting(Launcher):
         self.beats = beats
 
     def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        # The session that chooses runs before anything is claimed, and nothing
+        # beats for a run holding no Lease. Waiting for one here would wait out
+        # the whole deadline before the Task this is about was even claimed.
+        if request.role == roster.ORCHESTRATOR:
+            return self.choose(request)
         deadline = time.monotonic() + 5.0
         while len(self.connection.sent(execution.HEARTBEAT)) < self.beats:
             if time.monotonic() > deadline:
@@ -531,7 +670,8 @@ class SlateTest(unittest.TestCase):
         # orchestrator chooses from these entries, so the factors it would
         # choose on and the expiry it would race have to survive the call.
         connection = Recorder(slate=3)
-        _, facts = attempt(connection)
+        with compiled():
+            _, facts = attempt(connection)
 
         self.assertEqual([1, 2, 3], [entry["ordinal"] for entry in facts["slate"]])
         self.assertEqual(["T1", "T2", "T3"], [entry["task"] for entry in facts["slate"]])
@@ -541,14 +681,17 @@ class SlateTest(unittest.TestCase):
 
     def test_a_slate_nothing_could_be_claimed_off_is_held_not_failed(self):
         connection = Recorder(claim=None)
-        ledger, facts = attempt(connection)
+        with compiled():
+            ledger, facts = attempt(connection)
         self.assertEqual([], ledger.violations)
         self.assertIsNone(facts["task"])
-        self.assertNotIn(execution.FINISH, connection.statements)
+        # The session that chose is closed; no attempt was opened to close.
+        self.assertEqual([], connection.finished())
 
     def test_a_scheduler_that_refuses_the_claim_is_a_violation_not_a_retry(self):
         connection = Recorder(raises={execution.CLAIM: database_error("lane_full")})
-        ledger, facts = attempt(connection)
+        with compiled():
+            ledger, facts = attempt(connection)
         self.assertEqual(1, len(ledger.violations))
         self.assertIsNone(facts["task"])
         self.assertEqual(1, connection.statements.count(execution.CLAIM))
@@ -561,7 +704,8 @@ class SlateTest(unittest.TestCase):
         # reads the row into an all-NULL record and compares against nothing.
         connection = Recorder(started=(started_row(subagent_cap=None),))
         launcher = Launcher()
-        ledger, facts = attempt(connection, launcher)
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
 
         self.assertEqual(1, len(ledger.violations))
         self.assertEqual(execution.INVALID_CONFIGURATION, ledger.violations[0].code)
@@ -594,9 +738,204 @@ class SlateTest(unittest.TestCase):
         # named only the label would open the attempt against whichever Program
         # the planner reached first.
         connection = Recorder()
-        attempt(connection)
+        with compiled():
+            attempt(connection)
 
         self.assertEqual([("AR7", PROGRAM)], connection.sent(execution.STARTED))
+
+
+class ChoiceTest(unittest.TestCase):
+    """The decision between the offer and the claim, in all four of its answers.
+
+    What is asserted here is the property PH2-27 is about: the choice is an
+    input to the claim and never a precondition for it. A session that answered
+    a label, a session that answered nothing, a session that could not be
+    opened and a session whose child never started all leave a defined outcome
+    -- and only one of them changes which Task runs.
+    """
+
+    def choice(self, connection: Recorder, launcher: Launcher | None = None) -> dict:
+        launcher = launcher or Launcher()
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
+        self.ledger, self.launcher = ledger, launcher
+        return facts
+
+    def test_the_session_is_opened_after_the_offer_and_closed_before_the_claim(self):
+        # The order is the whole mechanism: a session opened before the offer
+        # would be choosing off a Slate nobody had computed, and a claim made
+        # before the choice was recorded would be a claim with nothing to honour.
+        connection = Recorder()
+        self.choice(connection)
+        order = connection.statements
+
+        self.assertLess(order.index(execution.OFFER), order.index(execution.OPEN_SESSION))
+        self.assertLess(order.index(execution.OPEN_SESSION), order.index(execution.CHOICE))
+        self.assertLess(order.index(execution.CHOICE), order.index(execution.CLAIM))
+
+    def test_the_choosing_child_is_given_the_slate_and_nothing_to_reach_with(self):
+        # Criteria 1 and 2. The entries are the compact Slate rows and not the
+        # Tasks behind them, and `egress` is None because the roster serves this
+        # role no request tool: planning that reached a target would be testing
+        # nobody scheduled.
+        connection = Recorder(slate=3)
+        self.choice(connection)
+        planning = self.launcher.planned
+
+        self.assertEqual(roster.ORCHESTRATOR, planning.role)
+        self.assertIsNone(planning.egress)
+        self.assertEqual(SESSION, planning.agent_run_id)
+        self.assertEqual(["T1", "T2", "T3"], [entry["task"] for entry in planning.slate])
+        self.assertIn("3 Task(s) on offer", planning.objective)
+        self.assertEqual(roster.DEFAULT_SUBAGENTS, planning.subagent_cap)
+        self.assertEqual(40_000, planning.token_cap)
+
+    def test_the_role_that_chooses_may_read_and_pick_and_call_no_target(self):
+        # The other half of criterion 2, asked of the roster rather than of the
+        # request: a surface that carried the request tool would make the
+        # `egress` above a courtesy rather than a bound.
+        served = roster.ROLES[roster.ORCHESTRATOR].allowed_tools(agent.SERVED)
+
+        self.assertIn("mcp__rk2__get_slate", served)
+        self.assertIn("mcp__rk2__pick_task", served)
+        self.assertNotIn("mcp__rk2__net_request", served)
+
+    def test_a_named_task_is_recorded_as_the_choice_and_then_claimed(self):
+        connection = Recorder()
+        facts = self.choice(connection)
+
+        self.assertEqual((SESSION, "chosen", "T1", None), connection.sent(execution.CHOICE)[0])
+        self.assertEqual("chosen", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["choice"]["task"])
+        self.assertEqual(1, facts["choice"]["attempts"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual([], self.ledger.violations)
+
+    def test_a_label_this_slate_no_longer_carries_claims_nothing_at_all(self):
+        # ADR 0003: an off-Slate choice is refused and not substituted. The
+        # runtime's own walk is the answer to "nobody chose", and claiming here
+        # would make it the answer to "the choice was refused" as well.
+        connection = Recorder(off_slate={"T1"})
+        facts = self.choice(connection)
+
+        self.assertEqual("off_slate", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["choice"]["task"])
+        self.assertIsNone(facts["task"])
+        self.assertNotIn(execution.CLAIM, connection.statements)
+        self.assertEqual([], self.launcher.requests)
+        self.assertEqual([], self.ledger.violations)
+
+    def test_the_runtime_never_decides_off_slate_for_itself(self):
+        # The label is offered to the database even though this runtime holds a
+        # copy of the Slate it could have checked it against. The copy has no
+        # lock on it: `record_choice` asks `pick_task`, which is the same
+        # function the claim re-validates through.
+        connection = Recorder(slate=1)
+        facts = self.choice(connection, Launcher(picks="T9"))
+
+        self.assertEqual((SESSION, "chosen", "T9", None), connection.sent(execution.CHOICE)[0])
+        self.assertEqual("chosen", facts["choice"]["outcome"])
+
+    def test_a_session_that_chose_nothing_leaves_the_walk_to_the_runtime(self):
+        connection = Recorder()
+        facts = self.choice(connection, Launcher(picks=None))
+
+        self.assertEqual((SESSION, "no_choice", None, None), connection.sent(execution.CHOICE)[0])
+        self.assertEqual("no_choice", facts["choice"]["outcome"])
+        self.assertIsNone(facts["choice"]["task"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual([], self.ledger.violations)
+
+    def test_a_pick_that_carried_no_label_is_malformed_and_not_a_choice(self):
+        connection = Recorder()
+        facts = self.choice(connection, Launcher(picks=""))
+        run_id, outcome, task, detail = connection.sent(execution.CHOICE)[0]
+
+        self.assertEqual((SESSION, "malformed", None), (run_id, outcome, task))
+        self.assertIn("1 pick(s) carried no task label", detail)
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual([], self.ledger.violations)
+
+    def test_a_child_that_never_started_is_unavailable_and_stops_nothing(self):
+        connection = Recorder()
+        facts = self.choice(
+            connection, Launcher(planning=isolation.Unavailable("no such image"))
+        )
+
+        self.assertEqual(
+            (SESSION, "unavailable", None, "no session answered"),
+            connection.sent(execution.CHOICE)[0],
+        )
+        self.assertEqual("unavailable", facts["choice"]["outcome"])
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual(1, len(self.ledger.violations))
+
+    def test_a_session_that_could_not_be_opened_still_claims_a_task(self):
+        connection = Recorder(
+            raises={execution.OPEN_SESSION: database_error("no orchestrator role")}
+        )
+        facts = self.choice(connection)
+
+        self.assertIsNone(facts["choice"])
+        self.assertNotIn(execution.CHOICE, connection.statements)
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual([], self.launcher.choices)
+        self.assertEqual(execution.INVALID_CONFIGURATION, self.ledger.violations[0].code)
+
+    def test_the_session_is_closed_whatever_it_answered(self):
+        connection = Recorder()
+        self.choice(connection)
+
+        self.assertEqual([(SESSION, "completed", 1200, 300)], connection.finished(SESSION))
+        self.assertLess(connection.closing(SESSION), connection.statements.index(execution.CLAIM))
+
+    def test_a_session_whose_child_never_answered_is_closed_as_aborted(self):
+        connection = Recorder()
+        self.choice(connection, Launcher(planning=isolation.Unavailable("no such image")))
+
+        self.assertEqual([(SESSION, "aborted", None, None)], connection.finished(SESSION))
+
+    def test_a_choice_that_could_not_be_recorded_is_closed_and_reported(self):
+        connection = Recorder(raises={execution.CHOICE: database_error("gone")})
+        facts = self.choice(connection)
+
+        self.assertIsNone(facts["choice"])
+        self.assertEqual([(SESSION, "completed", 1200, 300)], connection.finished(SESSION))
+        self.assertEqual("T1", facts["task"]["label"])
+        self.assertEqual(execution.INTEGRITY_FAILED, self.ledger.violations[0].code)
+
+    def test_nothing_is_dispatched_against_a_task_the_choice_did_not_commit(self):
+        # Criterion 5, and an invariant `claim_task` already holds: it prefers
+        # the outstanding pick and refuses it when it has gone stale, so a
+        # committed choice and a differently claimed Task is a claim that
+        # honoured neither. The Task is given back rather than run.
+        connection = Recorder(slate=2, started=(started_row(task_label="T2"),))
+        facts = self.choice(connection)
+
+        self.assertEqual("T1", facts["choice"]["task"])
+        self.assertEqual([], self.launcher.requests)
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+        self.assertEqual(1, len(connection.finished()))
+        self.assertEqual(execution.INTEGRITY_FAILED, self.ledger.violations[0].code)
+
+    def test_a_kind_claimed_as_a_role_the_roster_does_not_give_it_is_refused(self):
+        # Criterion 4's role half. `role_task_kinds` is unique on kind, so this
+        # is the database disagreeing with the roster -- which is exactly the
+        # disagreement that must not reach a started child.
+        connection = Recorder(started=(started_row(kind="analyze"),))
+        self.choice(connection)
+
+        self.assertEqual([], self.launcher.requests)
+        self.assertEqual(["roster"], [item.source for item in self.ledger.violations])
+        self.assertIn("js_analyst", self.ledger.violations[0].detail)
+        self.assertEqual(1, len(connection.finished()))
+
+    def test_every_kind_the_scheduler_can_claim_has_exactly_one_role(self):
+        # The map `_dispatchable` checks against, asserted to be total: a kind
+        # missing from it would refuse every Task of that kind at dispatch.
+        self.assertEqual(
+            sorted(roster.TASK_KINDS), sorted(roster.ROLE_FOR_KIND), roster.ROLE_FOR_KIND
+        )
 
 
 class AttemptTest(unittest.TestCase):
@@ -670,7 +1009,7 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual([], ledger.violations)
         self.assertEqual([(TOOL_RUN, "success")], connection.sent(proxy.CLOSE_TOOL_RUN))
         order = connection.statements
-        self.assertLess(order.index(proxy.CLOSE_TOOL_RUN), order.index(execution.FINISH))
+        self.assertLess(order.index(proxy.CLOSE_TOOL_RUN), connection.closing())
         self.assertEqual({"label": "RC1", "decision": "allowed", "status_code": 200}, facts["receipt"])
 
     def test_a_blocked_receipt_closes_the_tool_run_as_denied_and_says_so(self):
@@ -710,13 +1049,13 @@ class AttemptTest(unittest.TestCase):
         self.assertIsNone(facts["proposal"])
         self.assertNotIn(execution.PROMOTE, connection.statements)
         self.assertEqual([], ledger.violations)
-        self.assertEqual(1, len(connection.sent(execution.FINISH)))
+        self.assertEqual(1, len(connection.finished()))
 
     def test_the_task_status_reported_is_the_one_the_database_decided(self):
         connection = Recorder(
             closure={
                 "agent_run": "AR7",
-                "task": "T3",
+                "task": "T1",
                 "task_status": "pending",
                 "accepted": False,
                 "runs_closed": 1,
@@ -756,19 +1095,20 @@ class AttemptTest(unittest.TestCase):
         with compiled():
             _, facts = attempt(connection, Launcher(answer=result(stop_reason="end_turn")))
         self.assertEqual("completed", facts["agent_run"]["stop_reason"])
-        self.assertEqual([(RUN, "completed", 1200, 300)], connection.sent(execution.FINISH))
+        self.assertEqual([(RUN, "completed", 1200, 300)], connection.finished())
 
 
 class RefusalTest(unittest.TestCase):
     """Every way the attempt stops, and the closing that runs regardless."""
 
     def closed(self, connection: Recorder) -> None:
-        self.assertEqual(1, len(connection.sent(execution.FINISH)), connection.statements)
+        self.assertEqual(1, len(connection.finished()), connection.statements)
 
     def test_a_subject_with_no_address_is_refused_and_the_task_returned(self):
         connection = Recorder(started=(started_row(subject_type="hypothesis", url=None),))
         launcher = Launcher()
-        ledger, facts = attempt(connection, launcher)
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
         self.assertEqual(1, len(ledger.violations))
         self.assertIsNone(facts["target"])
         self.assertEqual([], launcher.requests)
@@ -776,9 +1116,13 @@ class RefusalTest(unittest.TestCase):
         self.closed(connection)
 
     def test_a_role_this_runtime_cannot_start_is_refused_before_the_packet(self):
-        connection = Recorder(started=(started_row(role="reporter"),))
+        # A `report` Task claimed as the role the roster gives that kind: the
+        # refusal under test is about what this runtime can start, not about a
+        # role and a kind that do not go together.
+        connection = Recorder(started=(started_row(role="reporter", kind="report"),))
         launcher = Launcher()
-        ledger, _ = attempt(connection, launcher)
+        with compiled():
+            ledger, _ = attempt(connection, launcher)
         self.assertEqual(1, len(ledger.violations))
         self.assertEqual([], launcher.requests)
         self.closed(connection)
@@ -789,9 +1133,10 @@ class RefusalTest(unittest.TestCase):
         # so a role that may not spend it would be handed a capability nothing
         # it is allowed to call could use -- and the gate would have minted it.
         self.assertNotIn(execution.NET, roster.ROLES["js_analyst"].tool_groups)
-        connection = Recorder(started=(started_row(role="js_analyst"),))
+        connection = Recorder(started=(started_row(role="js_analyst", kind="analyze"),))
         launcher = Launcher()
-        ledger, _ = attempt(connection, launcher)
+        with compiled():
+            ledger, _ = attempt(connection, launcher)
         self.assertEqual(["roster"], [item.source for item in ledger.violations])
         self.assertEqual([], launcher.requests)
         self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
@@ -844,7 +1189,7 @@ class RefusalTest(unittest.TestCase):
             ledger, facts = attempt(connection, launcher)
         self.assertTrue(ledger.violations)
         self.assertEqual("refusal", facts["agent_run"]["stop_reason"])
-        self.assertEqual([(RUN, "refusal", None, None)], connection.sent(execution.FINISH))
+        self.assertEqual([(RUN, "refusal", None, None)], connection.finished())
 
     def test_an_unavailable_boundary_is_a_violation_and_not_a_traceback(self):
         connection = Recorder()
@@ -926,7 +1271,7 @@ class HeartbeatTest(unittest.TestCase):
         statements = connection.statements
         self.assertLess(
             max(n for n, sql in enumerate(statements) if sql == execution.HEARTBEAT),
-            statements.index(execution.FINISH),
+            connection.closing(),
         )
 
     def test_a_lapsed_lease_is_reported_and_not_beaten_harder(self):

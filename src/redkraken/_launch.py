@@ -42,7 +42,7 @@ import json
 import os
 import ssl
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import NoReturn
 
@@ -211,6 +211,64 @@ class Submission:
         }
 
 
+class Choice:
+    """The Task an orchestrator session named, and the tries it took to name it.
+
+    Superseding rather than latching, and that is the difference from
+    `Submission` above: a result is a claim about what happened and the first
+    one stands, while a choice is a preference and the current one is whatever
+    was said last. `pick_task` in the database supersedes for the same reason --
+    it calls `supersede_pick` before it writes -- so a session that changes its
+    mind gets the same answer here as it would there.
+
+    Membership is checked and does not decide. A label the offered Slate does
+    not carry is answered as refused, which is what lets the model correct
+    itself while it is still running, and it is still what comes back: the
+    Slate this process holds is a copy that travelled in a job document, and
+    the authority on what may still be picked is the transaction that picks it.
+    Refusing here as well would be this process deciding an outcome the
+    database is the only one able to decide.
+    """
+
+    def __init__(self, offered: Sequence[Mapping[str, object]] = ()) -> None:
+        self.entries = [dict(entry) for entry in offered]
+        self.offered = [
+            str(entry["task"]) for entry in self.entries if entry.get("task")
+        ]
+        self.task: str | None = None
+        self.attempts = 0
+
+    def pick(self, arguments: Mapping[str, object]) -> dict:
+        self.attempts += 1
+        label = arguments.get("task_label")
+        if not isinstance(label, str) or not label:
+            return {
+                "accepted": False,
+                "reason": "no_task_label",
+                "attempts": self.attempts,
+            }
+        self.task = label
+        if label not in self.offered:
+            return {
+                "accepted": False,
+                "reason": "off_slate",
+                "offered": list(self.offered),
+                "attempts": self.attempts,
+                "note": "the runtime will refuse this; pick one of the offered tasks",
+            }
+        return {
+            "accepted": True,
+            "task": label,
+            "attempts": self.attempts,
+            # Not "claimed". The claim is a transaction the runtime opens after
+            # this process ends, and it re-checks every condition the offer was
+            # made under -- so a pick that is accepted here is a pick that may
+            # still be refused there, and saying otherwise would be this handler
+            # promising a Task nothing has taken yet.
+            "note": "recorded; the claim and its revalidation are the runtime's step",
+        }
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -238,6 +296,19 @@ DESCRIPTIONS = {
         "that Artifact -- its metadata and, where its head was staged as text, a byte "
         "range of it. The hash is reported, never asked for. Whole large Artifacts "
         "are analysed by a tool run, not read into this context."
+    ),
+    "get_slate": (
+        "List the Tasks this decision may choose between: their kind, subject, "
+        "priority, the factors behind it and when the offer stops being good. It is "
+        "the whole of the choice -- the queue behind it is not offered and is not "
+        "yours to reach."
+    ),
+    "pick_task": (
+        "Name the one offered Task to run next, by its label. Calling it again "
+        "replaces your previous answer; not calling it at all leaves the choice to "
+        "the runtime, which takes the first entry that still holds. The runtime "
+        "re-checks the Task before it claims it and refuses a label this Slate no "
+        "longer carries."
     ),
     "http_request": (
         "Send one HTTP request to a target through the capability proxy, which "
@@ -276,8 +347,9 @@ def server(
     reader: packet.Reader,
     submission: Submission,
     door: agent.Egress | None = None,
+    choice: Choice | None = None,
 ):
-    """The runtime's MCP server: five bounded reads, one request, one proposal.
+    """The runtime's MCP server: five reads, one request, one proposal, one choice.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -290,6 +362,13 @@ def server(
     is refused before the gate and long before a handler. The gate checks the
     same properties again afterwards. Two checks of one statement, which is the
     arrangement, rather than two statements.
+
+    Every tool is built for every run, including the two only an orchestrator
+    may call. What a run may reach is the roster's allowlist and not this list,
+    for the reason `net.request` is served unconditionally: an allowlist that
+    varied with the job would be an allowlist the startup assertion could not
+    check against the roster. A worker's Slate is empty, which is the honest
+    answer for a run that was offered no choice.
     """
     reads = {
         "get_attack_surface": reader.attack_surface,
@@ -298,9 +377,12 @@ def server(
         "get_receipts": reader.receipts,
         "get_artifact": reader.artifact,
     }
+    picking = Choice() if choice is None else choice
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
     tools.append(_request(surface, door))
     tools.append(_propose(surface, submission))
+    tools.append(_slate(surface, picking))
+    tools.append(_pick(surface, picking))
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
 
@@ -403,6 +485,36 @@ def _spend(door: agent.Egress, url: str, method: str) -> dict:
         "truncated": len(answer.body) > len(body),
         "body": body.decode("utf-8", "replace"),
     }
+
+
+def _slate(surface: Surface, choice: Choice):
+    """The bounded set this decision chooses from, as it was offered.
+
+    Answered from the job rather than from the database, because there is no
+    database on this side of the boundary: the container's one network reaches
+    the capability proxy. What that costs is nothing -- the Slate was written
+    by `offer_slate` in the transaction that ranked it, and a second read would
+    only tell the model about entries it may not have anyway.
+    """
+    name = "get_slate"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content({"slate": choice.entries, "count": len(choice.entries)})
+
+    return handler
+
+
+def _pick(surface: Surface, choice: Choice):
+    name = "pick_task"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(choice.pick(dict(arguments or {})))
+
+    return handler
 
 
 def _propose(surface: Surface, submission: Submission):
@@ -559,6 +671,9 @@ async def run(
     # without one still serves the request tool -- the allowlist is the role's,
     # not the job's -- and the tool answers that it has nothing to spend.
     door = agent.Egress.from_dict(job.get("egress"))
+    # Empty for every run that was offered no Slate, which is every run that is
+    # executing a Task rather than choosing one.
+    choice = Choice(_slate_entries(job.get("slate")))
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
     # SDK version would do for one role, so an absent SDK and an unknown role
@@ -568,7 +683,13 @@ async def run(
     options = (
         None
         if claude_agent_sdk is None or gate is None
-        else options_for(job, runtime, server(surface, reader, submission, door), launch, gate)
+        else options_for(
+            job,
+            runtime,
+            server(surface, reader, submission, door, choice),
+            launch,
+            gate,
+        )
     )
 
     violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)
@@ -634,7 +755,23 @@ async def run(
         "mission_attempts": submission.attempts,
         "input_tokens": spent_in,
         "output_tokens": spent_out,
+        "choice": choice.task,
+        "pick_attempts": choice.attempts,
     }
+
+
+def _slate_entries(stated: object) -> list[Mapping[str, object]]:
+    """The offered entries a job carried, or none where it carried none.
+
+    Anything that is not a list of objects is no Slate rather than an error.
+    A malformed one leaves the session with nothing to choose from, which the
+    runtime reads back as a session that chose nothing and falls back on its
+    own walk -- and that is a working pass, where a raise here would be a run
+    that never started.
+    """
+    if not isinstance(stated, list):
+        return []
+    return [entry for entry in stated if isinstance(entry, Mapping)]
 
 
 def _usage(stated: object) -> tuple[int, int]:

@@ -114,13 +114,35 @@ SERVER_VERSION = "0.1.0"
 #: to start rather than start with nothing to spend.
 SERVED_GROUPS = ("state.read", "state.propose", "net.request")
 
+#: The one group served in part, and exactly which of its members. `sched.pick`
+#: is five tools built by four tickets: the two here are the Slate the
+#: orchestrator is offered and the choice it makes on it, and the other three --
+#: validation, a report and parking for a human -- are requests their own
+#: tickets serve. Naming the members is what keeps the difference visible: a
+#: group is served whole unless there is a list saying which part, and the list
+#: is checked below against the group it claims to be part of, so a tool that
+#: later moved to another authority class fails the compile here rather than
+#: arriving quietly on the orchestrator's allowlist.
+SERVED_MEMBERS = {"sched.pick": ("mcp__rk2__get_slate", "mcp__rk2__pick_task")}
+
 #: Everything this launch actually serves. The roster says what a role may
 #: call; this says what exists to be called, and the allowlist a launch carries
 #: is the intersection. It is derived rather than written because two hand-kept
 #: lists is how a tool comes to be granted and not served.
 SERVED = tuple(
-    sorted(name for group in SERVED_GROUPS for name in roster.TOOL_GROUPS[group])
+    sorted(
+        {name for group in SERVED_GROUPS for name in roster.TOOL_GROUPS[group]}
+        | {name for group, part in SERVED_MEMBERS.items() for name in part}
+    )
 )
+
+for _group, _members in SERVED_MEMBERS.items():
+    if _group in SERVED_GROUPS:
+        raise roster.RosterError(f"{_group} is served whole and in part")
+    if not set(_members) <= set(roster.TOOL_GROUPS.get(_group, ())):
+        raise roster.RosterError(
+            f"{_group} does not contain every tool this launch serves out of it"
+        )
 
 #: The bare tool names, which is what the MCP server registers. The SDK
 #: prefixes `mcp__<server>__` on the way out, so these two lists are the same
@@ -332,6 +354,12 @@ class AgentRunRequest:
     run, so a caller that reserved nothing states nothing, and the child runs
     bounded by its turns alone. A number invented here would be a ceiling no
     Program's capacity was held against.
+
+    `slate` is the bounded set of Tasks this run may choose between, and it
+    travels for the third time for the same reason: the child has no database,
+    so a Slate it was not given is a Slate it cannot be shown. Empty for every
+    run that is executing a Task rather than choosing one -- a worker offered a
+    Slate would be a worker told what else it could have been doing.
     """
 
     agent_run_id: str
@@ -344,6 +372,7 @@ class AgentRunRequest:
     timeout: float = TIMEOUT
     subagent_cap: int = roster.DEFAULT_SUBAGENTS
     token_cap: int | None = None
+    slate: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +407,13 @@ class AgentRunResult:
     the numbers the reservation this run was claimed under is settled against.
     Zero is what a run that never reached the model reports, and it is a
     measurement rather than an absence: nothing was spent because nothing ran.
+
+    `choice` is the Task label an orchestrator session named, and it is a
+    report rather than a decision: this label is offered to `record_choice`,
+    which asks the database whether the Slate still carries it and refuses it
+    when it does not. Nothing with `pick_attempts` at zero is a session that
+    chose nothing; nothing with attempts behind it is one whose calls carried
+    no label to record.
     """
 
     agent_run_id: str
@@ -395,6 +431,8 @@ class AgentRunResult:
     mission_attempts: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    choice: str | None = None
+    pick_attempts: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -415,6 +453,8 @@ class AgentRunResult:
             "mission_attempts": self.mission_attempts,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "choice": self.choice,
+            "pick_attempts": self.pick_attempts,
         }
 
 
@@ -456,6 +496,7 @@ def agent_run(
             "egress": None if request.egress is None else request.egress.as_dict(),
             "subagent_cap": request.subagent_cap,
             "token_cap": request.token_cap,
+            "slate": [dict(entry) for entry in request.slate],
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:
@@ -916,6 +957,14 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
         mission_attempts=int(result.get("mission_attempts") or 0),
         input_tokens=int(result.get("input_tokens") or 0),
         output_tokens=int(result.get("output_tokens") or 0),
+        # A label and nothing else. Anything that is not a non-empty string is
+        # read as no choice at all rather than coerced into one: the caller
+        # records what a session answered, and `str(None)` is a Task label
+        # nothing offered and nothing will claim.
+        choice=(
+            choice if isinstance(choice := result.get("choice"), str) and choice else None
+        ),
+        pick_attempts=int(result.get("pick_attempts") or 0),
     )
 
 

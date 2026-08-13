@@ -153,6 +153,39 @@ QUOTA = "SELECT advance_lane_quota('runtime')"
 OFFER = "SELECT * FROM offer_slate()"
 CLAIM = "SELECT claim_task()"
 
+#: The decision between the offer and the claim. `open_orchestrator_session`
+#: opens the Task-less Agent run the choice is made in and answers the two
+#: ceilings the child has no database to read; `record_choice` writes what came
+#: back, downgrading a label the current Slate no longer carries to `off_slate`
+#: rather than substituting one of its own.
+#:
+#: `claim_task()` above still takes no argument, and that is what makes the two
+#: paths one path: called with none it prefers this Program's outstanding pick,
+#: re-checks it under a lock and walks the Slate only when there is no pick to
+#: honour. So a session that chose is committed by the same statement that
+#: covers a session that chose nothing, and neither can name a Task the offer
+#: did not carry.
+OPEN_SESSION = "SELECT open_orchestrator_session()"
+CHOICE = "SELECT record_choice($1::uuid, $2, $3, $4)"
+
+#: What one orchestrator session is told. The Slate is not repeated into it: the
+#: entries are served by `get_slate` from the same job document, and an
+#: objective carrying them as prose would be a second copy for the model to
+#: prefer. What this does say is the bound -- one call, the runtime re-checks
+#: it, and choosing nothing is an answer with a defined consequence rather than
+#: a failure.
+PLANNING = (
+    "Choose the Task this harness runs next.\n\n"
+    "Call mcp__rk2__get_slate for the {count} Task(s) on offer, each with its kind, "
+    "subject, priority and the factors behind that priority. Read what the Program "
+    "already knows with the state tools where it helps you tell them apart. Then "
+    "call mcp__rk2__pick_task once, with the label of the one to run.\n\n"
+    "You are choosing, not running. Nothing you pick is executed by you, and the "
+    "runtime re-checks the Task inside the transaction that claims it: a label this "
+    "Slate no longer carries is refused rather than replaced. Name nothing and the "
+    "runtime claims the first entry that still holds."
+)
+
 #: What was claimed, read back through the Agent run the claim created rather
 #: than assembled from what this process asked for. The claim is the database's
 #: decision -- which Task, which role, which model -- and a runtime that
@@ -331,6 +364,43 @@ def stopped_as(reported: str | None) -> str:
     if reported in ACCEPTED_STOPS:
         return reported
     return STOP_REASONS.get(reported, "error")
+
+
+@dataclass(frozen=True, slots=True)
+class Chosen:
+    """What one orchestrator decision came to, in the words the runtime acts on.
+
+    `outcome` is the database's rather than this runtime's: `record_choice`
+    takes what the session answered and returns what it made of it, and the one
+    word it can change is `chosen` into `off_slate` -- which it does when the
+    Slate no longer carries the label. So a label is here only when a pick was
+    actually written, and everything else falls back to the runtime's own walk.
+
+    `task_label` is what the session named even where the outcome refused it.
+    A refusal that forgot the label would leave an operator asking why nothing
+    ran with no way to see what was asked for.
+    """
+
+    agent_run_id: str
+    agent_run_label: str
+    outcome: str
+    task_label: str | None
+    attempts: int
+    detail: str | None
+
+    @property
+    def committed(self) -> bool:
+        """Whether a pick was written, and therefore what the claim must take."""
+        return self.outcome == "chosen" and self.task_label is not None
+
+    def facts(self) -> dict:
+        return {
+            "agent_run": self.agent_run_label,
+            "outcome": self.outcome,
+            "task": self.task_label,
+            "attempts": self.attempts,
+            "detail": self.detail,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -607,6 +677,7 @@ class Slice:
         facts = {
             "reconciliation": None,
             "slate": [],
+            "choice": None,
             "task": None,
             "agent_run": None,
             "target": None,
@@ -629,6 +700,21 @@ class Slice:
             ledger.hold("slate", "no Task is ready; nothing was claimed")
             return facts
 
+        chosen = self._choose(ledger, connection, program_id, offered)
+        if chosen is not None:
+            facts["choice"] = chosen.facts()
+        # An off-Slate choice is where the pass stops. ADR 0003 is explicit that
+        # a stale or off-Slate choice is refused and not substituted, and
+        # claiming here would substitute one: the runtime's walk is the answer
+        # to "nobody chose", not to "the choice was refused".
+        if chosen is not None and chosen.outcome == "off_slate":
+            ledger.hold(
+                "claim",
+                f"{chosen.agent_run_label} chose {chosen.task_label}, which this Slate "
+                "no longer carries; nothing was claimed",
+            )
+            return facts
+
         claimed = self._claim(ledger, connection, program_id, len(offered))
         if claimed is None:
             return facts
@@ -640,7 +726,7 @@ class Slice:
         )
 
         try:
-            self._run(ledger, connection, program_id, claimed, facts)
+            self._run(ledger, connection, program_id, claimed, chosen, facts)
         finally:
             facts["closure"] = self._finish(ledger, connection, claimed, facts)
         return facts
@@ -709,6 +795,238 @@ class Slice:
                 )
                 return None
 
+    # -- the decision ------------------------------------------------------
+
+    def _choose(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        program_id: str,
+        offered: list[dict],
+    ) -> Chosen | None:
+        """One orchestrator decision over the offered Slate, recorded either way.
+
+        Nothing about the claim depends on this succeeding. A session that
+        could not be opened, a child that would not start and a model that
+        answered nothing all leave the pass exactly where it was -- with a
+        Slate and no pick -- and `claim_task` walks it, which is what the
+        runtime did before there was an orchestrator. That is the property
+        worth stating: the decision is an input to the claim and never a
+        precondition for it.
+
+        `None` is only the case where there is no session to record against.
+        Every outcome that has one is written, including the ones that say the
+        model produced nothing usable, because a pass that claimed nothing has
+        to say why it claimed nothing.
+        """
+        session = self._session(ledger, connection)
+        if session is None:
+            return None
+
+        run_id = str(session.get("agent_run"))
+        label = str(session.get("label"))
+        result = self._planner(ledger, program_id, run_id, label, session, offered)
+        outcome, task, detail = self._answered(result)
+        try:
+            return self._record(ledger, connection, run_id, label, outcome, task, detail, result)
+        finally:
+            # In a `finally` for the reason the attempt's closing is: this run
+            # holds no Task and no reservation, but it does hold an open row
+            # that the next pass's reconciliation would otherwise have to reap,
+            # and its tokens are not counted against the Program until it closes.
+            self._close_session(ledger, connection, run_id, label, result)
+
+    def _session(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
+        """The Task-less Agent run this decision is made in, or nothing.
+
+        A failure here is reported and is not the pass failing. The one thing
+        it costs is the choice, and the claim below covers exactly that case.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                return proxy.as_object(connection.execute(OPEN_SESSION).scalar())
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "choice",
+                f"no orchestrator session could be opened to choose in: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return None
+
+    def _planner(
+        self,
+        ledger: Ledger,
+        program_id: str,
+        run_id: str,
+        label: str,
+        session: Mapping[str, object],
+        offered: list[dict],
+    ) -> agent.AgentRunResult | None:
+        """The one child that chooses, started with the Slate and no capability.
+
+        No `egress`, and that is a property of the run rather than of the
+        request: the roster withholds `net.request` from the orchestrator, so
+        there is no capability to mint and nothing served that could spend one.
+        Planning that reached a target would be testing nobody scheduled.
+
+        Every failure is the same answer -- no result -- because the caller does
+        one thing with all of them. A refused startup, an unavailable boundary
+        and a child that died differ in what the Ledger says and not in what
+        the pass does next, which is to fall back to the runtime's own walk.
+        """
+        mission = self._packet(ledger, program_id)
+        if mission is None:
+            return None
+        request = agent.AgentRunRequest(
+            agent_run_id=run_id,
+            objective=PLANNING.format(count=len(offered)),
+            container=self.boundary,
+            role=roster.ORCHESTRATOR,
+            program_id=program_id,
+            packet=mission,
+            egress=None,
+            timeout=self.timeout,
+            subagent_cap=int(session.get("subagent_cap") or roster.DEFAULT_SUBAGENTS),
+            token_cap=(
+                None if session.get("token_cap") is None else int(session["token_cap"])
+            ),
+            slate=tuple(offered),
+        )
+        try:
+            return self.launch(request)
+        except agent.StartupRefusal as refusal:
+            ledger.refuse(
+                "startup_assertion",
+                f"the choosing child was refused in {refusal.phase} by "
+                f"{len(refusal.violations)} vector(s)",
+                agent.diagnostics(refusal).violations,
+            )
+        except isolation.Unavailable as error:
+            ledger.fail(
+                "boundary",
+                f"the Agent boundary could not be provided to choose in: {error}",
+                code=INVALID_CONFIGURATION,
+                source=f"environment:{IMAGE}",
+            )
+        except RuntimeError as error:
+            ledger.fail(
+                "choice",
+                f"{label} left no account of the choice it was asked to make: {error}",
+                code=INTEGRITY_FAILED,
+                source="agent",
+            )
+        return None
+
+    @staticmethod
+    def _answered(result: agent.AgentRunResult | None) -> tuple[str, str | None, str | None]:
+        """What the session answered, as one of the four words the verb takes.
+
+        `off_slate` is not among them on purpose: whether the Slate still
+        carries a label is the database's question, asked inside `record_choice`
+        by the same function the model would have called. A runtime that decided
+        it here would be deciding it against a copy of the Slate with no lock on
+        it, and would refuse a choice the claim would have honoured.
+        """
+        if result is None:
+            return "unavailable", None, "no session answered"
+        if result.choice:
+            return "chosen", result.choice, None
+        if result.pick_attempts:
+            return (
+                "malformed",
+                None,
+                f"{result.pick_attempts} pick(s) carried no task label",
+            )
+        return "no_choice", None, None
+
+    def _record(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        run_id: str,
+        label: str,
+        outcome: str,
+        task: str | None,
+        detail: str | None,
+        result: agent.AgentRunResult | None,
+    ) -> Chosen | None:
+        """Make the decision durable, in the words the runtime will act on.
+
+        The answer is the database's: `record_choice` returns the outcome it
+        recorded, which is the one this runtime dispatches on. Reading back what
+        was sent instead would miss the only word it can change -- the
+        downgrade to `off_slate` -- and the pass would claim a Task the choice
+        was refused for.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                recorded = proxy.as_object(
+                    connection.execute(CHOICE, (run_id, outcome, task, detail)).scalar()
+                )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "choice",
+                f"the choice {label} made could not be recorded: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        chosen = Chosen(
+            agent_run_id=run_id,
+            agent_run_label=label,
+            outcome=str(recorded.get("outcome")),
+            task_label=(
+                None if recorded.get("offered_task") is None
+                else str(recorded["offered_task"])
+            ),
+            attempts=0 if result is None else result.pick_attempts,
+            detail=None if recorded.get("detail") is None else str(recorded["detail"]),
+        )
+        ledger.hold(
+            "choice",
+            f"{label} answered {chosen.outcome}"
+            + (f" ({chosen.task_label})" if chosen.task_label else "")
+            + f" after {chosen.attempts} pick(s)",
+        )
+        return chosen
+
+    def _close_session(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        run_id: str,
+        label: str,
+        result: agent.AgentRunResult | None,
+    ) -> None:
+        """Close the session that chose, and charge the Program what it spent.
+
+        The same call the attempt closes with, which is deliberate: a run with
+        no Task is a case `finish_task_attempt` already answers, and a second
+        closing verb would be a second place the token settlement is written.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                connection.execute(
+                    FINISH,
+                    (
+                        run_id,
+                        "aborted" if result is None else stopped_as(result.stop_reason),
+                        None if result is None else result.input_tokens,
+                        None if result is None else result.output_tokens,
+                    ),
+                )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "choice",
+                f"the orchestrator session {label} could not be closed: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+
     def _claim(
         self, ledger: Ledger, connection: pg.Connection, program_id: str, offered: int
     ) -> Claimed | None:
@@ -770,6 +1088,7 @@ class Slice:
         connection: pg.Connection,
         program_id: str,
         claimed: Claimed,
+        chosen: Chosen | None,
         facts: dict,
     ) -> None:
         """Everything between the claim and the closing, in the one order.
@@ -779,6 +1098,8 @@ class Slice:
         that threw instead would still be closed -- but the report would carry
         a traceback where it should carry the reason.
         """
+        if not self._dispatchable(ledger, claimed, chosen):
+            return
         if claimed.url is None:
             ledger.fail(
                 "target",
@@ -876,6 +1197,49 @@ class Slice:
             # what the request did, and the Receipt above is what it knows it
             # from.
             self._close(ledger, connection, claimed, facts["tool_run"], outcome)
+
+    def _dispatchable(
+        self, ledger: Ledger, claimed: Claimed, chosen: Chosen | None
+    ) -> bool:
+        """Whether what is about to be dispatched is what was committed.
+
+        Two invariants, both of them the database's and neither of them
+        therefore expected to fail: `claim_task` prefers the outstanding pick
+        and refuses it when it has gone stale, so a committed choice and a
+        claimed Task that are different Tasks is a claim that honoured neither;
+        and `role_task_kinds` is unique on kind, so the role the claim wrote is
+        the one role the roster gives that kind.
+
+        Checked anyway, and checked here, because this is the last statement
+        before a child is started with a Lease and a reservation: a Task
+        substituted between the choice and the dispatch is exactly what
+        criterion 5 says cannot happen, and an invariant nothing asserts is a
+        claim about the code rather than about the run. Reported and returned
+        rather than raised -- the caller's `finally` closes the attempt, which
+        gives the Task back with its attempt spent rather than leaving it
+        claimed by a run that never started.
+        """
+        if chosen is not None and chosen.committed and chosen.task_label != claimed.task_label:
+            ledger.fail(
+                "dispatch",
+                f"{chosen.agent_run_label} chose {chosen.task_label} and the claim took "
+                f"{claimed.task_label}; nothing may be dispatched against a Task nobody "
+                "committed",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return False
+        expected = roster.ROLE_FOR_KIND.get(claimed.kind)
+        if expected != claimed.role:
+            ledger.fail(
+                "dispatch",
+                f"{claimed.task_label} is a {claimed.kind} Task, which the roster gives "
+                f"to {expected or 'no role'}, and it was claimed as {claimed.role}",
+                code=INTEGRITY_FAILED,
+                source="roster",
+            )
+            return False
+        return True
 
     def _heartbeat(
         self, ledger: Ledger, connection: pg.Connection, claimed: Claimed, facts: dict

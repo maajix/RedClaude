@@ -1087,6 +1087,48 @@ CONTROLS = (
         "DROP TRIGGER task_dependencies_sound_basis_is_derived ON task_dependencies",
     ),
     Control(
+        # An admission rule that admits everything, which is one way of no
+        # longer asking which role may load a Task's Skills. Structural for the
+        # reason the slate's clock control is: the failure is in the text, and a
+        # rule that stopped asking would leave every row looking exactly as it
+        # does now until a child failed at load time inside a started container.
+        "standing:orchestrator_dispatch",
+        "CREATE OR REPLACE FUNCTION claimable_for(t tasks, w scheduler_weights)"
+        " RETURNS text LANGUAGE sql STABLE AS $ctl$ SELECT NULL::text $ctl$",
+    ),
+    Control(
+        # A recorded choice with a sixth word in it. The runtime branches on
+        # five, so this is an outcome nothing downstream has an answer for --
+        # and it is written by hand because `record_choice` cannot produce it:
+        # the point of the arm is the row a restore or a later verb could leave.
+        "standing:orchestrator_dispatch",
+        "DO $ctl$ DECLARE p uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('chose-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO agent_runs (program_id, role, runs_as, model, effort, mission_packet)"
+        "        VALUES (p, 'orchestrator', 'session', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO events (program_id, type, actor_kind, agent_run_id, payload)"
+        '        VALUES (p, \'scheduler.chose\', \'llm\', r, \'{"outcome": "probably"}\'::jsonb);'
+        " END $ctl$",
+    ),
+    Control(
+        # A choice nothing made. An Event naming no session is a decision with
+        # no decider: the run that chose is the one thing that says which model,
+        # at which effort, under which caps, answered the way it did.
+        "standing:orchestrator_dispatch",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('unattributed-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO events (program_id, type, actor_kind, payload)"
+        '        VALUES (p, \'scheduler.chose\', \'llm\', \'{"outcome": "chosen"}\'::jsonb);'
+        " END $ctl$",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -8221,6 +8263,12 @@ AFFORDABLE = budgets(
 )
 
 
+#: "Whatever you offered me first", as a value a test can pass. `None` is
+#: already a choice a session can make -- naming nothing -- so the default
+#: cannot be spelled that way without making the two indistinguishable.
+FIRST = object()
+
+
 class Child:
     """A launcher that spends the capability it was handed, and reports back.
 
@@ -8234,6 +8282,17 @@ class Child:
     tool calls inside a real child. A hand-rolled request here would be a second
     client, and the door's answer -- which decides whether the Tool run closes
     as served or as denied -- would be parsed in two places.
+
+    It answers as two children, because one pass starts two: the orchestrator
+    session that chooses off the Slate, and the worker that runs what was
+    claimed. They are kept in separate lists rather than told apart by index --
+    a planning run that stopped happening would otherwise shift every assertion
+    about the worker by one and still pass.
+
+    The choice it makes is the first entry it was offered, through the same
+    latch a real child picks with. `_launch.Choice` is what refuses an off-Slate
+    label and what supersedes an earlier pick, so a fixture that set the field
+    directly would be reporting a choice no tool would have accepted.
     """
 
     def __init__(
@@ -8242,14 +8301,19 @@ class Child:
         *,
         observations: list[dict] | None = None,
         completion: str = "complete",
+        picks: object = FIRST,
     ) -> None:
         self.subject = subject
         self.overrides = observations
         self.completion = completion
+        self.picks = picks
         self.requests: list[agent.AgentRunRequest] = []
+        self.choices: list[agent.AgentRunRequest] = []
         self.answers: list[dict] = []
 
     def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        if request.role == roster.ORCHESTRATOR:
+            return self.choose(request)
         self.requests.append(request)
         if request.egress is not None:
             self.answers.append(_launch._spend(request.egress, URL, "GET"))
@@ -8267,6 +8331,38 @@ class Child:
             text="one request, one observation",
             mission_result=self.result(),
             mission_attempts=1,
+        )
+
+    def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        """What the orchestrator session answers: one pick, or nothing.
+
+        `picks` is what this child would call `pick_task` with -- `FIRST` for
+        the first entry it was offered, a label for one it names itself, and
+        `None` for a session that chooses nothing at all. Every one of them goes
+        through the same latch, so what comes back is what the tool would have
+        returned rather than what this fixture would like it to be.
+        """
+        self.choices.append(request)
+        latch = _launch.Choice(request.slate)
+        wanted = self.picks
+        if wanted is FIRST:
+            wanted = latch.offered[0] if latch.offered else None
+        if wanted is not None:
+            latch.pick({"task_label": wanted})
+        return agent.AgentRunResult(
+            agent_run_id=request.agent_run_id,
+            role=request.role,
+            sdk_version="selftest",
+            cli_version="selftest",
+            api_key_source="none",
+            tool_ready=1,
+            tools_served=agent.SERVED,
+            denials=(),
+            answers=1,
+            stop_reason="completed",
+            text=f"{len(latch.entries)} offered",
+            choice=latch.task,
+            pick_attempts=latch.attempts,
         )
 
     def result(self) -> dict:
@@ -8362,6 +8458,11 @@ DECIDED = {
     "heartbeat": ("every", "lapsed", "failure"),
     "slate": ("ordinal", "task", "kind", "subject", "priority", "factors",
               "entitled"),
+    #: What one decision came to. The label is kept for the reason the run
+    #: labels are: two Programs seeded alike open their sessions in the same
+    #: order and must name them the same. `detail` is left out because the one
+    #: thing that fills it is a refusal message from the server.
+    "choice": ("agent_run", "outcome", "task", "attempts"),
     "task": ("label", "kind", "attempts", "subject", "subject_type"),
     "agent_run": ("label", "role", "stop_reason"),
     "target": None,
@@ -11199,6 +11300,16 @@ class SchedulerFixture:
         return cls.as_owner(sql, parameters).scalar()
 
     @classmethod
+    def claimable(cls, name: str, label: str) -> str | None:
+        """Why one Task may not be claimed, in the scheduler's own vocabulary."""
+        answer = cls.scalar(
+            "SELECT claimable_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.label = $2",
+            (cls.identifiers[name], label),
+        )
+        return None if answer is None else str(answer)
+
+    @classmethod
     def claimed_by(cls, name: str, run: object) -> str | None:
         """The Task an Agent run was opened against, by label."""
         claimed = cls.scalar(
@@ -12537,16 +12648,6 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         return rows[0] if rows else None
 
     @classmethod
-    def claimable(cls, name: str, label: str) -> str | None:
-        """Why one Task may not be claimed, in the scheduler's own vocabulary."""
-        answer = cls.scalar(
-            "SELECT claimable_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
-            " WHERE w.active AND t.program_id = $1::uuid AND t.label = $2",
-            (cls.identifiers[name], label),
-        )
-        return None if answer is None else str(answer)
-
-    @classmethod
     def run_id(cls, name: str, label: str) -> str:
         """The identifier behind a run label, which is what the verbs take."""
         return str(
@@ -13634,6 +13735,572 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
             ("task_ranking",),
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: The Programs of `OrchestratorDispatchTest`, sharing a prefix so one DELETE
+#: retires them.
+DISPATCH_SLUG = "selftest-dispatch"
+
+#: The one Skill the corpus registers, and the one role it is granted to.
+#: Criterion 4 is a claim about that pair: `hunt` reaches `web_hunter`, which
+#: holds the grant, and every other kind reaches a role that does not.
+IDENTITY_SKILL = "use-identity"
+
+#: One Program per scenario, so no scenario is read through another's rows.
+DISPATCH_SCENARIOS = ("chose", "refused", "silent", "skilled")
+
+
+class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
+    """PH2-27: one model decides, and the runtime commits it or refuses it.
+
+    The arithmetic of a choice is nothing -- a label comes back and a Task is
+    claimed. What only a server can answer is everything around it: that the
+    session the choice was made in holds no Task and therefore no lane slot,
+    that a label the Slate no longer carries is refused rather than replaced,
+    that three different kinds of silence all leave the same walk available,
+    and that the admission rule knows which role would have to load the Task's
+    Skills.
+
+    Each Program is one scenario. `chose` is the pass that works, and it names
+    the second entry so that "the claim honoured the choice" and "the claim
+    walked the Slate" cannot be true of the same label. `refused` is every way
+    of recording something that is not a choice, plus the two downgrades.
+    `silent` is the three answers that are not a choice at all. `skilled` is
+    one Skill, the kind whose role holds it, and the kind whose role does not.
+
+    Everything runs in `setUpClass` because all of it commits, and because a
+    refusal only means anything against the state the step before it left.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in DISPATCH_SCENARIOS:
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{DISPATCH_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_chose()
+        cls.arrange_refused()
+        cls.arrange_silent()
+        cls.arrange_skilled()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{DISPATCH_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the moves a scenario is made of ---------------------------------------
+
+    @classmethod
+    def session(cls, name: str) -> dict:
+        """One planning session, opened by the statement the runtime sends.
+
+        `execution.OPEN_SESSION` rather than a statement spelled here, for
+        `started`'s reason: what is under test is the seam, and a second
+        spelling of the call would only prove that the function can be called.
+        """
+        cls.bind(name)
+        return json.loads(str(cls.call(execution.OPEN_SESSION)))
+
+    @classmethod
+    def choose(
+        cls, run: str, outcome: str, label: str | None = None, detail: str | None = None
+    ) -> dict:
+        """One recorded answer, through the runtime's own statement."""
+        return json.loads(str(cls.call(execution.CHOICE, (run, outcome, label, detail))))
+
+    @classmethod
+    def ceilings(cls, name: str) -> tuple[int, int]:
+        """The two numbers a session is bounded by, read from their own rows."""
+        return (
+            int(
+                cls.scalar(
+                    "SELECT max_concurrent_subagents FROM scheduler_weights"
+                    " WHERE active"
+                )
+            ),
+            int(
+                cls.scalar(
+                    "SELECT run_tokens FROM program_capacity WHERE program_id = $1::uuid",
+                    (cls.identifiers[name],),
+                )
+            ),
+        )
+
+    # -- reading a Program back ------------------------------------------------
+
+    @classmethod
+    def run_row(cls, name: str, run: object) -> dict:
+        """One Agent run, the roster row behind it, and what it promised."""
+        return cls.as_owner(
+            "SELECT a.role, a.task_id, a.executes_tasks, a.model, a.effort,"
+            "       r.model AS roster_model, r.effort AS roster_effort,"
+            "       (SELECT count(*) FROM budget_reservations b"
+            "         WHERE b.agent_run_id = a.id) AS reservations"
+            "  FROM agent_runs a JOIN roles r ON r.role = a.role"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[name], str(run)),
+        ).dicts()[0]
+
+    @classmethod
+    def run_id(cls, name: str, run: object) -> str:
+        return str(
+            cls.scalar(
+                "SELECT id::text FROM agent_runs"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], str(run)),
+            )
+        )
+
+    @classmethod
+    def dispatched(cls, name: str, run: object) -> dict:
+        """What a committed claim leaves for the dispatch to act on.
+
+        The Task, the Lease clock it was taken under and the promise held
+        against it, read through the Agent run rather than through the Task:
+        criterion 5 is that the run carries the claim's own Task, and a query
+        that started from the Task could not tell that apart from a run that
+        was pointed at a different one.
+        """
+        return cls.as_owner(
+            "SELECT t.label AS task, t.status,"
+            "       t.lease_expires_at IS NOT NULL AS leased,"
+            "       b.kind AS reserved_kind, bt.label AS reserved_task,"
+            "       b.tokens IS NOT NULL AS reserved_tokens"
+            "  FROM agent_runs a"
+            "  JOIN tasks t ON t.id = a.task_id"
+            "  LEFT JOIN budget_reservations b ON b.agent_run_id = a.id"
+            "  LEFT JOIN tasks bt ON bt.id = b.task_id"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[name], str(run)),
+        ).dicts()[0]
+
+    @classmethod
+    def choices(cls, name: str) -> list[dict]:
+        """Every recorded choice of a Program, oldest first.
+
+        The session is joined back in rather than trusted from the payload, so
+        that "names a Task-less orchestrator run" is read off the run itself.
+        """
+        return [
+            {
+                "actor": str(row["actor_kind"]),
+                "run": None if row["run"] is None else str(row["run"]),
+                "role": None if row["role"] is None else str(row["role"]),
+                "holds_task": row["holds_task"],
+                "payload": json.loads(str(row["payload"])),
+            }
+            for row in cls.as_owner(
+                "SELECT e.actor_kind, e.payload::text AS payload, ar.label AS run,"
+                "       ar.role, ar.task_id IS NOT NULL AS holds_task"
+                "  FROM events e LEFT JOIN agent_runs ar ON ar.id = e.agent_run_id"
+                " WHERE e.program_id = $1::uuid AND e.type = 'scheduler.chose'"
+                " ORDER BY e.seq",
+                (cls.identifiers[name],),
+            ).dicts()
+        ]
+
+    @classmethod
+    def outstanding_picks(cls, name: str) -> int:
+        return int(
+            cls.scalar(
+                "SELECT count(*) FROM task_picks"
+                " WHERE program_id = $1::uuid AND NOT consumed",
+                (cls.identifiers[name],),
+            )
+        )
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_chose(cls):
+        """A session opens, names an entry that is not the first, and gets it."""
+        cls.chose = cls.seed("chose", 3)
+        cls.bind("chose")
+        cls.chose_slate = cls.offer()
+        cls.chose_ceilings = cls.ceilings("chose")
+        cls.opened = cls.session("chose")
+        cls.opened_row = cls.run_row("chose", cls.opened["label"])
+
+        # The second entry. Choosing the first would be indistinguishable from
+        # the runtime's own walk, which is the other thing this file tests.
+        cls.wanted = str(cls.chose_slate[1]["task_label"])
+        cls.chose_payload = cls.choose(
+            cls.opened["agent_run"], "chosen", cls.wanted, "the second entry reads better"
+        )
+        cls.chose_run = cls.call("SELECT claim_task()")
+        cls.chose_claimed = cls.claimed_by("chose", cls.chose_run)
+        cls.chose_dispatch = cls.dispatched("chose", cls.chose_run)
+        cls.chose_events = cls.choices("chose")
+
+    @classmethod
+    def arrange_refused(cls):
+        """Five ways of recording something that is not a choice, and two
+        downgrades.
+
+        The refusals are raised and the downgrades are not, and that is the
+        distinction the scenario exists to draw: a caller contradicting itself
+        is a bug in the runtime and stops the statement, while a label the
+        Slate has stopped carrying is the ordinary outcome of thinking for a
+        while and is recorded as one.
+        """
+        cls.refused = cls.seed("refused", 3)
+        cls.bind("refused")
+        cls.refused_slate = cls.offer()
+        cls.refused_session = cls.session("refused")
+        run = cls.refused_session["agent_run"]
+
+        # A label no Slate ever carried.
+        cls.off_slate_payload = cls.choose(run, "chosen", "T99")
+        cls.picks_after_off_slate = cls.outstanding_picks("refused")
+
+        cls.unknown_outcome = cls.refusal(
+            execution.CHOICE, (run, "probably", None, None)
+        )
+        cls.chosen_without_label = cls.refusal(
+            execution.CHOICE, (run, "chosen", None, None)
+        )
+        cls.silent_with_label = cls.refusal(
+            execution.CHOICE, (run, "no_choice", cls.refused[0], None)
+        )
+        # `arrange_chose` ran first, so its session is a real run that this
+        # Program may not record anything against.
+        cls.other_programs_session = cls.refusal(
+            execution.CHOICE, (cls.opened["agent_run"], "no_choice", None, None)
+        )
+
+        # A run that holds a Task is a worker, and a worker recording a choice
+        # would be the thing that was chosen attributing the choice to itself.
+        worker = cls.call(
+            "SELECT claim_task($1)", (str(cls.refused_slate[0]["task_label"]),)
+        )
+        cls.worker_session = cls.refusal(
+            execution.CHOICE, (cls.run_id("refused", worker), "no_choice", None, None)
+        )
+
+        # The list died while the model was reading it. The same downgrade as
+        # an unknown label, reached through the other half of `pick_task`.
+        cls.as_owner(
+            "UPDATE task_slate SET offered_at = now() - interval '10 minutes'"
+            " WHERE program_id = $1::uuid AND NOT consumed",
+            (cls.identifiers["refused"],),
+        )
+        cls.expired_payload = cls.choose(
+            run, "chosen", str(cls.refused_slate[1]["task_label"])
+        )
+        # One Task claimed and two runs -- the session and the worker -- is
+        # everything this scenario opened on purpose. A refusal that left a
+        # third would be one that got half way in.
+        cls.refused_counts = cls.counted("refused")
+        cls.refused_events = cls.choices("refused")
+
+    @classmethod
+    def arrange_silent(cls):
+        """The three answers that are not a choice, and the walk after them."""
+        cls.silent = cls.seed("silent", 3)
+        cls.bind("silent")
+        cls.silent_slate = cls.offer()
+        cls.silent_session = cls.session("silent")
+        run = cls.silent_session["agent_run"]
+        # The details are the ones `execution` writes, so that what an operator
+        # reads back is the sentence the runtime had at the time rather than a
+        # word this file invented.
+        cls.silent_payloads = {
+            outcome: cls.choose(run, outcome, None, detail)
+            for outcome, detail in (
+                ("no_choice", None),
+                ("malformed", "2 pick(s) carried no task label"),
+                ("unavailable", "no session answered"),
+            )
+        }
+        cls.picks_after_silence = cls.outstanding_picks("silent")
+        cls.silent_walk = cls.claimed_by("silent", cls.call("SELECT claim_task()"))
+        cls.silent_events = cls.choices("silent")
+
+    @classmethod
+    def arrange_skilled(cls):
+        """One Skill, the kind whose role holds it, and the kind whose does not.
+
+        Two Tasks about one subject in one Program, differing in kind and in
+        nothing else that the admission rule reads. The recon Task is seeded
+        rich -- 0.9 against the hunt's 0.1 -- so that it would lead the Slate
+        on every other measure the scheduler has, and what keeps it off is the
+        grant alone.
+        """
+        program_id = cls.identifiers["skilled"]
+        cls.skilled_hunt = cls.seed("skilled", 1, kind="hunt")[0]
+        subject = str(
+            cls.scalar(
+                "SELECT subject_entity_id::text FROM tasks"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (program_id, cls.skilled_hunt),
+            )
+        )
+        # A hunt is ready with a testable Hypothesis under it, and requires the
+        # Skill its role was granted.
+        cls.as_owner(
+            "UPDATE tasks SET hypothesis_id = $3::uuid, required_skills = ARRAY[$4::text]"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (
+                program_id,
+                cls.skilled_hunt,
+                cls.hypothesis("skilled", subject, "worth hunting"),
+                IDENTITY_SKILL,
+            ),
+        )
+        cls.skilled_recon = str(
+            cls.as_owner(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " required_skills, expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'recon', 'pending', $2::uuid, ARRAY[$3::text],"
+                " 0.9, 0.9) RETURNING label",
+                (program_id, subject, IDENTITY_SKILL),
+            ).scalar()
+        )
+
+        cls.bind("skilled")
+        cls.skilled_slate = [str(row["task_label"]) for row in cls.offer()]
+        cls.skilled_verdicts = {
+            label: cls.claimable("skilled", label)
+            for label in (cls.skilled_hunt, cls.skilled_recon)
+        }
+        cls.skilled_walk = cls.claimed_by("skilled", cls.call("SELECT claim_task()"))
+
+    # -- criterion 1: the session is bounded, and bounded from rows ------------
+
+    def test_a_session_carries_the_two_ceilings_the_child_cannot_read(self):
+        subagent_cap, token_cap = self.chose_ceilings
+        self.assertEqual(subagent_cap, self.opened["subagent_cap"])
+        self.assertEqual(token_cap, self.opened["token_cap"])
+
+    def test_a_session_says_what_it_is_and_nothing_more(self):
+        self.assertEqual(
+            {"agent_run", "label", "model", "effort", "subagent_cap", "token_cap"},
+            set(self.opened),
+        )
+
+    # -- criterion 2: what the session may be, and who may open one -----------
+
+    def test_a_planning_session_holds_no_task_and_no_lane_slot(self):
+        self.assertEqual("orchestrator", str(self.opened_row["role"]))
+        self.assertIsNone(self.opened_row["task_id"])
+        self.assertEqual(False, self.opened_row["executes_tasks"])
+
+    def test_it_runs_at_the_model_and_the_effort_the_roster_states(self):
+        self.assertEqual(
+            (str(self.opened_row["roster_model"]), str(self.opened_row["roster_effort"])),
+            (str(self.opened_row["model"]), str(self.opened_row["effort"])),
+        )
+        self.assertEqual(
+            (str(self.opened_row["model"]), str(self.opened_row["effort"])),
+            (str(self.opened["model"]), str(self.opened["effort"])),
+        )
+
+    def test_a_planning_session_promises_no_budget(self):
+        # `budget_reservations.task_id` is NOT NULL and its kind is the lane the
+        # promise is held against, and a session has neither. What it spends is
+        # still counted against the Program, which is `program_budget`'s sum
+        # over every run and not only the ones that held a Task.
+        self.assertEqual(0, int(str(self.opened_row["reservations"])))
+
+    def test_no_connection_a_model_reaches_through_can_choose(self):
+        # The revoke is the load-bearing half of the grant: `record_choice`
+        # writes a pick, and a model that could call it directly would be
+        # committing its own choice without the Slate ever being consulted.
+        reachable = [
+            str(row["proname"])
+            for row in self.as_owner(
+                "SELECT p.proname FROM pg_proc p"
+                " WHERE p.pronamespace = 'public'::regnamespace"
+                "   AND p.proname IN ('open_orchestrator_session','record_choice')"
+                "   AND has_function_privilege('rk2_state', p.oid, 'EXECUTE')"
+            ).dicts()
+        ]
+        self.assertEqual([], reachable)
+
+    def test_the_runtime_holds_both_verbs(self):
+        self.assertEqual(
+            2,
+            int(
+                self.scalar(
+                    "SELECT count(*) FROM pg_proc p"
+                    " WHERE p.pronamespace = 'public'::regnamespace"
+                    "   AND p.proname IN ('open_orchestrator_session','record_choice')"
+                    "   AND has_function_privilege('rk2_runtime', p.oid, 'EXECUTE')"
+                )
+            ),
+        )
+
+    # -- criterion 3: the claim, not the answer, decides -----------------------
+
+    def test_a_choice_the_slate_carries_is_the_task_the_claim_takes(self):
+        self.assertNotEqual(str(self.chose_slate[0]["task_label"]), self.wanted)
+        self.assertEqual(self.wanted, self.chose_claimed)
+        self.assertEqual(
+            {"outcome": "chosen", "task": self.wanted, "offered_task": self.wanted,
+             "agent_run": self.opened["label"],
+             "detail": "the second entry reads better"},
+            self.chose_payload,
+        )
+
+    def test_a_label_the_slate_no_longer_carries_claims_nothing(self):
+        # ADR 0003 is explicit that a stale choice is refused and not
+        # substituted: falling through to entry one here would be the runtime
+        # answering the question it was told the model owns.
+        for payload in (self.off_slate_payload, self.expired_payload):
+            with self.subTest(detail=str(payload["detail"])[:40]):
+                self.assertEqual("off_slate", payload["outcome"])
+                self.assertIsNone(payload["task"])
+        self.assertEqual(0, self.picks_after_off_slate)
+        self.assertIn("is not on the current slate", str(self.off_slate_payload["detail"]))
+        self.assertIn("expired after", str(self.expired_payload["detail"]))
+
+    def test_the_three_silences_leave_the_slate_to_the_runtimes_own_walk(self):
+        self.assertEqual(0, self.picks_after_silence)
+        self.assertEqual(str(self.silent_slate[0]["task_label"]), self.silent_walk)
+
+    # -- criterion 4: the kind selects the role, and the role loads the Skill ---
+
+    def test_a_task_whose_role_cannot_load_its_skill_is_not_claimable(self):
+        self.assertEqual(
+            {self.skilled_hunt: None, self.skilled_recon: "skill_not_granted_to_role"},
+            self.skilled_verdicts,
+        )
+
+    def test_the_offer_leaves_it_out_and_the_walk_passes_over_it(self):
+        self.assertEqual([self.skilled_hunt], self.skilled_slate)
+        self.assertEqual(self.skilled_hunt, self.skilled_walk)
+
+    def test_the_grant_is_read_from_the_role_that_runs_the_kind(self):
+        # The rule joins `role_skills` through `role_task_kinds`, so what makes
+        # the hunt Task admissible is that the one role running `hunt` holds
+        # the Skill -- not that some role somewhere does.
+        self.assertEqual(
+            [("web_hunter", "hunt")],
+            [
+                (str(row["role"]), str(row["kind"]))
+                for row in self.as_owner(
+                    "SELECT rs.role, m.kind FROM role_skills rs"
+                    "  JOIN role_task_kinds m ON m.role = rs.role"
+                    " WHERE rs.skill_name = $1 ORDER BY rs.role, m.kind",
+                    (IDENTITY_SKILL,),
+                ).dicts()
+            ],
+        )
+
+    # -- criterion 5: the dispatch acts on the claim, not on the answer --------
+
+    def test_the_claim_leaves_the_lease_and_the_promise_of_the_task_chosen(self):
+        row = self.chose_dispatch
+        self.assertEqual(
+            (self.wanted, "claimed", self.wanted, "recon"),
+            (
+                str(row["task"]),
+                str(row["status"]),
+                str(row["reserved_task"]),
+                str(row["reserved_kind"]),
+            ),
+        )
+        self.assertEqual((True, True), (row["leased"], row["reserved_tokens"]))
+
+    def test_a_choice_cannot_be_recorded_against_another_programs_session(self):
+        self.assertIn("is not this Program's", self.other_programs_session)
+
+    def test_a_run_that_holds_a_task_is_not_a_session_to_choose_in(self):
+        self.assertIn("is not a Task-less orchestrator session", self.worker_session)
+
+    def test_a_refusal_leaves_no_run_and_moves_no_task(self):
+        self.assertEqual((1, 2), self.refused_counts)
+
+    # -- criterion 6: deterministic, safe and auditable ------------------------
+
+    def test_an_outcome_the_runtime_has_no_branch_for_is_refused(self):
+        self.assertIn(
+            "a choice is chosen, no_choice, malformed or unavailable", self.unknown_outcome
+        )
+
+    def test_only_a_chosen_outcome_names_a_task(self):
+        for refused in (self.chosen_without_label, self.silent_with_label):
+            with self.subTest(refused=refused[:40]):
+                self.assertIn("only a chosen outcome names a task", refused)
+
+    def test_every_answer_writes_one_choice_naming_its_session(self):
+        recorded = self.chose_events + self.refused_events + self.silent_events
+        self.assertEqual(
+            ["chosen", "off_slate", "off_slate", "no_choice", "malformed", "unavailable"],
+            [entry["payload"]["outcome"] for entry in recorded],
+        )
+        for entry in recorded:
+            with self.subTest(outcome=entry["payload"]["outcome"]):
+                self.assertEqual("orchestrator", entry["role"])
+                self.assertEqual(False, entry["holds_task"])
+                self.assertEqual(entry["run"], entry["payload"]["agent_run"])
+
+    def test_the_actor_is_the_model_except_where_no_model_ran(self):
+        self.assertEqual(
+            {"no_choice": "llm", "malformed": "llm", "unavailable": "runtime"},
+            {
+                entry["payload"]["outcome"]: entry["actor"]
+                for entry in self.silent_events
+            },
+        )
+        self.assertEqual(
+            {"llm"}, {entry["actor"] for entry in self.chose_events + self.refused_events}
+        )
+
+    def test_a_downgraded_choice_still_says_what_was_asked_for(self):
+        # The label is kept in `offered_task` and cleared from `task`, so a run
+        # that chose and could not be committed reads back as one that chose.
+        self.assertEqual("T99", self.off_slate_payload["offered_task"])
+        self.assertIsNone(self.off_slate_payload["task"])
+
+    def test_what_the_silent_answers_recorded_is_what_the_runtime_said(self):
+        self.assertEqual(
+            {"no_choice": None, "malformed": "2 pick(s) carried no task label",
+             "unavailable": "no session answered"},
+            {
+                outcome: payload["detail"]
+                for outcome, payload in self.silent_payloads.items()
+            },
+        )
+        for outcome, payload in self.silent_payloads.items():
+            with self.subTest(outcome=outcome):
+                self.assertEqual(outcome, payload["outcome"])
+                self.assertIsNone(payload["task"])
+                self.assertIsNone(payload["offered_task"])
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = $1",
+            ("orchestrator_dispatch",),
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
+            ("orchestrator_dispatch",),
         ).rows
 
         self.assertEqual(1, int(registered[0]))

@@ -58,6 +58,12 @@ RUNS_AS = (SESSION, SUBAGENT, RENDERER)
 #: name, and the only role that starts another is the orchestrator.
 RUNTIME = "runtime"
 
+#: The one role that chooses rather than executes. Named because two other
+#: modules have to start it by name -- the runtime opens a session as it, and
+#: the checks below say what it may hold -- and a role spelled out at each of
+#: those is a role that can be renamed in two places out of three.
+ORCHESTRATOR = "orchestrator"
+
 #: The task-kind vocabulary of migration 0019. Held here so the compile can
 #: check the mapping is total and injective without a database.
 TASK_KINDS = ("recon", "hunt", "analyze", "validate", "report")
@@ -846,6 +852,16 @@ ROLES: dict[str, Role] = {
     ),
 }
 
+#: Which role runs a Task of each kind, as one lookup rather than a walk over
+#: every role's `task_kinds`. Filled by `_check_task_kinds` at import, because
+#: it is that check that makes the mapping a function at all: the kind side is
+#: total and injective, so exactly one role answers for each kind and a
+#: dispatcher has nothing left to choose. Migration 0019's `role_task_kinds` is
+#: the same statement with a unique index on `kind`, and the claim reads it to
+#: decide the role -- so this is what a runtime checks the claim's answer
+#: against, never a second place to decide it.
+ROLE_FOR_KIND: dict[str, str] = {}
+
 #: A cap across roles as well as within them. The per-role numbers can each be
 #: under their own ceiling while the sum is more concurrent work than one
 #: program's budget or one machine's containers can carry.
@@ -1379,16 +1395,25 @@ def _check_roles(measured: Mapping[str, Any]) -> None:
 
 
 def _check_task_kinds() -> None:
-    """The role-to-kind mapping is the schema's: total on kinds, injective."""
-    owner: dict[str, str] = {}
+    """The role-to-kind mapping is the schema's: total on kinds, injective.
+
+    It publishes `ROLE_FOR_KIND` as it goes rather than beside it. The two
+    properties are exactly what makes the mapping a lookup -- injective, so
+    there is one answer, and total, so there is one for every kind -- and a
+    dictionary built anywhere else would collapse a duplicate silently into the
+    answer this check exists to refuse.
+    """
+    ROLE_FOR_KIND.clear()
     for name, role in ROLES.items():
         for kind in role.task_kinds:
             if kind not in TASK_KINDS:
                 raise RosterError(f"{name}: {kind} is not a task kind")
-            if kind in owner:
-                raise RosterError(f"{kind} is executed by both {owner[kind]} and {name}")
-            owner[kind] = name
-    orphaned = sorted(set(TASK_KINDS) - set(owner))
+            if kind in ROLE_FOR_KIND:
+                raise RosterError(
+                    f"{kind} is executed by both {ROLE_FOR_KIND[kind]} and {name}"
+                )
+            ROLE_FOR_KIND[kind] = name
+    orphaned = sorted(set(TASK_KINDS) - set(ROLE_FOR_KIND))
     if orphaned:
         raise RosterError(f"task kinds no role executes: {orphaned}")
 
@@ -1463,7 +1488,7 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
 
 def _check_authority() -> None:
     """The three sentences the ticket makes about who holds what, as checks."""
-    orchestrator = ROLES["orchestrator"]
+    orchestrator = ROLES[ORCHESTRATOR]
     if not {"sched.pick", "state.read"}.issubset(orchestrator.tool_groups):
         raise RosterError("the orchestrator schedules and reads state")
     if {"net.request", "exec.tool_run"} & set(orchestrator.tool_groups):
