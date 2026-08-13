@@ -85,6 +85,7 @@ from redkraken.outcome import (
 from redkraken.store import Store
 from tests.fixtures import (
     EXPORTED,
+    FIRST,
     PINNED,
     ROLE,
     SCOPE_ENTITIES,
@@ -95,6 +96,7 @@ from tests.fixtures import (
     Target,
     boundary,
     counterparty,
+    latched,
     scratch,
     startup_refusal,
     tls_counterparty,
@@ -8263,11 +8265,6 @@ AFFORDABLE = budgets(
 )
 
 
-#: "Whatever you offered me first", as a value a test can pass. `None` is
-#: already a choice a session can make -- naming nothing -- so the default
-#: cannot be spelled that way without making the two indistinguishable.
-FIRST = object()
-
 
 class Child:
     """A launcher that spends the capability it was handed, and reports back.
@@ -8336,19 +8333,12 @@ class Child:
     def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
         """What the orchestrator session answers: one pick, or nothing.
 
-        `picks` is what this child would call `pick_task` with -- `FIRST` for
-        the first entry it was offered, a label for one it names itself, and
-        `None` for a session that chooses nothing at all. Every one of them goes
-        through the same latch, so what comes back is what the tool would have
+        The pick goes through `fixtures.latched`, which is the latch a served
+        `pick_task` writes into, so what comes back is what the tool would have
         returned rather than what this fixture would like it to be.
         """
         self.choices.append(request)
-        latch = _launch.Choice(request.slate)
-        wanted = self.picks
-        if wanted is FIRST:
-            wanted = latch.offered[0] if latch.offered else None
-        if wanted is not None:
-            latch.pick({"task_label": wanted})
+        latch = latched(request.slate, self.picks)
         return agent.AgentRunResult(
             agent_run_id=request.agent_run_id,
             role=request.role,

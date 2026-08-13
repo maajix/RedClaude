@@ -186,6 +186,26 @@ PLANNING = (
     "runtime claims the first entry that still holds."
 )
 
+#: The one outcome word no `scheduler.chose` row ever carries. `record_choice`
+#: writes five; this is the sixth, and it exists for the case where the write
+#: itself did not happen -- a session named a Task and the database refused the
+#: statement that would have made it the outstanding pick.
+#:
+#: It is a word rather than a `None` because the two are opposite instructions.
+#: Nothing recorded and nothing chosen is what the fallback walk answers; a
+#: choice that was made and could not be committed is a choice this pass may
+#: neither honour nor replace, which is the distinction below.
+UNRECORDED = "unrecorded"
+
+#: The outcomes a pass stops on, and what the hold says about each. ADR 0003 is
+#: explicit that a stale or off-Slate choice is refused and not substituted, and
+#: claiming after either of these would substitute one: the runtime's walk is
+#: the answer to "nobody chose", never to "the choice was refused".
+REFUSED = {
+    "off_slate": "this Slate no longer carries",
+    UNRECORDED: "could not be committed",
+}
+
 #: What was claimed, read back through the Agent run the claim created rather
 #: than assembled from what this process asked for. The claim is the database's
 #: decision -- which Task, which role, which model -- and a runtime that
@@ -201,7 +221,10 @@ PLANNING = (
 #: first run is `AR1`. This connection is the runtime's, which sees every
 #: Program, so a lookup on the label alone reads back whichever `AR1` the
 #: planner reached first -- and the attempt would then be opened against another
-#: Program's run.
+#: Program's run. The Task is joined on the same Program for the other half of
+#: criterion 5: a run of one Program holding a Task of another is a substitution
+#: nothing downstream could notice, so this read answers with no row at all and
+#: the claim is reported as one that opened nothing.
 #:
 #: The cross-role subagent cap comes back with the run for the same reason the
 #: Lease TTL is read rather than assumed: it is a column on the one active
@@ -231,7 +254,7 @@ STARTED = (
     " (SELECT br.tokens FROM budget_reservations br"
     "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL)"
     " FROM agent_runs ar"
-    " JOIN tasks t ON t.id = ar.task_id"
+    " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
@@ -375,6 +398,9 @@ class Chosen:
     word it can change is `chosen` into `off_slate` -- which it does when the
     Slate no longer carries the label. So a label is here only when a pick was
     actually written, and everything else falls back to the runtime's own walk.
+    The exception is `UNRECORDED`, which is the runtime's own and says that no
+    row was written at all; it falls back to nothing, because a choice nobody
+    recorded is still a choice this pass has no right to replace.
 
     `task_label` is what the session named even where the outcome refused it.
     A refusal that forgot the label would leave an operator asking why nothing
@@ -390,8 +416,15 @@ class Chosen:
 
     @property
     def committed(self) -> bool:
-        """Whether a pick was written, and therefore what the claim must take."""
-        return self.outcome == "chosen" and self.task_label is not None
+        """Whether a pick was written, and therefore what the claim must take.
+
+        The word alone, without also asking whether a label came back with it:
+        `record_choice` refuses `chosen` with no label, so the two can only
+        disagree if the database stopped meaning what it says -- and then the
+        pair of them is exactly what the assertion below should be failing on
+        rather than quietly passing over.
+        """
+        return self.outcome == "chosen"
 
     def facts(self) -> dict:
         return {
@@ -401,6 +434,41 @@ class Chosen:
             "attempts": self.attempts,
             "detail": self.detail,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """The Task-less Agent run one decision is made in.
+
+    `open_orchestrator_session` answers with the run and with the two ceilings
+    the child has no database to read for itself, and each step of the decision
+    needs a different few of them -- the label to report by, the id to record
+    and to close against, the caps to start the child under. One value rather
+    than the same four parameters threaded through four methods, which is the
+    reason `Claimed` is one value and not twelve.
+
+    The caps are resolved here rather than at the point of use so that the
+    defaulting happens once: a Program that stated no token ceiling and a
+    weights row read before this ticket existed are both answers this runtime
+    has to turn into a number, and turning them into one twice is how the child
+    comes to be started under a cap the record does not show.
+    """
+
+    agent_run_id: str
+    label: str
+    subagent_cap: int
+    token_cap: int | None
+
+    @classmethod
+    def from_row(cls, row: dict) -> Session:
+        return cls(
+            agent_run_id=str(row.get("agent_run")),
+            label=str(row.get("label")),
+            subagent_cap=int(row.get("subagent_cap") or roster.DEFAULT_SUBAGENTS),
+            token_cap=(
+                None if row.get("token_cap") is None else int(row["token_cap"])
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,15 +771,18 @@ class Slice:
         chosen = self._choose(ledger, connection, program_id, offered)
         if chosen is not None:
             facts["choice"] = chosen.facts()
-        # An off-Slate choice is where the pass stops. ADR 0003 is explicit that
-        # a stale or off-Slate choice is refused and not substituted, and
-        # claiming here would substitute one: the runtime's walk is the answer
-        # to "nobody chose", not to "the choice was refused".
-        if chosen is not None and chosen.outcome == "off_slate":
+        # A choice the runtime cannot honour is where the pass stops, and both
+        # ways of not honouring one stop it the same way: `off_slate` because
+        # the entry went while the model was thinking, `UNRECORDED` because the
+        # write that would have made it the outstanding pick did not happen.
+        # `REFUSED` says which, and the reason it is one branch rather than two
+        # is that the walk below is the answer to "nobody chose" in both cases
+        # and to "the choice was refused" in neither.
+        if chosen is not None and chosen.outcome in REFUSED:
             ledger.hold(
                 "claim",
-                f"{chosen.agent_run_label} chose {chosen.task_label}, which this Slate "
-                "no longer carries; nothing was claimed",
+                f"{chosen.agent_run_label} chose {chosen.task_label}, which "
+                f"{REFUSED[chosen.outcome]}; nothing was claimed",
             )
             return facts
 
@@ -823,20 +894,18 @@ class Slice:
         if session is None:
             return None
 
-        run_id = str(session.get("agent_run"))
-        label = str(session.get("label"))
-        result = self._planner(ledger, program_id, run_id, label, session, offered)
+        result = self._planner(ledger, program_id, session, offered)
         outcome, task, detail = self._answered(result)
         try:
-            return self._record(ledger, connection, run_id, label, outcome, task, detail, result)
+            return self._record(ledger, connection, session, outcome, task, detail, result)
         finally:
             # In a `finally` for the reason the attempt's closing is: this run
             # holds no Task and no reservation, but it does hold an open row
             # that the next pass's reconciliation would otherwise have to reap,
             # and its tokens are not counted against the Program until it closes.
-            self._close_session(ledger, connection, run_id, label, result)
+            self._close_session(ledger, connection, session, result)
 
-    def _session(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
+    def _session(self, ledger: Ledger, connection: pg.Connection) -> Session | None:
         """The Task-less Agent run this decision is made in, or nothing.
 
         A failure here is reported and is not the pass failing. The one thing
@@ -845,7 +914,9 @@ class Slice:
         try:
             with connection.transaction():
                 _actor(connection)
-                return proxy.as_object(connection.execute(OPEN_SESSION).scalar())
+                return Session.from_row(
+                    proxy.as_object(connection.execute(OPEN_SESSION).scalar())
+                )
         except pg.DatabaseError as error:
             ledger.fail(
                 "choice",
@@ -859,9 +930,7 @@ class Slice:
         self,
         ledger: Ledger,
         program_id: str,
-        run_id: str,
-        label: str,
-        session: Mapping[str, object],
+        session: Session,
         offered: list[dict],
     ) -> agent.AgentRunResult | None:
         """The one child that chooses, started with the Slate and no capability.
@@ -880,7 +949,7 @@ class Slice:
         if mission is None:
             return None
         request = agent.AgentRunRequest(
-            agent_run_id=run_id,
+            agent_run_id=session.agent_run_id,
             objective=PLANNING.format(count=len(offered)),
             container=self.boundary,
             role=roster.ORCHESTRATOR,
@@ -888,10 +957,8 @@ class Slice:
             packet=mission,
             egress=None,
             timeout=self.timeout,
-            subagent_cap=int(session.get("subagent_cap") or roster.DEFAULT_SUBAGENTS),
-            token_cap=(
-                None if session.get("token_cap") is None else int(session["token_cap"])
-            ),
+            subagent_cap=session.subagent_cap,
+            token_cap=session.token_cap,
             slate=tuple(offered),
         )
         try:
@@ -913,7 +980,8 @@ class Slice:
         except RuntimeError as error:
             ledger.fail(
                 "choice",
-                f"{label} left no account of the choice it was asked to make: {error}",
+                f"{session.label} left no account of the choice it was asked to make: "
+                f"{error}",
                 code=INTEGRITY_FAILED,
                 source="agent",
             )
@@ -945,8 +1013,7 @@ class Slice:
         self,
         ledger: Ledger,
         connection: pg.Connection,
-        run_id: str,
-        label: str,
+        session: Session,
         outcome: str,
         task: str | None,
         detail: str | None,
@@ -959,24 +1026,43 @@ class Slice:
         was sent instead would miss the only word it can change -- the
         downgrade to `off_slate` -- and the pass would claim a Task the choice
         was refused for.
+
+        A write that failed is the one case this runtime answers for itself, and
+        it answers `UNRECORDED` rather than nothing. Nothing would let the
+        fallback walk take entry one on behalf of a session that named a
+        different Task, which is a substitution however the write failed -- and
+        the substituted Task would run with the choice that lost to it nowhere
+        in the record. Only a session that named a Task has anything to refuse:
+        one that named none is exactly what the walk is the answer to.
         """
         try:
             with connection.transaction():
                 _actor(connection)
                 recorded = proxy.as_object(
-                    connection.execute(CHOICE, (run_id, outcome, task, detail)).scalar()
+                    connection.execute(
+                        CHOICE, (session.agent_run_id, outcome, task, detail)
+                    ).scalar()
                 )
         except pg.DatabaseError as error:
             ledger.fail(
                 "choice",
-                f"the choice {label} made could not be recorded: {error}",
+                f"the choice {session.label} made could not be recorded: {error}",
                 code=INTEGRITY_FAILED,
                 source="database",
             )
-            return None
+            if task is None:
+                return None
+            return Chosen(
+                agent_run_id=session.agent_run_id,
+                agent_run_label=session.label,
+                outcome=UNRECORDED,
+                task_label=task,
+                attempts=0 if result is None else result.pick_attempts,
+                detail=str(error),
+            )
         chosen = Chosen(
-            agent_run_id=run_id,
-            agent_run_label=label,
+            agent_run_id=session.agent_run_id,
+            agent_run_label=session.label,
             outcome=str(recorded.get("outcome")),
             task_label=(
                 None if recorded.get("offered_task") is None
@@ -987,7 +1073,7 @@ class Slice:
         )
         ledger.hold(
             "choice",
-            f"{label} answered {chosen.outcome}"
+            f"{session.label} answered {chosen.outcome}"
             + (f" ({chosen.task_label})" if chosen.task_label else "")
             + f" after {chosen.attempts} pick(s)",
         )
@@ -997,8 +1083,7 @@ class Slice:
         self,
         ledger: Ledger,
         connection: pg.Connection,
-        run_id: str,
-        label: str,
+        session: Session,
         result: agent.AgentRunResult | None,
     ) -> None:
         """Close the session that chose, and charge the Program what it spent.
@@ -1013,7 +1098,7 @@ class Slice:
                 connection.execute(
                     FINISH,
                     (
-                        run_id,
+                        session.agent_run_id,
                         "aborted" if result is None else stopped_as(result.stop_reason),
                         None if result is None else result.input_tokens,
                         None if result is None else result.output_tokens,
@@ -1022,7 +1107,7 @@ class Slice:
         except pg.DatabaseError as error:
             ledger.fail(
                 "choice",
-                f"the orchestrator session {label} could not be closed: {error}",
+                f"the orchestrator session {session.label} could not be closed: {error}",
                 code=INTEGRITY_FAILED,
                 source="database",
             )

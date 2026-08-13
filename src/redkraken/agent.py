@@ -136,13 +136,24 @@ SERVED = tuple(
     )
 )
 
-for _group, _members in SERVED_MEMBERS.items():
-    if _group in SERVED_GROUPS:
-        raise roster.RosterError(f"{_group} is served whole and in part")
-    if not set(_members) <= set(roster.TOOL_GROUPS.get(_group, ())):
-        raise roster.RosterError(
-            f"{_group} does not contain every tool this launch serves out of it"
-        )
+def _check_served_members() -> None:
+    """A group served in part is served out of a group that has those tools.
+
+    A function rather than a loop at module scope, which is `roster`'s own
+    convention for the same kind of statement: the loop's variables would
+    outlive it as module attributes, and a name this module exports by accident
+    is one another module can come to read.
+    """
+    for group, members in SERVED_MEMBERS.items():
+        if group in SERVED_GROUPS:
+            raise roster.RosterError(f"{group} is served whole and in part")
+        if not set(members) <= set(roster.TOOL_GROUPS.get(group, ())):
+            raise roster.RosterError(
+                f"{group} does not contain every tool this launch serves out of it"
+            )
+
+
+_check_served_members()
 
 #: The bare tool names, which is what the MCP server registers. The SDK
 #: prefixes `mcp__<server>__` on the way out, so these two lists are the same

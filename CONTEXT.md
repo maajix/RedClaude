@@ -156,7 +156,16 @@ Recorded whatever it turned out to be — a label, a label the Slate no longer
 carries, or nothing — because a pass that claimed nothing still has to say why.
 A request and not a decision: the claim re-asks every eligibility condition, and
 a stale choice is refused rather than replaced.
-_Avoid_: Selection, vote, assignment, dispatch
+_Avoid_: Selection, vote, assignment (a Choice is what was answered; the
+Dispatch is what the runtime then does about it)
+
+**Dispatch**:
+The runtime's act of starting an agent run from a committed claim, with that
+claim's Leases and reservations and no others. It is bounded on both sides: the
+Task is the one the claim wrote, and the role is the one the roster gives that
+Task's kind. Never the model's: a Choice asks for a Task, and this is the step
+that either happens against exactly that Task or does not happen.
+_Avoid_: Launch, schedule, assignment, handoff
 
 **Roster**:
 The closed statement of every role this harness runs and what each one may call,

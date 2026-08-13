@@ -34,6 +34,14 @@ states, and returns the two ceilings the child has no database to read: the
 cross-role subagent cap from the active weights and the Program's per-run token
 ceiling.
 
+One session per pass, and not the long-lived one ADR 0003's first consequence
+describes ("recomputed every time a slot frees inside one long orchestrator
+session"). The deviation is deliberate and is ticket 28's subject: a session
+that outlives a pass has to survive a restart, and rotation and resume are what
+28 builds. Until then a session that ends with the pass leaves nothing for a
+crash to strand, which is the weaker property but the one this ticket can hold
+on its own.
+
 No Task, and that is the whole shape of it. `agent_runs.executes_tasks` is
 generated from `task_id IS NOT NULL` and joined to `roles(role, executes_tasks)`
 by a foreign key, so a planning session that held a Task would be refused by the
@@ -66,6 +74,14 @@ run with no Task is a case that verb already answers.
   or a child that died. The one outcome whose `actor_kind` is `runtime`, because
   it is the runtime's own finding and not a model's.
 
+There is a sixth word, `UNRECORDED`, and no row ever carries it. It is what
+`_record` answers with when the write itself failed and the session had named a
+Task: nothing is outstanding, so there is nothing to honour, and falling back
+would let the walk claim entry one in place of a Task a model actually chose.
+The three silences are unaffected -- a session that named nothing is exactly
+what the walk answers -- so the runtime refuses only where it has a choice to
+refuse.
+
 `off_slate` is the only word the caller cannot send. The runtime offers `chosen`
 and the database downgrades it, inside the handler that catches `pick_task`'s
 refusal, because the database is the authority on what the current Slate carries
@@ -88,8 +104,11 @@ skill a role lacks is a load-time error, not a runtime escalation" -- and
 requirement was admitted anyway, claimed, dispatched, and discovered at load
 time inside a child that had already spent its startup.
 
-`claimable_for` gains one arm, `skill_not_granted_to_role`, joining `role_skills`
-through `role_task_kinds`. It sits after `no_role_runs_this_kind` because it
+`claimable_for` gains one arm, `skill_not_granted_to_role`, which asks
+`skills_ungranted_for(tasks)` -- a predicate of its own because the standing
+check asks the same question of the rows the rule produced, and two copies of
+one join is how a check comes to pass while asserting less than the rule
+enforces. It sits after `no_role_runs_this_kind` because it
 presupposes it: with no role for the kind there is no grant to look for. The
 first half of the criterion was already structural -- `role_task_kinds` is unique
 on kind, so a Task's kind selects one role and there is nothing to reject.
@@ -114,17 +133,36 @@ process refusing outright would be it deciding an outcome only the database can
 decide.
 
 `_dispatchable` is the last statement before a child is started with a Lease and
-a reservation. It asserts the two invariants criterion 5 names: the committed
-choice and the claimed Task are the same Task, and the claimed role is the one
-`roster.ROLE_FOR_KIND` gives that kind. Both are the database's already, so
-neither is expected to fire; an invariant nothing asserts is a claim about the
-code rather than about the run.
+a reservation. It asserts two of the three things criterion 5 names: the
+committed choice and the claimed Task are the same Task, and the claimed role is
+the one `roster.ROLE_FOR_KIND` gives that kind. Both are the database's already,
+so neither is expected to fire; an invariant nothing asserts is a claim about
+the code rather than about the run.
+
+The third, the Program, is bound in the read rather than in Python, because that
+is where it can be bound completely: `STARTED` matches the Agent run on the
+Program as well as the label -- a label is a per-Program counter, so every
+Program has an `AR1` -- and joins the Task on the same Program again. A run of
+one Program holding a Task of another therefore describes no row at all, and
+there is no `Claimed` for a later assertion to be made about. An equality in
+`_dispatchable` would be the weaker statement: it could only compare what this
+same read had already returned.
+
+### What the record does not cover
+
+Two paths leave a Ledger entry and no `scheduler.chose` Event, and both are the
+same shape: there is no Agent run to attribute one to. A session that could not
+be opened has no row, and `unavailable` -- the word for "no session answered" --
+is written *against* a session, so there is nothing to write it on. A
+`record_choice` that failed has a row but the write is what failed. Auditability
+in both is the Ledger's, which is where a pass that could not reach the database
+has to report anyway.
 
 ### The check
 
 `check_orchestrator_dispatch()` has six arms. Two are textual and guard code:
-`claimable_for` still asking `role_skills`, and neither new verb executable by
-`rk2_state`. Four are about rows: an outstanding Slate entry whose Skills its
+the chain `claimable_for` -> `skills_ungranted_for` -> `role_skills` still being
+asked link by link, and neither new verb executable by `rk2_state`. Four are about rows: an outstanding Slate entry whose Skills its
 role cannot load, a session that recorded a choice and also opened a request to
 a target, a recorded choice naming no Task-less orchestrator session, and a
 recorded choice carrying a sixth outcome word.

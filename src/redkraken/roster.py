@@ -36,6 +36,7 @@ import re
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
+from types import MappingProxyType
 from typing import Any
 
 
@@ -860,7 +861,12 @@ ROLES: dict[str, Role] = {
 #: the same statement with a unique index on `kind`, and the claim reads it to
 #: decide the role -- so this is what a runtime checks the claim's answer
 #: against, never a second place to decide it.
-ROLE_FOR_KIND: dict[str, str] = {}
+#:
+#: Published read-only over the dictionary the check fills, because everything
+#: else this module publishes is a tuple and a caller that could write to this
+#: one would be editing the compiled roster from outside the compile.
+_ROLE_FOR_KIND: dict[str, str] = {}
+ROLE_FOR_KIND: Mapping[str, str] = MappingProxyType(_ROLE_FOR_KIND)
 
 #: A cap across roles as well as within them. The per-role numbers can each be
 #: under their own ceiling while the sum is more concurrent work than one
@@ -1403,17 +1409,17 @@ def _check_task_kinds() -> None:
     dictionary built anywhere else would collapse a duplicate silently into the
     answer this check exists to refuse.
     """
-    ROLE_FOR_KIND.clear()
+    _ROLE_FOR_KIND.clear()
     for name, role in ROLES.items():
         for kind in role.task_kinds:
             if kind not in TASK_KINDS:
                 raise RosterError(f"{name}: {kind} is not a task kind")
-            if kind in ROLE_FOR_KIND:
+            if kind in _ROLE_FOR_KIND:
                 raise RosterError(
-                    f"{kind} is executed by both {ROLE_FOR_KIND[kind]} and {name}"
+                    f"{kind} is executed by both {_ROLE_FOR_KIND[kind]} and {name}"
                 )
-            ROLE_FOR_KIND[kind] = name
-    orphaned = sorted(set(TASK_KINDS) - set(ROLE_FOR_KIND))
+            _ROLE_FOR_KIND[kind] = name
+    orphaned = sorted(set(TASK_KINDS) - set(_ROLE_FOR_KIND))
     if orphaned:
         raise RosterError(f"task kinds no role executes: {orphaned}")
 

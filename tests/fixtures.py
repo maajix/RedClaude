@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _startup, agent, isolation, tls
+from redkraken import _launch, _startup, agent, isolation, tls
 
 
 VALID = """\
@@ -678,6 +678,32 @@ def unlatched():
     """
     with mock.patch.object(agent, "_LATCH", None):
         yield
+
+
+#: What a launcher fixture's `picks` means when nobody said: the first entry on
+#: offer. A sentinel rather than `None`, because `None` is already an answer --
+#: a session that called no tool and chose nothing -- and the two would
+#: otherwise be the same fixture.
+FIRST = object()
+
+
+def latched(slate, picks: object = FIRST) -> _launch.Choice:
+    """The latch a real child picks through, after it has picked.
+
+    Shared by both launcher fixtures, which answer a session the same way and
+    differ only in how they build the result around it. `_launch.Choice` is
+    what the served tool writes into, so a fixture that set `choice` on the
+    result directly would be reporting a pick no tool ever accepted.
+
+    `picks` is what the child calls `pick_task` with: `FIRST` for the first
+    entry it was offered, a label for one it names itself, `""` for a call that
+    carried no label at all, and `None` for a session that calls nothing.
+    """
+    latch = _launch.Choice(slate)
+    wanted = (latch.offered[0] if latch.offered else None) if picks is FIRST else picks
+    if wanted is not None:
+        latch.pick({"task_label": wanted})
+    return latch
 
 
 def scratch() -> Path:

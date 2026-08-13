@@ -256,6 +256,30 @@ COMMENT ON FUNCTION record_choice(uuid, text, text, text) IS
 -- database's own grant list, the one `playbooks_admissible` and 0035's promotion
 -- rule already decide by, and the claim has to decide by what the harness has
 -- registered rather than by what a compiled document hopes exists.
+--
+-- Its own function because two statements ask it: the admission rule below and
+-- the standing check's arm (b), which asks the same question of the rows the
+-- rule produced. Written twice, the check would pass while quietly asking a
+-- narrower question than the rule enforces -- and the two are meant to disagree
+-- about nothing at all. `required_skills` defaults to `'{}'`, so a Task that
+-- requires none unnests to no rows and is never ungranted.
+CREATE FUNCTION skills_ungranted_for(t tasks) RETURNS boolean
+LANGUAGE sql STABLE AS $fn$
+    SELECT EXISTS (SELECT 1 FROM unnest(t.required_skills) AS s
+                    WHERE NOT EXISTS (SELECT 1 FROM role_skills rs
+                                        JOIN role_task_kinds m ON m.role = rs.role
+                                       WHERE m.kind = t.kind AND rs.skill_name = s));
+$fn$;
+
+COMMENT ON FUNCTION skills_ungranted_for(tasks) IS
+    'True when this Task requires a Skill the one role that runs its kind was '
+    'never granted. The claim refuses on it and the standing check reports on '
+    'it, so the rule the offer applies and the property the check asserts are '
+    'one statement rather than two that can drift apart.';
+
+REVOKE ALL ON FUNCTION skills_ungranted_for(tasks) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION skills_ungranted_for(tasks) TO rk2_runtime;
+
 CREATE OR REPLACE FUNCTION claimable_for(t tasks, w scheduler_weights) RETURNS text
 LANGUAGE plpgsql STABLE AS $fn$
 DECLARE v text;
@@ -287,12 +311,7 @@ BEGIN
         RETURN 'no_role_runs_this_kind';
     END IF;
 
-    IF EXISTS (SELECT 1 FROM unnest(t.required_skills) AS s
-                WHERE NOT EXISTS (SELECT 1 FROM role_skills rs
-                                    JOIN role_task_kinds m ON m.role = rs.role
-                                   WHERE m.kind = t.kind AND rs.skill_name = s)) THEN
-        RETURN 'skill_not_granted_to_role';
-    END IF;
+    IF skills_ungranted_for(t) THEN RETURN 'skill_not_granted_to_role'; END IF;
 
     IF NOT EXISTS (SELECT 1 FROM scheduler_lane_state s
                     WHERE s.program_id = t.program_id AND s.kind = t.kind
@@ -358,28 +377,29 @@ END $$;
 CREATE FUNCTION check_orchestrator_dispatch()
 RETURNS TABLE (problem text, subject text, detail text)
 LANGUAGE sql STABLE AS $fn$
-    -- (a) criterion 4, against the rule that carries it. A `claimable_for` that
-    --     stopped asking `role_skills` is one that admits work no role can run,
-    --     and the Task would fail inside a child that had already started.
-    SELECT 'skill_rule_not_shared', p.proname::text,
+    -- (a) criterion 4, against the rule that carries it, as a chain of two: the
+    --     admission rule has to ask the skill predicate, and the skill predicate
+    --     has to ask the grants. Either link cut is a `claimable_for` that
+    --     admits work no role can run, and the Task would fail inside a child
+    --     that had already started.
+    SELECT 'skill_rule_not_shared', asked.fn,
            'the admission rule decides without asking which role may load the Task''s Skills'
-      FROM pg_proc p
-     WHERE p.pronamespace = 'public'::regnamespace
-       AND p.proname = 'claimable_for'
-       AND p.prosrc !~ 'role_skills'
+      FROM (VALUES ('claimable_for'::text, 'skills_ungranted_for'::text),
+                   ('skills_ungranted_for', 'role_skills')) AS asked(fn, asks)
+      JOIN pg_proc p ON p.proname = asked.fn
+                    AND p.pronamespace = 'public'::regnamespace
+     WHERE p.prosrc !~ asked.asks
 
 UNION ALL
     -- (b) the same criterion as an outcome rather than as text: whatever the
     --     rule says, no outstanding Slate entry may be one whose Skills the
-    --     role that would run it cannot load.
+    --     role that would run it cannot load. It asks the same predicate the
+    --     rule asks, so this arm reports on what the offer did rather than on a
+    --     second, hand-copied idea of what it should have done.
     SELECT 'slate_offers_an_unloadable_skill', t.label,
            'an offered Task requires a Skill the one role that runs its kind was never granted'
       FROM task_slate s JOIN tasks t ON t.id = s.task_id
-     WHERE NOT s.consumed
-       AND EXISTS (SELECT 1 FROM unnest(t.required_skills) AS k
-                    WHERE NOT EXISTS (SELECT 1 FROM role_skills rs
-                                        JOIN role_task_kinds m ON m.role = rs.role
-                                       WHERE m.kind = t.kind AND rs.skill_name = k))
+     WHERE NOT s.consumed AND skills_ungranted_for(t)
 
 UNION ALL
     -- (c) the orchestrator holds no egress, stated against the rows rather than

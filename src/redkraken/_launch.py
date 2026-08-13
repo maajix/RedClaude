@@ -300,8 +300,8 @@ DESCRIPTIONS = {
     "get_slate": (
         "List the Tasks this decision may choose between: their kind, subject, "
         "priority, the factors behind it and when the offer stops being good. It is "
-        "the whole of the choice -- the queue behind it is not offered and is not "
-        "yours to reach."
+        "the whole of the choice -- what the runtime did not offer is not yours to "
+        "reach and not yours to name."
     ),
     "pick_task": (
         "Name the one offered Task to run next, by its label. Calling it again "
@@ -507,6 +507,13 @@ def _slate(surface: Surface, choice: Choice):
 
 
 def _pick(surface: Surface, choice: Choice):
+    """The one answer this session gives, latched where the runtime can read it.
+
+    Held in the process rather than sent anywhere, because there is no database
+    on this side of the boundary and a pick is not a claim: what comes back here
+    is a request, and `record_choice` is where it becomes a row -- or does not,
+    if the Slate stopped carrying the label while the model was thinking.
+    """
     name = "pick_task"
 
     @tool(name, DESCRIPTIONS[name], _schema(name))

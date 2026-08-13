@@ -18,7 +18,6 @@ import unittest
 from unittest import mock
 
 from redkraken import (
-    _launch,
     agent,
     execution,
     isolation,
@@ -40,10 +39,10 @@ TOOL_RUN = "44444444-4444-4444-8444-444444444444"
 PROPOSAL = "55555555-5555-4555-8555-555555555555"
 SESSION = "66666666-6666-4666-8666-666666666666"
 
-#: What `Launcher.picks` means when nobody said: the first entry on offer. A
-#: sentinel rather than `None`, because `None` is already an answer -- a session
-#: that called no tool and chose nothing.
-FIRST = object()
+#: What `Launcher.picks` means when nobody said, named here for the tests that
+#: pass it. The sentinel itself is `fixtures`', because the launcher fixture in
+#: `test_database` answers a session with the same walk.
+FIRST = fixtures.FIRST
 
 CAPABILITY = "c0ffee" * 10 + "cafe"
 
@@ -439,22 +438,14 @@ class Launcher:
     def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
         """One session's answer, made through the latch a real child picks with.
 
-        `picks` is what it calls `mcp__rk2__pick_task` with: `FIRST` for the
-        first entry it was offered, a label for one it names itself, `""` for a
-        call that carried no label at all, and `None` for a session that calls
-        nothing. `_launch.Choice` is what a served tool would have answered
-        with, so a fixture that set `choice` directly would be reporting a pick
-        no tool accepted.
+        `planning` is the one thing this adds to the shared walk: a child that
+        died before it could pick anything, which is a different case from one
+        that picked nothing.
         """
         self.choices.append(request)
         if self.planning is not None:
             raise self.planning
-        latch = _launch.Choice(request.slate)
-        wanted = self.picks
-        if wanted is FIRST:
-            wanted = latch.offered[0] if latch.offered else None
-        if wanted is not None:
-            latch.pick({"task_label": wanted})
+        latch = fixtures.latched(request.slate, self.picks)
         return result(
             agent_run_id=request.agent_run_id,
             role=request.role,
@@ -895,12 +886,31 @@ class ChoiceTest(unittest.TestCase):
 
         self.assertEqual([(SESSION, "aborted", None, None)], connection.finished(SESSION))
 
-    def test_a_choice_that_could_not_be_recorded_is_closed_and_reported(self):
+    def test_a_choice_that_could_not_be_recorded_claims_nothing_in_its_place(self):
+        # ADR 0003 refuses a choice it cannot honour rather than replacing it,
+        # and a failed write is one it cannot honour: nothing is outstanding, so
+        # the fallback walk would take entry one on behalf of a session that
+        # named a Task. The session is still closed and the failure reported.
         connection = Recorder(raises={execution.CHOICE: database_error("gone")})
         facts = self.choice(connection)
 
-        self.assertIsNone(facts["choice"])
+        self.assertEqual(
+            (execution.UNRECORDED, "T1"),
+            (facts["choice"]["outcome"], facts["choice"]["task"]),
+        )
+        self.assertIsNone(facts["task"])
+        self.assertNotIn(execution.CLAIM, connection.statements)
         self.assertEqual([(SESSION, "completed", 1200, 300)], connection.finished(SESSION))
+        self.assertEqual(execution.INTEGRITY_FAILED, self.ledger.violations[0].code)
+
+    def test_a_silent_session_whose_record_failed_still_falls_back(self):
+        # The other half of the same rule: a session that named nothing has
+        # nothing to refuse, so a write that failed leaves the pass exactly
+        # where a session that answered `no_choice` would have.
+        connection = Recorder(raises={execution.CHOICE: database_error("gone")})
+        facts = self.choice(connection, Launcher(picks=None))
+
+        self.assertIsNone(facts["choice"])
         self.assertEqual("T1", facts["task"]["label"])
         self.assertEqual(execution.INTEGRITY_FAILED, self.ledger.violations[0].code)
 
