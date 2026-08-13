@@ -1001,6 +1001,17 @@ CONTROLS = (
         " LANGUAGE sql AS $ctl$ SELECT to_jsonb(clock_timestamp()) $ctl$",
     ),
     Control(
+        # A model identifier spelled in SQL. `claude-opus-5` is what one measured
+        # SDK/CLI pair resolves the alias `opus` to, and the manifest that records
+        # the resolution is bound to that pair; a copy in a function body is a
+        # value that goes stale on the day the pair changes, without moving and
+        # without anything reading it noticing. Structural for the same reason
+        # the slate's is: no row is wrong, the text is.
+        "standing:roster_numbers",
+        "CREATE FUNCTION selftest_model_for_role() RETURNS text"
+        " LANGUAGE sql IMMUTABLE AS $ctl$ SELECT 'claude-opus-5'::text $ctl$",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -10877,6 +10888,16 @@ SLATE_SPEND = (40000, 10000)
 #: rather than partially claimed.
 SLATE_CONTENDERS = 4
 
+#: The bytes the analyze scenario's subject was observed through. Any 64 hex
+#: characters do: `artifacts` is content-addressed and nothing on the claim path
+#: hashes anything back, so what `ready_for` asks is that the row exists, is
+#: agent-visible, is unencrypted and is reachable from an Observation.
+ANALYSED_SHA = "7e" * 32
+
+#: What the seeded Findings are findings of. One of 034's seeded classes, chosen
+#: because it is the family the seeded Hypotheses' property class belongs to.
+FINDING_CLASS = "idor"
+
 
 class SlateClaimTest(DatabaseCase):
     """PH2-23: a Slate is offered, and exactly one Task is claimed off it.
@@ -10918,6 +10939,7 @@ class SlateClaimTest(DatabaseCase):
             ("spent", SLATE_TIGHT),
             ("held", AFFORDABLE),
             ("contended", AFFORDABLE),
+            ("numbers", AFFORDABLE),
         ):
             path = write(
                 SCOPED.replace(SCOPED_BUDGETS, budgets).replace(
@@ -10936,12 +10958,27 @@ class SlateClaimTest(DatabaseCase):
         cls.arrange_spent()
         cls.arrange_held()
         cls.arrange_contended()
+        cls.arrange_numbers()
 
     @classmethod
     def tearDownClass(cls):
         cls.runtime.close()
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
+            # The rollup edge goes first, and this is a workaround rather than
+            # tidiness: `finding_hypotheses` cascades from the finding side only
+            # (016's `purge_cascade_edges`), while `hypotheses_program_id_fkey`
+            # is older than `findings_program_id_fkey` and so cascades first --
+            # so the NO ACTION check on the edge fires before the delete that
+            # would have removed it, and `DELETE FROM programs` raises. It is a
+            # purge that cannot travel its own edge in the order the catalogue
+            # happens to hold, which is 031's failure in a place 031 does not
+            # repair. Recorded against PH2-71 and owed a ticket.
+            cls.connection.execute(
+                "DELETE FROM finding_hypotheses WHERE program_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{SLATE_SLUG}-%",),
+            )
             cls.connection.execute(
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{SLATE_SLUG}-%",)
             )
@@ -11174,6 +11211,182 @@ class SlateClaimTest(DatabaseCase):
                 (cls.identifiers["contended"],),
             ).rows
         )
+
+    @classmethod
+    def arrange_numbers(cls):
+        """One Task of every kind, each claimed, each against its roster row.
+
+        PH2-71's criterion 3. `claim_task` used to decide a run's model and
+        effort from `runs_as` alone, so three of the five agent roles ran at
+        numbers the roster does not give them -- and a fixture that claims only
+        recon Tasks cannot see that, because recon is one of the two the
+        constant happened to be right about. Every kind is seeded ready here,
+        which is also the first time `claimable_for` is asked about all five in
+        one Program.
+
+        Each run is closed before the next Task is claimed, which is not
+        tidiness: four of the five kinds are run by a subagent role and
+        `max_concurrent_subagents` is three, so five simultaneous claims would
+        have the last one refused `global_subagent_cap` -- a true refusal about
+        somebody else's concurrency, and nothing to do with what this fixture
+        asks. The closing hands the Task back to `pending` with the attempt
+        spent, which is what frees the lane and the count.
+        """
+        program_id = cls.identifiers["numbers"]
+        labels = cls.seed("numbers", 5)
+        by_kind = dict(zip(("recon", "hunt", "analyze", "validate", "report"), labels))
+        subjects = {
+            kind: str(
+                cls.scalar(
+                    "SELECT subject_entity_id::text FROM tasks"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (program_id, label),
+                )
+            )
+            for kind, label in by_kind.items()
+        }
+
+        # A hunt is ready with a testable Hypothesis under it.
+        hypothesis = str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " property_class, statement, status)"
+                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
+                " 'a hypothesis worth hunting', 'testable') RETURNING id::text",
+                (program_id, subjects["hunt"]),
+            )
+        )
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (program_id, by_kind["hunt"], hypothesis),
+        )
+
+        # An analyze is ready with an agent-visible Artifact reachable from an
+        # Observation on its subject, which is ticket 12's `artifact_refs`
+        # bridge: content-addressed bytes, a Receipt of this Program citing
+        # them, and an Observation citing the Receipt.
+        cls.as_owner(
+            "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+            " VALUES ($1, 9, 'text/plain', 'agent_visible')",
+            (ANALYSED_SHA,),
+        )
+        receipt = str(
+            cls.scalar(
+                # The replay lane, because 040 fences the agent one: an allowed
+                # agent receipt has to name a live capability held by a running
+                # tool run, which is a whole exchange this fixture does not have
+                # and `ready_for` does not ask about. The scope class and the
+                # policy version it was classified under are 021's biconditional
+                # -- a receipt of the Program's own traffic carries both.
+                "INSERT INTO receipts (program_id, lane, decision, reason,"
+                " ts_arrival, response_agent_sha, scope_class, scope_version)"
+                " VALUES ($1::uuid, 'replay', 'allowed', 'seeded', now(), $2,"
+                "         'target', (SELECT max(version) FROM program_scope_versions"
+                "                     WHERE program_id = $1::uuid))"
+                " RETURNING id::text",
+                (program_id, ANALYSED_SHA),
+            )
+        )
+        cls.as_owner(
+            "INSERT INTO observations (program_id, subject_entity_id, kind, summary,"
+            " provenance_kind, receipt_id)"
+            " VALUES ($1::uuid, $2::uuid, 'artifact_captured', 'a body worth reading',"
+            " 'receipt', $3::uuid)",
+            (program_id, subjects["analyze"], receipt),
+        )
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'analyze'"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (program_id, by_kind["analyze"]),
+        )
+
+        # A validate is ready with a candidate Finding that has a test spec
+        # behind it; a report is ready with a validated Finding anywhere in the
+        # Program, and a validated Finding is one the runtime re-ran.
+        candidate = cls.finding("numbers", subjects["validate"], "candidate")
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'validate', finding_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (program_id, by_kind["validate"], candidate),
+        )
+        cls.finding("numbers", subjects["report"], "validated")
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'report'"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (program_id, by_kind["report"]),
+        )
+
+        cls.bind("numbers")
+        cls.offered_numbers = cls.offer()
+        cls.claimed_numbers = {}
+        for kind in ("recon", "hunt", "analyze", "validate", "report"):
+            run = cls.call("SELECT claim_task($1)", (by_kind[kind],))
+            claimed = cls.as_owner(
+                "SELECT a.id::text AS id, a.role, a.model, a.effort,"
+                "       r.model AS roster_model, r.effort AS roster_effort"
+                "  FROM agent_runs a JOIN roles r ON r.role = a.role"
+                " WHERE a.program_id = $1::uuid AND a.label = $2",
+                (program_id, str(run)),
+            ).dicts()[0]
+            cls.claimed_numbers[kind] = claimed
+            cls.call("SELECT finish_task_attempt($1::uuid, 'completed')",
+                     (claimed["id"],))
+
+    @classmethod
+    def finding(cls, name: str, subject: str, status: str) -> str:
+        """One Finding of the given status, with everything that status needs.
+
+        A candidate needs a Hypothesis with a test spec, because that is what
+        `validate.no_test_spec` asks for. A validated one needs all of that and
+        a run of the spec as well: `findings` refuses `validated` without the
+        `test_runs` row, which is Q27 in the schema -- validated means the
+        runtime re-ran it.
+        """
+        program_id = cls.identifiers[name]
+        hypothesis = str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " property_class, statement, status)"
+                " VALUES ($1::uuid, $2::uuid, 'authorization.object_ownership',"
+                " 'a hypothesis worth judging', 'testable') RETURNING id::text",
+                (program_id, subject),
+            )
+        )
+        test = str(
+            cls.scalar(
+                "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+                " VALUES ($1::uuid, $2::uuid, '{}'::jsonb,"
+                "         encode(sha256('{}'::bytea), 'hex')) RETURNING id::text",
+                (program_id, hypothesis),
+            )
+        )
+        run = None
+        if status == "validated":
+            run = str(
+                cls.scalar(
+                    "INSERT INTO test_runs (program_id, test_id, lane, outcome,"
+                    " assertion_results)"
+                    " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', '[]'::jsonb)"
+                    " RETURNING id::text",
+                    (program_id, test),
+                )
+            )
+        finding = str(
+            cls.scalar(
+                "INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
+                " severity, status, validated_by_test_run_id)"
+                " VALUES ($1::uuid, $2::uuid, $3, 'a seeded finding', 'medium', $4,"
+                " $5::uuid) RETURNING id::text",
+                (program_id, subject, FINDING_CLASS, status, run),
+            )
+        )
+        cls.as_owner(
+            "INSERT INTO finding_hypotheses (finding_id, hypothesis_id)"
+            " VALUES ($1::uuid, $2::uuid)",
+            (finding, hypothesis),
+        )
+        return finding
 
     @classmethod
     def contend(cls, gate: threading.Barrier, guard: threading.Lock):
@@ -11510,18 +11723,67 @@ class SlateClaimTest(DatabaseCase):
     def test_the_event_log_accounts_for_the_row_the_race_moved(self):
         self.assertEqual([], self.contended_integrity)
 
+    # -- the numbers the claim opens a run at (PH2-71) --------------------------
+
+    def test_every_kind_opens_its_run_at_the_roster_row_numbers(self):
+        # Criterion 3, and the whole of what the ticket moved: the claim reads
+        # the role's model and effort off `roles` instead of deciding them from
+        # `runs_as`. Asserted against the roster row rather than against five
+        # literals, so a future roster edit the scheduler does not follow fails
+        # here without this file being touched.
+        self.assertEqual(
+            {kind: (row["roster_model"], row["roster_effort"])
+             for kind, row in self.claimed_numbers.items()},
+            {kind: (row["model"], row["effort"])
+             for kind, row in self.claimed_numbers.items()},
+        )
+
+    def test_the_kinds_do_not_all_run_at_one_number(self):
+        # The guard on the assertion above. Four of the five kinds ran at
+        # `high` before this ticket, and a roster that gave every role the same
+        # effort would make agreeing with it prove nothing.
+        self.assertEqual(
+            {"recon": "medium", "hunt": "high", "analyze": "high",
+             "validate": "max", "report": "none"},
+            {kind: row["effort"] for kind, row in self.claimed_numbers.items()},
+        )
+
+    def test_the_run_the_renderer_opens_carries_no_model(self):
+        # `agent_runs_renderer_has_no_model` is the column-level half; this is
+        # the claim actually satisfying it off a roster row rather than off the
+        # branch that used to spell `'none'` here.
+        self.assertEqual(
+            ("reporter", "none", "none"),
+            (self.claimed_numbers["report"]["role"],
+             self.claimed_numbers["report"]["model"],
+             self.claimed_numbers["report"]["effort"]),
+        )
+
+    def test_no_run_was_opened_at_a_resolved_model_identifier(self):
+        # The alias is what `_launch.options_for` hands the SDK, so the alias is
+        # what the run row records. A resolution -- what one measured SDK/CLI
+        # pair turns `opus` into -- belongs to the version-bound manifest, and a
+        # copy of it here would go stale without moving.
+        self.assertEqual(
+            [], [kind for kind, row in self.claimed_numbers.items()
+                 if str(row["model"]).startswith("claude-")]
+        )
+
     # -- the invariant ---------------------------------------------------------
 
-    def test_the_standing_check_is_registered_and_holds(self):
-        [registered] = self.connection.execute(
-            "SELECT count(*) FROM standing_checks WHERE name = 'slate_claim'"
-        ).rows
-        [[problems, detail]] = self.connection.execute(
-            "SELECT problems, detail FROM run_standing_checks() WHERE name = 'slate_claim'"
-        ).rows
+    def test_the_standing_checks_are_registered_and_hold(self):
+        for name in ("slate_claim", "roster_numbers"):
+            with self.subTest(check=name):
+                [registered] = self.connection.execute(
+                    "SELECT count(*) FROM standing_checks WHERE name = $1", (name,)
+                ).rows
+                [[problems, detail]] = self.connection.execute(
+                    "SELECT problems, detail FROM run_standing_checks() WHERE name = $1",
+                    (name,),
+                ).rows
 
-        self.assertEqual(1, int(registered[0]))
-        self.assertEqual((0, ""), (int(problems), str(detail)))
+                self.assertEqual(1, int(registered[0]))
+                self.assertEqual((0, ""), (int(problems), str(detail)))
 
 
 #: The Programs of `LeaseTest`, which share a prefix so one DELETE retires them.

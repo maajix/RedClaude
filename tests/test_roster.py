@@ -777,15 +777,27 @@ class SchemaAgreementTest(unittest.TestCase):
         r"(?P<executes_tasks>true|false), (?P<max_concurrent>\d+), (?P<clamp>true|false)\)"
     )
     KINDS = re.compile(r"\('(?P<role>\w+)', '(?P<kind>\w+)'\)")
+    #: PH2-71's `UPDATE roles ... FROM (VALUES ...)`. A second file because the
+    #: two columns were added after 019 was applied and a migration cannot be
+    #: edited once it has a recorded checksum, so the roster's statement of a
+    #: role is spread over two documents and this test is what keeps that from
+    #: mattering.
+    NUMBERS = re.compile(
+        r"\('(?P<role>\w+)', +'(?P<model>[\w.-]+)', +'(?P<effort>\w+)'\)"
+    )
 
     @classmethod
     def setUpClass(cls):
-        migration = ROOT / "src" / "redkraken" / "migrations" / "0019_role_kinds.sql"
-        cls.sql = migration.read_text(encoding="utf-8")
+        migrations = ROOT / "src" / "redkraken" / "migrations"
+        cls.sql = (migrations / "0019_role_kinds.sql").read_text(encoding="utf-8")
+        cls.numbers_sql = (
+            migrations / "20260813T200000Z__a_role_runs_at_the_rosters_model_and_effort.sql"
+        ).read_text(encoding="utf-8")
 
-    def statement(self, prefix: str) -> str:
-        start = self.sql.index(prefix)
-        return self.sql[start : self.sql.index(";", start)]
+    def statement(self, prefix: str, sql: str | None = None) -> str:
+        text = self.sql if sql is None else sql
+        start = text.index(prefix)
+        return text[start : text.index(";", start)]
 
     def test_every_role_row_the_schema_carries_is_this_rosters_row(self):
         rows = self.ROWS.finditer(self.statement("INSERT INTO roles"))
@@ -809,6 +821,29 @@ class SchemaAgreementTest(unittest.TestCase):
                         role.max_concurrent,
                         role.clamp_to_identity_leases,
                     ),
+                )
+        self.assertEqual(set(roster.ROLES), set(stated))
+
+    def test_every_role_runs_at_the_model_and_effort_this_roster_gives_it(self):
+        # PH2-71. The scheduler used to decide both from `runs_as`, so three of
+        # the five agent roles ran at numbers this file does not state. They are
+        # a roster row now, and this is the assertion that keeps them one
+        # statement: a roster edit the migration does not follow fails here
+        # rather than in a claim nobody is watching.
+        stated = {}
+        for row in self.NUMBERS.finditer(
+            self.statement("UPDATE roles r SET", self.numbers_sql)
+        ):
+            role = roster.ROLES[row["role"]]
+            stated[row["role"]] = (row["model"], row["effort"])
+            with self.subTest(role=row["role"]):
+                # `None` is the renderer, which is not an agent at all. The
+                # column is NOT NULL because every other role's number is a
+                # fact, so 'none' is how the schema says "has none" -- the same
+                # spelling `agent_runs` has used since 019.
+                self.assertEqual(
+                    stated[row["role"]],
+                    (role.model or "none", role.effort or "none"),
                 )
         self.assertEqual(set(roster.ROLES), set(stated))
 
