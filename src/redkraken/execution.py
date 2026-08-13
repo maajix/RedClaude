@@ -139,11 +139,17 @@ ACCEPTED_STOPS = (
 #: is an input to the entitlement sort and to nothing in the priority formula,
 #: so running it after the ranking cannot invalidate the numbers just written.
 #:
-#: `offer_slate` consumes the outstanding slate and writes a new one, so asking
-#: for the count is not a peek: it is the offer, and the claim takes from it.
+#: `offer_slate` consumes the outstanding slate and writes a new one, so calling
+#: it is not a peek: it is the offer, and the claim takes from it.
+#:
+#: Every column of it, not a count. A slate the runtime reduced to a number is a
+#: slate nobody was offered -- ticket 23's Slate is what the orchestrator chooses
+#: from, and a choice needs the entries, their factors and when the offer stops
+#: being good. `claim_task()` still takes no argument here: this loop is the
+#: runtime's own path, and decision 3 says the runtime takes the first entry.
 RANK = "SELECT rank_pass('runtime')"
 QUOTA = "SELECT advance_lane_quota('runtime')"
-OFFER = "SELECT count(*)::int FROM offer_slate()"
+OFFER = "SELECT * FROM offer_slate()"
 CLAIM = "SELECT claim_task()"
 
 #: What was claimed, read back through the Agent run the claim created rather
@@ -387,7 +393,7 @@ class Slice:
         would be four chances to bind the wrong one.
         """
         facts = {
-            "slate": 0,
+            "slate": [],
             "task": None,
             "agent_run": None,
             "target": None,
@@ -408,7 +414,7 @@ class Slice:
             ledger.hold("slate", "no Task is ready; nothing was claimed")
             return facts
 
-        claimed = self._claim(ledger, connection, program_id, offered)
+        claimed = self._claim(ledger, connection, program_id, len(offered))
         if claimed is None:
             return facts
         facts.update(claimed.facts())
@@ -426,20 +432,23 @@ class Slice:
 
     # -- the queue ---------------------------------------------------------
 
-    def _offer(self, ledger: Ledger, connection: pg.Connection) -> int | None:
+    def _offer(self, ledger: Ledger, connection: pg.Connection) -> list[dict] | None:
         """One scheduler pass: rank, advance the quota, offer.
 
         One transaction, because the three are one pass. A ranking that
         committed and an offer that did not would leave priorities computed
         against a slate nobody was given, and the next pass would rank them
         again from the same rows.
+
+        The entries come back as the database named them. `None` is the pass
+        failing, which an empty slate is not.
         """
         with connection.transaction():
             _actor(connection)
             try:
                 connection.execute(RANK)
                 connection.execute(QUOTA)
-                return int(connection.execute(OFFER).scalar() or 0)
+                return [_offered(row) for row in connection.execute(OFFER).dicts()]
             except pg.DatabaseError as error:
                 ledger.fail(
                     "slate",
@@ -454,11 +463,12 @@ class Slice:
     ) -> Claimed | None:
         """One Task off the slate, described by the run the claim opened.
 
-        A refused claim is reported and not retried. The reasons `claim_task`
-        raises for -- the Task moved, a lane is full, the subagent cap is spent
-        -- are all reasons the next Task would be decided against differently,
-        and a runtime that walked the slate looking for one that took would be
-        a second scheduler with a worse view than the first.
+        A refused claim is reported and not retried, because the walk down the
+        slate belongs to `claim_task` and has already happened. Called with no
+        argument it takes the first entry that is still claimable when the
+        claim's own transaction rechecks it, so a NULL here means every entry
+        was rechecked and every one had gone -- and a raise here means the pass
+        itself is unusable, which retrying would not mend.
         """
         with connection.transaction():
             _actor(connection)
@@ -996,3 +1006,25 @@ class Slice:
 def _actor(connection: pg.Connection) -> None:
     """Who the database records as writing. Transaction-local by construction."""
     connection.execute("SELECT set_actor('runtime', $1)", (program.ACTOR,))
+
+
+def _offered(row: Mapping[str, object]) -> dict:
+    """One entry of the offered Slate, renamed for whoever is choosing.
+
+    `factors` arrives as the text of a jsonb value -- this client decodes
+    booleans, integers and floats and leaves everything else exactly as the
+    server sent it -- so it is parsed here rather than handed on as a string a
+    reader would have to parse a second time. Everything else is passed through:
+    a numeric that keeps its own digits is more faithful than a float that
+    rounds them, and the expiry is already the timestamp the server rendered.
+    """
+    return {
+        "ordinal": row["ordinal"],
+        "task": row["task_label"],
+        "kind": row["kind"],
+        "subject": row["subject_label"],
+        "priority": row["priority"],
+        "factors": json.loads(str(row["factors"])),
+        "entitled": row["entitled"],
+        "expires_at": row["expires_at"],
+    }

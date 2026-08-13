@@ -945,10 +945,11 @@ class RelationAgreementTest(unittest.TestCase):
         r"(?: IF NOT EXISTS)? ([a-z_][a-z0-9_]*)"
     )
 
-    #: The one name the corpus does not create yet. Ticket 23 owns the picking
-    #: relation; the exemption is by name so that adding a second one is an edit
-    #: to this list rather than a silent widening.
-    PENDING = frozenset({"task_picks"})
+    #: Names the corpus does not create yet. Empty since ticket 23 created
+    #: `task_picks`, which was the only one; kept, because the exemption being
+    #: by name is what makes adding one an edit to this list rather than a
+    #: silent widening.
+    PENDING: frozenset[str] = frozenset()
 
     @classmethod
     def setUpClass(cls):
@@ -978,9 +979,10 @@ class RelationAgreementTest(unittest.TestCase):
             with self.subTest(relation=name, named_by=sorted(sites)):
                 self.assertIn(name, self.created)
 
-    def test_the_one_relation_that_does_not_exist_yet_is_named_here(self):
+    def test_every_relation_exempted_here_still_does_not_exist(self):
         # A pending name that quietly started existing would leave an exemption
-        # standing for a check that could now be made.
+        # standing for a check that could now be made. `task_picks` did start
+        # existing, under ticket 23, and the exemption came out with it.
         for name in self.PENDING:
             with self.subTest(relation=name):
                 self.assertNotIn(name, self.created)

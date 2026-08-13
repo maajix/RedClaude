@@ -981,6 +981,15 @@ CONTROLS = (
         " VALUES ('selftest_section', 'selftest', 'a section with no delta kinds')",
     ),
     Control(
+        # A clock inside the eligibility rule, which is the one thing that
+        # would make two passes over the same rows disagree. Structural because
+        # that is where determinism lives: no row can be wrong in a way that
+        # falsifies it, and the arm reads the function's own text.
+        "standing:slate_claim",
+        "CREATE OR REPLACE FUNCTION identity_held_for(t tasks) RETURNS boolean"
+        " LANGUAGE sql STABLE AS $ctl$ SELECT now() IS NOT NULL $ctl$",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -8203,8 +8212,15 @@ STRUCTURAL = ("completion_guard_detached", "promotion_writes_no_event")
 #: exactly the distinction criterion 6 draws: two Programs seeded alike must
 #: reach the same verdicts and hand out the same per-Program labels, and must
 #: share no single row identifier while doing it. `None` keeps the whole value.
+#:
+#: The slate is a list, and every field of an entry is a decision except
+#: `expires_at`, which is the one clock reading in it. Naming the rest rather
+#: than dropping the section is the point of ticket 23's criterion 1: a rank
+#: that differed between two identically seeded Programs would mean the ranking
+#: pass read something other than its rows and its weights version.
 DECIDED = {
-    "slate": None,
+    "slate": ("ordinal", "task", "kind", "subject", "priority", "factors",
+              "entitled"),
     "task": ("label", "kind", "attempts", "subject", "subject_type"),
     "agent_run": ("label", "role", "stop_reason"),
     "target": None,
@@ -8219,16 +8235,22 @@ DECIDED = {
 }
 
 
+def _kept(value: object, fields: tuple[str, ...] | None) -> object:
+    """One section of a report, narrowed to the named fields.
+
+    A list is narrowed entry by entry rather than kept whole, because a section
+    that is a sequence of rows -- the slate -- is still a sequence of decisions.
+    """
+    if fields is None or value is None:
+        return value
+    if isinstance(value, list):
+        return [_kept(entry, fields) for entry in value]
+    return {name: value[name] for name in fields}
+
+
 def decided(facts: dict) -> dict:
     """One attempt's verdicts, without the identifiers two attempts must differ in."""
-    kept = {}
-    for key, value in facts.items():
-        fields = DECIDED[key]
-        kept[key] = (
-            value if fields is None or value is None
-            else {name: value[name] for name in fields}
-        )
-    return kept
+    return {key: _kept(value, DECIDED[key]) for key, value in facts.items()}
 
 
 class ExecutionSliceTest(DatabaseCase):
@@ -8489,7 +8511,7 @@ class ExecutionSliceTest(DatabaseCase):
         facts = self.facts
 
         self.assertEqual([], list(self.ledger.violations), self.ledger.violations)
-        self.assertEqual(1, facts["slate"])
+        self.assertEqual(1, len(facts["slate"]))
         self.assertEqual("recon", facts["task"]["kind"])
         self.assertEqual(1, facts["task"]["attempts"])
         self.assertEqual(self.subject, facts["task"]["subject"])
@@ -8757,7 +8779,7 @@ class ExecutionSliceTest(DatabaseCase):
         ledger = Ledger()
         facts = self.attempt("grounded", Child(self.subject), ledger)
 
-        self.assertEqual(0, facts["slate"])
+        self.assertEqual([], facts["slate"])
         self.assertIsNone(facts["task"])
         self.assertEqual([], list(ledger.violations))
         self.assertIn(
@@ -10810,6 +10832,661 @@ class SurfaceFingerprintTest(DatabaseCase):
 
         self.assertEqual(1, int(registered[0]))
         self.assertEqual([], list(problems))
+
+
+#: The Programs the slate case opens. One per scenario, because a slate is a
+#: Program's own and claiming off it moves that Program's Lane: two scenarios
+#: sharing a Program would be two orchestrators contending for one Lane, which
+#: is what only the last of them is about.
+SLATE_SLUG = "selftest-slate"
+
+#: A budget wide enough to offer a recon Task and, once spent against, too
+#: narrow to claim one. `claimable_for` calls a Task affordable where
+#: `tokens_left` covers `estimated_cost * cost_reference_tokens` -- 60000 for a
+#: recon Task with no run history to shrink its 0.30 prior -- so 100000 opens
+#: and `SLATE_SPEND` closes it while leaving the budget itself unexhausted,
+#: which is a refusal with a different name.
+SLATE_TIGHT = (
+    "requests = 500\ntokens = 100000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+)
+
+#: What one Agent run spends to take that Program under the line.
+SLATE_SPEND = (40000, 10000)
+
+#: How many orchestrators race for one Lane in the contended Program. Four
+#: against a Lane that admits one, so three of them have to come back empty
+#: rather than partially claimed.
+SLATE_CONTENDERS = 4
+
+
+class SlateClaimTest(DatabaseCase):
+    """PH2-23: a Slate is offered, and exactly one Task is claimed off it.
+
+    Every question here is one only a server can answer, because what ticket 23
+    asks about is the gap between two moments -- what the Ranking pass decided
+    when it wrote the slate, and what is still true when a claim arrives. A
+    recorder cannot have a gap: only real rows can move under an offer.
+
+    The Programs are the scenarios. Each one is opened, seeded, offered a slate
+    and then disturbed in exactly one way -- a Task that runs out of attempts, a
+    Lane that fills, a budget that gets spent, an Identity that gets leased, a
+    slate that ages past its expiry, a choice whose entry is consumed under it,
+    a second Program that owns the label being asked for. What the claim then
+    does with the disturbance is the whole of the ticket.
+
+    Everything runs in `setUpClass` because all of it commits: a claim repeated
+    per test would be a second claim on a Task the first one took, and the
+    refusals only mean anything against the state the steps before them left.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name, budgets in (
+            ("ranked", AFFORDABLE),
+            ("fallback", AFFORDABLE),
+            ("refused", AFFORDABLE),
+            ("onlooker", AFFORDABLE),
+            ("picked", AFFORDABLE),
+            ("stale", AFFORDABLE),
+            ("spent", SLATE_TIGHT),
+            ("held", AFFORDABLE),
+            ("contended", AFFORDABLE),
+        ):
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, budgets).replace(
+                    'name = "matrix-web"', f'name = "{SLATE_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_ranked()
+        cls.arrange_fallback()
+        cls.arrange_refused()
+        cls.arrange_picked()
+        cls.arrange_stale()
+        cls.arrange_spent()
+        cls.arrange_held()
+        cls.arrange_contended()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SLATE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_ranked(cls):
+        """Two passes over six Tasks nothing disturbs between them."""
+        cls.ranked = cls.seed("ranked", 6)
+        cls.bind("ranked")
+        cls.first = cls.offer()
+        cls.again = cls.offer()
+        # Whether the one clock reading in the offer is the one the weights
+        # declare, asked of the row rather than of the report: an expiry that
+        # did not come from `offered_at + slate_ttl` would still look like a
+        # timestamp five minutes out to anything comparing it with `now()`.
+        cls.expiry_is_the_ttl = cls.scalar(
+            "SELECT bool_and(s.offered_at + w.slate_ttl = $2::timestamptz)"
+            "  FROM task_slate s CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND s.program_id = $1::uuid AND NOT s.consumed",
+            (cls.identifiers["ranked"], cls.again[0]["expires_at"]),
+        )
+
+    @classmethod
+    def arrange_fallback(cls):
+        """The top entry stops being claimable after it was offered.
+
+        Nothing re-ranks in between, which is the point: the slate still names
+        the Task, and only the claim's own recheck can notice that it has spent
+        its last attempt. What the orchestrator asked for is then refused, and
+        what it gets by asking for nothing is the next entry that survives.
+        """
+        cls.seed("fallback", 6)
+        cls.bind("fallback")
+        cls.offered_fallback = cls.offer()
+        cls.top = cls.offered_fallback[0]["task_label"]
+        cls.second = cls.offered_fallback[1]["task_label"]
+        cls.arranged(
+            "UPDATE tasks SET attempts = 3 WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers["fallback"], cls.top),
+        )
+        cls.exhausted = cls.refusal("SELECT claim_task($1)", (cls.top,))
+        cls.fallback_run = cls.call("SELECT claim_task()")
+        cls.fallback_task = cls.claimed_by("fallback", cls.fallback_run)
+        # One claimed recon Task fills the recon Lane, whose role admits one at
+        # a time, so the next pass over the same five survivors offers nothing.
+        cls.lane_full = cls.offer()
+
+    @classmethod
+    def arrange_refused(cls):
+        """Four ways of naming a Task that is not on this Program's slate."""
+        cls.elsewhere = cls.seed("onlooker", 6)[5]
+        cls.seed("refused", 3)
+        cls.bind("refused")
+        cls.offered_refused = cls.offer()
+        cls.off_slate = cls.refusal("SELECT claim_task($1)", ("T99",))
+        cls.cross_program = cls.refusal("SELECT claim_task($1)", (cls.elsewhere,))
+        cls.off_slate_pick = cls.refusal("SELECT pick_task($1)", ("T99",))
+        cls.arranged(
+            "UPDATE task_slate SET offered_at = now() - interval '10 minutes'"
+            " WHERE program_id = $1::uuid AND NOT consumed",
+            (cls.identifiers["refused"],),
+        )
+        cls.expired = cls.refusal("SELECT claim_task()")
+        cls.untouched = cls.counted("refused")
+
+    @classmethod
+    def arrange_picked(cls):
+        """A choice recorded out of band, and honoured by the next claim."""
+        cls.seed("picked", 3)
+        cls.bind("picked")
+        cls.offered_picked = cls.offer()
+        cls.chosen = cls.offered_picked[1]["task_label"]
+        cls.pick_echo = cls.call("SELECT pick_task($1)", (cls.chosen,))
+        cls.picked_task = cls.claimed_by("picked", cls.call("SELECT claim_task()"))
+        cls.picks_left = int(
+            cls.scalar(
+                "SELECT count(*) FROM task_picks"
+                " WHERE program_id = $1::uuid AND NOT consumed",
+                (cls.identifiers["picked"],),
+            )
+        )
+
+    @classmethod
+    def arrange_stale(cls):
+        """A recorded choice whose slate entry is gone by the time it is read.
+
+        The entry is consumed here rather than raced for, and that is a fixture
+        decision worth stating. `task_picks` references `tasks` on the Program's
+        own key, so recording a pick holds a KEY SHARE lock on the Task row and
+        a concurrent `claim_task` blocks on it at `FOR UPDATE` -- the two
+        transactions cannot in fact interleave into this state from outside.
+        The state itself is reachable, because a claim commits its consumption
+        of the slate before the next transaction reads the pick. So what stands
+        in for the race is the state the race would leave.
+        """
+        cls.seed("stale", 3)
+        cls.bind("stale")
+        offered = cls.offer()
+        cls.forgotten = offered[1]["task_label"]
+        cls.call("SELECT pick_task($1)", (cls.forgotten,))
+        cls.arranged(
+            "UPDATE task_slate s SET consumed = true FROM tasks t"
+            " WHERE t.id = s.task_id AND s.program_id = $1::uuid AND t.label = $2",
+            (cls.identifiers["stale"], cls.forgotten),
+        )
+        cls.stale_pick = cls.refusal("SELECT claim_task()")
+        cls.stale_counts = cls.counted("stale")
+
+    @classmethod
+    def arrange_spent(cls):
+        """The budget that made the offer affordable is gone by the claim."""
+        cls.seed("spent", 3)
+        cls.bind("spent")
+        cls.offered_spent = cls.offer()
+        cls.needed = int(
+            cls.scalar(
+                "SELECT max(t.estimated_cost * w.cost_reference_tokens)::bigint"
+                "  FROM tasks t CROSS JOIN scheduler_weights w"
+                " WHERE w.active AND t.program_id = $1::uuid",
+                (cls.identifiers["spent"],),
+            )
+        )
+        cls.left_before = cls.tokens_left("spent")
+        # Spent through a run rather than by writing `programs.token_budget`,
+        # because the budget is a configured number and the ledger is the only
+        # thing entitled to move what is left of it. The role is one that runs
+        # no Task, which is what a run with no Task must name.
+        cls.arranged(
+            "INSERT INTO agent_runs (program_id, role, model, effort, mission_packet,"
+            " input_tokens, output_tokens)"
+            " VALUES ($1::uuid, 'orchestrator', 'operator', 'low', '{}', $2, $3)",
+            (cls.identifiers["spent"], *SLATE_SPEND),
+        )
+        cls.left_after = cls.tokens_left("spent")
+        cls.unaffordable = cls.refusal(
+            "SELECT claim_task($1)", (cls.offered_spent[0]["task_label"],)
+        )
+        cls.offer_when_poor = cls.offer()
+
+    @classmethod
+    def arrange_held(cls):
+        """The Identity a hunt needs is leased between the offer and the claim."""
+        cls.seed("held", 1, kind="hunt")
+        program_id = cls.identifiers["held"]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.identity = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, "identity:slate-member"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO identities (entity_id, program_id, slot_name, class)"
+                " VALUES ($1::uuid, $2::uuid, 'slate-member', 'anonymous')",
+                (cls.identity, program_id),
+            )
+            # A hunt Task is only ready with a testable Hypothesis under it, and
+            # a Hypothesis about an Identity is what makes the Task need one.
+            hypothesis = str(
+                cls.connection.execute(
+                    "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                    " identity_a_entity_id, property_class, statement, status)"
+                    " SELECT $1::uuid, subject_entity_id, $2::uuid,"
+                    " 'authorization.object_ownership', 'a slate hypothesis', 'testable'"
+                    "   FROM tasks WHERE program_id = $1::uuid AND kind = 'hunt'"
+                    " RETURNING id::text",
+                    (program_id, cls.identity),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "UPDATE tasks SET hypothesis_id = $2::uuid"
+                " WHERE program_id = $1::uuid AND kind = 'hunt'",
+                (program_id, hypothesis),
+            )
+        cls.bind("held")
+        cls.offered_held = cls.offer()
+        holder = str(
+            cls.arranged(
+                "INSERT INTO agent_runs (program_id, role, model, effort, mission_packet)"
+                " VALUES ($1::uuid, 'orchestrator', 'operator', 'low', '{}')"
+                " RETURNING id::text",
+                (program_id,),
+            ).scalar()
+        )
+        cls.arranged(
+            "INSERT INTO identity_leases (program_id, identity_entity_id,"
+            " holder_agent_run_id, expires_at)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, now() + interval '10 minutes')",
+            (program_id, cls.identity, holder),
+        )
+        cls.identity_held = cls.refusal(
+            "SELECT claim_task($1)", (cls.offered_held[0]["task_label"],)
+        )
+        cls.offer_while_held = cls.offer()
+
+    @classmethod
+    def arrange_contended(cls):
+        """Four orchestrators claim off one slate at once."""
+        cls.seed("contended", 5)
+        cls.bind("contended")
+        cls.offer()
+
+        gate = threading.Barrier(SLATE_CONTENDERS)
+        guard = threading.Lock()
+        cls.outcomes: list[str | None] = []
+        contenders = [
+            threading.Thread(target=cls.contend, args=(gate, guard))
+            for _ in range(SLATE_CONTENDERS)
+        ]
+        for contender in contenders:
+            contender.start()
+        for contender in contenders:
+            contender.join()
+        cls.contended_counts = cls.counted("contended")
+        cls.contended_integrity = list(
+            cls.connection.execute(
+                "SELECT problem, detail, count FROM check_event_log_integrity($1::uuid)",
+                (cls.identifiers["contended"],),
+            ).rows
+        )
+
+    @classmethod
+    def contend(cls, gate: threading.Barrier, guard: threading.Lock):
+        """One orchestrator's whole part in the race, on its own connection.
+
+        A refusal is recorded rather than raised, because three of these are
+        supposed to lose and a loser that raised in a thread would fail nothing.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            connection.execute(agent.BIND, (cls.identifiers["contended"],))
+            gate.wait()
+            try:
+                with connection.transaction():
+                    connection.execute("SELECT set_actor('runtime', 'selftest')")
+                    outcome = connection.execute("SELECT claim_task()").scalar()
+            except pg.DatabaseError as refused:
+                outcome = f"refused: {refused}"
+            with guard:
+                cls.outcomes.append(None if outcome is None else str(outcome))
+        finally:
+            connection.close()
+
+    # -- what the scenarios are built out of -----------------------------------
+
+    @classmethod
+    def seed(cls, name: str, count: int, kind: str = "recon") -> list[str]:
+        """`count` endpoints under one application, and one Task about each.
+
+        The Tasks differ only in what they promise -- the i-th is worth 0.1*i in
+        both gain and impact -- so the order the ranking should reach is known
+        here without this file recomputing the weights it is testing. Written as
+        the owner and in one transaction, because an endpoint whose application
+        did not commit with it is a Task with no resolvable subject.
+        """
+        program_id = cls.identifiers[name]
+        labels = []
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (application, BASE_URL),
+            )
+            for index in range(1, count + 1):
+                path = f"{PATH}/{index}"
+                endpoint = str(
+                    cls.connection.execute(
+                        "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
+                        (program_id, HOST, f"endpoint:GET {path}"),
+                    ).scalar()
+                )
+                cls.connection.execute(
+                    "INSERT INTO endpoints (entity_id, application_id, method,"
+                    " path_template) VALUES ($1::uuid, $2::uuid, 'GET', $3)",
+                    (endpoint, application, path),
+                )
+                labels.append(
+                    str(
+                        cls.connection.execute(
+                            "INSERT INTO tasks (program_id, kind, status,"
+                            " subject_entity_id, expected_information_gain,"
+                            " potential_impact) VALUES ($1::uuid, $2, 'pending',"
+                            " $3::uuid, $4, $4) RETURNING label",
+                            (program_id, kind, endpoint, str(round(0.1 * index, 2))),
+                        ).scalar()
+                    )
+                )
+        return labels
+
+    @classmethod
+    def bind(cls, name: str):
+        """Which Program the runtime connection is speaking for from here on."""
+        cls.runtime.execute(agent.BIND, (cls.identifiers[name],))
+
+    @classmethod
+    def offer(cls) -> tuple[dict[str, object], ...]:
+        """One Ranking pass, one Lane quota, and the slate they leave."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.runtime.execute("SELECT rank_pass('runtime')")
+            cls.runtime.execute("SELECT advance_lane_quota('runtime')")
+            return cls.runtime.execute("SELECT * FROM offer_slate()").dicts()
+
+    @classmethod
+    def call(cls, sql: str, parameters: tuple = ()) -> object:
+        """One statement as the runtime, in its own transaction."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.runtime.execute(sql, parameters).scalar()
+
+    @classmethod
+    def refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        """What one refused statement raised, insisting that it did."""
+        try:
+            cls.call(sql, parameters)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError(f"not refused: {sql} {parameters}")
+
+    @classmethod
+    def arranged(cls, sql: str, parameters: tuple = ()):
+        """One statement as the role that owns the rows the scheduler reads."""
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.connection.execute(sql, parameters)
+
+    @classmethod
+    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
+        """One reading as the owner, which every Program's rows are visible to.
+
+        `DatabaseCase.owned` is the same statement, and this is not it: that one
+        stringifies its answer, and half of what is read here is a count or a
+        boolean that a string would flatten into something always true.
+        """
+        return cls.arranged(sql, parameters).scalar()
+
+    @classmethod
+    def claimed_by(cls, name: str, run: object) -> str | None:
+        """The Task an Agent run was opened against, by label."""
+        claimed = cls.scalar(
+            "SELECT t.label FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[name], str(run)),
+        )
+        return None if claimed is None else str(claimed)
+
+    @classmethod
+    def counted(cls, name: str) -> tuple[int, int]:
+        """How much of a Program has moved: Tasks off pending, and Agent runs."""
+        program_id = cls.identifiers[name]
+        return (
+            int(
+                cls.scalar(
+                    "SELECT count(*) FROM tasks"
+                    " WHERE program_id = $1::uuid AND status <> 'pending'",
+                    (program_id,),
+                )
+            ),
+            int(
+                cls.scalar(
+                    "SELECT count(*) FROM agent_runs WHERE program_id = $1::uuid",
+                    (program_id,),
+                )
+            ),
+        )
+
+    @classmethod
+    def tokens_left(cls, name: str) -> int:
+        return int(
+            cls.scalar(
+                "SELECT tokens_left FROM program_budget WHERE program_id = $1::uuid",
+                (cls.identifiers[name],),
+            )
+        )
+
+    # -- criterion 1: the same rows and weights reach the same order -----------
+
+    def test_two_passes_over_the_same_rows_offer_the_same_order(self):
+        self.assertEqual(
+            [(row["ordinal"], row["task_label"]) for row in self.first],
+            [(row["ordinal"], row["task_label"]) for row in self.again],
+        )
+
+    def test_two_passes_over_the_same_rows_reach_the_same_numbers(self):
+        # The order alone would survive a rank that drifted with the clock as
+        # long as it drifted monotonically, so the values are compared too.
+        self.assertEqual(
+            [(row["priority"], row["factors"]) for row in self.first],
+            [(row["priority"], row["factors"]) for row in self.again],
+        )
+
+    def test_the_only_thing_the_second_pass_moved_is_the_expiry(self):
+        # And the expiry is not a rank value: it is when this offer stops being
+        # one, which is the single reading of the clock an offer is allowed.
+        self.assertNotEqual(
+            self.first[0]["expires_at"], self.again[0]["expires_at"]
+        )
+        self.assertTrue(self.expiry_is_the_ttl)
+
+    # -- criterion 2: what the offered slate contains --------------------------
+
+    def test_the_slate_is_capped_and_ordinal_from_one(self):
+        self.assertEqual(5, len(self.first))
+        self.assertEqual([1, 2, 3, 4, 5], [row["ordinal"] for row in self.first])
+
+    def test_the_slate_holds_the_five_worth_most_and_drops_the_sixth(self):
+        # Seeded ascending, so the offer should be the reverse, less the least.
+        self.assertEqual(
+            list(reversed(self.ranked))[:5], [row["task_label"] for row in self.first]
+        )
+        self.assertNotIn(self.ranked[0], [row["task_label"] for row in self.first])
+
+    def test_every_entry_breaks_its_priority_into_factors(self):
+        for row in self.first:
+            self.assertEqual(
+                {"novelty", "confidence", "gain", "impact", "cost"},
+                set(json.loads(str(row["factors"]))),
+            )
+
+    def test_the_whole_slate_shares_one_expiry(self):
+        self.assertEqual(1, len({row["expires_at"] for row in self.first}))
+
+    def test_only_what_the_lane_has_room_for_is_entitled(self):
+        # The recon Lane's floor is one slot and its role admits one at a time,
+        # so exactly the top entry is what the Lane is currently short of.
+        self.assertEqual(
+            [True, False, False, False, False], [row["entitled"] for row in self.first]
+        )
+
+    def test_a_full_lane_offers_nothing(self):
+        self.assertEqual((), self.lane_full)
+
+    def test_an_unaffordable_task_is_not_offered(self):
+        self.assertEqual(3, len(self.offered_spent))
+        self.assertEqual((), self.offer_when_poor)
+
+    def test_a_task_whose_identity_is_held_is_not_offered(self):
+        self.assertEqual(1, len(self.offered_held))
+        self.assertEqual((), self.offer_while_held)
+
+    # -- criterion 3: the claim rechecks rather than trusting the snapshot -----
+
+    def test_a_task_that_ran_out_of_attempts_is_refused_after_being_offered(self):
+        self.assertIn(f"task {self.top} is no longer claimable", self.exhausted)
+        self.assertIn("attempts_exhausted", self.exhausted)
+
+    def test_a_task_the_budget_no_longer_covers_is_refused_after_being_offered(self):
+        self.assertEqual(60000, self.needed)
+        self.assertEqual(100000, self.left_before)
+        self.assertEqual(50000, self.left_after)
+        self.assertIn("is no longer claimable: unaffordable", self.unaffordable)
+
+    def test_a_task_whose_identity_was_leased_is_refused_after_being_offered(self):
+        self.assertIn("is no longer claimable: identity_held", self.identity_held)
+
+    # -- criterion 4: refused whole, or not at all -----------------------------
+
+    def test_a_task_that_was_never_offered_is_refused(self):
+        self.assertIn("task T99 is not on the current slate", self.off_slate)
+        self.assertIn("task T99 is not on the current slate", self.off_slate_pick)
+
+    def test_another_programs_task_is_refused_even_though_the_label_exists(self):
+        # Labels are counted per Program, so `T6` names a live Task of the
+        # onlooker and nothing at all in the Program doing the asking. A claim
+        # that read labels without their Program would have found one.
+        self.assertEqual(
+            1,
+            int(
+                self.scalar(
+                    "SELECT count(*) FROM tasks"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.identifiers["onlooker"], self.elsewhere),
+                )
+            ),
+        )
+        self.assertEqual(
+            0,
+            int(
+                self.scalar(
+                    "SELECT count(*) FROM tasks"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.identifiers["refused"], self.elsewhere),
+                )
+            ),
+        )
+        self.assertIn(
+            f"task {self.elsewhere} is not on the current slate", self.cross_program
+        )
+
+    def test_an_expired_slate_is_refused_by_its_age_and_not_by_its_contents(self):
+        self.assertEqual(3, len(self.offered_refused))
+        self.assertIn("expired after 00:05:00", self.expired)
+
+    def test_a_choice_whose_entry_is_gone_is_refused(self):
+        self.assertIn(
+            "the choice recorded for this program is no longer on the slate",
+            self.stale_pick,
+        )
+
+    def test_none_of_the_refusals_claimed_anything(self):
+        self.assertEqual((0, 0), self.untouched)
+        self.assertEqual((0, 0), self.stale_counts)
+
+    # -- criterion 5: choosing, and not choosing -------------------------------
+
+    def test_a_recorded_choice_is_the_task_the_claim_takes(self):
+        self.assertEqual(self.chosen, self.pick_echo)
+        self.assertEqual(self.chosen, self.picked_task)
+        self.assertEqual(0, self.picks_left)
+
+    def test_choosing_nothing_falls_through_to_the_first_entry_that_survives(self):
+        self.assertEqual(self.second, self.fallback_task)
+
+    # -- criterion 6: one winner, and a complete account of it -----------------
+
+    def test_four_claims_at_once_produce_exactly_one_run(self):
+        claimed = [
+            outcome
+            for outcome in self.outcomes
+            if outcome is not None and not outcome.startswith("refused")
+        ]
+
+        self.assertEqual(SLATE_CONTENDERS, len(self.outcomes))
+        self.assertEqual(1, len(claimed))
+        self.assertEqual((1, 1), self.contended_counts)
+
+    def test_the_losers_come_back_empty_rather_than_refused(self):
+        # An empty slate is what a Program with a full Lane has, and asking for
+        # nothing off one is not an error. A raise here would make three of four
+        # orchestrators handle an exception on the ordinary path.
+        self.assertEqual(
+            [None] * (SLATE_CONTENDERS - 1),
+            [outcome for outcome in self.outcomes if outcome is None],
+        )
+
+    def test_the_event_log_accounts_for_the_row_the_race_moved(self):
+        self.assertEqual([], self.contended_integrity)
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'slate_claim'"
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = 'slate_claim'"
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
 
 
 if __name__ == "__main__":

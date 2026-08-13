@@ -597,11 +597,11 @@ CONTRACTS: dict[str, Contract] = {
     ),
     # A pick, not a claim. The row it writes is the orchestrator's choice; the
     # claim transaction that re-evaluates every filter and moves the Task is the
-    # runtime's, and it falls through to the next slate entry when the choice
-    # has gone stale. `task_picks` is the one relation named here that the
-    # migration corpus does not yet create: ticket 23 owns both the table and
-    # this handler, and `tests/test_roster.py` records the exemption by name so
-    # it stays one deliberate absence rather than a class of them.
+    # runtime's, and it REFUSES a choice that has gone stale rather than falling
+    # through to the next slate entry -- ticket 23's "off-Slate, expired, stale,
+    # cross-Program and no-longer-ready choices are refused", which this comment
+    # said the opposite of before that ticket built the claim. Falling through
+    # is what the runtime does when nobody chose at all.
     "mcp__rk2__pick_task": Contract(
         "sched.pick",
         REQUEST,

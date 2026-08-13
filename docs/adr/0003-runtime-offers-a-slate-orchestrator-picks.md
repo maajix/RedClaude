@@ -3,9 +3,10 @@
 Task selection is split. Each time a slot frees, the runtime computes the top
 five pending tasks that are ready, lane-legal, identity-available and affordable,
 and offers that slate to the orchestrator. The orchestrator picks one. The
-runtime then commits the claim in a transaction that re-evaluates every filter,
-and falls through to the next slate entry — or to position one, if the
-orchestrator picked nothing or picked off-slate.
+runtime then commits the claim in a transaction that re-evaluates every filter.
+A choice that no longer holds is refused rather than substituted; an
+orchestrator that chose nothing gets the first entry that still holds, walking
+from position one.
 
 Decided because neither pure alternative is acceptable. If the runtime simply
 claims the highest-ranked task, the orchestrator's judgement is unusable: it is
@@ -35,7 +36,15 @@ and the runtime discards it without a provenance record.
   is the reason the slate carries an expiry.
 - **A degenerate orchestrator is still correct.** One that always picks position
   one reduces the system to pure greedy ranking, and one that picks nothing gets
-  position one anyway. The model can improve scheduling; it cannot break it.
+  the first entry that survives re-validation. The model can improve scheduling;
+  it cannot break it.
+- **A wrong choice is refused, not corrected.** This decision originally read
+  "falls through to position one" for an off-slate or stale pick as well, and
+  ticket 23 narrowed it: substituting a Task for the one that was named would
+  answer a request nobody made, and the orchestrator would learn nothing from
+  having asked for something that was gone. Refusal and fallback stay distinct
+  because they mean different things -- one is a choice that failed, the other
+  is no choice at all.
 - **Lane quotas stay on the runtime's side.** They bound how many runs of each
   kind exist at once, which makes them a spend and containment control. That is
   why moving them during a run is its own open question rather than something the

@@ -112,6 +112,34 @@ def result(**overrides) -> agent.AgentRunResult:
     return agent.AgentRunResult(**fields)
 
 
+#: `offer_slate()`'s own columns, as the server names them. Spelled out because
+#: the slice reads the answer by name: a recorder that returned bare tuples
+#: would let a column order change pass every test in this file.
+SLATE_COLUMNS = (
+    "ordinal", "task_label", "kind", "subject_label",
+    "priority", "factors", "entitled", "expires_at",
+)
+
+
+def slate_row(ordinal: int) -> tuple:
+    """One offered entry, in the wire shapes this client actually decodes.
+
+    `priority`, `factors` and `expires_at` stay text on purpose -- numeric,
+    jsonb and timestamptz are none of the three types `pg` decodes -- so a slice
+    that assumed a parsed value would be assuming it here too.
+    """
+    return (
+        ordinal,
+        f"T{ordinal}",
+        "recon",
+        "EN1",
+        "0.500000",
+        '{"novelty": 1.0, "cost": 0.3}',
+        ordinal == 1,
+        "2026-08-13 17:05:00+00",
+    )
+
+
 class Recorder:
     """A connection that answers every statement the slice issues, and keeps them.
 
@@ -168,7 +196,10 @@ class Recorder:
         self.calls.append((sql, parameters))
         if sql in self.raises:
             raise self.raises[sql]
-        return pg.Result(columns=(), rows=tuple(self._answer(sql, parameters)), tag="SELECT")
+        columns = SLATE_COLUMNS if sql == execution.OFFER else ()
+        return pg.Result(
+            columns=columns, rows=tuple(self._answer(sql, parameters)), tag="SELECT"
+        )
 
     @contextlib.contextmanager
     def transaction(self):
@@ -193,7 +224,7 @@ class Recorder:
         if sql in (execution.RANK, execution.QUOTA):
             return [("{}",)]
         if sql == execution.OFFER:
-            return [(self.slate,)]
+            return [slate_row(n) for n in range(1, self.slate + 1)]
         if sql == execution.CLAIM:
             return [(self.claim,)]
         if sql == execution.STARTED:
@@ -412,10 +443,23 @@ class SlateTest(unittest.TestCase):
         launcher = Launcher()
         ledger, facts = attempt(connection, launcher)
         self.assertEqual([], ledger.violations)
-        self.assertEqual(0, facts["slate"])
+        self.assertEqual([], facts["slate"])
         self.assertIsNone(facts["task"])
         self.assertNotIn(execution.CLAIM, connection.statements)
         self.assertEqual([], launcher.requests)
+
+    def test_the_offered_slate_is_carried_out_of_the_attempt_entry_by_entry(self):
+        # A slate reduced to a count is a slate nobody was offered. The
+        # orchestrator chooses from these entries, so the factors it would
+        # choose on and the expiry it would race have to survive the call.
+        connection = Recorder(slate=3)
+        _, facts = attempt(connection)
+
+        self.assertEqual([1, 2, 3], [entry["ordinal"] for entry in facts["slate"]])
+        self.assertEqual(["T1", "T2", "T3"], [entry["task"] for entry in facts["slate"]])
+        self.assertEqual([True, False, False], [e["entitled"] for e in facts["slate"]])
+        self.assertEqual({"novelty": 1.0, "cost": 0.3}, facts["slate"][0]["factors"])
+        self.assertEqual("2026-08-13 17:05:00+00", facts["slate"][0]["expires_at"])
 
     def test_a_slate_nothing_could_be_claimed_off_is_held_not_failed(self):
         connection = Recorder(claim=None)
@@ -725,11 +769,11 @@ class ProgramHookTest(unittest.TestCase):
 
     def test_the_stop_reason_says_an_attempt_was_made_only_when_one_was(self):
         self.assertEqual(
-            program.STOPPED_NOTHING_TO_EXECUTE, self.stopped({"slate": 0, "task": None})
+            program.STOPPED_NOTHING_TO_EXECUTE, self.stopped({"slate": [], "task": None})
         )
         self.assertEqual(
             program.STOPPED_TASK_ATTEMPTED,
-            self.stopped({"slate": 1, "task": {"label": "T3"}}),
+            self.stopped({"slate": [slate_row(1)], "task": {"label": "T3"}}),
         )
 
     def test_execution_is_one_of_the_facts_a_run_always_answers_with(self):
