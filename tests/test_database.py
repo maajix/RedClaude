@@ -46,6 +46,7 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import (
+    _launch,
     _startup,
     agent,
     artifact,
@@ -53,6 +54,7 @@ from redkraken import (
     callback,
     config,
     decisions,
+    execution,
     header,
     identity,
     integrity,
@@ -76,6 +78,7 @@ from redkraken.outcome import (
     EXIT_OK,
     EXIT_TARGET_UNREACHABLE,
     TARGET_UNREACHABLE,
+    Ledger,
     Report,
 )
 from redkraken.store import Store
@@ -616,6 +619,13 @@ def repeat(character: str) -> str:
 #: control needs. Written once because a seal has four foreign keys behind it --
 #: the two artifacts, the algorithm and the key generation -- and repeating that
 #: per control would bury which one line is the falsification.
+#:
+#: The key generation is written `ON CONFLICT DO NOTHING` because it is not part
+#: of the falsification: a seal needs a generation on record, and the first
+#: sealed wire artifact of the installation establishes one and commits it. Any
+#: suite that reaches a live door before this one runs leaves generation 1
+#: behind, and a control that insisted on writing it would fail on the row it
+#: only needs to exist.
 SEAL_CONTROL = (
     "DO $ctl$ DECLARE p uuid;"
     " BEGIN"
@@ -623,7 +633,8 @@ SEAL_CONTROL = (
     "   INSERT INTO programs (slug, name) VALUES ('sealed-selftest', 'Self test')"
     "     RETURNING id INTO p;"
     "   INSERT INTO secret_kek (gen, salt, root_check)"
-    "        VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'));"
+    "        VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
+    "     ON CONFLICT (gen) DO NOTHING;"
     "   INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
     "        VALUES {sealed};"
     "   INSERT INTO artifacts (sha256, byte_size, visibility)"
@@ -1098,7 +1109,8 @@ CONTROLS = (
         # keeping key material where the dumps go.
         "standing:wire_artifact_secrecy",
         "INSERT INTO secret_kek (gen, salt, root_check)"
-        " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'));"
+        " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
+        " ON CONFLICT (gen) DO NOTHING;"
         " INSERT INTO secret_dek (scope_kind, scope_id, dek_gen, kek_gen, wrapped)"
         " VALUES ('program', '00000000-0000-4000-8000-000000000001'::uuid, 1, 1,"
         "         decode(repeat('63', 60), 'hex'))",
@@ -1139,6 +1151,54 @@ CONTROLS = (
         # state the control above leaves behind.
         "standing:callback_admission",
         CALLBACK_CONTROL,
+    ),
+    # --- the end of one attempt ----------------------------------------------
+    Control(
+        # The first arm, and the leak criterion 5 names first: a Task closed as
+        # done that no promotion accounts for. An INSERT rather than an UPDATE
+        # because `tasks_completion_needs_promotion` is BEFORE UPDATE, which is
+        # the whole reason the row arm exists beside the trigger -- the trigger
+        # closes the path the runtime takes, and the check reads the row however
+        # it arrived.
+        "standing:execution_closure",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('closed-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO tasks (program_id, kind, status, finished_at)"
+        "        VALUES (p, 'recon', 'done', now());"
+        " END $ctl$",
+    ),
+    Control(
+        # The arm `finish_task_attempt`'s ordering exists for: the Agent run
+        # ended and a Tool run of it is still open. Written by hand because no
+        # call produces it -- the closing updates the Tool runs first, so this
+        # is the state a crash between the two leaves, and the only one that
+        # holds a capability nothing will revoke.
+        "standing:execution_closure",
+        "DO $ctl$ DECLARE p uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('half-closed-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO agent_runs (program_id, role, runs_as, model, effort, mission_packet,"
+        "                           finished_at, stop_reason)"
+        "        VALUES (p, 'orchestrator', 'session', 'operator', 'low', '{}'::jsonb,"
+        "                now(), 'completed')"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport)"
+        f"        VALUES (p, r, '{proxy.TOOL}', '{{}}'::jsonb, 'running', 'runtime');"
+        " END $ctl$",
+    ),
+    Control(
+        # The structural arm, and the same demotion the callback control makes:
+        # the guard still holds on this connection and is skipped by the one
+        # connection that replays rows nobody re-checks. A Task that closed
+        # during a restore would be indistinguishable from one the runtime
+        # accepted a result for.
+        "standing:execution_closure",
+        "ALTER TABLE tasks DISABLE TRIGGER tasks_completion_needs_promotion",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -2607,7 +2667,13 @@ class StateReadTest(DatabaseCase):
             self.read(name, label="H404", per_kind=1, byte_limit=200)
         after = snapshot(self.connection)
 
-        self.assertEqual(before, after)
+        # By the rows, not by the size on disk. The size is the one column that
+        # moves without a write -- autovacuum reached this database mid-test once
+        # and grew it by twelve pages while every digest below stayed identical --
+        # and it is also the one column that could not have caught the write it
+        # would have been catching: a single row does not move a page count.
+        self.assertEqual(before[ROWS], after[ROWS])
+        self.assertGreaterEqual(after[0], before[0], "reading does not shrink a database")
         # And against the state as it was written, before any read in this class
         # had run: a read that moved something once would pass the comparison
         # above and fail this one.
@@ -7958,6 +8024,726 @@ class ProxyEgressTest(DatabaseCase):
                 self.connection.execute(insert, (self.identifiers["a"], live_tool_run))
                 raise Rollback
         self.assertIsNotNone(live_capability)
+
+
+#: The Programs the execution slice runs in. One per scenario, because the
+#: slice claims from a Program's own queue: two scenarios sharing one would be
+#: two attempts competing for the same Task, and whichever lost would be a test
+#: of the scheduler rather than of the slice.
+EXECUTION_SLUG = "selftest-execution"
+
+#: What the child claims to have established. `endpoint_discovered` is the one
+#: recon-shaped row of `observation_kinds` a plain http Receipt may back: every
+#: evidential kind is a comparison one request cannot make, and
+#: `transport_parameters_observed` is admissible only from the measurement lane.
+DISCOVERED = "endpoint_discovered"
+
+#: The address the seeded Task is about, as the Program's own rows spell it: an
+#: application whose base is the host `SCOPED` includes, and one endpoint under
+#: it. Together they have to join to `URL`, because that is the request the
+#: matrix already decides and the door already has a target for.
+HOST = "app.example.com"
+BASE_URL = f"http://{HOST}"
+PATH = "/notes"
+
+#: The budget these Programs carry, and its width is not arbitrary.
+#: `rank_candidates` calls a Task affordable only where `tokens_left` covers
+#: `estimated_cost * cost_reference_tokens`, and a recon Task with no run
+#: history to shrink towards costs the 0.30 prior of a 200000-token reference.
+#: Under `SCOPED`'s own 10000 no Task in this suite would ever be offered, and
+#: that reads as an idle queue rather than as a budget that is too small.
+AFFORDABLE = (
+    "requests = 500\ntokens = 1000000\nconcurrency = 4\nburst = 500\nwindow_seconds = 3600"
+)
+
+
+class Child:
+    """A launcher that spends the capability it was handed, and reports back.
+
+    Not a container, and it makes no claim to be one: what an engine does with
+    an image is `redkraken.isolation`'s subject and is asserted there. What this
+    stands in for is the one thing the slice needs a child for -- a request made
+    with the capability the runtime minted, and a structured result citing what
+    that request produced.
+
+    The request goes through `_launch._spend`, which is the function the served
+    tool calls inside a real child. A hand-rolled request here would be a second
+    client, and the door's answer -- which decides whether the Tool run closes
+    as served or as denied -- would be parsed in two places.
+    """
+
+    def __init__(
+        self,
+        subject: str,
+        *,
+        observations: list[dict] | None = None,
+        completion: str = "complete",
+    ) -> None:
+        self.subject = subject
+        self.overrides = observations
+        self.completion = completion
+        self.requests: list[agent.AgentRunRequest] = []
+        self.answers: list[dict] = []
+
+    def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        self.requests.append(request)
+        if request.egress is not None:
+            self.answers.append(_launch._spend(request.egress, URL, "GET"))
+        return agent.AgentRunResult(
+            agent_run_id=request.agent_run_id,
+            role=request.role,
+            sdk_version="selftest",
+            cli_version="selftest",
+            api_key_source="none",
+            tool_ready=1,
+            tools_served=agent.SERVED,
+            denials=(),
+            answers=1,
+            stop_reason="completed",
+            text="one request, one observation",
+            mission_result=self.result(),
+            mission_attempts=1,
+        )
+
+    def result(self) -> dict:
+        """What the child submits: one Observation and one completion claim."""
+        answer = self.answers[-1] if self.answers else {}
+        return {
+            "observations": (
+                self.overrides
+                if self.overrides is not None
+                else [
+                    {
+                        "kind": DISCOVERED,
+                        "subject_label": self.subject,
+                        "receipt_label": answer.get("receipt"),
+                        "summary": f"{URL} answered {answer.get('status')} through the door",
+                    }
+                ]
+            ),
+            "completion_claim": {"status": self.completion, "note": "one request, read"},
+        }
+
+
+#: Every row one attempt produced, read from the Receipt outwards. One query
+#: rather than six, because what criterion 2 asks is whether they agree, and six
+#: queries would each be right about a row while saying nothing about the six.
+ATTEMPT = (
+    "SELECT r.program_id::text  AS receipt_program,"
+    "       tr.program_id::text AS tool_run_program,"
+    "       ar.program_id::text AS agent_run_program,"
+    "       t.program_id::text  AS task_program,"
+    "       pr.program_id::text AS proposal_program,"
+    "       tr.agent_run_id::text AS tool_run_of,"
+    "       tr.task_id::text      AS tool_run_on,"
+    "       ar.id::text           AS agent_run,"
+    "       ar.task_id::text      AS agent_run_on,"
+    "       t.id::text            AS task,"
+    "       pr.agent_run_id::text AS proposal_of,"
+    "       pr.task_id::text      AS proposal_on,"
+    "       r.lane                AS lane,"
+    "       r.decision            AS decision"
+    "  FROM receipts r"
+    "  JOIN tool_runs tr  ON tr.id = r.tool_run_id"
+    "  JOIN agent_runs ar ON ar.id = tr.agent_run_id"
+    "  JOIN tasks t       ON t.id = ar.task_id"
+    "  JOIN proposals pr  ON pr.task_id = t.id"
+    " WHERE r.label = $1 AND r.program_id = $2::uuid"
+)
+
+#: The whole of criterion 5 about one finished attempt, as one row. Not a copy
+#: of `check_execution_closure()`: that function asks the same questions of the
+#: whole installation and is asserted as itself below, and a second copy of its
+#: five arms here would be a second statement of the same rule.
+SETTLED = (
+    "SELECT t.status, t.lease_expires_at, t.finished_at,"
+    "       ar.finished_at, ar.stop_reason,"
+    "       tr.status, tr.finished_at, tr.egress_token_sha256, tr.egress_token_expires_at,"
+    "       (SELECT count(*)::int FROM identity_leases l"
+    "         WHERE l.holder_agent_run_id = ar.id AND l.released_at IS NULL),"
+    "       (SELECT count(*)::int FROM proposals pr"
+    "         WHERE pr.task_id = t.id AND pr.status = 'promoted')"
+    "  FROM agent_runs ar"
+    "  JOIN tasks t       ON t.id = ar.task_id"
+    "  JOIN tool_runs tr  ON tr.agent_run_id = ar.id"
+    " WHERE ar.id = $1::uuid"
+)
+
+#: The two arms of the standing check that are about the installation rather
+#: than about any Program's rows. Asserted machine-wide because that is what
+#: they are: a detached completion guard or an `observations` table that stopped
+#: emitting Events is wrong everywhere at once.
+STRUCTURAL = ("completion_guard_detached", "promotion_writes_no_event")
+
+
+#: What of one attempt's report is a decision, section by section. Everything
+#: left out is either a row identifier or a machine-wide counter, and that is
+#: exactly the distinction criterion 6 draws: two Programs seeded alike must
+#: reach the same verdicts and hand out the same per-Program labels, and must
+#: share no single row identifier while doing it. `None` keeps the whole value.
+DECIDED = {
+    "slate": None,
+    "task": ("label", "kind", "attempts", "subject", "subject_type"),
+    "agent_run": ("label", "role", "stop_reason"),
+    "target": None,
+    "packet": ("sections",),
+    "tool_run": ("label", "decision"),
+    "receipt": None,
+    "proposal": ("label", "status", "completion", "drops"),
+    "promotion": None,
+    "closure": ("task_status", "accepted", "runs_closed", "tool_runs_closed",
+                "leases_released"),
+}
+
+
+def decided(facts: dict) -> dict:
+    """One attempt's verdicts, without the identifiers two attempts must differ in."""
+    kept = {}
+    for key, value in facts.items():
+        fields = DECIDED[key]
+        kept[key] = (
+            value if fields is None or value is None
+            else {name: value[name] for name in fields}
+        )
+    return kept
+
+
+class ExecutionSliceTest(DatabaseCase):
+    """PH2-20: one seeded Task run to a canonical Observation, and closed.
+
+    The half of ticket 20 only a server can answer. `tests/test_execution.py`
+    holds the other half -- what the sequence does with each answer -- against a
+    recorder; here the queue is the real scheduler, the capability is minted by
+    `authorize_tool_run` and spent through a real door, the Observation is
+    promoted by `promote_proposal`, and what closes the attempt is
+    `finish_task_attempt`.
+
+    Two things make this the production path rather than a rehearsal of it. The
+    request the child makes is `_launch._spend`, which is what the served tool
+    calls inside a real container. And the promotion runs on `rk2_runtime`, the
+    role an operator actually points at the database, against rows the
+    `rk2_state` connection that compiled the packet cannot write.
+
+    What stands in for the container is `Child`. The boundary itself is
+    described rather than started, because an engine is not available in the
+    assertion suite and because what this case is about is the order of the
+    steps either side of the child -- which is exactly the part a launcher seam
+    leaves intact.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        cls.root = scratch() / "execution-store"
+
+        cls.identifiers = {}
+        cls.configurations = {}
+        for name in ("grounded", "prose", "twin-a", "twin-b"):
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{EXECUTION_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.configurations[name] = path
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        # `SCOPED` declares a required header, and a declared header with no
+        # provisioned value is a request the door refuses before it dials. So
+        # this exists for the same reason the target does: what is under test is
+        # what reaches the wire, and a Program that cannot reach it tests nothing.
+        cls.root_secret = seal.Root(Path("live-execution-selftest-root"), SECRET)
+        value = scratch() / "execution-bounty-id.txt"
+        value.write_text("rk2-selftest-bounty-20", encoding="utf-8")
+        for name, path in cls.configurations.items():
+            sealed = header.provision(
+                cls.harness.runtime, path, "X-Bounty-Id", value, root_secret=cls.root_secret
+            )
+            assert sealed.ok, (name, sealed.violations)
+
+        cls.target, _ = counterparty(LiveTarget)
+        cls.authority = tls.authority(scratch() / "execution-authority")
+        cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
+        cls.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=cls.fence,
+            store=Store(cls.root),
+            connector=cls.dial,
+            resolver=cls.look_up,
+            authority=cls.authority,
+            root_secret=cls.root_secret,
+        )
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.boundary = boundary(
+            proxy_url=f"http://127.0.0.1:{cls.server.server_address[1]}"
+        )
+
+        # Every attempt the assertions read, run here because they commit: an
+        # attempt repeated per test would be a second attempt on a Task the
+        # first one closed, and one run in a test would make the test that
+        # reads it depend on which test ran first.
+        cls.subject, cls.task = cls.seed("grounded")
+        cls.child = Child(cls.subject)
+        cls.ledger = Ledger()
+        cls.facts = cls.attempt("grounded", cls.child, cls.ledger)
+
+        # Everything about this one is a success except the thing that counts:
+        # the child made its request, read the answer and claimed to have
+        # finished -- citing a Receipt that does not exist.
+        ungrounded, _ = cls.seed("prose")
+        cls.prose = cls.attempt(
+            "prose",
+            Child(
+                ungrounded,
+                observations=[
+                    {
+                        "kind": DISCOVERED,
+                        "subject_label": ungrounded,
+                        "receipt_label": "R404",
+                        "summary": "an endpoint I am sure about",
+                    }
+                ],
+            ),
+            Ledger(),
+        )
+
+        cls.twins = {}
+        for name in ("twin-a", "twin-b"):
+            twin, _ = cls.seed(name)
+            ledger = Ledger()
+            cls.twins[name] = cls.attempt(name, Child(twin), ledger)
+            assert not list(ledger.violations), (name, ledger.violations)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.fence.close()
+        cls.target.shutdown()
+        cls.target.server_close()
+        cls.runtime.close()
+
+        stored = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
+                "  FROM receipts r JOIN programs p ON p.id = r.program_id"
+                " WHERE p.slug LIKE $1",
+                (f"{EXECUTION_SLUG}-%",),
+            ).rows
+            if row[0] is not None
+        ]
+        ciphertexts = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT s.ciphertext_sha256 FROM artifact_seal s JOIN programs p"
+                "    ON p.id = s.scope_id AND s.scope_kind = 'program'"
+                " WHERE p.slug LIKE $1",
+                (f"{EXECUTION_SLUG}-%",),
+            ).rows
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM secret_access_log WHERE program_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{EXECUTION_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program' AND scope_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{EXECUTION_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{EXECUTION_SLUG}-%",)
+            )
+            if stored:
+                cls.connection.execute(
+                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    ("{" + ",".join(stored) + "}",),
+                )
+        keep = Store(cls.root)
+        for sha256 in (*stored, *ciphertexts):
+            keep.discard(sha256)
+        super().tearDownClass()
+
+    @classmethod
+    def look_up(cls, host: str, port: int) -> tuple[str, ...]:
+        """What the names in this suite resolve to, without asking a real zone."""
+        return (PINNED,)
+
+    @classmethod
+    def dial(
+        cls,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
+        """The one authorised name reaches the one target this machine is running.
+
+        The pinned `address` is not dialled, because no test on this machine can
+        route to a public one. Everything before this point -- resolution,
+        routability, the door's second decision -- happened for real.
+        """
+        return http.client.HTTPConnection(
+            "127.0.0.1", cls.target.server_address[1], timeout=timeout
+        ), None
+
+    @classmethod
+    def seed(cls, name: str) -> tuple[str, str]:
+        """One in-scope endpoint under one application, and a Task about it.
+
+        Written as the owner and in one transaction, because an endpoint whose
+        application did not commit with it is a subject the slice would resolve
+        no address for -- which is a different test than this one.
+
+        Both entities are created through `add_entity`, which is the only way an
+        in-scope one comes to exist: an entity is born denied and `in_scope` is
+        projected from the policy, so a fixture that asserted scope itself would
+        be seeding a Task the scheduler would never have offered. The labels are
+        left to the database for the same reason -- `assign_entity_label` is what
+        a Program's rows are named by, and naming them here would be asserting
+        against this file's own spelling.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (application, BASE_URL),
+            )
+            endpoint = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"endpoint:GET {PATH}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method, path_template)"
+                " VALUES ($1::uuid, $2::uuid, 'GET', $3)",
+                (endpoint, application, PATH),
+            )
+            cls.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id)"
+                " VALUES ($1::uuid, 'recon', 'pending', $2::uuid)",
+                (program_id, endpoint),
+            )
+            subject = str(
+                cls.connection.execute(
+                    "SELECT label FROM entities WHERE id = $1::uuid", (endpoint,)
+                ).scalar()
+            )
+        return subject, endpoint
+
+    @classmethod
+    def attempt(cls, name: str, child: Child, ledger: Ledger) -> dict:
+        """One slice, run against one Program on the runtime's own connection."""
+        return execution.Slice(
+            boundary=cls.boundary, state=cls.harness.state, launch=child
+        ).attempt(ledger, cls.runtime, cls.identifiers[name])
+
+    # -- criterion 1: one Task, one role, one bounded packet, one request ------
+
+    def test_the_slice_claimed_one_task_and_ran_it(self):
+        facts = self.facts
+
+        self.assertEqual([], list(self.ledger.violations), self.ledger.violations)
+        self.assertEqual(1, facts["slate"])
+        self.assertEqual("recon", facts["task"]["kind"])
+        self.assertEqual(1, facts["task"]["attempts"])
+        self.assertEqual(self.subject, facts["task"]["subject"])
+        self.assertEqual("recon", facts["agent_run"]["role"])
+        self.assertEqual({"url": URL, "method": "GET"}, facts["target"])
+
+    def test_the_child_was_started_inside_the_boundary_with_one_capability(self):
+        self.assertEqual(1, len(self.child.requests))
+        started = self.child.requests[0]
+
+        self.assertIs(self.boundary, started.container)
+        self.assertEqual("recon", started.role)
+        self.assertEqual(self.identifiers["grounded"], started.program_id)
+        self.assertEqual(self.facts["agent_run"]["id"], started.agent_run_id)
+        self.assertIsNotNone(started.packet)
+        self.assertIsNotNone(started.egress)
+        self.assertEqual(self.boundary.proxy_url, started.egress.proxy_url)
+        # The capability lives about five minutes, and the child is given no
+        # longer: turns spent after it lapses cannot reach anything.
+        self.assertLessEqual(started.timeout, 300.0)
+        self.assertGreater(started.timeout, 0.0)
+
+    def test_the_packet_the_child_read_was_compiled_as_the_agent_role(self):
+        # `packet.compile` runs on the state connection and refuses any other,
+        # so a packet existing at all is the claim: what the child may read was
+        # bounded by row level security rather than by this runtime's own reach.
+        # Its surface is what that connection could see of this Program, which
+        # is the application and the endpoint and nothing of the other three.
+        sections = self.facts["packet"]["sections"]
+
+        self.assertEqual(set(packet.SECTIONS), set(sections))
+        self.assertEqual(2, sections["surface"])
+        self.assertEqual(0, sections["receipts"])
+
+    def test_the_one_request_was_served_through_the_door(self):
+        self.assertEqual(1, len(self.child.answers))
+        answer = self.child.answers[0]
+
+        self.assertTrue(answer["served"], answer)
+        self.assertEqual(200, answer["status"])
+        self.assertIsNone(answer["decision"])
+        self.assertEqual(ANSWER.decode(), answer["body"])
+        self.assertEqual(answer["receipt"], self.facts["receipt"]["label"])
+        self.assertEqual("allowed", self.facts["receipt"]["decision"])
+
+    # -- criterion 2: one Program and one cause across every row --------------
+
+    def test_every_row_of_the_attempt_names_one_program_and_one_cause(self):
+        program_id = self.identifiers["grounded"]
+        row = self.connection.execute(
+            ATTEMPT, (self.facts["receipt"]["label"], program_id)
+        ).dicts()[0]
+
+        self.assertEqual(
+            {program_id},
+            {
+                row["receipt_program"],
+                row["tool_run_program"],
+                row["agent_run_program"],
+                row["task_program"],
+                row["proposal_program"],
+            },
+        )
+        self.assertEqual(
+            {self.facts["agent_run"]["id"]},
+            {row["tool_run_of"], row["agent_run"], row["proposal_of"]},
+        )
+        self.assertEqual(
+            {self.facts["task"]["id"]},
+            {row["tool_run_on"], row["agent_run_on"], row["task"], row["proposal_on"]},
+        )
+        self.assertEqual("agent", row["lane"])
+        self.assertEqual("allowed", row["decision"])
+
+    def test_the_response_artifact_is_reachable_from_the_receipt(self):
+        rows = self.connection.execute(
+            "SELECT a.visibility, a.encrypted, a.purged_at"
+            "  FROM artifact_refs x JOIN artifacts a ON a.sha256 = x.sha256"
+            " WHERE x.program_id = $1::uuid AND x.ref_label = $2"
+            "   AND x.ref_kind = 'receipt_response'",
+            (self.identifiers["grounded"], self.facts["receipt"]["label"]),
+        ).rows
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("agent_visible", str(rows[0][0]))
+        self.assertFalse(rows[0][1])
+        self.assertIsNone(rows[0][2])
+
+    def test_the_events_of_the_attempt_name_the_run_that_caused_them(self):
+        # `set_cause` is what puts them there. Without it every Event of this
+        # slice would name a Program and no run, and criterion 2 would be true
+        # of the rows and false of the log that accounts for them.
+        rows = self.connection.execute(
+            "SELECT DISTINCT e.agent_run_id::text, e.task_id::text FROM events e"
+            " WHERE e.program_id = $1::uuid AND e.type = 'observation.recorded'",
+            (self.identifiers["grounded"],),
+        ).rows
+
+        self.assertEqual(
+            [(self.facts["agent_run"]["id"], self.facts["task"]["id"])],
+            [(str(row[0]), str(row[1])) for row in rows],
+        )
+
+    # -- criterion 3: exactly one immutable Observation, with its Event -------
+
+    def test_exactly_one_observation_became_canonical(self):
+        rows = self.connection.execute(
+            "SELECT o.label, o.kind, o.provenance_kind, o.receipt_id::text,"
+            "       o.agent_run_id::text, o.subject_entity_id::text,"
+            "       o.metadata ->> 'proposal', o.metadata ->> 'element'"
+            "  FROM observations o WHERE o.program_id = $1::uuid",
+            (self.identifiers["grounded"],),
+        ).rows
+
+        self.assertEqual(1, len(rows))
+        label, kind, provenance, receipt, run, subject, proposed, element = rows[0]
+        self.assertEqual(self.facts["promotion"]["observations"], [str(label)])
+        self.assertEqual(DISCOVERED, str(kind))
+        self.assertEqual("receipt", str(provenance))
+        self.assertIsNotNone(receipt)
+        self.assertEqual(self.facts["agent_run"]["id"], str(run))
+        self.assertEqual(self.task, str(subject))
+        self.assertEqual(self.facts["proposal"]["label"], str(proposed))
+        self.assertEqual("observations[0]", str(element))
+        self.assertEqual("promoted", self.facts["promotion"]["status"])
+        self.assertEqual(0, self.facts["promotion"]["refused"])
+
+    def test_the_observation_it_promoted_carries_its_own_event(self):
+        rows = self.connection.execute(
+            "SELECT e.subject_id::text, e.actor_kind FROM events e"
+            "  JOIN observations o ON o.id = e.subject_id"
+            " WHERE e.program_id = $1::uuid AND e.subject_table = 'observations'",
+            (self.identifiers["grounded"],),
+        ).rows
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("runtime", str(rows[0][1]))
+
+    def test_a_canonical_observation_cannot_be_changed_afterwards(self):
+        with self.assertRaises(pg.DatabaseError) as raised:
+            self.owner(
+                "UPDATE observations SET summary = 'edited' WHERE program_id = $1::uuid",
+                (self.identifiers["grounded"],),
+            )
+
+        self.assertIn("observations rows are immutable", str(raised.exception))
+
+    # -- criterion 4: prose closes nothing ------------------------------------
+
+    def test_a_completion_claim_the_runtime_cannot_ground_closes_nothing(self):
+        facts = self.prose
+
+        self.assertEqual("complete", facts["proposal"]["completion"])
+        self.assertEqual(
+            [{"element": "observations[0]", "reason": "no_such_receipt"}],
+            facts["proposal"]["drops"],
+        )
+        self.assertEqual("rejected", facts["promotion"]["status"])
+        self.assertEqual([], facts["promotion"]["observations"])
+        self.assertFalse(facts["closure"]["accepted"])
+        self.assertEqual("pending", facts["closure"]["task_status"])
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT count(*)::int FROM observations WHERE program_id = $1::uuid",
+                (self.identifiers["prose"],),
+            ).scalar(),
+        )
+
+    def test_a_task_cannot_be_closed_as_done_without_a_promoted_proposal(self):
+        # The structural half of the same claim, asked of the row directly: no
+        # writer, however privileged, closes a Task the runtime did not accept.
+        with self.assertRaises(pg.DatabaseError) as raised:
+            self.owner(
+                "UPDATE tasks SET status = 'done' WHERE program_id = $1::uuid",
+                (self.identifiers["prose"],),
+            )
+
+        self.assertIn("no proposal of it has been promoted", str(raised.exception))
+
+    # -- criterion 5: nothing left open, and closing again changes nothing ----
+
+    def test_the_finished_attempt_left_nothing_open(self):
+        row = self.connection.execute(
+            SETTLED, (self.facts["agent_run"]["id"],)
+        ).rows[0]
+        (
+            task_status,
+            lease_expires_at,
+            task_finished_at,
+            run_finished_at,
+            stop_reason,
+            tool_run_status,
+            tool_run_finished_at,
+            digest,
+            expires_at,
+            held,
+            promoted,
+        ) = row
+
+        self.assertEqual("done", str(task_status))
+        self.assertIsNone(lease_expires_at)
+        self.assertIsNotNone(task_finished_at)
+        self.assertIsNotNone(run_finished_at)
+        self.assertEqual("completed", str(stop_reason))
+        self.assertEqual("success", str(tool_run_status))
+        self.assertIsNotNone(tool_run_finished_at)
+        self.assertIsNone(digest)
+        self.assertIsNone(expires_at)
+        self.assertEqual(0, int(held))
+        self.assertEqual(1, int(promoted))
+
+    def test_the_installation_wide_structures_the_closing_depends_on_hold(self):
+        reported = [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT problem FROM check_execution_closure()"
+            ).rows
+        ]
+
+        self.assertEqual([], [item for item in reported if item in STRUCTURAL])
+
+    def test_closing_the_same_attempt_again_finds_nothing_to_close(self):
+        self.runtime.execute(proxy.BIND, (self.identifiers["grounded"],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            again = proxy.as_object(
+                self.runtime.execute(
+                    "SELECT finish_task_attempt($1::uuid, 'completed')",
+                    (self.facts["agent_run"]["id"],),
+                ).scalar()
+            )
+
+        self.assertEqual(
+            {"runs_closed": 0, "tool_runs_closed": 0, "leases_released": 0},
+            {key: int(again[key]) for key in ("runs_closed", "tool_runs_closed", "leases_released")},
+        )
+        self.assertEqual("done", again["task_status"])
+        self.assertTrue(again["accepted"])
+
+    def test_a_second_slice_on_the_same_program_claims_nothing(self):
+        ledger = Ledger()
+        facts = self.attempt("grounded", Child(self.subject), ledger)
+
+        self.assertEqual(0, facts["slate"])
+        self.assertIsNone(facts["task"])
+        self.assertEqual([], list(ledger.violations))
+        self.assertIn(
+            "no Task is ready", " ".join(item.detail for item in ledger.assertions)
+        )
+
+    # -- criterion 6: two identical Programs decide the same way --------------
+
+    def test_two_identically_seeded_programs_reach_the_same_decisions(self):
+        first, second = self.twins["twin-a"], self.twins["twin-b"]
+
+        self.assertEqual(decided(first), decided(second))
+        self.assertEqual("done", first["closure"]["task_status"])
+
+    def test_the_two_attempts_share_no_row_identifier(self):
+        # The other half of criterion 6: the same decisions, and every row
+        # identifier its own. Asked of the rows rather than of the report,
+        # because two attempts that agreed by sharing a row would agree for the
+        # one reason that is not allowed.
+        rows = self.connection.execute(
+            "SELECT ar.program_id::text, ar.id::text, ar.task_id::text,"
+            "       tr.id::text, o.id::text"
+            "  FROM agent_runs ar"
+            "  JOIN tool_runs tr ON tr.agent_run_id = ar.id"
+            "  JOIN observations o ON o.agent_run_id = ar.id"
+            " WHERE ar.program_id = ANY($1::uuid[])",
+            ("{" + ",".join(self.identifiers[name] for name in ("twin-a", "twin-b")) + "}",),
+        ).rows
+
+        self.assertEqual(2, len(rows))
+        for column in range(len(rows[0])):
+            self.assertNotEqual(rows[0][column], rows[1][column])
 
 
 #: The Programs the refusal case opens. Two of them, because one thing a

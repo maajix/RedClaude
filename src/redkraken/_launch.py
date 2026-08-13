@@ -36,15 +36,17 @@ an unmeasured runtime and refuses at the assertion.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import importlib.metadata
 import json
 import os
+import ssl
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import NoReturn
 
-from redkraken import agent, packet, roster
+from redkraken import agent, packet, proxy, roster, scope, tls
 
 
 try:
@@ -93,6 +95,14 @@ REFUSAL = "startup_refusal"
 #: result document travels through a pipe and this is proof the run finished,
 #: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
+
+#: Why a request tool call reached no target. Tokens rather than prose, for the
+#: same reason the door's decision header is a token: the model reads one of
+#: these and the runtime reads the same one out of the transcript, and a reason
+#: reworded later would silently change what either concluded.
+NO_CAPABILITY = "no_capability"
+UNUSABLE_TARGET = "unusable_target"
+DOOR_UNREACHABLE = "door_unreachable"
 
 
 class Closed(RuntimeError):
@@ -229,6 +239,13 @@ DESCRIPTIONS = {
         "range of it. The hash is reported, never asked for. Whole large Artifacts "
         "are analysed by a tool run, not read into this context."
     ),
+    "http_request": (
+        "Send one HTTP request to a target through the capability proxy, which "
+        "decides it against this Program's scope and writes the Receipt and the "
+        "response Artifact. Answers the status, the Receipt label to cite and a "
+        "bounded excerpt of the body; a refusal names the door's decision rather "
+        "than pretending the request happened."
+    ),
     "submit_mission_result": (
         "Submit this run's one result: proposed Entities, Relationships, "
         "Hypotheses, Observations with the Receipt or Tool Run each cites, evidence "
@@ -239,8 +256,13 @@ DESCRIPTIONS = {
 }
 
 
-def server(surface: Surface, reader: packet.Reader, submission: Submission):
-    """The runtime's MCP server: five bounded reads and one proposal.
+def server(
+    surface: Surface,
+    reader: packet.Reader,
+    submission: Submission,
+    door: agent.Egress | None = None,
+):
+    """The runtime's MCP server: five bounded reads, one request, one proposal.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -262,6 +284,7 @@ def server(surface: Surface, reader: packet.Reader, submission: Submission):
         "get_artifact": reader.artifact,
     }
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
+    tools.append(_request(surface, door))
     tools.append(_propose(surface, submission))
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
@@ -283,6 +306,88 @@ def _read(surface: Surface, name: str, answer):
         return _content(answer(**given))
 
     return handler
+
+
+def _request(surface: Surface, door: agent.Egress | None):
+    """The one call that leaves the boundary, spent through the door or refused.
+
+    Blocking work on a thread, because the request is a socket and the caller is
+    an event loop: a synchronous exchange run inline would stall every other
+    thing the session has in flight for as long as the target takes to answer.
+
+    Nothing here decides whether the request is allowed. The capability was
+    minted against a Tool run by the runtime, the door re-decides the request
+    that actually arrives against live policy, and this handler's whole job is
+    to carry one to the other and report what came back -- including a refusal,
+    which is reported as a refusal rather than as a failure to reach anything.
+    """
+    name = "http_request"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        given = dict(arguments or {})
+        if door is None:
+            return _content(
+                {
+                    "served": False,
+                    "reason": NO_CAPABILITY,
+                    "detail": "this run was started with no capability; no request was sent",
+                }
+            )
+        return _content(
+            await asyncio.to_thread(
+                _spend, door, str(given.get("url") or ""), str(given.get("method") or "GET")
+            )
+        )
+
+    return handler
+
+
+def _spend(door: agent.Egress, url: str, method: str) -> dict:
+    """One exchange through the door, as the four facts a model can act on.
+
+    The Receipt label is the first of them and the reason the rest are bounded:
+    an Observation the runtime will promote has to cite a Receipt, and the way
+    to say more about the body than fits here is to analyse the Artifact the
+    door already wrote rather than to read it into this context.
+    """
+    try:
+        listener = proxy.peer(door.proxy_url)
+        request = scope.canonical_request(url)
+    except (proxy.Refused, scope.PolicyError) as refusal:
+        return {"served": False, "reason": UNUSABLE_TARGET, "detail": refusal.detail}
+
+    trust: ssl.SSLContext | None = None
+    if request.protocol == "https":
+        try:
+            trust = tls.trust(Path(door.certificate))
+        except (OSError, ssl.SSLError) as error:
+            return {"served": False, "reason": UNUSABLE_TARGET, "detail": str(error)}
+
+    try:
+        answer = proxy.spend(
+            listener,
+            url,
+            capability=door.capability,
+            program_id=door.program_id,
+            method=method,
+            trust=trust,
+        )
+    except (OSError, http.client.HTTPException) as error:
+        return {"served": False, "reason": DOOR_UNREACHABLE, "detail": str(error)}
+
+    body = answer.body[: packet.DEFAULT_EXCERPT]
+    return {
+        "served": answer.decision is None,
+        "status": answer.status,
+        "receipt": answer.receipt,
+        "decision": answer.decision,
+        "detail": answer.detail,
+        "byte_size": len(answer.body),
+        "truncated": len(answer.body) > len(body),
+        "body": body.decode("utf-8", "replace"),
+    }
 
 
 def _propose(surface: Surface, submission: Submission):
@@ -435,6 +540,10 @@ async def run(
     reader = packet.Reader(packet.Packet.from_dict(dict(job.get("packet") or {})))
     submission = Submission()
     role = str(job.get("role") or "")
+    # Nothing, when the job carried no usable capability block. A run started
+    # without one still serves the request tool -- the allowlist is the role's,
+    # not the job's -- and the tool answers that it has nothing to spend.
+    door = agent.Egress.from_dict(job.get("egress"))
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
     # SDK version would do for one role, so an absent SDK and an unknown role
@@ -444,7 +553,7 @@ async def run(
     options = (
         None
         if claude_agent_sdk is None or gate is None
-        else options_for(job, runtime, server(surface, reader, submission), launch, gate)
+        else options_for(job, runtime, server(surface, reader, submission, door), launch, gate)
     )
 
     violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)

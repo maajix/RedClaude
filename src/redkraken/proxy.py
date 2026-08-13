@@ -133,6 +133,7 @@ __all__ = [
     "listen",
     "merge_control",
     "origin_form",
+    "peer",
     "pinned_ips",
     "query_sha256",
     "redirected",
@@ -140,6 +141,7 @@ __all__ = [
     "resolve",
     "send",
     "serve",
+    "spend",
     "take_control",
     "unroutable",
     "with_required",
@@ -708,6 +710,36 @@ def wire_view(
     return transcript(start, [(EXCHANGE, exchange)] + headers, body)
 
 
+def peer(url: str) -> tuple[str, int]:
+    """The door's address, as whoever is about to send it a capability sees it.
+
+    Plain HTTP and nothing else, because the capability rides on that hop and a
+    client that spoke TLS to the door would be verifying the door's own
+    certificate against the door's own authority -- which proves nothing about
+    who is on the other end and hides the exchange from the fence that has to
+    read it.
+
+    Where the door *is* differs by side and is not decided here. The operator's
+    runtime reaches it on loopback and asserts as much in `endpoint`; a child
+    reaches it by container name over the one internal network its boundary
+    joins, and there is no loopback there to assert.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "http":
+        raise Refused(
+            "endpoint refused",
+            f"{url} is not an http:// endpoint; the door speaks plain HTTP",
+        )
+    host = parts.hostname or ""
+    try:
+        port = parts.port or 80
+    except ValueError as error:
+        raise Refused("endpoint refused", f"the proxy port cannot be read: {error}") from error
+    if not host:
+        raise Refused("endpoint refused", f"{url} names no host to send the capability to")
+    return host, port
+
+
 def endpoint(url: str) -> tuple[str, int]:
     """The local proxy an operator named, refused if it is not local.
 
@@ -721,17 +753,7 @@ def endpoint(url: str) -> tuple[str, int]:
     in a report. Only the detail survives that, which is why the detail says the
     whole thing.
     """
-    parts = urlsplit(url)
-    if parts.scheme != "http":
-        raise Refused(
-            "endpoint refused",
-            f"{url} is not an http:// endpoint; the local proxy speaks plain HTTP",
-        )
-    host = parts.hostname or ""
-    try:
-        port = parts.port or 80
-    except ValueError as error:
-        raise Refused("endpoint refused", f"the proxy port cannot be read: {error}") from error
+    host, port = peer(url)
     if not _loopback(host):
         raise Refused(
             "endpoint refused",
@@ -852,12 +874,15 @@ RELEASE = "SELECT release_egress_slot($1::uuid, $2)"
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 
 
-def _object(answer: object) -> dict:
+def as_object(answer: object) -> dict:
     """One `jsonb` answer as a mapping, whichever shape the driver returned it in.
 
     Both sides of this module read a function that answers with an object, and a
     second spelling of the same two-branch decode is a second place for the two
-    to disagree about what an answer with no rows looks like.
+    to disagree about what an answer with no rows looks like. Public because the
+    execution slice reads the same three functions -- `authorize_tool_run`,
+    `promote_proposal`, `finish_task_attempt` -- and a copy over there would be
+    that second place, one import away from the original.
     """
     return json.loads(answer) if isinstance(answer, str) else dict(answer)
 
@@ -1123,7 +1148,7 @@ class Fence:
                 ).scalar()
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
-        return _object(answer)
+        return as_object(answer)
 
     def open_identity(
         self,
@@ -3142,7 +3167,7 @@ def _spend(
 
     outcome = "error"
     try:
-        gate = _object(connection.execute(AUTHORIZE_TOOL_RUN, (tool_run_id,)).scalar())
+        gate = as_object(connection.execute(AUTHORIZE_TOOL_RUN, (tool_run_id,)).scalar())
         capability = gate.get("capability")
         if not capability and gate.get("decision") == "ask":
             outcome = _park(ledger, facts, connection, tool_run_id, label, gate)
@@ -3280,6 +3305,43 @@ def _park(
         source=f"decision:{decision}",
     )
     return "parked"
+
+
+def spend(
+    listener: tuple[str, int],
+    url: str,
+    *,
+    capability: str,
+    program_id: str,
+    method: str = "GET",
+    timeout: float = TIMEOUT,
+    trust: ssl.SSLContext | None = None,
+) -> Answer:
+    """Spend one already-minted capability on one request, and read the answer.
+
+    The half of `send` that is only the wire. `send` is the operator's whole
+    command -- it loads a configuration, opens a Tool run, mints and revokes --
+    and none of that is available to an Agent child, which has no database and
+    no configuration file and is handed a capability that some other process
+    minted and will revoke. What the child does have is exactly this: an
+    address, a capability, a Program to claim and one request to make.
+
+    Public so that side does not grow a second client. A hand-rolled request
+    inside the boundary would be a second place the control headers are spelled,
+    the tunnel is opened and the door's refusal is read back -- and the third of
+    those is the one that decides whether a Tool run closes as denied or as
+    served.
+    """
+    return _through(
+        listener,
+        url,
+        method,
+        capability,
+        program_id,
+        timeout,
+        scope.canonical_request(url),
+        trust,
+    )
 
 
 def _through(

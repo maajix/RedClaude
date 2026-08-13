@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, isolation, packet, roster, tls
+from redkraken import _launch, _startup, agent, isolation, packet, proxy, roster, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -729,11 +729,14 @@ class MissionTest(unittest.TestCase):
 class ServedToolTest(unittest.TestCase):
     """What the child offers the model, and what each handler does with a call."""
 
-    def served(self, stack, reader=None, mission=None):
+    def served(self, stack, reader=None, mission=None, door=None):
         surface = _launch.Surface()
         offered = stack.enter_context(packaged())
         _launch.server(
-            surface, reader or packet.Reader(packet.Packet()), mission or _launch.Submission()
+            surface,
+            reader or packet.Reader(packet.Packet()),
+            mission or _launch.Submission(),
+            door,
         )
         return surface, offered
 
@@ -859,6 +862,194 @@ class ServedToolTest(unittest.TestCase):
             self.answer(offered["get_receipts"], {"receipt_labels": ["R1"]})
 
         self.assertEqual(["get_hypotheses", "get_receipts"], surface.served)
+
+
+class RequestToolTest(unittest.TestCase):
+    """The one call that leaves the boundary, and every way it does not.
+
+    The handler decides nothing about whether a request is allowed -- the
+    capability was minted against a Tool run before this process started and
+    the door re-decides the request that arrives. What it does decide is how a
+    refusal is reported, and the whole of this class is that: a run with no
+    capability, a target that will not canonicalise, a door that does not
+    answer and a door that answers no are four different facts, and a handler
+    that flattened them would leave a model guessing which one it hit.
+    """
+
+    door = agent.Egress(
+        capability="c0ffee" * 10 + "cafe",
+        program_id="11111111-1111-4111-8111-111111111111",
+        proxy_url="http://rk2-proxy:18080",
+        certificate="/run/redkraken-ca.pem",
+    )
+
+    def served(self, stack, door=None):
+        surface = _launch.Surface()
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface, packet.Reader(packet.Packet()), _launch.Submission(), door
+        )
+        surface.open()
+        return offered["http_request"]
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        return json.loads(wire["content"][0]["text"])
+
+    @contextlib.contextmanager
+    def spending(self, answer=None, error: Exception | None = None):
+        """`proxy.spend` recorded rather than performed."""
+        calls: list[tuple[tuple, dict]] = []
+
+        def stand_in(*positional, **keyword):
+            calls.append((positional, keyword))
+            if error is not None:
+                raise error
+            return answer or proxy.Answer(
+                status=200, body=b"hello", receipt="RC1", decision=None, detail=None
+            )
+
+        with mock.patch.object(_launch.proxy, "spend", stand_in):
+            yield calls
+
+    def test_a_run_with_no_capability_says_so_and_sends_nothing(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=None)
+            with self.spending() as calls:
+                answer = self.answer(handler, {"method": "GET", "url": "https://x.test/"})
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(_launch.NO_CAPABILITY, answer["reason"])
+        self.assertEqual([], calls)
+
+    def test_the_capability_is_spent_on_the_door_the_job_named(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/a"})
+
+        (listener, url), keyword = calls[0]
+        self.assertEqual(("rk2-proxy", 18080), listener)
+        self.assertEqual("http://x.test/a", url)
+        self.assertEqual(self.door.capability, keyword["capability"])
+        self.assertEqual(self.door.program_id, keyword["program_id"])
+        self.assertEqual("GET", keyword["method"])
+        self.assertTrue(answer["served"])
+        self.assertEqual(200, answer["status"])
+        self.assertEqual("RC1", answer["receipt"])
+        self.assertEqual("hello", answer["body"])
+
+    def test_a_plain_target_needs_no_trust_and_a_tls_one_loads_it(self):
+        loaded: list[Path] = []
+
+        def stand_in(certificate):
+            loaded.append(Path(certificate))
+            return "an ssl context"
+
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            stack.enter_context(mock.patch.object(_launch.tls, "trust", stand_in))
+            with self.spending() as calls:
+                self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+                self.answer(handler, {"method": "GET", "url": "https://x.test/"})
+
+        self.assertIsNone(calls[0][1]["trust"])
+        self.assertEqual("an ssl context", calls[1][1]["trust"])
+        self.assertEqual([Path(self.door.certificate)], loaded)
+
+    def test_a_body_larger_than_the_excerpt_is_cut_and_says_it_was(self):
+        long = b"a" * (packet.DEFAULT_EXCERPT + 100)
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(
+                answer=proxy.Answer(200, long, "RC1", None, None)
+            ):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertEqual(packet.DEFAULT_EXCERPT, len(answer["body"]))
+        self.assertEqual(len(long), answer["byte_size"])
+        self.assertTrue(answer["truncated"])
+
+    def test_bytes_that_are_not_text_are_replaced_rather_than_raised(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(answer=proxy.Answer(200, b"\xff\xfe", "RC1", None, None)):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertEqual("��", answer["body"])
+
+    def test_a_door_that_refused_reports_the_refusal_rather_than_a_failure(self):
+        # 407 with a decision is this fence saying no. The request did not
+        # happen, the Receipt proves it did not, and a handler reporting it as
+        # an unreachable target would have the model retry a policy decision.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(
+                answer=proxy.Answer(407, b"", "RC2", "out_of_scope", "not in policy")
+            ):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertFalse(answer["served"])
+        self.assertEqual("out_of_scope", answer["decision"])
+        self.assertEqual("RC2", answer["receipt"])
+        self.assertNotIn("reason", answer)
+
+    def test_a_target_that_will_not_canonicalise_never_reaches_the_door(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                answer = self.answer(handler, {"method": "GET", "url": "gopher://x.test/"})
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(_launch.UNUSABLE_TARGET, answer["reason"])
+        self.assertEqual([], calls)
+
+    def test_a_door_address_that_is_not_an_address_is_the_same_answer(self):
+        broken = agent.Egress(
+            capability=self.door.capability,
+            program_id=self.door.program_id,
+            proxy_url="https://rk2-proxy:18080",
+        )
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=broken)
+            with self.spending() as calls:
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertEqual(_launch.UNUSABLE_TARGET, answer["reason"])
+        self.assertEqual([], calls)
+
+    def test_a_certificate_that_cannot_be_read_is_not_a_traceback(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            stack.enter_context(
+                mock.patch.object(_launch.tls, "trust", side_effect=OSError("no such file"))
+            )
+            with self.spending() as calls:
+                answer = self.answer(handler, {"method": "GET", "url": "https://x.test/"})
+
+        self.assertEqual(_launch.UNUSABLE_TARGET, answer["reason"])
+        self.assertEqual([], calls)
+
+    def test_a_door_that_does_not_answer_is_reported_as_the_door(self):
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(error=OSError("connection refused")):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(_launch.DOOR_UNREACHABLE, answer["reason"])
+        self.assertIn("connection refused", answer["detail"])
+
+    def test_the_call_is_on_the_surfaces_record_however_it_ended(self):
+        with contextlib.ExitStack() as stack:
+            surface = _launch.Surface()
+            offered = stack.enter_context(packaged())
+            _launch.server(surface, packet.Reader(packet.Packet()), _launch.Submission())
+            surface.open()
+
+            self.answer(offered["http_request"], {"method": "GET", "url": "http://x.test/"})
+
+        self.assertEqual(["http_request"], surface.served)
 
 
 class ChildTest(unittest.TestCase):

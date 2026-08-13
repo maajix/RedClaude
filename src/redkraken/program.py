@@ -25,6 +25,7 @@ reports what is durable and stops, which is what `stop_reason` says.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,12 @@ from redkraken.outcome import (
 
 COMMAND = "run"
 
+#: What `rk run` does after the Program is open: one ledger to record against,
+#: the runtime connection it was opened on, and the Program it opened. The
+#: answer is whatever the caller wants reported under `execution`, and this
+#: module does not look inside it beyond asking whether a Task was attempted.
+Execute = Callable[[Ledger, pg.Connection, str], dict]
+
 #: Who the database records as having written. A run is a runtime actor: there
 #: is no model in the loop yet, and the operator is not writing these rows by
 #: hand. `events` carries the kind and not the identifier, so no row this
@@ -58,12 +65,16 @@ RESUME = "resume"
 REVISE = "revise"
 REFUSE = "refuse"
 
-#: Why the command stopped. `nothing_to_execute` is the honest answer while the
-#: execution loop is owed by a later ticket: the Program is open and ready and
-#: this command has nothing more to do with it.
+#: Why the command stopped. `nothing_to_execute` covers both ways of having
+#: nothing to do: a machine with no execution slice configured, and one whose
+#: scheduler offered nothing ready. `task_attempted` says one attempt was made
+#: and is deliberately silent about how it went -- what the Task became is in
+#: the execution facts, and a stop reason that summarised it would be a second
+#: answer to a question the database has already answered.
 STOPPED_REFUSED = "refused"
 STOPPED_AWAITING_DECISION = "awaiting_decision"
 STOPPED_NOTHING_TO_EXECUTE = "nothing_to_execute"
+STOPPED_TASK_ATTEMPTED = "task_attempted"
 
 #: Everything the command reports, and the reason the list is written down: a
 #: run answers with durable identifiers, what state the Program is in, why it
@@ -79,6 +90,7 @@ FACTS = (
     "stop_reason",
     "pending_decisions",
     "integrity",
+    "execution",
 )
 
 #: The advisory lock a run holds while it decides. The two-integer key space is
@@ -168,8 +180,17 @@ def run(
     *,
     accept_change: bool = False,
     corpus: Path = migrate.CORPUS,
+    execute: Execute | None = None,
 ) -> Report:
-    """Create or resume the Program this configuration names."""
+    """Create or resume the Program this configuration names, then work it.
+
+    `execute` is a callback rather than an import. The slice that runs a Task
+    needs the capability proxy, the proxy needs this module to resolve the
+    Program a request is spent against, and a module that imported its own
+    caller would close that loop. Passing the work in also keeps the ordering
+    honest: nothing can be attempted against a Program this command has not
+    already opened, verified and read back.
+    """
     ledger = Ledger()
     state = _State()
 
@@ -257,7 +278,32 @@ def run(
         # against a Program that exists, so the identifiers stay in the answer.
         _read_durable_state(ledger, connection, state)
 
+        if execute is not None and _workable(ledger, state):
+            state.execution = execute(ledger, connection, str(state.program_id))
+
     return _report(ledger, state)
+
+
+def _workable(ledger: Ledger, state: _State) -> bool:
+    """Whether this Program is in a state anything may be attempted against.
+
+    Three refusals rather than one, because they are three different facts and
+    an operator reading "nothing happened" deserves to know which. A closed or
+    retired Program is not a fault at all, which is why it is held rather than
+    failed: the run resumed it correctly and there is nothing left to work on.
+    """
+    if ledger.violations:
+        return False
+    if state.pending:
+        ledger.hold(
+            "execution",
+            f"{len(state.pending)} decision(s) are waiting on a human; nothing was claimed",
+        )
+        return False
+    if state.lifecycle != "open":
+        ledger.hold("execution", f"the Program is {state.lifecycle}; nothing was claimed")
+        return False
+    return True
 
 
 @dataclass
@@ -278,14 +324,18 @@ class _State:
     lifecycle: str | None = None
     pending: list[dict] | None = None
     integrity: dict | None = None
+    execution: dict | None = None
 
 
 def _report(ledger: Ledger, state: _State) -> Report:
     pending = state.pending or []
+    attempted = bool((state.execution or {}).get("task"))
     if ledger.violations:
         stop_reason = STOPPED_REFUSED
     elif pending:
         stop_reason = STOPPED_AWAITING_DECISION
+    elif attempted:
+        stop_reason = STOPPED_TASK_ATTEMPTED
     else:
         stop_reason = STOPPED_NOTHING_TO_EXECUTE
     return report(
@@ -299,6 +349,7 @@ def _report(ledger: Ledger, state: _State) -> Report:
         stop_reason=stop_reason,
         pending_decisions=pending,
         integrity=state.integrity,
+        execution=state.execution,
     )
 
 

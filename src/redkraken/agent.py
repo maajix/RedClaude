@@ -100,12 +100,19 @@ DIAGNOSTIC = 1500
 SERVER = "rk2"
 SERVER_VERSION = "0.1.0"
 
-#: The two groups `_launch` builds handlers for: the bounded state reads and
-#: the one outbound proposal. Named as groups rather than as tools so that
-#: moving a tool between groups in the roster moves it here too -- a served
-#: tool that had quietly changed authority class would otherwise be a hole the
-#: compile cannot see.
-SERVED_GROUPS = ("state.read", "state.propose")
+#: The three groups `_launch` builds handlers for: the bounded state reads, the
+#: one outbound proposal and the one request that leaves the boundary. Named as
+#: groups rather than as tools so that moving a tool between groups in the
+#: roster moves it here too -- a served tool that had quietly changed authority
+#: class would otherwise be a hole the compile cannot see.
+#:
+#: `net.request` is served for every role the roster grants it to, and whether a
+#: particular run may spend it is not decided here: the handler answers a
+#: refusal when its job carries no capability. Serving it conditionally would
+#: make the allowlist a function of the job, and the assertion checks that
+#: allowlist against the roster -- so a launch with no capability would refuse
+#: to start rather than start with nothing to spend.
+SERVED_GROUPS = ("state.read", "state.propose", "net.request")
 
 #: Everything this launch actually serves. The roster says what a role may
 #: call; this says what exists to be called, and the allowlist a launch carries
@@ -214,6 +221,59 @@ _LATCH: StartupRefusal | None = None
 
 
 @dataclass(frozen=True, slots=True)
+class Egress:
+    """The one live capability a child may spend, and where to spend it.
+
+    Everything a request through the door needs and nothing a request could be
+    decided from. The capability is bearer material with about five minutes to
+    live; the Program is what the door's control header claims; the address is
+    the door as the *container* sees it, which is a name on an internal network
+    rather than the loopback address the supervisor used.
+
+    What is deliberately absent is the target. The capability was minted against
+    one Tool run naming one URL, and the door re-decides every request that
+    arrives under it against live policy -- subresources and redirects share one
+    capability by design, and each still earns its own verdict. Putting the
+    target here as well would read like a second gate, and it would be one this
+    process could not enforce.
+    """
+
+    capability: str
+    program_id: str
+    proxy_url: str
+    certificate: str = isolation.CA_FILE
+
+    def as_dict(self) -> dict:
+        return {
+            "capability": self.capability,
+            "program_id": self.program_id,
+            "proxy_url": self.proxy_url,
+            "certificate": self.certificate,
+        }
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, object] | None) -> "Egress | None":
+        """The block a job carried, or nothing when it carried no usable one.
+
+        Nothing rather than a partial value, and nothing rather than an
+        exception. A child cannot check a capability against anything -- it has
+        no database and no second copy -- so the one thing it decides is whether
+        it was given all three parts, and a job missing any of them is a run
+        that may not reach a target. The handler says so when it is called,
+        which is a refusal the model can read, rather than a crash mid-turn.
+        """
+        if not isinstance(document, Mapping):
+            return None
+        values = {
+            name: str(document.get(name) or "")
+            for name in ("capability", "program_id", "proxy_url")
+        }
+        if not all(values.values()):
+            return None
+        return cls(**values, certificate=str(document.get("certificate") or isolation.CA_FILE))
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRunRequest:
     """One Agent run, described completely enough to be started.
 
@@ -250,6 +310,13 @@ class AgentRunRequest:
     served from what came in with the job. A request with no packet starts a
     child whose state reads all answer "nothing", which is the honest answer
     for a run the runtime compiled no state for.
+
+    `egress` is the same argument about reaching outwards. The capability is
+    minted by the database against a Tool run the runtime opened, so a child
+    that could mint its own would be a child deciding what it may call. With
+    none, the request tool is still served -- the roster decides that, not the
+    job -- and it answers a refusal, which is the honest answer for a run
+    nothing authorised a request for.
     """
 
     agent_run_id: str
@@ -258,6 +325,7 @@ class AgentRunRequest:
     role: str
     program_id: str | None = None
     packet: packet_module.Packet | None = None
+    egress: Egress | None = None
     timeout: float = TIMEOUT
 
 
@@ -359,6 +427,7 @@ def agent_run(
             "role": request.role,
             "workspace": isolation.WORKSPACE,
             "packet": (request.packet or packet_module.Packet()).as_dict(),
+            "egress": None if request.egress is None else request.egress.as_dict(),
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:

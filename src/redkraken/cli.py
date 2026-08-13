@@ -21,6 +21,7 @@ from redkraken import (
     callback,
     decisions,
     doctor,
+    execution,
     header,
     identity,
     migrate,
@@ -149,6 +150,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "record a new configuration revision when the policy has changed; "
             "without it a changed policy is refused rather than adopted"
+        ),
+    )
+    # The second string, added by hand for the reason `rk state` adds its own:
+    # `_add_url` also declares which role the command's single URL is, and this
+    # command's single URL is the runtime's. Optional, because the string is
+    # only needed when the machine is configured to run a Task at all.
+    runner.add_argument(
+        AGENT.flag,
+        metavar="postgresql://...",
+        help=(
+            "the agent connection string the Mission packet is compiled on "
+            f"(default: ${AGENT.variable}); needed only when {execution.IMAGE} "
+            "and the rest of the Agent boundary are set"
         ),
     )
     runner.set_defaults(run=_run)
@@ -905,13 +919,49 @@ def _scope(arguments: argparse.Namespace) -> int:
 
 
 def _run(arguments: argparse.Namespace) -> int:
+    """Open the Program, and work one Task where this machine can run one.
+
+    Three outcomes rather than two. A machine that describes no Agent boundary
+    gets the command every earlier ticket had -- open, report, stop -- because
+    that is still a correct use of it. A machine that describes half a boundary
+    is refused by name: a missing image or proxy container is an operator
+    mistake, and defaulting past one would start a child somewhere nobody chose.
+    """
+    ledger = Ledger()
+    slice_ = _slice(ledger, arguments)
+    if ledger.violations:
+        return _render(report(program.COMMAND, ledger))
     return _with_settings(
         arguments,
         program.COMMAND,
         lambda settings: program.run(
-            settings, arguments.config, accept_change=arguments.accept_change
+            settings,
+            arguments.config,
+            accept_change=arguments.accept_change,
+            execute=None if slice_ is None else slice_.attempt,
         ),
     )
+
+
+def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | None:
+    """The execution slice this machine is configured for, or nothing."""
+    if not execution.requested(os.environ):
+        return None
+    boundary, missing = execution.boundary(os.environ)
+    if boundary is None:
+        ledger.fail(
+            "agent_boundary",
+            "the Agent boundary is described in part: " + ", ".join(missing) + " "
+            + ("is" if len(missing) == 1 else "are")
+            + " unset, and no child is started without all of them",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{missing[0]}",
+        )
+        return None
+    agent = _url(ledger, AGENT, arguments.state_url, program.COMMAND)
+    if agent is None:
+        return None
+    return execution.Slice(boundary=boundary, state=agent)
 
 
 def _state(arguments: argparse.Namespace) -> int:
