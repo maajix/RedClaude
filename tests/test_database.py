@@ -64,6 +64,7 @@ from redkraken import (
     program,
     proposal,
     proxy,
+    roster,
     scope,
     seal,
     state,
@@ -1010,6 +1011,23 @@ CONTROLS = (
         "standing:roster_model_and_effort",
         "CREATE FUNCTION selftest_model_for_role() RETURNS text"
         " LANGUAGE sql IMMUTABLE AS $ctl$ SELECT 'claude-opus-5'::text $ctl$",
+    ),
+    Control(
+        # The cross-role subagent cap, counted correctly and bounded by a copy
+        # of the number instead of by the row that holds it. Structural for the
+        # third time and for the third version of the same reason: with the
+        # weights row at 3 this function answers exactly what the scheduler
+        # answers, and it starts lying on the day an operator moves the row --
+        # which is the day nothing would be watching it.
+        "standing:subagent_cap",
+        "CREATE FUNCTION selftest_subagent_cap_reached() RETURNS boolean"
+        " LANGUAGE sql STABLE AS $ctl$"
+        " SELECT (SELECT count(*) FROM tasks c"
+        "           JOIN effective_lane_capacity lc"
+        "             ON lc.program_id = c.program_id AND lc.kind = c.kind"
+        "           JOIN roles r ON r.role = lc.role"
+        "          WHERE c.status IN ('claimed','running')"
+        "            AND r.runs_as = 'subagent') >= 3 $ctl$",
     ),
     Control(
         "standing:purge_reachability",
@@ -10949,6 +10967,7 @@ class SlateClaimTest(DatabaseCase):
             ("held", AFFORDABLE),
             ("contended", AFFORDABLE),
             ("roster", AFFORDABLE),
+            ("capped", AFFORDABLE),
         ):
             path = write(
                 SCOPED.replace(SCOPED_BUDGETS, budgets).replace(
@@ -10968,6 +10987,7 @@ class SlateClaimTest(DatabaseCase):
         cls.arrange_held()
         cls.arrange_contended()
         cls.arrange_model_and_effort()
+        cls.arrange_subagent_cap()
 
     @classmethod
     def tearDownClass(cls):
@@ -11336,6 +11356,92 @@ class SlateClaimTest(DatabaseCase):
             cls.claimed_runs[kind] = claimed
             cls.call("SELECT finish_task_attempt($1::uuid, 'completed')",
                      (claimed["id"],))
+
+    @classmethod
+    def arrange_subagent_cap(cls):
+        """The one number moved, and both sides of the runtime seam moving.
+
+        PH2-73's criterion 2. `scheduler_weights.max_concurrent_subagents` is
+        what the claim refuses past and what the pre-tool gate refuses past,
+        and until this ticket the gate held its own copy of it -- so raising
+        the row offered a subagent the gate then denied, and lowering it left
+        the gate as code that never fired.
+
+        Both claims are made against one slate, offered before the row is
+        touched, because it is the claim that re-reads the weights: the Task
+        the Slate offered is refused at a cap of one and taken at a cap of two,
+        with nothing about the Task itself different between the two attempts.
+        The row is put back at the end, and `cap_after` is what says so -- it
+        is a global row, and every scenario after this one would otherwise be
+        scheduled under a cap this fixture chose.
+        """
+        program_id = cls.identifiers["capped"]
+        first, second = cls.seed("capped", 2)
+        subject = str(
+            cls.scalar(
+                "SELECT subject_entity_id::text FROM tasks"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (program_id, second),
+            )
+        )
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (program_id, second, cls.hypothesis("capped", subject, "worth hunting")),
+        )
+
+        cls.bind("capped")
+        cls.offer()
+        cls.cap_before = cls.cap()
+
+        # One subagent Task claimed and running, which is the whole of the
+        # Program's count. The recon lane admits one at a time, so what refuses
+        # the hunt below cannot be this Task's lane.
+        cls.set_cap(1)
+        cls.capped_at_one = cls.started(
+            "capped", cls.call("SELECT claim_task($1)", (first,))
+        )
+        cls.capped_refusal = cls.refusal("SELECT claim_task($1)", (second,))
+
+        cls.set_cap(2)
+        cls.capped_at_two = cls.started(
+            "capped", cls.call("SELECT claim_task($1)", (second,))
+        )
+
+        cls.set_cap(cls.cap_before)
+        cls.cap_after = cls.cap()
+
+    @classmethod
+    def cap(cls) -> int:
+        """What the active weights row says the cross-role subagent cap is."""
+        return int(
+            cls.scalar(
+                "SELECT max_concurrent_subagents FROM scheduler_weights WHERE active"
+            )
+        )
+
+    @classmethod
+    def set_cap(cls, subagents: int) -> None:
+        """The operator's edit, which is the only place this number is set."""
+        cls.as_owner(
+            "UPDATE scheduler_weights SET max_concurrent_subagents = $1::smallint"
+            " WHERE active",
+            (str(subagents),),
+        )
+
+    @classmethod
+    def started(cls, name: str, run: object) -> execution.Claimed:
+        """The claimed run as the runtime reads it back, through its own query.
+
+        `execution.STARTED` rather than a statement written here: what is under
+        test is that the number the runtime carries to the child is the one the
+        claim ran against, and a second query would only prove that the column
+        can be selected.
+        """
+        rows = cls.runtime.execute(
+            execution.STARTED, (str(run), cls.identifiers[name])
+        ).rows
+        return execution.Claimed.from_row(rows[0])
 
     @classmethod
     def hypothesis(cls, name: str, subject: str, worth: str) -> str:
@@ -11789,10 +11895,68 @@ class SlateClaimTest(DatabaseCase):
                  if str(row["model"]).startswith("claude-")]
         )
 
+    # -- the one cross-role subagent cap (PH2-73) -------------------------------
+
+    def test_the_claim_carries_the_weights_rows_cap_into_the_run(self):
+        # Criterion 1, read back through `execution.STARTED`: the number the
+        # runtime hands the child is the one the claim ran against, and it
+        # moves when the row moves rather than when a constant is edited.
+        self.assertEqual(
+            (1, 2),
+            (self.capped_at_one.subagent_cap, self.capped_at_two.subagent_cap),
+        )
+
+    def test_a_lowered_cap_refuses_the_claim_a_raised_one_admits(self):
+        # The scheduler half of criterion 2, off one slate: the same Task, the
+        # same lane and the same budget, refused and then taken with nothing
+        # changed but the weights row. `web_hunter` is a subagent role, so the
+        # refusal is the cap and not the lane -- the lane admits two.
+        self.assertIn("global_subagent_cap", self.capped_refusal)
+        self.assertEqual(
+            ("hunt", "web_hunter"), (self.capped_at_two.kind, self.capped_at_two.role)
+        )
+
+    def test_the_gate_refuses_at_the_cap_the_claim_was_admitted_under(self):
+        # The runtime half of the same criterion, and the seam the ticket
+        # closes: the gate is built from what the claim read, so both numbers
+        # here came out of one row that this fixture moved once.
+        for claimed in (self.capped_at_one, self.capped_at_two):
+            with self.subTest(subagents=claimed.subagent_cap):
+                gate = roster.Gate("orchestrator", claimed.subagent_cap)
+                # Alternating targets, because both roles run two at a time:
+                # every delegation here is inside its own role's ceiling, so
+                # the session's cap is the only thing that can refuse one.
+                delegations = [
+                    roster.Call(
+                        tool=roster.DELEGATION,
+                        arguments={
+                            roster.SUBAGENT_TYPE:
+                                "web_hunter" if index % 2 == 0 else "js_analyst"
+                        },
+                        ticket=f"t{index}",
+                    )
+                    for index in range(claimed.subagent_cap + 1)
+                ]
+
+                for admitted in delegations[:-1]:
+                    self.assertIsNone(gate.decide(admitted))
+                denial = gate.decide(delegations[-1])
+
+                self.assertIsNotNone(denial, "the gate admitted one past its cap")
+                self.assertEqual(roster.OVERFLOW, denial.rule)
+                self.assertIn("this session", denial.reason)
+                self.assertIn(str(claimed.subagent_cap), denial.reason)
+
+    def test_the_weights_row_is_back_where_this_fixture_found_it(self):
+        # `scheduler_weights` is one global row, so a scenario that moved it and
+        # did not put it back would schedule every case after this one -- in
+        # this file and in every other -- under a cap this fixture chose.
+        self.assertEqual(self.cap_before, self.cap_after)
+
     # -- the invariant ---------------------------------------------------------
 
     def test_the_standing_checks_are_registered_and_hold(self):
-        for name in ("slate_claim", "roster_model_and_effort"):
+        for name in ("slate_claim", "roster_model_and_effort", "subagent_cap"):
             with self.subTest(check=name):
                 [registered] = self.connection.execute(
                     "SELECT count(*) FROM standing_checks WHERE name = $1", (name,)

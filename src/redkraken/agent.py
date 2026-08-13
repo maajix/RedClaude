@@ -317,6 +317,14 @@ class AgentRunRequest:
     none, the request tool is still served -- the roster decides that, not the
     job -- and it answers a refusal, which is the honest answer for a run
     nothing authorised a request for.
+
+    `subagent_cap` is the one number this request does carry that the roster
+    does not state, and for the reason the rest of them are not carried: it is
+    not a roster value at all. `scheduler_weights.max_concurrent_subagents` is
+    set per Program and per weights version, so the caller that claimed the
+    Task read it and passes it on, and the gate inside the child refuses at the
+    same number the scheduler offered under. The default is the roster's, which
+    is the schema's default, for a caller with no weights row to read.
     """
 
     agent_run_id: str
@@ -327,6 +335,7 @@ class AgentRunRequest:
     packet: packet_module.Packet | None = None
     egress: Egress | None = None
     timeout: float = TIMEOUT
+    subagent_cap: int = roster.GLOBAL_SUBAGENTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +437,7 @@ def agent_run(
             "workspace": isolation.WORKSPACE,
             "packet": (request.packet or packet_module.Packet()).as_dict(),
             "egress": None if request.egress is None else request.egress.as_dict(),
+            "subagent_cap": request.subagent_cap,
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:

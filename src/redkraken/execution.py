@@ -169,6 +169,14 @@ CLAIM = "SELECT claim_task()"
 #: Program, so a lookup on the label alone reads back whichever `AR1` the
 #: planner reached first -- and the attempt would then be opened against another
 #: Program's run.
+#:
+#: The cross-role subagent cap comes back with the run for the same reason the
+#: Lease TTL is read rather than assumed: it is a weights column an operator
+#: sets per Program, and the gate inside the child has to refuse at the number
+#: the scheduler offered and claimed under. Read here rather than in a second
+#: statement so that it is the row this claim ran against -- a weights version
+#: activated between the claim and the launch would otherwise start a child
+#: under a cap no part of this attempt was scheduled by.
 STARTED = (
     "SELECT ar.id::text, ar.label, ar.role,"
     " t.id::text, t.label, t.kind, t.attempts,"
@@ -179,10 +187,12 @@ STARTED = (
     "     || CASE WHEN left(ep.path_template, 1) = '/' THEN ep.path_template"
     "             ELSE '/' || ep.path_template END"
     "   WHEN ap.entity_id IS NOT NULL THEN ap.base_url"
-    " END"
+    " END,"
+    " w.max_concurrent_subagents"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
+    " JOIN scheduler_weights w ON w.active"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
     " LEFT JOIN applications ap ON ap.entity_id = e.id"
@@ -320,11 +330,17 @@ def stopped_as(reported: str | None) -> str:
 class Claimed:
     """One claimed Task and the run the database opened for it.
 
-    A single value rather than eleven passed around together, because every
+    A single value rather than twelve passed around together, because every
     step below the claim needs some of them and no step needs a different
-    eleven. `url` is the one that can be absent: a subject that is neither an
+    twelve. `url` is the one that can be absent: a subject that is neither an
     application nor an endpoint has no address to send a request to, and that
     is a refusal with a reason rather than a missing field to work around.
+
+    `subagent_cap` is the odd one: it describes the weights row rather than the
+    Task, and it is here because it has to travel with the claim. The scheduler
+    ranked and claimed under it, and the gate in the child refuses under it, so
+    a copy carried anywhere else would be a second statement of the one number
+    ticket 73 exists to have only one of.
     """
 
     agent_run_id: str
@@ -338,6 +354,7 @@ class Claimed:
     subject_label: str
     method: str
     url: str | None
+    subagent_cap: int
 
     @classmethod
     def from_row(cls, row) -> Claimed:
@@ -353,6 +370,7 @@ class Claimed:
             subject_label=str(row[8]),
             method=str(row[9]),
             url=None if row[10] is None else str(row[10]),
+            subagent_cap=int(row[11]),
         )
 
     def objective(self) -> str:
@@ -1036,6 +1054,7 @@ class Slice:
             packet=mission,
             egress=door,
             timeout=timeout,
+            subagent_cap=claimed.subagent_cap,
         )
         try:
             result = self.launch(request)

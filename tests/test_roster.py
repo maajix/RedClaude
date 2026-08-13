@@ -566,6 +566,37 @@ class GateTest(unittest.TestCase):
         self.assertEqual(roster.OVERFLOW, denial.rule)
         self.assertIn("this session", denial.reason)
 
+    def test_a_lowered_cap_refuses_a_delegation_the_default_would_admit(self):
+        # PH2-73. The ceiling is `scheduler_weights.max_concurrent_subagents`,
+        # which the runtime reads with the claim and gives to the gate, so the
+        # gate refuses at whatever the scheduler offered under. `web_hunter`
+        # runs two at a time, so nothing but the session's own cap refuses the
+        # second one here.
+        gate = roster.Gate("orchestrator", 1)
+        self.assertIsNone(gate.decide(self.delegating("web_hunter", "a")))
+
+        denial = self.denied(gate, self.delegating("web_hunter", "b"))
+        self.assertEqual(roster.OVERFLOW, denial.rule)
+        self.assertIn("this session", denial.reason)
+
+    def test_a_raised_cap_admits_the_delegation_the_default_would_refuse(self):
+        # The other direction, which is the one that used to end in a claimed
+        # Task with no child: the scheduler offers a fourth subagent, the
+        # orchestrator delegates it, and a gate holding its own constant denies
+        # it. Every target here is inside its own role's ceiling of two, so the
+        # session's cap is the only thing that could refuse any of them.
+        admitted = (("web_hunter", "a"), ("web_hunter", "b"),
+                    ("js_analyst", "c"), ("js_analyst", "d"))
+        self.assertGreater(len(admitted), roster.GLOBAL_SUBAGENTS)
+        gate = roster.Gate("orchestrator", len(admitted))
+
+        for target, ticket in admitted:
+            self.assertIsNone(gate.decide(self.delegating(target, ticket)))
+
+        denial = self.denied(gate, self.delegating("recon", "e"))
+        self.assertEqual(roster.OVERFLOW, denial.rule)
+        self.assertIn(str(len(admitted)), denial.reason)
+
     def test_a_finished_delegation_gives_its_slot_back_once(self):
         self.assertIsNone(self.gate.decide(self.delegating("recon", "a")))
         self.assertEqual(roster.OVERFLOW, self.denied(self.gate, self.delegating("recon", "b")).rule)
@@ -732,6 +763,16 @@ class GateTest(unittest.TestCase):
                 with self.assertRaises(roster.RosterError):
                     roster.Gate(name)
 
+    def test_a_gate_cannot_be_made_for_a_concurrency_that_holds_nothing(self):
+        # The schema's own `CHECK (max_concurrent_subagents >= 1)`, asked where
+        # the number is spent. A session that may hold no delegation is not a
+        # stricter cap, it is an orchestrator that cannot do its work, and the
+        # honest place to say so is before the run is started.
+        for subagents in (0, -1):
+            with self.subTest(subagents=subagents):
+                with self.assertRaises(roster.RosterError):
+                    roster.Gate("orchestrator", subagents)
+
 
 class SurfaceIntersectionTest(unittest.TestCase):
     """What a launch offers, against what the roster grants."""
@@ -785,6 +826,11 @@ class SchemaAgreementTest(unittest.TestCase):
     #: written into only one fails here rather than at its first claim.
     MODEL_AND_EFFORT = re.compile(
         r"\('(?P<role>\w+)', +'(?P<model>[\w.-]+)', +'(?P<effort>\w+)'\)"
+    )
+    #: 019's cross-role cap, which is the only one of these numbers this file
+    #: does not own: `scheduler_weights` is a versioned row an operator moves.
+    DEFAULT_SUBAGENTS = re.compile(
+        r"max_concurrent_subagents smallint NOT NULL DEFAULT (?P<cap>\d+)"
     )
 
     @classmethod
@@ -847,6 +893,17 @@ class SchemaAgreementTest(unittest.TestCase):
                     (role.model or "none", role.effort or "none"),
                 )
         self.assertEqual(set(roster.ROLES), set(stated))
+
+    def test_the_default_session_ceiling_is_the_schemas_own_default(self):
+        # PH2-73. What governs a run is the weights row, which the runtime
+        # reads with the claim and hands the gate; this constant is only what a
+        # gate built without one falls back to. The two being one number is
+        # what makes that fallback the schema's answer rather than a second
+        # opinion about a value an operator sets per Program.
+        stated = self.DEFAULT_SUBAGENTS.search(self.sql)
+
+        self.assertIsNotNone(stated, "019 no longer states a default subagent cap")
+        self.assertEqual(roster.GLOBAL_SUBAGENTS, int(stated["cap"]))
 
     def test_the_task_kind_mapping_is_the_schemas(self):
         mapped = {

@@ -17,8 +17,8 @@ review, all triaged into the graph.
 | Check | Result |
 | --- | --- |
 | Ticket files | 75, numbered continuously 01–75 |
-| Ticket status | 25 `resolved`, 50 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 430 total, 147 ticked |
+| Ticket status | 26 `resolved`, 49 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 430 total, 150 ticked |
 | Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -38,7 +38,7 @@ and the scheduler that will read it: the model and effort a claimed run records,
 the Identity a clamped role must hold, and the cross-role subagent cap that is
 written once in `roster.py` and once as a `scheduler_weights` column. Each is
 blocked by the scheduler ticket that owns the code it changes (23 and 24), which
-is also why none of them was fixed under 18. The first of the three, 71, is
+is also why none of them was fixed under 18. Two of the three, 71 and 73, are
 resolved.
 
 Tickets 74 and 75 are what 71 found that was not 71's, and both are defects the
@@ -55,9 +55,9 @@ Task of every kind in one Program and then purged it.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–24, 71 |
-| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 72, 73, 74, 75 |
-| Criteria ticked | 147 of 430 |
+| Resolved | 01–24, 71, 73 |
+| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 72, 74, 75 |
+| Criteria ticked | 150 of 430 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -105,10 +105,14 @@ keeps what it holds. What that run is started at is now the roster's own: the
 model and effort a claim records are two columns on `roles` the claim reads,
 rather than one constant the scheduler spelled for every role that is not the
 renderer, and the model is the alias the SDK is handed rather than the
-resolution a version-bound manifest owns. The budgets and ranking policy the
-scheduler is measured by, the hypothesis and validation half of the epistemic
-pipeline, kill chains, the v1 knowledge migration and the operator surface are
-untouched.
+resolution a version-bound manifest owns. How many subagents may run beside it
+is now one number rather than two that happened to match: the runtime reads
+`max_concurrent_subagents` off the weights row with the claim and the pre-tool
+gate refuses at what it read, so an operator raising the cap raises what the
+Slate offers and what the gate admits in one edit. The budgets and ranking
+policy the scheduler is measured by, the hypothesis and validation half of the
+epistemic pipeline, kill chains, the v1 knowledge migration and the operator
+surface are untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

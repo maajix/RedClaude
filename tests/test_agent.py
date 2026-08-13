@@ -1075,6 +1075,26 @@ class ChildTest(unittest.TestCase):
         self.assertEqual("pre_spawn", raised.exception.phase)
         self.assertEqual([agent.UNMEASURED_RUNTIME], codes(raised.exception.violations))
 
+    def test_the_gate_the_child_builds_refuses_at_the_cap_the_job_carried(self):
+        # PH2-73. The number is `scheduler_weights.max_concurrent_subagents`,
+        # and it arrives on the job because this process cannot ask for it: the
+        # container's one network reaches the capability proxy and no database.
+        capped = job(fixtures.scratch(), subagent_cap=5)
+        gate = _launch._gate(fixtures.ROLE, _launch._subagent_cap(capped))
+
+        self.assertEqual(5, gate.subagents)
+
+    def test_a_job_that_carries_no_cap_gets_the_rosters_default(self):
+        # A job written before the number travelled, not a value this process
+        # prefers to the one the claim read.
+        self.assertEqual(roster.GLOBAL_SUBAGENTS, _launch._subagent_cap(self.job))
+
+    def test_a_cap_the_roster_refuses_leaves_the_child_with_no_gate(self):
+        # The same answer an unknown role gets, and for the same reason: no
+        # gate is no options value, and a launch that cannot be described is
+        # one `assess` refuses field by field rather than one that crashes.
+        self.assertIsNone(_launch._gate(fixtures.ROLE, 0))
+
     def test_a_credential_vector_in_the_inherited_environment_refuses_the_same_way(self):
         with self.assertRaises(agent.StartupRefusal) as raised:
             asyncio.run(
@@ -1902,6 +1922,20 @@ class RecordingTest(unittest.TestCase):
                 agent.uncorroborated(_launch.ABSENT), "init", *_startup.KNOWN_RUNTIME
             ),
         )
+
+    def test_the_job_carries_the_cap_the_caller_claimed_the_task_under(self):
+        # PH2-73's seam. The scheduler ranked and claimed under the weights
+        # row's number, so the gate inside the child has to refuse at that one
+        # -- and the only way it reaches the child is on the job.
+        written = {}
+        spawn = mock.patch.object(
+            agent, "_spawn", side_effect=lambda request, job: written.update(job)
+        )
+
+        with unlatched(), spawn:
+            agent.agent_run(self.request(subagent_cap=5))
+
+        self.assertEqual(5, written["subagent_cap"])
 
     def test_a_refusal_before_any_program_exists_is_raised_and_written_nowhere(self):
         with unlatched(), self.refusing():

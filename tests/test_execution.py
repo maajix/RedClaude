@@ -61,6 +61,7 @@ def claimed(**overrides) -> execution.Claimed:
         "subject_label": "GET /login",
         "method": "GET",
         "url": "https://app.example.com/login",
+        "subagent_cap": roster.GLOBAL_SUBAGENTS,
     }
     fields.update(overrides)
     return execution.Claimed(**fields)
@@ -81,6 +82,7 @@ def started_row(**overrides) -> tuple:
         subject.subject_label,
         subject.method,
         subject.url,
+        subject.subagent_cap,
     )
 
 
@@ -615,6 +617,19 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual(RUN, launcher.only.agent_run_id)
         self.assertEqual(PROGRAM, launcher.only.program_id)
         self.assertIs(BOUNDARY, launcher.only.container)
+
+    def test_the_child_is_capped_at_the_concurrency_the_claim_read(self):
+        # PH2-73. `max_concurrent_subagents` comes back with the claim and goes
+        # out with the child, so the gate inside refuses at the number the
+        # Slate was offered and the Task was claimed under. A default in the
+        # child would be a second statement of a weight an operator sets per
+        # Program -- offered at four and denied at three, with the Task claimed
+        # and no child ever started.
+        launcher = Launcher()
+        with compiled():
+            attempt(Recorder(started=(started_row(subagent_cap=4),)), launcher)
+
+        self.assertEqual(4, launcher.only.subagent_cap)
 
     def test_the_child_gets_no_longer_than_its_capability_has_left(self):
         launcher = Launcher()

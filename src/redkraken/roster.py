@@ -849,6 +849,13 @@ ROLES: dict[str, Role] = {
 #: A cap across roles as well as within them. The per-role numbers can each be
 #: under their own ceiling while the sum is more concurrent work than one
 #: program's budget or one machine's containers can carry.
+#:
+#: The default, and only the default. The number that governs a run is
+#: `scheduler_weights.max_concurrent_subagents` -- a weights column an operator
+#: sets per Program and per weights version -- which the runtime reads with the
+#: claim and hands to `Gate`. This roster is a compile-time document and cannot
+#: state a runtime value, so what it states is the schema's own `DEFAULT 3`,
+#: held equal to it by `SchemaAgreementTest`.
 GLOBAL_SUBAGENTS = 3
 
 
@@ -899,12 +906,30 @@ class Gate:
     the run's evidence saying a tool was not served without saying it was
     refused, and the difference between "the model did not ask" and "the model
     asked and was refused" is most of what this gate is for.
+
+    `subagents` is the cross-role cap, taken here rather than read from a
+    constant: it is `scheduler_weights.max_concurrent_subagents`, which the
+    runtime read to claim the Task and passes on, so an operator who raises it
+    raises what the scheduler offers and what this refuses in one edit. What
+    this counts is not what that column counts on the scheduler's side, and the
+    two are worth keeping apart: this is the delegations outstanding inside one
+    orchestrator session, which is the SDK's concurrency and this machine's
+    containers, while the scheduler counts `claimed` and `running` subagent
+    Tasks across the Program, which outlives any one session. This population
+    is a subset of that one, which is why one number bounds both.
     """
 
-    def __init__(self, role: str) -> None:
+    def __init__(self, role: str, subagents: int = GLOBAL_SUBAGENTS) -> None:
         if role not in ROLES:
             raise RosterError(f"{role} is not a roster role")
+        # The schema's own `CHECK (max_concurrent_subagents >= 1)`, restated
+        # where the number is spent. A session that may hold no delegation is
+        # not a stricter cap, it is a role that cannot do its work at all, and
+        # a run started under one would spend its turns being refused.
+        if subagents < 1:
+            raise RosterError(f"{subagents} is not a concurrency a session can run at")
         self.role = ROLES[role]
+        self.subagents = subagents
         self.denials: list[Denial] = []
         self._bindings: dict[str, str] = {}
         self._outstanding: dict[str, str] = {}
@@ -1063,12 +1088,12 @@ class Gate:
                 role.name,
                 f"{target.name} is at its concurrency of {target.max_concurrent}",
             )
-        if self.outstanding >= GLOBAL_SUBAGENTS:
+        if self.outstanding >= self.subagents:
             return Denial(
                 OVERFLOW,
                 DELEGATION,
                 role.name,
-                f"this session is at its concurrency of {GLOBAL_SUBAGENTS}",
+                f"this session is at its concurrency of {self.subagents}",
             )
         # A monotonic key rather than the current count: two admissions either
         # side of a release would otherwise be counted once, and the ceiling
