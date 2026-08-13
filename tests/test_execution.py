@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 import unittest
 from unittest import mock
 
@@ -173,6 +174,20 @@ class Recorder:
             },
         )
         self.lifetime = answers.get("lifetime", 300.0)
+        # Half an hour, which is the weights' own TTL, so the interval is ten
+        # minutes and no beat fires while a stand-in child returns instantly.
+        # A test that wants one shortens it.
+        self.lease_ttl = answers.get("lease_ttl", 1800.0)
+        self.heartbeat = answers.get(
+            "heartbeat",
+            {
+                "agent_run": "AR7",
+                "beat": True,
+                "reason": None,
+                "expires_at": "2026-08-13 19:30:00+00",
+                "identity_leases": 1,
+            },
+        )
         self.receipt = answers.get("receipt", ("RC1", "allowed", 200))
         self.promotion = answers.get(
             "promotion",
@@ -244,6 +259,10 @@ class Recorder:
             return [(json.dumps(self.gate),)]
         if sql == execution.LIFETIME:
             return [(self.lifetime,)]
+        if sql == execution.LEASE_TTL:
+            return [(self.lease_ttl,)]
+        if sql == execution.HEARTBEAT:
+            return [(json.dumps(self.heartbeat),)]
         if sql == execution.EXCHANGE:
             return [self.receipt] if self.receipt else []
         if sql == execution.PROMOTE:
@@ -294,6 +313,30 @@ class Launcher:
     def only(self) -> agent.AgentRunRequest:
         assert len(self.requests) == 1, self.requests
         return self.requests[0]
+
+
+class Waiting(Launcher):
+    """A child that does not return until the run's Lease has been renewed.
+
+    Deterministic where a sleep would not be. What these tests want to observe
+    is a beat, so the child ends when one has been issued rather than after a
+    duration guessed to be long enough -- and it gives up rather than hanging if
+    none arrives, because a heartbeat that never beats is the failure under
+    test and not a reason for the suite to stop.
+    """
+
+    def __init__(self, connection: Recorder, beats: int = 1, **answers):
+        super().__init__(**answers)
+        self.connection = connection
+        self.beats = beats
+
+    def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        deadline = time.monotonic() + 5.0
+        while len(self.connection.sent(execution.HEARTBEAT)) < self.beats:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"no heartbeat arrived within 5s for {request.role}")
+            time.sleep(0.005)
+        return super().__call__(request)
 
 
 @contextlib.contextmanager
@@ -791,6 +834,92 @@ class ProgramHookTest(unittest.TestCase):
     def stopped(self, execution_facts: dict) -> str:
         state = program._State(program_id=PROGRAM, execution=execution_facts)
         return str(program._report(Ledger(), state).facts["stop_reason"])
+
+
+class HeartbeatTest(unittest.TestCase):
+    """PH2-24: the run says it is still here for as long as its child runs.
+
+    A sixtieth of the weights' TTL everywhere below, so the beating this slice
+    would do over half an hour happens inside a test. The interval is the only
+    thing shortened: what is asserted is that a beat is issued at all, that it
+    names the run the claim opened, that a refusal stops it rather than being
+    retried, and that nothing beats after the child is gone.
+    """
+
+    #: A TTL whose third is twenty milliseconds.
+    QUICK = 0.06
+
+    def test_the_run_renews_what_it_holds_while_its_child_runs(self):
+        connection = Recorder(lease_ttl=self.QUICK)
+        with compiled():
+            ledger, facts = attempt(connection, Waiting(connection))
+        self.assertEqual([(RUN,)], connection.sent(execution.HEARTBEAT)[:1])
+        self.assertLessEqual(1, facts["heartbeat"]["beats"])
+        self.assertEqual(
+            (None, None),
+            (facts["heartbeat"]["lapsed"], facts["heartbeat"]["failed"]),
+        )
+        self.assertEqual([], [step.name for step in ledger.assertions if not step.ok])
+
+    def test_nothing_beats_after_the_child_is_gone(self):
+        # The one ordering that matters: the closing releases the Lease, and a
+        # beat arriving after it would be this process renewing a hold it had
+        # just given back.
+        connection = Recorder(lease_ttl=self.QUICK)
+        with compiled():
+            attempt(connection, Waiting(connection))
+        statements = connection.statements
+        self.assertLess(
+            max(n for n, sql in enumerate(statements) if sql == execution.HEARTBEAT),
+            statements.index(execution.FINISH),
+        )
+
+    def test_a_lapsed_lease_is_reported_and_not_beaten_harder(self):
+        # `beat: false` means some reconciliation is entitled to this run's
+        # work and may already have taken it. One attempt, then silence.
+        connection = Recorder(
+            lease_ttl=self.QUICK,
+            heartbeat={
+                "agent_run": "AR7",
+                "beat": False,
+                "reason": "the task lease has lapsed",
+                "expires_at": None,
+                "identity_leases": 0,
+            },
+        )
+        with compiled():
+            ledger, facts = attempt(connection, Waiting(connection))
+        self.assertEqual(1, len(connection.sent(execution.HEARTBEAT)))
+        self.assertEqual(0, facts["heartbeat"]["beats"])
+        self.assertEqual("the task lease has lapsed", facts["heartbeat"]["lapsed"])
+        self.assertEqual(
+            ["heartbeat"], [step.name for step in ledger.assertions if not step.ok]
+        )
+
+    def test_a_heartbeat_that_cannot_reach_the_database_stops_and_says_so(self):
+        connection = Recorder(
+            lease_ttl=self.QUICK,
+            raises={execution.HEARTBEAT: database_error("the server went away")},
+        )
+        with compiled():
+            ledger, facts = attempt(connection, Waiting(connection))
+        self.assertEqual(1, len(connection.sent(execution.HEARTBEAT)))
+        self.assertIn("the server went away", str(facts["heartbeat"]["failed"]))
+        # Reported, and the attempt still finished: what a failed beat costs is
+        # the Lease, which expires on its own, and the child was still running.
+        self.assertIn(execution.FINISH, connection.statements)
+
+    def test_a_ttl_the_runtime_cannot_read_starts_no_beating_at_all(self):
+        connection = Recorder(
+            raises={execution.LEASE_TTL: database_error("no active weights row")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual([], connection.sent(execution.HEARTBEAT))
+        self.assertEqual(0, facts["heartbeat"]["every"])
+        self.assertEqual(
+            ["heartbeat"], [step.name for step in ledger.assertions if not step.ok]
+        )
 
 
 if __name__ == "__main__":

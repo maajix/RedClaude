@@ -16,8 +16,8 @@ and 71–73 by the ticket-18 review, all triaged into the graph.
 | Check | Result |
 | --- | --- |
 | Ticket files | 73, numbered continuously 01–73 |
-| Ticket status | 23 `resolved`, 50 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 424 total, 138 ticked |
+| Ticket status | 24 `resolved`, 49 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 424 total, 144 ticked |
 | Blocking edges | 134 exact title-and-number references |
 | Dependency graph | Acyclic |
 | Initial frontier | Ticket 01 only |
@@ -43,9 +43,9 @@ is also why none of them was fixed under 18.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–23 |
-| Unblocked and open | 24, 25, 26, 30, 31, 33, 66, 67, 68, 70, 71, 73 |
-| Criteria ticked | 138 of 424 |
+| Resolved | 01–24 |
+| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 71, 72, 73 |
+| Criteria ticked | 144 of 424 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -84,10 +84,14 @@ being one, the claim re-asks every condition inside its own transaction rather
 than trusting that snapshot, the orchestrator's choice survives between two
 processes as a row the runtime may refuse, choosing nothing walks down to the
 first entry that still holds, and four claims at once leave one run and an
-Event log that accounts for it. The leases, budgets and ranking policy the
-scheduler is measured by, the hypothesis and validation half of the epistemic
-pipeline, kill chains, the v1 knowledge migration and the operator surface are
-untouched.
+Event log that accounts for it. What that claim holds is now held on one clock:
+the Task Lease and every Identity Lease the run took share a single heartbeat
+that renews both or neither, releasing twice costs nothing, and a run that dies
+leaves rows a named reconciliation verb -- reachable from no status read --
+returns to `pending` without inventing an attempt, while a still-live owner
+keeps what it holds. The budgets and ranking policy the scheduler is measured
+by, the hypothesis and validation half of the epistemic pipeline, kill chains,
+the v1 knowledge migration and the operator surface are untouched.
 
 Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with

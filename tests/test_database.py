@@ -990,6 +990,17 @@ CONTROLS = (
         " LANGUAGE sql STABLE AS $ctl$ SELECT now() IS NOT NULL $ctl$",
     ),
     Control(
+        # The second clock, which is the failure a Lease cannot survive: two
+        # halves of one hold written from a timestamp that advances between the
+        # two statements do not expire together, and a run whose Task Lease is
+        # alive beside a dead Identity Lease is exactly what the glossary
+        # forbids. Structural, because no row can be wrong in a way that shows
+        # it -- the two expiries would differ by microseconds and look right.
+        "standing:lease_liveness",
+        "CREATE OR REPLACE FUNCTION heartbeat_leases(p_agent_run uuid) RETURNS jsonb"
+        " LANGUAGE sql AS $ctl$ SELECT to_jsonb(clock_timestamp()) $ctl$",
+    ),
+    Control(
         "standing:purge_reachability",
         "CREATE FUNCTION selftest_block_delete() RETURNS trigger LANGUAGE plpgsql"
         " AS $fn$ BEGIN RETURN OLD; END $fn$;"
@@ -11499,6 +11510,628 @@ class SlateClaimTest(DatabaseCase):
         ).rows
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks() WHERE name = 'slate_claim'"
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: The Programs of `LeaseTest`, which share a prefix so one DELETE retires them.
+LEASE_SLUG = "selftest-lease"
+
+
+class LeaseTest(DatabaseCase):
+    """PH2-24: one Lease, one clock, one heartbeat, and what a crash leaves.
+
+    Every Program here is one hunt Task with one Identity named by its
+    Hypothesis, because that is the smallest shape in which both halves of a
+    Lease exist. `claim_task` writes an Identity Lease only for a role that
+    clamps to one -- `web_hunter` -- and only where the Task's Hypothesis names
+    an Identity; a recon Task would give a Task Lease with nothing to disagree
+    with it, and disagreement is what this ticket is about.
+
+    The Programs are the scenarios, and each is disturbed in one way after the
+    claim. `beating` is renewed and never lapses. `lapsed` has both expiries
+    pushed into the past, which is what a process that stopped beating leaves,
+    and is then refused a beat. `released` gives both halves back and gives them
+    back again. `crashed` and `retired` are reconciled after their owner
+    stopped, one with attempts to spare and one without. `alive` is the one
+    nothing may take, and it is asked of the reconciler and of the restart path
+    in turn -- the second being where a competing claim used to get in.
+
+    Everything runs in `setUpClass` because all of it commits, and because the
+    order is the assertion: a beat after a release means nothing unless the
+    release happened first.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        cls.runs: dict[str, tuple[str, str]] = {}
+        for name in ("beating", "lapsed", "released", "crashed", "retired", "alive"):
+            path = write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{LEASE_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+            cls.seed(name)
+
+        cls.arrange_beating()
+        cls.arrange_lapsed()
+        cls.arrange_released()
+        cls.arrange_crashed()
+        cls.arrange_retired()
+        cls.arrange_alive()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{LEASE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_beating(cls):
+        """A run that keeps saying it is here, twice, and is believed twice."""
+        cls.claim("beating")
+        cls.at_claim = cls.lease("beating")
+        cls.first_beat = cls.beat("beating")
+        cls.after_first = cls.lease("beating")
+        cls.beat_moved_it = cls.scalar(
+            "SELECT $2::timestamptz > $1::timestamptz",
+            (cls.at_claim["task_lease"], cls.after_first["task_lease"]),
+        )
+        cls.second_beat = cls.beat("beating")
+        cls.after_second = cls.lease("beating")
+        # Whether the renewal accumulated or was set. Asked as one reading of
+        # the server's clock against the row, because two beats that each added
+        # a TTL would leave an hour on a thirty-minute Lease and nothing else
+        # here would notice.
+        cls.beat_is_bounded = cls.scalar(
+            "SELECT bool_and(t.lease_expires_at <= now() + w.lease_ttl)"
+            "  FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.program_id = $1::uuid"
+            "   AND t.lease_expires_at IS NOT NULL",
+            (cls.identifiers["beating"],),
+        )
+        # The renewal as a non-event: `identity_leases.expires_at` is ignored
+        # like `tasks.lease_expires_at`, so a beat writes a suppressed row and
+        # not two Events per minute.
+        cls.beat_events = cls.counted_events("beating", "identity_leases")
+        cls.beat_suppressed = int(
+            cls.scalar(
+                "SELECT count(*) FROM suppressed_writes"
+                " WHERE program_id = $1::uuid AND table_name = 'identity_leases'",
+                (cls.identifiers["beating"],),
+            )
+        )
+
+    @classmethod
+    def arrange_lapsed(cls):
+        """The Lease is already gone when the beat arrives."""
+        cls.claim("lapsed")
+        cls.lapse("lapsed")
+        cls.expired_lease = cls.lease("lapsed")
+        cls.refused_beat = cls.beat("lapsed")
+        cls.after_refused = cls.lease("lapsed")
+
+    @classmethod
+    def arrange_released(cls):
+        """Both halves given back, and given back again."""
+        cls.claim("released")
+        cls.released_once = cls.call("SELECT release_leases($1::uuid)", cls.holder("released"))
+        cls.after_release = cls.lease("released")
+        cls.released_twice = cls.call(
+            "SELECT release_leases($1::uuid)", cls.holder("released")
+        )
+        cls.after_second_release = cls.lease("released")
+        cls.release_events = cls.counted_events("released", "identity_leases")
+        cls.release_unattributed = int(
+            cls.scalar(
+                "SELECT count(*) FROM events"
+                " WHERE program_id = $1::uuid AND subject_table = 'identity_leases'"
+                "   AND actor_kind IS DISTINCT FROM 'runtime'",
+                (cls.identifiers["released"],),
+            )
+        )
+        # Settled after the releases, because a Task left `claimed` with no
+        # Lease is a row the standing check refuses -- correctly. Releasing is
+        # not deciding what the Task becomes, and this is the caller deciding.
+        cls.released_closure = cls.call(
+            "SELECT finish_task_attempt($1::uuid, 'error')", cls.holder("released")
+        )
+
+    @classmethod
+    def arrange_crashed(cls):
+        """An owner that stopped beating, and the recovery that finds out."""
+        cls.claim("crashed")
+        cls.under_test("crashed")
+        cls.lapse("crashed")
+        cls.recovered, cls.recovered_again = cls.twice("SELECT reconcile_leases()")
+        cls.after_recovery = cls.lease("crashed")
+        cls.recovered_hypothesis = str(
+            cls.scalar(
+                "SELECT status FROM hypotheses WHERE program_id = $1::uuid",
+                (cls.identifiers["crashed"],),
+            )
+        )
+
+    @classmethod
+    def arrange_retired(cls):
+        """The same crash on a Task with no attempts left."""
+        cls.claim("retired")
+        cls.as_owner(
+            "UPDATE tasks SET attempts = (SELECT max_attempts FROM scheduler_weights"
+            " WHERE active) WHERE program_id = $1::uuid",
+            (cls.identifiers["retired"],),
+        )
+        cls.lapse("retired")
+        cls.retired_by = cls.call("SELECT reconcile_leases()")
+        cls.after_retirement = cls.lease("retired")
+        # Terminal work stays terminal: a second pass over an abandoned Task
+        # must not find it, and a third must not either.
+        cls.retired_again = cls.call("SELECT reconcile_leases()")
+        cls.after_second_pass = cls.lease("retired")
+
+    @classmethod
+    def arrange_alive(cls):
+        """The Lease nothing may take, asked of both things that take Leases."""
+        cls.claim("alive")
+        cls.spared_by_reconcile = cls.call("SELECT reconcile_leases()")
+        cls.spared_by_resume = cls.call(
+            "SELECT resume_program($1::uuid)", (cls.identifiers["alive"],)
+        )
+        cls.after_resume = cls.lease("alive")
+        # The competing claim, made the way a second `rk run` makes it: a fresh
+        # pass over the Program's own rows, and a claim off whatever it offers.
+        cls.bind("alive")
+        cls.competing_slate = cls.offer()
+        cls.competing_claim = cls.claimed_label("SELECT claim_task()")
+        cls.after_competition = cls.lease("alive")
+
+    # -- what the scenarios are built out of -----------------------------------
+
+    @classmethod
+    def seed(cls, name: str) -> None:
+        """One hunt Task about one endpoint, with one Identity in its Hypothesis.
+
+        One transaction, because a Hypothesis whose Identity did not commit with
+        it is a Task whose Lease has nothing to hold.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (application, BASE_URL),
+            )
+            endpoint = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'endpoint', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"endpoint:GET {PATH}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method, path_template)"
+                " VALUES ($1::uuid, $2::uuid, 'GET', $3)",
+                (endpoint, application, PATH),
+            )
+            identity = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, "identity:lease-holder"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO identities (entity_id, program_id, slot_name, class)"
+                " VALUES ($1::uuid, $2::uuid, 'lease-holder', 'anonymous')",
+                (identity, program_id),
+            )
+            hypothesis = str(
+                cls.connection.execute(
+                    "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                    " identity_a_entity_id, property_class, statement, status)"
+                    " VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'authorization.object_ownership', 'a leased hypothesis', 'testable')"
+                    " RETURNING id::text",
+                    (program_id, endpoint, identity),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " hypothesis_id, expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, 0.5, 0.5)",
+                (program_id, endpoint, hypothesis),
+            )
+
+    @classmethod
+    def claim(cls, name: str) -> None:
+        """One Task claimed, and the Agent run that now holds its Lease."""
+        cls.bind(name)
+        offered = cls.offer()
+        assert offered, f"{name} offered nothing to claim"
+        label = str(cls.claimed_label("SELECT claim_task()"))
+        run = cls.scalar(
+            "SELECT id::text FROM agent_runs WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers[name], label),
+        )
+        cls.runs[name] = (label, str(run))
+
+    @classmethod
+    def holder(cls, name: str) -> tuple[str]:
+        """The Agent run holding this Program's Lease, as a parameter tuple."""
+        return (cls.runs[name][1],)
+
+    @classmethod
+    def bind(cls, name: str):
+        cls.runtime.execute(agent.BIND, (cls.identifiers[name],))
+
+    @classmethod
+    def offer(cls) -> tuple[dict[str, object], ...]:
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.runtime.execute("SELECT rank_pass('runtime')")
+            cls.runtime.execute("SELECT advance_lane_quota('runtime')")
+            return cls.runtime.execute("SELECT * FROM offer_slate()").dicts()
+
+    @classmethod
+    def claimed_label(cls, sql: str, parameters: tuple = ()) -> object:
+        """One statement as the runtime, in its own transaction, answer as sent."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.runtime.execute(sql, parameters).scalar()
+
+    @classmethod
+    def call(cls, sql: str, parameters: tuple = ()) -> dict:
+        """The same, for the verbs that answer with a jsonb report.
+
+        Every verb this ticket adds does, and so do the two it changed: what a
+        Lease operation did is a set of counts, and a caller that had to read
+        the rows back to find out would be re-deriving what the function knows.
+        """
+        return json.loads(str(cls.claimed_label(sql, parameters)))
+
+    @classmethod
+    def twice(cls, sql: str) -> tuple[object, object]:
+        """The same statement twice inside one transaction.
+
+        Which is a question about the reconciler and not about the fixture: the
+        sweep this replaced built a `TEMP TABLE ... ON COMMIT DROP`, so a second
+        call before the commit raised rather than finding nothing to do.
+        """
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            first = cls.runtime.execute(sql).scalar()
+            second = cls.runtime.execute(sql).scalar()
+        return json.loads(str(first)), json.loads(str(second))
+
+    @classmethod
+    def beat(cls, name: str) -> dict:
+        return cls.call("SELECT heartbeat_leases($1::uuid)", cls.holder(name))
+
+    @classmethod
+    def lapse(cls, name: str):
+        """What a process that stopped beating leaves behind.
+
+        Both halves, from one reading of the clock, because that is the state a
+        Lease that ran out reaches -- and because a Task Lease pushed back on
+        its own would be the disagreement the standing check exists to refuse.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "UPDATE tasks SET lease_expires_at = now() - interval '1 minute'"
+                " WHERE program_id = $1::uuid AND lease_expires_at IS NOT NULL",
+                (program_id,),
+            )
+            cls.connection.execute(
+                "UPDATE identity_leases SET expires_at = now() - interval '1 minute'"
+                " WHERE program_id = $1::uuid AND released_at IS NULL",
+                (program_id,),
+            )
+
+    @classmethod
+    def under_test(cls, name: str):
+        """The Hypothesis moved to `testing`, which only a Receipt may do.
+
+        Needed because recovery has to put it back, and a Hypothesis that never
+        entered `testing` would let that arm of the reconciler pass untested.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            receipt = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1::uuid, 'agent', 'blocked', 'self test', now(),"
+                    " 'target', 1, $2) RETURNING id::text",
+                    (program_id, HOST),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO hypothesis_transitions (program_id, hypothesis_id,"
+                " from_status, to_status, actor_kind, receipt_id, rationale)"
+                " SELECT $1::uuid, id, 'testable', 'testing', 'runtime', $2::uuid,"
+                " 'self test' FROM hypotheses WHERE program_id = $1::uuid",
+                (program_id, receipt),
+            )
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.connection.execute(sql, parameters)
+
+    @classmethod
+    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
+        return cls.as_owner(sql, parameters).scalar()
+
+    @classmethod
+    def lease(cls, name: str) -> dict[str, object]:
+        """Both halves of the Lease and the Task under it, in one reading.
+
+        One row and one statement, because the whole question here is whether
+        two columns agree, and two statements would be two clocks of this
+        test's own.
+        """
+        [row] = cls.as_owner(
+            "SELECT t.status, t.attempts, t.lease_expires_at AS task_lease,"
+            "       l.expires_at AS identity_lease, l.released_at,"
+            "       a.finished_at, a.stop_reason,"
+            "       t.lease_expires_at IS NOT DISTINCT FROM l.expires_at AS agree"
+            "  FROM tasks t"
+            "  JOIN agent_runs a ON a.id = $2::uuid"
+            "  LEFT JOIN identity_leases l ON l.holder_agent_run_id = a.id"
+            " WHERE t.program_id = $1::uuid",
+            (cls.identifiers[name], cls.runs[name][1]),
+        ).dicts()
+        return dict(row)
+
+    @classmethod
+    def counted_events(cls, name: str, table: str) -> dict[str, int]:
+        """How many Events of each type this Program's rows of `table` produced."""
+        return {
+            str(row["type"]): int(str(row["n"]))
+            for row in cls.as_owner(
+                "SELECT type, count(*) AS n FROM events"
+                " WHERE program_id = $1::uuid AND subject_table = $2"
+                " GROUP BY type",
+                (cls.identifiers[name], table),
+            ).dicts()
+        }
+
+    # -- criterion 1: one transaction writes all three, against database time --
+
+    def test_the_claim_wrote_both_halves_from_one_reading_of_the_clock(self):
+        self.assertEqual(True, self.at_claim["agree"])
+
+    def test_the_claim_leased_the_identity_to_the_run_it_opened(self):
+        self.assertEqual(
+            (None, None), (self.at_claim["released_at"], self.at_claim["finished_at"])
+        )
+        self.assertEqual("claimed", self.at_claim["status"])
+
+    def test_the_expiry_is_the_ttl_the_weights_declare(self):
+        # Asked of the row rather than of a report, and of the Program nothing
+        # renewed: an expiry that did not come from `claimed_at + lease_ttl`
+        # would still look like a timestamp half an hour out to anything
+        # comparing it with `now()`.
+        self.assertEqual(
+            True,
+            self.scalar(
+                "SELECT bool_and(t.claimed_at + w.lease_ttl = t.lease_expires_at)"
+                "  FROM tasks t CROSS JOIN scheduler_weights w"
+                " WHERE w.active AND t.program_id = $1::uuid",
+                (self.identifiers["alive"],),
+            ),
+        )
+
+    # -- criterion 2: one heartbeat, and no disagreement ----------------------
+
+    def test_one_beat_moves_both_halves_to_the_same_moment(self):
+        self.assertEqual(True, self.first_beat["beat"])
+        self.assertEqual(1, self.first_beat["identity_leases"])
+        self.assertEqual(True, self.after_first["agree"])
+
+    def test_the_beat_moved_the_lease_forward(self):
+        self.assertEqual(True, self.beat_moved_it)
+
+    def test_beating_twice_renews_rather_than_accumulates(self):
+        self.assertEqual(True, self.second_beat["beat"])
+        self.assertEqual(True, self.after_second["agree"])
+        self.assertEqual(True, self.beat_is_bounded)
+
+    def test_a_renewal_is_a_non_event_on_both_halves_of_the_lease(self):
+        # `tasks.lease_expires_at` has been an ignored column since 014 and
+        # `identity_leases.expires_at` is one now, so two beats produce the one
+        # Event the claim made and no others. Silence and not absence: the
+        # suppressed rows are what let the integrity check tell this from a
+        # trigger somebody disabled.
+        self.assertEqual({"identity_lease.created": 1}, self.beat_events)
+        self.assertEqual(2, self.beat_suppressed)
+
+    def test_a_lapsed_lease_is_reported_rather_than_renewed(self):
+        self.assertEqual(False, self.refused_beat["beat"])
+        self.assertEqual("the task lease has lapsed", self.refused_beat["reason"])
+        self.assertEqual(0, self.refused_beat["identity_leases"])
+
+    def test_a_refused_beat_leaves_the_identity_lease_where_it_was(self):
+        # The half that matters: a beat that renewed the Identity under a dead
+        # Task Lease is the disagreement CONTEXT.md forbids, and it is the one
+        # a caller retrying a failed heartbeat would produce.
+        self.assertEqual(
+            self.expired_lease["identity_lease"], self.after_refused["identity_lease"]
+        )
+        self.assertEqual(self.expired_lease["task_lease"], self.after_refused["task_lease"])
+
+    # -- criterion 3: nothing else may take what a live run holds -------------
+
+    def test_the_restart_left_a_live_run_holding_both_halves(self):
+        self.assertEqual(1, self.spared_by_resume["tasks_left_to_live_owners"])
+        self.assertEqual(0, self.spared_by_resume["tasks_unclaimed"])
+        self.assertEqual(0, self.spared_by_resume["agent_runs_aborted"])
+        self.assertEqual(0, self.spared_by_resume["leases_released"])
+        self.assertEqual("claimed", self.after_resume["status"])
+        self.assertEqual(None, self.after_resume["released_at"])
+
+    def test_a_competing_claim_gets_nothing(self):
+        # Not a refusal: a Program whose only Task is held offers an empty
+        # slate, and asking for nothing off one is the queue being busy rather
+        # than an error. What matters is that the claim came back empty on a
+        # Program that a second `rk run` used to be able to empty first.
+        self.assertEqual((), self.competing_slate)
+        self.assertEqual(None, self.competing_claim)
+
+    def test_the_competing_claim_left_the_lease_exactly_as_it_found_it(self):
+        self.assertEqual(self.after_resume, self.after_competition)
+
+    # -- criterion 4: release, twice, and attributed --------------------------
+
+    def test_the_release_gives_both_halves_back(self):
+        self.assertEqual(True, self.released_once["task_lease_released"])
+        self.assertEqual(1, self.released_once["identity_leases"])
+        self.assertEqual(None, self.after_release["task_lease"])
+        self.assertNotEqual(None, self.after_release["released_at"])
+
+    def test_a_second_release_releases_nothing_and_says_so(self):
+        self.assertEqual(False, self.released_twice["task_lease_released"])
+        self.assertEqual(0, self.released_twice["identity_leases"])
+        self.assertEqual(self.after_release, self.after_second_release)
+
+    def test_every_lease_event_names_who_wrote_it(self):
+        self.assertEqual(
+            {"identity_lease.created": 1, "identity_lease.updated": 1},
+            self.release_events,
+        )
+        self.assertEqual(0, self.release_unattributed)
+
+    def test_the_closing_finds_the_leases_already_given_back(self):
+        self.assertEqual(0, self.released_closure["leases_released"])
+        self.assertEqual("pending", self.released_closure["task_status"])
+
+    # -- criterion 5: reconciliation, and what it declines to touch -----------
+
+    def test_reconciliation_recovers_what_an_expired_owner_left(self):
+        self.assertEqual(
+            {
+                "tasks_left_to_live_owners": 0,
+                "tasks_returned": 1,
+                "tasks_retired": 0,
+                "runs_aborted": 1,
+                "leases_released": 1,
+                "hypotheses_returned_to_testable": 1,
+            },
+            self.recovered,
+        )
+
+    def test_a_second_reconciliation_in_the_same_transaction_finds_nothing(self):
+        self.assertEqual(
+            {
+                "tasks_left_to_live_owners": 0,
+                "tasks_returned": 0,
+                "tasks_retired": 0,
+                "runs_aborted": 0,
+                "leases_released": 0,
+                "hypotheses_returned_to_testable": 0,
+            },
+            self.recovered_again,
+        )
+
+    def test_recovery_released_both_halves_and_closed_the_run(self):
+        self.assertEqual(None, self.after_recovery["task_lease"])
+        self.assertNotEqual(None, self.after_recovery["released_at"])
+        self.assertEqual("aborted", self.after_recovery["stop_reason"])
+
+    def test_the_hypothesis_under_a_recovered_task_is_testable_again(self):
+        self.assertEqual("testable", self.recovered_hypothesis)
+
+    def test_reconciliation_reports_a_live_owner_rather_than_recovering_it(self):
+        self.assertEqual(
+            {
+                "tasks_left_to_live_owners": 1,
+                "tasks_returned": 0,
+                "tasks_retired": 0,
+                "runs_aborted": 0,
+                "leases_released": 0,
+                "hypotheses_returned_to_testable": 0,
+            },
+            self.spared_by_reconcile,
+        )
+
+    def test_no_reading_role_can_reach_the_reconciler(self):
+        # Criterion 5's second half, as a privilege rather than as a promise.
+        # The textual arm of the standing check says no function calls it; this
+        # says no role that only reads can.
+        self.assertEqual(
+            [(False, False, True)],
+            [
+                (bool(row[0]), bool(row[1]), bool(row[2]))
+                for row in self.connection.execute(
+                    "SELECT has_function_privilege('rk2_state', $1, 'EXECUTE'),"
+                    "       has_function_privilege('rk2_proxy', $1, 'EXECUTE'),"
+                    "       has_function_privilege('rk2_runtime', $1, 'EXECUTE')",
+                    ("reconcile_leases()",),
+                ).rows
+            ],
+        )
+
+    # -- criterion 6: what comes back, and what stays gone --------------------
+
+    def test_the_recovered_task_is_pending_with_the_attempt_it_spent(self):
+        # One attempt, which `claim_task` counted and a child was started
+        # against. A recovery that gave it back would loop forever on work that
+        # fails the same way each time; one that spent a second would retire a
+        # Task for having crashed once.
+        self.assertEqual("pending", self.after_recovery["status"])
+        self.assertEqual(1, int(str(self.after_recovery["attempts"])))
+
+    def test_a_task_with_no_attempts_left_is_retired_rather_than_returned(self):
+        self.assertEqual(1, self.retired_by["tasks_retired"])
+        self.assertEqual(0, self.retired_by["tasks_returned"])
+        self.assertEqual("abandoned", self.after_retirement["status"])
+
+    def test_terminal_work_stays_terminal(self):
+        self.assertEqual(0, self.retired_again["tasks_retired"])
+        self.assertEqual(0, self.retired_again["tasks_returned"])
+        self.assertEqual(self.after_retirement, self.after_second_pass)
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'lease_liveness'"
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'lease_liveness'"
         ).rows
 
         self.assertEqual(1, int(registered[0]))

@@ -32,6 +32,7 @@ slice through a callback it is given, because `proxy` imports `program` and a
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -225,6 +226,19 @@ PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
 FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
 
+#: The Lease this run was given, and the one call that moves both halves of it.
+#: The TTL is read rather than assumed: it is a weights column, so a harness
+#: that shortened it would shorten what a crash costs, and a runtime carrying
+#: its own copy would keep beating on the old one.
+LEASE_TTL = "SELECT extract(epoch FROM lease_ttl) FROM scheduler_weights WHERE active"
+HEARTBEAT = "SELECT heartbeat_leases($1::uuid)"
+
+#: How many beats fit in one TTL. Three, so two may be lost -- to a slow
+#: statement, a paused container, a machine that swapped -- before the Lease
+#: lapses and this run's work becomes something another one may take. One would
+#: make every missed beat fatal; ten would spend the log on saying nothing.
+HEARTBEAT_SHARE = 3
+
 #: The three answers the gate can give, and the two this runtime may act on.
 ALLOW = "allow"
 ASK = "ask"
@@ -367,6 +381,115 @@ class Claimed:
         }
 
 
+class Heartbeat:
+    """One run saying it is still here, for as long as its child runs.
+
+    A thread, because what this has to outlast is a blocking wait on a
+    subprocess and there is nothing else in that window to hang a timer on. It
+    shares the runtime's connection rather than opening one, and that is safe
+    for one reason worth stating: the main thread is inside `_child` for the
+    whole life of this thread and touches nothing until `__exit__` has joined
+    it. Overlap is not avoided by a lock here, it is not possible.
+
+    A beat that comes back refused stops the beating and is not retried. The
+    database answers `beat: false` when the Task Lease has already lapsed, and
+    at that point some reconciliation is entitled to this run's work -- may have
+    taken it already. Beating harder at that would be this process arguing with
+    the only clock either half of the Lease has.
+
+    A beat that raises stops it too, and stops it quietly. The child is still
+    running and the attempt is still worth finishing; what a failed heartbeat
+    costs is the Lease, which lapses on its own, and the closing reports it.
+    """
+
+    def __init__(
+        self,
+        connection: pg.Connection,
+        ledger: Ledger,
+        claimed: Claimed,
+        facts: dict,
+        every: float,
+    ):
+        self.connection = connection
+        self.ledger = ledger
+        self.claimed = claimed
+        self.facts = facts
+        self.every = every
+        self.beats = 0
+        self.lapsed: str | None = None
+        self.failure: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._beat, name=f"heartbeat-{claimed.agent_run_label}", daemon=True
+        )
+        self._started = False
+
+    def __enter__(self) -> Heartbeat:
+        if self.every > 0:
+            self._thread.start()
+            self._started = True
+        return self
+
+    def __exit__(self, *exception) -> bool:
+        self._stop.set()
+        if self._started:
+            self._thread.join()
+        self.facts["heartbeat"] = {
+            "every": self.every,
+            "beats": self.beats,
+            "lapsed": self.lapsed,
+            "failed": self.failure,
+        }
+        self._report()
+        return False
+
+    def _beat(self) -> None:
+        # `wait` and not `sleep`: the child usually ends between two beats, and
+        # a sleeping thread would hold the attempt open for the rest of an
+        # interval that no longer has anything to keep alive.
+        while not self._stop.wait(self.every):
+            try:
+                with self.connection.transaction():
+                    _actor(self.connection)
+                    answer = proxy.as_object(
+                        self.connection.execute(
+                            HEARTBEAT, (self.claimed.agent_run_id,)
+                        ).scalar()
+                    )
+            except pg.DatabaseError as error:
+                self.failure = str(error)
+                return
+            if not answer.get("beat"):
+                self.lapsed = str(answer.get("reason"))
+                return
+            self.beats += 1
+
+    def _report(self) -> None:
+        if self.failure is not None:
+            self.ledger.fail(
+                "heartbeat",
+                f"{self.claimed.agent_run_label} stopped renewing its Lease after "
+                f"{self.beats} beat(s): {self.failure}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return
+        if self.lapsed is not None:
+            self.ledger.fail(
+                "heartbeat",
+                f"{self.claimed.agent_run_label} no longer holds what it claimed after "
+                f"{self.beats} beat(s): {self.lapsed}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return
+        self.ledger.hold(
+            "heartbeat",
+            f"{self.claimed.task_label} and every Identity leased with it were held "
+            f"through {self.beats} beat(s), one every {self.every:.0f}s",
+        )
+
+
 @dataclass(frozen=True)
 class Slice:
     """One attempt at one Task, and everything an attempt needs to be made.
@@ -398,6 +521,7 @@ class Slice:
             "agent_run": None,
             "target": None,
             "packet": None,
+            "heartbeat": None,
             "tool_run": None,
             "receipt": None,
             "proposal": None,
@@ -574,7 +698,12 @@ class Slice:
 
         outcome = "error"
         try:
-            result = self._child(ledger, claimed, mission, door, lifetime, program_id)
+            # The beating stops before anything else in this transaction's
+            # sequence resumes, which is what makes sharing the connection with
+            # it safe -- and before the closing releases the Lease, which is the
+            # one thing a late beat could contradict.
+            with self._heartbeat(ledger, connection, claimed, facts):
+                result = self._child(ledger, claimed, mission, door, lifetime, program_id)
             if result is None:
                 facts["agent_run"]["stop_reason"] = "refusal"
                 return
@@ -588,6 +717,29 @@ class Slice:
             # what the request did, and the Receipt above is what it knows it
             # from.
             self._close(ledger, connection, claimed, facts["tool_run"], outcome)
+
+    def _heartbeat(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed, facts: dict
+    ) -> Heartbeat:
+        """How often this run says it is here, from the TTL it was given.
+
+        A TTL this runtime cannot read leaves the interval at zero, which starts
+        no thread at all. That is the honest degradation: the Lease still
+        expires on its own, the run still finishes, and the report says nothing
+        beat rather than claiming a renewal that never happened.
+        """
+        try:
+            ttl = float(str(connection.execute(LEASE_TTL).scalar()))
+        except (pg.DatabaseError, TypeError, ValueError) as error:
+            ledger.fail(
+                "heartbeat",
+                f"the Lease TTL could not be read, so {claimed.agent_run_label} will "
+                f"not renew what it holds: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            ttl = 0.0
+        return Heartbeat(connection, ledger, claimed, facts, ttl / HEARTBEAT_SHARE)
 
     def _close(
         self,
