@@ -17939,6 +17939,7 @@ class SourceCitationTest(DatabaseCase):
         cls.refusals = {}
         cls.refuse_the_call()
         cls.refuse_the_input_row()
+        cls.refuse_the_path_row()
         cls.propose()
         cls.problems = cls.connection.execute("SELECT * FROM check_source_conclusions()").rows
 
@@ -17988,22 +17989,34 @@ class SourceCitationTest(DatabaseCase):
             cls.analyser if hash_ == "" else hash_,
         )
 
+    #: What the run that reads the bundle said it found. Written here rather
+    #: than parsed out of `PRINTED`, because what these cases are about is the
+    #: rule the database applies to the rows; that the rows come from the
+    #: analyser's own answer is `tool.py`'s end of it, and
+    #: `JsAnalystCommandTest` holds that one against a real container.
+    NAMED = ("/api/v1/login",)
+
     @classmethod
-    def reading(cls, label: str) -> dict:
-        """One `js_parse` run over one Artifact, opened, kept and closed."""
+    def reading(cls, label: str, *, named: tuple[str, ...] = ()) -> dict:
+        """One `js_parse` run over one Artifact, opened, kept, named and closed.
+
+        `named` is what this run's own answer said the source calls, which is
+        what a proposed route is held against. One of the two runs here names
+        nothing, because a run that reported no route grounds none.
+        """
         plan = json.loads(committed(cls.connection, cls.OPEN, cls.opening({"source": label})))
-        committed(
-            cls.connection,
-            "INSERT INTO tool_run_artifacts (program_id, tool_run_id, stream, sha256,"
-            "                                produced_bytes, truncated)"
-            " VALUES ($1::uuid, $2::uuid, 'stdout', $3, $4::bigint, false) RETURNING id",
-            (
-                cls.identifiers["main"],
-                plan["tool_run_id"],
-                artifact.digest(cls.PRINTED),
-                len(cls.PRINTED),
-            ),
-        )
+        cls.file_the_answer(plan["tool_run_id"])
+        for path in named:
+            committed(
+                cls.connection,
+                cls.PATH + " RETURNING id",
+                (
+                    cls.identifiers["main"],
+                    plan["tool_run_id"],
+                    artifact.digest(cls.PRINTED),
+                    path,
+                ),
+            )
         committed(
             cls.connection,
             "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
@@ -18027,8 +18040,13 @@ class SourceCitationTest(DatabaseCase):
             ),
         }
         # Two closed runs over two different source Artifacts, so "this run read
-        # those bytes" is a question with a wrong answer available.
-        cls.runs = {name: cls.reading(cls.labels[name]) for name in ("bundle", "original")}
+        # those bytes" is a question with a wrong answer available. Only one of
+        # them reported a route, which is the other half: a citation that holds
+        # still has to be a citation of a run that said this.
+        cls.runs = {
+            "bundle": cls.reading(cls.labels["bundle"], named=cls.NAMED),
+            "original": cls.reading(cls.labels["original"]),
+        }
         cls.held = [str(label) for [label] in cls.connection.execute(
             "SELECT label FROM artifact_references WHERE program_id = $1::uuid",
             (cls.identifiers["main"],),
@@ -18146,6 +18164,91 @@ class SourceCitationTest(DatabaseCase):
             (*row, "source", cls.labels["original"], artifact.digest(SOURCE_ORIGINAL), "source"),
         )
 
+    PATH = (
+        "INSERT INTO tool_run_paths (program_id, tool_run_id, sha256, path)"
+        " VALUES ($1::uuid, $2::uuid, $3, $4)"
+    )
+
+    @classmethod
+    def refuse_the_path_row(cls):
+        """What the table refuses about a run's own answer.
+
+        `paths` is a JSON key and anything at all can print one, so what makes
+        a row here evidence is not the key: it is that the run is a harness
+        analyser's, that the bytes it was read out of are that run's own
+        output, and that it is still the run reporting.
+        """
+        answer = artifact.digest(cls.PRINTED)
+        analysis = json.loads(
+            committed(cls.connection, cls.OPEN, cls.opening({"source": cls.labels["bundle"]}))
+        )
+        cls.file_the_answer(analysis["tool_run_id"])
+        cls.refusals["bytes_the_run_did_not_produce"] = refused(
+            cls.connection,
+            cls.PATH,
+            (
+                cls.identifiers["main"],
+                analysis["tool_run_id"],
+                artifact.digest(SOURCE_ORIGINAL),
+                "/api/v1/login",
+            ),
+        )
+        committed(
+            cls.connection,
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (analysis["tool_run_id"],),
+        )
+        cls.refusals["named_after_the_run_closed"] = refused(
+            cls.connection,
+            cls.PATH,
+            (cls.identifiers["main"], analysis["tool_run_id"], answer, "/api/v1/login"),
+        )
+        # `jq` reads the same bytes and produces the same kind of output, and
+        # the one difference is the one that counts: the registry gives it no
+        # analyser, so its answer is whatever the image prints.
+        query = json.loads(
+            committed(
+                cls.connection,
+                cls.OPEN,
+                (
+                    offline_agent_run(
+                        cls.connection, cls.identifiers["main"], role="recon", kind="recon"
+                    ),
+                    "jq",
+                    "jq-1.7.1",
+                    json.dumps({"filter": ".host", "input": cls.labels["bundle"]}),
+                    None,
+                ),
+            )
+        )
+        cls.file_the_answer(query["tool_run_id"])
+        cls.refusals["not_an_analyser"] = refused(
+            cls.connection,
+            cls.PATH,
+            (cls.identifiers["main"], query["tool_run_id"], answer, "/api/v1/login"),
+        )
+        committed(
+            cls.connection,
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (query["tool_run_id"],),
+        )
+
+    @classmethod
+    def file_the_answer(cls, tool_run_id: str) -> None:
+        """The stdout Artifact a run produced, so only the rule under test fails."""
+        committed(
+            cls.connection,
+            "INSERT INTO tool_run_artifacts (program_id, tool_run_id, stream, sha256,"
+            "                                produced_bytes, truncated)"
+            " VALUES ($1::uuid, $2::uuid, 'stdout', $3, $4::bigint, false) RETURNING id",
+            (
+                cls.identifiers["main"],
+                tool_run_id,
+                artifact.digest(cls.PRINTED),
+                len(cls.PRINTED),
+            ),
+        )
+
     # -- criteria 4 and 5: what a conclusion may cite --------------------------
 
     @classmethod
@@ -18213,6 +18316,16 @@ class SourceCitationTest(DatabaseCase):
                     auth_required=False,
                     source_artifact_label=cls.foreign_label,
                     source_sha256=None,
+                ),
+                # The invention. Everything the other five reasons ask is true
+                # of it -- real Artifact, held as source, unchanged, read by the
+                # run it cites -- and the run never said the bundle calls this.
+                cls.read_the_bundle(
+                    type="endpoint",
+                    parent_ref="app",
+                    method="get",
+                    path_template="/api/admin/secret/",
+                    auth_required=False,
                 ),
             ],
             # A Relationship can carry a citation like anything else, and
@@ -18334,25 +18447,45 @@ class SourceCitationTest(DatabaseCase):
         )
         self.assertIn("has already been closed as error", self.refusals["after_the_run_closed"])
 
+    def test_a_run_names_paths_out_of_its_own_answer_or_names_none(self):
+        # What stops the ground truth being written by the thing it judges. The
+        # `jq` run is the case worth having: same bytes in, same shape of answer
+        # out, and it may not file a row, because a tool from the image printing
+        # a `paths` key would otherwise become the evidence a route is checked
+        # against.
+        self.assertIn(
+            "did not produce those bytes", self.refusals["bytes_the_run_did_not_produce"]
+        )
+        self.assertIn(
+            "has already been closed as success", self.refusals["named_after_the_run_closed"]
+        )
+        self.assertEqual(
+            "jq is not an analyser and names no paths", self.refusals["not_an_analyser"]
+        )
+
     # -- criteria 4 and 5 ------------------------------------------------------
 
     def test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed(self):
-        # Eight from the trigger, in the order it walks the payload, and the
-        # ninth from the runtime. Alphabetical by element list is why
+        # Nine from the trigger, in the order it walks the payload, and the
+        # tenth from the runtime. Alphabetical by element list is why
         # `hypotheses` comes first and `relationships` last: the walk is
         # deterministic, which is what makes the ordinals reproducible. All four
-        # lists are here because all four can carry a citation.
+        # lists are here because all four can carry a citation. The route drop
+        # is cited by the route rather than by a label, cleaned: it is the one
+        # reason where what is wrong is what the element says, not where it
+        # says it came from.
         self.assertEqual(
             [
                 (0, "hypotheses[0]", "no_such_artifact", "ZZ9"),
                 (1, "new_entities[3]", "no_such_artifact", self.foreign_label),
-                (2, "observations[1]", "no_such_artifact", "ZZ9"),
-                (3, "observations[2]", "artifact_not_source", self.labels["printed"]),
-                (4, "observations[3]", "artifact_changed", self.labels["bundle"]),
-                (5, "observations[4]", "artifact_not_read", self.labels["original"]),
-                (6, "observations[5]", "no_source_citation", None),
-                (7, "relationships[0]", "no_such_artifact", "ZZ9"),
-                (8, "observations[6]", "no_such_tool_run", "ZZ99"),
+                (2, "new_entities[4]", "path_not_in_output", "/api/admin/secret"),
+                (3, "observations[1]", "no_such_artifact", "ZZ9"),
+                (4, "observations[2]", "artifact_not_source", self.labels["printed"]),
+                (5, "observations[3]", "artifact_changed", self.labels["bundle"]),
+                (6, "observations[4]", "artifact_not_read", self.labels["original"]),
+                (7, "observations[5]", "no_source_citation", None),
+                (8, "relationships[0]", "no_such_artifact", "ZZ9"),
+                (9, "observations[6]", "no_such_tool_run", "ZZ99"),
             ],
             [
                 (drop.ordinal, drop.element_path, drop.reason, drop.cited)
@@ -18394,10 +18527,11 @@ class SourceCitationTest(DatabaseCase):
 
     def test_the_endpoint_promoted_is_the_one_that_can_name_its_source(self):
         # Criterion 4's own words -- endpoints, parameters and hypotheses -- as
-        # canonical rows. Three Entities arrive and the fourth does not, and the
-        # one that does not is the endpoint nothing in the bundle calls: the
-        # decoy is refused because its citation is another Program's Artifact,
-        # which is the only difference between it and the route beside it.
+        # canonical rows. Three Entities arrive out of five, and both that do
+        # not are the endpoint nothing in the bundle calls: one cites another
+        # Program's Artifact, and the other cites this Program's, correctly, and
+        # is a route the run it cites never reported. Criterion 6's "without
+        # invented endpoints" is that second one.
         self.assertEqual(3, len(self.promotion["entities"]))
         self.assertEqual([], self.promotion["relationships"])
         self.assertEqual(
@@ -18553,6 +18687,18 @@ class JsAnalystCommandTest(DatabaseCase):
     def said(self, answer: Report) -> str:
         return " ".join(item.detail for item in answer.violations)
 
+    def named_by(self, answer: Report) -> list[tuple]:
+        """Which request paths the run recorded its own answer naming."""
+        return [
+            tuple(str(value) for value in row)
+            for row in self.connection.execute(
+                "SELECT p.path, p.sha256 FROM tool_run_paths p"
+                "  JOIN tool_runs t ON t.id = p.tool_run_id"
+                " WHERE t.label = $1 AND t.program_id = $2::uuid ORDER BY p.path",
+                (answer.facts["tool_run"]["label"], self.program_id),
+            ).rows
+        ]
+
     def read_by(self, answer: Report) -> list[tuple]:
         """Which bytes the run recorded being given, by argument."""
         return [
@@ -18604,6 +18750,36 @@ class JsAnalystCommandTest(DatabaseCase):
         self.assertEqual(
             [], [entry["path"] for entry in printed["routes"] if entry["path"] in SOURCE_DECOYS]
         )
+
+    def test_the_run_records_the_request_paths_its_own_answer_named(self):
+        # The half of a citation the database cannot read for itself, filed
+        # while the runtime has the bytes. Both analyses record what they said
+        # and neither records more: `js_parse` names the decoy it reported as
+        # unrequested, because the check this feeds is about invention and not
+        # about judgement, and `js_routes` names the three routes it grounded.
+        # A proposed route the run never named is refused against these rows.
+        for name, expected in (
+            (
+                "parse",
+                ["/api/orphan", "/api/v1/login", "/api/v1/orders/{id}/lines", "/api/v1/search"],
+            ),
+            ("routes", ["/api/v1/login", "/api/v1/orders/{id}/lines", "/api/v1/search"]),
+        ):
+            with self.subTest(name):
+                answer = self.answers[name]
+                [stdout] = [
+                    item for item in answer.facts["outputs"] if item["stream"] == "stdout"
+                ]
+                # Against the hash of the answer, so reading those bytes again
+                # is how anyone checks the list.
+                self.assertEqual(
+                    [(path, stdout["sha256"]) for path in expected], self.named_by(answer)
+                )
+                self.assertEqual(expected, sorted(self.printed(answer)["paths"]))
+        # `js_map` reports what a map carries, which is files rather than
+        # requests, so a route citing it is grounded in nothing and refused.
+        self.assertEqual([], self.named_by(self.answers["index"]))
+        self.assertNotIn("paths", self.printed(self.answers["index"]))
 
     def test_the_run_records_the_analyser_and_the_bytes_it_was_given(self):
         run = self.answers["parse"].facts["tool_run"]

@@ -328,13 +328,14 @@ _Avoid_: Input file, JS file, asset, blob
 What a proposed element about source must carry, in any of the four lists a
 proposal has: the Artifact it came from, optionally the hash it was read at, and
 the Tool run that read it. It is checked when the proposal is staged and re-asked
-of everything promoted, and it fails in five distinguishable ways — the label is
+of everything promoted, and it fails in six distinguishable ways — the label is
 not this Program's, the bytes are not held as source, they have changed under the
-element, the cited run never read them, or the element is grounded in a run that
-read source and does not say which. A failed citation is a dropped element, not
-a refused proposal. It says which bytes a conclusion came from, not that the
-cited run reported that conclusion: the store is on the disk, so the check has
-the hash of a run's output and never its contents.
+element, the cited run never read them, the element is grounded in a run that
+read source and does not say which, or the element proposes a route the cited run
+never reported. A failed citation is a dropped element, not a refused proposal.
+The first five ask where a conclusion came from; the sixth asks whether the run
+said it, against the request paths the runtime read out of that run's own answer
+while it was filing it.
 _Avoid_: Reference, provenance, attribution, link
 
 **Receipt**:

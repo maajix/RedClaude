@@ -14,7 +14,10 @@
 -- that sounds right is indistinguishable in prose from a route that is there.
 -- So nothing here trusts the reading. A conclusion names the source Artifact it
 -- came from, the Tool run that read it, and the exact bytes that run was given,
--- and promotion refuses it when any of those three do not hold.
+-- and promotion refuses it when any of those three do not hold. A conclusion
+-- that names a route is held to one more thing: the run it cites has to have
+-- named that route, out of its own answer, which is the difference between a
+-- reading that could have come from the file and one that did.
 --
 -- Six things, one per criterion:
 --
@@ -40,12 +43,14 @@
 --      result may carry `source_artifact_label` and `source_sha256` beside the
 --      Tool run it already cites, and `rk2_source_citation` is the one place
 --      that decides whether the citation holds.
---   5. Promotion refuses the four ways it can fail to. The Artifact is not one
---      this Program holds, the hash the element names is not the hash the label
---      resolves to, the Artifact is held as something other than source, or the
---      cited run never read it. Each is its own `proposal_drops.reason`,
---      because an agent told "your citation is wrong" learns nothing it can
---      act on.
+--   5. Promotion refuses the ways it can fail to. The Artifact is not one this
+--      Program holds, the hash the element names is not the hash the label
+--      resolves to, the Artifact is held as something other than source, the
+--      cited run never read it -- or the run read it and never named the route
+--      the element proposes, which is `tool_run_paths` and is the one refusal
+--      that is about the answer rather than about the citation. Each is its own
+--      `proposal_drops.reason`, because an agent told "your citation is wrong"
+--      learns nothing it can act on.
 --   6. The negative controls are the refusals themselves, and
 --      `tests/test_database.py` walks a synthetic bundle through all three
 --      tools, holds the extracted routes against the ones the bundle really
@@ -172,7 +177,7 @@ COMMENT ON COLUMN tool_runs.analyser_sha256 IS
 
 
 -- ---------------------------------------------------------------------------
--- 3. What a run read
+-- 3. What a run read, and what it said
 -- ---------------------------------------------------------------------------
 -- Criterion 3. `tool_runs.args` has carried the labels since 030, which is
 -- what was asked for; this carries what was given, which is not the same fact.
@@ -292,6 +297,126 @@ COMMENT ON FUNCTION tool_run_input_is_this_runs_input() IS
     'Artifact.';
 
 GRANT SELECT, INSERT ON tool_run_inputs TO rk2_runtime;
+
+
+-- The other half of a citation, and the half the database cannot read for
+-- itself. `tool_run_inputs` says which bytes went in; this says which request
+-- paths the answer that came out names. Both are needed for the same reason
+-- and neither substitutes for the other: an Artifact and a run prove a
+-- conclusion could have come from those bytes, and only the run's own answer
+-- proves the run said it.
+--
+-- Filed here rather than derived on demand because the answer is an Artifact
+-- in the store and the store is on the disk. The runtime reads it once, while
+-- it has it, and what lands here is checkable afterwards by anyone: the row
+-- names the hash it was read out of, so re-deriving it is reading those bytes
+-- again.
+CREATE TABLE tool_run_paths (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    program_id  uuid NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    tool_run_id uuid NOT NULL,
+    sha256      text NOT NULL REFERENCES artifacts(sha256),
+    path        text NOT NULL CHECK (path <> '' AND length(path) <= 2048),
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (tool_run_id, program_id) REFERENCES tool_runs (id, program_id),
+    -- One row per path per run. An answer that names the same path from two
+    -- call sites still names one path, and the sites are in the answer.
+    UNIQUE (tool_run_id, path)
+);
+
+CREATE INDEX tool_run_paths_run_idx ON tool_run_paths (tool_run_id);
+
+COMMENT ON TABLE tool_run_paths IS
+    'Every request path one analyser run''s own answer names, by the hash of '
+    'the bytes it was read out of. What a promoted route is held against: a '
+    'citation says a conclusion could have come from an Artifact, and this is '
+    'what says the run that read it reported the route.';
+
+COMMENT ON COLUMN tool_run_paths.path IS
+    'As the analyser printed it. Held against a proposal through '
+    '`rk2_clean_path`, so the two are compared in the one spelling this schema '
+    'stores rather than by string equality.';
+
+INSERT INTO purge_cascade_edges (table_name, column_name, rationale) VALUES
+    ('tool_run_paths', 'program_id', 'program-scoped: the purge root');
+
+INSERT INTO event_types (id, family, subject_table, description) VALUES
+    ('tool_run.path_named', 'row', 'tool_run_paths',
+     'an analyser run''s answer named one request path in the source it read');
+
+INSERT INTO event_table_config
+    (table_name, created_type, updated_type, ignored_columns, redacted_columns) VALUES
+    ('tool_run_paths', 'tool_run.path_named', NULL, '{}', '{}');
+
+SELECT attach_event_triggers();
+
+-- Immutable for the reason the other two link tables are, and this one has the
+-- sharpest version of it: a row that could be edited afterwards would let the
+-- evidence a promoted route was checked against be rewritten to fit it.
+CREATE TRIGGER tool_run_paths_immutable
+    BEFORE UPDATE OR DELETE ON tool_run_paths
+    FOR EACH ROW EXECUTE FUNCTION reject_mutation_unless_purging();
+
+-- Readable by the analyst, and it is the one read here that changes what a
+-- model can do rather than only what it can see: an agent that can ask which
+-- paths its run named can propose exactly those and stop guessing.
+INSERT INTO state_read_surface (table_name, column_name, added_by) VALUES
+    ('tool_run_paths', 'tool_run_id', 'ph2-32'),
+    ('tool_run_paths', 'sha256',      'ph2-32'),
+    ('tool_run_paths', 'path',        'ph2-32'),
+    ('tool_run_paths', 'recorded_at', 'ph2-32');
+
+CREATE FUNCTION tool_run_path_is_this_runs_answer() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE v_run tool_runs%ROWTYPE;
+BEGIN
+    SELECT * INTO v_run FROM tool_runs
+     WHERE id = NEW.tool_run_id AND program_id = NEW.program_id;
+    IF NOT FOUND OR v_run.offline_tool IS NULL THEN
+        RAISE EXCEPTION 'tool run % is not an offline Tool run of this Program',
+            NEW.tool_run_id USING ERRCODE = '23503';
+    END IF;
+
+    -- The whole of why this is trustworthy. An analyser is a program the
+    -- harness shipped and hashed; a tool from the image is whatever the image
+    -- holds, and one that could file rows here would be a way to print an
+    -- invented route and have it become the ground truth routes are checked
+    -- against.
+    IF NOT EXISTS (SELECT 1 FROM offline_tools t
+                    WHERE t.tool = v_run.offline_tool AND t.analyser IS NOT NULL) THEN
+        RAISE EXCEPTION '% is not an analyser and names no paths', v_run.offline_tool
+            USING ERRCODE = '23514',
+                  HINT = 'only a harness-shipped analyser''s own answer is recorded';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM tool_run_artifacts a
+                    WHERE a.tool_run_id = NEW.tool_run_id AND a.sha256 = NEW.sha256) THEN
+        RAISE EXCEPTION 'tool run % did not produce those bytes', v_run.label
+            USING ERRCODE = '23514',
+                  HINT = 'a path is recorded against the answer it was read out of';
+    END IF;
+
+    -- Read out of the answer while the run is open, exactly as the output row
+    -- beside it is. A row arriving later would be a claim about what a run
+    -- reported, written after that run finished reporting.
+    IF v_run.status <> 'running' THEN
+        RAISE EXCEPTION 'tool run % has already been closed as %',
+            v_run.label, v_run.status USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END $fn$;
+
+CREATE TRIGGER tool_run_paths_is_this_runs_answer
+    BEFORE INSERT ON tool_run_paths
+    FOR EACH ROW EXECUTE FUNCTION tool_run_path_is_this_runs_answer();
+
+COMMENT ON FUNCTION tool_run_path_is_this_runs_answer() IS
+    'The four things a recorded path must be able to prove: the run is this '
+    'Program''s offline run, its tool is a harness analyser rather than '
+    'something the image holds, the bytes it was read out of are bytes that '
+    'run produced, and the run is still open.';
+
+GRANT SELECT, INSERT ON tool_run_paths TO rk2_runtime;
 
 
 -- ---------------------------------------------------------------------------
@@ -596,7 +721,7 @@ COMMENT ON FUNCTION open_offline_tool_run(uuid, text, text, jsonb, text) IS
 -- named one that holds up, and an element grounded in a run that read source
 -- must name which source. Either way round, the answer is a row or a refusal.
 --
--- The five reasons are five different mistakes and an agent told the wrong one
+-- The six reasons are six different mistakes and an agent told the wrong one
 -- will send the same claim back:
 --
 --   `no_such_artifact`       the label is not one this Program holds. Missing
@@ -622,6 +747,13 @@ COMMENT ON FUNCTION open_offline_tool_run(uuid, text, text, jsonb, text) IS
 --                            unnamed one is not a citation. What the run read is
 --                            `tool_run_inputs`, not what its tool could have
 --                            been given.
+--   `path_not_in_output`     the element proposes a route and the run it cites
+--                            never named it. The five above prove a conclusion
+--                            could have come from those bytes; this is the one
+--                            that asks whether the run said so, and it is the
+--                            answer to the failure the other five leave open --
+--                            a model that read a bundle, invented a route and
+--                            cited the real analysis of the real file.
 
 ALTER TABLE proposal_drops DROP CONSTRAINT proposal_drops_reason_check;
 ALTER TABLE proposal_drops ADD CONSTRAINT proposal_drops_reason_check
@@ -634,7 +766,8 @@ ALTER TABLE proposal_drops ADD CONSTRAINT proposal_drops_reason_check
                       'malformed_field','no_parent','out_of_scope',
                       'invalid_direction','is_containment',
                       'no_such_artifact','artifact_not_source','artifact_changed',
-                      'artifact_not_read','no_source_citation'));
+                      'artifact_not_read','no_source_citation',
+                      'path_not_in_output'));
 
 CREATE FUNCTION rk2_source_citation(p_program uuid, p_element jsonb, p_tool_run uuid)
 RETURNS TABLE(fault text, cited text)
@@ -642,6 +775,7 @@ LANGUAGE plpgsql STABLE AS $fn$
 DECLARE
     v_label  text := nullif(btrim(p_element ->> 'source_artifact_label'), '');
     v_claim  text := lower(nullif(btrim(p_element ->> 'source_sha256'), ''));
+    v_route  text := nullif(btrim(p_element ->> 'path_template'), '');
     v_ref    artifact_references%ROWTYPE;
 BEGIN
     IF v_label IS NULL THEN
@@ -683,6 +817,28 @@ BEGIN
             SELECT 1 FROM tool_run_inputs i
              WHERE i.tool_run_id = p_tool_run AND i.sha256 = v_ref.sha256) THEN
         RETURN QUERY SELECT 'artifact_not_read', v_label;
+        RETURN;
+    END IF;
+
+    -- The citation holds; what is left is whether the run said this. Only for
+    -- an element that proposes a route, because a route is the one thing the
+    -- analysers report and so the one thing there is an answer to check
+    -- against. A run that named no path at all fails this too, and has to: an
+    -- Artifact read by something that reported no routes grounds a conclusion
+    -- about what is in it and not a conclusion that it calls one.
+    --
+    -- Both sides are cleaned, so `/api/v1/login/` and `/api/v1/login` are the
+    -- one route this schema stores rather than two strings. A route that does
+    -- not clean is not answered here: promotion has a word for a malformed
+    -- field, and this one would say something false about the run.
+    IF v_route IS NOT NULL THEN
+        SELECT c.path INTO v_route FROM rk2_clean_path(v_route) c;
+    END IF;
+    IF v_route IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM tool_run_paths p
+             WHERE p.tool_run_id = p_tool_run
+               AND (SELECT c.path FROM rk2_clean_path(p.path) c) = v_route) THEN
+        RETURN QUERY SELECT 'path_not_in_output', v_route;
         RETURN;
     END IF;
 END $fn$;

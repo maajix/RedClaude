@@ -44,12 +44,14 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 #: What this program answers to `--version`. The registry pins a pattern
 #: against it, so this is the contract of the output below rather than a build
-#: number: a change to what these documents mean is a change here.
+#: number: a change to what these documents mean is a change here. `paths` is
+#: part of that contract: an answer that names request paths names them there,
+#: and the runtime files them against the run.
 VERSION = "rk2-jsscan 1"
 
 #: The one file `js_map` may write, and it is the name the registry declares as
@@ -643,8 +645,27 @@ def line_of(starts: list[int], offset: int) -> int:
     return low + 1
 
 
+def _named_paths(paths: Iterable[str]) -> list[str]:
+    """Every request path one answer names, deduplicated and in one order.
+
+    Redundant with the answer it sits beside, and deliberately: it is the one
+    key the runtime records against the run, so a proposed route can be held
+    against what this analysis actually said. A recorder that read
+    `path_literals` from one subcommand and `routes` from another would be a
+    second place those shapes live, and the shape is this file's to change.
+    """
+    return sorted({path for path in paths if path})
+
+
 def parse(raw: bytes, text: str) -> dict:
-    """What this source is made of, and which of its paths anything requests."""
+    """What this source is made of, and which of its paths anything requests.
+
+    Every path literal is claimed, including the ones nothing requests. What
+    this answer says is that the file names them, which is true of a decoy; the
+    `requested` flag beside each is what says whether anything asks for it, and
+    deciding a decoy is not an endpoint is the analyst's judgement rather than
+    a fact about the bytes.
+    """
     tokens = tokenize(text)
     starts = lines(text)
     grounded = {call["offset"] for call in calls(tokens)}
@@ -678,6 +699,7 @@ def parse(raw: bytes, text: str) -> dict:
         "strings": sum(1 for token in tokens if token.kind in LITERALS),
         "comments": sum(1 for token in tokens if token.kind == "comment"),
         "path_literals": literals,
+        "paths": _named_paths(literal["value"] for literal in literals),
     }
 
 
@@ -704,7 +726,11 @@ def routes(raw: bytes, text: str) -> dict:
             }
         )
     ordered = sorted(collected.values(), key=lambda entry: (entry["path"], entry["method"] or ""))
-    return {"byte_size": len(raw), "routes": ordered}
+    return {
+        "byte_size": len(raw),
+        "routes": ordered,
+        "paths": _named_paths(entry["path"] for entry in ordered),
+    }
 
 
 def sourcemap(raw: bytes, text: str, select: int | None) -> dict:

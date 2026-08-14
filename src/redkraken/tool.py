@@ -132,6 +132,20 @@ LINK = (
     " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::bigint, $7)"
 )
 
+#: One request path an analyser's answer named, filed against the run and the
+#: bytes it was read out of. The database refuses a row whose run printed other
+#: bytes, so this is a reading of the Artifact rather than a claim beside it.
+NAME = (
+    "INSERT INTO tool_run_paths (program_id, tool_run_id, sha256, path)"
+    " VALUES ($1::uuid, $2::uuid, $3, $4)"
+)
+
+#: The key an analyser's answer names its request paths under. One key across
+#: all three questions, so this side never has to know which document shape it
+#: is reading -- `jsscan.py` owns those, and a second reader of them here would
+#: be a second thing to change when one of them changes.
+PATHS = "paths"
+
 
 def run(
     runtime: pg.Settings,
@@ -293,10 +307,20 @@ def run(
         try:
             with connection.transaction():
                 connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
-                answers.outputs = [
-                    _keep_stream(connection, keep, answers.program_id, plan, produced)
-                    for produced in _streams(answer, plan)
-                ]
+                answers.outputs = []
+                named: list[str] = []
+                for produced in _streams(answer, plan):
+                    filed = _keep_stream(connection, keep, answers.program_id, plan, produced)
+                    if produced.stream == "stdout":
+                        named = _named(
+                            connection,
+                            answers.program_id,
+                            plan,
+                            analyser,
+                            produced,
+                            filed["sha256"],
+                        )
+                    answers.outputs.append(filed)
                 closed = json.loads(
                     str(
                         connection.execute(
@@ -315,6 +339,15 @@ def run(
         f"{len(answers.outputs)} Artifact(s), {kept} byte(s): "
         + ", ".join(f"{item['stream']} {item['label']}" for item in answers.outputs),
     )
+    if analyser is not None:
+        # Stated even when it is none, because none is the fact a later
+        # promotion turns on: a conclusion naming a route has to name one the
+        # run it cites said, and a run that said nothing grounds no route.
+        ledger.hold(
+            "paths",
+            f"{plan['tool_run']} named {len(named)} request path(s)"
+            + (": " + ", ".join(named) if named else " and grounds no route"),
+        )
     # A run the supervisor stopped is reported as a fault, because what was kept
     # is a fragment and the ceiling that cut it is the operator's to set. A tool
     # that decided its own exit is not: exiting non-zero on purpose -- no match,
@@ -575,6 +608,47 @@ def _keep_stream(
         "produced_bytes": captured.produced,
         "truncated": captured.truncated,
     }
+
+
+def _named(
+    connection: pg.Connection,
+    program_id: str,
+    plan: Mapping[str, object],
+    analyser: _Analyser | None,
+    produced: _Stream,
+    sha256: str,
+) -> list[str]:
+    """File the request paths this run's answer names, out of the answer itself.
+
+    This is the half of grounding the database cannot reach. A citation proves
+    which bytes a run read; it cannot prove that the run said what the citation
+    is attached to, because what a run printed is an Artifact in the store and
+    the store is on the disk. So the runtime reads the answer once, while it
+    still has it, and files the paths it names against the hash it read them
+    out of -- and a proposed route is then held against a row rather than
+    against a claim.
+
+    Only an analyser's answer, and only stdout. The analyser is a program this
+    build shipped and hashed, so what it says is the harness speaking; any tool
+    could print a `paths` key, and one that could would be a way to launder an
+    invented route into the ground truth it is checked against. Bytes that are
+    not the document an analyser writes -- a truncated stream, a run that
+    failed before it printed -- name nothing, which is the same answer as an
+    answer with no paths in it and is right for the same reason.
+    """
+    if analyser is None or produced.captured.truncated:
+        return []
+    try:
+        document = json.loads(produced.captured.data)
+    except ValueError:
+        return []
+    said = document.get(PATHS) if isinstance(document, dict) else None
+    if not isinstance(said, list):
+        return []
+    paths = list(dict.fromkeys(item for item in said if isinstance(item, str) and item))
+    for path in paths:
+        connection.execute(NAME, (program_id, plan["tool_run_id"], sha256, path))
+    return paths
 
 
 def _verdict(

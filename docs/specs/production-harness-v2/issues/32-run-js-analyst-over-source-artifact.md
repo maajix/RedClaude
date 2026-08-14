@@ -84,13 +84,16 @@
    `endpoints` rows afterwards.
 
 5. The refusal is a `proposal_drops` row, which is what every promotion walk
-   already skips, so the element never becomes canonical. Five reasons, five
+   already skips, so the element never becomes canonical. Six reasons, six
    different mistakes: `no_such_artifact` (missing or another Program's — one
    answer, deliberately), `artifact_not_source`, `artifact_changed` (the element
    named a hash and the label resolves to other bytes), `artifact_not_read` (the
-   citation holds and the cited run never read those bytes) and
+   citation holds and the cited run never read those bytes),
    `no_source_citation` (grounded in a run that read source and does not say
-   which). `check_source_conclusions` re-asks the whole question of everything
+   which) and `path_not_in_output` (the element proposes a route and the run it
+   cites never reported it). The first five are about the citation and the sixth
+   is about the answer, which is why it is the one that catches an invented
+   route. `check_source_conclusions` re-asks the whole question of everything
    already promoted, which is how a citation that held when it was checked and
    stopped holding afterwards becomes visible.
    `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
@@ -122,23 +125,29 @@ afterwards. The ordinal is part of the key, so both ask `rk2_next_drop_ordinal`
 where theirs starts and `stage` reports back what the table holds rather than
 only what it wrote.
 `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
-pins the whole sequence, eight from the trigger and the ninth from the runtime.
+pins the whole sequence, nine from the trigger and the tenth from the runtime.
 
 ## What a citation is not
 
-A citation says which bytes a conclusion came from and which run read them. It
-does not say that the run reported that conclusion, and nothing here can make it
-say so: what a run printed is an Artifact in the store, and the store is on the
-disk rather than in the database, so the trigger that refuses a citation has the
-hash of the output and never its contents. An analyst that reads a bundle
-through `mcp__rk2__get_artifact`, invents a route and cites the bundle and a real
-`js_parse` run over it is grounded by this ticket's rules and wrong.
+A citation says which bytes a conclusion came from and which run read them. On
+its own it does not say that the run reported that conclusion — an analyst that
+reads a bundle through `mcp__rk2__get_artifact`, invents a route and cites the
+bundle and a real `js_parse` run over it satisfies every rule about the citation
+and is wrong.
 
-What the ticket does buy against that is narrower and worth stating exactly: the
-invention has to name an Artifact this Program holds as source, unchanged, that
-the cited run actually read — so it is checkable after the fact, by anyone,
-against bytes that are still there. `js_routes` is what makes the check cheap,
-because the routes it reports are the ones a request was lexically given. Making
-the runtime compare a proposed path against the cited run's output before
-promoting it is a real strengthening and it belongs to whichever ticket gives
-`proposal.stage` the store; it is not a hole this one can close from SQL.
+`tool_run_paths` is the answer to that, and where it lives is the whole design.
+What a run printed is an Artifact in the store, and the store is on the disk
+rather than in the database, so a trigger reading a proposal has the hash of the
+output and never its contents. The runtime does have the contents, once, while
+it is filing them: `tool.run` reads the `paths` key out of the answer it just
+stored and files one row per path against the hash it read them out of. What the
+trigger then asks is a join. The rows are as checkable as everything else here —
+the hash is on the row, so re-deriving the list is reading those bytes again.
+
+Three things keep the table from becoming a way to write the ground truth. The
+run has to be an analyser's, so a tool from the image printing a `paths` key
+files nothing; the bytes have to be that run's own output; and the run has to
+still be open, so the answer cannot be amended after it was reported. What is
+left uncovered is what is not a route: an invented parameter, or a Hypothesis
+about a file, is still grounded only by its citation, because the analysers
+report paths and there is nothing else to hold those against.
