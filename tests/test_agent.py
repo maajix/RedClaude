@@ -1579,23 +1579,7 @@ class ContainedChildTest(unittest.TestCase):
         needs to exist did not add a way out, and that the only home inside is
         the one the runtime mounted.
         """
-        probe = r"""
-import json, os, socket
-
-def reaches(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=0.6):
-            return True
-    except OSError:
-        return False
-
-def resolves(host):
-    try:
-        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        return True
-    except OSError:
-        return False
-
+        probe = fixtures.PROBE + """
 print(json.dumps({
     'model_api': resolves('api.anthropic.com'),
     'internet_tcp': reaches('1.1.1.1', 443),

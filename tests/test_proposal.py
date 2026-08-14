@@ -75,8 +75,15 @@ class Recorder:
 
     @contextlib.contextmanager
     def transaction(self):
+        # Rolls back on any exception, because `pg.Connection.transaction` does:
+        # a recorder that committed whatever happened would let a stage that
+        # raised mid-transaction record a COMMIT it never issued.
         self.calls.append(("BEGIN", ()))
-        yield self
+        try:
+            yield self
+        except BaseException:
+            self.calls.append(("ROLLBACK", ()))
+            raise
         self.calls.append(("COMMIT", ()))
 
     @property

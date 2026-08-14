@@ -46,17 +46,19 @@ def entry(kind: str, number: int, revision: int) -> state.Entry:
 
 
 class Recorder:
-    """A connection that answers with canned rows and remembers what it was asked."""
+    """A connection that answers nothing and remembers what it was asked.
 
-    def __init__(self, answers: dict[str, list[tuple]] | None = None):
+    The empty answer is the whole fixture: the cases below are about the
+    statement the read sends and about a label no row carries. A canned-row
+    facility keyed on a fragment of the statement travelled with it -- and with
+    the same class in `test_artifact` -- and neither copy was ever handed one.
+    """
+
+    def __init__(self):
         self.calls: list[tuple[str, tuple]] = []
-        self.answers = answers or {}
 
     def execute(self, sql: str, parameters: tuple = ()) -> pg.Result:
         self.calls.append((sql, parameters))
-        for fragment, rows in self.answers.items():
-            if fragment in sql:
-                return pg.Result(columns=(), rows=tuple(rows), tag="SELECT")
         return pg.Result(columns=(), rows=(), tag="SELECT")
 
 

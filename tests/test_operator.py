@@ -20,6 +20,7 @@ from unittest import mock
 
 from redkraken import migrate, operator, pg
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION, EXIT_OK
+from tests import fixtures
 
 
 ANSWERED = json.dumps(
@@ -76,13 +77,7 @@ class FakeConnection:
         if "set_config" in sql:
             return pg.Result(columns=("set_config",), rows=(("",),))
         if "v_decision_queue" in sql:
-            return pg.Result(
-                columns=(
-                    "program", "label", "question_code", "tool", "risk_class", "question",
-                    "requested_at", "deadline_at", "status", "answered_by", "answer",
-                ),
-                rows=tuple(self.questions),
-            )
+            return pg.Result(columns=fixtures.DECISION_QUEUE_COLUMNS, rows=tuple(self.questions))
         if self.error is not None:
             raise self.error
         return pg.Result(columns=("answer",), rows=((self.answer,),))

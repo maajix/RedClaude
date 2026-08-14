@@ -304,23 +304,7 @@ class ToolIsolationTest(unittest.TestCase):
         self.assertEqual(b"", answer.stderr.data)
 
     def test_the_tool_has_no_route_out_and_cannot_write_what_it_was_given(self):
-        probe = """
-import json, os, socket
-
-def reaches(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
-
-def writable(path):
-    try:
-        open(path, 'w').close()
-        return True
-    except OSError:
-        return False
-
+        probe = fixtures.PROBE + """
 print(json.dumps({
     'internet_tcp': reaches('1.1.1.1', 443),
     'rootfs': writable('/rk2-root-write'),
@@ -539,23 +523,7 @@ class AgentContainerIsolationTest(unittest.TestCase):
         )
 
     def test_only_the_proxy_is_reachable_and_only_the_run_root_is_installed(self):
-        probe = r"""
-import json, os, socket
-
-def reaches(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=0.6):
-            return True
-    except OSError:
-        return False
-
-def resolves(host):
-    try:
-        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        return True
-    except OSError:
-        return False
-
+        probe = fixtures.PROBE + """
 written = True
 try:
     open('/rk2-root-write', 'w').close()
@@ -644,23 +612,7 @@ print(json.dumps({
         # this adapter and nothing else. So the name half is probed here too,
         # rather than only on the Agent boundary: a name that resolved would be
         # a second egress the door never sees.
-        probe = """
-import json, os, socket
-
-def reaches(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=0.6):
-            return True
-    except OSError:
-        return False
-
-def resolves(host):
-    try:
-        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        return True
-    except OSError:
-        return False
-
+        probe = fixtures.PROBE + """
 print(json.dumps({
     'proxy': reaches(os.environ['HTTP_PROXY'].split('//', 1)[1].split(':')[0], 18080),
     'target_ip': reaches(%r, 18081),

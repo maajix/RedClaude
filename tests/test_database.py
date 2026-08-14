@@ -14,17 +14,21 @@ fails when the thing it describes is broken. The last one is why the negative
 controls exist: a check nobody has seen fail is a check nobody knows is wired
 up, and a gate of those is a green light with nothing behind it.
 
-`ProgramRunTest` asks a fifth, about an operation rather than about the schema:
-that `rk run` opens one Program and afterwards resumes that one. `StateReadTest`
-asks a sixth, about the connection the model reads through: that one Program
-cannot name, infer or mutate another's rows. `ArtifactStoreTest` asks a seventh,
-about the half of the state that is not in the database: that bytes shared by
-content hash stay one row and two claims, and that a hash on its own opens
-nothing. `SealedWireArtifactTest` asks an eighth, about the half of an exchange
-nobody may read: that the wire view is kept whole, kept encrypted under key
-material the database never holds, and reachable only through an authorized
-operation that is audited whatever becomes of it. All four commit, because what
-survives the transaction is their subject.
+Everything after `NegativeControlTest` asks about an operation rather than about
+the schema, and there are as many of those as there are slices whose subject is
+what a real server does: `rk run` opening one Program and resuming that one, the
+connection the model reads through refusing to name another Program's rows,
+bytes shared by content hash staying one row and two claims, a wire view kept
+encrypted under key material the database never holds, the door, the scheduler,
+the Leases, the budgets, the offline tools, the browser. Each class says in its
+own docstring which question it is asking; this module is where they live
+because a real server is the only thing that can answer any of them.
+
+Two disciplines run side by side, and each class states which it is under. The
+cases about the gate write inside a transaction they roll back, because the gate
+and the archive want a database nobody has left anything in. Every other case
+commits and purges what it wrote at the end, because what survives the
+transaction is its subject.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ import threading
 import time
 import unittest
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
@@ -93,10 +98,12 @@ from redkraken.store import Store
 from tests import ROOT, browser_door, browser_target
 from tests.fixtures import (
     AGENT_IMAGE,
+    DECISION_QUEUE_COLUMNS,
     EXPORTED,
     FIRST,
     PINNED,
     ROLE,
+    SLATE_COLUMNS,
     SCOPE_ENTITIES,
     SCOPE_REQUESTS,
     SCOPED,
@@ -145,6 +152,32 @@ HYPOTHESIS = (
     " VALUES ($1, $2, (SELECT id FROM property_classes ORDER BY id LIMIT 1), 'a self test')"
     " RETURNING id"
 )
+
+#: What the database is, in the terms criterion 6 is about: its size on disk,
+#: the log that every revision is read from, and the Leases. A read that changed
+#: any of them would move at least one of these numbers, and so would a write
+#: some test meant to roll back and did not: `events` is trigger-authored, so a
+#: row left behind in any emitting table moves the count whether or not this
+#: query names that table.
+SNAPSHOT = """
+SELECT pg_database_size(current_database()),
+       (SELECT count(*) FROM events),
+       (SELECT coalesce(max(seq), 0) FROM events),
+       (SELECT count(*) FROM identity_leases),
+       (SELECT coalesce(md5(string_agg(l::text, '|' ORDER BY l.id)), '')
+          FROM identity_leases l),
+       (SELECT coalesce(md5(string_agg(e::text, '|' ORDER BY e.id)), '') FROM entities e),
+       (SELECT coalesce(md5(string_agg(h::text, '|' ORDER BY h.id)), '') FROM hypotheses h)
+"""
+
+#: Everything in `SNAPSHOT` except its first column. The size on disk moves for
+#: reasons that are not writes -- a catalogue page dirtied by a GRANT, autovacuum
+#: -- so it is compared across one test rather than across a whole class.
+ROWS = slice(1, None)
+
+
+def snapshot(connection: pg.Connection) -> tuple:
+    return tuple(connection.execute(SNAPSHOT).rows[0])
 
 
 @dataclass
@@ -1801,6 +1834,43 @@ RUNTIME_CONTROLS = (
 )
 
 
+class RecordedColumnsTest(DatabaseCase):
+    """What the offline suites spell out, read back off the server that has it.
+
+    Two answers are named rather than shaped in the suites that run without a
+    server: `offer_slate()`'s columns and the columns the console's decision
+    queue comes back under. Both are read by name in production -- the slice
+    indexes the slate's `entitled`, the console hands the queue's rows out as
+    dictionaries -- so a renamed column breaks the caller while every fake goes
+    on agreeing with itself.
+
+    The queue is asked by running the console's own statement, because what the
+    console reads is that statement's projection and not the view behind it: a
+    column the view grew and the statement never selected is not drift. The
+    slate is asked of the catalogue instead, because a function has to run to
+    describe itself, and running it means having something to offer.
+    """
+
+    #: The names a set-returning function declares, in the order it returns
+    #: them. `proargmodes` marks which of them are results: `t` for a `RETURNS
+    #: TABLE` column, `o` for an `OUT` parameter.
+    ROUTINE = """
+    SELECT n.name FROM pg_proc p,
+         unnest(p.proargnames, p.proargmodes) WITH ORDINALITY AS n(name, mode, ord)
+     WHERE p.proname = $1 AND n.mode IN ('t', 'o')
+     ORDER BY n.ord
+    """
+
+    def test_the_slate_the_recorder_replays_is_the_slate_the_server_offers(self):
+        named = self.connection.execute(self.ROUTINE, ("offer_slate",)).rows
+        self.assertEqual(SLATE_COLUMNS, tuple(str(name) for (name,) in named))
+
+    def test_the_queue_the_console_reads_is_the_queue_the_server_answers(self):
+        answered = self.connection.execute(operator.QUEUE, ("no-such-program", True))
+        self.assertEqual((), answered.rows, "the slug was chosen for matching nothing")
+        self.assertEqual(DECISION_QUEUE_COLUMNS, tuple(answered.columns))
+
+
 class NegativeControlTest(DatabaseCase):
     """Criterion 5: each check, shown failing when its subject is broken."""
 
@@ -1838,18 +1908,54 @@ class NegativeControlTest(DatabaseCase):
     def break_it(self, control: Control) -> list[str]:
         connection = self.connection_for(control.on)
         failed: list[str] = []
+        with self.rolled_back(connection):
+            if control.on == "owner":
+                connection.execute("SET LOCAL ROLE rk2_owner")
+            connection.execute_script(control.sql)
+            failed = self.run_gate(connection, control.families)
+        return failed
+
+    @contextlib.contextmanager
+    def rolled_back(self, connection: pg.Connection | None = None) -> Iterator[None]:
+        """Break something, ask the gate, and leave the database as it was found.
+
+        Every control in this class runs inside one of these. The rollback is
+        the transaction's, but the witness is not: it is read on the connection
+        that owns the tables once the transaction is gone, so a control that
+        somehow committed is caught here by name rather than by whichever later
+        class first trips over the rows. `events` is trigger-authored, so a row
+        left behind in any emitting table moves the witness even though the
+        query does not name that table.
+        """
+        connection = connection or self.connection
+        before = snapshot(self.connection)[ROWS]
         try:
             with connection.transaction():
-                if control.on == "owner":
-                    connection.execute("SET LOCAL ROLE rk2_owner")
-                connection.execute_script(control.sql)
-                failed = self.run_gate(connection, control.families)
+                yield
                 raise Rollback
         except Rollback:
             pass
-        return failed
+        self.assertEqual(before, snapshot(self.connection)[ROWS], "a control left rows behind")
 
-    def test_the_gate_holds_before_anything_is_broken(self):
+    @contextlib.contextmanager
+    def arranged(self) -> Iterator[list[str]]:
+        """The same scaffold, for a control that needs rows rather than an edit.
+
+        The caller writes its rows inside the block and reads the gate's verdict
+        out of the list afterwards; the list is filled with what failed once the
+        block returns, which is why it is handed over empty.
+        """
+        failed: list[str] = []
+        with self.rolled_back():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            yield failed
+            failed.extend(self.run_gate(self.connection))
+
+    def test_the_gate_holds_when_nothing_is_broken(self):
+        # That every control put the database back is asserted by `rolled_back`,
+        # per control, rather than once at the end: unittest runs the methods of
+        # a class in alphabetical order, so a test named "afterwards" is not.
         self.assertEqual([], self.run_gate(self.connection))
 
     def test_each_check_fails_when_its_subject_is_broken(self):
@@ -1873,25 +1979,17 @@ class NegativeControlTest(DatabaseCase):
         # The one check that needs rows rather than an edit: headroom is the
         # number of vectors an HNSW build fits in maintenance_work_mem, so
         # falsifying it means having more rows than the setting allows.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SET LOCAL maintenance_work_mem = '64kB'")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program = self.connection.execute(PROGRAM, ("headroom-selftest",)).scalar()
-                entity = self.connection.execute(ENTITY, (program,)).scalar()
-                hypothesis = self.connection.execute(HYPOTHESIS, (program, entity)).scalar()
-                self.connection.execute(
-                    "INSERT INTO hypothesis_embeddings (hypothesis_id, model, embedding, program_id)"
-                    " SELECT $1, 'selftest-' || g, array_fill(0::real, ARRAY[1536])::vector, $2"
-                    "   FROM generate_series(1, 12) g",
-                    (hypothesis, program),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            self.connection.execute("SET LOCAL maintenance_work_mem = '64kB'")
+            program = self.connection.execute(PROGRAM, ("headroom-selftest",)).scalar()
+            entity = self.connection.execute(ENTITY, (program,)).scalar()
+            hypothesis = self.connection.execute(HYPOTHESIS, (program, entity)).scalar()
+            self.connection.execute(
+                "INSERT INTO hypothesis_embeddings (hypothesis_id, model, embedding, program_id)"
+                " SELECT $1, 'selftest-' || g, array_fill(0::real, ARRAY[1536])::vector, $2"
+                "   FROM generate_series(1, 12) g",
+                (hypothesis, program),
+            )
 
         self.assertIn("baseline:hnsw_headroom", failed)
 
@@ -1901,28 +1999,20 @@ class NegativeControlTest(DatabaseCase):
         # makes it that shape rather than a refusal: bytes left this machine and
         # nothing accounts for them. A refusal decided before contact has no
         # tool run either, by construction, and is not this.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program = self.connection.execute(PROGRAM, ("receipt-selftest",)).scalar()
-                self.connection.execute(
-                    "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
-                    " VALUES ($1, 1, '{}'::jsonb, repeat('b', 64))",
-                    (program,),
-                )
-                self.connection.execute(
-                    "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
-                    " ts_egress, scope_class, scope_version, host)"
-                    " VALUES ($1, 'agent', 'blocked', 'self test', now(), now(),"
-                    " 'target', 1, 'example.test')",
-                    (program,),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            program = self.connection.execute(PROGRAM, ("receipt-selftest",)).scalar()
+            self.connection.execute(
+                "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
+                " VALUES ($1, 1, '{}'::jsonb, repeat('b', 64))",
+                (program,),
+            )
+            self.connection.execute(
+                "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
+                " ts_egress, scope_class, scope_version, host)"
+                " VALUES ($1, 'agent', 'blocked', 'self test', now(), now(),"
+                " 'target', 1, 'example.test')",
+                (program,),
+            )
 
         self.assertIn("standing:receipt_integrity", failed)
 
@@ -1933,28 +2023,20 @@ class NegativeControlTest(DatabaseCase):
         # it means. Counting those made one fabricated capability fail the
         # standing gate for every Program, for good, and the only way to clear
         # it was to delete the row the refusal existed to leave.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program = self.connection.execute(PROGRAM, ("refusal-selftest",)).scalar()
-                self.connection.execute(
-                    "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
-                    " VALUES ($1, 1, '{}'::jsonb, repeat('c', 64))",
-                    (program,),
-                )
-                self.connection.execute(
-                    "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
-                    " scope_class, scope_version, host)"
-                    " VALUES ($1, 'agent', 'blocked', 'refused before contact', now(),"
-                    " 'target', 1, 'example.test')",
-                    (program,),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            program = self.connection.execute(PROGRAM, ("refusal-selftest",)).scalar()
+            self.connection.execute(
+                "INSERT INTO program_scope_versions (program_id, version, policy, policy_sha256)"
+                " VALUES ($1, 1, '{}'::jsonb, repeat('c', 64))",
+                (program,),
+            )
+            self.connection.execute(
+                "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
+                " scope_class, scope_version, host)"
+                " VALUES ($1, 'agent', 'blocked', 'refused before contact', now(),"
+                " 'target', 1, 'example.test')",
+                (program,),
+            )
 
         self.assertNotIn("standing:receipt_integrity", failed)
 
@@ -1963,23 +2045,15 @@ class NegativeControlTest(DatabaseCase):
         # hook said no and the network happened anyway -- and both halves have
         # to be present for it to be that: a tool run the gate did not allow,
         # and a Receipt carrying `ts_egress`.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program, tool_run = self._refused_tool_run("denied-egress-selftest")
-                self.connection.execute(
-                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
-                    " ts_arrival, ts_egress, scope_class, scope_version, host)"
-                    " VALUES ($1, $2, 'agent', 'blocked', 'self test', now(), now(),"
-                    " 'target', 1, 'example.test')",
-                    (program, tool_run),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            program, tool_run = self._refused_tool_run("denied-egress-selftest")
+            self.connection.execute(
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                " ts_arrival, ts_egress, scope_class, scope_version, host)"
+                " VALUES ($1, $2, 'agent', 'blocked', 'self test', now(), now(),"
+                " 'target', 1, 'example.test')",
+                (program, tool_run),
+            )
 
         self.assertIn("standing:receipt_integrity", failed)
 
@@ -1990,25 +2064,17 @@ class NegativeControlTest(DatabaseCase):
         # contact, and the runtime closed the run as denied because a refused
         # request must not close as success. Nothing here is a hole -- reading
         # the outcome as the verdict was.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program, tool_run = self._refused_tool_run(
-                    "budget-refusal-selftest", decision="allow"
-                )
-                self.connection.execute(
-                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
-                    " ts_arrival, scope_class, scope_version, host)"
-                    " VALUES ($1, $2, 'agent', 'blocked', 'rate limited', now(),"
-                    " 'target', 1, 'example.test')",
-                    (program, tool_run),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            program, tool_run = self._refused_tool_run(
+                "budget-refusal-selftest", decision="allow"
+            )
+            self.connection.execute(
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                " ts_arrival, scope_class, scope_version, host)"
+                " VALUES ($1, $2, 'agent', 'blocked', 'rate limited', now(),"
+                " 'target', 1, 'example.test')",
+                (program, tool_run),
+            )
 
         self.assertNotIn("standing:receipt_integrity", failed)
 
@@ -2017,25 +2083,17 @@ class NegativeControlTest(DatabaseCase):
         # was read as a verdict; here, a verdict nobody gave is written as an
         # outcome. The gate allowed this run, the name resolved to nothing, and
         # `denied` says the harness refused a request it in fact authorized.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program, tool_run = self._refused_tool_run(
-                    "target-fault-selftest", decision="allow"
-                )
-                self.connection.execute(
-                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
-                    " ts_arrival, scope_class, scope_version, host)"
-                    " VALUES ($1, $2, 'agent', 'blocked', 'target unresolved', now(),"
-                    " 'target', 1, 'example.test')",
-                    (program, tool_run),
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            program, tool_run = self._refused_tool_run(
+                "target-fault-selftest", decision="allow"
+            )
+            self.connection.execute(
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                " ts_arrival, scope_class, scope_version, host)"
+                " VALUES ($1, $2, 'agent', 'blocked', 'target unresolved', now(),"
+                " 'target', 1, 'example.test')",
+                (program, tool_run),
+            )
 
         self.assertIn("standing:receipt_integrity", failed)
 
@@ -2044,26 +2102,18 @@ class NegativeControlTest(DatabaseCase):
         # than the status alone: one run may make several requests. This one met
         # an unreachable target and was separately refused, so `denied` is a word
         # something under it earned.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                program, tool_run = self._refused_tool_run(
-                    "target-fault-and-refusal-selftest", decision="allow"
+        with self.arranged() as failed:
+            program, tool_run = self._refused_tool_run(
+                "target-fault-and-refusal-selftest", decision="allow"
+            )
+            for reason in ("target unreachable", "capability refused"):
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision,"
+                    " reason, ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1, $2, 'agent', 'blocked', $3, now(),"
+                    " 'target', 1, 'example.test')",
+                    (program, tool_run, reason),
                 )
-                for reason in ("target unreachable", "capability refused"):
-                    self.connection.execute(
-                        "INSERT INTO receipts (program_id, tool_run_id, lane, decision,"
-                        " reason, ts_arrival, scope_class, scope_version, host)"
-                        " VALUES ($1, $2, 'agent', 'blocked', $3, now(),"
-                        " 'target', 1, 'example.test')",
-                        (program, tool_run, reason),
-                    )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
 
         self.assertNotIn("standing:receipt_integrity", failed)
 
@@ -2073,20 +2123,12 @@ class NegativeControlTest(DatabaseCase):
         # A run closed `denied` under it says the harness refused a request
         # nobody had yet ruled on -- and the row is all that is left, because
         # nothing was queued and nobody was asked.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                self._refused_tool_run(
-                    "discarded-question-selftest",
-                    decision="ask",
-                    risk_class="approval_required",
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            self._refused_tool_run(
+                "discarded-question-selftest",
+                decision="ask",
+                risk_class="approval_required",
+            )
 
         self.assertIn("standing:receipt_integrity", failed)
 
@@ -2095,21 +2137,13 @@ class NegativeControlTest(DatabaseCase):
         # resolves to `ask`, so an `allow` on it did not come from the policy
         # table; the only thing that can produce one is a live grant, and this
         # run names no decision at all.
-        failed: list[str] = []
-        try:
-            with self.connection.transaction():
-                self.connection.execute("SET LOCAL ROLE rk2_owner")
-                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                self._refused_tool_run(
-                    "ungranted-allow-selftest",
-                    decision="allow",
-                    risk_class="approval_required",
-                    status="success",
-                )
-                failed = self.run_gate(self.connection)
-                raise Rollback
-        except Rollback:
-            pass
+        with self.arranged() as failed:
+            self._refused_tool_run(
+                "ungranted-allow-selftest",
+                decision="allow",
+                risk_class="approval_required",
+                status="success",
+            )
 
         self.assertIn("standing:receipt_integrity", failed)
 
@@ -2167,10 +2201,6 @@ class NegativeControlTest(DatabaseCase):
         self.assertEqual(set(), ran - covered, "a check with no negative control")
         self.assertEqual(set(), covered - ran, "a control for a check the gate does not run")
 
-    def test_the_database_is_unchanged_afterwards(self):
-        # Every control above rolls back. If one did not, the gate says so here.
-        self.assertEqual([], self.run_gate(self.connection))
-
 
 #: What every Program these tests open is called, so the cleanup can find all of
 #: them by prefix and each test can still have one nobody else touches.
@@ -2180,11 +2210,12 @@ RUN_SLUG = "selftest-run"
 class ProgramRunTest(DatabaseCase):
     """PH2-04: `rk run` opens a Program once and resumes that one afterwards.
 
-    The only tests in this module that commit. Everything else writes inside a
-    transaction it rolls back, because the gate and the archive want an empty
-    database to look at; this operation's entire subject is what survives the
-    transaction, so it cannot be asked that way. The rows go at the end, down
-    the path a purge takes.
+    The first case in this module that commits, and the reason the discipline is
+    two-sided: the cases about the gate write inside a transaction they roll
+    back, because the gate wants a database nobody has left anything in, and
+    this operation's entire subject is what survives the transaction, so it
+    cannot be asked that way. The rows go at the end, down the path a purge
+    takes.
 
     They also run as `rk2_runtime` rather than as the owner, which is the point
     of asking a real server at all: row level security is in force, no DDL is
@@ -2808,30 +2839,6 @@ class ScopeEvaluatorTest(DatabaseCase):
 #: The Programs the state tests open. Two, because one Program can never
 #: demonstrate isolation from itself.
 STATE_SLUG = "selftest-state"
-
-#: What the database is, in the terms criterion 6 is about: its size on disk,
-#: the log that every revision is read from, and the Leases. A read that changed
-#: any of them would move at least one of these numbers.
-SNAPSHOT = """
-SELECT pg_database_size(current_database()),
-       (SELECT count(*) FROM events),
-       (SELECT coalesce(max(seq), 0) FROM events),
-       (SELECT count(*) FROM identity_leases),
-       (SELECT coalesce(md5(string_agg(l::text, '|' ORDER BY l.id)), '')
-          FROM identity_leases l),
-       (SELECT coalesce(md5(string_agg(e::text, '|' ORDER BY e.id)), '') FROM entities e),
-       (SELECT coalesce(md5(string_agg(h::text, '|' ORDER BY h.id)), '') FROM hypotheses h)
-"""
-
-#: Everything in `SNAPSHOT` except its first column. The size on disk moves for
-#: reasons that are not writes -- a catalogue page dirtied by a GRANT, autovacuum
-#: -- so it is compared across one test rather than across a whole class.
-ROWS = slice(1, None)
-
-
-def snapshot(connection: pg.Connection) -> tuple:
-    return tuple(connection.execute(SNAPSHOT).rows[0])
-
 
 class StateReadTest(DatabaseCase):
     """PH2-05: what one Program can read about itself, and what it cannot ask.
@@ -6125,7 +6132,7 @@ class ProxyEgressTest(DatabaseCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def refused(self, name: str, capability: str | None, program_id: str | None) -> tuple:
+    def refusal_receipt(self, name: str, capability: str | None, program_id: str | None) -> tuple:
         """One blocked arm: the answer, and the single record it left behind."""
         before = len(self.receipts(name))
         seen = len(self.target.seen)
@@ -7289,7 +7296,7 @@ class ProxyEgressTest(DatabaseCase):
         capability, tool_run, _ = self.mint("a")
         dialled = len(self.dialled)
 
-        record = self.refused("a", capability, self.identifiers["a"])
+        record = self.refusal_receipt("a", capability, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "address refused"), record[:3])
         self.assertEqual(tool_run, record[3], "the capability resolved, so its run is named")
@@ -7318,7 +7325,7 @@ class ProxyEgressTest(DatabaseCase):
                 capability, _, _ = self.mint("a")
                 dialled = len(self.dialled)
 
-                record = self.refused("a", capability, self.identifiers["a"])
+                record = self.refusal_receipt("a", capability, self.identifiers["a"])
 
                 self.assertEqual(("agent", "blocked", "address refused"), record[:3])
                 self.assertEqual(dialled, len(self.dialled), "a socket was opened")
@@ -7348,27 +7355,32 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(200, self.secured.facts["response"]["status"])
         self.assertEqual(len(ANSWER), self.secured.facts["response"]["byte_size"])
 
+        # Read by name rather than by position: this row is twelve columns wide
+        # and the claims below are about six of them, which is exactly the shape
+        # a positional read gets silently wrong when the SELECT list moves.
         row = self.connection.execute(
             "SELECT lane, decision, scheme, host, port, path, status_code, intercepted,"
             "       label, request_wire_sha, response_wire_sha, scope_class"
             "  FROM receipts WHERE tool_run_id = $1::uuid AND decision = 'allowed'",
             (self.secured.facts["tool_run"]["id"],),
-        ).rows[0]
+        ).dicts()[0]
 
-        self.assertEqual(("agent", "allowed", "https"), (str(row[0]), str(row[1]), str(row[2])))
+        self.assertEqual(
+            ("agent", "allowed", "https", "target"),
+            (str(row["lane"]), str(row["decision"]), str(row["scheme"]), str(row["scope_class"])),
+        )
         self.assertEqual(
             ("app.example.com", 443, "/notes", 200),
-            (str(row[3]), int(row[4]), str(row[5]), int(row[6])),
+            (str(row["host"]), int(row["port"]), str(row["path"]), int(row["status_code"])),
         )
-        self.assertEqual("target", str(row[11]))
-        self.assertTrue(row[7], "a terminated tunnel is an intercepted exchange")
-        self.assertEqual(self.secured.facts["receipt"], str(row[8]))
+        self.assertTrue(row["intercepted"], "a terminated tunnel is an intercepted exchange")
+        self.assertEqual(self.secured.facts["receipt"], str(row["label"]))
         # And the wire view is claimed on the side that has one. The request left
         # with a header the agent never saw, so the row names a different hash;
         # the response came back with nothing the agent may not read, so the row
         # says so by leaving that hash null rather than by repeating the agent's.
-        self.assertIsNotNone(row[9])
-        self.assertIsNone(row[10])
+        self.assertIsNotNone(row["request_wire_sha"])
+        self.assertIsNone(row["response_wire_sha"])
 
     def test_both_sides_of_the_intercepted_handshake_are_on_the_receipt(self):
         # The gap, written down. The agent's TLS stack negotiated with this door
@@ -7911,14 +7923,14 @@ class ProxyEgressTest(DatabaseCase):
         # Criterion 5, first arm. A Program is named and nothing else, so there
         # is somewhere to file the refusal -- and it is filed with no Tool run,
         # because no capability resolved one.
-        record = self.refused("a", None, self.identifiers["a"])
+        record = self.refusal_receipt("a", None, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
         self.assertIsNone(record[3])
 
     def test_a_fabricated_capability_is_blocked_before_the_target_is_contacted(self):
         # Second arm. Well-formed, right length, never minted.
-        record = self.refused("a", "c" * 64, self.identifiers["a"])
+        record = self.refusal_receipt("a", "c" * 64, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
 
@@ -7990,7 +8002,7 @@ class ProxyEgressTest(DatabaseCase):
         # Program is filed against the Program that was claimed.
         capability, _, _ = self.mint("a")
 
-        record = self.refused("b", capability, self.identifiers["b"])
+        record = self.refusal_receipt("b", capability, self.identifiers["b"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
         self.assertIsNone(record[3])
@@ -8005,7 +8017,7 @@ class ProxyEgressTest(DatabaseCase):
             (tool_run,),
         )
 
-        record = self.refused("a", capability, self.identifiers["a"])
+        record = self.refusal_receipt("a", capability, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
         self.assertEqual(
@@ -8025,7 +8037,7 @@ class ProxyEgressTest(DatabaseCase):
             self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
             self.runtime.execute(proxy.CLOSE_TOOL_RUN, (tool_run, "success"))
 
-        record = self.refused("a", capability, self.identifiers["a"])
+        record = self.refusal_receipt("a", capability, self.identifiers["a"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
         self.assertIsNone(
@@ -8041,7 +8053,7 @@ class ProxyEgressTest(DatabaseCase):
         capability, _, _ = self.mint("retired")
         self.owner("SELECT retire_program($1::uuid)", (self.identifiers["retired"],))
 
-        record = self.refused("retired", capability, self.identifiers["retired"])
+        record = self.refusal_receipt("retired", capability, self.identifiers["retired"])
 
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
 
@@ -8114,7 +8126,7 @@ class ProxyEgressTest(DatabaseCase):
             " WHERE id = $1::uuid",
             (task,),
         )
-        record = self.refused("shared", capability, self.identifiers["shared"])
+        record = self.refusal_receipt("shared", capability, self.identifiers["shared"])
 
         self.assertEqual(200, served[0])
         self.assertEqual(("agent", "blocked", "capability refused"), record[:3])
@@ -8147,7 +8159,7 @@ class ProxyEgressTest(DatabaseCase):
             "SELECT halt_program($1::uuid, $2)",
             (program_id, "operator containment self-test"),
         ).scalar()
-        child = self.refused("shared", capability, program_id)
+        child = self.refusal_receipt("shared", capability, program_id)
 
         self.assertEqual(200, parent[0])
         # Named as the Halt rather than as a lapse. A Halt refuses by making the
@@ -8220,8 +8232,8 @@ class ProxyEgressTest(DatabaseCase):
         )
 
         dialled = len(self.dialled)
-        lapsed = self.refused("halted", expired, program_id)
-        finished = self.refused("halted", closed, program_id)
+        lapsed = self.refusal_receipt("halted", expired, program_id)
+        finished = self.refusal_receipt("halted", closed, program_id)
 
         self.assertEqual(("agent", "blocked", "capability refused"), lapsed[:3])
         self.assertEqual(("agent", "blocked", "capability refused"), finished[:3])
@@ -16275,7 +16287,7 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         return identity
 
     @classmethod
-    def refused_operator(cls, program_name: str, sql: str, parameters: tuple = ()):
+    def operator_refusal_error(cls, program_name: str, sql: str, parameters: tuple = ()):
         """The error one refused operator verb raised, insisting that it did.
 
         The exception and not its text: what the console does with a refusal is
@@ -16431,7 +16443,7 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
             (task,),
         ).rows[0]
 
-        cls.stale_refusal = cls.refused_operator(
+        cls.stale_refusal = cls.operator_refusal_error(
             "stale",
             "SELECT answer_decision($1, 'approved', 'it looked fine when I read it')",
             (cls.stale_label,),
@@ -16467,7 +16479,7 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         cls.halted_state = cls.operator(
             "SELECT revalidate_decision($1)", (cls.halted_label,), program="halted"
         )
-        cls.halted_refusal = cls.refused_operator(
+        cls.halted_refusal = cls.operator_refusal_error(
             "halted",
             "SELECT answer_decision($1, 'approved', 'go on then')",
             (cls.halted_label,),
@@ -16789,6 +16801,11 @@ OFFLINE_STDOUT = b'"app.example.com"\n'
 #: whatever the corpus happened to seed first.
 OFFLINE_OBSERVATION = "content_match"
 
+#: What the Observation those cases file says. Spelled once because a promotion
+#: in the same class files another Observation of the same kind on the same run,
+#: so the summary is what tells one insert's row from the other's.
+OFFLINE_CLAIM = "a claim about what the tool printed"
+
 
 def committed(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
     """One attributed write, committed, whose one value is needed back."""
@@ -16797,7 +16814,7 @@ def committed(connection: pg.Connection, sql: str, parameters: tuple = ()) -> st
         return str(connection.execute(sql, parameters).scalar())
 
 
-def refused(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
+def refusal_message(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
     """One statement that must not be allowed, in the words it refused in.
 
     Each one gets a transaction of its own, because a refusal aborts the
@@ -17012,7 +17029,7 @@ class OfflineToolRunTest(DatabaseCase):
 
     @classmethod
     def refuse(cls, sql: str, parameters: tuple = ()) -> str:
-        return refused(cls.connection, sql, parameters)
+        return refusal_message(cls.connection, sql, parameters)
 
     @classmethod
     def arrange(cls):
@@ -17187,7 +17204,7 @@ class OfflineToolRunTest(DatabaseCase):
             OFFLINE_OBSERVATION,
             cls.subject,
             tool_run,
-            "a claim about what the tool printed",
+            OFFLINE_CLAIM,
             cls.recon,
         )
 
@@ -17466,10 +17483,29 @@ class OfflineToolRunTest(DatabaseCase):
         # was refused twice above is accepted once the run it cites has finished
         # with its bytes stored. Rolled back, because everything else in this
         # class is measured against the state as arranged.
+        admitted: list[tuple] = []
         with contextlib.suppress(Rollback), self.connection.transaction():
             self.connection.execute("SELECT set_actor('runtime', 'selftest')")
             self.connection.execute(self.OBSERVE, self.observing(self.plan["tool_run_id"]))
+            # Read back rather than trusting the insert not to raise: an
+            # admission is a row that is there afterwards, and a trigger that
+            # dropped it silently would leave this test passing on nothing.
+            # Found by its summary, because the promotion in `propose` already
+            # filed an Observation of the same kind on this same run: the
+            # question here is whether this insert landed, not how many rows
+            # cite the run.
+            admitted.extend(
+                (str(kind), str(provenance))
+                for kind, provenance in self.connection.execute(
+                    "SELECT kind, provenance_kind FROM observations"
+                    " WHERE tool_run_id = $1::uuid AND agent_run_id = $2::uuid"
+                    "   AND summary = $3",
+                    (self.plan["tool_run_id"], self.recon, OFFLINE_CLAIM),
+                ).rows
+            )
             raise Rollback
+
+        self.assertEqual([(OFFLINE_OBSERVATION, "tool_run")], admitted)
 
     # -- the registry is the runtime's ------------------------------------------
 
@@ -18153,20 +18189,20 @@ class SourceCitationTest(DatabaseCase):
             # so this refuses an earlier run's own output as well as a stored
             # response body. Otherwise a tool could launder anything into source
             # by printing it.
-            tool_output=refused(
+            tool_output=refusal_message(
                 cls.connection, cls.OPEN, cls.opening({"source": cls.labels["printed"]})
             ),
             # The same answer a label nobody holds gets, and deliberately: two
             # answers would make the argument a way to ask what another Program
             # has.
-            foreign=refused(
+            foreign=refusal_message(
                 cls.connection, cls.OPEN, cls.opening({"source": cls.foreign_label})
             ),
-            no_hash=refused(cls.connection, cls.OPEN, cls.opening(source, hash_=None)),
-            bad_hash=refused(cls.connection, cls.OPEN, cls.opening(source, hash_="not a hash")),
+            no_hash=refusal_message(cls.connection, cls.OPEN, cls.opening(source, hash_=None)),
+            bad_hash=refusal_message(cls.connection, cls.OPEN, cls.opening(source, hash_="not a hash")),
             # `jq` names no analyser, so a hash supplied for it is the same
             # disagreement seen from the other side.
-            hash_without_analyser=refused(
+            hash_without_analyser=refusal_message(
                 cls.connection,
                 cls.OPEN,
                 (
@@ -18200,17 +18236,17 @@ class SourceCitationTest(DatabaseCase):
         )
         row = (cls.identifiers["main"], open_run["tool_run_id"])
         cls.refusals.update(
-            label_disagrees_with_bytes=refused(
+            label_disagrees_with_bytes=refusal_message(
                 cls.connection,
                 cls.INPUT,
                 (*row, "source", cls.labels["bundle"], artifact.digest(SOURCE_ORIGINAL), "source"),
             ),
-            label_disagrees_with_kind=refused(
+            label_disagrees_with_kind=refusal_message(
                 cls.connection,
                 cls.INPUT,
                 (*row, "source", cls.labels["printed"], artifact.digest(cls.PRINTED), "source"),
             ),
-            undeclared_argument=refused(
+            undeclared_argument=refusal_message(
                 cls.connection,
                 cls.INPUT,
                 (*row, "map", cls.labels["bundle"], artifact.digest(SOURCE_BUNDLE), "source"),
@@ -18221,7 +18257,7 @@ class SourceCitationTest(DatabaseCase):
             "SELECT close_offline_tool_run($1::uuid, 'error', 1, $2)",
             (open_run["tool_run_id"], "closed by the case that opened it"),
         )
-        cls.refusals["after_the_run_closed"] = refused(
+        cls.refusals["after_the_run_closed"] = refusal_message(
             cls.connection,
             cls.INPUT,
             (*row, "source", cls.labels["original"], artifact.digest(SOURCE_ORIGINAL), "source"),
@@ -18246,7 +18282,7 @@ class SourceCitationTest(DatabaseCase):
             committed(cls.connection, cls.OPEN, cls.opening({"source": cls.labels["bundle"]}))
         )
         cls.file_the_answer(analysis["tool_run_id"])
-        cls.refusals["bytes_the_run_did_not_produce"] = refused(
+        cls.refusals["bytes_the_run_did_not_produce"] = refusal_message(
             cls.connection,
             cls.PATH,
             (
@@ -18261,7 +18297,7 @@ class SourceCitationTest(DatabaseCase):
             "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
             (analysis["tool_run_id"],),
         )
-        cls.refusals["named_after_the_run_closed"] = refused(
+        cls.refusals["named_after_the_run_closed"] = refusal_message(
             cls.connection,
             cls.PATH,
             (cls.identifiers["main"], analysis["tool_run_id"], answer, "/api/v1/login"),
@@ -18285,7 +18321,7 @@ class SourceCitationTest(DatabaseCase):
             )
         )
         cls.file_the_answer(query["tool_run_id"])
-        cls.refusals["not_an_analyser"] = refused(
+        cls.refusals["not_an_analyser"] = refusal_message(
             cls.connection,
             cls.PATH,
             (cls.identifiers["main"], query["tool_run_id"], answer, "/api/v1/login"),
@@ -19168,7 +19204,7 @@ class BrowserMissionTest(DatabaseCase):
 
     @classmethod
     def refuse(cls, sql: str, parameters: tuple = ()) -> str:
-        return refused(cls.connection, sql, parameters)
+        return refusal_message(cls.connection, sql, parameters)
 
     @classmethod
     def opening(cls, steps, *, run: str | None = None, slot: str | None = None) -> tuple:

@@ -265,7 +265,8 @@ class Target(BaseHTTPRequestHandler):
         """
         return "Thu, 01 Jan 2026 00:00:00 GMT"
 
-    def do_GET(self) -> None:
+    def record(self) -> None:
+        """What this target saw, in the one shape every suite reads it back in."""
         self.server.seen.append(
             (
                 self.command,
@@ -273,6 +274,9 @@ class Target(BaseHTTPRequestHandler):
                 [(name.lower(), value) for name, value in self.headers.items()],
             )
         )
+
+    def do_GET(self) -> None:
+        self.record()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         for name, value in self.response_headers:
@@ -306,20 +310,14 @@ class Redirecting(Target):
     answered = "/followed"
 
     def do_GET(self) -> None:
-        # The 200 half is `Target`'s, called rather than copied: what the target
-        # saw is recorded in one place, so a suite reading `seen` after a
-        # redirect is reading the same tuple as a suite reading it after a plain
-        # exchange.
+        # Both halves record through `Target.record`, called rather than copied:
+        # what the target saw is written in one place, so a suite reading `seen`
+        # after a redirect is reading the same tuple as a suite reading it after
+        # a plain exchange.
         if self.path == self.answered:
             super().do_GET()
             return
-        self.server.seen.append(
-            (
-                self.command,
-                self.path,
-                [(name.lower(), value) for name, value in self.headers.items()],
-            )
-        )
+        self.record()
         self.send_response(303)
         self.send_header("Location", self.elsewhere)
         self.send_header("Content-Length", "0")
@@ -597,6 +595,56 @@ def subscription(home: Path) -> Path:
 AGENT_IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.14-slim")
 
 
+#: What the server calls the columns of the two answers the offline suites have
+#: to spell out: `offer_slate()`'s rows and the rows the console's decision
+#: queue comes back as. Both are read by name in production --
+#: `execution._slate_entry` and `operator.queue` -- so a fake that named them
+#: differently would keep passing while a renamed column broke the caller.
+#: `RecordedColumnsTest` in the live suite asserts both against the server that
+#: has them, which is what makes these names a record of it rather than a
+#: second opinion about it.
+SLATE_COLUMNS = (
+    "ordinal", "task_label", "kind", "subject_label",
+    "priority", "factors", "entitled", "expires_at",
+)
+DECISION_QUEUE_COLUMNS = (
+    "program", "label", "question_code", "tool", "risk_class", "question",
+    "requested_at", "deadline_at", "status", "answered_by", "answer",
+)
+
+#: What every container probe starts with. Here for the reason `docker` is here:
+#: both container suites need it, and four copies of one preamble is how two of
+#: them came to use different timeouts for the same question. The timeout only
+#: bounds the answer a probe is usually asserting -- a route that is not there
+#: answers by not answering -- so it is one number, and a generous one, because
+#: a probe that timed out early under load would report an isolation that is
+#: real as an isolation that is proven.
+PROBE = """
+import json, os, socket
+
+def reaches(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+def resolves(host):
+    try:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
+
+def writable(path):
+    try:
+        open(path, 'w').close()
+        return True
+    except OSError:
+        return False
+"""
+
+
 def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     """One engine command, for the suites that arrange what `isolation` verifies.
 
@@ -700,7 +748,12 @@ def latched(slate, picks: object = FIRST) -> _launch.Choice:
     carried no label at all, and `None` for a session that calls nothing.
     """
     latch = _launch.Choice(slate)
-    wanted = (latch.offered[0] if latch.offered else None) if picks is FIRST else picks
+    if picks is FIRST and not latch.offered:
+        # Refused rather than quietly degraded: an empty slate asked for its
+        # first entry is a fixture that would stand for `picks=None`, and a test
+        # meaning "the child picked nothing" has to say so.
+        raise AssertionError("an empty slate has no first entry: pass picks=None to pick nothing")
+    wanted = latch.offered[0] if picks is FIRST else picks
     if wanted is not None:
         latch.pick({"task_label": wanted})
     return latch

@@ -142,13 +142,13 @@ def result(**overrides) -> agent.AgentRunResult:
     return agent.AgentRunResult(**fields)
 
 
-#: `offer_slate()`'s own columns, as the server names them. Spelled out because
-#: the slice reads the answer by name: a recorder that returned bare tuples
-#: would let a column order change pass every test in this file.
-SLATE_COLUMNS = (
-    "ordinal", "task_label", "kind", "subject_label",
-    "priority", "factors", "entitled", "expires_at",
-)
+#: `offer_slate()`'s own columns, as the server names them. Spelled out in
+#: `fixtures` because the slice reads the answer by name -- a recorder that
+#: returned bare tuples would let a column order change pass every test in this
+#: file -- and asserted against the server itself by `RecordedColumnsTest`,
+#: which is what stops the spelling from being a second opinion about what the
+#: function returns.
+SLATE_COLUMNS = fixtures.SLATE_COLUMNS
 
 
 def slate_row(ordinal: int) -> tuple:
@@ -341,8 +341,16 @@ class Recorder:
 
     @contextlib.contextmanager
     def transaction(self):
+        # Rolls back on any exception, because `pg.Connection.transaction` does:
+        # a recorder that committed whatever happened would let a slice that
+        # raised mid-transaction record a COMMIT it never issued, which is the
+        # one thing these tests read the call list to find out.
         self.calls.append(("BEGIN", ()))
-        yield self
+        try:
+            yield self
+        except BaseException:
+            self.calls.append(("ROLLBACK", ()))
+            raise
         self.calls.append(("COMMIT", ()))
 
     def __enter__(self):
