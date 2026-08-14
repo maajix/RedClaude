@@ -639,6 +639,11 @@ print(json.dumps({
         # its only peer, rather than onto the Agent's -- which already has one
         # peer and would refuse a second, and which the tool has no business
         # sharing. The network exists for the run and is gone afterwards.
+        #
+        # PH2-31 criterion 2 asks for the same of a browser, which is a tool on
+        # this adapter and nothing else. So the name half is probed here too,
+        # rather than only on the Agent boundary: a name that resolved would be
+        # a second egress the door never sees.
         probe = """
 import json, os, socket
 
@@ -649,12 +654,21 @@ def reaches(host, port):
     except OSError:
         return False
 
+def resolves(host):
+    try:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
+
 print(json.dumps({
     'proxy': reaches(os.environ['HTTP_PROXY'].split('//', 1)[1].split(':')[0], 18080),
     'target_ip': reaches(%r, 18081),
     'internet_tcp': reaches('1.1.1.1', 443),
+    'external_dns': resolves('example.com'),
+    'target_name': resolves(%r),
 }))
-""" % self.target_ip
+""" % (self.target_ip, self.target)
         before = docker("network", "ls", "--format", "{{.Name}}").stdout.split()
 
         answer = isolation.run_tool(
@@ -675,6 +689,8 @@ print(json.dumps({
         self.assertTrue(facts["proxy"])
         self.assertFalse(facts["target_ip"])
         self.assertFalse(facts["internet_tcp"])
+        self.assertFalse(facts["external_dns"])
+        self.assertFalse(facts["target_name"])
         self.assertEqual(
             before, docker("network", "ls", "--format", "{{.Name}}").stdout.split()
         )

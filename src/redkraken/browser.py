@@ -45,11 +45,9 @@ from redkraken.store import Store
 
 __all__ = [
     "COMMAND",
-    "DRIVER",
     "FACTS",
     "IMAGE_VARIABLE",
     "RUN",
-    "artifact_names",
     "image_from_environment",
     "run",
 ]
@@ -114,11 +112,13 @@ ARTIFACT_FILES = {
     "probe": "probe-{ordinal}.json",
 }
 
-#: The class a navigation is recorded as when the door filed no Receipt for it.
-#: Not an omission and not a guess: no Receipt means nothing was let through, and
-#: `denied` is the word the scope compiler itself uses for a destination no rule
-#: covers.
-UNCLASSIFIED = "denied"
+#: The class a navigation is recorded as when the door filed no Receipt naming
+#: its destination. Its own word rather than the scope compiler's `denied`: the
+#: door writes a Receipt for a refusal too, so a navigation it refused already
+#: reads `denied`, and reusing that word here would make "the door turned this
+#: down" and "nothing here matched a Receipt" the same answer. They are not the
+#: same, and only one of them is a statement about the target.
+UNCLASSIFIED = "unrecorded"
 
 #: How much scratch a browser needs. Chromium is told to put its shared memory in
 #: TMPDIR by `--disable-dev-shm-usage`, and the few megabytes a command-line tool
@@ -228,14 +228,14 @@ def run(
             return _abandon(
                 ledger, answers, connection, plan,
                 f"the risk gate refused this mission: {_said(error)}",
-                name="capability", source="risk_gate",
+                name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
             )
         capability = gate.get("capability")
         if not capability:
             return _abandon(
                 ledger, answers, connection, plan,
                 f"the risk gate answered {gate.get('decision')} rather than allow",
-                name="capability", source="risk_gate",
+                name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
             )
         ledger.hold("capability", f"the risk gate allowed {plan['tool_run']}")
 
@@ -245,7 +245,7 @@ def run(
         except isolation.Unavailable as error:
             return _abandon(
                 ledger, answers, connection, plan, str(error),
-                name="run", source=f"environment:{IMAGE_VARIABLE}",
+                name="run", code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}",
             )
         except BaseException as error:
             _closing(connection, plan, f"the supervisor could not run the browser: {error!r}")
@@ -272,7 +272,7 @@ def run(
             return _abandon(
                 ledger, answers, connection, plan,
                 f"what the browser reported was refused: {_said(error)}",
-                name="outcome", source="browser_run",
+                name="outcome", code=INVALID_CONFIGURATION, source="browser_run",
             )
         except BaseException as error:
             _closing(connection, plan, f"the output could not be filed: {error!r}")
@@ -494,7 +494,18 @@ def _keep_stream(
     declared: Mapping[str, object],
     captured: isolation.Captured,
 ) -> dict:
-    """File one artifact and link it to the step that produced it."""
+    """File one artifact and link it to the step that produced it.
+
+    Two accounts of how big the evidence was, and the larger wins. The supervisor
+    measures the file that came out of the container, and the driver measures
+    what it had before it clipped it to the bound -- and a driver that clips
+    writes a whole file, so the supervisor alone would record every truncation as
+    a complete document. Neither is preferred outright: the supervisor's is the
+    one a container cannot understate, and the driver's is the only one that
+    exists once the clip has happened, so a mission is truncated if either says
+    so and as large as the larger of them says.
+    """
+    produced = max(captured.produced, int(declared["produced_bytes"]))
     record = artifact.filed(connection, keep, program_id, captured.data, kind="tool_output")
     connection.execute(
         LINK,
@@ -505,8 +516,8 @@ def _keep_stream(
             declared["output_name"],
             declared["ordinal"],
             record["sha256"],
-            captured.produced,
-            captured.truncated,
+            produced,
+            captured.truncated or bool(declared["truncated"]),
         ),
     )
     return {
@@ -516,8 +527,8 @@ def _keep_stream(
         "label": record["label"],
         "sha256": record["sha256"],
         "byte_size": record["byte_size"],
-        "produced_bytes": captured.produced,
-        "truncated": captured.truncated,
+        "produced_bytes": produced,
+        "truncated": captured.truncated or bool(declared["truncated"]),
     }
 
 
@@ -529,6 +540,7 @@ def _abandon(
     detail: str,
     *,
     name: str,
+    code: str,
     source: str,
 ) -> Report:
     """Close a mission that cannot go on, and say why.
@@ -539,7 +551,7 @@ def _abandon(
     """
     _closing(connection, plan, detail)
     answers.tool_run.update(status="error", detail=detail)
-    ledger.fail(name, detail, code=INVALID_CONFIGURATION, source=source)
+    ledger.fail(name, detail, code=code, source=source)
     return _report(ledger, answers)
 
 

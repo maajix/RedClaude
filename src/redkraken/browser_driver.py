@@ -105,8 +105,9 @@ CONSOLE = "console"
 
 #: The chromium flags this harness has proven, and the reason for each.
 FLAGS = (
-    # No setuid sandbox: the container is the sandbox, and the two together need
-    # a capability set this container drops.
+    # No setuid sandbox of Chromium's own: the Agent boundary is what confines
+    # this process, and the two together need a capability set this container
+    # drops.
     "--no-sandbox",
     "--disable-gpu",
     # Send shared memory to TMPDIR instead of /dev/shm, which a hardened

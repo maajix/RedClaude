@@ -491,11 +491,11 @@ INSERT INTO event_table_exempt (table_name, exempt_kind, reason, owner_ticket) V
      'the extension of a Tool run, written with it; the opening and the closing '
      'are tool_run.proposed and tool_run.settled', '31'),
     ('browser_steps', 'bookkeeping',
-     'the plan of a mission whose opening is a tool_run.proposed carrying its '
-     'plan digest', '31'),
+     'the compiled plan of a mission, written in the transaction that opens it '
+     'and never afterwards; check_browser_runs holds it against its digest', '31'),
     ('browser_step_results', 'bookkeeping',
-     'the outcomes of a mission whose closing is a tool_run.settled carrying '
-     'its result digest', '31');
+     'the outcomes of a mission, written in the transaction that closes it and '
+     'never afterwards; check_browser_runs holds them against its digest', '31');
 
 SELECT attach_event_triggers();
 
@@ -723,6 +723,41 @@ COMMENT ON FUNCTION rk2_browser_outcome_word(jsonb) IS
     'characters. Criterion 5 excludes timestamps, nonces, generated identifiers '
     'and screenshot bytes, and none of them can be written in this.';
 
+-- The one name a browser mission's Tool run goes by. A function rather than
+-- three string literals: `open_browser_run` writes it, and `authorize_egress_request`
+-- reads it twice to decide what a request off this capability may be, so a
+-- typo in any one of them would be a mission whose requests are judged by the
+-- rules for something else.
+CREATE FUNCTION rk2_browser_tool() RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$ SELECT 'mcp__rk2__browse'::text; $fn$;
+
+COMMENT ON FUNCTION rk2_browser_tool() IS
+    'The `tool_runs.tool` value a browser mission is opened under, in one '
+    'place. Ticket 31.';
+
+-- One line of either digest. Both this file's digests are a step's ordinal, its
+-- action and a set of named values in key order, and they differ only in which
+-- values: the plan digests the arguments a step was given and the result digests
+-- the outcome it reported. Written once so they cannot drift -- a change to the
+-- separators or the ordering in one and not the other would leave two digests
+-- that look comparable and are not.
+CREATE FUNCTION rk2_browser_digest_line(
+        p_ordinal integer, p_action text, p_values jsonb, p_keys text[])
+RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT p_ordinal || ' ' || p_action || ' ' ||
+           coalesce((SELECT string_agg(k || '=' || (p_values ->> k), ',' ORDER BY k)
+                       FROM unnest(p_keys) AS k), '');
+$fn$;
+
+COMMENT ON FUNCTION rk2_browser_digest_line(integer, text, jsonb, text[]) IS
+    'One line of a browser mission''s digest: the ordinal, the action, and the '
+    'named values in key order. The plan digest passes a step''s arguments and '
+    'their own keys; the result digest passes the outcome and the action''s '
+    'declared outcome keys. A key with no value contributes nothing to the '
+    'line, the way string_agg skips a NULL, so an optional argument that was '
+    'not given reads the same as one that does not exist.';
+
 CREATE FUNCTION open_browser_run(
         p_agent_run_id  uuid,
         p_steps         jsonb,
@@ -808,6 +843,10 @@ BEGIN
 
     FOR v_step IN SELECT * FROM jsonb_array_elements(p_steps) LOOP
         v_ordinal := v_ordinal + 1;
+        -- Cleared per step rather than left to the argument loop below to
+        -- overwrite: a step that names no probe must not inherit the last one
+        -- that did, and the resolution at the end of this loop reads it.
+        v_probe := NULL;
         IF jsonb_typeof(v_step) <> 'object' THEN
             RAISE EXCEPTION 'step % is not an object', v_ordinal USING ERRCODE = '22023';
         END IF;
@@ -911,27 +950,26 @@ BEGIN
         END IF;
 
         v_lines := array_append(v_lines,
-            v_ordinal || ' ' || v_action.action || ' ' ||
-            coalesce((SELECT string_agg(k || '=' || (v_args ->> k), ',' ORDER BY k)
-                        FROM jsonb_object_keys(v_args) k), ''));
+            rk2_browser_digest_line(v_ordinal, v_action.action, v_args,
+                                    ARRAY(SELECT jsonb_object_keys(v_args))));
 
         -- The resolved step, which is what the driver performs. A `probe` or an
         -- `inject` carries the registry's own source and payload, so the driver
-        -- has nothing to look up and no name of its own to resolve.
+        -- has nothing to look up and no name of its own to resolve. Read off
+        -- `v_probe`, which the argument loop above already fetched and which the
+        -- same loop refused if it named nothing: asking again here would be a
+        -- second read of one row that could answer differently.
         v_plan := v_plan || jsonb_build_object(
             'ordinal', v_ordinal,
             'action', v_action.action,
             'arguments', v_args,
             'outcome_keys', to_jsonb(v_action.outcome_keys),
             'javascript', CASE WHEN v_action.action = 'probe'
-                               THEN (SELECT b.javascript FROM browser_probes b
-                                      WHERE b.probe = v_args ->> 'probe') END,
+                               THEN v_probe.javascript END,
             'payload', CASE WHEN v_action.action = 'inject'
-                            THEN (SELECT b.payload FROM browser_probes b
-                                   WHERE b.probe = v_args ->> 'probe') END,
+                            THEN v_probe.payload END,
             'verdicts', CASE WHEN v_action.action = 'probe'
-                             THEN (SELECT to_jsonb(b.verdicts) FROM browser_probes b
-                                    WHERE b.probe = v_args ->> 'probe') END);
+                             THEN to_jsonb(v_probe.verdicts) END);
     END LOOP;
 
     -- The rows, and nothing has started. `args` is what was asked for and is
@@ -941,7 +979,7 @@ BEGIN
     INSERT INTO tool_runs
         (program_id, agent_run_id, task_id, tool, args, status, transport)
     VALUES
-        (p, v_run.id, v_run.task_id, 'mcp__rk2__browse',
+        (p, v_run.id, v_run.task_id, rk2_browser_tool(),
          jsonb_build_object('identity_slot', p_identity_slot,
                             'methods', to_jsonb(v_methods),
                             'steps', jsonb_array_length(p_steps)),
@@ -1070,9 +1108,8 @@ CREATE FUNCTION browser_run_digest(p_tool_run_id uuid) RETURNS text
 LANGUAGE sql STABLE AS $fn$
     SELECT encode(digest(string_agg(l.line, E'\n' ORDER BY l.ordinal), 'sha256'), 'hex')
       FROM (SELECT r.ordinal,
-                   r.ordinal || ' ' || s.action || ' ' ||
-                   coalesce((SELECT string_agg(k || '=' || (r.outcome ->> k), ',' ORDER BY k)
-                               FROM unnest(a.outcome_keys) AS k), '') AS line
+                   rk2_browser_digest_line(r.ordinal, s.action, r.outcome,
+                                           a.outcome_keys) AS line
               FROM browser_step_results r
               JOIN browser_steps s
                 ON s.tool_run_id = r.tool_run_id AND s.ordinal = r.ordinal
@@ -1274,13 +1311,13 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
     IF v_method <> 'CONNECT'
-       AND v_tool IN ('mcp__rk2__net_request', 'mcp__rk2__browse')
+       AND v_tool IN ('mcp__rk2__net_request', rk2_browser_tool())
        AND coalesce(p_identity, '') IS DISTINCT FROM
            coalesce(v_args ->> 'identity_slot', '') THEN
         RAISE EXCEPTION 'egress identity does not match authorized tool run'
             USING ERRCODE = '23514';
     END IF;
-    IF v_tool = 'mcp__rk2__browse' THEN
+    IF v_tool = rk2_browser_tool() THEN
         -- CONNECT is exempt for ticket 10's reason: no tunnel is opened at all,
         -- so there is no request for a declared method to describe.
         IF v_method <> 'CONNECT'

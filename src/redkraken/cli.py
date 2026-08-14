@@ -1459,9 +1459,10 @@ def _browser_run(arguments: argparse.Namespace) -> int:
             code=INVALID_CONFIGURATION,
             source=f"environment:{missing[0]}",
         )
-    if runtime is None or root is None or image is None or authority is None:
-        return _render(report(browser.RUN, ledger))
-    if steps is None or door is None:
+    if (
+        runtime is None or root is None or image is None
+        or authority is None or steps is None or door is None
+    ):
         return _render(report(browser.RUN, ledger))
     return _render(
         _guarded(

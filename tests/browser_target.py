@@ -40,6 +40,22 @@ HOST = "app.example.com"
 PAGE = "/api/orders"
 SEARCH = "/api/search"
 
+#: The rest of what one render costs: a subresource the markup pulls, a `fetch`
+#: the script makes, and a websocket it opens. A document is not one request,
+#: and criterion 1 is about every request rather than the first one. All three
+#: are under `/api/`, so the scope in `VALID` admits them and the door is the
+#: only way any of them reaches here.
+SCRIPT = "/api/app.js"
+PING = "/api/ping"
+SOCKET = "/api/socket"
+
+#: What each render appends once its `fetch` answered and once its socket
+#: settled, numbered by render. A plan waiting for the second render's marker
+#: cannot match the first one's, which is still in the document until the
+#: browser replaces it.
+FETCHED = "fetched-%d"
+SETTLED = "socket-%d"
+
 #: What the Program declares it must send this target on every request. The
 #: twins answer nothing without it, so a mission that saw a page at all is a
 #: mission whose door opened a sealed value and put it on the wire -- and the
@@ -56,7 +72,25 @@ BODY = """<!doctype html><html><head><title>%(twin)s</title></head><body>
   <button type="submit">go</button>
 </form>
 <div id="result">%(result)s</div>
-<script>console.log("fixture ready: %(twin)s");</script>
+<script src="%(script)s"></script>
+<script>
+console.log("fixture ready: %(twin)s");
+var mark = function (id, text) {
+  var node = document.createElement("div");
+  node.id = id;
+  node.textContent = text;
+  document.body.appendChild(node);
+};
+fetch("%(ping)s").then(function (answer) { return answer.text(); })
+                 .then(function (text) { mark("%(fetched)s", text); });
+var socket = new WebSocket("%(socket)s");
+var settle = function (how) {
+  if (!document.getElementById("%(settled)s")) { mark("%(settled)s", how); }
+};
+socket.onopen = function () { settle("open"); };
+socket.onerror = function () { settle("refused"); };
+socket.onclose = function () { settle("refused"); };
+</script>
 </body></html>"""
 
 
@@ -67,13 +101,35 @@ class Twin(BaseHTTPRequestHandler):
     twin = "secure"
     expected = ""
 
-    def render(self, result: str, status: int = 200) -> None:
-        body = (BODY % {"twin": self.twin, "action": SEARCH, "result": result}).encode()
+    def answer(self, body: bytes, kind: str, status: int = 200) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(body)))
+        # Nothing here is cacheable. A second render that reused a cached
+        # subresource would make one request where the first made two, and
+        # criterion 1 counts requests against Receipts.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def render(self, result: str, status: int = 200) -> None:
+        # The GET render and the POST render number their markers apart, so a
+        # plan can wait for the second without matching the first.
+        generation = 2 if self.command == "POST" else 1
+        body = (
+            BODY
+            % {
+                "twin": self.twin,
+                "action": SEARCH,
+                "result": result,
+                "script": SCRIPT,
+                "ping": PING,
+                "socket": f"wss://{HOST}{SOCKET}",
+                "fetched": FETCHED % generation,
+                "settled": SETTLED % generation,
+            }
+        ).encode()
+        self.answer(body, "text/html; charset=utf-8", status)
 
     def identified(self) -> bool:
         """Whether the door put this Program's required header on the wire.
@@ -92,6 +148,18 @@ class Twin(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self.identified():
             return self.refuse()
+        if self.path == SCRIPT:
+            return self.answer(b'console.log("subresource ready");\n', "text/javascript")
+        if self.path == PING:
+            return self.answer(b"pong", "text/plain; charset=utf-8")
+        if self.path == SOCKET:
+            # Answered as the ordinary request it arrives as. The door drops the
+            # upgrade header, so what reaches here is a GET and what the page
+            # gets back is a handshake that failed -- deliberately, because a
+            # websocket the door could not read would be bytes leaving another
+            # way. The initiation is what criterion 1 is about, and it is a
+            # Receipt either way.
+            return self.answer(b"no upgrade here", "text/plain; charset=utf-8")
         self.render("nothing yet")
 
     def do_POST(self) -> None:

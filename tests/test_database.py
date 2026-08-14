@@ -16999,6 +16999,15 @@ class OfflineToolRunTest(DatabaseCase):
         )
         committed(cls.connection, cls.LINK + " RETURNING id", cls.linking())
 
+        # PH2-31 replaced this table's key and so changed what an offline run
+        # may keep. Under 30's `(tool_run_id, stream, output_name)` a second
+        # `stdout` row was a distinct row, because `output_name` is NULL there
+        # and NULLs never equal each other -- one run could hold two
+        # contradictory records of what one process printed, with nothing to say
+        # which of them an Observation stood on. The row here is the one already
+        # linked above, which is exactly the row the old key admitted twice.
+        cls.refusals["stdout_twice"] = cls.refuse(cls.LINK, cls.linking())
+
     # -- criterion 5: an Observation stands on stored output -------------------
 
     OBSERVE = (
@@ -17229,6 +17238,7 @@ class OfflineToolRunTest(DatabaseCase):
 
     def test_output_bytes_this_program_does_not_hold_are_refused(self):
         self.assertIn("is not held by this Program", self.refusals["artifact_not_held"])
+        self.assertIn("tool_run_artifacts_stream_key", self.refusals["stdout_twice"])
 
     def test_a_truncation_flag_that_disagrees_with_the_bytes_is_refused(self):
         self.assertIn("truncation flag disagrees", self.refusals["truncation_disagrees"])
@@ -17817,11 +17827,13 @@ class BrowserMissionTest(DatabaseCase):
         cls.refusals = {}
         cls.refuse_before_the_row_exists()
         cls.open_the_mission()
+        cls.open_with_the_identity_it_holds()
         cls.record_the_outcomes()
         cls.keep_what_it_saw()
         cls.close_the_mission()
         cls.walk_it_again_as_the_other_twin()
         cls.leave_one_unfinished()
+        cls.reconcile_two_accounts_of_one_capture()
         cls.refuse_after_the_close()
         cls.problems = cls.connection.execute("SELECT * FROM check_browser_runs()").rows
 
@@ -18000,6 +18012,51 @@ class BrowserMissionTest(DatabaseCase):
             cls.opening([{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE}}]),
         )
 
+    @classmethod
+    def open_with_the_identity_it_holds(cls):
+        """The other side of `unheld_identity`: the slot a mission does hold.
+
+        The same slot, which is the Program's own -- `VALID` declares `member`
+        and the Program has held it since it opened. What the refusal above was
+        about is therefore the lease and nothing else, and so is this.
+
+        The lease is taken by the run that opens the mission rather than by any
+        run of this Program, because `holder_agent_run_id` is what
+        `open_browser_run` matches on -- a lease somebody else holds is one this
+        mission may not spend, and a fixture that leased it to a different run
+        would pass the refusal test and prove nothing about this one.
+
+        What the slot then does is the door's business, so what is recorded here
+        is what the door reads: the name in `tool_runs.args`, which is where
+        `resolve_egress_identity` looks, and the plan digest, which covers the
+        slot so that the same steps under a different Identity are a different
+        mission.
+        """
+        entity = str(
+            cls.connection.execute(
+                "SELECT entity_id FROM identities"
+                " WHERE program_id = $1::uuid AND slot_name = 'member'",
+                (cls.program_id,),
+            ).scalar()
+        )
+        run = cls.mission_run()
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute(
+                "INSERT INTO identity_leases (program_id, identity_entity_id,"
+                "                             holder_agent_run_id, expires_at)"
+                " VALUES ($1::uuid, $2::uuid, $3::uuid, now() + interval '10 minutes')",
+                (cls.program_id, entity, run),
+            )
+        cls.borrowed = cls.called(cls.OPEN, cls.opening(BROWSER_PLAN, run=run, slot="member"))
+        cls.borrowed_slot = str(
+            cls.connection.execute(
+                "SELECT args ->> 'identity_slot' FROM tool_runs WHERE id = $1::uuid",
+                (cls.borrowed["tool_run_id"],),
+            ).scalar()
+        )
+
     # -- criterion 5: what a step may report -----------------------------------
 
     @classmethod
@@ -18168,6 +18225,52 @@ class BrowserMissionTest(DatabaseCase):
         )
 
     @classmethod
+    def reconcile_two_accounts_of_one_capture(cls):
+        """What the runtime does with the driver's size and the supervisor's.
+
+        A mission that clipped a capture to its ceiling writes a whole file, so
+        the supervisor -- which measures the file that came out of the container
+        -- sees nothing missing, and only the driver knows there was more. The
+        other way round, the driver wrote everything it had and the output bound
+        cut it on the way out, so only the supervisor knows. Neither account is
+        preferred: the row takes the larger size and is truncated if either says
+        so, and both directions are arranged here because each reads as a
+        complete capture when the other one is the one that clipped.
+
+        The run is closed as an error, which is what a mission that kept
+        something and did not finish its plan is. `leave_one_unfinished` is
+        where that close is under test; what is under test here is the two rows.
+        """
+        keep = Store(scratch())
+        run = cls.called(cls.OPEN, cls.opening(BROWSER_PLAN))
+        cls.reconciled = {}
+        for who, stream, ordinal, captured, declared in (
+            ("driver", "dom", 6, isolation.Captured(data=BROWSER_DOM, produced=len(BROWSER_DOM)),
+             {"produced_bytes": 4096, "truncated": True}),
+            ("supervisor", "screenshot", 7, isolation.Captured(data=BROWSER_SHOT, produced=4096),
+             {"produced_bytes": len(BROWSER_SHOT), "truncated": False}),
+        ):
+            with cls.connection.transaction():
+                cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                cls.reconciled[who] = browser._keep_stream(
+                    cls.connection,
+                    keep,
+                    cls.program_id,
+                    {"tool_run_id": run["tool_run_id"]},
+                    {"stream": stream, "output_name": None, "ordinal": ordinal, **declared},
+                    captured,
+                )
+        cls.reconciled_rows = [
+            (str(stream), int(size), bool(cut))
+            for stream, size, cut in cls.connection.execute(
+                "SELECT stream, produced_bytes, truncated FROM tool_run_artifacts"
+                " WHERE tool_run_id = $1::uuid ORDER BY stream",
+                (run["tool_run_id"],),
+            ).rows
+        ]
+        cls.called(cls.CLOSE, (run["tool_run_id"], "error", "it kept two captures and stopped"))
+
+    @classmethod
     def refuse_after_the_close(cls):
         cls.refusals.update(
             closed_twice=cls.refuse(cls.CLOSE, (cls.tool_run, "success", None)),
@@ -18228,6 +18331,17 @@ class BrowserMissionTest(DatabaseCase):
 
     def test_an_identity_the_program_does_not_hold_never_reaches_the_door(self):
         self.assertIn("Identity lease refused", self.refusals["unheld_identity"])
+
+    def test_an_identity_the_run_does_hold_is_named_where_the_door_reads_it(self):
+        # The same plan, opened once with a slot and once without. The name is
+        # in `args` because that is the only place the door looks, and the two
+        # digests differ because the slot is inside the plan: one mission that
+        # arrived as somebody and one that arrived as nobody walked the same
+        # steps, and a digest that could not tell them apart would let a replay
+        # answer for a session it never had.
+        self.assertEqual("member", self.borrowed_slot)
+        self.assertNotEqual(self.plan["plan_sha256"], self.borrowed["plan_sha256"])
+        self.assertEqual(self.plan["methods"], self.borrowed["methods"])
 
     def test_the_mission_is_a_row_before_the_browser_starts(self):
         tool_name, status, slot, methods, steps, started, open_still = self.opened
@@ -18293,7 +18407,23 @@ class BrowserMissionTest(DatabaseCase):
         self.assertIn(
             "does not run the probe", self.refusals["probe_on_a_step_that_does_not_run_it"]
         )
-        self.assertTrue(self.refusals["console_twice"])
+        # The same key the offline half is held to, which is the point of
+        # having replaced it: a console is the mission's and has neither a name
+        # nor an ordinal, so under 30's key a second one was a distinct row.
+        self.assertIn("tool_run_artifacts_stream_key", self.refusals["console_twice"])
+
+    def test_a_capture_is_as_large_as_either_account_says_and_truncated_by_either(self):
+        # The driver clipped in one row and the supervisor clipped in the other,
+        # and each wrote the account the other cannot see. Both rows record the
+        # same thing, because a capture is a prefix of something longer whichever
+        # of the two did the clipping -- and a row that took only one account
+        # would file half a document as a whole one.
+        self.assertEqual(
+            [("dom", 4096, True), ("screenshot", 4096, True)], self.reconciled_rows
+        )
+        for who, answer in self.reconciled.items():
+            with self.subTest(who):
+                self.assertEqual((4096, True), (answer["produced_bytes"], answer["truncated"]))
 
     def test_every_artifact_is_attributable_to_the_step_that_produced_it(self):
         kept = [
@@ -18400,12 +18530,23 @@ BROWSER_REASON = (
 #: the database case walks, because the selectors it names are the selectors the
 #: fixture serves: one plan, one page, and the only thing left to differ is what
 #: the page did with what was typed into it.
+#: Each render's marker for its `fetch` and for its websocket, waited for so
+#: that a render's whole request set has happened before the plan moves on.
+#: Without them a capture could land while a subresource was still in flight,
+#: and how many requests the mission made would be a matter of timing.
+BROWSER_FETCHED = "div#" + browser_target.FETCHED
+BROWSER_SETTLED = "div#" + browser_target.SETTLED
+
 BROWSER_MISSION = (
     {"action": "navigate", "arguments": {"url": f"https://{browser_target.HOST}{browser_target.PAGE}"}},
     {"action": "wait_for", "arguments": {"selector": "form#login"}},
+    {"action": "wait_for", "arguments": {"selector": BROWSER_FETCHED % 1}},
+    {"action": "wait_for", "arguments": {"selector": BROWSER_SETTLED % 1}},
     {"action": "inject", "arguments": {"selector": "input[name=q]", "probe": "markup_injection"}},
     {"action": "click", "arguments": {"selector": "button[type=submit]"}},
     {"action": "wait_for", "arguments": {"selector": "div#result"}},
+    {"action": "wait_for", "arguments": {"selector": BROWSER_FETCHED % 2}},
+    {"action": "wait_for", "arguments": {"selector": BROWSER_SETTLED % 2}},
     {"action": "probe", "arguments": {"probe": "markup_injection"}},
     {"action": "capture_dom", "arguments": {}},
     {"action": "screenshot", "arguments": {}},
@@ -18763,6 +18904,42 @@ class BrowserCommandTest(DatabaseCase):
                 self.assertEqual(receipted[0][0], receipted[0][1])
                 self.assertEqual("2", receipted[0][2])
 
+    def test_the_subresources_the_fetch_and_the_socket_are_receipts_too(self):
+        """Criterion 1 names more than the navigation.
+
+        The page pulls a script, calls `fetch` and opens a websocket, and each
+        of the two renders does all three. Every one is a Receipt the door
+        wrote, which is the whole of the criterion: the container has no second
+        way out, so a request with no Receipt behind it did not happen.
+
+        The websocket is an initiation and stays one. The door drops the upgrade
+        header, so the handshake reaches the twin as an ordinary GET and comes
+        back as an ordinary answer, and the page settles it as refused -- which
+        is what the marker in the document it kept says.
+        """
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                seen = self.rows(
+                    "SELECT r.path, count(*)::text FROM receipts r"
+                    "  JOIN tool_runs t ON t.id = r.tool_run_id"
+                    " WHERE t.label = $1 GROUP BY r.path",
+                    twin,
+                )
+
+                self.assertEqual(
+                    [
+                        (browser_target.SCRIPT, "2"),
+                        (browser_target.PAGE, "1"),
+                        (browser_target.PING, "2"),
+                        (browser_target.SEARCH, "1"),
+                        (browser_target.SOCKET, "2"),
+                    ],
+                    sorted(seen),
+                )
+                kept = self.document(twin)
+                self.assertIn('<div id="fetched-2">pong</div>', kept)
+                self.assertIn('<div id="socket-2">refused</div>', kept)
+
     def test_the_receipts_name_the_target_and_the_scope_that_admitted_it(self):
         for twin in self.missions:
             with self.subTest(twin=twin):
@@ -18814,9 +18991,9 @@ class BrowserCommandTest(DatabaseCase):
                         # The console belongs to the mission rather than to a
                         # step, which is why it is the one row with no ordinal.
                         ("console", "", "true", "false", "true"),
-                        ("dom", "7", "true", "false", "true"),
-                        ("probe", "6", "true", "false", "true"),
-                        ("screenshot", "8", "true", "false", "true"),
+                        ("dom", "11", "true", "false", "true"),
+                        ("probe", "10", "true", "false", "true"),
+                        ("screenshot", "12", "true", "false", "true"),
                     ],
                     kept,
                 )
@@ -18846,7 +19023,7 @@ class BrowserCommandTest(DatabaseCase):
                     twin,
                 )
 
-                self.assertEqual(("4", "2"), (artifacts, receipts))
+                self.assertEqual(("4", "8"), (artifacts, receipts))
                 # One run per mission and two missions, so nothing this Program
                 # holds was attached to a run neither of them opened.
                 self.assertEqual("2", runs)
@@ -18911,6 +19088,13 @@ class BrowserCommandTest(DatabaseCase):
 
     # -- criterion 6: the twins differ, and the difference is the behaviour -----
 
+    def test_every_path_reports_the_same_keys(self):
+        # The same promise `rk tool run` makes: a caller parses one document
+        # whether the mission ran, was refused, or died holding a container.
+        for twin, answer in self.missions.items():
+            with self.subTest(twin=twin):
+                self.assertEqual(set(browser.FACTS), set(answer.facts))
+
     def test_two_twins_walking_one_plan_agree_on_the_plan(self):
         self.assertEqual(
             self.facts("secure")["plan_sha256"], self.facts("vulnerable")["plan_sha256"]
@@ -18931,7 +19115,7 @@ class BrowserCommandTest(DatabaseCase):
             twin: self.rows(
                 "SELECT r.outcome ->> 'verdict' FROM browser_step_results r"
                 "  JOIN tool_runs t ON t.id = r.tool_run_id"
-                " WHERE t.label = $1 AND r.ordinal = 6",
+                " WHERE t.label = $1 AND r.ordinal = 10",
                 twin,
             )[0][0]
             for twin in self.missions
