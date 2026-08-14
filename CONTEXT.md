@@ -305,6 +305,36 @@ rendered, so the same plan against two targets that behave differently returns
 different verdicts. A verdict outside the declared set is refused.
 _Avoid_: Check, detector, payload, test case
 
+**Analyser**:
+A program this harness ships and mounts into an offline tool's container, named
+by the registry row and hashed by the runtime, whose hash the Tool run records.
+It is what makes an analysis reproducible without a second build: what ran is
+named exactly, and a registry row and a runtime that disagree about whether
+there is one open no run at all. One analyser answers several questions — the
+tool's own name is the subcommand — so which analysis a run was is the registry
+key rather than an argument.
+_Avoid_: Script, plugin, helper, wrapper
+
+**Source Artifact**:
+An Artifact this Program holds as source: bytes an analysis may read, as
+distinct from bytes a run produced or the runtime stored. The kind is a property
+of how the Program came to hold them, so it cannot be claimed after the fact —
+an offline tool's own output is `tool_output` unless its registry row declares
+otherwise, which is what stops a tool laundering arbitrary bytes into source by
+printing them. Only a source Artifact may be an analysis argument.
+_Avoid_: Input file, JS file, asset, blob
+
+**Source citation**:
+What a proposed Entity, Observation or Hypothesis about source must carry: the
+Artifact it came from, optionally the hash it was read at, and the Tool run that
+read it. It is checked when the proposal is staged and re-asked of everything
+promoted, and it fails in five distinguishable ways — the label is not this
+Program's, the bytes are not held as source, they have changed under the
+element, the cited run never read them, or the element is grounded in a run that
+read source and does not say which. A failed citation is a dropped element, not
+a refused proposal.
+_Avoid_: Reference, provenance, attribution, link
+
 **Receipt**:
 The proxy's authoritative record of one network exchange, including the ones it
 blocked. Carries the hashes of what the agent saw and what actually crossed the

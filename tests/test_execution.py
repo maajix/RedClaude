@@ -433,6 +433,16 @@ class Recorder:
             return [("PD1",)]
         if sql == proposal.INSERT:
             return [(PROPOSAL, "PR1", proposal.STAGED)]
+        # Two writers put rows in `proposal_drops`: the staging trigger, before
+        # this side reads anything, and this side afterwards. The fake has no
+        # trigger, so the first answer is nothing and the second is whatever the
+        # runtime just wrote -- which is what `stage` reports back.
+        if sql == proposal.NEXT_DROP:
+            return [(0,)]
+        if sql == proposal.DROPS:
+            # The last four of the six: the ordinal this side chose, and the
+            # three columns it wrote there.
+            return [tuple(written[2:]) for written in self.sent(proposal.INSERT_DROP)]
         if sql in (
             proxy.BIND,
             execution.BEAT_TIMEOUT,

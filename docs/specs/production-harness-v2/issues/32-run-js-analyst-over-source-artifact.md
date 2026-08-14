@@ -4,11 +4,101 @@
 
 **Blocked by:** 30 — Promote offline Tool output through an Artifact.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The JS analyst receives only reachable source Artifacts, the bounded Mission packet and its allowed offline analysis capabilities.
-- [ ] Its runtime has no target network capability, credential material or arbitrary Program read surface.
-- [ ] Source parsing, endpoint extraction and source-map recovery run through recorded Tool runs with exact tool and input hashes.
-- [ ] Proposed endpoints, parameters and hypotheses cite the source Artifact and Tool run that produced them.
-- [ ] Runtime promotion rejects conclusions citing missing, changed, foreign or non-source Artifacts.
-- [ ] A synthetic bundle with known routes and a secure decoy demonstrates grounded recall without invented endpoints.
+- [x] The JS analyst receives only reachable source Artifacts, the bounded Mission packet and its allowed offline analysis capabilities.
+- [x] Its runtime has no target network capability, credential material or arbitrary Program read surface.
+- [x] Source parsing, endpoint extraction and source-map recovery run through recorded Tool runs with exact tool and input hashes.
+- [x] Proposed endpoints, parameters and hypotheses cite the source Artifact and Tool run that produced them.
+- [x] Runtime promotion rejects conclusions citing missing, changed, foreign or non-source Artifacts.
+- [x] A synthetic bundle with known routes and a secure decoy demonstrates grounded recall without invented endpoints.
+
+## How each is met
+
+1. What the analyst may be pointed at is a column rather than a convention.
+   `offline_tool_arguments.artifact_kind` is `source` on all three tools, and
+   `open_offline_tool_run` refuses an Artifact this Program holds any other way
+   — including an earlier run's own output, which is what stops a tool
+   laundering arbitrary bytes into source by printing them. An Artifact another
+   Program holds gets the same answer a label nobody holds gets, so the argument
+   cannot be used to ask what somebody else has. The capabilities are the three
+   registry rows, granted in `offline_tool_roles` to `js_analyst` and to nothing
+   else: `recon` keeps `jq` and finds hosts, and a second role holding these
+   would be a second place a source conclusion could come from without the
+   roster having said so. The packet is 028's, unchanged. Proven in
+   `SourceCitationTest` (the two refusals and the argv) and end to end in
+   `JsAnalystCommandTest.test_an_artifact_the_runtime_stored_is_not_something_an_analysis_may_read`
+   and `test_no_role_but_the_analyst_may_ask_these_questions`.
+
+2. All three tools are `network = 'none'`, so `isolation.run_tool` gives the
+   container `--network none` and there is no adapter to reach anything with.
+   `check_source_conclusions` re-asks that of the registry rather than of a run
+   — `source_tool_has_network` fires on any tool that reads source and has
+   acquired a network, because that would be true of every run made after the
+   row changed. The read surface is the mount list: only `/input`, read only,
+   holding exactly the analyser and the Artifacts the plan resolved, plus the
+   `/work` scratch when a tool declares an output. No credential material can
+   arrive because nothing but those files is mounted and the argv is built from
+   the registry. `JsAnalystCommandTest.test_the_analysis_runs_with_no_network_and_reads_only_what_it_was_given`
+   holds the network and the whole argv, which names two paths and no third.
+
+3. The three analyses are `js_parse`, `js_routes` and `js_map`, one harness
+   analyser (`src/redkraken/jsscan.py`) asked three questions. The tool name is
+   the subcommand, so which analysis this is comes from the registry key rather
+   than from an argument. `tool_runs.program_sha256` records the hash of the
+   analyser bytes the runtime mounted, and `open_offline_tool_run` refuses a run
+   where the registry and the runtime disagree about whether there is an
+   analyser at all. `tool_run_inputs` records what the run was given — argument,
+   label, sha256 and kind — inside the same statement that opens the row and
+   before the process starts, so a run that never comes back still says which
+   bytes it was going to read. `check_source_conclusions` reports an analyser
+   run with no hash and a closed source run that recorded nothing.
+   `JsAnalystCommandTest.test_the_run_records_the_analyser_and_the_bytes_it_was_given`
+   holds both against a real container.
+
+4. `rk2_source_citation` is the one question asked in both directions: an
+   element that names a source Artifact must have named one that holds up, and
+   an element grounded in a run that read source must name which source. It runs
+   from `proposals_ground_source_citations`, an AFTER INSERT trigger on
+   `proposals`, over `new_entities`, `observations` and `hypotheses` alike.
+   Hypotheses are the reason it is a trigger: nothing promotes a Hypothesis, so
+   a check inside `promote_proposal` would never see one, and the criterion
+   names hypotheses beside endpoints and parameters. Endpoints and parameters
+   are Entities and arrive in `new_entities`, which the same walk covers.
+
+5. The refusal is a `proposal_drops` row, which is what every promotion walk
+   already skips, so the element never becomes canonical. Five reasons, five
+   different mistakes: `no_such_artifact` (missing or another Program's — one
+   answer, deliberately), `artifact_not_source`, `artifact_changed` (the element
+   named a hash and the label resolves to other bytes), `artifact_not_read` (the
+   citation holds and the cited run never read those bytes) and
+   `no_source_citation` (grounded in a run that read source and does not say
+   which). `check_source_conclusions` re-asks the whole question of everything
+   already promoted, which is how a citation that held when it was checked and
+   stopped holding afterwards becomes visible.
+   `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
+   walks seven elements alike in everything but their citation and gets one
+   promotion and six refusals, each by its own reason.
+
+6. `SOURCE_BUNDLE` in `tests/test_database.py` holds three routes something
+   requests — a template literal through `fetch`, an `axios.post` and a
+   `$.ajax` with its method in an options object — and three paths nothing does:
+   one in a comment, one assigned and never used, and one inside a regular
+   expression. `js_routes` reports the three routes with the call site that
+   grounds each, and none of the decoys: a path is a route only when it is
+   lexically an argument of a request-shaped call. `js_parse` reports the one
+   decoy that is a string literal with `requested: false` rather than dropping
+   it, because an analyst has to be able to see the decoy in order to not
+   propose it. `js_map` then recovers an original out of a source map, which is
+   filed as `source` because its `offline_tool_outputs.reference_kind` says so,
+   and `js_routes` over that recovered file finds a route the bundle does not
+   contain — which is how "this came out of the map" is told from "this was
+   already read".
+
+## Two writers, one table
+
+`proposal_drops` now has two: the trigger, at staging, and `proposal.stage`
+afterwards. The ordinal is part of the key, so `stage` reads `max(ordinal) + 1`
+before writing and reports back what the table holds rather than only what it
+wrote. `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
+pins the whole sequence, six from the trigger and the seventh from the runtime.

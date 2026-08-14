@@ -31,6 +31,15 @@ actually installed, when this command asks it. What is recorded on the run is
 what the image answered -- so `tool_runs.tool_version` is provenance rather than
 policy, and a run made before an upgrade still says what produced its bytes.
 
+Some tools are not in the image at all. A registry row may name an analyser, and
+then the executable is an interpreter and the program is a file this harness
+ships: read off this side's disk, hashed here, and mounted read only beside the
+input Artifacts, the way `browser.py` stages its driver. That keeps the analysis
+inside the repository the tests can reach while leaving the registry the thing
+that says which analyses exist -- and the hash goes on the run, so what a
+conclusion rests on is not "this tool" but these exact bytes of this exact
+program over that exact input.
+
 Nothing here mints a capability or asks the risk gate. An offline tool makes no
 request and reaches no target, so there is nothing for the gate to decide; the
 one policy that does reach it is the Halt, and `open_offline_tool_run` applies
@@ -41,6 +50,7 @@ command can reach a network at all.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -89,9 +99,17 @@ FACTS = ("program_id", "program_slug", "tool_run", "outputs")
 #: there is no quoting rule for this module to reimplement.
 REGISTERED = (
     "SELECT executable, to_json(version_argv)::text, timeout_seconds, memory_mb,"
-    "       cpu_quota, pids_limit, max_output_bytes"
+    "       cpu_quota, pids_limit, max_output_bytes, analyser,"
+    "       CASE WHEN analyser IS NOT NULL THEN rk2_offline_program_path(analyser) END"
     "  FROM rk2_offline_tool($1)"
 )
+
+#: Where a harness-shipped analyser is read from. Beside this module, because
+#: that is what it is: a tool whose program the registry names but does not
+#: hold, staged into the container the way `browser.py` stages its driver. The
+#: registry says which file, and this side says what is in it -- so a row can
+#: name a program only if the harness that reads the row also shipped it.
+PROGRAMS = Path(__file__).parent
 
 #: Which Program this connection is, for the session's lifetime. The verbs read
 #: it rather than taking a Program, so that a runtime holding one connection open
@@ -102,7 +120,7 @@ BIND = "SELECT set_config('rk2.program_id', $1, false)"
 #: Program is in the query because a label is only unique within one.
 AGENT_RUN = "SELECT id FROM agent_runs WHERE program_id = $1::uuid AND label = $2"
 
-OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb)"
+OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb, $5)"
 CLOSE = "SELECT close_offline_tool_run($1::uuid, $2, $3::integer, $4)"
 
 #: One stored stream. `produced_bytes` is what the stream reached rather than
@@ -182,7 +200,13 @@ def run(
                 "image", str(error), code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}"
             )
             return _report(ledger, answers)
-        ledger.hold("tool", f"{offline_tool} reports itself as {version}")
+        analyser = registered["analyser"]
+        ledger.hold(
+            "tool",
+            f"{offline_tool} reports itself as {version}" if analyser is None
+            else f"{offline_tool} reports itself as {version}, "
+                 f"from {analyser['path']} at {analyser['sha256']}",
+        )
 
         # Everything that decides whether this call may happen at all happens
         # here, and the row it writes is committed before the process starts.
@@ -192,7 +216,14 @@ def run(
                 plan = json.loads(
                     str(
                         connection.execute(
-                            OPEN, (run_id, offline_tool, version, json.dumps(dict(arguments)))
+                            OPEN,
+                            (
+                                run_id,
+                                offline_tool,
+                                version,
+                                json.dumps(dict(arguments)),
+                                analyser["sha256"] if analyser else None,
+                            ),
                         ).scalar()
                     )
                 )
@@ -231,7 +262,7 @@ def run(
         # the one state `check_offline_tools` cannot tell from a supervisor that
         # died, so this is the difference between a failure and a mystery.
         try:
-            answer = _perform(container, keep, plan)
+            answer = _perform(container, keep, plan, analyser)
         except (Missing, Corrupt) as error:
             return _abandon(
                 ledger, answers, connection, plan, f"an input Artifact cannot be read: {error}",
@@ -251,8 +282,8 @@ def run(
             with connection.transaction():
                 connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
                 answers.outputs = [
-                    _keep_stream(connection, keep, answers.program_id, plan, stream, name, captured)
-                    for stream, name, captured in _streams(answer, plan)
+                    _keep_stream(connection, keep, answers.program_id, plan, produced)
+                    for produced in _streams(answer, plan)
                 ]
                 closed = json.loads(
                     str(
@@ -318,12 +349,13 @@ def _report(ledger: Ledger, answers: _Answers) -> Report:
 
 def _registered(connection: pg.Connection, tool: str) -> dict:
     """The registry row for one enabled tool, or the registry's own refusal."""
-    executable, version_argv, timeout, memory, cpu, pids, output = connection.execute(
-        REGISTERED, (tool,)
-    ).rows[0]
+    (
+        executable, version_argv, timeout, memory, cpu, pids, output, analyser, program_path
+    ) = connection.execute(REGISTERED, (tool,)).rows[0]
     return {
         "executable": str(executable),
         "version_argv": [str(item) for item in json.loads(str(version_argv))],
+        "analyser": _analyser(analyser, program_path),
         "ceilings": isolation.Ceilings(
             timeout_seconds=float(timeout),
             memory_mb=int(memory),
@@ -334,22 +366,73 @@ def _registered(connection: pg.Connection, tool: str) -> dict:
     }
 
 
+def _analyser(analyser: object, program_path: object) -> dict | None:
+    """The analyser this tool's registry row names, read off this harness's disk.
+
+    A registry row can name a program but cannot hold one, so the name and the
+    bytes come from two places on purpose: the row says which analysis this
+    installation admits and the file says what it does, and a row naming a file
+    the harness does not ship is a refusal here rather than a container that
+    starts and finds nothing at the path.
+
+    The name is taken apart rather than joined: the registry's pattern already
+    admits only a bare `*.py`, and reading a path out of a table into an open
+    would make that pattern the only thing between a row and any file this
+    process can read.
+    """
+    if analyser is None:
+        return None
+    source = PROGRAMS / Path(str(analyser)).name
+    try:
+        body = source.read_bytes()
+    except OSError as error:
+        raise isolation.Unavailable(f"this harness does not ship {analyser}: {error}") from None
+    return {
+        "path": str(program_path),
+        "bytes": body,
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+
+def _staged(analyser: Mapping[str, object] | None) -> dict[str, bytes]:
+    """Where the analyser appears in the container, if this tool has one.
+
+    One place builds this mount, because the version probe and the run have to
+    agree about it: a probe that read one file and a run that read another would
+    record a version of something that never ran.
+    """
+    return {} if analyser is None else {str(analyser["path"]): analyser["bytes"]}
+
+
 def _version(container: isolation.ToolContainer, registered: Mapping[str, object]) -> str:
     """Ask the installed tool what it is, in a container with nothing in it.
 
     The registry says which versions it admits and the image says which one is
     there; neither can answer for the other, so the answer is taken from the
-    thing that will actually run. No network and no inputs: a version probe that
-    could reach anything would be a way to reach something.
+    thing that will actually run. No network, and the only input is the analyser
+    itself where there is one: a version probe that could reach anything would
+    be a way to reach something.
+
+    An analyser is asked in the same container the run will use, so what answers
+    is the same interpreter running the same bytes. That is what makes the
+    version a fact about this run rather than about this checkout -- a program
+    whose file changed between the probe and the run would have to change under
+    a hash that is recorded on the row.
 
     What comes back is one line and is not interpreted here. `open_offline_tool_run`
     holds it against the registry's pattern, which is where the decision belongs
     -- this is the half that cannot lie about what is installed.
     """
+    analyser = registered["analyser"]
     answer = isolation.run_tool(
         container,
-        (str(registered["executable"]), *registered["version_argv"]),
+        (
+            str(registered["executable"]),
+            *((str(analyser["path"]),) if analyser else ()),
+            *registered["version_argv"],
+        ),
         ceilings=registered["ceilings"],
+        inputs=_staged(analyser),
     )
     reported = answer.stdout.data.decode("utf-8", "replace").strip().splitlines()
     if answer.exit_code != 0 or not reported:
@@ -360,7 +443,10 @@ def _version(container: isolation.ToolContainer, registered: Mapping[str, object
 
 
 def _perform(
-    container: isolation.ToolContainer, keep: Store, plan: Mapping[str, object]
+    container: isolation.ToolContainer,
+    keep: Store,
+    plan: Mapping[str, object],
+    analyser: Mapping[str, object] | None,
 ) -> isolation.ToolProcess:
     """Run the plan the database produced, and nothing this module invented.
 
@@ -368,6 +454,11 @@ def _perform(
     `Store.load`'s verification is what puts them in the container: bytes that no
     longer hash to their own name never reach a tool, and the run is abandoned
     instead of being fed something that is not what the Artifact says it is.
+
+    The analyser goes in beside them and is the one input this side chooses. It
+    is mounted where the plan already says it is -- `argv` was built around that
+    path before the row was written -- and under the hash on the row, so what
+    ran and what the run claims ran are the same bytes or the run is a fault.
     """
     return isolation.run_tool(
         container,
@@ -379,10 +470,29 @@ def _perform(
             pids_limit=int(plan["pids_limit"]),
             max_output_bytes=int(plan["max_output_bytes"]),
         ),
-        inputs={item["path"]: keep.load(item["sha256"]) for item in plan["inputs"]},
+        inputs={
+            **_staged(analyser),
+            **{item["path"]: keep.load(item["sha256"]) for item in plan["inputs"]},
+        },
         outputs=[item["name"] for item in plan["outputs"]],
         network=str(plan["network"]),
     )
+
+
+@dataclass(frozen=True)
+class _Stream:
+    """One thing a run produced, and what holding on to it means.
+
+    `kind` is the whole of why this is a record rather than three values: what
+    an Artifact is held as decides what a later run may be pointed at, so it
+    travels with the bytes from the registry row that declared it to the row
+    that files it, and never gets decided in between.
+    """
+
+    stream: str
+    name: str | None
+    kind: str
+    captured: isolation.Captured
 
 
 def _streams(answer: isolation.ToolProcess, plan: Mapping[str, object]):
@@ -391,14 +501,17 @@ def _streams(answer: isolation.ToolProcess, plan: Mapping[str, object]):
     Stdout and stderr are always kept, empty or not. An empty stream is a fact
     about the run -- it is how "printed nothing" is told from "nobody looked" --
     and it is what lets a run that failed silently still close with its output
-    recorded rather than as a success that stored nothing.
+    recorded rather than as a success that stored nothing. Both are what the
+    tool said about itself, so both are held as tool output whatever the tool
+    is; only a declared output can be held as anything else, and only as the
+    kind its registry row names.
     """
-    yield "stdout", None, answer.stdout
-    yield "stderr", None, answer.stderr
+    yield _Stream("stdout", None, "tool_output", answer.stdout)
+    yield _Stream("stderr", None, "tool_output", answer.stderr)
     for declared in plan["outputs"]:
         found = answer.outputs.get(declared["name"])
         if found is not None:
-            yield "output", declared["name"], found
+            yield _Stream("output", str(declared["name"]), str(declared["kind"]), found)
 
 
 def _keep_stream(
@@ -406,12 +519,11 @@ def _keep_stream(
     keep: Store,
     program_id: str,
     plan: Mapping[str, object],
-    stream: str,
-    name: str | None,
-    captured: isolation.Captured,
+    produced: _Stream,
 ) -> dict:
     """File one stream as an Artifact and link it to the run that produced it."""
-    record = artifact.filed(connection, keep, program_id, captured.data, kind="tool_output")
+    stream, name, captured = produced.stream, produced.name, produced.captured
+    record = artifact.filed(connection, keep, program_id, captured.data, kind=produced.kind)
     connection.execute(
         LINK,
         (
@@ -427,6 +539,7 @@ def _keep_stream(
     return {
         "stream": stream,
         "output_name": name,
+        "kind": produced.kind,
         "label": record["label"],
         "sha256": record["sha256"],
         "byte_size": record["byte_size"],

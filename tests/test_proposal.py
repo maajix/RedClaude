@@ -59,11 +59,15 @@ class Recorder:
     with a Receipt.
     """
 
-    def __init__(self, *, receipts=None, tool_runs=None, entities=None):
+    def __init__(self, *, receipts=None, tool_runs=None, entities=None, existing=()):
         self.calls: list[tuple[str, tuple]] = []
         self.receipts = receipts or {}
         self.tool_runs = tool_runs or {}
         self.entities = entities or {}
+        #: Drops the database wrote before this side was asked, as the four
+        #: columns `stage` reads back.
+        self.existing = list(existing)
+        self.dropped: list[tuple] = []
 
     def execute(self, sql: str, parameters: tuple = ()) -> pg.Result:
         self.calls.append((sql, parameters))
@@ -88,8 +92,16 @@ class Recorder:
             return list(self.entities.get(parameters[0], ()))
         if sql == proposal.INSERT:
             return [(PROPOSAL, "PR1", proposal.STAGED)]
+        if sql == proposal.NEXT_DROP:
+            # What the database refused as the proposal landed, already
+            # numbered. `existing` is that count, so a case can put this side's
+            # drops after someone else's without a second table to fake.
+            return [(len(self.existing),)]
         if sql == proposal.INSERT_DROP:
+            self.dropped.append(parameters[2:])
             return []
+        if sql == proposal.DROPS:
+            return [*self.existing, *self.dropped]
         raise AssertionError(f"an unplanned statement was issued: {sql}")
 
 
@@ -388,6 +400,40 @@ class StageTest(unittest.TestCase):
         staged = self.stage(connection, result(observation(), observation(), observation()))
 
         self.assertEqual([0, 1, 2], [drop.ordinal for drop in staged.drops])
+
+    def test_this_side_numbers_its_drops_after_the_ones_already_there(self):
+        # The database refuses an ungrounded source citation the moment the
+        # proposal lands, so by the time this side writes anything the table
+        # may already hold rows under this proposal. Continuing the numbering
+        # is the whole of what that costs -- and the key is what makes it
+        # mandatory rather than tidy.
+        connection = Recorder(existing=[(0, "observations[0]", "no_such_artifact", "AZ9")])
+
+        staged = self.stage(connection, result(observation(), observation()))
+
+        self.assertEqual([0, 1, 2], [drop.ordinal for drop in staged.drops])
+        self.assertEqual(
+            ["no_such_artifact", "no_provenance", "no_provenance"],
+            [drop.reason for drop in staged.drops],
+        )
+
+    def test_what_it_reports_is_what_the_table_holds(self):
+        # Two writers, one table. A caller told only about the half this side
+        # found would read a proposal as more accepted than it is.
+        connection = Recorder(
+            receipts={"R9": [receipt()]},
+            existing=[(0, "new_entities[3]", "artifact_changed", "AF1")],
+        )
+
+        staged = self.stage(connection, result(observation(receipt_label="R9")))
+
+        self.assertEqual(
+            [(0, "new_entities[3]", "artifact_changed", "AF1")],
+            [
+                (drop.ordinal, drop.element_path, drop.reason, drop.cited)
+                for drop in staged.drops
+            ],
+        )
 
 
 class CorpusTest(unittest.TestCase):

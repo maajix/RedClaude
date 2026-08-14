@@ -56,6 +56,11 @@ REASONS = (
     "label_other_program",
     "no_provenance",
 )
+#: Not every reason the column admits, and deliberately: a source citation that
+#: does not hold is refused by a trigger on `proposals`, so those words are the
+#: database's rather than this module's. `stage` reads back what the table holds
+#: instead of listing them here, because a second copy of that vocabulary could
+#: only ever be out of date.
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +292,21 @@ INSERT_DROP = (
     " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)"
 )
 
+#: Where this side's drops start. The database drops elements of its own the
+#: moment the proposal lands -- an ungrounded source citation is refused by a
+#: trigger, so that a promotion cannot be reached by not going through here --
+#: and those rows are already numbered when this asks. The ordinal is a key
+#: rather than a rank, so continuing the numbering is all this has to do.
+NEXT_DROP = "SELECT coalesce(max(ordinal) + 1, 0) FROM proposal_drops WHERE proposal_id = $1::uuid"
+
+#: Every element this proposal lost, whoever refused it. Read back rather than
+#: assembled from what this module wrote, because a caller told only about the
+#: half this side found would read a proposal as more accepted than it is.
+DROPS = (
+    "SELECT ordinal, element_path, reason, cited FROM proposal_drops"
+    " WHERE proposal_id = $1::uuid ORDER BY ordinal"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Staged:
@@ -321,8 +341,15 @@ def stage(
     Two tables, one transaction. The transaction is not for speed: a proposal
     whose drops did not commit with it would read as a proposal that passed
     provenance, which is the one misreading these rows exist to prevent.
+
+    Two writers, one table. What this side proves it reads off Receipts and Tool
+    runs before the proposal exists; what the database proves it reads off the
+    proposal itself, so it has to happen after. Both end in `proposal_drops`
+    because that is the one seam every promotion walk already consults, and this
+    side goes second: it continues the numbering rather than owning it, and what
+    it returns is what the table holds rather than what it put there.
     """
-    drops = review(
+    found = review(
         connection, result, program_id=program_id, agent_run_id=agent_run_id
     )
     with connection.transaction():
@@ -337,22 +364,32 @@ def stage(
             ),
         ).rows
         proposal_id, label, status = (str(value) for value in rows[0])
-        for drop in drops:
+        base = int(connection.execute(NEXT_DROP, (proposal_id,)).scalar())
+        for offset, drop in enumerate(found):
             connection.execute(
                 INSERT_DROP,
                 (
                     proposal_id,
                     program_id,
-                    drop.ordinal,
+                    base + offset,
                     drop.element_path,
                     drop.reason,
                     drop.cited,
                 ),
             )
+        drops = tuple(
+            Drop(
+                ordinal=int(ordinal),
+                element_path=str(path),
+                reason=str(reason),
+                cited=None if cited is None else str(cited),
+            )
+            for ordinal, path, reason, cited in connection.execute(DROPS, (proposal_id,)).rows
+        )
     return Staged(
         proposal_id=proposal_id,
         label=label,
         status=status,
         completion=result.completion,
-        drops=tuple(drops),
+        drops=drops,
     )

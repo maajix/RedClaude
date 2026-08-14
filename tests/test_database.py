@@ -1568,6 +1568,102 @@ CONTROLS = (
         " END $ctl$",
     ),
     Control(
+        # PH2-32 criterion 3, from two sides at once, because a run that read
+        # source is the only thing a source conclusion can rest on. This one
+        # neither says which analyser produced it nor records anything it read,
+        # which is what a conclusion attributed to a tool rather than to bytes
+        # looks like from the outside. `open_offline_tool_run` writes both or
+        # refuses the call, so the row has to be written by hand.
+        "standing:source_conclusions",
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('sourcerun-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'sourcerun-selftest', 'tech:sourcerun-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'analyze', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'js_analyst', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+        "                          offline_tool, tool_version, finished_at)"
+        "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
+        "                'js_parse', 'rk2-jsscan 1', now());"
+        " END $ctl$",
+    ),
+    Control(
+        # The same criterion from the store's side: a run that says which bytes
+        # it read, of an Artifact this Program does not hold that way. Written
+        # against the Program the control above makes, so the only new fact is
+        # the input row -- the guard on the table refuses this at insert time,
+        # and what is left is the state a purge or a re-file could reach.
+        "standing:source_conclusions",
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid; r uuid; t uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('sourceheld-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'sourceheld-selftest', 'tech:sourceheld-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'analyze', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'js_analyst', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+        "                          offline_tool, tool_version, program_sha256)"
+        "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'running', 'runtime',"
+        f"                'js_parse', 'rk2-jsscan 1', {repeat('b')})"
+        "     RETURNING id INTO t;"
+        "   INSERT INTO artifacts (sha256, byte_size, visibility) VALUES"
+        f"        ({repeat('c')}, 1, 'agent_visible') ON CONFLICT DO NOTHING;"
+        "   ALTER TABLE tool_run_inputs DISABLE TRIGGER tool_run_inputs_is_this_runs_input;"
+        "   INSERT INTO tool_run_inputs (program_id, tool_run_id, argument, artifact_label,"
+        "                                sha256, reference_kind)"
+        f"        VALUES (p, t, 'source', 'AZ9', {repeat('c')}, 'source');"
+        " END $ctl$",
+    ),
+    Control(
+        # PH2-32 criterion 2, as a property of the registry rather than of a
+        # run: a tool that reads source and can reach a network is a way to
+        # send the source somewhere, and it is true of every run made after the
+        # row changed rather than of the run that changed it.
+        "standing:source_conclusions",
+        "UPDATE offline_tools SET network = 'proxy' WHERE tool = 'js_routes'",
+    ),
+    Control(
+        # PH2-32 criterion 5, after the fact. The trigger drops this element as
+        # it lands -- the label is nobody's Artifact -- so the falsification is
+        # the drop row going away, which is the one thing that would make a
+        # promotion walk carry it. That is the state a hand-edited proposal or a
+        # restored table could reach, and it is what the check is for.
+        "standing:source_conclusions",
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid; r uuid; q uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('citation-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'citation-selftest', 'tech:citation-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'analyze', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'js_analyst', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO proposals (program_id, agent_run_id, task_id, payload, completion,"
+        "                          status, promoted_at)"
+        "        VALUES (p, r, k, '{\"observations\":[{\"source_artifact_label\":\"AZ9\"}]}'::jsonb,"
+        "                'complete', 'promoted', now())"
+        "     RETURNING id INTO q;"
+        "   DELETE FROM proposal_drops WHERE proposal_id = q;"
+        " END $ctl$",
+    ),
+    Control(
         # PH2-31 criterion 1, which is the whole point of running a browser
         # behind the door: a mission that counted a request the door wrote no
         # Receipt for is bytes that left another way. The row is written by hand
@@ -16735,12 +16831,17 @@ def claimed_agent_run(
     )
 
 
-def offline_reference(connection: pg.Connection, program_id: str, data: bytes) -> str:
+def offline_reference(
+    connection: pg.Connection, program_id: str, data: bytes, kind: str = "source"
+) -> str:
     """One Artifact a Program holds, by the label an argument names it with.
 
     The bytes are not written anywhere: what an argument resolves through is the
     reference, and the two cases that need the bytes as well go through
     `artifact.put`.
+
+    The kind is how this Program came to hold them, which PH2-32 made the
+    difference between an Artifact an analysis may read and one it may not.
     """
     with connection.transaction():
         connection.execute("SELECT set_actor('runtime', 'selftest')")
@@ -16753,8 +16854,8 @@ def offline_reference(connection: pg.Connection, program_id: str, data: bytes) -
     return committed(
         connection,
         "INSERT INTO artifact_references (program_id, sha256, kind)"
-        " VALUES ($1::uuid, $2, 'source') RETURNING label",
-        (program_id, artifact.digest(data)),
+        " VALUES ($1::uuid, $2, $3) RETURNING label",
+        (program_id, artifact.digest(data), kind),
     )
 
 
@@ -17182,6 +17283,10 @@ class OfflineToolRunTest(DatabaseCase):
                     "argument": "input",
                     "label": self.input_label,
                     "sha256": artifact.digest(OFFLINE_INPUT),
+                    # What the Artifact is held as, carried into the plan by
+                    # ph2-32 so that a run says which kind of bytes it read and
+                    # not only which bytes.
+                    "kind": "source",
                     "path": f"/input/{self.input_label}",
                 }
             ],
@@ -17716,6 +17821,823 @@ class OfflineToolCommandTest(DatabaseCase):
     def test_the_standing_check_holds_over_everything_this_class_left(self):
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks() WHERE name = 'offline_tools'"
+        ).rows
+
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+SOURCE_SLUG = "selftest-source"
+
+#: The synthetic bundle both PH2-32 cases read, and the whole of criterion 6 in
+#: one file. Three routes something requests, and three paths that are in the
+#: bytes and that nothing does: one in a comment, one assigned and never used,
+#: and one inside a regular expression. A scanner that reported those three
+#: would be inventing endpoints out of a file that merely mentions them, which
+#: is the failure this ticket exists to make impossible rather than unlikely.
+SOURCE_BUNDLE = b"""/*! app bundle */
+// The decoy: "/api/admin/secret" is written here and nothing requests it.
+var ORPHAN = "/api/orphan";
+var PATTERN = /\\/api\\/regex\\/only/;
+function load(id) {
+  return fetch(`/api/v1/orders/${id}/lines`).then(function (r) { return r.json(); });
+}
+axios.post("/api/v1/login", {user: 1});
+$.ajax({url: "/api/v1/search", type: "GET"});
+//# sourceMappingURL=bundle.js.map
+"""
+
+#: What `js_routes` must find in it, in the order it reports them -- sorted by
+#: path, so the order is the file's content rather than the order the analyser
+#: happened to walk it in -- and nothing else.
+SOURCE_ROUTES = (
+    ("POST", "/api/v1/login", "axios.post"),
+    (None, "/api/v1/orders/{id}/lines", "fetch"),
+    ("GET", "/api/v1/search", "$.ajax"),
+)
+
+#: And what it must not: the three paths that are only mentioned. The middle one
+#: is a string literal, so `js_parse` reports it and says nothing requests it;
+#: the other two are a comment and a regular expression, which are not paths at
+#: all and never become one.
+SOURCE_DECOYS = ("/api/admin/secret", "/api/orphan", "/api/regex/only")
+
+#: One original, and the map that carries it. The recovered file requests a
+#: route the bundle above does not, so a route found in it is a route that came
+#: out of the map rather than out of something already read.
+SOURCE_ORIGINAL = b'fetch("/api/v1/recovered");\n'
+SOURCE_MAP = json.dumps(
+    {
+        "version": 3,
+        "file": "bundle.js",
+        "sources": ["webpack:///src/api.js", "webpack:///src/absent.js"],
+        "sourcesContent": [SOURCE_ORIGINAL.decode(), None],
+        "mappings": "AAAA",
+    },
+    separators=(",", ":"),
+).encode()
+
+#: Bytes the other Program holds so that its labels run past this one's. A label
+#: is a per-Program sequence, so the first few are the same word in both.
+SOURCE_PADDING = tuple(b"padding %d for the other Program\n" % n for n in range(8))
+
+
+class SourceCitationTest(DatabaseCase):
+    """PH2-32 criteria 1, 4 and 5, as the database decides them.
+
+    A source conclusion is a claim about bytes, so the question every path here
+    is asked is the same one: which bytes, and which run read them. The registry
+    answers the first half before a container exists -- an Artifact of the wrong
+    kind, one another Program holds, and a call that does not say which analyser
+    it is about are all refusals to write a row. The trigger answers the second
+    half afterwards: an element that cites a source it did not read, or that
+    changed under it, or that nobody holds, loses that element before any
+    promotion walk reaches it.
+
+    Hypotheses are here for the reason criterion 4 names them beside endpoints
+    and parameters: nothing promotes a Hypothesis, so a check living inside
+    `promote_proposal` would never see one. The trigger walks the payload, which
+    is where a Hypothesis is.
+
+    The last observation is dropped by the runtime rather than by the trigger,
+    because both write to one table with one key: what this case pins is that
+    the second writer continues the first one's numbering instead of colliding
+    with it.
+
+    Everything runs as `rk2_runtime` and commits. The Programs are purged at the
+    end.
+    """
+
+    settings_for = "runtime"
+
+    OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb, $5)"
+    PRINTED = b'{"tool":"js_parse"}\n'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.identifiers = {}
+        for name in ("main", "other"):
+            slug = f"{SOURCE_SLUG}-{name}"
+            opened = program.run(
+                cls.harness.runtime, write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            )
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.analyser = artifact.digest((tool.PROGRAMS / "jsscan.py").read_bytes())
+        cls.bind("main")
+        cls.arrange()
+        cls.hold_it_elsewhere()
+        cls.refusals = {}
+        cls.refuse_the_call()
+        cls.refuse_the_input_row()
+        cls.propose()
+        cls.problems = cls.connection.execute("SELECT * FROM check_source_conclusions()").rows
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SOURCE_SLUG}-%",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                (
+                    "{"
+                    + ",".join(
+                        artifact.digest(item)
+                        for item in (
+                            SOURCE_BUNDLE,
+                            SOURCE_ORIGINAL,
+                            SOURCE_MAP,
+                            cls.PRINTED,
+                            *SOURCE_PADDING,
+                        )
+                    )
+                    + "}",
+                ),
+            )
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def bind(cls, name: str) -> None:
+        """Which Program this connection is, for row level security."""
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.identifiers[name],)
+        )
+
+    @classmethod
+    def opening(cls, arguments: dict, *, hash_: str | None = "", name: str = "js_parse") -> tuple:
+        """One call on `open_offline_tool_run`, as its five parameters."""
+        return (
+            cls.run_id,
+            name,
+            "rk2-jsscan 1",
+            json.dumps(arguments),
+            cls.analyser if hash_ == "" else hash_,
+        )
+
+    @classmethod
+    def reading(cls, label: str) -> dict:
+        """One `js_parse` run over one Artifact, opened, kept and closed."""
+        plan = json.loads(committed(cls.connection, cls.OPEN, cls.opening({"source": label})))
+        committed(
+            cls.connection,
+            "INSERT INTO tool_run_artifacts (program_id, tool_run_id, stream, sha256,"
+            "                                produced_bytes, truncated)"
+            " VALUES ($1::uuid, $2::uuid, 'stdout', $3, $4::bigint, false) RETURNING id",
+            (
+                cls.identifiers["main"],
+                plan["tool_run_id"],
+                artifact.digest(cls.PRINTED),
+                len(cls.PRINTED),
+            ),
+        )
+        committed(
+            cls.connection,
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (plan["tool_run_id"],),
+        )
+        return plan
+
+    @classmethod
+    def arrange(cls):
+        cls.run_id = offline_agent_run(
+            cls.connection, cls.identifiers["main"], role="js_analyst", kind="analyze"
+        )
+        cls.subject = offline_entity(cls.connection, cls.identifiers["main"])
+        cls.labels = {
+            "bundle": offline_reference(cls.connection, cls.identifiers["main"], SOURCE_BUNDLE),
+            "original": offline_reference(
+                cls.connection, cls.identifiers["main"], SOURCE_ORIGINAL
+            ),
+            "printed": offline_reference(
+                cls.connection, cls.identifiers["main"], cls.PRINTED, kind="tool_output"
+            ),
+        }
+        # Two closed runs over two different source Artifacts, so "this run read
+        # those bytes" is a question with a wrong answer available.
+        cls.runs = {name: cls.reading(cls.labels[name]) for name in ("bundle", "original")}
+        cls.held = [str(label) for [label] in cls.connection.execute(
+            "SELECT label FROM artifact_references WHERE program_id = $1::uuid",
+            (cls.identifiers["main"],),
+        ).rows]
+        cls.inputs = [
+            tuple(str(value) for value in row)
+            for row in cls.connection.execute(
+                "SELECT argument, artifact_label, sha256, reference_kind FROM tool_run_inputs"
+                " WHERE tool_run_id = $1::uuid",
+                (cls.runs["bundle"]["tool_run_id"],),
+            ).rows
+        ]
+
+    @classmethod
+    def hold_it_elsewhere(cls):
+        """One Artifact the other Program holds, under a label this one has not.
+
+        The padding is what makes the refusal about the Program rather than
+        about the word: a case that took the other Program's first label would
+        be naming one this Program also holds, and would pass whatever the verb
+        decided.
+        """
+        cls.bind("other")
+        for filler in SOURCE_PADDING:
+            cls.foreign_label = offline_reference(
+                cls.connection, cls.identifiers["other"], filler
+            )
+            if cls.foreign_label not in cls.held:
+                break
+        else:
+            raise AssertionError(f"every padded label is one {SOURCE_SLUG}-main holds")
+        cls.bind("main")
+
+    # -- criterion 1: what an analysis may be pointed at ------------------------
+
+    @classmethod
+    def refuse_the_call(cls):
+        source = {"source": cls.labels["bundle"]}
+        cls.refusals.update(
+            # The kind is a property of how this Program came to hold the bytes,
+            # so this refuses an earlier run's own output as well as a stored
+            # response body. Otherwise a tool could launder anything into source
+            # by printing it.
+            tool_output=refused(
+                cls.connection, cls.OPEN, cls.opening({"source": cls.labels["printed"]})
+            ),
+            # The same answer a label nobody holds gets, and deliberately: two
+            # answers would make the argument a way to ask what another Program
+            # has.
+            foreign=refused(
+                cls.connection, cls.OPEN, cls.opening({"source": cls.foreign_label})
+            ),
+            no_hash=refused(cls.connection, cls.OPEN, cls.opening(source, hash_=None)),
+            bad_hash=refused(cls.connection, cls.OPEN, cls.opening(source, hash_="not a hash")),
+            # `jq` names no analyser, so a hash supplied for it is the same
+            # disagreement seen from the other side.
+            hash_without_analyser=refused(
+                cls.connection,
+                cls.OPEN,
+                (
+                    cls.run_id,
+                    "jq",
+                    "jq-1.7.1",
+                    json.dumps({"filter": ".host", "input": cls.labels["bundle"]}),
+                    cls.analyser,
+                ),
+            ),
+        )
+
+    INPUT = (
+        "INSERT INTO tool_run_inputs"
+        " (program_id, tool_run_id, argument, artifact_label, sha256, reference_kind)"
+        " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)"
+    )
+
+    @classmethod
+    def refuse_the_input_row(cls):
+        """What the table refuses when something writes to it directly.
+
+        The rows are written inside the verb that opens a run, which is the only
+        moment they are true of anything. Each refusal is one way a row written
+        later would be a claim the run cannot support -- and the run this uses is
+        left open until the last of them, because "after it closed" is one of
+        them.
+        """
+        open_run = json.loads(
+            committed(cls.connection, cls.OPEN, cls.opening({"source": cls.labels["bundle"]}))
+        )
+        row = (cls.identifiers["main"], open_run["tool_run_id"])
+        cls.refusals.update(
+            label_disagrees_with_bytes=refused(
+                cls.connection,
+                cls.INPUT,
+                (*row, "source", cls.labels["bundle"], artifact.digest(SOURCE_ORIGINAL), "source"),
+            ),
+            label_disagrees_with_kind=refused(
+                cls.connection,
+                cls.INPUT,
+                (*row, "source", cls.labels["printed"], artifact.digest(cls.PRINTED), "source"),
+            ),
+            undeclared_argument=refused(
+                cls.connection,
+                cls.INPUT,
+                (*row, "map", cls.labels["bundle"], artifact.digest(SOURCE_BUNDLE), "source"),
+            ),
+        )
+        committed(
+            cls.connection,
+            "SELECT close_offline_tool_run($1::uuid, 'error', 1, $2)",
+            (open_run["tool_run_id"], "closed by the case that opened it"),
+        )
+        cls.refusals["after_the_run_closed"] = refused(
+            cls.connection,
+            cls.INPUT,
+            (*row, "source", cls.labels["original"], artifact.digest(SOURCE_ORIGINAL), "source"),
+        )
+
+    # -- criteria 4 and 5: what a conclusion may cite --------------------------
+
+    @classmethod
+    def citing(cls, **fields) -> dict:
+        """One Observation, alike in everything but what it says about source."""
+        return {
+            "kind": OFFLINE_OBSERVATION,
+            "summary": "a route this run is said to have read out of the bundle",
+            "subject_label": str(cls.subject_label),
+            "tool_run_label": cls.runs["bundle"]["tool_run"],
+            **fields,
+        }
+
+    @classmethod
+    def propose(cls):
+        task, cls.subject_label = cls.connection.execute(
+            "SELECT r.task_id, e.label FROM agent_runs r, entities e"
+            " WHERE r.id = $1::uuid AND e.id = $2::uuid",
+            (cls.run_id, cls.subject),
+        ).rows[0]
+        payload = {
+            "observations": [
+                cls.citing(
+                    source_artifact_label=cls.labels["bundle"],
+                    source_sha256=artifact.digest(SOURCE_BUNDLE),
+                ),
+                cls.citing(source_artifact_label="ZZ9"),
+                cls.citing(source_artifact_label=cls.labels["printed"]),
+                cls.citing(source_artifact_label=cls.labels["bundle"], source_sha256="a" * 64),
+                cls.citing(source_artifact_label=cls.labels["original"]),
+                cls.citing(),
+                # The one the runtime drops, so the two writers meet.
+                cls.citing(tool_run_label="ZZ99"),
+            ],
+            # Nothing promotes a Hypothesis, so this element is the whole case
+            # for the refusal living in a trigger.
+            "hypotheses": [
+                {
+                    "statement": "the recovered original reaches an endpoint nothing calls",
+                    "tool_run_label": cls.runs["bundle"]["tool_run"],
+                    "source_artifact_label": "ZZ9",
+                }
+            ],
+        }
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.identifiers["main"],
+                agent_run_id=cls.run_id,
+                task_id=str(task),
+            )
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.promotion = json.loads(
+                str(
+                    cls.connection.execute(
+                        "SELECT promote_proposal($1::uuid)", (cls.staged.proposal_id,)
+                    ).scalar()
+                )
+            )
+
+    # -- criterion 1 -----------------------------------------------------------
+
+    def test_an_artifact_held_as_a_tools_output_is_not_source(self):
+        self.assertIn(
+            f"{self.labels['printed']} is held as tool_output and source takes source there",
+            self.refusals["tool_output"],
+        )
+
+    def test_an_artifact_another_program_holds_is_not_an_artifact_at_all(self):
+        self.assertEqual(
+            f"{self.foreign_label} is not an artifact of this Program", self.refusals["foreign"]
+        )
+
+    def test_a_run_of_an_analyser_says_which_analyser_ran(self):
+        self.assertEqual(
+            "the registry says js_parse runs an analyser and the runtime supplied none",
+            self.refusals["no_hash"],
+        )
+        self.assertEqual("the analyser hash is not a sha256", self.refusals["bad_hash"])
+        self.assertEqual(
+            "the registry says jq runs no analyser and the runtime supplied one",
+            self.refusals["hash_without_analyser"],
+        )
+
+    def test_the_analyser_and_the_question_come_before_anything_a_caller_said(self):
+        # Which analysis this is comes from the registry key rather than from an
+        # argument, so it is not something a validated call can differ in.
+        self.assertEqual(
+            [
+                "/usr/local/bin/python3",
+                "/input/jsscan.py",
+                "js_parse",
+                f"/input/{self.labels['bundle']}",
+            ],
+            self.runs["bundle"]["argv"],
+        )
+        self.assertEqual(
+            ("jsscan.py", "/input/jsscan.py", "none"),
+            (
+                self.runs["bundle"]["analyser"],
+                self.runs["bundle"]["program_path"],
+                self.runs["bundle"]["network"],
+            ),
+        )
+
+    def test_the_run_records_which_bytes_it_was_given_and_which_analyser_it_was(self):
+        self.assertEqual(
+            [("source", self.labels["bundle"], artifact.digest(SOURCE_BUNDLE), "source")],
+            self.inputs,
+        )
+        [[recorded]] = self.connection.execute(
+            "SELECT program_sha256 FROM tool_runs WHERE id = $1::uuid",
+            (self.runs["bundle"]["tool_run_id"],),
+        ).rows
+        self.assertEqual(self.analyser, str(recorded))
+
+    def test_an_input_row_is_the_reference_it_names_or_it_is_nothing(self):
+        for name in ("label_disagrees_with_bytes", "label_disagrees_with_kind"):
+            with self.subTest(name):
+                self.assertIn("does not name those bytes held that way", self.refusals[name])
+        self.assertEqual(
+            "js_parse takes no Artifact argument named map", self.refusals["undeclared_argument"]
+        )
+        self.assertIn("has already been closed as error", self.refusals["after_the_run_closed"])
+
+    # -- criteria 4 and 5 ------------------------------------------------------
+
+    def test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed(self):
+        # Six from the trigger, in the order it walks the payload, and the
+        # seventh from the runtime. Alphabetical by element list is why
+        # `hypotheses` comes first: the walk is deterministic, which is what
+        # makes the ordinals reproducible.
+        self.assertEqual(
+            [
+                (0, "hypotheses[0]", "no_such_artifact", "ZZ9"),
+                (1, "observations[1]", "no_such_artifact", "ZZ9"),
+                (2, "observations[2]", "artifact_not_source", self.labels["printed"]),
+                (3, "observations[3]", "artifact_changed", self.labels["bundle"]),
+                (4, "observations[4]", "artifact_not_read", self.labels["original"]),
+                (5, "observations[5]", "no_source_citation", None),
+                (6, "observations[6]", "no_such_tool_run", "ZZ99"),
+            ],
+            [
+                (drop.ordinal, drop.element_path, drop.reason, drop.cited)
+                for drop in self.staged.drops
+            ],
+        )
+
+    def test_the_citation_that_holds_is_the_one_element_promoted(self):
+        # Six refused and one kept, out of seven elements that differ in nothing
+        # else. What survives is the Observation whose source this Program holds,
+        # as source, unchanged, and which the run it names actually read --
+        # named by element path, because "one Observation" would be satisfied by
+        # the wrong one.
+        self.assertEqual("promoted", self.promotion["status"])
+        self.assertEqual(
+            [("observations[0]",)],
+            [
+                tuple(str(value) for value in row)
+                for row in self.connection.execute(
+                    "SELECT metadata ->> 'element' FROM observations"
+                    " WHERE metadata ->> 'proposal' = $1",
+                    (self.staged.label,),
+                ).rows
+            ],
+        )
+
+    def test_the_standing_check_holds_over_everything_this_class_left(self):
+        self.assertEqual((), self.problems)
+
+
+@unittest.skipUnless(CONTAINERS, CONTAINER_REASON)
+class JsAnalystCommandTest(DatabaseCase):
+    """PH2-32 criteria 2, 3 and 6: the three analyses, end to end, in a container.
+
+    No registry rows are written here. The tools are the ones the migration
+    ships, the analyser is the file this harness ships beside them, and what the
+    case supplies is a bundle -- which is the point: an analysis whose program
+    came from anywhere but the harness would be a conclusion about bytes nobody
+    can name afterwards.
+
+    The bundle is the ticket's sixth criterion. Three routes something requests
+    and three paths nothing does, and both halves are asserted: an analyser that
+    reported the decoys would be inventing endpoints, and one that dropped
+    `/api/orphan` from what it found in the file would be hiding the difference
+    between "not requested" and "not there".
+
+    The chain is the fourth thing under test. `js_map` recovers an original out
+    of a source map and it is filed as source, because its registry row says so,
+    so `js_routes` may then be pointed at it -- and finds a route the bundle
+    itself does not contain, which is how "this came out of the map" is told from
+    "this was already read".
+
+    This case commits, and purges its Program and its bytes at the end.
+    """
+
+    settings_for = "runtime"
+
+    #: Bytes this Program holds the way an ordinary run leaves them. Not source,
+    #: so an analysis pointed at them is a refusal rather than a conclusion.
+    SOURCE_RESPONSE = b'{"body":"a response the runtime stored"}\n'
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {AGENT_IMAGE}")
+        super().setUpClass()
+
+        cls.root = scratch() / "artifacts"
+        cls.configuration = write(
+            VALID.replace('name = "acme-web"', f'name = "{SOURCE_SLUG}-command"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+        cls.analyst = offline_agent_run(
+            cls.connection, cls.program_id, role="js_analyst", kind="analyze"
+        )
+        cls.recon = offline_agent_run(
+            cls.connection, cls.program_id, role="recon", kind="recon"
+        )
+        cls.labels = {
+            "bundle": cls.stored(SOURCE_BUNDLE, "source"),
+            "map": cls.stored(SOURCE_MAP, "source"),
+            "response": cls.stored(cls.SOURCE_RESPONSE, "runtime"),
+        }
+        cls.answers = {
+            "parse": cls.perform("js_parse", {"source": cls.labels["bundle"]}),
+            "routes": cls.perform("js_routes", {"source": cls.labels["bundle"]}),
+            "index": cls.perform("js_map", {"map": cls.labels["map"]}),
+            "recover": cls.perform("js_map", {"map": cls.labels["map"], "select": "0"}),
+            "absent": cls.perform("js_map", {"map": cls.labels["map"], "select": "1"}),
+            "not_source": cls.perform("js_parse", {"source": cls.labels["response"]}),
+            "role": cls.perform(
+                "js_parse", {"source": cls.labels["bundle"]}, agent_run=cls.recon
+            ),
+        }
+        cls.answers["chained"] = cls.perform(
+            "js_routes", {"source": cls.recovered(cls.answers["recover"])["label"]}
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (f"{SOURCE_SLUG}-command",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE NOT EXISTS"
+                " (SELECT 1 FROM artifact_references r WHERE r.sha256 = artifacts.sha256)"
+            )
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def stored(cls, data: bytes, kind: str) -> str:
+        """Bytes in the store and a reference this Program holds, as `rk artifact put`."""
+        source = scratch() / "stored.bin"
+        source.write_bytes(data)
+        put = artifact.put(
+            cls.harness.runtime, cls.configuration, source, root=cls.root, kind=kind
+        )
+        assert put.ok, put.violations
+        return put.facts["artifact"]["label"]
+
+    @classmethod
+    def perform(
+        cls, name: str, arguments: dict[str, str], *, agent_run: str | None = None
+    ) -> Report:
+        return tool.run(
+            cls.harness.runtime,
+            cls.configuration,
+            root=cls.root,
+            image=AGENT_IMAGE,
+            agent_run=str(
+                cls.connection.execute(
+                    "SELECT label FROM agent_runs WHERE id = $1::uuid",
+                    (agent_run or cls.analyst,),
+                ).scalar()
+            ),
+            offline_tool=name,
+            arguments=arguments,
+        )
+
+    @classmethod
+    def recovered(cls, answer: Report) -> dict:
+        """The declared output one run produced, as the record that filed it."""
+        assert answer.ok, answer.violations
+        [found] = [item for item in answer.facts["outputs"] if item["stream"] == "output"]
+        return found
+
+    def printed(self, answer: Report) -> dict:
+        """What the analyser said, read back out of the store rather than the report."""
+        [stdout] = [item for item in answer.facts["outputs"] if item["stream"] == "stdout"]
+        return json.loads(Store(self.root).load(stdout["sha256"]))
+
+    def said(self, answer: Report) -> str:
+        return " ".join(item.detail for item in answer.violations)
+
+    def read_by(self, answer: Report) -> list[tuple]:
+        """Which bytes the run recorded being given, by argument."""
+        return [
+            tuple(str(value) for value in row)
+            for row in self.connection.execute(
+                "SELECT i.argument, i.artifact_label, i.sha256, i.reference_kind"
+                "  FROM tool_run_inputs i JOIN tool_runs t ON t.id = i.tool_run_id"
+                " WHERE t.label = $1 AND t.program_id = $2::uuid ORDER BY i.argument",
+                (answer.facts["tool_run"]["label"], self.program_id),
+            ).rows
+        ]
+
+    # -- criteria 3 and 6 ------------------------------------------------------
+
+    def test_the_analysis_reports_the_paths_in_the_file_and_which_are_requested(self):
+        answer = self.answers["parse"]
+        printed = self.printed(answer)
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(("js_parse", "rk2-jsscan 1"), (printed["tool"], printed["analyser"]))
+        # The analyser names the bytes it read, and they are the bytes the row
+        # says it was given: the two halves of the citation, agreeing.
+        self.assertEqual(artifact.digest(SOURCE_BUNDLE), printed["source_sha256"])
+        self.assertEqual("bundle.js.map", printed["source_map"])
+        self.assertEqual(
+            [
+                ("/api/orphan", False),
+                ("/api/v1/orders/{id}/lines", True),
+                ("/api/v1/login", True),
+                ("/api/v1/search", True),
+            ],
+            [(item["value"], item["requested"]) for item in printed["path_literals"]],
+        )
+
+    def test_only_the_paths_something_calls_come_out_as_routes(self):
+        answer = self.answers["routes"]
+        printed = self.printed(answer)
+
+        self.assertTrue(answer.ok, answer.violations)
+        # Every route with the call that grounds it, so a reader can go and look
+        # at the site rather than take the path on trust.
+        self.assertEqual(
+            list(SOURCE_ROUTES),
+            [
+                (entry["method"], entry["path"], entry["sites"][0]["call"])
+                for entry in printed["routes"]
+            ],
+        )
+        self.assertEqual(
+            [], [entry["path"] for entry in printed["routes"] if entry["path"] in SOURCE_DECOYS]
+        )
+
+    def test_the_run_records_the_analyser_and_the_bytes_it_was_given(self):
+        run = self.answers["parse"].facts["tool_run"]
+
+        self.assertEqual(
+            [("source", self.labels["bundle"], artifact.digest(SOURCE_BUNDLE), "source")],
+            self.read_by(self.answers["parse"]),
+        )
+        [[recorded]] = self.connection.execute(
+            "SELECT program_sha256 FROM tool_runs WHERE label = $1 AND program_id = $2::uuid",
+            (run["label"], self.program_id),
+        ).rows
+        self.assertEqual(
+            artifact.digest((tool.PROGRAMS / "jsscan.py").read_bytes()), str(recorded)
+        )
+
+    # -- criterion 2 -----------------------------------------------------------
+
+    def test_the_analysis_runs_with_no_network_and_reads_only_what_it_was_given(self):
+        # The argv is the whole of what the container was told, and it names two
+        # paths under /input: the analyser and the Artifact. There is no host,
+        # no credential and no second file to be pointed at.
+        run = self.answers["parse"].facts["tool_run"]
+
+        self.assertEqual("none", run["network"])
+        self.assertEqual(
+            [
+                "/usr/local/bin/python3",
+                "/input/jsscan.py",
+                "js_parse",
+                f"/input/{self.labels['bundle']}",
+            ],
+            run["argv"],
+        )
+
+    def test_an_artifact_the_runtime_stored_is_not_something_an_analysis_may_read(self):
+        answer = self.answers["not_source"]
+
+        self.assertFalse(answer.ok)
+        self.assertIsNone(answer.facts["tool_run"])
+        self.assertIn("is held as runtime and source takes source there", self.said(answer))
+
+    def test_no_role_but_the_analyst_may_ask_these_questions(self):
+        answer = self.answers["role"]
+
+        self.assertFalse(answer.ok)
+        self.assertIsNone(answer.facts["tool_run"])
+        self.assertIn("the recon role may not run js_parse", self.said(answer))
+
+    # -- criterion 3: the recovery, and what may be done with it ----------------
+
+    def test_a_source_map_is_indexed_before_anything_is_recovered_from_it(self):
+        # The index is what makes the recovery citable: an original is named by
+        # its position in a document this run printed, so the only way to name
+        # one is to have read the run that listed it.
+        answer = self.answers["index"]
+        printed = self.printed(answer)
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertIsNone(printed["recovered"])
+        self.assertEqual(
+            [(0, "webpack:///src/api.js", True), (1, "webpack:///src/absent.js", False)],
+            [
+                (item["index"], item["path"], item["recoverable"])
+                for item in printed["sources"]
+            ],
+        )
+        self.assertEqual([], self.answers["index"].facts["tool_run"]["inputs"][1:])
+
+    def test_a_recovered_original_is_filed_as_source_under_its_own_name(self):
+        answer = self.answers["recover"]
+        output = self.recovered(answer)
+
+        self.assertEqual("source.js", output["output_name"])
+        self.assertEqual(
+            (artifact.digest(SOURCE_ORIGINAL), len(SOURCE_ORIGINAL), "source"),
+            (output["sha256"], output["byte_size"], output["kind"]),
+        )
+        self.assertEqual(SOURCE_ORIGINAL, Store(self.root).load(output["sha256"]))
+        # And the reference is the kind the registry row declared, which is what
+        # the next run is allowed to be pointed at.
+        self.assertEqual(
+            [("source",)],
+            [
+                tuple(str(value) for value in row)
+                for row in self.connection.execute(
+                    "SELECT kind FROM artifact_references"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.program_id, output["label"]),
+                ).rows
+            ],
+        )
+
+    def test_a_recovered_original_can_be_analysed_in_its_own_right(self):
+        # The route below is in the original and not in the bundle, so finding it
+        # is finding something the map recovered rather than something the first
+        # analysis had already read.
+        answer = self.answers["chained"]
+        printed = self.printed(answer)
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(
+            [(None, "/api/v1/recovered")],
+            [(entry["method"], entry["path"]) for entry in printed["routes"]],
+        )
+        self.assertEqual(
+            [
+                (
+                    "source",
+                    self.recovered(self.answers["recover"])["label"],
+                    artifact.digest(SOURCE_ORIGINAL),
+                    "source",
+                )
+            ],
+            self.read_by(answer),
+        )
+
+    def test_a_source_the_map_does_not_carry_is_the_analyser_s_answer(self):
+        # Exiting non-zero because there is nothing at that index is the tool
+        # answering, not the harness failing: the run closes as an error carrying
+        # the exit and the reason, and the command reports ok.
+        answer = self.answers["absent"]
+        run = answer.facts["tool_run"]
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(("error", 3), (run["status"], run["exit_code"]))
+        [stderr] = [item for item in answer.facts["outputs"] if item["stream"] == "stderr"]
+        self.assertEqual(
+            b"this source map carries no recoverable source at 1\n",
+            Store(self.root).load(stderr["sha256"]),
+        )
+        self.assertEqual(
+            [], [item for item in answer.facts["outputs"] if item["stream"] == "output"]
+        )
+
+    def test_the_standing_check_holds_over_everything_this_class_left(self):
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'source_conclusions'"
         ).rows
 
         self.assertEqual((0, ""), (int(problems), str(detail)))
