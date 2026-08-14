@@ -10468,12 +10468,26 @@ class StartupRefusalTest(DatabaseCase):
         self.assertEqual(1, len(self.refusals(run)))
 
 
+ARCHIVE_SLUG = "selftest-archive"
+
+
 class ArchiveTest(DatabaseCase):
     """Criterion 6: dump, restore, and a restored database that still holds."""
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Committed, not rolled back: an empty archive would restore into a
+        # database with nothing for the event log check to be wrong about, and
+        # the case that matters -- the one an operator restoring a real backup
+        # meets -- is a database that carries rows. Opened through `program.run`
+        # rather than by inserting the row, because the standing checks are what
+        # the restore is gated on and a Program with no configuration revision
+        # fails one of them before the archive is even involved.
+        path = write(VALID.replace('name = "acme-web"', f'name = "{ARCHIVE_SLUG}"'))
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.program = str(opened.facts["program_id"])
         provisioned = migrate.provision(
             cls.harness.admin, RESTORED, passwords=cls.harness.passwords
         )
@@ -10482,6 +10496,17 @@ class ArchiveTest(DatabaseCase):
         cls.archive = scratch() / "rk2.dump"
         cls.written = backup.dump(cls.harness.migrate, cls.archive)
         cls.read = backup.restore(cls.target, cls.archive)
+
+    @classmethod
+    def tearDownClass(cls):
+        # The Program was committed, so it outlives this class unless it is
+        # taken back out; every later case reads the same database. `app.purging`
+        # is what the immutability triggers read, and without it the
+        # configuration revisions and the events refuse to go.
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (ARCHIVE_SLUG,))
+        super().tearDownClass()
 
     def test_the_archive_is_written_and_identified_by_its_bytes(self):
         self.assertTrue(self.written.ok, self.written.violations)
@@ -10537,10 +10562,42 @@ class ArchiveTest(DatabaseCase):
         ).scalar()
 
     def test_the_restored_database_holds_on_its_own(self):
+        # Every check but one, and that one is named: `pg_restore` rewrites each
+        # tuple in the restore's own transaction while the events keep the
+        # transaction ids of the writes that really happened, so part (d) of the
+        # event log check is false for every restored row by construction.
+        # `rk db verify` says so rather than tolerating it -- the tolerance
+        # belongs to the restore, which is the only caller that knows why.
         result = migrate.verify(self.target)
 
-        self.assertTrue(result.ok, result.violations)
-        self.assertEqual([], result.facts["failed"])
+        self.assertEqual(["standing:event_log_integrity"], result.facts["failed"])
+        with pg.connect(self.target) as connection:
+            self.assertEqual(
+                [("row_last_write_unaccounted",)],
+                [tuple(row) for row in connection.execute(integrity.EVENT_LOG_PROBLEMS).rows],
+            )
+
+    def test_a_populated_archive_restores_into_a_database_the_gate_accepts(self):
+        # The whole point of the entitlement: an archive with rows in it used to
+        # fail its own restore, which left an operator restoring a real backup
+        # reading `integrity_failed` over evidence the restore itself destroyed.
+        held = {assertion.name: assertion.detail for assertion in self.read.assertions}
+
+        self.assertTrue(self.read.ok, self.read.violations)
+        self.assertIn(
+            "xmin evidence lost to the restore", held["standing:event_log_integrity"]
+        )
+        self.assertEqual(
+            1,
+            self.count(
+                "SELECT count(*) FROM program_configurations WHERE program_id = $1::uuid",
+                (self.program,),
+            ),
+        )
+
+    def count(self, sql: str, parameters: tuple = ()) -> int:
+        with pg.connect(self.target) as connection:
+            return int(connection.execute(sql, parameters).scalar())
 
     def test_the_restore_report_says_how_much_of_the_gate_ran(self):
         # A restore reports its own gate for the same reason a migration does:
@@ -10569,8 +10626,14 @@ class ArchiveTest(DatabaseCase):
                     connection.execute("SELECT set_actor('runtime', 'selftest')")
                     program = connection.execute(PROGRAM, ("restored-selftest",)).scalar()
                     entity = connection.execute(ENTITY, (program,)).scalar()
+                    # This Program's events, not the whole log: the archive
+                    # carries the events of everything that was written before
+                    # the dump, and what is asked here is whether the restored
+                    # database still writes its own.
                     events = connection.execute(
                         "SELECT type, subject_table, subject_id::text, actor_kind FROM events"
+                        " WHERE program_id = $1::uuid AND subject_table = 'entities'",
+                        (program,),
                     ).rows
 
                     self.assertEqual(

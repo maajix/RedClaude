@@ -139,6 +139,12 @@ def restore(
     empty, `pg_restore` brings the objects back, the finalizers repair what the
     archive could not carry, and the integrity gate says whether the result is
     the database the corpus describes.
+
+    That last gate is the one place that knows a restore happened, so it is the
+    one place that may spend the tolerance a restore is entitled to: a rewritten
+    tuple carries the restore's transaction id rather than the one its event
+    recorded. `rk db verify` afterwards stays strict and will keep reporting it,
+    which is the honest answer -- the evidence really is gone.
     """
     ledger = Ledger()
     source = Path(archive)
@@ -215,7 +221,9 @@ def restore(
             for name, answer in finalized.items():
                 ledger.hold(f"finalize:{name}", str(answer))
 
-            facts = migrate.gate_on_a_fresh_connection(ledger, settings, migrations)
+            facts = migrate.gate_on_a_fresh_connection(
+                ledger, settings, migrations, restored=True
+            )
 
     return report(
         "db restore",

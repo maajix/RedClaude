@@ -562,7 +562,11 @@ def verify(
 
 
 def gate_on_a_fresh_connection(
-    ledger: Ledger, settings: pg.Settings, migrations: tuple[Migration, ...]
+    ledger: Ledger,
+    settings: pg.Settings,
+    migrations: tuple[Migration, ...],
+    *,
+    restored: bool = False,
 ) -> dict[str, object]:
     """Run the integrity gate the way the next connection will see the database.
 
@@ -574,12 +578,20 @@ def gate_on_a_fresh_connection(
     The gate's own answers are returned rather than folded into the ledger,
     because how many checks ran is the number that says whether "the gate
     passed" means anything.
+
+    `restored` is passed through to the gate and nowhere else: it is the caller
+    saying an archive was just loaded, which buys the one tolerance a restored
+    database is entitled to.
     """
     connection = open_connection(ledger, settings)
     if connection is None:
         return {}
     with connection:
-        gate = integrity.verify(connection, expected=[item.identity for item in migrations])
+        gate = integrity.verify(
+            connection,
+            expected=[item.identity for item in migrations],
+            restored=restored,
+        )
     ledger.assertions.extend(gate.assertions)
     ledger.violations.extend(gate.violations)
     return dict(gate.facts)

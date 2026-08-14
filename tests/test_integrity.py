@@ -38,6 +38,7 @@ class FakeConnection:
         references_error=None,
         seals=(),
         records_seals=True,
+        event_log_problems=(),
     ):
         self.baseline = baseline
         self.roles = roles
@@ -49,6 +50,7 @@ class FakeConnection:
         self.references_error = references_error
         self.seals = seals
         self.records_seals = records_seals
+        self.event_log_problems = event_log_problems
         self.statements: list[str] = []
         self.parameters: list[tuple] = []
 
@@ -69,6 +71,11 @@ class FakeConnection:
             return pg.Result(columns=("check_name", "ok", "detail"), rows=tuple(self.roles))
         if integrity.STANDING in sql:
             return pg.Result(columns=("name", "problems", "detail"), rows=tuple(self.standing))
+        if "check_event_log_integrity" in sql:
+            return pg.Result(
+                columns=("problem",),
+                rows=tuple((problem,) for problem in self.event_log_problems),
+            )
         if "FROM artifact_references" in sql:
             if self.references_error is not None:
                 raise self.references_error
@@ -205,6 +212,79 @@ class VerifyTest(unittest.TestCase):
 
         self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
         self.assertIn("could not be run", result.violations[0].detail)
+
+
+class RestoreEntitlementTest(unittest.TestCase):
+    """The one check a restored database is allowed to fail, and nothing beside it.
+
+    A restore rewrites every tuple in its own transaction while the events keep
+    the transaction ids of the writes that really happened, so part (d) of the
+    event log check is false for every restored row by construction. The
+    tolerance is spent by the command that ran `pg_restore` and by nothing else,
+    because no database can tell a rewritten tuple from a row someone wrote with
+    the emitter switched off.
+    """
+
+    FAILING = (("event_log_integrity", 13, "(row_last_write_unaccounted,receipts,48)"),)
+
+    def test_a_restore_carries_the_evidence_it_destroyed_rather_than_failing(self):
+        connection = FakeConnection(
+            standing=self.FAILING, event_log_problems=("row_last_write_unaccounted",)
+        )
+
+        result = integrity.verify(connection, restored=True)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertEqual([], result.as_dict()["failed"])
+        self.assertIn(
+            "xmin evidence lost to the restore",
+            [a.detail for a in result.assertions if a.name == "standing:event_log_integrity"][0],
+        )
+
+    def test_the_same_database_still_fails_a_plain_verify(self):
+        connection = FakeConnection(
+            standing=self.FAILING, event_log_problems=("row_last_write_unaccounted",)
+        )
+
+        result = integrity.verify(connection)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(["standing:event_log_integrity"], result.as_dict()["failed"])
+
+    def test_a_second_problem_kind_is_outside_the_entitlement(self):
+        connection = FakeConnection(
+            standing=self.FAILING,
+            event_log_problems=("row_last_write_unaccounted", "row_without_event"),
+        )
+
+        result = integrity.verify(connection, restored=True)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(["standing:event_log_integrity"], result.as_dict()["failed"])
+
+    def test_no_other_check_is_covered_by_it(self):
+        connection = FakeConnection(
+            standing=(("scope_policy", 2, "two entities"), *self.FAILING),
+            event_log_problems=("row_last_write_unaccounted",),
+        )
+
+        result = integrity.verify(connection, restored=True)
+
+        self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        self.assertEqual(["standing:scope_policy"], result.as_dict()["failed"])
+
+    def test_a_restore_that_asks_is_not_told_anything_when_the_check_holds(self):
+        # The entitlement costs a statement; a database with nothing to tolerate
+        # should not be paying for it, and should not be reading a detail that
+        # mentions a restore.
+        connection = FakeConnection(standing=(("event_log_integrity", 0, ""),))
+
+        result = integrity.verify(connection, restored=True)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertNotIn(
+            integrity.EVENT_LOG_PROBLEMS, [" ".join(s.split()) for s in connection.statements]
+        )
 
 
 class StoreVerificationTest(unittest.TestCase):

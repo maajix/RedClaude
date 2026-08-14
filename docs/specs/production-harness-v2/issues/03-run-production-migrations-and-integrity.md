@@ -162,3 +162,41 @@ the_receipt_check` now writes `ts_egress`, because that is what makes the row th
 shape RK-REG-002 produced, and `test_a_refusal_before_contact_does_not_fail_the_
 receipt_check` asserts the gate stays clear for the refusal. Removing the
 migration fails the second one by name.
+
+### A populated archive could not restore itself, 2026-08-14
+
+Live validation restored a real backup and the restore failed its own gate:
+`standing:event_log_integrity | 13 problem(s):
+(row_last_write_unaccounted,receipts,48)`, exit 9. Criterion 6 had been passing
+on an archive whose Program rows were rolled back before the dump, so the
+restored database had nothing for part (d) of the event log check to be wrong
+about.
+
+Part (d) compares a row's `xmin` -- the transaction that produced the live tuple
+-- with the transaction id recorded on its Event. `pg_restore
+--single-transaction` rewrites every tuple in the restore's own transaction
+while the Events keep the ids of the writes that really happened, so the
+comparison is false for every restored row by construction. That is not an
+emitter that was switched off; it is evidence destroyed by machinery outside the
+schema, the same class as the `xmin = 2` exclusion the check already carries for
+frozen tuples. The row degrades to part (b) -- an Event exists for it at all --
+and the restore says so rather than passing silently.
+
+The tolerance is the prototype's, unchanged: `docs/prototype/schema/restore.sh`
+decided it and measured the same 13 problems of the same one kind. It lives in
+the only caller that knows a restore happened. `integrity.verify(restored=True)`
+holds the failure as a passing check with its detail extended, and asks
+`check_event_log_integrity()` for the problem kinds rather than parsing them out
+of the standing check's detail, because what is tolerated is a kind and the
+kinds are a column. A second problem kind in the same check fails a restore
+exactly as it fails anything else. `rk db verify` stays strict, so a database
+that fails this way without anyone restoring it is still a database whose
+emitter was switched off for a write.
+
+`ArchiveTest` now opens its Program through `program.run` and commits it, so the
+archive carries rows and the case an operator actually meets is the one under
+test: `test_the_restored_database_holds_on_its_own` asserts that a plain
+`rk db verify` still fails, and only on that one problem kind;
+`test_a_populated_archive_restores_into_a_database_the_gate_accepts` asserts
+that the restore holds and that the configuration revisions survived it.
+Reverting `entitled_by_a_restore` fails the second one by name.

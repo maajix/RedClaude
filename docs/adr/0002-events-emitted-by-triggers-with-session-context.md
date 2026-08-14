@@ -47,6 +47,14 @@ must go through one helper that populates it.
 - **Dropping a trigger is the failure mode to watch.** A migration that rewrites
   a table can silently detach it. `check_event_log_integrity()` therefore checks
   `pg_trigger` against the config, not only rows against events.
+- **A restore destroys one kind of evidence, and says so.** The check ties a row
+  to its event by `xmin`, which belongs to the tuple rather than to the row.
+  `pg_restore` rewrites every tuple in its own transaction, so
+  `row_last_write_unaccounted` is false for every restored row by construction —
+  the same class as the `xmin = 2` exclusion for frozen tuples. Only
+  `rk db restore` may hold that one failure, and only when it is the sole problem
+  kind; `rk db verify` stays strict, because otherwise a detached emitter would
+  hide behind a restore that never happened.
 
 Settled in historical ticket 07, decisions 9, 11 and 17.
 Amended by migration 0030 (historical ticket 33) to record the checked
