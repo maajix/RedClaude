@@ -18,6 +18,7 @@ from redkraken import (
     __version__,
     artifact,
     backup,
+    browser,
     callback,
     decisions,
     doctor,
@@ -123,6 +124,11 @@ KEYS = _Source("artifact_key", "--key", artifact.KEY_VARIABLE)
 #: the Agent's because they are its own image: one holds an SDK and resolves a
 #: credential, and the other holds executables and must resolve nothing.
 TOOLS = _Source("tool_image", "--image", tool.IMAGE_VARIABLE)
+
+#: And the image a headless browser lives in. Its own for the same reason again:
+#: a browser image holds a browser and nothing this harness registers as a tool,
+#: and one variable for both would start whichever of them answered.
+BROWSERS = _Source("browser_image", "--image", browser.IMAGE_VARIABLE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -751,6 +757,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     invoke.set_defaults(run=_tool_run)
 
+    browsing = commands.add_parser(
+        "browser", help="drive one browser mission through the door and file what it saw"
+    )
+    missions = browsing.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    mission = missions.add_parser(
+        "run",
+        help=(
+            "walk one plan of browser steps for one agent run, behind the door, "
+            f"and file its evidence as artifacts (${DATABASE_URL})"
+        ),
+    )
+    _add_url(mission, RUNTIME)
+    _add_root(mission)
+    mission.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program this mission belongs to",
+    )
+    mission.add_argument(
+        BROWSERS.flag,
+        dest="image",
+        metavar="image",
+        help=(
+            "the image a headless browser lives in; never pulled implicitly "
+            f"(default: ${BROWSERS.variable})"
+        ),
+    )
+    mission.add_argument(
+        AUTHORITY.flag,
+        dest="authority",
+        type=Path,
+        metavar="directory",
+        help=(
+            "the door's certificate authority, whose leaf key the browser is "
+            "told to pin and to believe nothing else "
+            f"(default: ${AUTHORITY.variable})"
+        ),
+    )
+    mission.add_argument(
+        "--agent-run",
+        dest="agent_run",
+        required=True,
+        metavar="label",
+        help="the agent run this mission is made for, by its label",
+    )
+    mission.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        metavar="path",
+        help=(
+            "a JSON array of steps, each an action and its arguments; the "
+            "registry decides which actions exist and what each takes"
+        ),
+    )
+    mission.add_argument(
+        "--identity",
+        dest="identity",
+        metavar="slot",
+        help=(
+            "the Identity the door is to present, by the slot this Program "
+            "holds; the browser is never given its value"
+        ),
+    )
+    mission.set_defaults(run=_browser_run)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1345,6 +1420,97 @@ def _tool_run(arguments: argparse.Namespace) -> int:
             ),
         )
     )
+
+
+def _browser_run(arguments: argparse.Namespace) -> int:
+    """A connection, a store, an image, an authority, a door and a plan.
+
+    The door is required rather than offered, which is the one place this differs
+    from `rk tool run`: a browser that found no boundary described would be a
+    browser with a route to the internet, and the whole of this command is that
+    it has exactly one route and the door is it.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, browser.RUN)
+    root = _root(ledger, arguments.artifacts)
+    image = browser.image_from_environment(arguments.image)
+    if image is None:
+        ledger.fail(
+            BROWSERS.fact,
+            f"no browser image: pass {BROWSERS.flag} or set {BROWSERS.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{BROWSERS.variable}",
+        )
+    authority = _path(AUTHORITY, arguments.authority)
+    if authority is None:
+        ledger.fail(
+            AUTHORITY.fact,
+            f"no certificate authority: pass {AUTHORITY.flag} or set {AUTHORITY.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{AUTHORITY.variable}",
+        )
+    steps = _plan(ledger, arguments.plan)
+    door, missing = execution.boundary(os.environ)
+    if missing:
+        ledger.fail(
+            "boundary",
+            "no Agent boundary is described, and a browser has no other route: "
+            + ", ".join(missing),
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{missing[0]}",
+        )
+    if runtime is None or root is None or image is None or authority is None:
+        return _render(report(browser.RUN, ledger))
+    if steps is None or door is None:
+        return _render(report(browser.RUN, ledger))
+    return _render(
+        _guarded(
+            browser.RUN,
+            lambda: browser.run(
+                runtime,
+                arguments.config,
+                root=root,
+                image=image,
+                authority=authority,
+                agent_run=arguments.agent_run,
+                steps=steps,
+                identity_slot=arguments.identity,
+                door=door,
+            ),
+        )
+    )
+
+
+def _plan(ledger: Ledger, path: Path) -> list | None:
+    """The steps an operator wrote, as a document rather than as a shape.
+
+    Nothing here decides whether a step is acceptable -- that is the registry's,
+    and a second opinion in the adapter would be a second place to keep in step.
+    What is decided here is only that the file is readable and holds a JSON array
+    at all, because the alternative is a refusal from the database quoting a type
+    error at an operator who mistyped a filename.
+    """
+    try:
+        document = json.loads(Path(path).read_bytes())
+    except OSError as error:
+        ledger.fail(
+            "plan", f"{path} cannot be read: {error}",
+            code=INVALID_CONFIGURATION, source="argument:--plan",
+        )
+        return None
+    except ValueError as error:
+        ledger.fail(
+            "plan", f"{path} is not readable JSON: {error}",
+            code=INVALID_CONFIGURATION, source="argument:--plan",
+        )
+        return None
+    if not isinstance(document, list):
+        ledger.fail(
+            "plan", f"{path} holds {type(document).__name__}, not an array of steps",
+            code=INVALID_CONFIGURATION, source="argument:--plan",
+        )
+        return None
+    return document
 
 
 def _pairs(ledger: Ledger, given: list[str]) -> dict[str, str] | None:

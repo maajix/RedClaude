@@ -32,6 +32,7 @@ no second store left to consult.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import re
@@ -189,15 +190,33 @@ class Authority:
         context.set_alpn_protocols(ALPN)
         return context
 
-    def _leaf(self, host: str) -> tuple[Path, Path]:
-        """Issue -- or find -- the certificate that names one host.
+    def pin(self) -> str:
+        """This run's leaf public key, as a client pins one.
 
-        Named by a digest rather than by the host, because the host is untrusted
-        input and a file name is a path. The digest is not a secret; it is a
-        stable name that cannot contain a separator.
+        Base64 of the SHA-256 of the subject public key info, which is the shape
+        `--ignore-certificate-errors-spki-list` takes and the shape every other
+        pinning client takes. One value covers every host, because every leaf
+        this authority issues is signed over the same key -- which is what makes
+        a pin usable at all for a proxy that certifies hosts it has not met yet.
+
+        The pin is for a client that cannot be given a certificate store. It is
+        narrower than the alternative it replaces, not wider: a browser told to
+        ignore certificate errors trusts anything, and a browser told this
+        trusts one key that exists for the length of one run and is held in a
+        directory the door owns.
         """
-        if not HOST.match(host):
-            raise Unusable(f"{host!r} is not a host this door can certify")
+        spki = _run(
+            [OPENSSL, "pkey", "-in", str(self._signing_key()), "-pubout", "-outform", "DER"]
+        )
+        return base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+
+    def _signing_key(self) -> Path:
+        """The one key every leaf is issued over, made if it is not there.
+
+        One key rather than one per host: issuing is two forks and a key
+        generation, and the host-by-host part is the certificate, not the key.
+        It is also what makes `pin` a single value.
+        """
         key = self.directory / "leaf-key.pem"
         if not key.exists():
             _run(
@@ -209,6 +228,18 @@ class Authority:
                 ]
             )
             _own(key)
+        return key
+
+    def _leaf(self, host: str) -> tuple[Path, Path]:
+        """Issue -- or find -- the certificate that names one host.
+
+        Named by a digest rather than by the host, because the host is untrusted
+        input and a file name is a path. The digest is not a secret; it is a
+        stable name that cannot contain a separator.
+        """
+        if not HOST.match(host):
+            raise Unusable(f"{host!r} is not a host this door can certify")
+        key = self._signing_key()
         stamp = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
         certificate = self.directory / f"leaf-{stamp}.pem"
         if certificate.exists():
@@ -336,21 +367,29 @@ def _own(path: Path) -> None:
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
-def _run(command: list[str]) -> None:
+def _run(command: list[str]) -> bytes:
     """One `openssl` invocation, or the reason it could not be one.
 
     The missing-program case is answered before the call rather than caught
     after it, because `FileNotFoundError` from `subprocess` names the program
     and not what the operator has to install.
+
+    Bytes come back because one caller asks for a key in DER, and the callers
+    whose output is a file it wrote ignore them. Read as bytes throughout rather
+    than by a flag the caller passes: what `openssl` prints is binary or text
+    depending on the subcommand, and the one place that matters -- the refusal
+    below -- has to survive either.
     """
     if shutil.which(command[0]) is None:
         raise Missing(
             f"{command[0]} is not on PATH; it issues the certificate that lets this "
             "door see inside a tunnel"
         )
-    finished = subprocess.run(command, capture_output=True, text=True, check=False)
+    finished = subprocess.run(command, capture_output=True, check=False)
     if finished.returncode != 0:
-        detail = (finished.stderr or finished.stdout).strip().splitlines()
+        said = (finished.stderr or finished.stdout).decode("utf-8", "replace")
+        detail = said.strip().splitlines()
         raise Unusable(
             f"{command[0]} {command[1]} refused: {detail[-1] if detail else 'no output'}"
         )
+    return finished.stdout

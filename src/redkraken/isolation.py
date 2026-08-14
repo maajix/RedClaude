@@ -336,6 +336,7 @@ def run_tool(
     inputs: Mapping[str, bytes] | None = None,
     outputs: Sequence[str] = (),
     network: str = "none",
+    scratch_mb: int = 16,
 ) -> ToolProcess:
     """Run one registry-described tool, bounded, and read back what it produced.
 
@@ -367,6 +368,8 @@ def run_tool(
         raise Unavailable("an offline tool needs a positive timeout and output bound")
     if network not in ("none", "proxy"):
         raise Unavailable(f"an offline tool has no network or the proxy, not {network}")
+    if not 1 <= scratch_mb <= 1024:
+        raise Unavailable(f"a tool's scratch tmpfs is between 1MB and 1GB, not {scratch_mb}")
 
     engine = _engine(container.engine)
     watched = sorted(
@@ -413,8 +416,14 @@ def run_tool(
         docker = [
             *_hardened(engine, name),
             *routing,
+            # The scratch a tool is given, and the reason it is a parameter: a
+            # command-line tool needs somewhere to put a few kilobytes, and a
+            # browser needs somewhere to put its shared memory because
+            # `--disable-dev-shm-usage` sends it here.  The mount options do not
+            # move -- what a tool may do with its scratch is not negotiable, and
+            # only how much of it there is.
             "--tmpfs",
-            f"{TMPDIR}:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            f"{TMPDIR}:rw,nosuid,nodev,noexec,size={scratch_mb}m,mode=1777",
             "--memory",
             f"{ceilings.memory_mb}m",
             # The same number again: a memory ceiling a container may page past

@@ -41,9 +41,11 @@ import ssl
 import threading
 import time
 import unittest
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
 from redkraken import (
     _launch,
@@ -51,6 +53,7 @@ from redkraken import (
     agent,
     artifact,
     backup,
+    browser,
     callback,
     capsule,
     config,
@@ -59,6 +62,7 @@ from redkraken import (
     header,
     identity,
     integrity,
+    isolation,
     migrate,
     operator,
     packet,
@@ -86,6 +90,7 @@ from redkraken.outcome import (
     Report,
 )
 from redkraken.store import Store
+from tests import ROOT, browser_door, browser_target
 from tests.fixtures import (
     AGENT_IMAGE,
     EXPORTED,
@@ -1561,6 +1566,60 @@ CONTROLS = (
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
         "                'jq', 'jq-1.7.1', now());"
         " END $ctl$",
+    ),
+    Control(
+        # PH2-31 criterion 1, which is the whole point of running a browser
+        # behind the door: a mission that counted a request the door wrote no
+        # Receipt for is bytes that left another way. The row is written by hand
+        # because no verb writes it -- `record_browser_step` will happily record
+        # the count, and the fault only exists once the Receipts are compared
+        # against it. The step also loads a document, so the second arm fires on
+        # the same row: a navigation with no Receipt at all is the same escape
+        # seen from the other side.
+        "standing:browser_runs",
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid; a uuid; t uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('browser-escape-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'browser-escape', 'tech:browser-escape')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'recon', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'recon', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO a;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport)"
+        "        VALUES (p, a, 'mcp__rk2__browse', '{}'::jsonb, 'running', 'runtime')"
+        "     RETURNING id INTO t;"
+        "   INSERT INTO browser_runs (tool_run_id, program_id, plan_sha256)"
+        "        VALUES (t, p, repeat('a', 64));"
+        "   INSERT INTO browser_steps (tool_run_id, ordinal, program_id, action, arguments)"
+        "        VALUES (t, 1, p, 'navigate',"
+        "                '{\"url\":\"https://app.example.com/api/orders\"}'::jsonb);"
+        "   INSERT INTO browser_step_results"
+        "        (tool_run_id, ordinal, program_id, outcome, network_requests)"
+        "        VALUES (t, 1, p, '{\"http_status\":200,\"scope_class\":\"target\","
+        "                           \"document_loaded\":true}'::jsonb, 1);"
+        " END $ctl$",
+    ),
+    Control(
+        # PH2-31 criterion 3, and the reason the probe registry is the owner's:
+        # a probe is javascript that runs in the page, so one that reads the
+        # cookie jar hands the Agent the credential the door exists to keep from
+        # it. Registered, not run -- what the check finds is the registration.
+        "standing:browser_runs",
+        "INSERT INTO browser_probes (probe, payload, javascript, verdicts, description)"
+        " VALUES ('cookie_reader', NULL, 'return document.cookie;',"
+        "         '{present,absent}', 'a self test probe that reads what it may not')",
+    ),
+    Control(
+        # The registry is the runtime's. A model that can read `browser_probes`
+        # knows which marker every verdict turns on, and reads its own scoring
+        # rubric before it is scored.
+        "standing:browser_runs",
+        "GRANT SELECT ON browser_probes TO rk2_state",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -16633,6 +16692,49 @@ def offline_agent_run(
     )
 
 
+def claimed_agent_run(
+    connection: pg.Connection,
+    owner: pg.Connection,
+    program_id: str,
+    *,
+    role: str,
+    kind: str,
+) -> str:
+    """One agent run whose Task is claimed and leased, as a capability needs it.
+
+    `offline_agent_run` leaves the Task open, which is everything an offline tool
+    needs. A Tool run that makes requests goes through `authorize_tool_run`, and
+    that verb refuses any run whose Task is no longer held -- so a mission
+    arranged the other way would be refused before its first request rather than
+    at the assertion it was written for.
+
+    The Task is written by the owner because `claim_task` needs a live offer on
+    the slate, which is a scheduler no caller here is exercising, and over a
+    throwaway Entity because two live Tasks of one kind over one subject are the
+    same Task and the schema says so.
+    """
+    subject = offline_entity(connection, program_id)
+    with owner.transaction():
+        owner.execute("SET LOCAL ROLE rk2_owner")
+        owner.execute("SELECT set_actor('runtime', 'selftest')")
+        task = str(
+            owner.execute(
+                "INSERT INTO tasks (program_id, kind, subject_entity_id, status,"
+                "                   claimed_at, lease_expires_at)"
+                " VALUES ($1::uuid, $2, $3::uuid, 'claimed', now(),"
+                "         now() + interval '30 minutes')"
+                " RETURNING id::text",
+                (program_id, kind, subject),
+            ).scalar()
+        )
+    return committed(
+        connection,
+        "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        " VALUES ($1::uuid, $2::uuid, $3, 'operator', 'low', '{}'::jsonb) RETURNING id",
+        (program_id, task, role),
+    )
+
+
 def offline_reference(connection: pg.Connection, program_id: str, data: bytes) -> str:
     """One Artifact a Program holds, by the label an argument names it with.
 
@@ -17607,6 +17709,1260 @@ class OfflineToolCommandTest(DatabaseCase):
         ).rows
 
         self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+BROWSER_SLUG = "selftest-browser"
+
+#: Where every mission here navigates. `VALID` scopes `app.example.com` under
+#: `/api/`, so this is the one URL the policy admits and the next one is the
+#: nearest thing to it that it does not.
+BROWSER_IN_SCOPE = "https://app.example.com/api/orders"
+BROWSER_OUT_OF_SCOPE = "https://admin.example.com/"
+
+#: The plan both twins walk, and the shape a browser mission has: arrive, wait
+#: for the page to be there, plant a probe's payload, submit it, wait for the
+#: answer, read the probe, and keep what the page became. Seven steps because
+#: every action in the registry that matters to a criterion appears once.
+BROWSER_PLAN = (
+    {"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE}},
+    {"action": "wait_for", "arguments": {"selector": "form#login"}},
+    {
+        "action": "inject",
+        "arguments": {"selector": "input[name=q]", "probe": "markup_injection"},
+    },
+    {"action": "click", "arguments": {"selector": "button[type=submit]"}},
+    {"action": "probe", "arguments": {"probe": "markup_injection"}},
+    {"action": "capture_dom", "arguments": {}},
+    {"action": "screenshot", "arguments": {}},
+)
+
+#: What each step of that plan reports, by ordinal. The keys are the registry's
+#: per action, which is what makes the digest a statement about behaviour: two
+#: runs of one plan differ here or they do not differ at all.
+BROWSER_OUTCOMES = {
+    1: {"http_status": 200, "scope_class": "target", "document_loaded": True},
+    2: {"matched": True},
+    3: {"matched": True},
+    4: {"matched": True},
+    5: {"verdict": "reflected"},
+    6: {"captured": True},
+    7: {"captured": True},
+}
+
+#: What one mission is recorded as having kept. Bytes rather than a description,
+#: because the link carries the size and the digest of what was stored and a
+#: placeholder would make both of them arbitrary.
+BROWSER_DOM = b"<!doctype html><title>fixture</title><rk-probe id=rk-probe-marker></rk-probe>"
+BROWSER_SHOT = b"\x89PNG\r\n\x1a\n" + b"pretend this is a screenshot" * 4
+BROWSER_CONSOLE = b'{"level":"log","text":"hello"}\n'
+BROWSER_PROBE = b'{"verdict":"reflected","node_count":1,"marker_in_text":false}'
+
+
+class BrowserMissionTest(DatabaseCase):
+    """PH2-31 criteria 3, 4, 5 and 6, as the database decides them.
+
+    A browser mission is a plan the database compiles before a container starts:
+    every step is an action this browser performs, every argument is one that
+    action declares, every value is of a kind the registry names, and the one
+    URL in it is inside the current scope. So the refusals here are refusals to
+    write a row rather than refusals to navigate -- a plan that would leave the
+    scope never reaches the door, because the run it would have been part of
+    does not exist.
+
+    After that the order is the same three moments an offline tool run has, and
+    each has a refusal saying what the previous one was for: the row is opened
+    and committed, outcomes and Artifacts are attached to it, and only then does
+    it close. What is different is what may be attached. An outcome may only
+    have the keys its action declares and only hold canonical values, because
+    the digest is computed over exactly those -- a timestamp or an identifier in
+    one would make two runs of one plan differ for a reason that is not
+    behaviour. And a stream may only be linked to the step that produced it,
+    because an Artifact nobody can attribute to a step is evidence of nothing.
+
+    The twin is criterion 6: two runs of one plan, digested. They agree on the
+    plan and differ on the result, which is what distinguishes replay that reads
+    behaviour from replay that reproduces a recording.
+
+    Everything runs as `rk2_runtime` and commits. The Programs are purged at the
+    end. `BrowserCommandTest` is the other half -- the same verbs with a real
+    browser, a real door and a real target behind them.
+    """
+
+    settings_for = "runtime"
+
+    OPEN = "SELECT open_browser_run($1::uuid, $2::jsonb, $3)"
+    STEP = "SELECT record_browser_step($1::uuid, $2::integer, $3::jsonb, $4::integer)"
+    CLOSE = "SELECT close_browser_run($1::uuid, $2, $3)"
+    LINK = (
+        "INSERT INTO tool_run_artifacts"
+        " (program_id, tool_run_id, stream, output_name, browser_step_ordinal,"
+        "  sha256, produced_bytes, truncated)"
+        " VALUES ($1::uuid, $2::uuid, $3, $4, $5::integer, $6, $7::bigint, false)"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{BROWSER_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+        cls.owner_connection = pg.connect(cls.harness.migrate)
+
+        cls.refusals = {}
+        cls.refuse_before_the_row_exists()
+        cls.open_the_mission()
+        cls.record_the_outcomes()
+        cls.keep_what_it_saw()
+        cls.close_the_mission()
+        cls.walk_it_again_as_the_other_twin()
+        cls.leave_one_unfinished()
+        cls.refuse_after_the_close()
+        cls.problems = cls.connection.execute("SELECT * FROM check_browser_runs()").rows
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (BROWSER_SLUG,))
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                (
+                    "{"
+                    + ",".join(
+                        artifact.digest(item)
+                        for item in (BROWSER_DOM, BROWSER_SHOT, BROWSER_CONSOLE, BROWSER_PROBE)
+                    )
+                    + "}",
+                ),
+            )
+        cls.owner_connection.close()
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def called(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One verb whose answer is a document, committed."""
+        return json.loads(committed(cls.connection, sql, parameters))
+
+    @classmethod
+    def receipted(cls, tool_run: str) -> None:
+        """The capability one walk of the plan spends, and the Receipts it leaves.
+
+        `authorize_tool_run` first, through the same constant the real mission
+        goes through, because an `allowed` Receipt on the agent lane is refused
+        unless the Tool run it names holds a live capability: that rule is what
+        makes a Receipt evidence of a request some door let through rather than
+        a row anybody can write.
+
+        The Receipts themselves are written by the owner because the door writes
+        them as `rk2_proxy` through a verb this case is not testing, and left
+        without an egress timestamp because nothing was sent: what these rows
+        carry is the one fact `check_browser_runs` reads them for, which is that
+        a request the browser counted is a request the door saw. A mission whose
+        navigation loaded a document and has no Receipt behind it reached the
+        network another way, so a case that recorded outcomes without these
+        would be asserting the verbs by leaving the control it has to satisfy
+        broken.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(proxy.AUTHORIZE_TOOL_RUN, (tool_run,))
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for method in ("GET", "POST"):
+                cls.owner_connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    "                      method, scheme, host, port, path, status_code,"
+                    "                      ts_arrival, scope_class, scope_version)"
+                    " VALUES ($1::uuid, $2::uuid, 'agent', 'allowed',"
+                    "         'allowed as target under scope version 1', $3, 'https',"
+                    "         'app.example.com', 443, '/api/orders', 200, now(), 'target', 1)",
+                    (cls.program_id, tool_run, method),
+                )
+
+    @classmethod
+    def refuse(cls, sql: str, parameters: tuple = ()) -> str:
+        return refused(cls.connection, sql, parameters)
+
+    @classmethod
+    def opening(cls, steps, *, run: str | None = None, slot: str | None = None) -> tuple:
+        """One call on `open_browser_run`, as its three parameters."""
+        return (run or cls.mission_run(), json.dumps(list(steps)), slot)
+
+    @classmethod
+    def mission_run(cls) -> str:
+        """One agent run under a claimed Task, fresh each time it is asked for.
+
+        Fresh because a mission is a Tool run of an agent run, and the cases
+        below open several: sharing one would make every assertion about a run
+        an assertion about whichever mission got there first.
+        """
+        return claimed_agent_run(
+            cls.connection, cls.owner_connection, cls.program_id, role="recon", kind="recon"
+        )
+
+    @classmethod
+    def held(cls, data: bytes) -> str:
+        """Bytes on record and a reference this Program holds, by their digest.
+
+        `tool_output` rather than `source`: what a browser produced is output of
+        a run, and the link the mission writes resolves through this row.
+        """
+        digest = artifact.digest(data)
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+                " VALUES ($1, $2::bigint, 'application/octet-stream', 'agent_visible')"
+                " ON CONFLICT (sha256) DO NOTHING",
+                (digest, len(data)),
+            )
+        committed(
+            cls.connection,
+            "INSERT INTO artifact_references (program_id, sha256, kind)"
+            " VALUES ($1::uuid, $2, 'tool_output') RETURNING label",
+            (cls.program_id, digest),
+        )
+        return digest
+
+    # -- criterion 3 and the plan: everything decided before the row exists -----
+
+    @classmethod
+    def refuse_before_the_row_exists(cls):
+        cls.refusals.update(
+            unknown_action=cls.refuse(cls.OPEN, cls.opening([{"action": "hack", "arguments": {}}])),
+            extra_argument=cls.refuse(
+                cls.OPEN,
+                cls.opening(
+                    [{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE, "depth": "2"}}]
+                ),
+            ),
+            missing_argument=cls.refuse(
+                cls.OPEN, cls.opening([{"action": "navigate", "arguments": {}}])
+            ),
+            unusable_scheme=cls.refuse(
+                cls.OPEN,
+                cls.opening([{"action": "navigate", "arguments": {"url": "file:///etc/passwd"}}]),
+            ),
+            fragment=cls.refuse(
+                cls.OPEN,
+                cls.opening(
+                    [{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE + "#top"}}]
+                ),
+            ),
+            out_of_scope=cls.refuse(
+                cls.OPEN,
+                cls.opening([{"action": "navigate", "arguments": {"url": BROWSER_OUT_OF_SCOPE}}]),
+            ),
+            unknown_probe=cls.refuse(
+                cls.OPEN, cls.opening([{"action": "probe", "arguments": {"probe": "nope"}}])
+            ),
+            script_in_a_selector=cls.refuse(
+                cls.OPEN,
+                cls.opening([{"action": "wait_for", "arguments": {"selector": "a{x};alert(1)"}}]),
+            ),
+            value_that_is_not_text=cls.refuse(
+                cls.OPEN,
+                cls.opening(
+                    [{"action": "wait_for", "arguments": {"selector": "a", "timeout_ms": 500}}]
+                ),
+            ),
+            empty_plan=cls.refuse(cls.OPEN, cls.opening([])),
+            # The Identity half of criterion 3: a slot the Program does not hold
+            # is refused here rather than at the door, because the capability the
+            # door spends is minted from a run that never opened.
+            unheld_identity=cls.refuse(cls.OPEN, cls.opening(BROWSER_PLAN, slot="member")),
+        )
+
+    @classmethod
+    def open_the_mission(cls):
+        cls.plan = cls.called(cls.OPEN, cls.opening(BROWSER_PLAN))
+        cls.tool_run = cls.plan["tool_run_id"]
+        cls.opened = cls.connection.execute(
+            "SELECT tool, status, args ->> 'identity_slot', args -> 'methods', args ->> 'steps',"
+            "       started_at IS NOT NULL, finished_at IS NULL"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (cls.tool_run,),
+        ).rows[0]
+        # The same plan opened by a run that only reads. Its methods are the
+        # claim: what a mission may send is derived from what its plan does,
+        # rather than declared by whoever wrote the plan.
+        cls.read_only = cls.called(
+            cls.OPEN,
+            cls.opening([{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE}}]),
+        )
+
+    # -- criterion 5: what a step may report -----------------------------------
+
+    @classmethod
+    def record_the_outcomes(cls):
+        cls.refusals.update(
+            outcome_with_an_extra_key=cls.refuse(
+                cls.STEP, (cls.tool_run, 2, json.dumps({"matched": True, "at": "now"}), 0)
+            ),
+            outcome_missing_a_key=cls.refuse(
+                cls.STEP, (cls.tool_run, 1, json.dumps({"http_status": 200}), 0)
+            ),
+            outcome_carrying_a_timestamp=cls.refuse(
+                cls.STEP, (cls.tool_run, 2, json.dumps({"matched": "2026-08-14T00:00:00Z"}), 0)
+            ),
+            outcome_carrying_an_identifier=cls.refuse(
+                cls.STEP,
+                (
+                    cls.tool_run,
+                    2,
+                    json.dumps({"matched": "0198c0de-0000-7000-8000-000000000000"}),
+                    0,
+                ),
+            ),
+            verdict_the_probe_does_not_give=cls.refuse(
+                cls.STEP, (cls.tool_run, 5, json.dumps({"verdict": "exploited"}), 0)
+            ),
+            step_that_is_not_in_the_plan=cls.refuse(
+                cls.STEP, (cls.tool_run, 8, json.dumps({"captured": True}), 0)
+            ),
+        )
+        cls.receipted(cls.tool_run)
+        for ordinal, outcome in sorted(BROWSER_OUTCOMES.items()):
+            committed(
+                cls.connection,
+                cls.STEP,
+                (cls.tool_run, ordinal, json.dumps(outcome), 1 if ordinal in (1, 4) else 0),
+            )
+        cls.refusals["step_recorded_twice"] = cls.refuse(
+            cls.STEP, (cls.tool_run, 2, json.dumps({"matched": True}), 0)
+        )
+
+    # -- criterion 4: what may be linked to a mission --------------------------
+
+    @classmethod
+    def keep_what_it_saw(cls):
+        cls.refusals["close_with_nothing_kept"] = cls.refuse(
+            cls.CLOSE, (cls.tool_run, "success", None)
+        )
+        cls.digests = {
+            "dom": cls.held(BROWSER_DOM),
+            "screenshot": cls.held(BROWSER_SHOT),
+            "console": cls.held(BROWSER_CONSOLE),
+            "probe": cls.held(BROWSER_PROBE),
+        }
+        cls.refusals.update(
+            stream_of_the_other_kind_of_run=cls.refuse(
+                cls.LINK,
+                (
+                    cls.program_id,
+                    cls.tool_run,
+                    "stdout",
+                    None,
+                    None,
+                    cls.digests["dom"],
+                    len(BROWSER_DOM),
+                ),
+            ),
+            capture_with_no_step=cls.refuse(
+                cls.LINK,
+                (
+                    cls.program_id,
+                    cls.tool_run,
+                    "dom",
+                    None,
+                    None,
+                    cls.digests["dom"],
+                    len(BROWSER_DOM),
+                ),
+            ),
+            probe_on_a_step_that_does_not_run_it=cls.refuse(
+                cls.LINK,
+                (
+                    cls.program_id,
+                    cls.tool_run,
+                    "probe",
+                    "markup_injection",
+                    6,
+                    cls.digests["probe"],
+                    len(BROWSER_PROBE),
+                ),
+            ),
+        )
+        for stream, name, ordinal, digest, data in (
+            ("dom", None, 6, cls.digests["dom"], BROWSER_DOM),
+            ("screenshot", None, 7, cls.digests["screenshot"], BROWSER_SHOT),
+            ("console", None, None, cls.digests["console"], BROWSER_CONSOLE),
+            ("probe", "markup_injection", 5, cls.digests["probe"], BROWSER_PROBE),
+        ):
+            committed(
+                cls.connection,
+                cls.LINK + " RETURNING id",
+                (cls.program_id, cls.tool_run, stream, name, ordinal, digest, len(data)),
+            )
+        cls.refusals["console_twice"] = cls.refuse(
+            cls.LINK,
+            (
+                cls.program_id,
+                cls.tool_run,
+                "console",
+                None,
+                None,
+                cls.digests["console"],
+                len(BROWSER_CONSOLE),
+            ),
+        )
+
+    @classmethod
+    def close_the_mission(cls):
+        cls.closed = cls.called(cls.CLOSE, (cls.tool_run, "success", None))
+
+    # -- criterion 6: the same plan, the other twin ----------------------------
+
+    @classmethod
+    def walk_it_again_as_the_other_twin(cls):
+        cls.twin = cls.called(cls.OPEN, cls.opening(BROWSER_PLAN))
+        cls.receipted(cls.twin["tool_run_id"])
+        # The same walk, differing in one place: the target escaped the payload
+        # the other reflected. Everything else is held identical on purpose --
+        # two digests that differed for a second reason would say nothing about
+        # which of the two the digest is sensitive to.
+        escaped = {**BROWSER_OUTCOMES, 5: {"verdict": "escaped"}}
+        for ordinal, outcome in sorted(escaped.items()):
+            committed(
+                cls.connection,
+                cls.STEP,
+                (
+                    cls.twin["tool_run_id"],
+                    ordinal,
+                    json.dumps(outcome),
+                    1 if ordinal in (1, 4) else 0,
+                ),
+            )
+        committed(
+            cls.connection,
+            cls.LINK + " RETURNING id",
+            (
+                cls.program_id,
+                cls.twin["tool_run_id"],
+                "console",
+                None,
+                None,
+                cls.digests["console"],
+                len(BROWSER_CONSOLE),
+            ),
+        )
+        cls.twin_closed = cls.called(cls.CLOSE, (cls.twin["tool_run_id"], "success", None))
+
+    @classmethod
+    def leave_one_unfinished(cls):
+        cls.unfinished = cls.called(cls.OPEN, cls.opening(BROWSER_PLAN))
+        cls.refusals["success_without_the_whole_plan"] = cls.refuse(
+            cls.CLOSE, (cls.unfinished["tool_run_id"], "success", None)
+        )
+        cls.errored = cls.called(
+            cls.CLOSE, (cls.unfinished["tool_run_id"], "error", "the browser did not start")
+        )
+
+    @classmethod
+    def refuse_after_the_close(cls):
+        cls.refusals.update(
+            closed_twice=cls.refuse(cls.CLOSE, (cls.tool_run, "success", None)),
+            linked_after_the_close=cls.refuse(
+                cls.LINK,
+                (
+                    cls.program_id,
+                    cls.tool_run,
+                    "dom",
+                    None,
+                    6,
+                    cls.digests["dom"],
+                    len(BROWSER_DOM),
+                ),
+            ),
+            recorded_after_the_close=cls.refuse(
+                cls.STEP, (cls.tool_run, 1, json.dumps(BROWSER_OUTCOMES[1]), 0)
+            ),
+            outcome_edited=cls.refuse(
+                "UPDATE browser_step_results SET outcome = '{}'::jsonb"
+                " WHERE tool_run_id = $1::uuid",
+                (cls.tool_run,),
+            ),
+            step_edited=cls.refuse(
+                "UPDATE browser_steps SET action = 'screenshot' WHERE tool_run_id = $1::uuid",
+                (cls.tool_run,),
+            ),
+        )
+
+    # -- the assertions --------------------------------------------------------
+
+    def test_a_plan_this_browser_cannot_perform_never_opens_a_run(self):
+        # Every one of these is decided against the registry, so none of them is
+        # a browser that started and stopped: the plan is the allowlist, and a
+        # step outside it is a row the verb declines to write.
+        for name, expected in (
+            ("unknown_action", "names no action this browser performs"),
+            ("extra_argument", "takes no argument named"),
+            ("missing_argument", "requires the argument"),
+            ("unusable_scheme", "is not a well formed url"),
+            ("script_in_a_selector", "is not a well formed selector"),
+            ("value_that_is_not_text", "is given as text"),
+            ("unknown_probe", "no probe named"),
+            ("empty_plan", "has between 1 and"),
+        ):
+            with self.subTest(name):
+                self.assertIn(expected, self.refusals[name])
+
+    def test_a_plan_that_leaves_the_scope_is_refused_before_the_door_sees_it(self):
+        # The door would refuse this request anyway, which is the point: a
+        # mission whose first step is out of scope would spend a real capability
+        # to be told no. The scope is read once, here, and the run never opens.
+        self.assertIn("navigates outside the current scope", self.refusals["out_of_scope"])
+        # And the same policy on a URL that is in scope but not canonical: a
+        # fragment is not sent, so a plan carrying one describes a navigation
+        # nobody can check against the Receipt it produces.
+        self.assertIn("is not a well formed", self.refusals["fragment"])
+
+    def test_an_identity_the_program_does_not_hold_never_reaches_the_door(self):
+        self.assertIn("Identity lease refused", self.refusals["unheld_identity"])
+
+    def test_the_mission_is_a_row_before_the_browser_starts(self):
+        tool_name, status, slot, methods, steps, started, open_still = self.opened
+
+        self.assertEqual(("mcp__rk2__browse", "running"), (str(tool_name), str(status)))
+        self.assertIsNone(slot)
+        self.assertEqual(str(len(BROWSER_PLAN)), str(steps))
+        self.assertEqual((True, True), (bool(started), bool(open_still)))
+        self.assertEqual(sorted(json.loads(methods)), self.plan["methods"])
+
+    def test_the_methods_a_mission_may_use_are_derived_from_the_plan_it_walks(self):
+        # The full plan submits a form, so it may POST. The read-only plan does
+        # nothing but arrive, so it may not -- and the door holds the capability
+        # to exactly that, which is why this is derived rather than declared.
+        self.assertIn("POST", self.plan["methods"])
+        self.assertEqual(["GET", "HEAD", "OPTIONS"], sorted(self.read_only["methods"]))
+
+    def test_the_plan_the_container_walks_carries_the_registry_rather_than_the_model(self):
+        # What the driver is handed is the registry's answer to each step: the
+        # payload an `inject` types, the javascript a `probe` evaluates, and the
+        # verdicts it may come back with. None of the three is in the plan the
+        # caller wrote, because a model that could write them could write a probe
+        # that reads the cookie jar.
+        inject, probe = self.plan["steps"][2], self.plan["steps"][4]
+
+        self.assertTrue(inject["payload"])
+        self.assertTrue(probe["javascript"])
+        self.assertIn("reflected", probe["verdicts"])
+        self.assertNotIn("payload", dict(BROWSER_PLAN[2]["arguments"]))
+        # And the ceilings the container runs under come from the same place.
+        self.assertGreater(int(self.plan["timeout_seconds"]), 0)
+        self.assertGreater(int(self.plan["max_artifact_bytes"]), 0)
+
+    def test_an_outcome_the_digest_cannot_read_is_refused(self):
+        # Criterion 5 is a claim about what the digest is over, so it is enforced
+        # where the outcome is written: the keys are the action's, and the values
+        # are booleans, small integers and lowercase words. A timestamp or a
+        # generated identifier would make two runs of one plan differ for a
+        # reason that is not behaviour.
+        for name, expected in (
+            ("outcome_with_an_extra_key", "has no outcome named"),
+            ("outcome_missing_a_key", "must report"),
+            ("outcome_carrying_a_timestamp", "is not a canonical value"),
+            ("outcome_carrying_an_identifier", "is not a canonical value"),
+            ("verdict_the_probe_does_not_give", "does not return the verdict"),
+            ("step_that_is_not_in_the_plan", "has no step"),
+            # The key rather than a sentence: a step is recorded once because
+            # the row is the primary key, which is a rule no verb can be talked
+            # out of by being called a second way.
+            ("step_recorded_twice", "browser_step_results_pkey"),
+        ):
+            with self.subTest(name):
+                self.assertIn(expected, self.refusals[name])
+
+    def test_only_what_a_browser_produces_may_be_linked_to_a_mission(self):
+        self.assertIn(
+            "does not belong to this kind of run", self.refusals["stream_of_the_other_kind_of_run"]
+        )
+        # And the same rule the other way round, as a constraint rather than a
+        # sentence: what a browser captured is a capture of one step, so a `dom`
+        # with no ordinal on it is evidence nobody can attribute.
+        self.assertIn("tool_run_artifacts_browser_step_ck", self.refusals["capture_with_no_step"])
+        self.assertIn(
+            "does not run the probe", self.refusals["probe_on_a_step_that_does_not_run_it"]
+        )
+        self.assertTrue(self.refusals["console_twice"])
+
+    def test_every_artifact_is_attributable_to_the_step_that_produced_it(self):
+        kept = [
+            (str(stream), None if name is None else str(name), ordinal, str(sha256), int(size))
+            for stream, name, ordinal, sha256, size in self.connection.execute(
+                "SELECT a.stream, a.output_name, a.browser_step_ordinal, a.sha256, f.byte_size"
+                "  FROM tool_run_artifacts a JOIN artifacts f ON f.sha256 = a.sha256"
+                " WHERE a.tool_run_id = $1::uuid ORDER BY a.stream",
+                (self.tool_run,),
+            ).rows
+        ]
+
+        self.assertEqual(
+            [
+                ("console", None, None, artifact.digest(BROWSER_CONSOLE), len(BROWSER_CONSOLE)),
+                ("dom", None, 6, artifact.digest(BROWSER_DOM), len(BROWSER_DOM)),
+                ("probe", "markup_injection", 5, artifact.digest(BROWSER_PROBE), len(BROWSER_PROBE)),
+                ("screenshot", None, 7, artifact.digest(BROWSER_SHOT), len(BROWSER_SHOT)),
+            ],
+            kept,
+        )
+
+    def test_a_mission_that_kept_nothing_does_not_close_as_a_success(self):
+        self.assertIn("stored none of what it saw", self.refusals["close_with_nothing_kept"])
+
+    def test_a_mission_that_walked_part_of_its_plan_does_not_close_as_a_success(self):
+        self.assertIn("recorded 0 of its 7 step(s)", self.refusals["success_without_the_whole_plan"])
+        self.assertEqual("error", self.errored["status"])
+        self.assertIsNone(self.errored["result_digest"])
+
+    def test_a_mission_closes_once_and_is_sealed_afterwards(self):
+        self.assertEqual(
+            ("success", len(BROWSER_PLAN), len(BROWSER_PLAN), 4),
+            (
+                self.closed["status"],
+                self.closed["steps"],
+                self.closed["recorded"],
+                self.closed["artifacts"],
+            ),
+        )
+        self.assertRegex(self.closed["result_digest"], "^[0-9a-f]{64}$")
+        for name in (
+            "closed_twice",
+            "linked_after_the_close",
+            "recorded_after_the_close",
+            "outcome_edited",
+            "step_edited",
+        ):
+            with self.subTest(name):
+                self.assertTrue(self.refusals[name])
+
+    def test_two_twins_agree_on_the_plan_and_differ_on_what_it_found(self):
+        # Criterion 6. The plan digest is over what was asked, so it is the same
+        # for both; the result digest is over what came back, so a target that
+        # escapes the payload and one that reflects it cannot produce the same
+        # one. A replay that merely reproduced a recording would agree twice.
+        self.assertEqual(self.plan["plan_sha256"], self.twin["plan_sha256"])
+        self.assertNotEqual(self.closed["result_digest"], self.twin_closed["result_digest"])
+        self.assertEqual(
+            self.closed["result_digest"],
+            str(
+                self.connection.execute(
+                    "SELECT browser_run_digest($1::uuid)", (self.tool_run,)
+                ).scalar()
+            ),
+        )
+
+    def test_the_digest_is_the_same_answer_however_often_it_is_asked(self):
+        digests = {
+            str(
+                self.connection.execute(
+                    "SELECT browser_run_digest($1::uuid)", (self.tool_run,)
+                ).scalar()
+            )
+            for _ in range(3)
+        }
+
+        self.assertEqual({self.closed["result_digest"]}, digests)
+
+    def test_the_standing_check_is_registered_and_holds_over_what_this_class_left(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+        [[registered]] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'browser_runs'"
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = 'browser_runs'"
+        ).rows
+
+        self.assertEqual(1, int(registered))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: Where a real browser is. Its own name rather than the Agent image's, because
+#: an image with a browser in it is built by an installation and a case that
+#: fell back to one without would report "no browser here" as a mission failure.
+#: The class skips when it is absent instead of failing: a browser is the price
+#: of this class in the way a server is the price of the module.
+BROWSER_IMAGE = os.environ.get("RK_TEST_BROWSER_IMAGE", "rk2browser:test")
+BROWSER_REASON = (
+    "set RK_TEST_BROWSER_IMAGE to an image holding a headless Chrome and python3"
+)
+
+#: What the twins are asked to do, in the order they are asked. The same plan as
+#: the database case walks, because the selectors it names are the selectors the
+#: fixture serves: one plan, one page, and the only thing left to differ is what
+#: the page did with what was typed into it.
+BROWSER_MISSION = (
+    {"action": "navigate", "arguments": {"url": f"https://{browser_target.HOST}{browser_target.PAGE}"}},
+    {"action": "wait_for", "arguments": {"selector": "form#login"}},
+    {"action": "inject", "arguments": {"selector": "input[name=q]", "probe": "markup_injection"}},
+    {"action": "click", "arguments": {"selector": "button[type=submit]"}},
+    {"action": "wait_for", "arguments": {"selector": "div#result"}},
+    {"action": "probe", "arguments": {"probe": "markup_injection"}},
+    {"action": "capture_dom", "arguments": {}},
+    {"action": "screenshot", "arguments": {}},
+)
+
+#: How long a container may take to say it is listening. Generous, because the
+#: first run of an image pays for a page cache this one does not control.
+BROWSER_READY_SECONDS = 60.0
+
+
+@unittest.skipUnless(CONTAINERS, CONTAINER_REASON)
+class BrowserCommandTest(DatabaseCase):
+    """PH2-31 criteria 1, 3, 4, 5 and 6: one real browser, two twins, one door.
+
+    Everything the case above decided is carried out here by the things
+    themselves. A real Chrome walks the plan the database compiled, inside a
+    container whose only peer is a real door; the door is the production proxy,
+    holding the production fence over the production role, and every request the
+    page makes -- the document, the form submission, each subresource -- reaches
+    the twin through it or does not happen. What the browser kept becomes
+    Artifacts this Program holds, and what it saw becomes a digest.
+
+    The twins are two containers serving one document that differs in one line:
+    the vulnerable one writes back what was typed and the secure one escapes it.
+    Neither the plan, the door, the browser nor the digest knows which is which,
+    so the digests differing is the behaviour differing -- criterion 6 -- and the
+    plan digests agreeing is the proof that the same mission produced both.
+
+    This case commits and purges its Program at the end. It is the slowest case
+    in this module by a distance: four containers stay up for the class and a
+    fifth starts and dies per mission.
+    """
+
+    settings_for = "runtime"
+
+    #: What the door listens on inside its own container. Fixed rather than
+    #: ephemeral because the browser is told about the door as a URL, and a port
+    #: the engine chose would have to be read back out of it before that URL
+    #: could be written.
+    PORT = 18080
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        for image, reason in (
+            (AGENT_IMAGE, f"the local Agent test image is absent: {AGENT_IMAGE}"),
+            (BROWSER_IMAGE, f"{BROWSER_REASON}; {BROWSER_IMAGE} is absent"),
+        ):
+            if docker("image", "inspect", image, check=False).returncode:
+                raise unittest.SkipTest(reason)
+        super().setUpClass()
+
+        suffix = uuid.uuid4().hex[:12]
+        cls.network = f"rk2-browser-{suffix}"
+        cls.containers: list[str] = []
+        cls.authorities: dict[str, tls.Authority] = {}
+        cls.home = scratch() / f"browser-{suffix}"
+        cls.store = cls.home / "store"
+        cls.store.mkdir(parents=True)
+        # Issued here, on the host, so every file in the directory belongs to
+        # the user running the tests: a certificate first written by a container
+        # running as root is one this process could not read afterwards.
+        cls.fixture = tls.authority(cls.home / "fixture")
+        cls.fixture.context(browser_target.HOST)
+
+        cls.owner_connection = pg.connect(cls.harness.migrate)
+        cls.configuration = write(
+            VALID.replace('name = "acme-web"', f'name = "{BROWSER_SLUG}-command"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+
+        # `VALID` declares `X-Bounty-Id`, and a declared header with no
+        # provisioned value is a request the door refuses before it dials. So
+        # the value is sealed here and the key is handed to the door alone: the
+        # browser is never given either, which is what makes the twins' demand
+        # for the header a proof about who put it on the wire.
+        cls.key = cls.home / "root.key"
+        cls.key.write_bytes(SECRET)
+        cls.key.chmod(0o600)
+        cls.marker = f"rk2-browser-bounty-{suffix}"
+        value = cls.home / "bounty-id.txt"
+        value.write_text(cls.marker, encoding="utf-8")
+        sealed = header.provision(
+            cls.harness.runtime,
+            cls.configuration,
+            "X-Bounty-Id",
+            value,
+            root_secret=seal.load_root(cls.key),
+        )
+        assert sealed.ok, sealed.violations
+
+        try:
+            docker("network", "create", cls.network)
+            cls.doors = {
+                twin: cls.arrange(twin, f"rk2-{twin}-{suffix}", f"rk2-door-{twin}-{suffix}")
+                for twin in ("vulnerable", "secure")
+            }
+            cls.missions = {twin: cls.walk(twin) for twin in cls.doors}
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        for container in reversed(getattr(cls, "containers", [])):
+            docker("rm", "--force", container, check=False)
+        if getattr(cls, "network", ""):
+            docker("network", "rm", cls.network, check=False)
+        if getattr(cls, "program_id", ""):
+            # Read before the purge and deleted after it: the content rows are
+            # shared and outlive the Program that referenced them, so a run that
+            # left them behind would leave rows no purge can reach.
+            kept = [
+                str(row[0])
+                for row in cls.connection.execute(
+                    "SELECT sha256 FROM tool_run_artifacts WHERE program_id = $1::uuid"
+                    " UNION"
+                    " SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                    "                              request_wire_sha, response_wire_sha])"
+                    "   FROM receipts WHERE program_id = $1::uuid",
+                    (cls.program_id,),
+                ).rows
+                if row[0] is not None
+            ]
+            with cls.connection.transaction():
+                cls.connection.execute("SET LOCAL app.purging = 'on'")
+                # Before the Program and not with it: a seal is scoped by a kind
+                # and an id rather than by a foreign key, so nothing about
+                # deleting the Program reaches one. A seal left behind is a pair
+                # whose agent view no reference names, which every later case in
+                # this module would fail the standing check on.
+                cls.connection.execute(
+                    "DELETE FROM artifact_seal"
+                    " WHERE scope_kind = 'program' AND scope_id = $1::uuid",
+                    (cls.program_id,),
+                )
+                cls.connection.execute(
+                    "DELETE FROM programs WHERE slug = $1", (f"{BROWSER_SLUG}-command",)
+                )
+                cls.connection.execute(
+                    "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                    ("{" + ",".join(kept) + "}",),
+                )
+            # Nothing is discarded from a Store here, unlike the cases that keep
+            # theirs: every store this case wrote to -- the mission's and one per
+            # door -- is under the directory removed below.
+        if getattr(cls, "owner_connection", None) is not None:
+            cls.owner_connection.close()
+        # Given back before it is removed: the door runs as root and writes its
+        # wire directory and its leaf certificates as root, and this process
+        # cannot unlink a file in a directory it does not own.
+        home = getattr(cls, "home", None)
+        if home is not None and home.exists():
+            docker(
+                "run", "--rm", "--pull", "never",
+                "--mount", f"type=bind,src={home},dst=/given",
+                AGENT_IMAGE, "chown", "--recursive", f"{os.getuid()}:{os.getgid()}", "/given",
+                check=False,
+            )
+            shutil.rmtree(home, ignore_errors=True)
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def arrange(cls, twin: str, target: str, door: str) -> isolation.AgentContainer:
+        """One twin and the door in front of it, both listening.
+
+        A door each rather than one door told to switch, because a door is the
+        thing under test: two missions through one door that changed its mind
+        between them would leave which twin answered as a property of the order
+        the tests ran in.
+        """
+        cls.serve(
+            target,
+            browser_target.__name__,
+            (twin,),
+            browser_target.LISTENING,
+            mounts=(f"type=bind,src={cls.fixture.directory},dst=/authority,readonly",),
+            environment={"RK_TARGET_HEADER": cls.marker},
+        )
+        # A signing directory and a wire store of this door's own. Two doors
+        # sharing either would be two processes writing one leaf certificate
+        # under one name, which is a race with a certificate at the end of it.
+        authority = tls.authority(cls.home / f"authority-{twin}")
+        # The signing key is made here rather than left to whoever needs it
+        # first. The door runs as root over the same directory, so a key it
+        # created would be a file this process could not read the pin out of.
+        authority.pin()
+        cls.authorities[twin] = authority
+        store = cls.home / f"wire-{twin}"
+        store.mkdir()
+        cls.serve(
+            door,
+            browser_door.__name__,
+            (),
+            browser_door.LISTENING,
+            mounts=(
+                f"type=bind,src={cls.fixture.directory},dst=/fixture,readonly",
+                f"type=bind,src={authority.directory},dst=/authority",
+                f"type=bind,src={store},dst=/wire",
+                f"type=bind,src={cls.key},dst=/root.key,readonly",
+            ),
+            environment={
+                "RK_DOOR_URL": cls.door_url(),
+                "RK_DOOR_LISTEN": str(cls.PORT),
+                "RK_DOOR_STORE": "/wire",
+                "RK_DOOR_AUTHORITY": "/authority",
+                "RK_DOOR_KEY": "/root.key",
+                "RK_DOOR_TARGET": target,
+                "RK_DOOR_TARGET_CA": "/fixture/ca.pem",
+            },
+        )
+        return isolation.AgentContainer(
+            image=BROWSER_IMAGE,
+            network=cls.network,
+            proxy_container=door,
+            proxy_url=f"http://{door}:{cls.PORT}",
+            certificate=authority.certificate,
+        )
+
+    @classmethod
+    def serve(
+        cls,
+        name: str,
+        module: str,
+        arguments: tuple[str, ...],
+        marker: str,
+        *,
+        mounts: tuple[str, ...] = (),
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        """Start one fixture container and wait until it says it is ready."""
+        cls.containers.append(name)
+        docker(
+            "run", "--detach", "--rm", "--pull", "never",
+            "--name", name,
+            "--network", cls.network,
+            "--add-host", "host.docker.internal:host-gateway",
+            "--mount", f"type=bind,src={ROOT},dst=/repo,readonly",
+            *[argument for mount in mounts for argument in ("--mount", mount)],
+            "--env", "PYTHONPATH=/repo/src:/repo",
+            *[
+                argument
+                for key, value in (environment or {}).items()
+                for argument in ("--env", f"{key}={value}")
+            ],
+            AGENT_IMAGE,
+            "python3", "-m", module, *arguments,
+        )
+        deadline = time.monotonic() + BROWSER_READY_SECONDS
+        while time.monotonic() < deadline:
+            logs = docker("logs", name, check=False)
+            if marker in logs.stdout:
+                return
+            if docker("inspect", "--format", "{{.State.Running}}", name,
+                      check=False).stdout.strip() != "true":
+                raise AssertionError(f"{name} stopped: {logs.stdout}{logs.stderr}")
+            time.sleep(0.2)
+        raise AssertionError(f"{name} never listened: {docker('logs', name, check=False).stderr}")
+
+    @classmethod
+    def door_url(cls) -> str:
+        """How a container reaches the database this suite is running against.
+
+        A loopback address is this machine's from the host's namespace and the
+        container's own from inside one, so it -- and only it -- is rewritten to
+        the gateway the engine publishes back. Anything else is a server that is
+        somewhere, and somewhere is reachable from both.
+        """
+        settings = cls.harness.proxy
+        host = settings.host
+        if host in ("127.0.0.1", "localhost", "::1") or host.startswith("/"):
+            host = "host.docker.internal"
+        return (
+            f"postgres://{quote(settings.user)}:{quote(settings.password or '')}"
+            f"@{host}:{settings.port}/{quote(settings.database)}"
+        )
+
+    @classmethod
+    def walk(cls, twin: str) -> Report:
+        """One mission at one twin, as `rk browser run` performs it."""
+        run = claimed_agent_run(
+            cls.connection, cls.owner_connection, cls.program_id, role="recon", kind="recon"
+        )
+        label = str(
+            cls.connection.execute(
+                "SELECT label FROM agent_runs WHERE id = $1::uuid", (run,)
+            ).scalar()
+        )
+        return browser.run(
+            cls.harness.runtime,
+            cls.configuration,
+            root=cls.store,
+            image=BROWSER_IMAGE,
+            authority=cls.authorities[twin].directory,
+            agent_run=label,
+            steps=BROWSER_MISSION,
+            identity_slot=None,
+            door=cls.doors[twin],
+        )
+
+    def facts(self, twin: str) -> dict:
+        report = self.missions[twin]
+        self.assertTrue(report.ok, report.violations)
+        return report.facts["tool_run"]
+
+    def rows(self, sql: str, twin: str) -> list[tuple[str, ...]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                sql, (self.missions[twin].facts["tool_run"]["label"],)
+            ).rows
+        ]
+
+    def document(self, twin: str) -> str:
+        """What this twin's mission kept of the page, read back from the store."""
+        [[sha256]] = self.rows(
+            "SELECT a.sha256 FROM tool_run_artifacts a"
+            "  JOIN tool_runs t ON t.id = a.tool_run_id"
+            " WHERE t.label = $1 AND a.stream = 'dom'",
+            twin,
+        )
+        return Store(self.store).load(sha256).decode()
+
+    # -- criterion 1: nothing left another way ---------------------------------
+
+    def test_every_request_the_page_made_is_a_receipt_the_door_wrote(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                counted = self.rows(
+                    "SELECT coalesce(sum(r.network_requests), 0)::text"
+                    "  FROM browser_step_results r JOIN tool_runs t ON t.id = r.tool_run_id"
+                    " WHERE t.label = $1",
+                    twin,
+                )
+                receipted = self.rows(
+                    "SELECT count(*)::text, count(*) FILTER (WHERE r.decision = 'allowed')::text,"
+                    "       count(DISTINCT r.method)::text"
+                    "  FROM receipts r JOIN tool_runs t ON t.id = r.tool_run_id"
+                    " WHERE t.label = $1",
+                    twin,
+                )
+
+                # More Receipts than counted requests is a preflight or a retry
+                # the driver did not see; fewer is bytes that left another way.
+                self.assertGreaterEqual(int(receipted[0][0]), int(counted[0][0]))
+                self.assertGreaterEqual(int(counted[0][0]), 1)
+                self.assertEqual(receipted[0][0], receipted[0][1])
+                self.assertEqual("2", receipted[0][2])
+
+    def test_the_receipts_name_the_target_and_the_scope_that_admitted_it(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                seen = self.rows(
+                    "SELECT DISTINCT r.host, r.port::text, r.scope_class, r.lane"
+                    "  FROM receipts r JOIN tool_runs t ON t.id = r.tool_run_id"
+                    " WHERE t.label = $1",
+                    twin,
+                )
+
+                self.assertEqual(
+                    [(browser_target.HOST, "443", "target", "agent")], sorted(seen)
+                )
+
+    def test_the_methods_the_door_saw_are_the_ones_the_plan_derived(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                declared = set(self.facts(twin)["methods"])
+                sent = {
+                    row[0]
+                    for row in self.rows(
+                        "SELECT DISTINCT r.method FROM receipts r"
+                        "  JOIN tool_runs t ON t.id = r.tool_run_id WHERE t.label = $1",
+                        twin,
+                    )
+                }
+
+                self.assertEqual({"GET", "HEAD", "OPTIONS", "POST"}, declared)
+                self.assertEqual({"GET", "POST"}, sent)
+
+    # -- criterion 4: what it kept, and whose it is ----------------------------
+
+    def test_what_the_browser_kept_is_attributable_to_the_step_that_kept_it(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                kept = self.rows(
+                    "SELECT a.stream, coalesce(a.browser_step_ordinal::text, ''),"
+                    "       (a.produced_bytes > 0)::text, a.truncated::text,"
+                    "       (f.sha256 IS NOT NULL)::text"
+                    "  FROM tool_run_artifacts a"
+                    "  JOIN tool_runs t ON t.id = a.tool_run_id"
+                    "  LEFT JOIN artifacts f ON f.sha256 = a.sha256"
+                    " WHERE t.label = $1 ORDER BY a.stream",
+                    twin,
+                )
+
+                self.assertEqual(
+                    [
+                        # The console belongs to the mission rather than to a
+                        # step, which is why it is the one row with no ordinal.
+                        ("console", "", "true", "false", "true"),
+                        ("dom", "7", "true", "false", "true"),
+                        ("probe", "6", "true", "false", "true"),
+                        ("screenshot", "8", "true", "false", "true"),
+                    ],
+                    kept,
+                )
+
+    def test_what_it_kept_and_what_the_door_let_through_meet_on_one_run(self):
+        """The Tool run is the join, because a capture is not one request.
+
+        A document is what a navigation and every subresource under it became,
+        so an Artifact cannot name the Receipt that produced it -- there are
+        several, and for a screenshot there are none. What the criterion asks
+        for is that the evidence and the requests behind it be attributable to
+        each other, and the Tool run is where they meet.
+        """
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                [[artifacts, receipts, runs]] = self.rows(
+                    "SELECT (SELECT count(*) FROM tool_run_artifacts a"
+                    "         WHERE a.tool_run_id = t.id)::text,"
+                    "       (SELECT count(*) FROM receipts r"
+                    "         WHERE r.tool_run_id = t.id)::text,"
+                    "       (SELECT count(DISTINCT x.tool_run_id) FROM ("
+                    "          SELECT a.tool_run_id FROM tool_run_artifacts a"
+                    "           WHERE a.program_id = t.program_id"
+                    "          UNION SELECT r.tool_run_id FROM receipts r"
+                    "           WHERE r.program_id = t.program_id) x)::text"
+                    "  FROM tool_runs t WHERE t.label = $1",
+                    twin,
+                )
+
+                self.assertEqual(("4", "2"), (artifacts, receipts))
+                # One run per mission and two missions, so nothing this Program
+                # holds was attached to a run neither of them opened.
+                self.assertEqual("2", runs)
+
+    def test_the_bytes_behind_every_link_are_in_the_store_under_their_digest(self):
+        keep = Store(self.store)
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                for stream, sha256, size in [
+                    (row[0], row[1], int(row[2]))
+                    for row in self.rows(
+                        "SELECT a.stream, a.sha256, a.produced_bytes::text"
+                        "  FROM tool_run_artifacts a JOIN tool_runs t ON t.id = a.tool_run_id"
+                        " WHERE t.label = $1",
+                        twin,
+                    )
+                ]:
+                    with self.subTest(stream=stream):
+                        # `load` hashes what it read and refuses a name that
+                        # does not match, so this is the store's own answer to
+                        # "are these the bytes the link is about".
+                        self.assertEqual(size, len(keep.load(sha256)))
+
+    def test_the_document_it_kept_is_the_document_the_twin_served(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                self.assertIn(f'<h1 id="who">{twin}</h1>', self.document(twin))
+
+    # -- criterion 3: the credential went to the target, not to the Agent ------
+
+    def test_the_header_the_target_demanded_is_in_nothing_the_agent_can_read(self):
+        keep = Store(self.store)
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                kept = [
+                    keep.load(row[0])
+                    for row in self.rows(
+                        "SELECT a.sha256 FROM tool_run_artifacts a"
+                        "  JOIN tool_runs t ON t.id = a.tool_run_id WHERE t.label = $1",
+                        twin,
+                    )
+                ]
+
+                # The twins answer 403 without the value, so a mission that got
+                # a page had it on the wire; nothing the Agent keeps holds it.
+                self.assertTrue(kept)
+                for data in kept:
+                    self.assertNotIn(self.marker.encode(), data)
+
+    def test_the_receipt_the_agent_reads_does_not_carry_the_value_either(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                seen = self.connection.execute(
+                    "SELECT r.* FROM receipts r JOIN tool_runs t ON t.id = r.tool_run_id"
+                    " WHERE t.label = $1",
+                    (self.missions[twin].facts["tool_run"]["label"],),
+                ).rows
+
+                self.assertTrue(seen)
+                for row in seen:
+                    self.assertNotIn(self.marker, " ".join(str(field) for field in row))
+
+    # -- criterion 6: the twins differ, and the difference is the behaviour -----
+
+    def test_two_twins_walking_one_plan_agree_on_the_plan(self):
+        self.assertEqual(
+            self.facts("secure")["plan_sha256"], self.facts("vulnerable")["plan_sha256"]
+        )
+        self.assertEqual(
+            ["success", "success"],
+            sorted(self.facts(twin)["status"] for twin in self.missions),
+        )
+
+    def test_the_digest_separates_the_twin_that_reflected_from_the_one_that_escaped(self):
+        digests = {twin: self.facts(twin)["result_digest"] for twin in self.missions}
+
+        self.assertNotEqual(digests["secure"], digests["vulnerable"])
+        self.assertEqual(2, len({value for value in digests.values() if value}))
+
+    def test_the_verdict_is_the_probe_reading_the_page_rather_than_a_recording(self):
+        verdicts = {
+            twin: self.rows(
+                "SELECT r.outcome ->> 'verdict' FROM browser_step_results r"
+                "  JOIN tool_runs t ON t.id = r.tool_run_id"
+                " WHERE t.label = $1 AND r.ordinal = 6",
+                twin,
+            )[0][0]
+            for twin in self.missions
+        }
+
+        self.assertEqual({"vulnerable": "reflected", "secure": "escaped"}, verdicts)
+
+    def test_the_kept_documents_differ_where_the_twins_differ(self):
+        self.assertIn('<rk-probe id="rk-probe-marker">', self.document("vulnerable"))
+        self.assertNotIn('<rk-probe id="rk-probe-marker">', self.document("secure"))
+        self.assertIn("&lt;rk-probe", self.document("secure"))
+
+    # -- criterion 5, against two real walks -----------------------------------
+
+    def test_the_digest_is_the_answer_the_database_gives_again(self):
+        for twin in self.missions:
+            with self.subTest(twin=twin):
+                [[digest]] = self.rows(
+                    "SELECT browser_run_digest(t.id) FROM tool_runs t WHERE t.label = $1",
+                    twin,
+                )
+
+                self.assertEqual(self.facts(twin)["result_digest"], digest)
+
+    def test_the_standing_check_holds_over_two_missions_that_really_ran(self):
+        problems = [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute("SELECT * FROM check_browser_runs()").rows
+        ]
+
+        self.assertEqual([], problems)
 
 
 if __name__ == "__main__":

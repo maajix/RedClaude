@@ -277,6 +277,34 @@ version the image reported. Distinct from a hook-opened Tool run, which records 
 call the model made through the SDK and which the pre-tool gate decides.
 _Avoid_: Shell command, job, subprocess, scan
 
+**Browser mission**:
+One walk of a compiled plan by a real browser: a sequence of registered actions
+over one in-scope URL, written and committed as a Tool run before any container
+starts, performed with the door as the process's only peer, and closed with what
+each step became. Every request it makes is the door's to admit, so a mission is
+a Tool run whose Receipts are the whole of what it reached. What it kept — the
+document, the viewport, the console and each declared probe's answer — are
+Artifacts of that run, each naming the step that produced it. Distinct from an
+offline tool run, which has no page and no door.
+_Avoid_: Crawl, browser session, headless run, scripted click-through
+
+**Result digest**:
+What one browser mission is compared by: the digest over each step's ordinal,
+action and canonical outcome, and nothing else. Timestamps, nonces, generated
+identifiers and the bytes of a screenshot are excluded by construction rather
+than by filtering, because the outcome keys an action may report are the
+registry's and the values they may hold are canonical. Two missions of one plan
+that differ here differ in what the target did.
+_Avoid_: Fingerprint, run hash, signature, checksum
+
+**Probe**:
+A registered piece of page-side script a browser mission may run, with its own
+payload and the closed set of verdicts it may return. What makes a mission a
+measurement rather than a recording: the verdict is read off the page the target
+rendered, so the same plan against two targets that behave differently returns
+different verdicts. A verdict outside the declared set is refused.
+_Avoid_: Check, detector, payload, test case
+
 **Receipt**:
 The proxy's authoritative record of one network exchange, including the ones it
 blocked. Carries the hashes of what the agent saw and what actually crossed the
