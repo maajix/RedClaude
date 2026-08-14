@@ -112,6 +112,7 @@ __all__ = [
     "audit",
     "carried",
     "digest",
+    "filed",
     "get",
     "holding",
     "holdings",
@@ -310,6 +311,50 @@ def holdings(connection: pg.Connection, program_id: str) -> list[dict]:
     ]
 
 
+def filed(
+    connection: pg.Connection,
+    keep: Store,
+    program_id: str,
+    data: bytes,
+    *,
+    kind: str,
+    content_type: str | None = None,
+) -> dict:
+    """File these bytes under their hash and record that this Program holds them.
+
+    The order is the one thing this function exists to state once: the bytes go
+    down first, so no committed row ever names a file that was never written --
+    the one direction of skew `audit` cannot repair. The other direction is left
+    alone on purpose. A failed insert leaves the bytes filed under their own hash
+    and nothing else, which no reader can reach and which the next caller storing
+    the same plaintext adopts; deleting them on the way out would be a race,
+    since another process may already have committed a reference to exactly these
+    bytes.
+
+    Both writes are idempotent, and they are idempotent for different reasons.
+    The artifact is global and may already be there because another Program
+    stored the same bytes; the reference is this Program's and may already be
+    there because this Program did.
+    """
+    sha256, written = keep.put(data)
+    connection.execute(STORE, (sha256, len(data), content_type))
+    rows = connection.execute(REFER, (program_id, sha256, kind)).rows
+    label = str(
+        rows[0][0]
+        if rows
+        else connection.execute(REFERENCE, (program_id, sha256, kind)).scalar()
+    )
+    return {
+        "label": label,
+        "kind": kind,
+        "sha256": sha256,
+        "byte_size": len(data),
+        "content_type": content_type,
+        "stored": written,
+        "referenced": bool(rows),
+    }
+
+
 def put(
     runtime: pg.Settings,
     configuration_path: Path,
@@ -357,38 +402,16 @@ def put(
 
         with connection.transaction():
             connection.execute("SELECT set_actor('runtime', $1)", (f"rk {PUT}",))
-            # The bytes go down first, so no committed row ever names a file
-            # that was never written -- the one direction of skew `audit` cannot
-            # repair. The other direction is left alone on purpose: a failed
-            # insert leaves the bytes filed under their own hash and nothing
-            # else, which no reader can reach and which the next `put` of the
-            # same plaintext adopts. Deleting them on the way out would be a
-            # race, since another process may already have committed a
-            # reference to exactly these bytes.
-            sha256, written = keep.put(data)
-            connection.execute(STORE, (sha256, len(data), content_type))
-            rows = connection.execute(REFER, (program_id, sha256, kind)).rows
-            referenced = bool(rows)
-            label = str(
-                rows[0][0]
-                if rows
-                else connection.execute(REFERENCE, (program_id, sha256, kind)).scalar()
+            answers.artifact = filed(
+                connection, keep, program_id, data, kind=kind, content_type=content_type
             )
 
-    answers.artifact = {
-        "label": label,
-        "kind": kind,
-        "sha256": sha256,
-        "byte_size": len(data),
-        "content_type": content_type,
-        "stored": written,
-        "referenced": referenced,
-    }
+    record = answers.artifact
     ledger.hold(
         "artifact",
-        f"{label} names {sha256[:12]}: "
-        + ("bytes written" if written else "bytes already in the store")
-        + (", reference created" if referenced else ", reference already held"),
+        f"{record['label']} names {record['sha256'][:12]}: "
+        + ("bytes written" if record["stored"] else "bytes already in the store")
+        + (", reference created" if record["referenced"] else ", reference already held"),
     )
     answers.integrity = _verify(ledger, keep, [answers.artifact])
     return _report(ledger, answers)
@@ -612,16 +635,15 @@ def seal_wire(
         try:
             with connection.transaction():
                 connection.execute("SELECT set_actor('runtime', $1)", (f"rk {SEAL}",))
-                agent_sha, agent_written = keep.put(visible)
-                connection.execute(STORE, (agent_sha, len(visible), content_type))
-                rows = connection.execute(REFER, (program_id, agent_sha, "runtime")).rows
-                label = str(
-                    rows[0][0]
-                    if rows
-                    else connection.execute(
-                        REFERENCE, (program_id, agent_sha, "runtime")
-                    ).scalar()
+                agent = filed(
+                    connection,
+                    keep,
+                    program_id,
+                    visible,
+                    kind="runtime",
+                    content_type=content_type,
                 )
+                agent_sha = agent["sha256"]
                 ciphertext_sha, wire_written = keep.put(envelope)
                 connection.execute(STORE_SEALED, (wire_sha, len(plaintext), content_type))
                 if not connection.execute(
@@ -644,7 +666,7 @@ def seal_wire(
                     program_id,
                     generation=keying.generation,
                     outcome="ok",
-                    detail=f"{label} pairs with sealed wire artifact {wire_sha}",
+                    detail=f"{agent['label']} pairs with sealed wire artifact {wire_sha}",
                     length=len(plaintext),
                     fingerprint=root_secret.fingerprint(plaintext),
                 )
@@ -664,15 +686,8 @@ def seal_wire(
                 ledger, answers, connection, program_id, root_secret, keying, plaintext
             )
 
-    answers.artifact = {
-        "label": label,
-        "kind": "runtime",
-        "sha256": agent_sha,
-        "byte_size": len(visible),
-        "content_type": content_type,
-        "stored": agent_written,
-        "referenced": bool(rows),
-    }
+    answers.artifact = agent
+    label = agent["label"]
     answers.seals = [
         {
             "label": label,

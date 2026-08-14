@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -145,6 +146,298 @@ class ContainerEnvironmentTest(unittest.TestCase):
         mounts = isolation._mounts(fixtures.boundary(sdk=private), private / "root.pem")
 
         self.assertIn(f"type=bind,src={private},dst={isolation.SDK},readonly", mounts)
+
+
+class ToolPlanTest(unittest.TestCase):
+    """PH2-30: what a tool plan may say, decided before an engine is asked.
+
+    Everything here is refused by reading the plan, so none of it needs a
+    container: an argv that is not an argv, a ceiling that bounds nothing, a
+    network that is not one of the two, and -- the one that matters -- a path
+    that names somewhere other than the two directories the runtime mounts.
+    The argument kinds already refuse a separator, so a plan that names a place
+    is a plan something built rather than one the database produced, and it is
+    refused twice for that reason.
+    """
+
+    def ceilings(self, **overrides) -> isolation.Ceilings:
+        values = {
+            "timeout_seconds": 20.0,
+            "memory_mb": 256,
+            "cpu_quota": 1.0,
+            "pids_limit": 32,
+            "max_output_bytes": 1024,
+        }
+        values.update(overrides)
+        return isolation.Ceilings(**values)
+
+    def staging(self) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="rk2-staging-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        return root
+
+    def test_an_argv_that_is_not_one_is_refused_before_an_engine_is_asked(self):
+        container = isolation.ToolContainer(image="rk2-tool-image-that-is-never-started")
+
+        for argv, expect in (
+            ("/bin/true", "not one string"),
+            ((), "non-empty argv"),
+            (("/bin/true", ""), "non-empty argv"),
+            (("/bin/true", "a\0b"), "non-empty argv"),
+            (("/bin/true", 7), "non-empty argv"),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(isolation.Unavailable, expect):
+                    isolation.run_tool(container, argv, ceilings=self.ceilings())
+
+    def test_a_ceiling_that_bounds_nothing_and_a_network_that_is_not_one_are_refused(self):
+        container = isolation.ToolContainer(image="rk2-tool-image-that-is-never-started")
+
+        for ceilings in (self.ceilings(timeout_seconds=0), self.ceilings(max_output_bytes=0)):
+            with self.subTest(ceilings=ceilings):
+                with self.assertRaisesRegex(isolation.Unavailable, "positive timeout"):
+                    isolation.run_tool(container, ("/bin/true",), ceilings=ceilings)
+
+        with self.assertRaisesRegex(isolation.Unavailable, "no network or the proxy"):
+            isolation.run_tool(
+                container, ("/bin/true",), ceilings=self.ceilings(), network="host"
+            )
+
+    def test_an_input_path_that_names_a_place_is_refused(self):
+        for path in ("/etc/passwd", "/input/../etc/passwd", "/input/sub/AF1", "/input"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(
+                    isolation.Unavailable, f"not under {isolation.TOOL_INPUTS}"
+                ):
+                    isolation._staged(self.staging(), {path: b"x"}, ())
+
+    def test_a_declared_output_that_is_not_a_bare_filename_is_refused(self):
+        for name in ("../../etc/passwd", "/etc/passwd", "sub/report.json", ".."):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(isolation.Unavailable, "bare filename"):
+                    isolation._staged(self.staging(), {}, (name,))
+
+    def test_what_crosses_is_readable_and_only_the_workspace_is_writable(self):
+        staging = self.staging()
+
+        workspace = isolation._staged(
+            staging, {f"{isolation.TOOL_INPUTS}/AF1": b"kept"}, ("report.json",)
+        )
+
+        inputs = staging / "input"
+        self.assertEqual(b"kept", (inputs / "AF1").read_bytes())
+        self.assertEqual(0o555, inputs.stat().st_mode & 0o777)
+        self.assertEqual(0o444, (inputs / "AF1").stat().st_mode & 0o777)
+        # The container's user is nameless and owns nothing, so the one place it
+        # may write has to be writable by everyone. What makes that safe is the
+        # parent: `run_tool` puts both under a directory only this process can
+        # traverse, which is what `mkdtemp` means.
+        self.assertEqual(0o777, workspace.stat().st_mode & 0o777)
+        self.assertEqual(0o700, staging.stat().st_mode & 0o777)
+
+    def test_a_tool_that_declares_no_output_is_given_no_workspace(self):
+        # Not an empty directory: a tool with nothing to write has nothing
+        # writable at all, and the difference is one mount that does not exist.
+        self.assertIsNone(isolation._staged(self.staging(), {}, ()))
+
+    def test_a_stream_says_whether_it_is_a_prefix_of_something_longer(self):
+        self.assertFalse(isolation.Captured(b"kept", 4).truncated)
+        self.assertTrue(isolation.Captured(b"kept", 4096).truncated)
+
+        bounded = isolation.Captured(b"", 0)
+        self.assertTrue(isolation.ToolProcess(0, bounded, bounded).succeeded)
+        for answer in (
+            isolation.ToolProcess(1, bounded, bounded),
+            isolation.ToolProcess(None, bounded, bounded, timed_out=True),
+            isolation.ToolProcess(0, bounded, bounded, overflowed=True),
+        ):
+            with self.subTest(answer=answer):
+                self.assertFalse(answer.succeeded)
+
+
+@unittest.skipUnless(LIVE, REASON)
+class ToolIsolationTest(unittest.TestCase):
+    """PH2-30 criteria 2 and 4: a tool has no wire, and its output is bounded.
+
+    Every claim `run_tool`'s docstring makes about the container it starts is
+    asked of a real one here, because each of them is a flag that is either on
+    the command line or is not: no interface, a read-only root filesystem, the
+    nameless user, an input mount nothing can write, and the two bounds that
+    have to end a run rather than describe it afterwards.
+
+    The image is the Agent test image, which is a stand-in for the tool image an
+    installation builds. What is measured is the boundary, and the boundary does
+    not depend on which executables are inside it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", fixtures.AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {fixtures.AGENT_IMAGE}")
+        cls.container = isolation.ToolContainer(image=fixtures.AGENT_IMAGE)
+
+    def ceilings(self, **overrides) -> isolation.Ceilings:
+        values = {
+            "timeout_seconds": 30.0,
+            "memory_mb": 256,
+            "cpu_quota": 1.0,
+            "pids_limit": 32,
+            "max_output_bytes": 1024,
+        }
+        values.update(overrides)
+        return isolation.Ceilings(**values)
+
+    def test_one_input_crosses_and_comes_back_on_stdout(self):
+        answer = isolation.run_tool(
+            self.container,
+            ("/bin/cat", f"{isolation.TOOL_INPUTS}/AF1"),
+            ceilings=self.ceilings(),
+            inputs={f"{isolation.TOOL_INPUTS}/AF1": b'{"host": "example.test"}'},
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        self.assertEqual(b'{"host": "example.test"}', answer.stdout.data)
+        self.assertEqual(24, answer.stdout.produced)
+        self.assertFalse(answer.stdout.truncated)
+        self.assertEqual(b"", answer.stderr.data)
+
+    def test_the_tool_has_no_route_out_and_cannot_write_what_it_was_given(self):
+        probe = """
+import json, os, socket
+
+def reaches(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+def writable(path):
+    try:
+        open(path, 'w').close()
+        return True
+    except OSError:
+        return False
+
+print(json.dumps({
+    'internet_tcp': reaches('1.1.1.1', 443),
+    'rootfs': writable('/rk2-root-write'),
+    'input': writable('/input/AF1'),
+    'scratch': writable(os.environ['TMPDIR'] + '/scratch'),
+    'tmp': writable('/tmp/scratch'),
+    'uid': os.getuid(),
+}))
+"""
+        answer = isolation.run_tool(
+            self.container,
+            ("python3", "-c", probe),
+            ceilings=self.ceilings(),
+            inputs={f"{isolation.TOOL_INPUTS}/AF1": b"x"},
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        facts = json.loads(answer.stdout.data)
+        self.assertFalse(facts["internet_tcp"])
+        self.assertFalse(facts["rootfs"])
+        self.assertFalse(facts["input"])
+        # One writable place, and it is the one the runtime mounted and named in
+        # the environment. `/tmp` is part of a read-only root here, so a tool
+        # that writes where a tool usually writes fails rather than escaping.
+        self.assertTrue(facts["scratch"])
+        self.assertFalse(facts["tmp"])
+        self.assertEqual(isolation.UID, facts["uid"])
+
+    def test_every_ceiling_the_registry_set_is_one_the_kernel_is_holding(self):
+        # Read from inside rather than off the command line: a flag the engine
+        # accepted and did not apply looks identical in an argv and is the whole
+        # difference between a bounded run and an unbounded one.
+        probe = """
+import json
+
+def read(path):
+    with open(path) as handle:
+        return handle.read().strip()
+
+print(json.dumps({
+    'memory': read('/sys/fs/cgroup/memory.max'),
+    'swap': read('/sys/fs/cgroup/memory.swap.max'),
+    'cpu': read('/sys/fs/cgroup/cpu.max'),
+    'pids': read('/sys/fs/cgroup/pids.max'),
+}))
+"""
+        ceilings = self.ceilings(memory_mb=64, cpu_quota=0.5, pids_limit=16)
+
+        answer = isolation.run_tool(self.container, ("python3", "-c", probe), ceilings=ceilings)
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        facts = json.loads(answer.stdout.data)
+        self.assertEqual(str(64 * 1024 * 1024), facts["memory"])
+        # Nothing to page into: a memory ceiling a container may swap past is a
+        # ceiling on how fast it uses the machine rather than on how much.
+        self.assertEqual("0", facts["swap"])
+        quota, period = facts["cpu"].split()
+        self.assertEqual(0.5, int(quota) / int(period))
+        self.assertEqual("16", facts["pids"])
+
+    def test_output_past_the_bound_ends_the_run_and_says_how_much_there_was(self):
+        started = time.monotonic()
+
+        answer = isolation.run_tool(
+            self.container,
+            ("python3", "-c", "import sys\nwhile True: sys.stdout.write('x' * 4096)\n"),
+            ceilings=self.ceilings(max_output_bytes=1024, timeout_seconds=30),
+        )
+
+        self.assertTrue(answer.overflowed)
+        self.assertFalse(answer.succeeded)
+        self.assertEqual(1024, len(answer.stdout.data))
+        self.assertGreater(answer.stdout.produced, 1024)
+        self.assertTrue(answer.stdout.truncated)
+        # The bound is what ended it, so the run is over long before the timeout
+        # it was also given. A bound applied to output already read would leave
+        # this loop running for the whole thirty seconds.
+        self.assertLess(time.monotonic() - started, 25)
+
+    def test_time_past_the_deadline_ends_the_run(self):
+        started = time.monotonic()
+
+        answer = isolation.run_tool(
+            self.container, ("sleep", "60"), ceilings=self.ceilings(timeout_seconds=3)
+        )
+
+        self.assertTrue(answer.timed_out)
+        self.assertFalse(answer.succeeded)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_a_declared_output_is_read_back_and_a_link_is_not(self):
+        answer = isolation.run_tool(
+            self.container,
+            (
+                "python3",
+                "-c",
+                "import os\n"
+                "open('report.json', 'w').write('{\"kept\": true}')\n"
+                "os.symlink('/etc/hostname', 'sneaky.txt')\n",
+            ),
+            ceilings=self.ceilings(),
+            outputs=("report.json", "sneaky.txt", "never.txt"),
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        self.assertEqual(b'{"kept": true}', answer.outputs["report.json"].data)
+        # The workspace is owned by the container's own user, so a declared
+        # output written as a link is a name the tool chose and the supervisor
+        # would resolve on the host. It is skipped rather than followed.
+        self.assertNotIn("sneaky.txt", answer.outputs)
+        self.assertNotIn("never.txt", answer.outputs)
+
+    def test_a_tool_that_wants_the_proxy_and_has_no_door_is_refused(self):
+        with self.assertRaisesRegex(isolation.Unavailable, "no egress door"):
+            isolation.run_tool(
+                self.container, ("/bin/true",), ceilings=self.ceilings(), network="proxy"
+            )
 
 
 @unittest.skipUnless(LIVE, REASON)
@@ -339,6 +632,52 @@ print(json.dumps({
                 isolation.run(self.boundary(), ("true",))
         finally:
             docker("network", "disconnect", self.agent_network, self.target, check=False)
+
+    def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
+        # PH2-30 criterion 2, the half that is not a refusal. A tool that
+        # declares the adapter is put on a network of its own with the proxy as
+        # its only peer, rather than onto the Agent's -- which already has one
+        # peer and would refuse a second, and which the tool has no business
+        # sharing. The network exists for the run and is gone afterwards.
+        probe = """
+import json, os, socket
+
+def reaches(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.6):
+            return True
+    except OSError:
+        return False
+
+print(json.dumps({
+    'proxy': reaches(os.environ['HTTP_PROXY'].split('//', 1)[1].split(':')[0], 18080),
+    'target_ip': reaches(%r, 18081),
+    'internet_tcp': reaches('1.1.1.1', 443),
+}))
+""" % self.target_ip
+        before = docker("network", "ls", "--format", "{{.Name}}").stdout.split()
+
+        answer = isolation.run_tool(
+            isolation.ToolContainer(image=fixtures.AGENT_IMAGE, door=self.boundary()),
+            ("python3", "-c", probe),
+            ceilings=isolation.Ceilings(
+                timeout_seconds=30.0,
+                memory_mb=256,
+                cpu_quota=1.0,
+                pids_limit=32,
+                max_output_bytes=4096,
+            ),
+            network="proxy",
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        facts = json.loads(answer.stdout.data)
+        self.assertTrue(facts["proxy"])
+        self.assertFalse(facts["target_ip"])
+        self.assertFalse(facts["internet_tcp"])
+        self.assertEqual(
+            before, docker("network", "ls", "--format", "{{.Name}}").stdout.split()
+        )
 
 
 if __name__ == "__main__":

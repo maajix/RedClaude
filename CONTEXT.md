@@ -257,6 +257,26 @@ _Avoid_: Log entry, message, audit record, projection
 The runtime's record of invoking one tool, with its arguments and status.
 _Avoid_: Call, invocation, action
 
+**Offline tool**:
+One row of the closed registry an offline analysis tool must be in to run: the
+executable's path, the arguments it takes and the kind each one's value has, the
+version its image must report, its five ceilings, whether it has a network, and
+which roles may run it. The registry is the whole of what such a call may be, not
+a list of suggestions — a tool nothing registered cannot run, and a value the
+registry does not describe cannot be passed. Only the runtime reads it; the
+connection the model reads the world through cannot see it at all.
+_Avoid_: Binary, command, plugin, allowlist entry
+
+**Offline tool run**:
+One execution of a registered offline tool: a Tool run written and committed
+before the process starts, carried out in a container with no route out unless
+the registry row says otherwise, and closed with what became of it — success,
+failure, timeout or an output bound reached. What leaves it is stdout, stderr and
+the output files the registry declares, each stored as an Artifact against the
+version the image reported. Distinct from a hook-opened Tool run, which records a
+call the model made through the SDK and which the pre-tool gate decides.
+_Avoid_: Shell command, job, subprocess, scan
+
 **Receipt**:
 The proxy's authoritative record of one network exchange, including the ones it
 blocked. Carries the hashes of what the agent saw and what actually crossed the

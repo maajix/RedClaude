@@ -14,18 +14,32 @@ credential is resolved from.  The runtime verifies the topology, constructs the
 complete child environment, decides where each of those is mounted and which of
 them may be written, adds the run certificate (never its directory or signing
 key), and applies the process restrictions itself.
+
+An offline tool is the same boundary asked for less.  `run_tool` starts one
+registry-described process with no network at all unless its registry row says
+it uses the proxy adapter, in which case it is given a one-peer network of its
+own to the same proxy -- the Agent's topology rather than the Agent's network,
+because a second peer on that one is a route between two children.  What it may
+consume is stated per tool rather than per installation, and what it produced is
+read back through bounds the supervisor enforces while the process is still
+running: a tool that decides to print forever is a tool that decides how much of
+the supervisor's memory it gets, unless something is counting.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import selectors
 import shutil
+import stat
 import subprocess
+import tempfile
+import time
 import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from redkraken import _startup, tls
@@ -67,9 +81,57 @@ IMPORT_PATH = "PYTHONPATH"
 UID = 65534
 GID = 65534
 
+# Where an offline tool's inputs appear and the one directory it may write.  The
+# runtime's half of an agreement the database states -- `rk2_offline_input_path`
+# and `rk2_offline_workspace` return them, and a plan naming anything else is
+# refused here rather than mounted.  Scratch space is `TMPDIR` above, the same
+# directory an agent child gets: the conventional one names a tree on the machine
+# that launches as well, and a path that means one thing inside the container and
+# another outside it is a path someone will eventually read as the wrong one.
+TOOL_INPUTS = "/input"
+TOOL_WORKSPACE = "/work"
+
+# The whole environment an offline tool gets.  Nothing is inherited and nothing
+# is configurable: the executable is an absolute path from the registry, so
+# there is no search path to poison, and a tool whose output depended on the
+# operator's locale would be a tool whose Artifact is not reproducible.
+TOOL_ENVIRONMENT = {"HOME": "/", "TMPDIR": TMPDIR, "LC_ALL": "C.UTF-8"}
+
 
 class Unavailable(RuntimeError):
     """The configured engine, image or topology cannot provide isolation."""
+
+
+def _hardened(engine: str, name: str) -> list[str]:
+    """The restrictions every container this module starts runs under.
+
+    One list rather than one per caller.  An Agent child and an offline tool
+    differ in what they are given -- a network, a scratch size, a memory ceiling
+    -- and not at all in what they are denied, so a second copy of the denials
+    is a second place for one of them to quietly lose a line.
+    """
+    return [
+        engine,
+        "run",
+        "--rm",
+        # Never pulled implicitly: which build ran is half of what its output
+        # means, and a pull here would decide that from the network.
+        "--pull",
+        "never",
+        "--name",
+        name,
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges=true",
+        "--read-only",
+        "--user",
+        f"{UID}:{GID}",
+        # The image's entrypoint is not the argv the caller asked for, and a
+        # tool run through one is a tool whose argv the registry did not decide.
+        "--entrypoint",
+        "",
+    ]
 
 
 @dataclass(frozen=True)
@@ -169,30 +231,15 @@ def run(
 
     name = f"rk2-agent-{uuid.uuid4().hex}"
     docker = [
-        engine,
-        "run",
-        "--rm",
-        "--pull",
-        "never",
-        "--name",
-        name,
+        *_hardened(engine, name),
         "--network",
         container.network,
         "--dns",
         DNS_BLACKHOLE,
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges=true",
-        "--read-only",
         "--tmpfs",
-        "/run:rw,nosuid,nodev,noexec,size=64m,mode=1777",
+        f"{TMPDIR}:rw,nosuid,nodev,noexec,size=64m,mode=1777",
         "--pids-limit",
         "256",
-        "--user",
-        f"{UID}:{GID}",
-        "--entrypoint",
-        "",
         *mounts,
     ]
     if stdin is not None:
@@ -213,15 +260,428 @@ def run(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as error:
-        subprocess.run(
-            [engine, "rm", "--force", name],
-            env=host_environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
+        _remove(engine, name, host_environment)
         raise Unavailable(f"the Agent container exceeded its {timeout:g}s runtime") from error
+
+
+@dataclass(frozen=True)
+class ToolContainer:
+    """What this installation can offer an offline tool, whatever it asks for.
+
+    The image is the one holding the registered executables.  `door` is the
+    Agent boundary a tool that declares the proxy adapter is put on, and it is
+    absent by default because absent is the contained value: an installation
+    that has not described a door cannot run a tool that wants one, which is a
+    refusal rather than a tool quietly running with the wire open.
+    """
+
+    image: str
+    engine: str = ENGINE
+    door: AgentContainer | None = None
+
+
+@dataclass(frozen=True)
+class Ceilings:
+    """What one run may consume before it is taken away.
+
+    Five numbers that travel together because the registry decides all five per
+    tool, and a run held to four of them is a run that is not held.
+    """
+
+    timeout_seconds: float
+    memory_mb: int
+    cpu_quota: float
+    pids_limit: int
+    max_output_bytes: int
+
+
+@dataclass(frozen=True)
+class Captured:
+    """One stream of a run: the bytes kept, and how many there were.
+
+    The two are different numbers whenever a tool printed more than its bound
+    allows, and both are needed downstream -- the bytes become the Artifact, the
+    count is what says the Artifact is a prefix of something longer.
+    """
+
+    data: bytes
+    produced: int
+
+    @property
+    def truncated(self) -> bool:
+        return self.produced > len(self.data)
+
+
+@dataclass(frozen=True)
+class ToolProcess:
+    """What became of one offline tool process."""
+
+    exit_code: int | None
+    stdout: Captured
+    stderr: Captured
+    outputs: dict[str, Captured] = field(default_factory=dict)
+    timed_out: bool = False
+    overflowed: bool = False
+
+    @property
+    def succeeded(self) -> bool:
+        return self.exit_code == 0 and not self.timed_out and not self.overflowed
+
+
+def run_tool(
+    container: ToolContainer,
+    argv: Sequence[str],
+    *,
+    ceilings: Ceilings,
+    inputs: Mapping[str, bytes] | None = None,
+    outputs: Sequence[str] = (),
+    network: str = "none",
+) -> ToolProcess:
+    """Run one registry-described tool, bounded, and read back what it produced.
+
+    The caller passes the plan the database produced and nothing of its own:
+    the argv, where each input's bytes are to appear, which filenames the tool
+    declares, whether it has a network, and the five ceilings.  Every path is
+    checked against this module's constants rather than trusted, because a plan
+    is data and the one thing an argument may never do is name a place.
+
+    Inputs cross read-only, so the only writable thing in the container is the
+    workspace, and the workspace exists only for a tool that declares outputs.
+    Both staging directories live under a private one this process owns, which
+    is what makes it safe for the mount itself to be readable by the nameless
+    user the child runs as.
+
+    Nothing about the result is decided after the fact.  Bytes past the output
+    bound and time past the deadline both end the run where they happen, and
+    both are reported, because a truncated stream that read like a complete one
+    would be evidence of something that did not happen.
+    """
+    if isinstance(argv, (str, bytes)):
+        raise Unavailable("an offline tool argv must be a sequence, not one string")
+    command = tuple(argv)
+    if not command or any(
+        not isinstance(item, str) or not item or "\0" in item for item in command
+    ):
+        raise Unavailable("an offline tool needs a non-empty argv of plain strings")
+    if ceilings.timeout_seconds <= 0 or ceilings.max_output_bytes <= 0:
+        raise Unavailable("an offline tool needs a positive timeout and output bound")
+    if network not in ("none", "proxy"):
+        raise Unavailable(f"an offline tool has no network or the proxy, not {network}")
+
+    engine = _engine(container.engine)
+    watched = sorted(
+        set(_image_environment(engine, container.image)) & set(_startup.WATCHED_ENV_VECTORS)
+    )
+    if watched:
+        raise Unavailable(
+            "the tool image declares watched credential vectors: " + ", ".join(watched)
+        )
+
+    environment = dict(TOOL_ENVIRONMENT)
+    routing = ["--network", "none"]
+    certificate: Path | None = None
+    door: AgentContainer | None = None
+    if network == "proxy":
+        door = container.door
+        if door is None:
+            raise Unavailable(
+                "this tool declares the proxy adapter and no egress door is configured"
+            )
+        certificate = Path(door.certificate).resolve()
+        if not certificate.is_file():
+            raise Unavailable(f"the run trust root is not a readable file: {certificate}")
+        environment = tls.agent_environment(
+            environment, proxy_url=door.proxy_url, certificate=CA_FILE
+        )
+
+    staging = Path(tempfile.mkdtemp(prefix="rk2-tool-"))
+    name = f"rk2-tool-{uuid.uuid4().hex}"
+    host_environment = {"PATH": os.environ.get("PATH", "")}
+    adapter: str | None = None
+    try:
+        if door is not None:
+            adapter = f"{name}-door"
+            _adapter(engine, door, adapter, host_environment)
+            routing = ["--network", adapter, "--dns", DNS_BLACKHOLE]
+        workspace = _staged(staging, inputs or {}, outputs)
+        mounts = [f"type=bind,src={staging / 'input'},dst={TOOL_INPUTS},readonly"]
+        if workspace is not None:
+            mounts.append(f"type=bind,src={workspace},dst={TOOL_WORKSPACE}")
+        if certificate is not None:
+            mounts.append(f"type=bind,src={certificate},dst={CA_FILE},readonly")
+
+        docker = [
+            *_hardened(engine, name),
+            *routing,
+            "--tmpfs",
+            f"{TMPDIR}:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "--memory",
+            f"{ceilings.memory_mb}m",
+            # The same number again: a memory ceiling a container may page past
+            # is a ceiling on how fast it uses the machine, not on how much.
+            "--memory-swap",
+            f"{ceilings.memory_mb}m",
+            "--cpus",
+            f"{ceilings.cpu_quota:g}",
+            "--pids-limit",
+            str(ceilings.pids_limit),
+            "--workdir",
+            TOOL_WORKSPACE if workspace is not None else "/",
+        ]
+        for mount in mounts:
+            docker.extend(("--mount", mount))
+        for key, value in sorted(environment.items()):
+            docker.extend(("--env", f"{key}={value}"))
+        docker.extend((container.image, *command))
+
+        process = subprocess.Popen(
+            docker,
+            env=host_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with process:
+            answer = _bounded(
+                process,
+                ceilings,
+                stop=lambda: _remove(engine, name, host_environment),
+            )
+        if answer.timed_out or answer.overflowed:
+            # The process is gone and whatever it wrote is a fragment, but the
+            # fragment is read anyway: what a run printed before it was taken
+            # away is the most an operator will ever be told about why.
+            return answer
+        produced = _produced(workspace, outputs, ceilings.max_output_bytes)
+        return ToolProcess(
+            exit_code=answer.exit_code,
+            stdout=answer.stdout,
+            stderr=answer.stderr,
+            outputs=produced,
+            # A declared output past the bound is the same overrun as a stream
+            # past it, and the run has to end the same way. The file is kept as
+            # the prefix it is, but a run whose output was cut off is not a run
+            # that succeeded, whichever place the bytes were going.
+            overflowed=any(item.truncated for item in produced.values()),
+        )
+    finally:
+        if adapter is not None:
+            _unadapt(engine, adapter, door.proxy_container, host_environment)
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _staged(staging: Path, inputs: Mapping[str, bytes], outputs: Sequence[str]) -> Path | None:
+    """Write the inputs where the plan says they appear, and open a workspace if asked.
+
+    The plan names the container paths, so this is where they are held against
+    what the runtime actually mounts: an input under anything but `/input`, or a
+    declared output that is not a bare filename, is a plan that has been made to
+    name a place, and no argument kind admits a separator for exactly that
+    reason.
+
+    `staging` is this process's own directory and stays so.  What crosses is
+    readable, and the workspace is writable by everyone, because the user inside
+    the container is nameless and owns nothing -- reachable only through a
+    parent no other user on this machine can traverse.
+    """
+    root = staging / "input"
+    root.mkdir()
+    for path, data in inputs.items():
+        placed = PurePosixPath(path)
+        if placed.parent != PurePosixPath(TOOL_INPUTS) or placed.name in ("", ".", ".."):
+            raise Unavailable(f"an offline tool input is not under {TOOL_INPUTS}: {path}")
+        target = root / placed.name
+        target.write_bytes(data)
+        target.chmod(0o444)
+    root.chmod(0o555)
+
+    if not outputs:
+        return None
+    for name in outputs:
+        if name != PurePosixPath(name).name or name in ("", ".", ".."):
+            raise Unavailable(f"an offline tool output is not a bare filename: {name}")
+    workspace = staging / "work"
+    workspace.mkdir()
+    workspace.chmod(0o777)
+    return workspace
+
+
+def _bounded(
+    process: subprocess.Popen[bytes], ceilings: Ceilings, *, stop: Callable[[], None]
+) -> ToolProcess:
+    """Read both streams while the process runs, holding it to time and to size.
+
+    Neither bound survives being applied afterwards.  Reading to the end and
+    then truncating lets a tool decide how much of the supervisor's memory it
+    takes; waiting for exit and then noticing the clock lets it decide how long
+    the supervisor waits.  So the reads are incremental, everything past the
+    bound is counted and dropped, and the first breach of either takes the
+    container away rather than waiting to see what the exit code turns out to be.
+    """
+    selector = selectors.DefaultSelector()
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    kept = {name: bytearray() for name in streams}
+    produced = dict.fromkeys(streams, 0)
+    for name, handle in streams.items():
+        selector.register(handle, selectors.EVENT_READ, name)
+
+    deadline = time.monotonic() + ceilings.timeout_seconds
+    timed_out = overflowed = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in selector.select(min(remaining, 0.25)):
+                chunk = key.fileobj.read1(65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                produced[key.data] += len(chunk)
+                room = ceilings.max_output_bytes - len(kept[key.data])
+                if room > 0:
+                    kept[key.data].extend(chunk[:room])
+            if any(count > ceilings.max_output_bytes for count in produced.values()):
+                overflowed = True
+                break
+    finally:
+        selector.close()
+
+    if timed_out or overflowed:
+        # The client first, then the container.  The daemon streams a container's
+        # output through the attached client, and by here that client is blocked
+        # writing into a pipe this loop has stopped reading -- so a removal asked
+        # for while it still holds the stream waits on a reader that is never
+        # coming, and the removal is what times out instead of the run.
+        process.kill()
+        stop()
+    try:
+        process.wait(timeout=max(deadline - time.monotonic(), 10.0))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stop()
+        process.wait(timeout=10.0)
+        timed_out = True
+    return ToolProcess(
+        exit_code=process.returncode,
+        stdout=Captured(bytes(kept["stdout"]), produced["stdout"]),
+        stderr=Captured(bytes(kept["stderr"]), produced["stderr"]),
+        timed_out=timed_out,
+        overflowed=overflowed,
+    )
+
+
+def _produced(
+    workspace: Path | None, outputs: Sequence[str], limit: int
+) -> dict[str, Captured]:
+    """Read the declared outputs a run actually left behind.
+
+    Opened without following links and refused unless regular, because the
+    container's own user owns this directory: a tool that wrote its declared
+    output as a symlink would otherwise have the supervisor resolve it here, on
+    the host, where the name means something else entirely.  An output the tool
+    did not write is simply absent -- whether that is a failure is the caller's
+    question, not this one's.
+    """
+    if workspace is None:
+        return {}
+    found: dict[str, Captured] = {}
+    for name in outputs:
+        try:
+            handle = os.open(workspace / name, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            status = os.fstat(handle)
+            if not stat.S_ISREG(status.st_mode):
+                continue
+            with open(handle, "rb", closefd=False) as opened:
+                found[name] = Captured(opened.read(limit), status.st_size)
+        finally:
+            os.close(handle)
+    return found
+
+
+def _adapter(
+    engine: str, door: AgentContainer, network: str, host_environment: Mapping[str, str]
+) -> None:
+    """One internal network for one tool run, whose only peer is the proxy.
+
+    A network of its own rather than the Agent's.  That network's whole claim is
+    that the only peer on it is the proxy: a tool attached to it would be a
+    second peer, which is both a route between the tool and whatever agent
+    process is running beside it and a topology `_one_peer` would refuse for the
+    next run either of them made.  So a tool that declares the proxy adapter gets
+    the same shape of boundary rather than a share of somebody else's -- created
+    here, the proxy joined to it under the hostname the door's URL names, held to
+    the same assertion, and taken away when the run ends.
+
+    The caller names the network before this is called, so a step that fails
+    part of the way through is still a network the `finally` knows to remove.
+    """
+    proxy_host = _proxy_host(door.proxy_url)
+    _engine_command(
+        engine, ("network", "create", "--internal", network), host_environment,
+        f"the tool egress network cannot be created: {network}",
+    )
+    _engine_command(
+        engine,
+        ("network", "connect", "--alias", proxy_host, network, door.proxy_container),
+        host_environment,
+        f"the proxy cannot be joined to the tool egress network: {door.proxy_container}",
+    )
+    _one_peer(engine, network, door.proxy_container, proxy_host)
+
+
+def _unadapt(
+    engine: str, network: str, proxy_container: str, host_environment: Mapping[str, str]
+) -> None:
+    """Take one run's egress network away, whatever became of the run.
+
+    Unchecked, and in this order: the proxy is a container this harness does not
+    own and must be left as it was found, and a network still holding a peer is
+    a network the engine will not remove.  A failure here is not something to
+    raise over the run's own answer -- what is left behind is one empty network
+    with this run's name on it, which is a thing an operator can see and remove.
+    """
+    _engine_command(
+        engine, ("network", "disconnect", "--force", network, proxy_container),
+        host_environment, None,
+    )
+    _engine_command(engine, ("network", "rm", network), host_environment, None)
+
+
+def _engine_command(
+    engine: str,
+    arguments: Sequence[str],
+    host_environment: Mapping[str, str],
+    refusal: str | None,
+) -> None:
+    """One engine command that changes something, with `refusal` if it may not fail."""
+    answer = subprocess.run(
+        [engine, *arguments],
+        env=dict(host_environment),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if answer.returncode and refusal is not None:
+        detail = (answer.stderr or answer.stdout).strip().splitlines()
+        raise Unavailable(f"{refusal}: {detail[-1] if detail else 'no reason given'}")
+
+
+def _remove(engine: str, name: str, host_environment: Mapping[str, str]) -> None:
+    """Take one named container away, now, and never mind whether it was there."""
+    subprocess.run(
+        [engine, "rm", "--force", name],
+        env=dict(host_environment),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
 
 
 def _supplied(container: AgentContainer) -> list[tuple[str, Path, bool, bool]]:

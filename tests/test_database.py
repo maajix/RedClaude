@@ -71,6 +71,7 @@ from redkraken import (
     seal,
     state,
     tls,
+    tool,
 )
 from redkraken.outcome import (
     AWAITING_DECISION,
@@ -86,6 +87,7 @@ from redkraken.outcome import (
 )
 from redkraken.store import Store
 from tests.fixtures import (
+    AGENT_IMAGE,
     EXPORTED,
     FIRST,
     PINNED,
@@ -98,6 +100,7 @@ from tests.fixtures import (
     Target,
     boundary,
     counterparty,
+    docker,
     latched,
     scratch,
     startup_refusal,
@@ -112,6 +115,12 @@ DATABASE = os.environ.get("RK_TEST_DATABASE", "rk2_selftest")
 RESTORED = f"{DATABASE}_restored"
 
 REASON = "set RK_TEST_SUPERUSER_URL to a disposable PostgreSQL 18 superuser connection string"
+
+#: The second gate, for the one case here that needs a container as well as a
+#: server. Separate from `REASON` because a server is the price of this module
+#: and a container engine is the price of one class in it.
+CONTAINERS = os.environ.get("RK_TEST_CONTAINERS") == "1"
+CONTAINER_REASON = "set RK_TEST_CONTAINERS=1 to run the disposable offline tool proof"
 
 #: The Lane check, verbatim, as the server renders it. Pinned rather than
 #: derived: the corpus pins the same text in `check_causal_attribution`, and a
@@ -1517,6 +1526,41 @@ CONTROLS = (
         # accepted a result for.
         "standing:execution_closure",
         "ALTER TABLE tasks DISABLE TRIGGER tasks_completion_needs_promotion",
+    ),
+    Control(
+        # A registered tool no role may run. The registry is the allowlist, and
+        # an entry nothing can reach is an entry that reads as one and is not --
+        # so the falsification is a row with no `offline_tool_roles` beside it.
+        "standing:offline_tools",
+        "INSERT INTO offline_tools"
+        " (tool, executable, version_argv, version_pattern, timeout_seconds, memory_mb,"
+        "  cpu_quota, pids_limit, max_output_bytes, description)"
+        " VALUES ('unreachable', '/usr/bin/unreachable', '{--version}', '^x', 30, 64, 1.0,"
+        "         16, 1024, 'a self test row no role may run')",
+    ),
+    Control(
+        # And the same check from criterion 4's side: a run closed as a success
+        # that kept none of its output. `close_offline_tool_run` refuses it, so
+        # the control writes the row the verb would never write.
+        "standing:offline_tools",
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('emptyrun-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'emptyrun-selftest', 'tech:emptyrun-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'recon', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'recon', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+        "                          offline_tool, tool_version, finished_at)"
+        "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
+        "                'jq', 'jq-1.7.1', now());"
+        " END $ctl$",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -16498,6 +16542,1068 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         [[problems, detail]] = self.connection.execute(
             "SELECT problems, detail FROM run_standing_checks()"
             " WHERE name = 'control_surface'"
+        ).rows
+
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+OFFLINE_SLUG = "selftest-offline-tool"
+
+#: What the one seeded tool is pointed at. JSON because `jq` is what the corpus
+#: registers, and a filter over an object is the smallest call its argument
+#: schema admits.
+OFFLINE_INPUT = b'{"host": "app.example.com", "ports": [443]}'
+
+#: Bytes another Program holds and this one does not, and two more that only
+#: exist to be counted. Labels are assigned per Program, so a foreign label that
+#: happened to be this Program's own would be resolved rather than refused: the
+#: padding puts the one under test past anything this Program reaches.
+OFFLINE_FOREIGN = b"bytes another Program stored and this one never saw\n"
+OFFLINE_PADDING = (b"one\n", b"two\n", b"three\n", b"four\n")
+
+#: What one run of the tool is recorded as having printed. Not produced by
+#: running anything: this case is about the rows, and the process that would
+#: produce them is `OfflineToolCommandTest`'s subject.
+OFFLINE_STDOUT = b'"app.example.com"\n'
+
+#: The Observation kind both offline cases cite with. Named rather than looked
+#: up, because a query for "some kind that admits a tool run" would agree with
+#: whatever the corpus happened to seed first.
+OFFLINE_OBSERVATION = "content_match"
+
+
+def committed(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
+    """One attributed write, committed, whose one value is needed back."""
+    with connection.transaction():
+        connection.execute("SELECT set_actor('runtime', 'selftest')")
+        return str(connection.execute(sql, parameters).scalar())
+
+
+def refused(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
+    """One statement that must not be allowed, in the words it refused in.
+
+    Each one gets a transaction of its own, because a refusal aborts the
+    transaction it happened in and what these cases arrange afterwards commits.
+    """
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', 'selftest')")
+            connection.execute(sql, parameters)
+    except pg.DatabaseError as error:
+        return error.primary or str(error)
+    return ""
+
+
+def offline_entity(connection: pg.Connection, program_id: str) -> str:
+    """One Entity of this Program's, distinct from every other this module makes."""
+    name = f"offline-selftest-{secrets.token_hex(4)}"
+    return committed(
+        connection,
+        "INSERT INTO entities (program_id, type, label, dedup_key)"
+        " VALUES ($1::uuid, 'technology', $2, $3) RETURNING id",
+        (program_id, name, f"tech:{name}"),
+    )
+
+
+def offline_agent_run(
+    connection: pg.Connection, program_id: str, *, role: str, kind: str, ended: bool = False
+) -> str:
+    """One Task and the agent run that executes it, as the verbs read them.
+
+    `runs_as` is left out because the roster derives it, and a case that spelled
+    it would be asserting the roster rather than using it. The subject is a
+    throwaway Entity of the Task's own, because two live Tasks of one kind over
+    one subject are the same Task and the schema says so.
+    """
+    subject = offline_entity(connection, program_id)
+    task = committed(
+        connection,
+        "INSERT INTO tasks (program_id, kind, subject_entity_id)"
+        " VALUES ($1::uuid, $2, $3::uuid) RETURNING id",
+        (program_id, kind, subject),
+    )
+    return committed(
+        connection,
+        "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet,"
+        "                        finished_at, stop_reason)"
+        " VALUES ($1::uuid, $2::uuid, $3, 'operator', 'low', '{}'::jsonb,"
+        "         CASE WHEN $4 = 'ended' THEN now() END,"
+        "         CASE WHEN $4 = 'ended' THEN 'completed' END) RETURNING id",
+        (program_id, task, role, "ended" if ended else "open"),
+    )
+
+
+def offline_reference(connection: pg.Connection, program_id: str, data: bytes) -> str:
+    """One Artifact a Program holds, by the label an argument names it with.
+
+    The bytes are not written anywhere: what an argument resolves through is the
+    reference, and the two cases that need the bytes as well go through
+    `artifact.put`.
+    """
+    with connection.transaction():
+        connection.execute("SELECT set_actor('runtime', 'selftest')")
+        connection.execute(
+            "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+            " VALUES ($1, $2::bigint, 'application/json', 'agent_visible')"
+            " ON CONFLICT (sha256) DO NOTHING",
+            (artifact.digest(data), len(data)),
+        )
+    return committed(
+        connection,
+        "INSERT INTO artifact_references (program_id, sha256, kind)"
+        " VALUES ($1::uuid, $2, 'source') RETURNING label",
+        (program_id, artifact.digest(data)),
+    )
+
+
+class OfflineToolRunTest(DatabaseCase):
+    """PH2-30 criteria 1, 3, 5 and 6, as the database decides them.
+
+    The registry is the whole of what an offline tool call may be, so every
+    refusal here is a refusal to write a row rather than a refusal to start a
+    process: an unregistered tool, a role the tool does not admit, a version the
+    image reported that the registry will not accept, an argument nobody
+    declared, a required one left out, a value shaped like a path, and an
+    Artifact this Program does not hold. None of them can reach a container,
+    because the verb that would describe one never returns.
+
+    The order after that is the ticket's third criterion. The row is opened and
+    committed, the output is linked to it, and only then does it close -- and
+    each of the three has a refusal that says what the previous one was for: a
+    success that stored nothing, a link to bytes this Program cannot name, and a
+    second close. The last pair are criterion 5: an Observation may cite a run,
+    and citing one that is still in flight or that kept nothing is citing a
+    sentence rather than evidence.
+
+    Everything runs as `rk2_runtime`, which is the role an installation points
+    at the database, and it commits: what survives the transaction is the
+    subject. The Programs are purged at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.identifiers = {}
+        for name in ("main", "other", "halted"):
+            slug = f"{OFFLINE_SLUG}-{name}"
+            opened = program.run(
+                cls.harness.runtime, write(VALID.replace('name = "acme-web"', f'name = "{slug}"'))
+            )
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.bind("main")
+        cls.arrange()
+        cls.refusals = {}
+        cls.refuse_before_the_row_exists()
+        cls.arrange_the_run()
+        cls.refuse_around_the_output()
+        cls.close_the_run()
+        cls.refuse_after_the_run()
+        cls.propose()
+        cls.problems = cls.connection.execute("SELECT * FROM check_offline_tools()").rows
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{OFFLINE_SLUG}-%",)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                (
+                    "{"
+                    + ",".join(
+                        artifact.digest(item)
+                        for item in (
+                            OFFLINE_INPUT,
+                            OFFLINE_FOREIGN,
+                            OFFLINE_STDOUT,
+                            *OFFLINE_PADDING,
+                        )
+                    )
+                    + "}",
+                ),
+            )
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def bind(cls, name: str) -> None:
+        """Which Program this connection is, for row level security."""
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.identifiers[name],)
+        )
+
+    @classmethod
+    def called(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One verb whose answer is a document, committed."""
+        return json.loads(committed(cls.connection, sql, parameters))
+
+    @classmethod
+    def refuse(cls, sql: str, parameters: tuple = ()) -> str:
+        return refused(cls.connection, sql, parameters)
+
+    @classmethod
+    def arrange(cls):
+        cls.recon = offline_agent_run(
+            cls.connection, cls.identifiers["main"], role="recon", kind="recon"
+        )
+        cls.validator = offline_agent_run(
+            cls.connection, cls.identifiers["main"], role="validator", kind="validate"
+        )
+        cls.ended = offline_agent_run(
+            cls.connection, cls.identifiers["main"], role="recon", kind="recon", ended=True
+        )
+        cls.elsewhere = offline_agent_run(
+            cls.connection, cls.identifiers["other"], role="recon", kind="recon"
+        )
+        cls.input_label = offline_reference(
+            cls.connection, cls.identifiers["main"], OFFLINE_INPUT
+        )
+        for filler in OFFLINE_PADDING:
+            offline_reference(cls.connection, cls.identifiers["other"], filler)
+        cls.foreign_label = offline_reference(
+            cls.connection, cls.identifiers["other"], OFFLINE_FOREIGN
+        )
+        held = cls.connection.execute(
+            "SELECT label FROM artifact_references WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers["main"], cls.foreign_label),
+        ).rows
+        assert not held, f"{cls.foreign_label} is this Program's own label"
+
+    @classmethod
+    def opening(
+        cls,
+        arguments: dict,
+        *,
+        run: str | None = None,
+        version: str = "jq-1.7.1",
+        name: str = "jq",
+    ) -> tuple:
+        """One call on `open_offline_tool_run`, as its four parameters."""
+        return (run or cls.recon, name, version, json.dumps(arguments))
+
+    # -- criterion 1: everything decided before the row exists ------------------
+
+    OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb)"
+
+    @classmethod
+    def refuse_before_the_row_exists(cls):
+        whole = {"filter": ".host", "input": cls.input_label}
+        cls.refusals.update(
+            unknown_tool=cls.refuse(cls.OPEN, cls.opening(whole, name="nmap")),
+            role=cls.refuse(cls.OPEN, cls.opening(whole, run=cls.validator)),
+            version=cls.refuse(cls.OPEN, cls.opening(whole, version="jq/1.7")),
+            extra_argument=cls.refuse(cls.OPEN, cls.opening({**whole, "outfile": "passwd"})),
+            missing_argument=cls.refuse(cls.OPEN, cls.opening({"input": cls.input_label})),
+            path_escape=cls.refuse(
+                cls.OPEN, cls.opening({**whole, "filter": "../../etc/passwd"})
+            ),
+            foreign_artifact=cls.refuse(
+                cls.OPEN, cls.opening({**whole, "input": cls.foreign_label})
+            ),
+            other_program_run=cls.refuse(cls.OPEN, cls.opening(whole, run=cls.elsewhere)),
+            ended_run=cls.refuse(cls.OPEN, cls.opening(whole, run=cls.ended)),
+        )
+
+        # The Halt, on a Program of its own so nothing after this is measured
+        # through it. Halting is the operator's verb and no other role holds it,
+        # which is why this is the one arrangement made on their connection.
+        halted = offline_agent_run(
+            cls.connection, cls.identifiers["halted"], role="recon", kind="recon"
+        )
+        with pg.connect(cls.harness.human) as human:
+            human.execute("SELECT set_actor('human', 'selftest')")
+            human.execute(
+                "SELECT halt_program($1::uuid, $2)",
+                (cls.identifiers["halted"], "a self test that must not start new work"),
+            )
+        cls.bind("halted")
+        held = offline_reference(cls.connection, cls.identifiers["halted"], OFFLINE_INPUT)
+        cls.refusals["halted"] = cls.refuse(
+            cls.OPEN, (halted, "jq", "jq-1.7.1", json.dumps({"filter": ".host", "input": held}))
+        )
+        cls.bind("main")
+
+    # -- criterion 3: the row is written before anything starts -----------------
+
+    @classmethod
+    def arrange_the_run(cls):
+        cls.plan = cls.called(
+            cls.OPEN, cls.opening({"filter": ".host", "input": cls.input_label})
+        )
+        cls.opened = cls.connection.execute(
+            "SELECT status, offline_tool, tool_version, exit_code, args::text,"
+            "       started_at IS NOT NULL, finished_at IS NULL"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (cls.plan["tool_run_id"],),
+        ).rows[0]
+
+    # -- criteria 4 and 6: what may be linked to a run -------------------------
+
+    LINK = (
+        "INSERT INTO tool_run_artifacts"
+        " (program_id, tool_run_id, stream, output_name, sha256, produced_bytes, truncated)"
+        " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::bigint, $7)"
+    )
+
+    @classmethod
+    def linking(cls, **overrides) -> tuple:
+        """One output row, as the six values that vary between the refusals."""
+        row = {
+            "stream": "stdout",
+            "output_name": None,
+            "sha256": artifact.digest(OFFLINE_STDOUT),
+            "produced_bytes": len(OFFLINE_STDOUT),
+            "truncated": False,
+        }
+        row.update(overrides)
+        return (cls.identifiers["main"], cls.plan["tool_run_id"], *row.values())
+
+    @classmethod
+    def refuse_around_the_output(cls):
+        cls.refusals["success_without_output"] = cls.refuse(
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (cls.plan["tool_run_id"],),
+        )
+
+        # The bytes exist and this Program does not hold them, which is the
+        # foreign-Artifact refusal from the other side: an output row is a claim
+        # that this Program can read what it points at.
+        committed(
+            cls.connection,
+            "INSERT INTO artifacts (sha256, byte_size, visibility)"
+            " VALUES ($1, $2::bigint, 'agent_visible') RETURNING sha256",
+            (artifact.digest(OFFLINE_STDOUT), len(OFFLINE_STDOUT)),
+        )
+        cls.refusals["artifact_not_held"] = cls.refuse(cls.LINK, cls.linking())
+
+        committed(
+            cls.connection,
+            "INSERT INTO artifact_references (program_id, sha256, kind)"
+            " VALUES ($1::uuid, $2, 'tool_output') RETURNING label",
+            (cls.identifiers["main"], artifact.digest(OFFLINE_STDOUT)),
+        )
+        cls.refusals.update(
+            truncation_disagrees=cls.refuse(cls.LINK, cls.linking(produced_bytes=4096)),
+            undeclared_output=cls.refuse(
+                cls.LINK, cls.linking(stream="output", output_name="report.json")
+            ),
+        )
+        committed(cls.connection, cls.LINK + " RETURNING id", cls.linking())
+
+    # -- criterion 5: an Observation stands on stored output -------------------
+
+    OBSERVE = (
+        "INSERT INTO observations (program_id, kind, subject_entity_id, provenance_kind,"
+        "                          tool_run_id, summary, agent_run_id)"
+        " VALUES ($1::uuid, $2, $3::uuid, 'tool_run', $4::uuid, $5, $6::uuid)"
+    )
+
+    @classmethod
+    def observing(cls, tool_run: str) -> tuple:
+        return (
+            cls.identifiers["main"],
+            OFFLINE_OBSERVATION,
+            cls.subject,
+            tool_run,
+            "a claim about what the tool printed",
+            cls.recon,
+        )
+
+    @classmethod
+    def close_the_run(cls):
+        cls.subject = offline_entity(cls.connection, cls.identifiers["main"])
+        cls.refusals["observing_a_running_run"] = cls.refuse(
+            cls.OBSERVE, cls.observing(cls.plan["tool_run_id"])
+        )
+        cls.closed = cls.called(
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (cls.plan["tool_run_id"],),
+        )
+        cls.finished = cls.connection.execute(
+            "SELECT status, exit_code, finished_at IS NOT NULL FROM tool_runs"
+            " WHERE id = $1::uuid",
+            (cls.plan["tool_run_id"],),
+        ).rows[0]
+
+    @classmethod
+    def refuse_after_the_run(cls):
+        cls.refusals["closed_twice"] = cls.refuse(
+            "SELECT close_offline_tool_run($1::uuid, 'success', 0, NULL)",
+            (cls.plan["tool_run_id"],),
+        )
+        cls.refusals["link_after_close"] = cls.refuse(
+            cls.LINK, cls.linking(stream="stderr")
+        )
+
+        # A run that ended without keeping anything: an error, which is a state
+        # the table records, and which nothing may cite.
+        empty = cls.called(
+            cls.OPEN, cls.opening({"filter": ".ports", "input": cls.input_label})
+        )
+        cls.emptied = cls.called(
+            "SELECT close_offline_tool_run($1::uuid, 'error', 5, $2)",
+            (empty["tool_run_id"], "the run exceeded its output bound"),
+        )
+        cls.refusals["observing_a_run_that_kept_nothing"] = cls.refuse(
+            cls.OBSERVE, cls.observing(empty["tool_run_id"])
+        )
+
+    @classmethod
+    def propose(cls):
+        """One staged result citing both runs, promoted the way a Mission is.
+
+        Two elements alike in everything but which run they name, so what the
+        promotion does to each is the difference between a run that kept its
+        output and one that did not, and nothing else.
+        """
+        task, subject = cls.connection.execute(
+            "SELECT r.task_id, e.label FROM agent_runs r, entities e"
+            " WHERE r.id = $1::uuid AND e.id = $2::uuid",
+            (cls.recon, cls.subject),
+        ).rows[0]
+        payload = {
+            "observations": [
+                {
+                    "kind": OFFLINE_OBSERVATION,
+                    "summary": "what the run that kept nothing is said to have printed",
+                    "tool_run_label": cls.emptied["tool_run"],
+                    "subject_label": str(subject),
+                },
+                {
+                    "kind": OFFLINE_OBSERVATION,
+                    "summary": "what the run that kept its output printed",
+                    "tool_run_label": cls.plan["tool_run"],
+                    "subject_label": str(subject),
+                },
+            ]
+        }
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.identifiers["main"],
+                agent_run_id=cls.recon,
+                task_id=str(task),
+            )
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.promotion = json.loads(
+                str(
+                    cls.connection.execute(
+                        "SELECT promote_proposal($1::uuid)", (cls.staged.proposal_id,)
+                    ).scalar()
+                )
+            )
+        cls.dropped = [
+            (str(path), str(reason), str(cited))
+            for path, reason, cited in cls.connection.execute(
+                "SELECT element_path, reason, cited FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid ORDER BY ordinal",
+                (cls.staged.proposal_id,),
+            ).rows
+        ]
+
+    # -- criterion 1 -----------------------------------------------------------
+
+    def test_a_tool_the_registry_does_not_hold_is_refused(self):
+        self.assertIn("no offline tool named nmap", self.refusals["unknown_tool"])
+
+    def test_a_role_the_registry_does_not_admit_may_not_run_it(self):
+        self.assertIn("the validator role may not run jq", self.refusals["role"])
+
+    def test_a_version_the_registry_does_not_admit_is_refused(self):
+        # The image says what is installed and the registry says what it will
+        # accept. A run opens only where the two agree, which is what makes
+        # `tool_runs.tool_version` provenance rather than a note.
+        self.assertIn("not a version this registry admits", self.refusals["version"])
+
+    def test_an_argument_the_tool_does_not_declare_is_refused_by_name(self):
+        self.assertIn("jq takes no argument named outfile", self.refusals["extra_argument"])
+
+    def test_a_required_argument_left_out_is_refused(self):
+        self.assertIn("jq requires the argument filter", self.refusals["missing_argument"])
+
+    def test_a_value_shaped_like_a_path_is_refused_by_its_kind(self):
+        self.assertIn("filter is not a well formed text", self.refusals["path_escape"])
+
+    def test_an_artifact_this_program_does_not_hold_is_refused(self):
+        self.assertIn(
+            f"{self.foreign_label} is not an artifact of this Program",
+            self.refusals["foreign_artifact"],
+        )
+
+    def test_a_run_of_another_program_and_a_run_that_ended_are_both_refused(self):
+        self.assertIn("is not a run of this Program", self.refusals["other_program_run"])
+        self.assertIn("has already ended", self.refusals["ended_run"])
+
+    def test_a_halted_program_may_not_start_new_work(self):
+        self.assertIn("Halted and may not start new work", self.refusals["halted"])
+
+    def test_the_plan_is_the_argv_the_registry_builds_and_the_ceilings_it_sets(self):
+        # The runtime is given a command, not the parts to assemble one from,
+        # and the executable is the registry's file rather than a name a PATH
+        # would resolve. The one input appears under `/input` by its label,
+        # which is the only place `isolation.run_tool` will mount anything.
+        self.assertEqual(
+            ["/usr/bin/jq", ".host", f"/input/{self.input_label}"], self.plan["argv"]
+        )
+        self.assertEqual("none", self.plan["network"])
+        self.assertEqual(
+            [30, 256, 32, 1048576],
+            [
+                self.plan["timeout_seconds"],
+                self.plan["memory_mb"],
+                self.plan["pids_limit"],
+                self.plan["max_output_bytes"],
+            ],
+        )
+        self.assertEqual(
+            [
+                {
+                    "argument": "input",
+                    "label": self.input_label,
+                    "sha256": artifact.digest(OFFLINE_INPUT),
+                    "path": f"/input/{self.input_label}",
+                }
+            ],
+            self.plan["inputs"],
+        )
+        # `jq` declares no output file, so there is nothing writable to mount.
+        self.assertEqual([], self.plan["outputs"])
+        self.assertIsNone(self.plan["workspace"])
+
+    # -- criterion 3 -----------------------------------------------------------
+
+    def test_the_run_is_recorded_before_the_process_starts(self):
+        status, tool_name, version, exit_code, args, started, open_still = self.opened
+
+        self.assertEqual("running", str(status))
+        self.assertEqual(("jq", "jq-1.7.1"), (str(tool_name), str(version)))
+        self.assertIsNone(exit_code)
+        self.assertTrue(started)
+        self.assertTrue(open_still)
+        # What was asked for, rather than the argv derived from it: the request
+        # is the thing worth keeping, and the redaction rules cover this field.
+        self.assertEqual(
+            {"tool_name": "jq", "arguments": {"filter": ".host", "input": self.input_label}},
+            json.loads(str(args)),
+        )
+
+    def test_a_success_that_stored_nothing_is_refused(self):
+        self.assertIn("stored none of its output", self.refusals["success_without_output"])
+
+    def test_a_run_closes_once_and_carries_what_became_of_it(self):
+        status, exit_code, finished = self.finished
+
+        self.assertEqual(
+            {
+                "tool_run": self.plan["tool_run"],
+                "status": "success",
+                "exit_code": 0,
+                "artifacts": 1,
+            },
+            self.closed,
+        )
+        self.assertEqual(("success", 0, True), (str(status), int(exit_code), finished))
+        self.assertIn("was already closed as success", self.refusals["closed_twice"])
+        self.assertIn("has already been closed", self.refusals["link_after_close"])
+
+    def test_a_run_that_kept_nothing_still_closes_as_an_error(self):
+        # The other half of the rule above: a failure, a timeout and an overrun
+        # end with nothing worth storing, and refusing to close them would leave
+        # the row open for `check_offline_tools` to report as a lost supervisor.
+        self.assertEqual("error", self.emptied["status"])
+        self.assertEqual(5, self.emptied["exit_code"])
+
+    # -- criteria 4 and 6 ------------------------------------------------------
+
+    def test_output_bytes_this_program_does_not_hold_are_refused(self):
+        self.assertIn("is not held by this Program", self.refusals["artifact_not_held"])
+
+    def test_a_truncation_flag_that_disagrees_with_the_bytes_is_refused(self):
+        self.assertIn("truncation flag disagrees", self.refusals["truncation_disagrees"])
+
+    def test_an_output_name_the_tool_does_not_declare_is_refused(self):
+        self.assertIn(
+            "jq declares no output named report.json", self.refusals["undeclared_output"]
+        )
+
+    # -- criterion 5 -----------------------------------------------------------
+
+    def test_an_observation_cannot_cite_a_run_that_has_not_finished(self):
+        self.assertIn("has not finished", self.refusals["observing_a_running_run"])
+
+    def test_an_observation_cannot_cite_a_run_that_kept_no_output(self):
+        self.assertIn(
+            "stored no output to observe", self.refusals["observing_a_run_that_kept_nothing"]
+        )
+
+    def test_a_proposal_may_cite_the_artifacts_and_loses_the_element_that_cannot(self):
+        # Criterion 5 from the side an agent actually reaches: it proposes, and
+        # the runtime promotes what grounds. The element naming the run that
+        # kept nothing is the shell-text case -- a sentence and a label, with no
+        # bytes behind it -- and it is dropped without taking the element beside
+        # it down with it.
+        self.assertEqual("promoted", self.promotion["status"])
+        self.assertEqual(1, len(self.promotion["observations"]))
+        self.assertEqual(1, self.promotion["refused"])
+        [(path, reason, cited)] = self.dropped
+        self.assertEqual(("observations[0]", "refused_by_invariant"), (path, reason))
+        self.assertIn("stored no output to observe", cited)
+
+        # And what was promoted is an Observation on the run whose bytes this
+        # Program holds, reachable from the Artifact rather than from the claim.
+        self.assertEqual(
+            [(self.plan["tool_run"], "stdout")],
+            [
+                (str(run), str(stream))
+                for run, stream in self.connection.execute(
+                    "SELECT t.label, a.stream FROM observations o"
+                    "  JOIN tool_runs t ON t.id = o.tool_run_id"
+                    "  JOIN tool_run_artifacts a ON a.tool_run_id = t.id"
+                    " WHERE o.label = $1 AND o.program_id = $2::uuid",
+                    (self.promotion["observations"][0], self.identifiers["main"]),
+                ).rows
+            ],
+        )
+
+    def test_an_observation_on_a_run_that_kept_its_output_is_admitted(self):
+        # The rule is about output, not about tool runs: the same insert that
+        # was refused twice above is accepted once the run it cites has finished
+        # with its bytes stored. Rolled back, because everything else in this
+        # class is measured against the state as arranged.
+        with contextlib.suppress(Rollback), self.connection.transaction():
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(self.OBSERVE, self.observing(self.plan["tool_run_id"]))
+            raise Rollback
+
+    # -- the registry is the runtime's ------------------------------------------
+
+    def test_the_registry_and_its_verbs_are_out_of_the_agent_connection_s_reach(self):
+        # `rk2_state` is what the model reads the world through. A registry it
+        # could read is a list of executables to ask for; a verb it could call
+        # is the tool loop without the runtime in it.
+        said = []
+        with pg.connect(self.harness.state) as session:
+            for statement, parameters in (
+                ("SELECT executable FROM offline_tools", ()),
+                ("SELECT value_kind FROM offline_tool_arguments", ()),
+                ("SELECT rk2_offline_tool('jq')", ()),
+                (self.OPEN, self.opening({"filter": ".host", "input": self.input_label})),
+            ):
+                try:
+                    session.execute(statement, parameters)
+                except pg.DatabaseError as error:
+                    said.append(error.primary or str(error))
+                else:
+                    said.append("")
+
+        self.assertEqual(4, sum("permission denied" in item for item in said), said)
+
+    def test_what_the_agent_may_read_is_the_output_and_not_the_ceilings(self):
+        # The other half of criterion 5. A model that may cite these Artifacts
+        # has to be able to see that they exist, so the link table and the four
+        # columns this ticket added to `tool_runs` are on the read surface --
+        # and the ceilings beside them are not, because a model that can read
+        # what the runtime would stop can shape a call to sit under it.
+        with pg.connect(self.harness.state) as session:
+            session.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (self.identifiers["main"],)
+            )
+            stream, name, produced = session.execute(
+                "SELECT a.stream, a.output_name, a.produced_bytes FROM tool_run_artifacts a"
+                "  JOIN tool_runs r ON r.id = a.tool_run_id"
+                " WHERE r.offline_tool IS NOT NULL AND r.exit_code = 0"
+                "   AND r.exit_detail IS NULL AND r.tool_version IS NOT NULL"
+                " ORDER BY a.recorded_at LIMIT 1"
+            ).rows[0]
+            try:
+                session.execute("SELECT timeout_seconds FROM offline_tools")
+            except pg.DatabaseError as error:
+                ceilings = error.primary or str(error)
+            else:
+                ceilings = ""
+
+        self.assertEqual(("stdout", None, len(OFFLINE_STDOUT)), (str(stream), name, int(produced)))
+        self.assertIn("permission denied", ceilings)
+
+    def test_the_standing_check_holds_over_everything_this_class_left(self):
+        self.assertEqual([], [list(row) for row in self.problems])
+
+
+@unittest.skipUnless(CONTAINERS, CONTAINER_REASON)
+class OfflineToolCommandTest(DatabaseCase):
+    """PH2-30 criteria 2, 3 and 4: `rk tool run`, end to end, in a container.
+
+    What the case above decided is carried out here: a real process starts under
+    the ceilings the registry set, its two streams become Artifacts this Program
+    holds, and the run closes with what became of it. The tools are `cat`, `cp`
+    and `grep` rather than the seeded `jq`, because the claim under test is the
+    runner and not which executables an installation's image happens to hold --
+    and because each of the three answers a different question exactly: `cat`
+    prints what it was given, so what ends up in the store is checkable against
+    what went in; `cp` writes a second file, which is what a declared output is;
+    and `grep` says what it found by exiting, which is a tool answering rather
+    than a tool failing.
+
+    The registry rows are written by the owner, which is what a migration is. A
+    runtime that could add one could run anything, and that this case has to
+    change roles to arrange itself is the shape of that rule rather than an
+    inconvenience.
+
+    This case commits, and purges its Program, its registry rows and its bytes
+    at the end.
+    """
+
+    settings_for = "runtime"
+
+    #: The four registered tools. The first is what a working run looks like;
+    #: the second is the same executable behind a version pattern no image can
+    #: satisfy, which is how "the version is policy" is asked of a real answer
+    #: read off a real image. The third declares an output and the fourth
+    #: answers by exiting non-zero.
+    REGISTRY = (
+        "INSERT INTO offline_tools"
+        " (tool, executable, version_argv, version_pattern, network, timeout_seconds,"
+        "  memory_mb, cpu_quota, pids_limit, max_output_bytes, description) VALUES"
+        " ('rkcat', '/bin/cat', '{--version}', '^cat \\(GNU coreutils\\) [0-9]', 'none',"
+        "  20, 64, 1.0, 16, 1024, 'a self test tool that prints what it was given'),"
+        " ('rkcatold', '/bin/cat', '{--version}', '^cat \\(GNU coreutils\\) 0\\.', 'none',"
+        "  20, 64, 1.0, 16, 1024, 'the same file behind a version no image reports'),"
+        " ('rkcopy', '/bin/cp', '{--version}', '^cp \\(GNU coreutils\\) [0-9]', 'none',"
+        "  20, 64, 1.0, 16, 1024, 'a self test tool that writes the file it declares'),"
+        " ('rkgrep', '/bin/grep', '{--version}', '^grep \\(GNU grep\\) [0-9]', 'none',"
+        "  20, 64, 1.0, 16, 1024, 'a self test tool that answers by exiting');"
+        "INSERT INTO offline_tool_arguments"
+        " (tool, name, position, flag, value_kind, required, choices, description) VALUES"
+        " ('rkcat', 'input', 0, NULL, 'artifact', true, NULL, 'the Artifact printed back'),"
+        " ('rkcatold', 'input', 0, NULL, 'artifact', true, NULL, 'the Artifact printed back'),"
+        " ('rkcopy', 'input', 0, NULL, 'artifact', true, NULL, 'the Artifact copied'),"
+        # Enumerated rather than free text, because the file the tool writes and
+        # the file the registry declares are the same file: a caller that could
+        # name it would be able to ask for one the declaration does not cover.
+        " ('rkcopy', 'output', 1, NULL, 'choice', true, '{report.json}',"
+        "  'the declared output it is copied to'),"
+        " ('rkgrep', 'pattern', 0, NULL, 'text', true, NULL, 'what is looked for'),"
+        " ('rkgrep', 'input', 1, NULL, 'artifact', true, NULL, 'the Artifact searched');"
+        "INSERT INTO offline_tool_outputs (tool, name, description) VALUES"
+        " ('rkcopy', 'report.json', 'the copy, which is what this tool exists to produce');"
+        "INSERT INTO offline_tool_roles (tool, role) VALUES"
+        " ('rkcat', 'recon'), ('rkcatold', 'recon'), ('rkcopy', 'recon'), ('rkgrep', 'recon')"
+    )
+
+    #: Longer than the 1024 byte bound the two rows above set, so a run over it
+    #: is a run the supervisor stops rather than one it merely trims.
+    LONG = b"x" * 4096
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {AGENT_IMAGE}")
+        super().setUpClass()
+        cls.owner_connection = pg.connect(cls.harness.migrate)
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute_script(cls.REGISTRY)
+
+        cls.root = scratch() / "artifacts"
+        cls.configuration = write(
+            VALID.replace('name = "acme-web"', f'name = "{OFFLINE_SLUG}-command"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+        cls.recon = offline_agent_run(
+            cls.connection, cls.program_id, role="recon", kind="recon"
+        )
+        cls.validator = offline_agent_run(
+            cls.connection, cls.program_id, role="validator", kind="validate"
+        )
+        cls.labels = {
+            "small": cls.stored(OFFLINE_INPUT),
+            "large": cls.stored(cls.LONG),
+            # A reference to bytes that are not in the store. Nothing writes
+            # them: the case it makes is what happens when the database and the
+            # store disagree, which is the one failure a run must not carry out.
+            "missing": offline_reference(
+                cls.connection, cls.program_id, b"bytes that were never filed\n"
+            ),
+        }
+
+        cls.answers = {
+            "success": cls.perform(name="rkcat", label=cls.labels["small"]),
+            "overflow": cls.perform(name="rkcat", label=cls.labels["large"]),
+            "unknown": cls.perform(name="nmap", label=cls.labels["small"]),
+            "role": cls.perform(
+                name="rkcat", label=cls.labels["small"], agent_run=cls.validator
+            ),
+            "version": cls.perform(name="rkcatold", label=cls.labels["small"]),
+            "unreadable": cls.perform(name="rkcat", label=cls.labels["missing"]),
+            "declared": cls.perform(
+                name="rkcopy", label=cls.labels["small"], more={"output": "report.json"}
+            ),
+            "nomatch": cls.perform(
+                name="rkgrep", label=cls.labels["small"], more={"pattern": "absent"}
+            ),
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (f"{OFFLINE_SLUG}-command",)
+            )
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for table in ("offline_tool_roles", "offline_tool_arguments", "offline_tools"):
+                cls.owner_connection.execute(
+                    f"DELETE FROM {table} WHERE tool IN ('rkcat', 'rkcatold')"
+                )
+            cls.owner_connection.execute(
+                "DELETE FROM artifacts WHERE NOT EXISTS"
+                " (SELECT 1 FROM artifact_references r WHERE r.sha256 = artifacts.sha256)"
+            )
+        cls.owner_connection.close()
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def stored(cls, data: bytes) -> str:
+        """Bytes in the store and a reference this Program holds, as `rk artifact put`."""
+        source = scratch() / "input.json"
+        source.write_bytes(data)
+        put = artifact.put(cls.harness.runtime, cls.configuration, source, root=cls.root)
+        assert put.ok, put.violations
+        return put.facts["artifact"]["label"]
+
+    @classmethod
+    def perform(
+        cls,
+        *,
+        name: str,
+        label: str,
+        agent_run: str | None = None,
+        more: dict[str, str] | None = None,
+    ) -> Report:
+        return tool.run(
+            cls.harness.runtime,
+            cls.configuration,
+            root=cls.root,
+            image=AGENT_IMAGE,
+            agent_run=cls.named(agent_run or cls.recon),
+            offline_tool=name,
+            arguments={"input": label, **(more or {})},
+        )
+
+    @classmethod
+    def named(cls, agent_run: str) -> str:
+        """What an operator calls an agent run on the command line."""
+        return str(
+            cls.connection.execute(
+                "SELECT label FROM agent_runs WHERE id = $1::uuid", (agent_run,)
+            ).scalar()
+        )
+
+    def linked(self, tool_run: str) -> list[tuple]:
+        """Every stream one run kept, with what it produced and what was stored."""
+        return [
+            (
+                str(stream),
+                None if name is None else str(name),
+                str(sha256),
+                int(produced),
+                bool(truncated),
+                int(byte_size),
+            )
+            for stream, name, sha256, produced, truncated, byte_size in self.connection.execute(
+                "SELECT a.stream, a.output_name, a.sha256, a.produced_bytes, a.truncated,"
+                "       f.byte_size"
+                "  FROM tool_run_artifacts a JOIN artifacts f ON f.sha256 = a.sha256"
+                " WHERE a.tool_run_id = (SELECT id FROM tool_runs WHERE label = $1"
+                "                          AND program_id = $2::uuid)"
+                " ORDER BY a.stream, a.output_name",
+                (tool_run, self.program_id),
+            ).rows
+        ]
+
+    def recorded(self, label: str) -> tuple:
+        return self.connection.execute(
+            "SELECT status, exit_code, tool_version FROM tool_runs"
+            " WHERE label = $1 AND program_id = $2::uuid",
+            (label, self.program_id),
+        ).rows[0]
+
+    def said(self, answer: Report) -> str:
+        return " ".join(item.detail for item in answer.violations)
+
+    # -- criteria 2, 3 and 4 ---------------------------------------------------
+
+    def test_a_run_that_succeeds_files_both_streams_and_closes(self):
+        answer = self.answers["success"]
+        run = answer.facts["tool_run"]
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(("success", 0), (run["status"], run["exit_code"]))
+        self.assertEqual("none", run["network"])
+        # The version on the row is what the image answered, read by asking the
+        # executable the registry names rather than by trusting either side.
+        self.assertRegex(run["version"], r"^cat \(GNU coreutils\) [0-9]")
+        status, exit_code, version = self.recorded(run["label"])
+        self.assertEqual(("success", 0, run["version"]), (str(status), int(exit_code), str(version)))
+
+        # Both streams, always: an empty stderr is how "printed nothing" is told
+        # from "nobody looked".
+        stderr, stdout = self.linked(run["label"])
+        self.assertEqual(["stderr", "stdout"], [stderr[0], stdout[0]])
+        self.assertEqual((artifact.digest(b""), 0, False, 0), stderr[2:])
+        self.assertEqual(
+            (artifact.digest(OFFLINE_INPUT), len(OFFLINE_INPUT), False, len(OFFLINE_INPUT)),
+            stdout[2:],
+        )
+        # And the bytes are really there, under the name the row gives them.
+        self.assertEqual(OFFLINE_INPUT, Store(self.root).load(stdout[2]))
+
+    def test_output_past_the_registry_s_bound_is_kept_as_a_prefix_that_says_so(self):
+        answer = self.answers["overflow"]
+        run = answer.facts["tool_run"]
+
+        self.assertFalse(answer.ok)
+        self.assertEqual("error", run["status"])
+        self.assertIn("output bound", run["detail"])
+        stderr, stdout = self.linked(run["label"])
+        # 1024 bytes kept of more than 1024 produced, and the row carries both,
+        # so a reader can tell a short answer from the start of a long one.
+        self.assertEqual((True, 1024), stdout[4:])
+        self.assertGreater(stdout[3], 1024)
+        self.assertEqual((0, False, 0), stderr[3:])
+        self.assertEqual(self.LONG[:1024], Store(self.root).load(stdout[2]))
+
+    def test_a_tool_the_registry_does_not_hold_never_reaches_an_engine(self):
+        answer = self.answers["unknown"]
+
+        self.assertFalse(answer.ok)
+        self.assertIsNone(answer.facts["tool_run"])
+        self.assertIn("no offline tool named nmap", self.said(answer))
+
+    def test_a_role_the_registry_does_not_admit_opens_no_run(self):
+        answer = self.answers["role"]
+
+        self.assertFalse(answer.ok)
+        self.assertIsNone(answer.facts["tool_run"])
+        self.assertIn("the validator role may not run rkcat", self.said(answer))
+
+    def test_a_version_the_registry_refuses_stops_the_run_before_it_opens(self):
+        answer = self.answers["version"]
+
+        self.assertFalse(answer.ok)
+        self.assertIsNone(answer.facts["tool_run"])
+        self.assertIn("not a version this registry admits", self.said(answer))
+
+    def test_an_input_the_store_cannot_produce_closes_the_run_it_opened(self):
+        # The row is committed before anything starts, so a run that cannot be
+        # carried out is a row that has to be closed rather than abandoned --
+        # otherwise it is indistinguishable from a supervisor that died holding
+        # one, which is what `check_offline_tools` reports as a fault.
+        answer = self.answers["unreadable"]
+        run = answer.facts["tool_run"]
+
+        self.assertFalse(answer.ok)
+        self.assertEqual("error", run["status"])
+        self.assertEqual(EXIT_INTEGRITY_FAILED, answer.exit_code)
+        status, exit_code, _ = self.recorded(run["label"])
+        self.assertEqual(("error", None), (str(status), exit_code))
+        self.assertEqual([], self.linked(run["label"]))
+
+    def test_a_declared_output_becomes_a_third_artifact_under_its_own_name(self):
+        # The two streams are what every run has; a declared output is what a
+        # tool that writes a file has, and criterion 4 names it beside them. The
+        # link carries the filename, so a reader citing the report can tell it
+        # from whatever the tool happened to print while producing it.
+        answer = self.answers["declared"]
+        run = answer.facts["tool_run"]
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(("success", 0), (run["status"], run["exit_code"]))
+        output, stderr, stdout = self.linked(run["label"])
+        self.assertEqual(
+            [("output", "report.json"), ("stderr", None), ("stdout", None)],
+            [(item[0], item[1]) for item in (output, stderr, stdout)],
+        )
+        self.assertEqual(
+            (artifact.digest(OFFLINE_INPUT), len(OFFLINE_INPUT), False, len(OFFLINE_INPUT)),
+            output[2:],
+        )
+        self.assertEqual(OFFLINE_INPUT, Store(self.root).load(output[2]))
+        # And the copy is the whole of what the run produced: `cp` says nothing
+        # on either stream, which is stored too rather than left unrecorded.
+        self.assertEqual((artifact.digest(b""), 0, False, 0), stdout[2:])
+
+    def test_a_tool_that_answers_by_exiting_is_history_rather_than_a_fault(self):
+        # `grep` finding nothing exits 1, and that is the tool's answer rather
+        # than a failure of this command: the run is closed as an error carrying
+        # the exit, its output is stored, and the command itself reports ok --
+        # an exit class here would send an operator to fix a working machine.
+        answer = self.answers["nomatch"]
+        run = answer.facts["tool_run"]
+
+        self.assertTrue(answer.ok, answer.violations)
+        self.assertEqual(EXIT_OK, answer.exit_code)
+        self.assertEqual(("error", 1), (run["status"], run["exit_code"]))
+        self.assertEqual("the tool exited 1", run["detail"])
+        status, exit_code, _ = self.recorded(run["label"])
+        self.assertEqual(("error", 1), (str(status), int(exit_code)))
+        self.assertEqual(
+            ["stderr", "stdout"], [item[0] for item in self.linked(run["label"])]
+        )
+
+    def test_a_supervisor_that_falls_over_still_closes_the_row_it_opened(self):
+        # Every named failure closes the run and reports it. This is the one
+        # nobody named: the row is committed before the process starts, so an
+        # exception on the way through has to close it too or leave behind the
+        # one state `check_offline_tools` cannot tell from a supervisor that
+        # died. The exception itself goes on being what it was.
+        with mock.patch.object(tool, "_perform", side_effect=RuntimeError("fell over")):
+            with self.assertRaisesRegex(RuntimeError, "fell over"):
+                self.perform(name="rkcat", label=self.labels["small"])
+
+        status, exit_code, detail = self.connection.execute(
+            "SELECT status, exit_code, exit_detail FROM tool_runs"
+            " WHERE program_id = $1::uuid AND offline_tool IS NOT NULL"
+            " ORDER BY started_at DESC LIMIT 1",
+            (self.program_id,),
+        ).rows[0]
+
+        self.assertEqual(("error", None), (str(status), exit_code))
+        self.assertIn("RuntimeError('fell over')", str(detail))
+
+    def test_every_path_reports_the_same_keys(self):
+        # Including the ones that never opened a run: a caller parses one
+        # document whether the tool ran, was refused, or was stopped.
+        for name, answer in self.answers.items():
+            with self.subTest(name):
+                self.assertEqual(set(tool.FACTS), set(answer.facts))
+
+    def test_the_standing_check_holds_over_everything_this_class_left(self):
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = 'offline_tools'"
         ).rows
 
         self.assertEqual((0, ""), (int(problems), str(detail)))

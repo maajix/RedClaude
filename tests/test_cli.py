@@ -1265,6 +1265,132 @@ class ProxyCommandTest(unittest.TestCase):
         self.assertNotIn("s3cr3t-runtime", result.stderr)
 
 
+class ToolCommandTest(unittest.TestCase):
+    """`rk tool run`, up to the point where a database and an engine are needed.
+
+    Four inputs, and the fourth is the image. It is named the way the store is
+    named -- a flag, or a variable behind it, and a refusal when neither -- for
+    the reason the Agent boundary gives about its own: a default would be
+    whatever the operator's machine happened to have, and which build of a tool
+    ran is half of what its output means.
+    """
+
+    def arguments(self, *extra: str) -> tuple[str, ...]:
+        return (
+            "tool", "run",
+            "--config", str(write(VALID)),
+            "--agent-run", "AR1",
+            "--tool", "jq",
+            *extra,
+        )
+
+    def test_the_image_and_the_store_are_named_alongside_the_connection(self):
+        result = run(*self.arguments())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("tool run", report["command"])
+        self.assertEqual(
+            [
+                "environment:RK_ARTIFACT_ROOT",
+                "environment:RK_DATABASE_URL",
+                "environment:RK_TOOL_IMAGE",
+            ],
+            sorted(item["source"] for item in report["violations"]),
+        )
+
+    def test_a_run_without_an_agent_run_or_a_tool_is_a_usage_error(self):
+        for missing in ("--agent-run", "--tool"):
+            with self.subTest(missing):
+                given = [item for item in self.arguments() if item != missing]
+                result = run(*[item for item in given if item not in ("AR1", "jq")])
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn(missing, result.stderr)
+
+    def test_an_argument_that_is_not_a_name_and_a_value_is_refused_by_name(self):
+        # The registry decides which names exist and what a value may look like.
+        # This is the one thing it cannot decide, because a string with no `=` in
+        # it does not reach the registry as an argument at all. It is refused the
+        # way every other malformed value here is -- a report on stdout naming the
+        # flag at fault -- rather than as a usage error, which is what argparse
+        # answers when a flag is missing or unknown, before any value is read.
+        result = run(
+            *self.arguments(
+                "--argument", "filter",
+                "--artifacts", str(scratch()),
+                "--image", "rk-tools:selftest",
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            )
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            ["argument:--argument"],
+            [item["source"] for item in report["violations"]],
+        )
+        self.assertIn("filter is not a name=value pair", result.stdout)
+
+    def test_the_same_argument_twice_keeps_neither_value(self):
+        result = run(
+            *self.arguments(
+                "--argument", "filter=.host",
+                "--argument", "filter=.ports",
+                "--artifacts", str(scratch()),
+                "--image", "rk-tools:selftest",
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            )
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertIn("given more than once", result.stdout)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(
+            *self.arguments(
+                "--argument", "filter=.host",
+                "--artifacts", str(scratch()),
+                "--image", "rk-tools:selftest",
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            )
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("tool run", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            *self.arguments(
+                "--artifacts", str(scratch()),
+                "--image", "rk-tools:selftest",
+                "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+            )
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+    def test_a_refused_configuration_reaches_no_engine_and_writes_nothing(self):
+        source = write(VALID.replace("requests = 5000", "requests = 0"))
+        root = scratch() / "artifacts"
+
+        observed = observe(
+            "tool", "run",
+            "--config", str(source),
+            "--agent-run", "AR1",
+            "--tool", "jq",
+            "--argument", "filter=.host",
+            "--artifacts", str(root),
+            "--image", "rk-tools:selftest",
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+        self.assertFalse(root.exists())
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

@@ -31,6 +31,7 @@ from redkraken import (
     proxy,
     scope,
     state,
+    tool,
 )
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
@@ -117,6 +118,11 @@ ARTIFACTS = _Source("artifact_root", "--artifacts", artifact.ROOT_VARIABLE)
 #: an operator who copied the bytes somewhere has not thereby copied the key,
 #: and the sealed artifacts are worth exactly as much as that stays true.
 KEYS = _Source("artifact_key", "--key", artifact.KEY_VARIABLE)
+
+#: The image the registered offline tools live in. Its own variable rather than
+#: the Agent's because they are its own image: one holds an SDK and resolves a
+#: credential, and the other holds executables and must resolve nothing.
+TOOLS = _Source("tool_image", "--image", tool.IMAGE_VARIABLE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -689,6 +695,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release.set_defaults(run=_artifact_open)
 
+    tools = commands.add_parser(
+        "tool", help="run one registered offline tool and keep what it printed"
+    )
+    running = tools.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    invoke = running.add_parser(
+        "run",
+        help=(
+            "run one registered offline tool for one agent run, bounded, and "
+            f"file its output as artifacts (${DATABASE_URL})"
+        ),
+    )
+    _add_url(invoke, RUNTIME)
+    _add_root(invoke)
+    invoke.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program this run belongs to",
+    )
+    invoke.add_argument(
+        TOOLS.flag,
+        dest="image",
+        metavar="image",
+        help=(
+            "the image the registered executables live in; never pulled "
+            f"implicitly (default: ${TOOLS.variable})"
+        ),
+    )
+    invoke.add_argument(
+        "--agent-run",
+        dest="agent_run",
+        required=True,
+        metavar="label",
+        help="the agent run this call is made for, by its label",
+    )
+    invoke.add_argument(
+        "--tool",
+        required=True,
+        metavar="name",
+        help="the registered tool to run; an unregistered name is refused by the registry",
+    )
+    invoke.add_argument(
+        "--argument",
+        dest="arguments",
+        action="append",
+        default=[],
+        metavar="name=value",
+        help=(
+            "one argument the tool declares, repeatable; the registry decides "
+            "which names exist and what each value may look like"
+        ),
+    )
+    invoke.set_defaults(run=_tool_run)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1242,6 +1304,79 @@ def _artifact_get(arguments: argparse.Namespace) -> int:
             ),
         )
     )
+
+
+def _tool_run(arguments: argparse.Namespace) -> int:
+    """A connection, a store, an image and the arguments, and none of them guessed.
+
+    The door is offered rather than required. A tool whose registry row says it
+    has no network never looks at it, so a machine that has not described an
+    Agent boundary can still run every tool registered today; one that declares
+    the proxy adapter and finds nothing there is refused by name inside the
+    runtime rather than quietly run with no route.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, tool.RUN)
+    root = _root(ledger, arguments.artifacts)
+    image = tool.image_from_environment(arguments.image)
+    if image is None:
+        ledger.fail(
+            TOOLS.fact,
+            f"no tool image: pass {TOOLS.flag} or set {TOOLS.variable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{TOOLS.variable}",
+        )
+    given = _pairs(ledger, arguments.arguments)
+    if runtime is None or root is None or image is None or given is None:
+        return _render(report(tool.RUN, ledger))
+    door, _ = execution.boundary(os.environ)
+    return _render(
+        _guarded(
+            tool.RUN,
+            lambda: tool.run(
+                runtime,
+                arguments.config,
+                root=root,
+                image=image,
+                agent_run=arguments.agent_run,
+                offline_tool=arguments.tool,
+                arguments=given,
+                door=door,
+            ),
+        )
+    )
+
+
+def _pairs(ledger: Ledger, given: list[str]) -> dict[str, str] | None:
+    """`name=value` arguments as a mapping, or a refusal naming the one at fault.
+
+    Nothing here decides whether a name or a value is acceptable -- that is the
+    registry's, and a second opinion in the adapter would be a second place to
+    keep in step. What is decided here is only that the operator wrote a pair at
+    all, and that they did not write the same name twice: a repeated name would
+    otherwise silently keep one of the two values.
+    """
+    pairs: dict[str, str] = {}
+    for item in given:
+        name, separator, value = item.partition("=")
+        if not separator or not name:
+            ledger.fail(
+                "arguments",
+                f"{item} is not a name=value pair",
+                code=INVALID_CONFIGURATION,
+                source="argument:--argument",
+            )
+            return None
+        if name in pairs:
+            ledger.fail(
+                "arguments",
+                f"the argument {name} is given more than once",
+                code=INVALID_CONFIGURATION,
+                source="argument:--argument",
+            )
+            return None
+        pairs[name] = value
+    return pairs
 
 
 def _artifact_audit(arguments: argparse.Namespace) -> int:
