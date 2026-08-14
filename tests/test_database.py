@@ -1114,6 +1114,16 @@ CONTROLS = (
         "ALTER TABLE relationships DISABLE TRIGGER relationships_follow_the_grammar",
     ),
     Control(
+        # The rule 007 seeded and ticket 33 changed, put back. One UPDATE, no
+        # row anywhere is wrong afterwards, and the state machine goes back to
+        # letting a model call its own claim testable -- which is the whole of
+        # criterion 6 undone by an edit a later migration could make in passing.
+        "standing:hypothesis_promotion",
+        "UPDATE transition_rules SET required_actor_kind = 'llm'"
+        " WHERE machine = 'hypothesis' AND from_status = 'proposed'"
+        "   AND to_status = 'testable'",
+    ),
+    Control(
         # A section registered without the three delta kinds derived from it.
         # Structural for the same reason: a projection section nothing compares
         # is a class of change that stops being detected silently, and every
@@ -10208,6 +10218,938 @@ class SurfacePromotionTest(DatabaseCase):
             sorted(self.promoted["relationships"]), sorted(repeated["relationships"])
         )
         self.assertEqual(before, self.labels("recon"))
+
+
+#: The Programs the Hypothesis case opens. Two, for the reason the promotion
+#: case opens two: "reachable from this Program" is a claim about a second
+#: Program that holds a subject and an Observation of its own.
+CLAIM_SLUG = "selftest-claim"
+
+#: The one Property class these claims are about. One throughout, because the
+#: dedup key is what this case turns on and a second class would be a second key
+#: rather than a second claim about the same thing.
+OWNERSHIP = "authorization.object_ownership"
+
+#: The two evidential Observation kinds cited here, and 018's rule they carry:
+#: both take Receipt provenance and nothing else. `DISCOVERED` is the third one,
+#: which is evidence of nothing and is cited on purpose.
+DIFFERENTIAL = "response_differential"
+INVARIANT = "response_invariant"
+
+
+def rationale(mechanism: str = "the object id is not checked against the caller") -> dict:
+    """A complete rationale, which is the only kind promotion admits."""
+    return {
+        "mechanism": mechanism,
+        "expectation": "the route rejects an object the caller does not own",
+        "falsifier": "the same request as a second member returns 403",
+    }
+
+
+class HypothesisPromotionTest(DatabaseCase):
+    """PH2-33: one hunter's proposal, promoted into a canonical Hypothesis.
+
+    Six things a server decides and Python cannot: whether the subject and the
+    Identity cell are this Program's, whether the Property class is in the
+    vocabulary, whether anything in the same result supports the claim, which
+    key two proposals converge on, and who may move the row once it exists.
+    Each is a criterion, and each is asserted against rows rather than against
+    the summary the promotion hands back.
+
+    Everything runs as `rk2_runtime`. The record a child reads is taken through
+    `rk2_state` bound to one Program, because a rationale only the writing role
+    can read is not the rationale the hunter downstream needs.
+
+    Four results are promoted in setup because they commit and because each
+    later one is about what the earlier ones left: the Surface and the evidence
+    to cite, the claim itself, the same claim from a second run, and a result in
+    which every element is wrong in a different way.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.identifiers = {}
+        for name in ("main", "other"):
+            path = write(
+                SCOPED.replace('name = "matrix-web"', f'name = "{CLAIM_SLUG}-{name}"')
+                + DECLARED
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+        cls.seeded = {name: cls._populate(name) for name in ("main", "other")}
+
+        # The Surface and the evidence, in the state a recon run and a first
+        # pass over it leave them: a route, a second Identity beside the
+        # declared one, and two Observations about the route -- one evidential
+        # and one not.
+        cls.promote("main", cls.recon("main"))
+        cls.promote("other", cls.recon("other"))
+        cls.held = cls.labels("main")
+
+        # The claim: one Hypothesis about the route, held for one Identity,
+        # standing on a differential this same result promoted and a control the
+        # Program already had.
+        cls.first, cls.claimed = cls.promote("main", cls.claim())
+        # The same claim from a second run, in different words and on its own
+        # new evidence. One Hypothesis comes out of it, not two.
+        cls.second, cls.converged = cls.promote("main", cls.again())
+
+        # Now that this Program has promoted everything it is going to, the
+        # second one is given more, and `unheld` reads off what it holds that
+        # this one does not. In that order, because a label is a per-Program
+        # sequence: computed any earlier, the string it hands back is one this
+        # Program goes on to issue to a row of its own.
+        cls.promote("other", cls.spare("other"))
+        cls.foreign = cls.unheld("main", "other")
+
+        cls.refusals, cls.refused = cls.promote("main", cls.wrong())
+        cls.dropped = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in cls.connection.execute(
+                "SELECT element_path, reason, cited FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid",
+                (cls.refusals.proposal_id,),
+            ).rows
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{CLAIM_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def _populate(cls, name: str) -> dict:
+        """One claimed Task, one run, and the two things evidence can stand on.
+
+        The Receipt is not optional here the way it is in a recon fixture: both
+        evidential kinds this case cites take `{receipt}` provenance and nothing
+        else, so a Hypothesis with support behind it needs one on record.
+        """
+        program_id = cls.identifiers[name]
+        seeded: dict[str, str] = {"program_id": program_id}
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            seeded["task"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, claimed_at,"
+                    " lease_expires_at) VALUES ($1::uuid, 'recon', 'claimed', now(),"
+                    " now() + interval '30 minutes') RETURNING id::text",
+                    (program_id,),
+                ).scalar()
+            )
+            seeded["run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, runs_as, model,"
+                    " effort, mission_packet) VALUES ($1::uuid, $2::uuid, 'recon',"
+                    " 'subagent', 'selftest', 'low', '{}'::jsonb) RETURNING id::text",
+                    (program_id, seeded["task"]),
+                ).scalar()
+            )
+            seeded["tool_run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'mcp__rk2__http_request', '{}'::jsonb, 'success', 'runtime')"
+                    " RETURNING label",
+                    (program_id, seeded["run"], seeded["task"]),
+                ).scalar()
+            )
+            seeded["receipt"] = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host, method, scheme,"
+                    " path) VALUES ($1::uuid, 'agent', 'blocked', 'refused before contact',"
+                    " now(), 'target', 1, 'app.example.com', 'GET', 'http', '/')"
+                    " RETURNING label",
+                    (program_id,),
+                ).scalar()
+            )
+        return seeded
+
+    @classmethod
+    def recon(cls, name: str) -> dict:
+        """The Surface a claim can be about, and the evidence it can cite."""
+        seeded = cls.seeded[name]
+        return {
+            "new_entities": [
+                {"ref": "site_app", "type": "application",
+                 "base_url": "http://app.example.com/", "kind": "web",
+                 "tool_run_label": seeded["tool_run"]},
+                {"ref": "route", "type": "endpoint", "parent_ref": "site_app",
+                 "method": "GET", "path_template": "/notes/{id}",
+                 "auth_required": True, "tool_run_label": seeded["tool_run"]},
+            ],
+            "observations": [
+                {"kind": INVARIANT, "subject_ref": "route",
+                 "summary": "the owner's own note answered identically twice",
+                 "receipt_label": seeded["receipt"]},
+                {"kind": DISCOVERED, "subject_ref": "route",
+                 "summary": "the route exists and takes an id",
+                 "tool_run_label": seeded["tool_run"]},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def spare(cls, name: str) -> dict:
+        """More rows for the second Program than the first one ever issues.
+
+        One more Endpoint under the application it already has, and four more
+        Observations about it. Four, because by now the first Program has
+        promoted four of its own and the point of these is to carry labels it
+        has not issued. The application is named again on purpose: an Entity
+        proposed twice converges on the row that is already there.
+        """
+        seeded = cls.seeded[name]
+        return {
+            "new_entities": [
+                {"ref": "site_app", "type": "application",
+                 "base_url": "http://app.example.com/", "kind": "web",
+                 "tool_run_label": seeded["tool_run"]},
+                {"ref": "listing", "type": "endpoint", "parent_ref": "site_app",
+                 "method": "GET", "path_template": "/notes",
+                 "auth_required": True, "tool_run_label": seeded["tool_run"]},
+            ],
+            "observations": [
+                {"kind": INVARIANT, "subject_ref": "listing",
+                 "summary": f"the listing answered identically on read {n}",
+                 "receipt_label": seeded["receipt"]}
+                for n in range(1, 5)
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def claim(cls) -> dict:
+        """One claim, the differential it rests on, and the control it cites.
+
+        The differential is proposed in this same result and named by `ref`,
+        which is the case the three passes exist for: the Observation has no
+        label until the walk before this one has run.
+        """
+        return {
+            "observations": [
+                {"ref": "diff", "kind": DIFFERENTIAL, "subject_label": cls.held["endpoint"],
+                 "summary": "a member read another member's note",
+                 "receipt_label": cls.seeded["main"]["receipt"]},
+            ],
+            "hypotheses": [
+                {"ref": "own", "subject_label": cls.held["endpoint"],
+                 "property_class": OWNERSHIP,
+                 "identity_a_label": cls.held["identity_member"],
+                 "statement": "the note id is honoured for a member who does not own it",
+                 "rationale": rationale()},
+            ],
+            "evidence": [
+                {"hypothesis_ref": "own", "observation_ref": "diff",
+                 "polarity": "supports", "role": "variant"},
+                {"hypothesis_ref": "own", "observation_label": cls.held[INVARIANT],
+                 "polarity": "supports", "role": "control"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def again(cls) -> dict:
+        """The same key, a second hunter's words, and one more edge.
+
+        Different prose, a different mechanism and its own Observation: what a
+        second proposal is allowed to differ in without being a different claim.
+        """
+        return {
+            "observations": [
+                {"ref": "second", "kind": DIFFERENTIAL,
+                 "subject_label": cls.held["endpoint"],
+                 "summary": "the same read succeeded from a second session",
+                 "receipt_label": cls.seeded["main"]["receipt"]},
+            ],
+            "hypotheses": [
+                {"ref": "same", "subject_label": cls.held["endpoint"],
+                 "property_class": OWNERSHIP,
+                 "identity_a_label": cls.held["identity_member"],
+                 "statement": "any member can read any note by guessing its id",
+                 "rationale": rationale("the handler trusts the id in the path")},
+            ],
+            "evidence": [
+                {"hypothesis_ref": "same", "observation_ref": "second",
+                 "polarity": "supports", "role": "baseline"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def wrong(cls) -> dict:
+        """One element per way of being wrong, and no two wrong the same way.
+
+        Read as a table: each element's reason is the one thing that element
+        gets wrong, and the promotion has to name that reason rather than the
+        first refusal the database happened to raise.
+
+        No Observations, so that "nothing canonical came out of it" is a fact
+        about the whole result rather than about the two lists this file walks.
+        """
+        held = cls.labels("main")
+        base = {"subject_label": held["endpoint"], "property_class": OWNERSHIP,
+                "statement": "the id is not checked", "rationale": rationale()}
+        return {
+            "hypotheses": [
+                # claims_execution: a status no Test in this result produced.
+                {**base, "ref": "ran", "status": "supported"},
+                # no_identity: an Entity of this Program that is not an Identity.
+                {**base, "ref": "misread", "identity_a_label": held["application"]},
+                # no_subject: a label that was never issued.
+                {**base, "ref": "nowhere", "subject_label": "EP999999"},
+                # label_other_program, and not the same mistake as the one
+                # above: the label is real, and it is the other Program's.
+                {**base, "ref": "theirs", "subject_label": cls.foreign["endpoint"]},
+                # unknown_kind: a Property class the vocabulary does not hold.
+                {**base, "ref": "invented", "property_class": "injection.telepathy"},
+                # malformed_field: a rationale that says what and not what would
+                # settle it, which is the field a Test is written from.
+                {**base, "ref": "partial",
+                 "rationale": {"mechanism": "the id is not checked",
+                               "expectation": "it is checked"}},
+                # no_support: everything right, and nothing says so.
+                {**base, "ref": "bare"},
+                # no_support by way of an edge the schema refuses: its only
+                # supporting edge cites a non-evidential Observation in a role
+                # the transition machine counts.
+                {**base, "ref": "thin"},
+                # malformed_field: no `ref`, which is the only handle an edge of
+                # this same result has for naming a claim it is proposed beside.
+                {**base},
+                # no_support by way of the role rather than the edge: `context`
+                # is in the vocabulary and the transition machine does not count
+                # it, so a claim standing on one stands on nothing.
+                {**base, "ref": "aside"},
+            ],
+            "evidence": [
+                # The edge that fails on the way in, taking `thin` with it.
+                {"hypothesis_ref": "thin", "observation_label": held[DISCOVERED],
+                 "polarity": "supports", "role": "baseline"},
+                # unknown_kind: a polarity outside the two the column takes.
+                {"hypothesis_label": held["hypothesis"], "observation_label": held[INVARIANT],
+                 "polarity": "proves", "role": "variant"},
+                # unknown_kind again, on the other vocabulary.
+                {"hypothesis_label": held["hypothesis"], "observation_label": held[INVARIANT],
+                 "polarity": "supports", "role": "smoking_gun"},
+                # label_other_program: an Observation that exists, elsewhere.
+                {"hypothesis_label": held["hypothesis"],
+                 "observation_label": cls.foreign[INVARIANT],
+                 "polarity": "supports", "role": "context"},
+                # no_provenance: an edge that cites no Observation at all.
+                {"hypothesis_label": held["hypothesis"],
+                 "polarity": "supports", "role": "context"},
+                # no_subject: an edge that names no claim at all.
+                {"observation_label": held[INVARIANT],
+                 "polarity": "supports", "role": "context"},
+                # polarity_conflict: this Observation already stands on this
+                # claim in this role, saying the other thing. The key does not
+                # hold polarity, so this is the one refusal that would otherwise
+                # be silence.
+                {"hypothesis_label": held["hypothesis"], "observation_label": held[INVARIANT],
+                 "polarity": "refutes", "role": "control"},
+                # The edge `aside` stands on, in the role that does not count.
+                {"hypothesis_ref": "aside", "observation_label": held[INVARIANT],
+                 "polarity": "supports", "role": "context"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def settled(cls) -> dict:
+        """The same claim again, proposed after it stopped being proposable.
+
+        Both ways in: a candidate whose key is the one already promoted, and an
+        edge naming that claim by label.
+        """
+        held = cls.labels("main")
+        return {
+            "hypotheses": [
+                {"ref": "late", "subject_label": held["endpoint"],
+                 "property_class": OWNERSHIP,
+                 "identity_a_label": held["identity_member"],
+                 "statement": "the note id is still not checked",
+                 "rationale": rationale()},
+            ],
+            "evidence": [
+                {"hypothesis_ref": "late", "observation_label": held[INVARIANT],
+                 "polarity": "supports", "role": "baseline"},
+                {"hypothesis_label": held["hypothesis"],
+                 "observation_label": held[DIFFERENTIAL],
+                 "polarity": "supports", "role": "context"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def promote(cls, name: str, payload: dict) -> tuple[proposal.Staged, dict]:
+        """Stage one result and promote it, the way the supervisor does both."""
+        seeded = cls.seeded[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.identifiers[name],
+                agent_run_id=seeded["run"],
+                task_id=seeded["task"],
+            )
+        return staged, cls.promoted_now(name, staged.proposal_id)
+
+    @classmethod
+    def promoted_now(cls, name: str, proposal_id: str) -> dict:
+        with cls.connection.transaction():
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.identifiers[name],)
+            )
+            return proxy.as_object(
+                cls.connection.execute(
+                    "SELECT promote_proposal($1::uuid)", (proposal_id,)
+                ).scalar()
+            )
+
+    @classmethod
+    def labels(cls, name: str) -> dict:
+        """This Program's rows, under the name a payload would call them by.
+
+        Entities by type and Identities by slot, both for the types this Program
+        holds one of; Observations by kind, of which the earliest is the one the
+        fixture promoted; and the Hypothesis by nothing at all, because after
+        the first claim there is exactly one and a lookup that had to
+        disambiguate it would be asserting about the label counter.
+        """
+        program_id = cls.identifiers[name]
+        found = {
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT type, min(label) FROM entities WHERE program_id = $1::uuid"
+                " GROUP BY type HAVING count(*) = 1",
+                (program_id,),
+            ).rows
+        }
+        found.update({
+            "identity_" + str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT i.slot_name, e.label FROM identities i"
+                "  JOIN entities e ON e.id = i.entity_id"
+                " WHERE i.program_id = $1::uuid",
+                (program_id,),
+            ).rows
+        })
+        found.update({
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT kind, min(label) FROM observations"
+                " WHERE program_id = $1::uuid GROUP BY kind",
+                (program_id,),
+            ).rows
+        })
+        held = cls.connection.execute(
+            "SELECT label FROM hypotheses WHERE program_id = $1::uuid", (program_id,)
+        ).rows
+        if len(held) == 1:
+            found["hypothesis"] = str(held[0][0])
+        return found
+
+    @classmethod
+    def unheld(cls, mine: str, theirs: str) -> dict:
+        """The labels the second Program holds and the first does not.
+
+        A label is a per-Program sequence, so `EP1` names a row in both
+        Programs and citing it is not citing across Programs at all. What a
+        cross-Program citation needs is a string that is a row there and no row
+        here, which is what the second Program's spare Endpoint and Observation
+        are for.
+        """
+        found = {}
+        for sql in (
+            "SELECT e.type, min(e.label) FROM entities e WHERE e.program_id = $1::uuid"
+            "   AND NOT EXISTS (SELECT 1 FROM entities m"
+            "                    WHERE m.program_id = $2::uuid AND m.label = e.label)"
+            " GROUP BY e.type",
+            "SELECT o.kind, min(o.label) FROM observations o WHERE o.program_id = $1::uuid"
+            "   AND NOT EXISTS (SELECT 1 FROM observations m"
+            "                    WHERE m.program_id = $2::uuid AND m.label = o.label)"
+            " GROUP BY o.kind",
+        ):
+            found.update({
+                str(row[0]): str(row[1])
+                for row in cls.connection.execute(
+                    sql, (cls.identifiers[theirs], cls.identifiers[mine])
+                ).rows
+            })
+        return found
+
+    def rows(self, sql: str, name: str = "main") -> list:
+        return list(self.connection.execute(sql, (self.identifiers[name],)).rows)
+
+    @contextlib.contextmanager
+    def agent_session(self, name: str):
+        """The connection a child reads through, bound to one Program."""
+        with pg.connect(self.harness.state) as session:
+            with session.transaction():
+                assert state.bind_agent_session(
+                    state.Ledger(), session, self.identifiers[name]
+                )
+                yield session
+
+    # -- criterion 1: one subject, one class, one cell, one rationale ---------
+
+    def test_one_proposal_became_one_hypothesis_naming_all_four(self):
+        claimed = self.claimed
+
+        self.assertEqual("promoted", claimed["status"])
+        self.assertEqual(0, claimed["refused"])
+        self.assertEqual(2, claimed["evidence"])
+        [row] = self.rows(
+            "SELECT h.label, h.property_class, h.statement, h.rationale,"
+            "       subj.label, ia.label, h.identity_b_entity_id, h.status"
+            "  FROM hypotheses h"
+            "  JOIN entities subj ON subj.id = h.subject_entity_id"
+            "  LEFT JOIN entities ia ON ia.id = h.identity_a_entity_id"
+            " WHERE h.program_id = $1::uuid"
+        )
+
+        self.assertEqual([str(row[0])], list(claimed["hypotheses"]))
+        self.assertEqual(OWNERSHIP, str(row[1]))
+        self.assertEqual(
+            "the note id is honoured for a member who does not own it", str(row[2])
+        )
+        self.assertEqual(rationale(), proxy.as_object(row[3]))
+        self.assertEqual(self.held["endpoint"], str(row[4]))
+        self.assertEqual(self.held["identity_member"], str(row[5]))
+        self.assertIsNone(row[6])
+        # Proposed, not testable: promotion writes the row and the state machine
+        # is the only thing that moves it, which is criterion 6 from this end.
+        self.assertEqual("proposed", str(row[7]))
+
+    def test_a_promoted_claim_says_what_would_refute_it(self):
+        # The falsifier by itself, because it is the field a Test is written
+        # from. A rationale is admitted whole or not at all, so a promoted row
+        # answering two of the three keys is not a partial record: it is one
+        # this promotion would have refused.
+        [row] = self.rows(
+            "SELECT rationale ->> 'falsifier', rk2_rationale_missing(rationale)"
+            "  FROM hypotheses WHERE program_id = $1::uuid"
+        )
+
+        self.assertEqual("the same request as a second member returns 403", str(row[0]))
+        self.assertIsNone(row[1])
+
+    def test_the_rationale_reaches_the_role_a_child_reads_through(self):
+        with self.agent_session("main") as session:
+            record = proxy.as_object(
+                session.execute(
+                    "SELECT record FROM v_records WHERE kind = 'hypothesis'"
+                    " AND label = $1",
+                    (self.claimed["hypotheses"][0],),
+                ).scalar()
+            )
+
+        self.assertEqual(rationale(), record["rationale"])
+        self.assertEqual("proposed", record["status"])
+        self.assertEqual(self.held["identity_member"], record["identity_a_label"])
+
+    def test_the_element_that_produced_it_names_its_proposal_and_its_run(self):
+        [row] = self.connection.execute(
+            "SELECT hp.element_path, hp.converged, p.label, ar.role"
+            "  FROM hypothesis_provenance hp"
+            "  JOIN proposals p ON p.id = hp.proposal_id"
+            "  JOIN agent_runs ar ON ar.id = hp.agent_run_id"
+            " WHERE hp.proposal_id = $1::uuid",
+            (self.first.proposal_id,),
+        ).rows
+
+        self.assertEqual("hypotheses[0]", str(row[0]))
+        self.assertFalse(bool(row[1]))
+        self.assertEqual(self.first.label, str(row[2]))
+        self.assertEqual("recon", str(row[3]))
+
+    # -- criterion 2: the edges, and what they may reference ------------------
+
+    def test_the_edges_name_observations_with_a_polarity_and_a_role(self):
+        rows = self.connection.execute(
+            "SELECT o.kind, he.polarity, he.role FROM hypothesis_evidence he"
+            "  JOIN observations o ON o.id = he.observation_id"
+            " WHERE he.proposal_id = $1::uuid ORDER BY he.role",
+            (self.first.proposal_id,),
+        ).rows
+
+        self.assertEqual(
+            [(INVARIANT, "supports", "control"), (DIFFERENTIAL, "supports", "variant")],
+            [(str(row[0]), str(row[1]), str(row[2])) for row in rows],
+        )
+
+    def test_an_observation_an_edge_cites_cannot_be_rewritten_afterwards(self):
+        # Immutability is 007's and not this file's, and the edge is what makes
+        # it load-bearing here: a summary that could be rewritten after
+        # promotion would let a refuted claim be re-supported without anyone
+        # making a new Observation.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            with self.connection.transaction():
+                self.connection.execute(
+                    "UPDATE observations SET summary = 'edited' WHERE label = $1",
+                    (self.held[INVARIANT],),
+                )
+
+        self.assertIn("observations rows are immutable", str(refused.exception))
+
+    # -- criterion 3: what the runtime verifies before a row exists -----------
+
+    def test_a_claim_about_a_subject_no_program_holds_is_refused(self):
+        self.assertEqual(("no_subject", "EP999999"), self.dropped["hypotheses[2]"])
+
+    def test_a_claim_about_another_programs_subject_is_refused_by_name(self):
+        # By name, and not by the name the one above gets: a label nobody was
+        # issued is this hunter's mistake about its own Program, and a label
+        # issued to another Program is the refusal worth reading on its own.
+        self.assertEqual(
+            ("label_other_program", self.foreign["endpoint"]),
+            self.dropped["hypotheses[3]"],
+        )
+        self.assertEqual(
+            [],
+            self.rows(
+                "SELECT 1 FROM hypotheses h JOIN entities e"
+                "    ON e.id = h.subject_entity_id"
+                " WHERE h.program_id = $1::uuid AND e.program_id <> h.program_id"
+            ),
+        )
+
+    def test_an_identity_cell_that_is_not_an_identity_is_refused_by_name(self):
+        reason, cited = self.dropped["hypotheses[1]"]
+
+        self.assertEqual("no_identity", reason)
+        self.assertIn(self.held["application"], cited)
+        self.assertIn("not an Identity of this Program", cited)
+
+    def test_a_property_class_outside_the_vocabulary_is_refused(self):
+        self.assertEqual(
+            ("unknown_kind", "injection.telepathy"), self.dropped["hypotheses[4]"]
+        )
+
+    def test_a_rationale_that_names_no_falsifier_is_refused(self):
+        reason, cited = self.dropped["hypotheses[5]"]
+
+        self.assertEqual("malformed_field", reason)
+        self.assertIn("falsifier", cited)
+
+    def test_a_claim_nothing_in_the_result_supports_is_refused(self):
+        self.assertEqual("no_support", self.dropped["hypotheses[6]"][0])
+
+    def test_a_claim_whose_only_support_the_schema_refuses_leaves_no_row(self):
+        # The one case that cannot be decided from the payload: the edge is
+        # well-formed and 018 refuses it because the Observation it cites is not
+        # evidential. Claim and edge are refused together, and the Hypothesis
+        # the edge would have supported does not exist.
+        self.assertEqual("no_support", self.dropped["hypotheses[7]"][0])
+        self.assertEqual("no_subject", self.dropped["evidence[0]"][0])
+        self.assertEqual(
+            [],
+            self.rows(
+                "SELECT 1 FROM hypotheses WHERE program_id = $1::uuid"
+                "   AND statement = 'the id is not checked'"
+            ),
+        )
+
+    def test_a_polarity_and_a_role_outside_their_vocabularies_are_refused(self):
+        self.assertEqual(("unknown_kind", "proves"), self.dropped["evidence[1]"])
+        self.assertEqual(("unknown_kind", "smoking_gun"), self.dropped["evidence[2]"])
+
+    def test_an_edge_naming_another_programs_observation_is_refused(self):
+        self.assertEqual(
+            ("label_other_program", self.foreign[INVARIANT]), self.dropped["evidence[3]"]
+        )
+
+    def test_an_edge_citing_no_observation_has_no_provenance_to_stand_on(self):
+        self.assertEqual("no_provenance", self.dropped["evidence[4]"][0])
+
+    def test_an_edge_that_names_no_claim_is_refused_for_naming_none(self):
+        self.assertEqual("no_subject", self.dropped["evidence[5]"][0])
+
+    def test_a_proposal_that_states_a_status_is_refused_rather_than_clamped(self):
+        self.assertEqual(("claims_execution", "supported"), self.dropped["hypotheses[0]"])
+
+    def test_a_claim_that_cannot_be_named_by_an_edge_is_refused_for_that(self):
+        # And not for the rule it would otherwise break at the end of pass 3: a
+        # candidate with no `ref` is unreachable by every edge of its own
+        # result, so `no_support` would be a true sentence about the wrong
+        # mistake.
+        reason, cited = self.dropped["hypotheses[8]"]
+
+        self.assertEqual("malformed_field", reason)
+        self.assertIn("ref", cited)
+
+    def test_a_claim_standing_only_on_context_stands_on_nothing(self):
+        # `context` is a role the column takes, so the edge is not refused for
+        # being one -- it is the claim that is refused, because the transition
+        # machine counts baseline, variant and control and nothing else.
+        self.assertEqual("no_support", self.dropped["hypotheses[9]"][0])
+        self.assertEqual("no_subject", self.dropped["evidence[7]"][0])
+
+    def test_the_same_observation_cannot_stand_both_ways_in_one_role(self):
+        # The primary key is (hypothesis, observation, role) and does not hold
+        # polarity, so the second edge would have been swallowed by `ON CONFLICT
+        # DO NOTHING` and reported nowhere.
+        reason, cited = self.dropped["evidence[6]"]
+
+        self.assertEqual("polarity_conflict", reason)
+        self.assertIn("supports", cited)
+        self.assertEqual(
+            [("supports",)],
+            [
+                tuple(str(cell) for cell in row)
+                for row in self.rows(
+                    "SELECT he.polarity FROM hypothesis_evidence he"
+                    "  JOIN observations o ON o.id = he.observation_id"
+                    " WHERE he.program_id = $1::uuid AND he.role = 'control'"
+                    "   AND o.kind = '" + INVARIANT + "'"
+                )
+            ],
+        )
+
+    def test_the_whole_wrong_result_left_the_canonical_tables_alone(self):
+        # Every element of it was wrong, which makes the proposal rejected
+        # rather than promoted -- and a rejected result is the one shape that
+        # must leave the canonical tables exactly as it found them.
+        self.assertEqual("rejected", self.refused["status"])
+        self.assertEqual([], list(self.refused["hypotheses"]))
+        self.assertEqual(0, self.refused["evidence"])
+        self.assertEqual(18, self.refused["refused"])
+        self.assertEqual(
+            1, len(self.rows("SELECT 1 FROM hypotheses WHERE program_id = $1::uuid"))
+        )
+
+    # -- criterion 4: two proposals, one claim, both sets of edges ------------
+
+    def test_the_second_proposal_converged_rather_than_writing_a_second_row(self):
+        self.assertEqual("promoted", self.converged["status"])
+        self.assertEqual(
+            list(self.claimed["hypotheses"]), list(self.converged["hypotheses"])
+        )
+        self.assertEqual(
+            1, len(self.rows("SELECT 1 FROM hypotheses WHERE program_id = $1::uuid"))
+        )
+
+    def test_both_proposals_are_named_and_the_second_says_it_arrived_second(self):
+        rows = self.connection.execute(
+            "SELECT p.label, hp.converged FROM hypothesis_provenance hp"
+            "  JOIN proposals p ON p.id = hp.proposal_id"
+            " WHERE hp.proposal_id IN ($1::uuid, $2::uuid) ORDER BY hp.at",
+            (self.first.proposal_id, self.second.proposal_id),
+        ).rows
+
+        self.assertEqual(
+            [(self.first.label, False), (self.second.label, True)],
+            [(str(row[0]), bool(row[1])) for row in rows],
+        )
+
+    def test_the_first_hunters_words_are_the_ones_that_stand(self):
+        # The row is not rewritten by whoever proposes it last: other rows cite
+        # this statement, and a claim whose text moved under them would make
+        # every earlier citation describe something else.
+        [row] = self.rows(
+            "SELECT statement, rationale ->> 'mechanism' FROM hypotheses"
+            " WHERE program_id = $1::uuid"
+        )
+
+        self.assertEqual(
+            "the note id is honoured for a member who does not own it", str(row[0])
+        )
+        self.assertEqual("the object id is not checked against the caller", str(row[1]))
+
+    def test_the_statement_that_converged_is_kept_as_a_key_collision(self):
+        [row] = self.rows(
+            "SELECT nm.candidate_statement, nm.action, nm.similarity,"
+            "       nm.embedding_model, h.label"
+            "  FROM hypothesis_near_matches nm"
+            "  JOIN hypotheses h ON h.id = nm.matched_hypothesis_id"
+            " WHERE nm.program_id = $1::uuid"
+        )
+
+        self.assertEqual("any member can read any note by guessing its id", str(row[0]))
+        self.assertEqual("key_collision", str(row[1]))
+        self.assertIsNone(row[2])
+        self.assertIsNone(row[3])
+        self.assertEqual(self.claimed["hypotheses"][0], str(row[4]))
+
+    def test_the_converged_claim_kept_the_evidence_of_both_proposals(self):
+        rows = self.rows(
+            "SELECT he.role, p.label FROM hypothesis_evidence he"
+            "  JOIN proposals p ON p.id = he.proposal_id"
+            " WHERE he.program_id = $1::uuid ORDER BY he.role"
+        )
+
+        self.assertEqual(
+            [("baseline", self.second.label), ("control", self.first.label),
+             ("variant", self.first.label)],
+            [(str(row[0]), str(row[1])) for row in rows],
+        )
+
+    def test_promoting_the_same_result_again_changes_nothing_and_says_so(self):
+        before = self.labels("main")
+
+        repeated = self.promoted_now("main", self.first.proposal_id)
+
+        self.assertTrue(repeated["repeated"])
+        self.assertEqual("promoted", repeated["status"])
+        self.assertEqual(
+            sorted(self.claimed["hypotheses"]), sorted(repeated["hypotheses"])
+        )
+        self.assertEqual(self.claimed["evidence"], repeated["evidence"])
+        self.assertEqual(before, self.labels("main"))
+
+    # -- criterion 6: who may move it, and who may not -----------------------
+
+    def test_no_hypothesis_transition_is_open_to_a_model(self):
+        rows = self.connection.execute(
+            "SELECT from_status, to_status, required_actor_kind FROM transition_rules"
+            " WHERE machine = 'hypothesis'"
+            "   AND required_actor_kind IS DISTINCT FROM 'runtime'"
+        ).rows
+
+        self.assertEqual([], [tuple(str(cell) for cell in row) for row in rows])
+
+    def test_a_model_cannot_call_the_claim_it_proposed_testable(self):
+        with self.assertRaises(pg.DatabaseError) as refused:
+            with self.connection.transaction():
+                self.connection.execute(
+                    "INSERT INTO hypothesis_transitions"
+                    " (program_id, hypothesis_id, from_status, to_status, actor_kind)"
+                    " SELECT program_id, id, 'proposed', 'testable', 'llm'"
+                    "   FROM hypotheses WHERE program_id = $1::uuid",
+                    (self.identifiers["main"],),
+                )
+
+        self.assertIn("requires actor_kind runtime, got llm", str(refused.exception))
+
+    def test_the_runtime_may_move_it_and_the_status_follows_the_transition(self):
+        # Rolled back rather than left behind: the row this class asserts about
+        # is `proposed`, and unittest runs the methods of a class in
+        # alphabetical order rather than in the order they read.
+        moved = None
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "INSERT INTO hypothesis_transitions"
+                    " (program_id, hypothesis_id, from_status, to_status,"
+                    "  actor_kind, rationale)"
+                    " SELECT program_id, id, 'proposed', 'testable', 'runtime',"
+                    "        'selftest' FROM hypotheses WHERE program_id = $1::uuid",
+                    (self.identifiers["main"],),
+                )
+                moved = str(
+                    self.connection.execute(
+                        "SELECT status FROM hypotheses WHERE program_id = $1::uuid",
+                        (self.identifiers["main"],),
+                    ).scalar()
+                )
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual("testable", moved)
+        self.assertEqual(
+            "proposed",
+            str(
+                self.connection.execute(
+                    "SELECT status FROM hypotheses WHERE program_id = $1::uuid",
+                    (self.identifiers["main"],),
+                ).scalar()
+            ),
+        )
+
+    def test_a_claim_under_test_is_not_something_a_later_result_may_reach(self):
+        # The other half of criterion 6, and the half a status field is not
+        # needed for: 018's key says nothing about status, so a claim already
+        # moved on is a row a later proposal can converge onto -- and 007's
+        # guard counts `hypothesis_evidence` for the quorum it reads before
+        # calling a claim supported. Both ways in are refused by name.
+        #
+        # The whole of it is rolled back, transition included, because the row
+        # the rest of this class asserts about is `proposed`.
+        answer, drops = None, {}
+        seeded = self.seeded["main"]
+        # Staged first and on its own, because staging opens a transaction of
+        # its own: done inside the one below, its commit would be the commit of
+        # the transition too, and a staged result nothing promoted is the state
+        # a supervisor is in between the two calls anyway.
+        with self.connection.transaction():
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+        staged = proposal.stage(
+            self.connection,
+            proposal.Result(payload=self.settled()),
+            program_id=self.identifiers["main"],
+            agent_run_id=seeded["run"],
+            task_id=seeded["task"],
+        )
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "INSERT INTO hypothesis_transitions"
+                    " (program_id, hypothesis_id, from_status, to_status,"
+                    "  actor_kind, rationale)"
+                    " SELECT program_id, id, 'proposed', 'testable', 'runtime',"
+                    "        'selftest' FROM hypotheses WHERE program_id = $1::uuid",
+                    (self.identifiers["main"],),
+                )
+                self.connection.execute(
+                    "SELECT set_config('rk2.program_id', $1, true)",
+                    (self.identifiers["main"],),
+                )
+                answer = proxy.as_object(
+                    self.connection.execute(
+                        "SELECT promote_proposal($1::uuid)", (staged.proposal_id,)
+                    ).scalar()
+                )
+                drops = {
+                    str(row[0]): (str(row[1]), str(row[2]))
+                    for row in self.connection.execute(
+                        "SELECT element_path, reason, cited FROM proposal_drops"
+                        " WHERE proposal_id = $1::uuid",
+                        (staged.proposal_id,),
+                    ).rows
+                }
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual("rejected", answer["status"])
+        self.assertEqual([], list(answer["hypotheses"]))
+        self.assertEqual(("claim_past_proposed",), (drops["hypotheses[0]"][0],))
+        self.assertIn("testable", drops["hypotheses[0]"][1])
+        # Its own edge falls with it, and the edge that named the claim by label
+        # is refused on its own account rather than by that cascade.
+        self.assertEqual("no_subject", drops["evidence[0]"][0])
+        self.assertEqual("claim_past_proposed", drops["evidence[1]"][0])
+        self.assertIn("testable", drops["evidence[1]"][1])
+
+    # -- the standing check ---------------------------------------------------
+
+    def test_the_standing_check_reports_nothing_about_this_installation(self):
+        # Through the registry rather than by calling the function, because a
+        # check nothing runs is a check that cannot fail.
+        [row] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'hypothesis_promotion'"
+        ).rows
+
+        self.assertEqual((0, ""), (int(row[0]), str(row[1])))
 
 
 #: The Programs the refusal case opens. Two of them, because one thing a

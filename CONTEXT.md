@@ -87,8 +87,24 @@ _Avoid_: Proof, artefact, exhibit
 **Hypothesis**:
 A proposed security property of one subject entity, usually about a pair of
 identities, moving through `proposed -> testable -> testing -> supported |
-refuted | inconclusive`. Only the runtime may start it testing.
+refuted | inconclusive`. Every one of those moves is the runtime's, `proposed ->
+testable` included, because a testable hypothesis is what a Task is ranked from
+and an agent that could set it would be scheduling its own work. It becomes
+canonical only by promotion, and only while something supports it. Two proposals
+reaching the same subject, identity pair and Property class converge on the one
+row, which keeps both proposals' evidence and records the collision. Once it has
+moved past `proposed`, no proposal reaches it at all: adding evidence to a claim
+whose Test is already running is the same authority as starting the Test.
 _Avoid_: Theory, idea, lead, suspicion
+
+**Rationale**:
+The three named fields a proposed hypothesis carries beside its one-sentence
+statement: the `mechanism` the defect would be, the `expectation` a correct
+system meets instead, and the `falsifier` whose result would settle the claim
+against the hunter. Closed, and all three required — a statement is prose two
+hunters can write identically about different mechanisms, and a refutation is
+only negative knowledge if something said in advance what one would be.
+_Avoid_: Reasoning, justification, explanation, notes
 
 **Property class**:
 The security property a hypothesis is about, and the component that decides
