@@ -43,9 +43,13 @@ COMPLETIONS = ("complete", "partial", "unproven")
 #: different claims, and only one of them was made.
 UNCLAIMED = "unproven"
 
-#: `proposal_drops.reason`, from migration 0020's check constraint. Every one
-#: of these is a statement the runtime can prove from a row; there is no
-#: `looked_wrong`.
+#: The reasons this module can write, out of the ones `proposal_drops.reason`
+#: admits. Every one is a statement the runtime can prove from a row; there is
+#: no `looked_wrong`. Deliberately not the whole column: a source citation that
+#: does not hold is refused by a trigger on `proposals`, so those words are the
+#: database's rather than this module's, and `stage` reads back what the table
+#: holds instead of listing them here -- a second copy of that vocabulary could
+#: only ever be out of date.
 REASONS = (
     "no_such_receipt",
     "receipt_other_program",
@@ -56,11 +60,6 @@ REASONS = (
     "label_other_program",
     "no_provenance",
 )
-#: Not every reason the column admits, and deliberately: a source citation that
-#: does not hold is refused by a trigger on `proposals`, so those words are the
-#: database's rather than this module's. `stage` reads back what the table holds
-#: instead of listing them here, because a second copy of that vocabulary could
-#: only ever be out of date.
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +295,10 @@ INSERT_DROP = (
 #: moment the proposal lands -- an ungrounded source citation is refused by a
 #: trigger, so that a promotion cannot be reached by not going through here --
 #: and those rows are already numbered when this asks. The ordinal is a key
-#: rather than a rank, so continuing the numbering is all this has to do.
-NEXT_DROP = "SELECT coalesce(max(ordinal) + 1, 0) FROM proposal_drops WHERE proposal_id = $1::uuid"
+#: rather than a rank, so continuing the numbering is all this has to do. The
+#: rule is asked of the database rather than spelled here, because the trigger
+#: that writes first asks the same function.
+NEXT_DROP = "SELECT rk2_next_drop_ordinal($1::uuid)"
 
 #: Every element this proposal lost, whoever refused it. Read back rather than
 #: assembled from what this module wrote, because a caller told only about the

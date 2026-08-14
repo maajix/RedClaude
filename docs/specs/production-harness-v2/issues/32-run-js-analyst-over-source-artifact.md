@@ -45,7 +45,7 @@
 3. The three analyses are `js_parse`, `js_routes` and `js_map`, one harness
    analyser (`src/redkraken/jsscan.py`) asked three questions. The tool name is
    the subcommand, so which analysis this is comes from the registry key rather
-   than from an argument. `tool_runs.program_sha256` records the hash of the
+   than from an argument. `tool_runs.analyser_sha256` records the hash of the
    analyser bytes the runtime mounted, and `open_offline_tool_run` refuses a run
    where the registry and the runtime disagree about whether there is an
    analyser at all. `tool_run_inputs` records what the run was given — argument,
@@ -54,17 +54,34 @@
    bytes it was going to read. `check_source_conclusions` reports an analyser
    run with no hash and a closed source run that recorded nothing.
    `JsAnalystCommandTest.test_the_run_records_the_analyser_and_the_bytes_it_was_given`
-   holds both against a real container.
+   holds both against a real container. The two hashes are not equally
+   checkable and the schema says which is which: an input hash is verified
+   against `artifact_references` by `tool_run_input_is_this_runs_input`, and the
+   analyser hash is provenance the runtime supplies — the registry never sees
+   the file, so it is the same kind of claim `tool_version` is, and the column
+   comment says so.
 
 4. `rk2_source_citation` is the one question asked in both directions: an
    element that names a source Artifact must have named one that holds up, and
-   an element grounded in a run that read source must name which source. It runs
-   from `proposals_ground_source_citations`, an AFTER INSERT trigger on
-   `proposals`, over `new_entities`, `observations` and `hypotheses` alike.
-   Hypotheses are the reason it is a trigger: nothing promotes a Hypothesis, so
-   a check inside `promote_proposal` would never see one, and the criterion
-   names hypotheses beside endpoints and parameters. Endpoints and parameters
-   are Entities and arrive in `new_entities`, which the same walk covers.
+   an element grounded in a run that read source must name which source. The
+   second half asks the registry and the run together — did this run fill an
+   argument declared to take source, with source — so a tool with an optional
+   source argument is not made to cite one on a run that read none, and `jq`
+   handed a file this Program happens to hold as source is not made to cite one
+   either. It runs from
+   `proposals_ground_source_citations`, an AFTER INSERT trigger on `proposals`,
+   over all four element lists — `rk2_proposal_elements` is the one place that
+   spells `promote_proposal`'s element paths, and both this trigger and the
+   standing check walk it. Hypotheses are the reason it is a trigger: nothing
+   promotes a Hypothesis, so a check inside `promote_proposal` would never see
+   one, and the criterion names hypotheses beside endpoints and parameters.
+   Endpoints and parameters are Entities and arrive in `new_entities`;
+   Relationships are walked too, because a list left out is a list an ungrounded
+   conclusion promotes through.
+   `SourceCitationTest.test_the_endpoint_promoted_is_the_one_that_can_name_its_source`
+   proposes an application, an endpoint and a parameter that can name their
+   source and a second endpoint that cannot, and holds the canonical
+   `endpoints` rows afterwards.
 
 5. The refusal is a `proposal_drops` row, which is what every promotion walk
    already skips, so the element never becomes canonical. Five reasons, five
@@ -77,8 +94,11 @@
    already promoted, which is how a citation that held when it was checked and
    stopped holding afterwards becomes visible.
    `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
-   walks seven elements alike in everything but their citation and gets one
-   promotion and six refusals, each by its own reason.
+   walks elements alike in everything but their citation, across all four lists,
+   and gets one promotion and a refusal per way of failing.
+   `test_an_artifact_another_program_holds_is_not_a_citation_either` is the one
+   worth stating separately, because it is the only reason where the refusal
+   depends on who is asking rather than on what the element says.
 
 6. `SOURCE_BUNDLE` in `tests/test_database.py` holds three routes something
    requests — a template literal through `fetch`, an `axios.post` and a
@@ -98,7 +118,27 @@
 ## Two writers, one table
 
 `proposal_drops` now has two: the trigger, at staging, and `proposal.stage`
-afterwards. The ordinal is part of the key, so `stage` reads `max(ordinal) + 1`
-before writing and reports back what the table holds rather than only what it
-wrote. `SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
-pins the whole sequence, six from the trigger and the seventh from the runtime.
+afterwards. The ordinal is part of the key, so both ask `rk2_next_drop_ordinal`
+where theirs starts and `stage` reports back what the table holds rather than
+only what it wrote.
+`SourceCitationTest.test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed`
+pins the whole sequence, eight from the trigger and the ninth from the runtime.
+
+## What a citation is not
+
+A citation says which bytes a conclusion came from and which run read them. It
+does not say that the run reported that conclusion, and nothing here can make it
+say so: what a run printed is an Artifact in the store, and the store is on the
+disk rather than in the database, so the trigger that refuses a citation has the
+hash of the output and never its contents. An analyst that reads a bundle
+through `mcp__rk2__get_artifact`, invents a route and cites the bundle and a real
+`js_parse` run over it is grounded by this ticket's rules and wrong.
+
+What the ticket does buy against that is narrower and worth stating exactly: the
+invention has to name an Artifact this Program holds as source, unchanged, that
+the cited run actually read — so it is checkable after the fact, by anyone,
+against bytes that are still there. `js_routes` is what makes the check cheap,
+because the routes it reports are the ones a request was lexically given. Making
+the runtime compare a proposed path against the cited run's output before
+promoting it is a real strengthening and it belongs to whichever ticket gives
+`proposal.stage` the store; it is not a hole this one can close from SQL.

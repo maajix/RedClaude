@@ -32,7 +32,7 @@
 --      and no database.
 --   3. What ran, and over exactly which bytes. `tool_run_inputs` is one row per
 --      materialised argument, carrying the Artifact's label, its hash and the
---      kind it is held as; `tool_runs.program_sha256` carries the hash of the
+--      kind it is held as; `tool_runs.analyser_sha256` carries the hash of the
 --      analyser the harness shipped into the container. Between them a run says
 --      what its output is a function of, which is what makes a second run of
 --      the same tool over the same bytes a check rather than a repetition.
@@ -151,17 +151,24 @@ COMMENT ON COLUMN offline_tool_outputs.reference_kind IS
     'migration rather than chosen at runtime, so nothing an agent does can '
     'make its own output into source for the next tool.';
 
-ALTER TABLE tool_runs ADD COLUMN program_sha256 text
-    CHECK (program_sha256 IS NULL OR program_sha256 ~ '^[0-9a-f]{64}$');
+-- `analyser_sha256` and not `program_sha256`: a Program is a bounty engagement
+-- here, and a column beside `program_id` spelling the word for something else
+-- would make the glossary's one reserved term ambiguous on a single row.
+ALTER TABLE tool_runs ADD COLUMN analyser_sha256 text
+    CHECK (analyser_sha256 IS NULL OR analyser_sha256 ~ '^[0-9a-f]{64}$');
 
-ALTER TABLE tool_runs ADD CONSTRAINT tool_runs_program_sha256_ck
-    CHECK (program_sha256 IS NULL OR offline_tool IS NOT NULL);
+ALTER TABLE tool_runs ADD CONSTRAINT tool_runs_analyser_sha256_ck
+    CHECK (analyser_sha256 IS NULL OR offline_tool IS NOT NULL);
 
-COMMENT ON COLUMN tool_runs.program_sha256 IS
+COMMENT ON COLUMN tool_runs.analyser_sha256 IS
     'The exact analyser bytes that ran, for a tool whose registry row names '
     'one. `tool_version` says what the program calls itself and this says what '
     'it was -- the same distinction 030 draws between the pattern the registry '
-    'admits and the version the image reported.';
+    'admits and the version the image reported, and provenance in the same '
+    'sense: the registry never sees the file, so this is what the runtime '
+    'hashed and not a claim the database can check. What it buys is that two '
+    'runs of one tool over one Artifact are comparable, and that a conclusion '
+    'rests on bytes that can be named rather than on a tool name.';
 
 
 -- ---------------------------------------------------------------------------
@@ -234,7 +241,7 @@ INSERT INTO state_read_surface (table_name, column_name, added_by) VALUES
     ('tool_run_inputs', 'sha256',         'ph2-32'),
     ('tool_run_inputs', 'reference_kind', 'ph2-32'),
     ('tool_run_inputs', 'recorded_at',    'ph2-32'),
-    ('tool_runs',       'program_sha256', 'ph2-32');
+    ('tool_runs',       'analyser_sha256', 'ph2-32');
 
 CREATE FUNCTION tool_run_input_is_this_runs_input() RETURNS trigger
 LANGUAGE plpgsql AS $fn$
@@ -357,10 +364,10 @@ INSERT INTO offline_tool_roles (tool, role) VALUES
 -- what is added is the analyser, the kind an Artifact argument admits, and the
 -- input rows.
 
-CREATE FUNCTION rk2_offline_program_path(p_name text) RETURNS text
+CREATE FUNCTION rk2_offline_analyser_path(p_name text) RETURNS text
 LANGUAGE sql IMMUTABLE AS $fn$ SELECT '/input/' || p_name $fn$;
 
-COMMENT ON FUNCTION rk2_offline_program_path(text) IS
+COMMENT ON FUNCTION rk2_offline_analyser_path(text) IS
     'Where a harness-shipped analyser appears inside the container. The same '
     'directory the input Artifacts land in, and it cannot collide with one: an '
     'Artifact label is upper case and digits, and an analyser name ends in .py.';
@@ -372,7 +379,7 @@ CREATE FUNCTION open_offline_tool_run(
         p_tool           text,
         p_version        text,
         p_arguments      jsonb DEFAULT '{}'::jsonb,
-        p_program_sha256 text DEFAULT NULL)
+        p_analyser_sha256 text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -427,14 +434,14 @@ BEGIN
     -- run whose evidence would have no statement of what produced it; a hash
     -- given for a tool that names none is a runtime that put a file into the
     -- container this registry row never asked for.
-    IF (v_tool.analyser IS NOT NULL) <> (p_program_sha256 IS NOT NULL) THEN
+    IF (v_tool.analyser IS NOT NULL) <> (p_analyser_sha256 IS NOT NULL) THEN
         RAISE EXCEPTION 'the registry says % % analyser and the runtime supplied %',
             p_tool,
             CASE WHEN v_tool.analyser IS NULL THEN 'runs no' ELSE 'runs an' END,
-            CASE WHEN p_program_sha256 IS NULL THEN 'none' ELSE 'one' END
+            CASE WHEN p_analyser_sha256 IS NULL THEN 'none' ELSE 'one' END
             USING ERRCODE = '22023';
     END IF;
-    IF p_program_sha256 IS NOT NULL AND p_program_sha256 !~ '^[0-9a-f]{64}$' THEN
+    IF p_analyser_sha256 IS NOT NULL AND p_analyser_sha256 !~ '^[0-9a-f]{64}$' THEN
         RAISE EXCEPTION 'the analyser hash is not a sha256' USING ERRCODE = '22023';
     END IF;
 
@@ -456,7 +463,7 @@ BEGIN
     -- analysis this is comes from the registry key rather than from an
     -- argument, so it is not something a validated call can differ in.
     IF v_tool.analyser IS NOT NULL THEN
-        v_argv := ARRAY[rk2_offline_program_path(v_tool.analyser), p_tool];
+        v_argv := ARRAY[rk2_offline_analyser_path(v_tool.analyser), p_tool];
     END IF;
 
     FOR v_arg IN
@@ -528,11 +535,11 @@ BEGIN
 
     INSERT INTO tool_runs
         (program_id, agent_run_id, task_id, tool, args, status, transport,
-         offline_tool, tool_version, program_sha256)
+         offline_tool, tool_version, analyser_sha256)
     VALUES
         (p, v_run.id, v_run.task_id, 'mcp__rk2__run_tool',
          jsonb_build_object('tool_name', p_tool, 'arguments', p_arguments),
-         'running', 'runtime', p_tool, p_version, p_program_sha256)
+         'running', 'runtime', p_tool, p_version, p_analyser_sha256)
     RETURNING id, label INTO v_id, v_label;
 
     -- After the run row and before anything starts, which is the same moment
@@ -552,8 +559,8 @@ BEGIN
         'version', p_version,
         'executable', v_tool.executable,
         'analyser', v_tool.analyser,
-        'program_path', CASE WHEN v_tool.analyser IS NOT NULL
-                             THEN rk2_offline_program_path(v_tool.analyser) END,
+        'analyser_path', CASE WHEN v_tool.analyser IS NOT NULL
+                             THEN rk2_offline_analyser_path(v_tool.analyser) END,
         'argv', to_jsonb(array_prepend(v_tool.executable, v_argv)),
         'network', v_tool.network,
         'timeout_seconds', v_tool.timeout_seconds,
@@ -612,7 +619,9 @@ COMMENT ON FUNCTION open_offline_tool_run(uuid, text, text, jsonb, text) IS
 --   `no_source_citation`     the element is grounded in a run that read source
 --                            and does not say which. Criterion 4 from the other
 --                            side: a run may read more than one file, and an
---                            unnamed one is not a citation.
+--                            unnamed one is not a citation. What the run read is
+--                            `tool_run_inputs`, not what its tool could have
+--                            been given.
 
 ALTER TABLE proposal_drops DROP CONSTRAINT proposal_drops_reason_check;
 ALTER TABLE proposal_drops ADD CONSTRAINT proposal_drops_reason_check
@@ -637,12 +646,20 @@ DECLARE
 BEGIN
     IF v_label IS NULL THEN
         -- Nothing cited, and nothing to check unless the evidence behind this
-        -- element is a run that was given source. `artifact_kind` is what makes
-        -- a tool a source analysis tool; there is no second list to keep.
+        -- element is a run that read source through an argument declared to
+        -- take it. Both halves are load-bearing and neither is enough alone:
+        -- the registry alone would demand a citation from a run that left an
+        -- optional source argument empty, and the run's inputs alone would
+        -- demand one from `jq` handed a file this Program happens to hold as
+        -- source, which is a query over bytes and not an analysis of them.
         IF p_tool_run IS NOT NULL AND EXISTS (
                 SELECT 1 FROM tool_runs tr
-                  JOIN offline_tool_arguments a ON a.tool = tr.offline_tool
-                 WHERE tr.id = p_tool_run AND a.artifact_kind = 'source') THEN
+                  JOIN tool_run_inputs i ON i.tool_run_id = tr.id
+                  JOIN offline_tool_arguments a
+                    ON a.tool = tr.offline_tool AND a.name = i.argument
+                 WHERE tr.id = p_tool_run
+                   AND a.artifact_kind = 'source'
+                   AND i.reference_kind = 'source') THEN
             RETURN QUERY SELECT 'no_source_citation', NULL::text;
         END IF;
         RETURN;
@@ -701,27 +718,67 @@ COMMENT ON FUNCTION rk2_source_citation(uuid, jsonb, uuid) IS
 -- and a guard only the convenience verb applied is a guard one statement gets
 -- around.
 
+-- The element paths are `promote_proposal`'s own spelling, and this is the one
+-- place that spells them: only objects are numbered, because only objects are
+-- elements, and a path that counted the strings would point promotion at the
+-- wrong one. Two callers below walk a payload and both have to agree with
+-- promotion about which element is which, so the walk is a function rather than
+-- a shape copied twice.
+-- Four lists: the three `promote_proposal` walks and `hypotheses`, which it
+-- does not. A Relationship is here because it can carry a citation like any
+-- other element, and a list left out would be a list where an ungrounded
+-- conclusion promotes.
+CREATE FUNCTION rk2_proposal_elements(p_payload jsonb)
+RETURNS TABLE(list text, ordinal integer, path text, element jsonb)
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT l.name, (x.n - 1)::integer, l.name || '[' || (x.n - 1) || ']', x.value
+      FROM (VALUES ('new_entities'),('relationships'),
+                   ('observations'),('hypotheses')) AS l(name)
+      CROSS JOIN LATERAL (
+            SELECT value, row_number() OVER () AS n
+              FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(p_payload -> l.name) = 'array'
+                           THEN p_payload -> l.name ELSE '[]'::jsonb END)
+             WHERE jsonb_typeof(value) = 'object') x
+$fn$;
+
+COMMENT ON FUNCTION rk2_proposal_elements(jsonb) IS
+    'Every proposed Entity, Observation and Hypothesis in one staged payload, '
+    'each with the `proposal_drops.element_path` that names it. The numbering '
+    'is `promote_proposal`''s, which is what makes a drop written here an '
+    'element promotion skips.';
+
+-- One rule for where the next drop goes, because `proposal_drops` has two
+-- writers -- this trigger at staging and the runtime afterwards -- and an
+-- ordinal is part of the key. Both ask this rather than each spelling the
+-- aggregate, so neither can start numbering somewhere the other does not.
+CREATE FUNCTION rk2_next_drop_ordinal(p_proposal uuid) RETURNS integer
+LANGUAGE sql STABLE AS $fn$
+    SELECT coalesce(max(ordinal) + 1, 0)::integer
+      FROM proposal_drops WHERE proposal_id = p_proposal
+$fn$;
+
+REVOKE ALL ON FUNCTION rk2_next_drop_ordinal(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION rk2_next_drop_ordinal(uuid) TO rk2_runtime;
+
+COMMENT ON FUNCTION rk2_next_drop_ordinal(uuid) IS
+    'Where the next `proposal_drops` row for this proposal is numbered. Read '
+    'rather than assumed: the staging trigger writes drops before the runtime '
+    'does, so a second writer that started at zero would collide with the '
+    'first.';
+
 CREATE FUNCTION proposal_grounds_its_source_citations() RETURNS trigger
 LANGUAGE plpgsql AS $fn$
 DECLARE
-    v_next integer := coalesce(
-        (SELECT max(ordinal) + 1 FROM proposal_drops WHERE proposal_id = NEW.id), 0);
+    v_next integer := rk2_next_drop_ordinal(NEW.id);
     v_row  record;
 BEGIN
     FOR v_row IN
         SELECT e.path AS path, f.fault AS fault, f.cited AS cited
-          FROM (VALUES ('new_entities'),('observations'),('hypotheses')) AS l(name)
-          CROSS JOIN LATERAL (
-                SELECT x.n AS n, l.name || '[' || (x.n - 1) || ']' AS path,
-                       x.value AS element
-                  FROM (SELECT value, row_number() OVER () AS n
-                          FROM jsonb_array_elements(
-                                  CASE WHEN jsonb_typeof(NEW.payload -> l.name) = 'array'
-                                       THEN NEW.payload -> l.name ELSE '[]'::jsonb END)
-                         WHERE jsonb_typeof(value) = 'object') x) e
+          FROM rk2_proposal_elements(NEW.payload) e
           CROSS JOIN LATERAL rk2_element_evidence(NEW.program_id, e.element) ev
           CROSS JOIN LATERAL rk2_source_citation(NEW.program_id, e.element, ev.tool_run_id) f
-         ORDER BY l.name, e.n
+         ORDER BY e.list, e.ordinal
     LOOP
         INSERT INTO proposal_drops
             (proposal_id, program_id, ordinal, element_path, reason, cited)
@@ -731,18 +788,15 @@ BEGIN
     RETURN NULL;
 END $fn$;
 
--- The element paths are `promote_proposal`'s own spelling, computed the same
--- way: only objects are numbered, because only objects are elements, and a
--- path that counted the strings would point promotion at the wrong one.
 CREATE TRIGGER proposals_ground_source_citations
     AFTER INSERT ON proposals
     FOR EACH ROW EXECUTE FUNCTION proposal_grounds_its_source_citations();
 
 COMMENT ON FUNCTION proposal_grounds_its_source_citations() IS
-    'Refuse, at staging, every proposed Entity, Observation and Hypothesis '
-    'whose citation of a source Artifact does not hold -- and every one '
-    'grounded in a run that read source and does not say which. The refusal is '
-    'a proposal_drops row, which is what promotion skips.';
+    'Refuse, at staging, every proposed Entity, Relationship, Observation and '
+    'Hypothesis whose citation of a source Artifact does not hold -- and every '
+    'one grounded in a run that read source and does not say which. The '
+    'refusal is a proposal_drops row, which is what promotion skips.';
 
 
 -- ---------------------------------------------------------------------------
@@ -759,10 +813,10 @@ COMMENT ON FUNCTION proposal_grounds_its_source_citations() IS
 CREATE FUNCTION check_source_conclusions()
 RETURNS TABLE(problem text, detail text)
 LANGUAGE sql STABLE AS $fn$
-    SELECT 'analyser_run_without_program_hash', tr.label
+    SELECT 'analyser_run_without_its_hash', tr.label
       FROM tool_runs tr
       JOIN offline_tools t ON t.tool = tr.offline_tool
-     WHERE t.analyser IS NOT NULL AND tr.program_sha256 IS NULL
+     WHERE t.analyser IS NOT NULL AND tr.analyser_sha256 IS NULL
 UNION ALL
     -- A closed run of a tool that requires source and was given none. The verb
     -- refuses a missing required argument, so this is a run that got there
@@ -794,16 +848,7 @@ UNION ALL
     SELECT 'promoted_element_cites_ungrounded_source',
            pp.label || ' ' || e.path || ': ' || f.fault
       FROM proposals pp
-      CROSS JOIN LATERAL (
-            SELECT x.n AS n, l.name || '[' || (x.n - 1) || ']' AS path,
-                   x.value AS element
-              FROM (VALUES ('new_entities'),('observations'),('hypotheses')) AS l(name)
-              CROSS JOIN LATERAL (
-                    SELECT value, row_number() OVER () AS n
-                      FROM jsonb_array_elements(
-                              CASE WHEN jsonb_typeof(pp.payload -> l.name) = 'array'
-                                   THEN pp.payload -> l.name ELSE '[]'::jsonb END)
-                     WHERE jsonb_typeof(value) = 'object') x) e
+      CROSS JOIN LATERAL rk2_proposal_elements(pp.payload) e
       CROSS JOIN LATERAL rk2_element_evidence(pp.program_id, e.element) ev
       CROSS JOIN LATERAL rk2_source_citation(pp.program_id, e.element, ev.tool_run_id) f
      WHERE pp.status = 'promoted'

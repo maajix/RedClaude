@@ -325,14 +325,16 @@ printing them. Only a source Artifact may be an analysis argument.
 _Avoid_: Input file, JS file, asset, blob
 
 **Source citation**:
-What a proposed Entity, Observation or Hypothesis about source must carry: the
-Artifact it came from, optionally the hash it was read at, and the Tool run that
-read it. It is checked when the proposal is staged and re-asked of everything
-promoted, and it fails in five distinguishable ways — the label is not this
-Program's, the bytes are not held as source, they have changed under the
+What a proposed element about source must carry, in any of the four lists a
+proposal has: the Artifact it came from, optionally the hash it was read at, and
+the Tool run that read it. It is checked when the proposal is staged and re-asked
+of everything promoted, and it fails in five distinguishable ways — the label is
+not this Program's, the bytes are not held as source, they have changed under the
 element, the cited run never read them, or the element is grounded in a run that
 read source and does not say which. A failed citation is a dropped element, not
-a refused proposal.
+a refused proposal. It says which bytes a conclusion came from, not that the
+cited run reported that conclusion: the store is on the disk, so the check has
+the hash of a run's output and never its contents.
 _Avoid_: Reference, provenance, attribution, link
 
 **Receipt**:

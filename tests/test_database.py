@@ -1615,7 +1615,7 @@ CONTROLS = (
         "        VALUES (p, k, 'js_analyst', 'operator', 'low', '{}'::jsonb)"
         "     RETURNING id INTO r;"
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
-        "                          offline_tool, tool_version, program_sha256)"
+        "                          offline_tool, tool_version, analyser_sha256)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'running', 'runtime',"
         f"                'js_parse', 'rk2-jsscan 1', {repeat('b')})"
         "     RETURNING id INTO t;"
@@ -17369,6 +17369,12 @@ class OfflineToolRunTest(DatabaseCase):
         # kept nothing is the shell-text case -- a sentence and a label, with no
         # bytes behind it -- and it is dropped without taking the element beside
         # it down with it.
+        #
+        # It also holds the edge of PH2-32's source rule from the other side:
+        # `jq` was given an Artifact this Program holds as source, and neither
+        # observation cites one. Neither is refused for it, because `jq` is not
+        # a tool the registry lets anyone point at source -- a query over bytes
+        # is not an analysis of them.
         self.assertEqual("promoted", self.promotion["status"])
         self.assertEqual(1, len(self.promotion["observations"]))
         self.assertEqual(1, self.promotion["refused"])
@@ -17893,10 +17899,12 @@ class SourceCitationTest(DatabaseCase):
     changed under it, or that nobody holds, loses that element before any
     promotion walk reaches it.
 
-    Hypotheses are here for the reason criterion 4 names them beside endpoints
-    and parameters: nothing promotes a Hypothesis, so a check living inside
-    `promote_proposal` would never see one. The trigger walks the payload, which
-    is where a Hypothesis is.
+    Criterion 4 names endpoints, parameters and hypotheses, and all three are
+    here as the payload spells them: the first two are Entities and arrive in
+    `new_entities`, and a Hypothesis is the reason the refusal is a trigger at
+    all -- nothing promotes one, so a check living inside `promote_proposal`
+    would never see it. Relationships are walked for the same reason, which is
+    that they can carry a citation.
 
     The last observation is dropped by the runtime rather than by the trigger,
     because both write to one table with one key: what this case pins is that
@@ -17924,7 +17932,7 @@ class SourceCitationTest(DatabaseCase):
             assert opened.ok, (name, opened.violations)
             cls.identifiers[name] = opened.facts["program_id"]
 
-        cls.analyser = artifact.digest((tool.PROGRAMS / "jsscan.py").read_bytes())
+        cls.analyser = artifact.digest((tool.ANALYSERS / "jsscan.py").read_bytes())
         cls.bind("main")
         cls.arrange()
         cls.hold_it_elsewhere()
@@ -18152,6 +18160,16 @@ class SourceCitationTest(DatabaseCase):
         }
 
     @classmethod
+    def read_the_bundle(cls, **fields) -> dict:
+        """The citation that holds, for an element that is not an Observation."""
+        return {
+            "tool_run_label": cls.runs["bundle"]["tool_run"],
+            "source_artifact_label": cls.labels["bundle"],
+            "source_sha256": artifact.digest(SOURCE_BUNDLE),
+            **fields,
+        }
+
+    @classmethod
     def propose(cls):
         task, cls.subject_label = cls.connection.execute(
             "SELECT r.task_id, e.label FROM agent_runs r, entities e"
@@ -18159,6 +18177,56 @@ class SourceCitationTest(DatabaseCase):
             (cls.run_id, cls.subject),
         ).rows[0]
         payload = {
+            # Criterion 4 names endpoints and parameters, and both are Entities:
+            # they arrive in `new_entities` and the trigger walks that list for
+            # the same reason it walks the other three. The application is what
+            # an Endpoint hangs off. The last one is the decoy, in scope and
+            # well formed and citing an Artifact another Program holds, so the
+            # only thing wrong with it is the one thing under test.
+            "new_entities": [
+                cls.read_the_bundle(
+                    ref="app",
+                    type="application",
+                    base_url="https://app.example.com/api/",
+                    kind="web",
+                ),
+                cls.read_the_bundle(
+                    ref="route",
+                    type="endpoint",
+                    parent_ref="app",
+                    method="post",
+                    path_template="/api/v1/login",
+                    auth_required=False,
+                ),
+                cls.read_the_bundle(
+                    ref="field",
+                    type="parameter",
+                    parent_ref="route",
+                    name="id",
+                    location="QUERY",
+                ),
+                cls.read_the_bundle(
+                    type="endpoint",
+                    parent_ref="app",
+                    method="get",
+                    path_template="/api/admin/secret",
+                    auth_required=False,
+                    source_artifact_label=cls.foreign_label,
+                    source_sha256=None,
+                ),
+            ],
+            # A Relationship can carry a citation like anything else, and
+            # `promote_proposal` walks the list, so a list the trigger skipped
+            # would be a list an ungrounded conclusion promotes through.
+            "relationships": [
+                cls.read_the_bundle(
+                    type="runs",
+                    src_ref="app",
+                    dst_label=str(cls.subject_label),
+                    source_artifact_label="ZZ9",
+                    source_sha256=None,
+                )
+            ],
             "observations": [
                 cls.citing(
                     source_artifact_label=cls.labels["bundle"],
@@ -18241,7 +18309,7 @@ class SourceCitationTest(DatabaseCase):
             ("jsscan.py", "/input/jsscan.py", "none"),
             (
                 self.runs["bundle"]["analyser"],
-                self.runs["bundle"]["program_path"],
+                self.runs["bundle"]["analyser_path"],
                 self.runs["bundle"]["network"],
             ),
         )
@@ -18252,7 +18320,7 @@ class SourceCitationTest(DatabaseCase):
             self.inputs,
         )
         [[recorded]] = self.connection.execute(
-            "SELECT program_sha256 FROM tool_runs WHERE id = $1::uuid",
+            "SELECT analyser_sha256 FROM tool_runs WHERE id = $1::uuid",
             (self.runs["bundle"]["tool_run_id"],),
         ).rows
         self.assertEqual(self.analyser, str(recorded))
@@ -18269,19 +18337,22 @@ class SourceCitationTest(DatabaseCase):
     # -- criteria 4 and 5 ------------------------------------------------------
 
     def test_each_way_a_citation_fails_is_dropped_by_the_reason_it_failed(self):
-        # Six from the trigger, in the order it walks the payload, and the
-        # seventh from the runtime. Alphabetical by element list is why
-        # `hypotheses` comes first: the walk is deterministic, which is what
-        # makes the ordinals reproducible.
+        # Eight from the trigger, in the order it walks the payload, and the
+        # ninth from the runtime. Alphabetical by element list is why
+        # `hypotheses` comes first and `relationships` last: the walk is
+        # deterministic, which is what makes the ordinals reproducible. All four
+        # lists are here because all four can carry a citation.
         self.assertEqual(
             [
                 (0, "hypotheses[0]", "no_such_artifact", "ZZ9"),
-                (1, "observations[1]", "no_such_artifact", "ZZ9"),
-                (2, "observations[2]", "artifact_not_source", self.labels["printed"]),
-                (3, "observations[3]", "artifact_changed", self.labels["bundle"]),
-                (4, "observations[4]", "artifact_not_read", self.labels["original"]),
-                (5, "observations[5]", "no_source_citation", None),
-                (6, "observations[6]", "no_such_tool_run", "ZZ99"),
+                (1, "new_entities[3]", "no_such_artifact", self.foreign_label),
+                (2, "observations[1]", "no_such_artifact", "ZZ9"),
+                (3, "observations[2]", "artifact_not_source", self.labels["printed"]),
+                (4, "observations[3]", "artifact_changed", self.labels["bundle"]),
+                (5, "observations[4]", "artifact_not_read", self.labels["original"]),
+                (6, "observations[5]", "no_source_citation", None),
+                (7, "relationships[0]", "no_such_artifact", "ZZ9"),
+                (8, "observations[6]", "no_such_tool_run", "ZZ99"),
             ],
             [
                 (drop.ordinal, drop.element_path, drop.reason, drop.cited)
@@ -18289,12 +18360,25 @@ class SourceCitationTest(DatabaseCase):
             ],
         )
 
+    def test_an_artifact_another_program_holds_is_not_a_citation_either(self):
+        # The same answer the verb gives, from the other side of the run: a
+        # label this Program does not hold is missing, whoever else holds it.
+        # The element is otherwise a well formed Endpoint inside the scope, so
+        # the citation is the only thing wrong with it.
+        self.assertIn(
+            (1, "new_entities[3]", "no_such_artifact", self.foreign_label),
+            [
+                (drop.ordinal, drop.element_path, drop.reason, drop.cited)
+                for drop in self.staged.drops
+            ],
+        )
+
     def test_the_citation_that_holds_is_the_one_element_promoted(self):
-        # Six refused and one kept, out of seven elements that differ in nothing
-        # else. What survives is the Observation whose source this Program holds,
-        # as source, unchanged, and which the run it names actually read --
-        # named by element path, because "one Observation" would be satisfied by
-        # the wrong one.
+        # Six refused and one kept, out of seven Observations that differ in
+        # nothing else. What survives is the one whose source this Program
+        # holds, as source, unchanged, and which the run it names actually read
+        # -- named by element path, because "one Observation" would be satisfied
+        # by the wrong one.
         self.assertEqual("promoted", self.promotion["status"])
         self.assertEqual(
             [("observations[0]",)],
@@ -18304,6 +18388,27 @@ class SourceCitationTest(DatabaseCase):
                     "SELECT metadata ->> 'element' FROM observations"
                     " WHERE metadata ->> 'proposal' = $1",
                     (self.staged.label,),
+                ).rows
+            ],
+        )
+
+    def test_the_endpoint_promoted_is_the_one_that_can_name_its_source(self):
+        # Criterion 4's own words -- endpoints, parameters and hypotheses -- as
+        # canonical rows. Three Entities arrive and the fourth does not, and the
+        # one that does not is the endpoint nothing in the bundle calls: the
+        # decoy is refused because its citation is another Program's Artifact,
+        # which is the only difference between it and the route beside it.
+        self.assertEqual(3, len(self.promotion["entities"]))
+        self.assertEqual([], self.promotion["relationships"])
+        self.assertEqual(
+            [("POST", "/api/v1/login")],
+            [
+                tuple(str(value) for value in row)
+                for row in self.connection.execute(
+                    "SELECT p.method, p.path_template FROM endpoints p"
+                    "  JOIN entities e ON e.id = p.entity_id"
+                    " WHERE e.program_id = $1::uuid ORDER BY p.path_template",
+                    (self.identifiers["main"],),
                 ).rows
             ],
         )
@@ -18508,11 +18613,11 @@ class JsAnalystCommandTest(DatabaseCase):
             self.read_by(self.answers["parse"]),
         )
         [[recorded]] = self.connection.execute(
-            "SELECT program_sha256 FROM tool_runs WHERE label = $1 AND program_id = $2::uuid",
+            "SELECT analyser_sha256 FROM tool_runs WHERE label = $1 AND program_id = $2::uuid",
             (run["label"], self.program_id),
         ).rows
         self.assertEqual(
-            artifact.digest((tool.PROGRAMS / "jsscan.py").read_bytes()), str(recorded)
+            artifact.digest((tool.ANALYSERS / "jsscan.py").read_bytes()), str(recorded)
         )
 
     # -- criterion 2 -----------------------------------------------------------

@@ -44,6 +44,8 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 
 #: What this program answers to `--version`. The registry pins a pattern
 #: against it, so this is the contract of the output below rather than a build
@@ -96,6 +98,11 @@ BEFORE_REGEX = frozenset(
 #: What the tokeniser calls the punctuation that can precede a division.
 CLOSERS = (")", "]", "}")
 
+#: The two kinds of token that can carry a path. Everything that reads a route
+#: out of the stream asks for one of these, and a third kind added here is a
+#: third kind every reader gets at once.
+LITERALS = ("string", "template")
+
 #: Where a source map says which file it describes.
 SOURCE_MAP = re.compile(rb"(?://|/\*)[#@]\s*sourceMappingURL=([^\s*'\"]+)")
 
@@ -110,22 +117,17 @@ MINIFIED_LINE = 500
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
 class Token:
     """One lexical unit, with where it started so a finding can be checked."""
 
-    __slots__ = ("kind", "value", "start", "parts", "holes")
-
-    def __init__(self, kind, value, start, parts=None, holes=None):
-        self.kind = kind
-        self.value = value
-        self.start = start
-        #: For a template literal: the static chunks and the expression sources
-        #: between them, which is what a route template is built out of.
-        self.parts = parts
-        self.holes = holes
-
-    def __repr__(self):
-        return f"Token({self.kind!r}, {self.value!r}, {self.start})"
+    kind: str
+    value: str
+    start: int
+    #: For a template literal: the static chunks and the expression sources
+    #: between them, which is what a route template is built out of.
+    parts: list[str] | None = None
+    holes: list[str] | None = None
 
 
 def tokenize(text: str) -> list[Token]:
@@ -254,6 +256,21 @@ def _template(text: str, index: int) -> tuple[list[str], list[str], int]:
     return parts, holes, index
 
 
+def _rejoined(parts: list[str], holes: list[str], render: Callable[[str], str]) -> str:
+    """A template literal's chunks and holes back in the order they were in.
+
+    The two callers differ in nothing but how a hole is spelled, so that is the
+    argument: putting the pieces back in the wrong order is the mistake worth
+    having one place to make.
+    """
+    pieces = []
+    for index, part in enumerate(parts):
+        pieces.append(part)
+        if index < len(holes):
+            pieces.append(render(holes[index]))
+    return "".join(pieces)
+
+
 def _written(parts: list[str], holes: list[str]) -> str:
     """A template literal put back together as it was written.
 
@@ -262,12 +279,7 @@ def _written(parts: list[str], holes: list[str]) -> str:
     different string -- `/orders//lines` for a template that says `${id}` --
     and quoting that would be quoting something nobody wrote.
     """
-    pieces = []
-    for index, part in enumerate(parts):
-        pieces.append(part)
-        if index < len(holes):
-            pieces.append("${%s}" % holes[index])
-    return "".join(pieces)
+    return _rejoined(parts, holes, lambda source: "${%s}" % source)
 
 
 def _expression(text: str, index: int) -> tuple[str, int]:
@@ -375,20 +387,20 @@ def path_of(value: str) -> str | None:
     return value or "/"
 
 
-def template_source(token: Token) -> str:
-    """One template literal with its holes named, as a path would spell them.
+def _named_hole(source: str) -> str:
+    """One `${...}` as a path spells it.
 
     A hole that is one identifier keeps its name, because `/orders/${id}` is a
     route with a parameter called `id` and that is worth carrying. Anything
     else becomes an anonymous hole rather than an invented name.
     """
-    pieces: list[str] = []
-    for index, part in enumerate(token.parts):
-        pieces.append(part)
-        if index < len(token.holes):
-            source = token.holes[index].strip()
-            pieces.append("{%s}" % source if NAME.fullmatch(source) else HOLE)
-    return "".join(pieces)
+    source = source.strip()
+    return "{%s}" % source if NAME.fullmatch(source) else HOLE
+
+
+def template_source(token: Token) -> str:
+    """One template literal with its holes named, as a path would spell them."""
+    return _rejoined(token.parts, token.holes, _named_hole)
 
 
 def template_of(token: Token) -> str | None:
@@ -527,11 +539,11 @@ def _joined(group: list[Token]) -> tuple[str, Token] | None:
     which is what keeps an options object out: a `"/b"` inside `{body: "/b"}`
     is not this call's route, and the braces are how that is known.
     """
-    if not group or group[0].kind not in ("string", "template"):
+    if not group or group[0].kind not in LITERALS:
         return None
     for index, token in enumerate(group):
         if index % 2 == 0:
-            if token.kind not in ("string", "template", "name", "number"):
+            if token.kind not in (*LITERALS, "name", "number"):
                 return None
         elif token.kind != "punct" or token.value != "+":
             return None
@@ -587,7 +599,7 @@ def _property(group: list[Token], keys: tuple[str, ...]) -> Token | None:
             continue
         if group[index + 1].kind != "punct" or group[index + 1].value != ":":
             continue
-        if group[index + 2].kind in ("string", "template"):
+        if group[index + 2].kind in LITERALS:
             return group[index + 2]
     return None
 
@@ -615,6 +627,12 @@ def lines(text: str) -> list[int]:
 
 
 def line_of(starts: list[int], offset: int) -> int:
+    """Which line an offset falls on, counting from one.
+
+    A binary search rather than a count, because a minified bundle is one line
+    and a hand-written file is thousands, and every reported finding asks this
+    question again over the same list.
+    """
     low, high = 0, len(starts) - 1
     while low < high:
         middle = (low + high + 1) // 2
@@ -657,7 +675,7 @@ def parse(raw: bytes, text: str) -> dict:
         "minified": longest > MINIFIED_LINE,
         "source_map": reference.group(1).decode("utf-8", "replace") if reference else None,
         "tokens": len(tokens),
-        "strings": sum(1 for token in tokens if token.kind in ("string", "template")),
+        "strings": sum(1 for token in tokens if token.kind in LITERALS),
         "comments": sum(1 for token in tokens if token.kind == "comment"),
         "path_literals": literals,
     }

@@ -32,13 +32,13 @@ what the image answered -- so `tool_runs.tool_version` is provenance rather than
 policy, and a run made before an upgrade still says what produced its bytes.
 
 Some tools are not in the image at all. A registry row may name an analyser, and
-then the executable is an interpreter and the program is a file this harness
+then the executable is an interpreter and what it runs is a file this harness
 ships: read off this side's disk, hashed here, and mounted read only beside the
 input Artifacts, the way `browser.py` stages its driver. That keeps the analysis
 inside the repository the tests can reach while leaving the registry the thing
 that says which analyses exist -- and the hash goes on the run, so what a
 conclusion rests on is not "this tool" but these exact bytes of this exact
-program over that exact input.
+analyser over that exact input.
 
 Nothing here mints a capability or asks the risk gate. An offline tool makes no
 request and reaches no target, so there is nothing for the gate to decide; the
@@ -100,16 +100,16 @@ FACTS = ("program_id", "program_slug", "tool_run", "outputs")
 REGISTERED = (
     "SELECT executable, to_json(version_argv)::text, timeout_seconds, memory_mb,"
     "       cpu_quota, pids_limit, max_output_bytes, analyser,"
-    "       CASE WHEN analyser IS NOT NULL THEN rk2_offline_program_path(analyser) END"
+    "       CASE WHEN analyser IS NOT NULL THEN rk2_offline_analyser_path(analyser) END"
     "  FROM rk2_offline_tool($1)"
 )
 
-#: Where a harness-shipped analyser is read from. Beside this module, because
-#: that is what it is: a tool whose program the registry names but does not
-#: hold, staged into the container the way `browser.py` stages its driver. The
-#: registry says which file, and this side says what is in it -- so a row can
-#: name a program only if the harness that reads the row also shipped it.
-PROGRAMS = Path(__file__).parent
+#: The directory a harness-shipped analyser is read from. Beside this module,
+#: because that is what it is: a tool whose program the registry names but does
+#: not hold, staged into the container the way `browser.py` stages its driver.
+#: The registry says which file, and this side says what is in it -- so a row
+#: can name an analyser only if the harness that reads the row also shipped it.
+ANALYSERS = Path(__file__).parent
 
 #: Which Program this connection is, for the session's lifetime. The verbs read
 #: it rather than taking a Program, so that a runtime holding one connection open
@@ -195,6 +195,18 @@ def run(
                 source="argument:--tool",
             )
             return _report(ledger, answers)
+        except _NotShipped as error:
+            # Not the image's fault and not reported as it: the registry names a
+            # file this installation of the harness was supposed to carry, and
+            # an operator sent to look at `RK_TOOL_IMAGE` for it would be
+            # looking in the one place it was never going to be.
+            ledger.fail(
+                "analyser",
+                str(error),
+                code=MISSING_DEPENDENCY,
+                source=f"offline_tool:{offline_tool}",
+            )
+            return _report(ledger, answers)
         except isolation.Unavailable as error:
             ledger.fail(
                 "image", str(error), code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}"
@@ -205,7 +217,7 @@ def run(
             "tool",
             f"{offline_tool} reports itself as {version}" if analyser is None
             else f"{offline_tool} reports itself as {version}, "
-                 f"from {analyser['path']} at {analyser['sha256']}",
+                 f"from {analyser.path} at {analyser.sha256}",
         )
 
         # Everything that decides whether this call may happen at all happens
@@ -222,7 +234,7 @@ def run(
                                 offline_tool,
                                 version,
                                 json.dumps(dict(arguments)),
-                                analyser["sha256"] if analyser else None,
+                                analyser.sha256 if analyser else None,
                             ),
                         ).scalar()
                     )
@@ -350,12 +362,12 @@ def _report(ledger: Ledger, answers: _Answers) -> Report:
 def _registered(connection: pg.Connection, tool: str) -> dict:
     """The registry row for one enabled tool, or the registry's own refusal."""
     (
-        executable, version_argv, timeout, memory, cpu, pids, output, analyser, program_path
+        executable, version_argv, timeout, memory, cpu, pids, output, analyser, analyser_path
     ) = connection.execute(REGISTERED, (tool,)).rows[0]
     return {
         "executable": str(executable),
         "version_argv": [str(item) for item in json.loads(str(version_argv))],
-        "analyser": _analyser(analyser, program_path),
+        "analyser": _analyser(analyser, analyser_path),
         "ceilings": isolation.Ceilings(
             timeout_seconds=float(timeout),
             memory_mb=int(memory),
@@ -366,10 +378,29 @@ def _registered(connection: pg.Connection, tool: str) -> dict:
     }
 
 
-def _analyser(analyser: object, program_path: object) -> dict | None:
+class _NotShipped(Exception):
+    """The registry names an analyser this build of the harness does not carry."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Analyser:
+    """The harness-shipped file one registry row names, as three facts.
+
+    They travel together or not at all: the path is where these exact bytes are
+    mounted and the hash is what goes on the run, so a caller holding one of
+    them and deriving another is a caller that can record a run of something it
+    did not stage.
+    """
+
+    path: str
+    body: bytes
+    sha256: str
+
+
+def _analyser(analyser: object, analyser_path: object) -> _Analyser | None:
     """The analyser this tool's registry row names, read off this harness's disk.
 
-    A registry row can name a program but cannot hold one, so the name and the
+    A registry row can name an analyser but cannot hold one, so the name and the
     bytes come from two places on purpose: the row says which analysis this
     installation admits and the file says what it does, and a row naming a file
     the harness does not ship is a refusal here rather than a container that
@@ -382,26 +413,24 @@ def _analyser(analyser: object, program_path: object) -> dict | None:
     """
     if analyser is None:
         return None
-    source = PROGRAMS / Path(str(analyser)).name
+    source = ANALYSERS / Path(str(analyser)).name
     try:
         body = source.read_bytes()
     except OSError as error:
-        raise isolation.Unavailable(f"this harness does not ship {analyser}: {error}") from None
-    return {
-        "path": str(program_path),
-        "bytes": body,
-        "sha256": hashlib.sha256(body).hexdigest(),
-    }
+        raise _NotShipped(f"this harness does not ship {analyser}: {error}") from None
+    return _Analyser(
+        path=str(analyser_path), body=body, sha256=hashlib.sha256(body).hexdigest()
+    )
 
 
-def _staged(analyser: Mapping[str, object] | None) -> dict[str, bytes]:
+def _staged(analyser: _Analyser | None) -> dict[str, bytes]:
     """Where the analyser appears in the container, if this tool has one.
 
     One place builds this mount, because the version probe and the run have to
     agree about it: a probe that read one file and a run that read another would
     record a version of something that never ran.
     """
-    return {} if analyser is None else {str(analyser["path"]): analyser["bytes"]}
+    return {} if analyser is None else {analyser.path: analyser.body}
 
 
 def _version(container: isolation.ToolContainer, registered: Mapping[str, object]) -> str:
@@ -428,7 +457,7 @@ def _version(container: isolation.ToolContainer, registered: Mapping[str, object
         container,
         (
             str(registered["executable"]),
-            *((str(analyser["path"]),) if analyser else ()),
+            *((analyser.path,) if analyser else ()),
             *registered["version_argv"],
         ),
         ceilings=registered["ceilings"],
@@ -446,7 +475,7 @@ def _perform(
     container: isolation.ToolContainer,
     keep: Store,
     plan: Mapping[str, object],
-    analyser: Mapping[str, object] | None,
+    analyser: _Analyser | None,
 ) -> isolation.ToolProcess:
     """Run the plan the database produced, and nothing this module invented.
 
