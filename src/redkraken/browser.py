@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from redkraken import artifact, config, isolation, migrate, pg, program, proxy, tls
+from redkraken import artifact, browser_driver, config, isolation, migrate, pg, program, proxy, tls
 from redkraken.outcome import (
     INVALID_CONFIGURATION,
     MISSING_DEPENDENCY,
@@ -309,8 +309,12 @@ def artifact_names(plan: Mapping[str, object]) -> dict[str, str]:
     The console is under `browser_driver.CONSOLE` rather than an ordinal because
     it belongs to the mission rather than to a step: a page logs when it likes,
     including while a step that captures nothing is running.
+
+    The key is taken from the driver rather than spelled again here. The two
+    sides of it are separated by a container boundary, so a second spelling
+    would be a mismatch nothing outside a live mission could catch.
     """
-    names = {"console": CONSOLE_FILE}
+    names = {browser_driver.CONSOLE: CONSOLE_FILE}
     for step in plan["steps"]:
         shape = ARTIFACT_FILES.get(str(step["action"]))
         if shape is not None:
@@ -427,7 +431,12 @@ def _read(
         tail = answer.stderr.data.decode("utf-8", "replace").strip().splitlines()
         return {}, "error", f"the browser reported nothing readable: {tail[-1] if tail else '(silent)'}"
     if said.get("plan_sha256") != plan["plan_sha256"]:
-        return said, "error", "the browser walked a plan this mission did not open"
+        # Nothing of the document survives the mismatch. Its steps are outcomes
+        # of a plan this mission did not commit, and the caller files whatever
+        # comes back under this mission's step ordinals -- so returning it would
+        # write another plan's answers into this one's record, which is the one
+        # thing the digest check exists to prevent.
+        return {}, "error", "the browser walked a plan this mission did not open"
     if said.get("status") == "success":
         return said, "success", None
     return said, "error", str(said.get("detail") or f"the browser exited {answer.exit_code}")

@@ -233,19 +233,22 @@ class Sealed:
         return self.alg == str(alg) and self.nonce.hex() == str(nonce)
 
 
-def seal(key: bytes, plaintext: bytes, *, aad: bytes, nonce: bytes | None = None) -> Sealed:
+def seal(key: bytes, plaintext: bytes, *, aad: bytes) -> Sealed:
     """Encrypt, then authenticate everything the reader will need to trust.
 
     A fresh nonce per call, so sealing one plaintext twice produces two
     unrelated ciphertexts. Equal ciphertexts would tell anyone holding the store
     and no key at all that two wire bodies were the same body.
+
+    The nonce is not a parameter, and that is the sentence above made true. This
+    construction is a stream cipher: two ciphertexts under one key and one nonce
+    are two plaintexts XORed together, so a caller that could choose the nonce
+    could -- by accident or otherwise -- hand out both halves of that. Nothing in
+    this system ever needs to, so nothing in this system is offered the chance.
     """
     if len(key) != KEY_BYTES:
         raise Unusable(f"a key is {KEY_BYTES} bytes, not {len(key)}")
-    if nonce is None:
-        nonce = secrets.token_bytes(NONCE_BYTES)
-    if len(nonce) != NONCE_BYTES:
-        raise Unusable(f"a nonce is {NONCE_BYTES} bytes, not {len(nonce)}")
+    nonce = secrets.token_bytes(NONCE_BYTES)
     stream, authentication = _subkeys(key, nonce)
     ciphertext = _xor(plaintext, _keystream(stream, len(plaintext)))
     tag = _tag(authentication, alg=ALG, nonce=nonce, ciphertext=ciphertext, aad=aad)

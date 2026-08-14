@@ -96,6 +96,14 @@ HOP_BY_HOP = frozenset(
 #: comes back false is not a failure -- it is the answer -- and the plan runs on.
 HALT_ON_FALSE = frozenset({"wait_for", "fill", "inject", "click"})
 
+#: Every CDP name under which a request leaves the page for the door.  Ordinary
+#: navigation, XHR, fetch and subresources all arrive as `requestWillBeSent`; a
+#: websocket handshake never does, and gets its own event.  Both are HTTP
+#: requests the door decides on and writes a Receipt for, so both are counted.
+NETWORK_REQUEST_EVENTS = frozenset(
+    {"Network.requestWillBeSent", "Network.webSocketWillSendHandshakeRequest"}
+)
+
 #: What every artifact of this mission is called is the host's to say, not this
 #: driver's: the host has to declare the files it expects out of the container
 #: before the container starts, and two places composing the same names is one
@@ -492,13 +500,20 @@ class Mission:
             lambda event: event["method"] == "Page.loadEventFired",
             since,
         )
-        status = None
+        # Zero, not null, when no Document response arrived.  A refused or
+        # timed-out navigation is an outcome the mission has to be able to
+        # record, and `rk2_browser_outcome_word` admits a boolean, a small
+        # integer or a lowercase word -- JSON null is none of the three, so a
+        # null here would abort the whole mission rather than write down that
+        # the page never answered.  Zero is the same thing browsers report for a
+        # request that never reached a status line.
+        status = 0
         for event in self.debugger.events[since:]:
             if (
                 event["method"] == "Network.responseReceived"
                 and event["params"].get("type") == "Document"
             ):
-                status = event["params"]["response"].get("status")
+                status = event["params"]["response"].get("status") or 0
         # `scope_class` is not here on purpose.  What class a URL belongs to is
         # the door's answer, read from the Receipt the door wrote, and a
         # container that could report its own would be a container that could
@@ -647,10 +662,17 @@ class Mission:
                 raise Refused(f"this driver does not perform {step['action']}")
             since = len(self.debugger.events)
             outcome = action(step)
+            # Both spellings, because CDP has two.  A websocket handshake is an
+            # HTTP request that goes through the door and earns a Receipt like
+            # any other, but it is never announced as `requestWillBeSent`, so
+            # counting only that name would leave every socket invisible in
+            # exactly the direction `check_browser_receipts` reads -- it faults
+            # when the count of requests exceeds the count of Receipts, and an
+            # uncounted request can never make it fire.
             requests = sum(
                 1
                 for event in self.debugger.events[since:]
-                if event["method"] == "Network.requestWillBeSent"
+                if event["method"] in NETWORK_REQUEST_EVENTS
             )
             self.results.append(
                 {

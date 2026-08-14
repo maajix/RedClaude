@@ -699,6 +699,12 @@ def parse(raw: bytes, text: str) -> dict:
         "strings": sum(1 for token in tokens if token.kind in LITERALS),
         "comments": sum(1 for token in tokens if token.kind == "comment"),
         "path_literals": literals,
+        # Every literal, requested or not, and `js_routes` files call sites only.
+        # The two subcommands ground different things on purpose: what
+        # `path_not_in_output` refuses is invention, and a decoy this file
+        # literally contains was not invented by the run that reported it.
+        # Whether a decoy is an endpoint is the analyst's judgement, and the
+        # `requested` flag beside each literal is what that judgement reads.
         "paths": _named_paths(literal["value"] for literal in literals),
     }
 

@@ -546,12 +546,18 @@ class Pattern:
         return self.match_key in wildcard_candidates(suffix)
 
 
-def parse_pattern(raw: str) -> Pattern:
+def parse_pattern(raw: str, *, broad: bool = False) -> Pattern:
     """One host pattern from the configuration, or a refusal.
 
     There is no globbing here and there never will be. A leading `*.` is a
     suffix test and nothing else, so `ap*.example.com` and `*.*.example.com` are
     refused rather than quietly matching more or less than they appear to.
+
+    `broad` is the exclusion side, and it lifts exactly one rule: the two-label
+    floor under a wildcard. README's scope section grants it -- "An exclusion has
+    no floor, because breadth there withdraws authority rather than claiming it"
+    -- and `config.load` already implements it through `_BROAD_HOST`, so without
+    the flag a configuration that loads is one this function refuses to compile.
     """
     if not isinstance(raw, str):
         raise PolicyError("malformed_host", "a host pattern must be text")
@@ -562,7 +568,7 @@ def parse_pattern(raw: str) -> Pattern:
             raise PolicyError("malformed_host", f"{raw!r} carries more than one wildcard")
         if _IPV4.fullmatch(suffix) or _IPV6.fullmatch(suffix) or _MAPPED.fullmatch(suffix):
             raise PolicyError("malformed_host", f"{raw!r} wildcards an address")
-        if "." not in suffix:
+        if "." not in suffix and not broad:
             raise PolicyError(
                 "malformed_host", f"{raw!r} wildcards a single label, which is a whole registry"
             )
@@ -812,7 +818,7 @@ def compile_policy(
 
     def add(effect: str, entry: dict, source: str, protocols, ports, paths) -> None:
         try:
-            pattern = parse_pattern(entry["host"])
+            pattern = parse_pattern(entry["host"], broad=effect == EXCLUDE)
         except PolicyError as error:
             refusals.append(_refusal(f"{source}.host", error.detail))
             return

@@ -276,11 +276,22 @@ def _discard(ledger: Ledger, target: Path) -> None:
     overwrite an archive, so leaving the remains in place would refuse every
     later dump to that path with "already exists" -- naming the wrong problem
     forever after one transient failure.
+
+    A removal that itself fails is recorded as a failure. `hold` writes an
+    assertion that held, and "could not be removed" is not one -- an operator
+    reading a green line whose own text says the file is still there is being
+    told the opposite of what happened, and the file is exactly what will refuse
+    their next dump.
     """
     try:
         target.unlink(missing_ok=True)
     except OSError as error:
-        ledger.hold("archive", f"{target} could not be removed: {error.strerror or error}")
+        ledger.fail(
+            "archive",
+            f"{target} could not be removed: {error.strerror or error}",
+            code=BACKUP_FAILED,
+            source="argument:--to",
+        )
 
 
 def _binary(ledger: Ledger, name: str) -> str | None:

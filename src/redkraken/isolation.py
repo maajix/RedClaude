@@ -91,10 +91,15 @@ GID = 65534
 TOOL_INPUTS = "/input"
 TOOL_WORKSPACE = "/work"
 
-# The whole environment an offline tool gets.  Nothing is inherited and nothing
-# is configurable: the executable is an absolute path from the registry, so
-# there is no search path to poison, and a tool whose output depended on the
-# operator's locale would be a tool whose Artifact is not reproducible.
+# What an offline tool starts from.  Nothing is inherited: the executable is an
+# absolute path from the registry, so there is no search path to poison, and a
+# tool whose output depended on the operator's locale would be a tool whose
+# Artifact is not reproducible.
+#
+# One thing is added afterwards and only one.  A tool that declares the proxy
+# adapter is handed the door through `tls.agent_environment`, which is the same
+# three variables every other container behind the fence gets and is the whole
+# of how a process finds it.  Everything else here is the whole environment.
 TOOL_ENVIRONMENT = {"HOME": "/", "TMPDIR": TMPDIR, "LC_ALL": "C.UTF-8"}
 
 
@@ -155,6 +160,18 @@ class AgentContainer:
     sdk: Path | None = None
     home: Path | None = None
     engine: str = ENGINE
+    #: What the child may consume, and why it is here at all. `run_tool` reads
+    #: its ceilings out of the registry because an offline tool declares what it
+    #: needs; an Agent container has no registry row and had, until this, no
+    #: ceiling either -- a `--pids-limit` and a scratch bound, and nothing
+    #: stopping one runaway child from taking the machine's memory with it and
+    #: the door, the database and every sibling run along with it.  Defaults
+    #: rather than required arguments so every existing caller keeps working,
+    #: and the same numbers `browser_ceilings` ships with: the browser is the
+    #: heaviest thing this harness starts, so a bound that holds it holds a
+    #: session that mostly waits on a model.
+    memory_mb: int = 1024
+    cpu_quota: float = 2.0
 
 
 def container_environment(
@@ -238,6 +255,15 @@ def run(
         DNS_BLACKHOLE,
         "--tmpfs",
         f"{TMPDIR}:rw,nosuid,nodev,noexec,size=64m,mode=1777",
+        "--memory",
+        f"{container.memory_mb}m",
+        # The same number again, for the reason `run_tool` gives: a memory
+        # ceiling a container may page past is a ceiling on how fast it uses the
+        # machine, not on how much.
+        "--memory-swap",
+        f"{container.memory_mb}m",
+        "--cpus",
+        f"{container.cpu_quota:g}",
         "--pids-limit",
         "256",
         *mounts,

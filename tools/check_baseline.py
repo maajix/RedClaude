@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tokenize
+import tomllib
 from collections import Counter
 from pathlib import Path
 
@@ -194,9 +195,9 @@ def read_manifest(path: Path = MANIFEST) -> list[dict[str, str]]:
     return rows
 
 
-def read_status() -> dict:
+def read_status(path: Path = STATUS) -> dict:
     try:
-        status = json.loads(STATUS.read_text(encoding="utf-8"))
+        status = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as error:
         raise BaselineError(f"invalid status registry: {error}") from error
     if status.get("schema") != 1:
@@ -249,6 +250,21 @@ def read_status() -> dict:
     ):
         raise BaselineError("status registry needs four unique forbidden dependency roots")
 
+    # Four *unique* roots is not four *meaningful* roots: the list could be four
+    # names nothing is called, and the scan below would then find nothing to
+    # complain about while still reporting that it ran. What the roots are for is
+    # pinned against the one directory this same registry already names and this
+    # same function already resolves against the filesystem -- every component of
+    # the path to the prototypes has to be one of them, because a production file
+    # may not reach the prototype tree and may not reach the tree it sits in
+    # either.
+    unguarded = [part for part in prototype_path.parts if part not in set(forbidden_roots)]
+    if unguarded:
+        raise BaselineError(
+            f"the prototype tree is reachable from production: {prototype_source} "
+            f"is not covered by the forbidden dependency roots ({', '.join(unguarded)})"
+        )
+
     regressions = status.get("regressions", [])
     regression_ids = [entry.get("id") for entry in regressions]
     if len(regression_ids) != len(set(regression_ids)):
@@ -264,6 +280,45 @@ def read_status() -> dict:
         if unknown:
             raise BaselineError(f"unknown regression on {entry['path']}: {', '.join(sorted(unknown))}")
     return status
+
+
+def shipped_source_roots(repo: Path) -> list[str]:
+    """The directories the wheel takes its code from, per the packaging metadata.
+
+    Read from `pyproject.toml` rather than from the registry, because the point
+    is to have a second author. The registry says what is scanned; this says what
+    is shipped, and it says it to a build backend that would notice if it were
+    wrong. A boundary check whose entire notion of "production" comes from one
+    editable file is a check that can be switched off by editing that file.
+    """
+    manifest = repo / "pyproject.toml"
+    try:
+        packaging = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise BaselineError(f"cannot read the packaging metadata: {error}") from error
+    found = (
+        packaging.get("tool", {}).get("setuptools", {}).get("packages", {}).get("find", {})
+    )
+    where = found.get("where", ["."])
+    if not isinstance(where, list) or not all(isinstance(entry, str) and entry for entry in where):
+        raise BaselineError("packaging metadata declares no source directory")
+    return where
+
+
+def unscanned_shipped_roots(repo: Path, scanned: list[str]) -> list[str]:
+    """The shipped directories no scanned target covers.
+
+    Covered means the target *is* the directory or contains it, which is the same
+    reach the scan itself has -- it walks each target with `rglob`. Anything left
+    is code that goes in the wheel and past this check without being read.
+    """
+    targets = {Path(target) for target in scanned}
+    missing = []
+    for root in shipped_source_roots(repo):
+        path = Path(root)
+        if not any(path == target or target in path.parents for target in targets):
+            missing.append(root)
+    return missing
 
 
 def forbidden_reference(
@@ -449,6 +504,17 @@ def main(argv: list[str] | None = None) -> int:
             for entry in status["classifications"]
             if entry["classification"] == "production"
         ]
+        # The checkout, not `--repo`. The question is whether this registry
+        # describes the boundary honestly, and the registry and the packaging
+        # metadata it is checked against are both this checkout's; `--repo` is a
+        # tree handed in to be read with them.
+        unscanned = unscanned_shipped_roots(
+            CHECKOUT, [*status["production_roots"], *production_paths]
+        )
+        if unscanned:
+            raise BaselineError(
+                "packaged source is outside the scanned boundary: " + ", ".join(unscanned)
+            )
         errors = implementation_claim_errors(CHECKOUT, status["classifications"])
         errors.extend(
             production_boundary_errors(

@@ -67,12 +67,12 @@ EXIT_STARTUP_REFUSED = 13
 #: classes continue the same order: a connection string that was refused
 #: explains a database nobody reached, an unusable corpus explains a schema that
 #: does not match it, and a schema that does not match explains an invariant
-#: that no longer holds. An archive that was never produced is last because it
-#: is reported by a command that stops before the gate, so it never competes
-#: with an integrity failure for the same exit. A target nobody reached sorts
-#: after all of them: every class above it is a statement about this machine, and
-#: any one of them explains a request that did not complete better than the
-#: outside world does. An open human decision is last of all, and it is the only
+#: that no longer holds. An archive that was never produced sorts after all of
+#: those because it is reported by a command that stops before the gate, so it
+#: never competes with an integrity failure for the same exit. A target nobody
+#: reached sorts after all of them: every class above it is a statement about
+#: this machine, and any one of them explains a request that did not complete
+#: better than the outside world does. An open human decision is last of all, and it is the only
 #: entry here that is not a fault: everything above it is something to fix, so if
 #: one of them is also present it is what an operator should be told about.
 PRECEDENCE = (

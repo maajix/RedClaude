@@ -2349,7 +2349,20 @@ class Handler(BaseHTTPRequestHandler):
                 # Withholding them would withhold nothing -- the Agent can read
                 # them under the hash it already holds -- and would seal, for a
                 # Program, a ciphertext of that Program's own plaintext.
-                agent_back, agent_returned, agent_reason = back, returned, reason
+                #
+                # `response_for_agent` is still applied, and is a no-op whenever
+                # the hit is what the comment above assumes: the unbound path
+                # files the projected view, so bytes filed by it are already
+                # projected and projecting them twice changes nothing. The store
+                # is a plain content-addressed heap that five other modules also
+                # write, and a hit proves only that the bytes are on disk -- not
+                # that this door is what put them there. Where those two differ,
+                # the projection is the answer and the hit is the coincidence.
+                agent_back, agent_returned, agent_reason = (
+                    response_for_agent(back),
+                    returned,
+                    reason,
+                )
             else:
                 agent_back, agent_returned = project_identity_response(back, returned)
                 agent_reason = ""
@@ -2470,6 +2483,15 @@ class Handler(BaseHTTPRequestHandler):
         # the link between the two -- without it the child Receipt names a URL
         # nobody asked for, and an auditor cannot tell a followed redirect from
         # an agent that invented a target for itself.
+        #
+        # Except when an Identity was bound. `project_identity_response` withholds
+        # the whole response head, `Location` included, because a redirect target
+        # is as capable of reflecting a credential as any other target-controlled
+        # field -- and a Receipt is read by more roles than the Agent view is.
+        # So those exchanges record no link, and an auditor reading one sees an
+        # unlinked child rather than a link that leaked. Reading `back` here
+        # instead would put the withheld bytes back on the record it was
+        # withheld from.
         onward = (
             redirected(url, _header(agent_back, "Location")) if status in REDIRECTS else None
         )

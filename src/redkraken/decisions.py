@@ -68,6 +68,23 @@ BODY_BYTES = 400
 ERROR_BYTES = 200
 
 
+def _clipped(text: str, limit: int) -> str:
+    """`text`, cut to `limit` bytes without splitting a character.
+
+    Bytes rather than code points, because both bounds above are named in bytes
+    and both are spent in bytes: an argument vector is measured by the kernel in
+    bytes and a column is stored in them. A slice of the string would bound four
+    times as much as the name promises the moment a target's own text is not
+    ASCII, and a target's text is exactly what ends up here.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    # `ignore` drops the partial sequence the cut may leave at the end, which is
+    # the one thing a byte-wise cut of UTF-8 can produce that is not text.
+    return encoded[:limit].decode("utf-8", "ignore")
+
+
 @dataclass
 class _Tally:
     """What one run of the sweep did, across however many passes it made."""
@@ -211,7 +228,8 @@ def _command(argv: Sequence[str], label: str, body: str) -> list[str]:
     """
     printable = "".join(character if character.isprintable() else " " for character in body)
     return [
-        part.replace(LABEL, label).replace(BODY, printable[:BODY_BYTES]) for part in argv
+        part.replace(LABEL, label).replace(BODY, _clipped(printable, BODY_BYTES))
+        for part in argv
     ]
 
 
@@ -232,11 +250,11 @@ def _run_channel(command: Sequence[str]) -> tuple[bool, str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        return False, f"{type(error).__name__}: {error}"[:ERROR_BYTES]
+        return False, _clipped(f"{type(error).__name__}: {error}", ERROR_BYTES)
     if done.returncode == 0:
         return True, ""
     said = (done.stderr or done.stdout or "").strip()
-    return False, f"exit {done.returncode}: {said}"[:ERROR_BYTES]
+    return False, _clipped(f"exit {done.returncode}: {said}", ERROR_BYTES)
 
 
 def _report(ledger: Ledger, tally: _Tally) -> Report:

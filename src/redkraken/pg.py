@@ -437,6 +437,19 @@ class Connection:
         self._send(None, struct.pack("!i", SSL_REQUEST))
         answer = self._read_exactly(1)
         if answer == b"S":
+            if self._buffer:
+                # Everything after the one-byte reply arrived before the
+                # handshake and is therefore unauthenticated: a man in the
+                # middle can append it to the `S` in the same segment, and a
+                # client that kept it would hand plaintext of the attacker's
+                # choosing to `_receive()` as if the server had said it inside
+                # the session. This is CVE-2021-23222. There is nothing to
+                # salvage -- a well-behaved server sends nothing until the
+                # handshake completes -- so the stream is lost.
+                del self._buffer[:]
+                raise ConnectionError_(
+                    "the server sent data before the TLS handshake; refusing the connection"
+                )
             context = _tls_context(self.settings)
             try:
                 self._socket = context.wrap_socket(

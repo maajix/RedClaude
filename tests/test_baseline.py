@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -200,6 +201,32 @@ class BaselineCliTest(unittest.TestCase):
 
             with self.assertRaisesRegex(check_baseline.BaselineError, "duplicate manifest source"):
                 check_baseline.read_manifest(duplicate)
+
+    def test_emptying_the_registry_does_not_empty_the_scan(self):
+        registry = check_baseline.read_status()
+        scanned = [
+            *registry["production_roots"],
+            *[
+                entry["path"]
+                for entry in registry["classifications"]
+                if entry["classification"] == "production"
+            ],
+        ]
+
+        self.assertEqual([], check_baseline.unscanned_shipped_roots(ROOT, scanned))
+        self.assertEqual(["src"], check_baseline.unscanned_shipped_roots(ROOT, []))
+
+    def test_forbidden_roots_must_cover_the_prototype_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = check_baseline.read_status()
+            registry["forbidden_dependency_roots"] = ["one", "two", "three", "four"]
+            renamed = Path(temporary) / "status.json"
+            renamed.write_text(json.dumps(registry), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                check_baseline.BaselineError, "prototype tree is reachable from production"
+            ):
+                check_baseline.read_status(renamed)
 
     def test_manifest_comparison_names_each_kind_of_drift(self):
         expected = [
