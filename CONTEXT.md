@@ -314,6 +314,31 @@ abort, which is unplanned and reconciles from current authoritative rows. Events
 audit that reconciliation; they are never replayed to rebuild state.
 _Avoid_: Pause, kill, stop, abort
 
+**Question code**:
+The stable classification a question is filed under -- risk, scope ambiguity,
+third-party impact, credential need, policy uncertainty -- held as
+program-global registry rows that the rule raising a question and the decision
+recording it both point at by foreign key. An operator answers the code, not the
+sentence: the sentence names one call, the code is what a standing grant and the
+next revalidation are written against.
+_Avoid_: Reason, category, tag, decision type
+
+**Parked**:
+A task interrupted by a question rather than finished or failed: its runs are
+closed, its leases released and its claim dropped, and only an operator verb
+moves it again. It costs no attempt, because nothing about the work was tried
+and found wanting. Distinct from abandoned, which is terminal, and from pending,
+which the scheduler may claim now.
+_Avoid_: Blocked, paused, waiting, on hold
+
+**Supersede**:
+An operator's withdrawal of a question they will not answer, after changing the
+configuration it was asked under. No grant is issued and the task goes back to
+pending, so what resolves it next is a fresh gate verdict under the policy in
+force then. Distinct from a denial, which ends the task on the operator's
+authority.
+_Avoid_: Cancel, dismiss, close, ignore
+
 **Credential vector**:
 An environment variable, settings key or provider switch that replaces,
 prevents, reroutes or redirects the CLI's subscription-authenticated request

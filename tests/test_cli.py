@@ -630,6 +630,108 @@ class DecisionCommandTest(unittest.TestCase):
         self.assertNotIn("s3cr3t-sentinel", result.stderr)
 
 
+class OperatorCommandTest(unittest.TestCase):
+    """The five commands a person runs, up to the point where a database is needed.
+
+    All five read `RK_HUMAN_URL` and nothing else. That is the ticket's fourth
+    criterion as an operator meets it: the connection that answers a question or
+    lifts a Halt is a role the runtime cannot become, so exporting the runtime's
+    URL has to be a refusal naming the variable this one wanted rather than a
+    command that quietly runs as the wrong role.
+    """
+
+    def test_every_operator_command_reads_the_operator_variable(self):
+        naming = {
+            ("decision", "list"): (),
+            ("decision", "answer"): ("--program", "p", "D1", "--approve", "--reason", "x"),
+            ("decision", "supersede"): ("--program", "p", "D1", "--reason", "x"),
+            ("halt",): ("--program", "p", "--reason", "x"),
+            ("resume",): ("--program", "p", "--reason", "x"),
+        }
+        observed = {}
+        for command, rest in naming.items():
+            report = json.loads(run(*command, *rest).stdout)
+            observed[report["command"]] = report["violations"][0]["source"]
+
+        self.assertEqual(
+            {
+                "decision list": "environment:RK_HUMAN_URL",
+                "decision answer": "environment:RK_HUMAN_URL",
+                "decision supersede": "environment:RK_HUMAN_URL",
+                "halt": "environment:RK_HUMAN_URL",
+                "resume": "environment:RK_HUMAN_URL",
+            },
+            observed,
+        )
+
+    def test_an_answer_without_a_verdict_is_a_usage_error(self):
+        # Neither verdict is a default. An operator who typed neither has not
+        # said what they decided, and the safe guess would be the one that ends
+        # a Task nobody meant to end.
+        result = run("decision", "answer", "--program", "p", "D1", "--reason", "x")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--approve", result.stderr)
+
+    def test_a_verdict_cannot_be_both_at_once(self):
+        result = run(
+            "decision", "answer", "--program", "p", "D1",
+            "--approve", "--deny", "--reason", "x",
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+
+    def test_every_verb_that_changes_something_requires_a_reason(self):
+        for command in (
+            ("decision", "answer", "--program", "p", "D1", "--deny"),
+            ("decision", "supersede", "--program", "p", "D1"),
+            ("halt", "--program", "p"),
+            ("resume", "--program", "p"),
+        ):
+            with self.subTest(command=command):
+                result = run(*command)
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn("--reason", result.stderr)
+
+    def test_a_verb_that_names_no_program_is_a_usage_error(self):
+        # Never defaulted to "the only one open": a machine running two
+        # campaigns would have a Halt whose target depended on which of them
+        # happened to be closed at the time.
+        result = run("halt", "--reason", "x")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--program", result.stderr)
+
+    def test_the_queue_may_be_asked_for_without_naming_a_program(self):
+        # Reading is the one thing an operator does before they know which
+        # Program is stopped.
+        result = run("decision", "list", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("decision list", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        url = "postgresql://rk2:s3cr3t-sentinel@127.0.0.1:1/rk2"
+
+        result = run("halt", "--program", "p", "--reason", "x", "--url", url)
+
+        self.assertNotIn("s3cr3t-sentinel", result.stdout)
+        self.assertNotIn("s3cr3t-sentinel", result.stderr)
+
+    def test_the_reason_an_operator_wrote_is_not_echoed_into_a_refusal(self):
+        # Criterion 6 as the CLI meets it: the words are for the decision record
+        # and the report is a document other things read.
+        result = run(
+            "decision", "answer", "--program", "p", "D1", "--deny",
+            "--reason", "s3cr3t-context-sentinel",
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+        )
+
+        self.assertNotIn("s3cr3t-context-sentinel", result.stdout)
+        self.assertNotIn("s3cr3t-context-sentinel", result.stderr)
+
+
 class IdentityCommandTest(unittest.TestCase):
     """Identity provisioning is an explicit operator adapter, never a net tool input."""
 

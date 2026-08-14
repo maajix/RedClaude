@@ -397,12 +397,12 @@ def assert_runtime_connection(ledger: Ledger, connection: pg.Connection) -> None
 def resolve(ledger: Ledger, connection: pg.Connection, slug: str) -> str | None:
     """The identifier of the Program a configuration names, or a refusal.
 
-    On the runtime connection, always: the agent's cannot read `programs` and is
-    not supposed to be able to, so this is the one crossing point where a name an
-    operator wrote becomes an identifier a session can be bound to. Public
-    because `rk state` and `rk artifact` both need that crossing, and the failure
-    they share -- a configuration naming a Program nobody opened -- is one an
-    operator should not see worded two ways.
+    Never on the agent's connection: `rk2_state` cannot read `programs` and is
+    not supposed to be able to, so this is the one crossing point where a name a
+    person wrote becomes an identifier a session can be bound to. Public because
+    `rk state`, `rk artifact` and the operator console all need that crossing,
+    and the failure they share -- a configuration naming a Program nobody opened
+    -- is one an operator should not see worded three ways.
     """
     rows = connection.execute("SELECT id::text FROM programs WHERE slug = $1", (slug,)).rows
     if not rows:

@@ -25,6 +25,7 @@ from redkraken import (
     header,
     identity,
     migrate,
+    operator,
     pg,
     program,
     proxy,
@@ -48,6 +49,11 @@ MIGRATE_URL = "RK_MIGRATE_URL"
 RESTORE_URL = "RK_RESTORE_URL"
 DATABASE_URL = "RK_DATABASE_URL"
 STATE_URL = "RK_STATE_URL"
+#: The operator console's own connection, held as `rk2_human`. It is the only
+#: role that may answer a question or lift a Halt, and it is deliberately not
+#: reachable from `RK_DATABASE_URL`: a control verb the runtime could execute is
+#: a control verb a model's tool call can reach through the runtime.
+HUMAN_URL = "RK_HUMAN_URL"
 #: The egress door's own connection, held as `rk2_proxy`: EXECUTE on two writers
 #: and no receipt DML at all. Spelled out rather than folded into
 #: `RK_DATABASE_URL` because a fence running as the runtime would be a fence with
@@ -87,6 +93,7 @@ RESTORATION = _Source("connection_string", "--url", RESTORE_URL)
 RUNTIME = _Source("connection_string", "--url", DATABASE_URL)
 AGENT = _Source("state_connection_string", "--state-url", STATE_URL)
 FENCE = _Source("connection_string", "--url", PROXY_DATABASE_URL)
+CONSOLE = _Source("connection_string", "--url", HUMAN_URL)
 
 #: Where the door listens, which is neither a role nor a store. The capability
 #: is sent to this address and to nothing else, and `proxy.endpoint` refuses any
@@ -806,6 +813,103 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tend.set_defaults(run=_decision_sweep)
 
+    listing = tending.add_parser(
+        "list",
+        help=f"show the questions waiting on an operator (${HUMAN_URL})",
+    )
+    _add_url(listing, CONSOLE)
+    listing.add_argument(
+        "--program",
+        metavar="slug",
+        help="show one Program's questions; without it, every Program's",
+    )
+    listing.add_argument(
+        "--closed",
+        action="store_true",
+        help="also show the questions somebody has already closed",
+    )
+    listing.set_defaults(run=_decision_list)
+
+    answering = tending.add_parser(
+        "answer",
+        help=f"approve or deny one question (${HUMAN_URL})",
+    )
+    _add_url(answering, CONSOLE)
+    _add_program(answering)
+    answering.add_argument("label", metavar="label", help="the question, as `rk decision list` cites it")
+    verdict = answering.add_mutually_exclusive_group(required=True)
+    verdict.add_argument(
+        "--approve",
+        action="store_true",
+        help=(
+            "let the call the question was filed about proceed; refused if the "
+            "request no longer classifies the way it did when it was asked"
+        ),
+    )
+    verdict.add_argument(
+        "--deny", action="store_true", help="refuse it, and abandon the Task behind it"
+    )
+    answering.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help=(
+            "why, in the operator's own words; recorded against the decision and "
+            "never handed to a model"
+        ),
+    )
+    answering.add_argument(
+        "--grant-hours",
+        type=float,
+        default=operator.DEFAULT_GRANT_HOURS,
+        metavar="hours",
+        help=(
+            "how long an approval stays good for "
+            f"(default: {operator.DEFAULT_GRANT_HOURS:g})"
+        ),
+    )
+    answering.set_defaults(run=_decision_answer)
+
+    withdrawing = tending.add_parser(
+        "supersede",
+        help=f"withdraw one question instead of answering it (${HUMAN_URL})",
+    )
+    _add_url(withdrawing, CONSOLE)
+    _add_program(withdrawing)
+    withdrawing.add_argument("label", metavar="label", help="the question to withdraw")
+    withdrawing.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help="why it is being withdrawn rather than answered",
+    )
+    withdrawing.set_defaults(run=_decision_supersede)
+
+    halting = commands.add_parser(
+        "halt",
+        help=f"Halt a Program: no egress and no new work until it is lifted (${HUMAN_URL})",
+    )
+    _add_url(halting, CONSOLE)
+    _add_program(halting)
+    halting.add_argument(
+        "--reason", required=True, metavar="text", help="why the Program is being Halted"
+    )
+    halting.set_defaults(run=_halt)
+
+    lift = commands.add_parser(
+        "resume",
+        help=(
+            "lift a Halt; the runtime recovers what it has to at the next "
+            f"`rk run` (${HUMAN_URL})"
+        ),
+    )
+    _add_url(lift, CONSOLE)
+    _add_program(lift)
+    lift.add_argument(
+        "--reason", required=True, metavar="text", help="why it is safe to start again"
+    )
+    lift.set_defaults(run=_resume)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -874,6 +978,21 @@ def _add_url(parser: argparse.ArgumentParser, source: _Source) -> None:
         help=f"the connection string (default: ${source.variable})",
     )
     parser.set_defaults(url_source=source)
+
+
+def _add_program(parser: argparse.ArgumentParser) -> None:
+    """The Program every operator verb names, as the slug an operator typed.
+
+    Required, and never defaulted to "the only one open": a machine running two
+    campaigns would then have a Halt whose target depended on which one happened
+    to be closed at the time.
+    """
+    parser.add_argument(
+        "--program",
+        required=True,
+        metavar="slug",
+        help="the Program, by the name its configuration gives it",
+    )
 
 
 def _add_root(parser: argparse.ArgumentParser, help: str | None = None) -> None:
@@ -1260,6 +1379,57 @@ def _decision_sweep(arguments: argparse.Namespace) -> int:
             decisions.COMMAND,
             lambda: decisions.sweep(runtime, every=arguments.every),
         )
+    )
+
+
+def _decision_list(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.LIST,
+        lambda console: operator.queue(
+            console, slug=arguments.program, closed=arguments.closed
+        ),
+    )
+
+
+def _decision_answer(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.ANSWER,
+        lambda console: operator.answer(
+            console,
+            arguments.program,
+            arguments.label,
+            approve=arguments.approve,
+            reason=arguments.reason,
+            grant_hours=arguments.grant_hours,
+        ),
+    )
+
+
+def _decision_supersede(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.SUPERSEDE,
+        lambda console: operator.supersede(
+            console, arguments.program, arguments.label, reason=arguments.reason
+        ),
+    )
+
+
+def _halt(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.HALT,
+        lambda console: operator.halt(console, arguments.program, reason=arguments.reason),
+    )
+
+
+def _resume(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.RESUME,
+        lambda console: operator.resume(console, arguments.program, reason=arguments.reason),
     )
 
 

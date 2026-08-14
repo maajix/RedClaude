@@ -60,6 +60,7 @@ from redkraken import (
     identity,
     integrity,
     migrate,
+    operator,
     packet,
     pg,
     program,
@@ -687,6 +688,52 @@ CALLBACK_CONTROL = (
 )
 
 
+#: The parked shape, assembled by hand, with the two holes PH2-29 closes: a
+#: receipt the parked run left open, and a Task still parked on a question that
+#: is over. Written once because everything before the last two statements is
+#: the ordinary shape -- a Program, a Task, the run that claimed it, the receipt
+#: that asked and the question it filed -- and repeating it per control would
+#: bury which one line is the falsification.
+#:
+#: `receipt` is what the asking receipt is left as: `'running'` is the open
+#: capability, and the parked spelling carries the decision because
+#: `tool_runs_parked_ck` requires it. `closed` is anything that happens to the
+#: question afterwards.
+PARKED_CONTROL = (
+    "DO $ctl$ DECLARE p uuid; k uuid; a uuid; t uuid; g jsonb; d uuid;"
+    " BEGIN"
+    "   PERFORM set_actor('runtime', 'selftest');"
+    "   INSERT INTO programs (slug, name) VALUES ('{slug}', 'Self test')"
+    "     RETURNING id INTO p;"
+    "   INSERT INTO tasks (program_id, kind, status) VALUES (p, 'recon', 'pending')"
+    "     RETURNING id INTO k;"
+    "   INSERT INTO agent_runs (program_id, task_id, role, kind, runs_as, model, effort,"
+    "                           mission_packet)"
+    "        VALUES (p, k, 'recon', 'recon', 'subagent', 'operator', 'low', '{{}}'::jsonb)"
+    "     RETURNING id INTO a;"
+    "   INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args, status, transport)"
+    "        VALUES (p, a, k, 'mcp__rk2__net_request',"
+    "                '{{\"url\":\"https://probe.invalid/a\",\"method\":\"POST\"}}'::jsonb,"
+    "                'running', 'runtime')"
+    "     RETURNING id INTO t;"
+    "   g := canonical_request('mcp__rk2__net_request',"
+    "                          '{{\"url\":\"https://probe.invalid/a\",\"method\":\"POST\"}}'::jsonb,"
+    "                          'probe');"
+    "   INSERT INTO pending_decisions"
+    "        (program_id, task_id, agent_run_id, tool_run_id, tool, risk_class, risk_rule,"
+    "         question_code, request_digest, equivalence_key, question, deadline_at)"
+    "        VALUES (p, k, a, t, 'mcp__rk2__net_request', 'approval_required',"
+    "                'net_unsafe_method', 'destructive_action', g, equivalence_key(g),"
+    "                render_decision_question(g, 'approval_required', 'net_unsafe_method'),"
+    "                now() + interval '1 hour')"
+    "     RETURNING id INTO d;"
+    "   UPDATE tool_runs SET status = {receipt} WHERE id = t;"
+    "   UPDATE tasks SET status = 'parked', pending_decision_id = d WHERE id = k;"
+    "   {closed}"
+    " END $ctl$"
+)
+
+
 #: Every check the gate runs, and the edit that makes it fail. Each runs in a
 #: transaction that is rolled back, so the database is unchanged afterwards --
 #: `test_the_database_is_unchanged_afterwards` is what says so.
@@ -768,6 +815,50 @@ CONTROLS = (
         "     FROM notification_channels c"
         "    WHERE c.channel = n.channel AND n.program_id = p;"
         " END $ctl$",
+    ),
+    Control(
+        # PH2-29, criterion 2: the parked shape with one receipt left open. The
+        # run that owns it ended when the question was filed, so this is a
+        # capability the door would still resolve on behalf of nobody -- which
+        # is what `park_authorized_tool_run` closes and what would come back the
+        # day a future parking path forgets the siblings.
+        "standing:control_surface",
+        PARKED_CONTROL.format(slug="parked-receipt-selftest", receipt="'running'", closed=""),
+    ),
+    Control(
+        # PH2-29, criterion 4: the same shape after the question is over. Each
+        # of the three verbs moves the Task; a Task still parked on a decision
+        # nobody can answer again is work no operator can reach and no scheduler
+        # will offer.
+        "standing:control_surface",
+        PARKED_CONTROL.format(
+            slug="parked-closed-selftest",
+            receipt="'parked', pending_decision_id = d",
+            # Closed the way the sweep closes one, because a half-written close
+            # is refused by `pending_decisions_answer_complete` before any check
+            # gets to see it -- and the fault under test is a complete close
+            # that left the Task where it was.
+            closed="UPDATE pending_decisions SET status = 'expired', actor_kind = 'runtime',"
+            " answered_at = now(), answered_by = 'runtime',"
+            " answer = 'deadline passed with no human answer' WHERE id = d;",
+        ),
+    ),
+    Control(
+        # PH2-29, criterion 4: the grant that was there before this ticket.
+        "standing:control_surface",
+        "GRANT EXECUTE ON FUNCTION answer_decision(text, text, text, interval) TO rk2_runtime",
+    ),
+    Control(
+        # PH2-29, criterion 6, all three routes to the operator's own words: the
+        # column, the view that selects it, and the log that republishes it.
+        "standing:control_surface",
+        "GRANT SELECT (answer) ON pending_decisions TO rk2_runtime",
+    ),
+    Control("standing:control_surface", "GRANT SELECT ON v_decision_queue TO rk2_runtime"),
+    Control(
+        "standing:control_surface",
+        "UPDATE event_table_config SET redacted_columns = array_remove(redacted_columns, 'answer')"
+        " WHERE table_name = 'pending_decisions'",
     ),
     # --- causal attribution --------------------------------------------------
     Control(
@@ -4854,21 +4945,34 @@ class SealedWireArtifactTest(DatabaseCase):
         self.assertEqual(("credential_bearing", True), (str(row[0]), bool(row[1])))
         self.assertEqual((len(WIRE), "message/http"), (int(row[2]), str(row[3])))
 
+    def scan(self, needle: str) -> list[tuple[str, str]]:
+        """Every column holding a value, asked as the role that reads them all.
+
+        `find_in_database` answers about what its caller may read, and since
+        PH2-29 one column -- the operator's own answer -- is readable by the
+        operator alone. Asked on this case's runtime connection the scan below
+        would still come back empty, and would have quietly stopped asking about
+        a column, which is the one way a marker-absence test can be wrong.
+        """
+        connection = pg.connect(self.harness.migrate)
+        try:
+            with connection.transaction():
+                connection.execute("SET LOCAL ROLE rk2_owner")
+                rows = connection.execute(
+                    "SELECT relation, attribute FROM find_in_database($1)", (needle,)
+                ).rows
+        finally:
+            connection.close()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
     def test_the_marker_is_in_no_column_of_any_table(self):
         # Criterion 3, asked of every column of every table at once -- rows,
         # Events, the audit trail and the diagnostics registry included, because
         # all of them are tables. The positive control is the point: the same
         # question about a value that *is* in the database answers, so the
         # absence is an answer rather than a query that matches nothing.
-        found = self.connection.execute(
-            "SELECT relation, attribute FROM find_in_database($1)", (MARKER,)
-        ).rows
-        control = self.connection.execute(
-            "SELECT relation, attribute FROM find_in_database($1)", (f"{SEAL_SLUG}-a",)
-        ).rows
-
-        self.assertEqual([], [(str(row[0]), str(row[1])) for row in found])
-        self.assertIn(("programs", "slug"), [(str(row[0]), str(row[1])) for row in control])
+        self.assertEqual([], self.scan(MARKER))
+        self.assertIn(("programs", "slug"), self.scan(f"{SEAL_SLUG}-a"))
 
     def test_the_marker_is_in_no_byte_of_the_store(self):
         # The half of criterion 3 that no SQL statement can answer.
@@ -11317,7 +11421,7 @@ class SchedulerFixture:
         raise AssertionError(f"not refused: {sql} {parameters}")
 
     @classmethod
-    def operator(cls, sql: str, parameters: tuple = ()) -> object:
+    def operator(cls, sql: str, parameters: tuple = (), *, program: str | None = None) -> object:
         """One statement as the operator, on a connection of its own.
 
         PH2-26 grants the weights verb to `rk2_human` and to nothing else, so a
@@ -11325,9 +11429,15 @@ class SchedulerFixture:
         no operator has. Opened per call rather than held: the scenarios that
         need it move the weights twice each, and a connection kept open across
         a class that commits is one more thing to close on a failure path.
+
+        `program` binds one first, which PH2-29's verbs need and PH2-26's does
+        not: a decision label is counted per Program and resolved inside the
+        session's, so an unbound operator connection reaches no question at all.
         """
         connection = pg.connect(cls.harness.human)
         try:
+            if program is not None:
+                connection.execute(operator.BIND, (cls.identifiers[program],))
             with connection.transaction():
                 return connection.execute(sql, parameters).scalar()
         finally:
@@ -15701,6 +15811,695 @@ class LeaseTest(DatabaseCase):
         ).rows
 
         self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+#: PH2-29's Programs: one per thing that can happen to a question between the
+#: moment the gate files it and the moment somebody answers it.
+OPERATOR_SLUG = "selftest-operator"
+
+#: What the operator wrote when they answered. A sentence nothing else in this
+#: suite would produce, because criterion 6 is asked by looking for it in every
+#: place it must not appear, and a reason reading "selftest" would be a needle
+#: indistinguishable from the hay.
+OPERATOR_REASON = "the tenant boundary here is ours to cross, and I checked it by hand"
+
+#: `SCOPED` with its wildcard inclusion narrowed to a path the parked request is
+#: not under: the operator editing the scope document while a question about it
+#: is open. `/notes` is a target under `paths = ["/"]` and is addressable by
+#: nothing afterwards, so the request the question was filed about canonicalises
+#: to something else -- which is the change criterion 5 revalidates against.
+NARROWED = SCOPED.replace(
+    '[[scope.include]]\nhost = "*.example.com"\nports = [80, 443]\n'
+    'protocols = ["http", "https"]\npaths = ["/"]\n',
+    '[[scope.include]]\nhost = "*.example.com"\nports = [80, 443]\n'
+    'protocols = ["http", "https"]\npaths = ["/api/"]\n',
+)
+assert NARROWED != SCOPED, "the inclusion PH2-29's stale scenario narrows is no longer in SCOPED"
+
+#: The same question, filed again under a word nobody registered. An INSERT
+#: rather than an UPDATE because the only legal update to a decision is the one
+#: that closes it, and what is under test here is the writer's foreign key.
+FORGED_QUESTION = (
+    "INSERT INTO pending_decisions"
+    " (program_id, agent_run_id, tool_run_id, tool, risk_class, risk_rule,"
+    "  question_code, request_digest, equivalence_key, question, deadline_at)"
+    " SELECT d.program_id, d.agent_run_id, d.tool_run_id, d.tool, d.risk_class,"
+    "        d.risk_rule, 'vibes_unclear', d.request_digest, d.equivalence_key,"
+    "        d.question, d.deadline_at"
+    "   FROM pending_decisions d"
+    "  WHERE d.program_id = $1::uuid AND d.label = $2"
+)
+
+
+class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
+    """PH2-29: what an operator may do with a filed question, and what moves.
+
+    Ticket 11 files the question and ticket 13 Halts the Program; both wrote
+    their verbs and neither wrote the other side of the transaction. That side
+    is only answerable here, because every one of its six criteria is about two
+    moments and the rows between them: a run holding a lease and then not, a
+    Task that no scheduler may offer and then may, an approval given about a
+    configuration that has since been edited.
+
+    The Programs are the scenarios, one per ending a question can have. In
+    `parked` the operator approves and the work goes back in the queue; in
+    `stale` the scope document moves underneath the question and the operator
+    withdraws it; in `halted` the Program is Halted, which lets a denial
+    through and refuses an approval; in `guarded` nothing but the operator's own
+    connection may close it at all.
+
+    Everything runs in `setUpClass` because all of it commits, and because each
+    step only means anything against the state the step before it left: an
+    approval refused for a request that was reclassified is a claim about the
+    republication that reclassified it.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in ("parked", "stale", "halted", "guarded"):
+            opened = program.run(cls.harness.runtime, cls.configuration(name, SCOPED))
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_parked()
+        cls.arrange_stale()
+        cls.arrange_halted()
+        cls.arrange_guarded()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM finding_hypotheses WHERE program_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{OPERATOR_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{OPERATOR_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the moves every scenario is built out of ------------------------------
+
+    @classmethod
+    def configuration(cls, name: str, source: str) -> Path:
+        """One scenario's configuration on disk, under its own Program name."""
+        return write(
+            source.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                'name = "matrix-web"', f'name = "{OPERATOR_SLUG}-{name}"'
+            )
+        )
+
+    @classmethod
+    def claim(cls, name: str) -> tuple[str, str, str, str]:
+        """Two Tasks under one Program, and the run that claimed the first.
+
+        Two rather than one because criterion 3 is about the other one: what a
+        parked Task must not do is stall its Program, and a Program with a single
+        Task cannot show the difference between a queue that carried on and a
+        queue that had nothing left to offer.
+        """
+        labels = cls.seed(name, 2)
+        cls.bind(name)
+        cls.offer()
+        run = str(cls.call("SELECT claim_task()"))
+        claimed = str(cls.claimed_by(name, run))
+        [other] = [label for label in labels if label != claimed]
+        run_id, task_id = cls.opened_run(name, run)
+        return run_id, task_id, claimed, other
+
+    @classmethod
+    def opened_run(cls, name: str, run_label: str) -> tuple[str, str]:
+        """The identifiers behind a claim, which the receipts hang from.
+
+        `claim_task` answers with the Agent run's label because that is what the
+        orchestrator carries to the child; every row written below is keyed on
+        the identifier, so the two are resolved together here.
+        """
+        [run, task] = cls.as_owner(
+            "SELECT a.id::text, t.id::text FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[name], run_label),
+        ).rows[0]
+        return str(run), str(task)
+
+    @classmethod
+    def receipt(cls, name: str, run: str, task: str, method: str) -> str:
+        """One open Tool run of that Agent run, as the runtime writes them."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(
+                cls.runtime.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args,"
+                    " status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb,"
+                    " 'running', 'runtime') RETURNING id::text",
+                    (
+                        cls.identifiers[name],
+                        run,
+                        task,
+                        proxy.TOOL,
+                        json.dumps({"url": URL, "method": method, "identity_slot": ""}),
+                    ),
+                ).scalar()
+            )
+
+    @classmethod
+    def park(cls, receipt: str) -> str:
+        """The gate's `ask`, taken all the way to a filed question.
+
+        Through `park_for_human` and not through the two verbs it calls: what is
+        under test is the transaction an orchestrator actually reaches, and the
+        authorization half is where the risk class comes from.
+        """
+        return str(
+            cls.call("SELECT park_for_human($1::uuid, interval '2 hours')", (receipt,))
+        )
+
+    @classmethod
+    def lease_identity(cls, name: str, run: str) -> str:
+        """One Identity of this Program, leased to the run that is about to park.
+
+        Written by hand because `SCOPED` declares none, and criterion 2 is about
+        the release: a lease nothing ever granted is a release nothing can be
+        asserted about.
+        """
+        identity = str(
+            cls.scalar(
+                "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
+                (cls.identifiers[name], HOST, f"identity:{name}"),
+            )
+        )
+        cls.as_owner(
+            "INSERT INTO identities (entity_id, program_id, slot_name, class)"
+            " VALUES ($1::uuid, $2::uuid, $3, 'anonymous')",
+            (identity, cls.identifiers[name], f"{OPERATOR_SLUG}-{name}"),
+        )
+        cls.as_owner(
+            "INSERT INTO identity_leases (program_id, identity_entity_id, holder_agent_run_id,"
+            " expires_at) VALUES ($1::uuid, $2::uuid, $3::uuid, now() + interval '30 minutes')",
+            (cls.identifiers[name], identity, run),
+        )
+        return identity
+
+    @classmethod
+    def refused_operator(cls, program_name: str, sql: str, parameters: tuple = ()):
+        """The error one refused operator verb raised, insisting that it did.
+
+        The exception and not its text: what the console does with a refusal is
+        read the hint off it, so a test that kept only the message would agree
+        with a corpus that stopped writing one.
+        """
+        try:
+            cls.operator(sql, parameters, program=program_name)
+        except pg.DatabaseError as refused:
+            return refused
+        raise AssertionError(f"not refused: {sql} {parameters}")
+
+    @classmethod
+    def owner_refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        """What one refused write raised, in a transaction nothing survives.
+
+        A class method because half of these are asked while a scenario is being
+        arranged, against a row that only exists between two of its steps.
+        """
+        try:
+            with cls.connection.transaction():
+                cls.connection.execute("SET LOCAL ROLE rk2_owner")
+                cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                cls.connection.execute(sql, parameters)
+                raise Rollback
+        except pg.DatabaseError as refused:
+            return str(refused)
+        except Rollback:
+            raise AssertionError(f"not refused: {sql} {parameters}") from None
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_parked(cls):
+        """A run parked holding everything a run can hold, and then answered."""
+        run, task, claimed, sibling = cls.claim("parked")
+        cls.parked_task, cls.parked_sibling = claimed, sibling
+        cls.parked_identity = cls.lease_identity("parked", run)
+        asked = cls.receipt("parked", run, task, "POST")
+        cls.parked_open = cls.receipt("parked", run, task, "GET")
+        cls.attempts_when_claimed = cls.as_owner(
+            "SELECT attempts FROM tasks WHERE id = $1::uuid", (task,)
+        ).scalar()
+        cls.parked_label = cls.park(asked)
+
+        cls.after_parking = cls.as_owner(
+            "SELECT t.status AS task,"
+            "       t.lease_expires_at IS NULL AS lease_returned,"
+            "       t.finished_at IS NULL AS task_unfinished,"
+            "       t.pending_decision_id = d.id AS task_names_the_question,"
+            "       t.attempts,"
+            "       a.stop_reason AS run,"
+            "       a.finished_at IS NOT NULL AS run_closed,"
+            "       (SELECT count(*) FROM identity_leases l"
+            "         WHERE l.holder_agent_run_id = a.id AND l.released_at IS NULL)"
+            "         AS identities_held,"
+            "       (SELECT count(*) FROM tool_runs r"
+            "         WHERE r.agent_run_id = a.id AND r.status = 'running') AS receipts_open"
+            "  FROM tasks t"
+            "  JOIN agent_runs a ON a.id = $2::uuid"
+            "  JOIN pending_decisions d ON d.id = t.pending_decision_id"
+            " WHERE t.id = $1::uuid",
+            (task, run),
+        ).dicts()[0]
+        cls.sibling_receipt = cls.as_owner(
+            "SELECT status, hook_error, finished_at IS NOT NULL FROM tool_runs WHERE id = $1::uuid",
+            (cls.parked_open,),
+        ).rows[0]
+        cls.asked_receipt = cls.as_owner(
+            "SELECT status, pending_decision_id IS NOT NULL, egress_token_sha256 IS NULL"
+            "  FROM tool_runs WHERE id = $1::uuid",
+            (asked,),
+        ).rows[0]
+
+        # Criterion 3, before anything is answered: the parked Task is refused
+        # by the scheduler's own predicate, its neighbour is not, and the next
+        # pass takes the neighbour.
+        cls.parked_refusal = cls.claimable("parked", claimed)
+        cls.sibling_refusal = cls.claimable("parked", sibling)
+        cls.offer()
+        cls.next_task = cls.claimed_by("parked", cls.call("SELECT claim_task()"))
+
+        # Criterion 6, on the connection that compiles what a model is handed.
+        cls.runtime_reading_the_answer = cls.refusal(
+            "SELECT answer FROM pending_decisions WHERE label = $1", (cls.parked_label,)
+        )
+        cls.runtime_reading_the_queue = cls.refusal("SELECT program FROM v_decision_queue")
+        cls.runtime_reading_the_question = str(
+            cls.call(
+                "SELECT question_code FROM pending_decisions WHERE label = $1",
+                (cls.parked_label,),
+            )
+        )
+
+        cls.answered = json.loads(
+            str(
+                cls.operator(
+                    "SELECT answer_decision($1, 'approved', $2, interval '30 minutes')",
+                    (cls.parked_label, OPERATOR_REASON),
+                    program="parked",
+                )
+            )
+        )
+        cls.after_answer = cls.as_owner(
+            "SELECT t.status, t.pending_decision_id IS NULL, d.status, d.answered_by,"
+            "       d.grant_expires_at IS NOT NULL, d.answer"
+            "  FROM tasks t JOIN pending_decisions d ON d.id = $2::uuid"
+            " WHERE t.id = $1::uuid",
+            (task, cls.decision_id("parked", cls.parked_label)),
+        ).rows[0]
+        cls.answer_event = str(
+            cls.scalar(
+                "SELECT payload::text FROM events"
+                " WHERE program_id = $1::uuid AND type = 'decision.answered'"
+                " ORDER BY seq DESC LIMIT 1",
+                (cls.identifiers["parked"],),
+            )
+        )
+
+    @classmethod
+    def decision_id(cls, name: str, label: str) -> str:
+        """One question by identifier, which only the owner reads by label."""
+        return str(
+            cls.scalar(
+                "SELECT id::text FROM pending_decisions"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], label),
+            )
+        )
+
+    @classmethod
+    def arrange_stale(cls):
+        """The scope document moves while the question about it is open."""
+        run, task, claimed, _ = cls.claim("stale")
+        cls.stale_task = claimed
+        cls.stale_label = cls.park(cls.receipt("stale", run, task, "POST"))
+        cls.stale_before = cls.operator(
+            "SELECT revalidate_decision($1)", (cls.stale_label,), program="stale"
+        )
+
+        republished = program.run(
+            cls.harness.runtime, cls.configuration("stale", NARROWED), accept_change=True
+        )
+        assert republished.ok, republished.violations
+        cls.stale_after = cls.operator(
+            "SELECT revalidate_decision($1)", (cls.stale_label,), program="stale"
+        )
+        # A re-publication is also a resume, and the Task must survive it: the
+        # runtime's recovery verb unclaims what a dead run was holding, and a
+        # parked Task is not something anybody is holding.
+        cls.still_parked = cls.as_owner(
+            "SELECT status, pending_decision_id IS NOT NULL FROM tasks WHERE id = $1::uuid",
+            (task,),
+        ).rows[0]
+
+        cls.stale_refusal = cls.refused_operator(
+            "stale",
+            "SELECT answer_decision($1, 'approved', 'it looked fine when I read it')",
+            (cls.stale_label,),
+        )
+        cls.withdrawn = json.loads(
+            str(
+                cls.operator(
+                    "SELECT supersede_decision($1, $2)",
+                    (cls.stale_label, "the scope moved under the question"),
+                    program="stale",
+                )
+            )
+        )
+        cls.after_withdrawal = cls.as_owner(
+            "SELECT t.status, t.pending_decision_id IS NULL, d.status,"
+            "       d.grant_expires_at IS NULL"
+            "  FROM tasks t JOIN pending_decisions d ON d.id = $2::uuid"
+            " WHERE t.id = $1::uuid",
+            (task, cls.decision_id("stale", cls.stale_label)),
+        ).rows[0]
+
+    @classmethod
+    def arrange_halted(cls):
+        """A Program stopped while a question about it is waiting."""
+        run, task, claimed, _ = cls.claim("halted")
+        cls.halted_task = claimed
+        cls.halted_label = cls.park(cls.receipt("halted", run, task, "POST"))
+        cls.operator(
+            "SELECT halt_program($1::uuid, $2)",
+            (cls.identifiers["halted"], "the target asked us to stop"),
+            program="halted",
+        )
+        cls.halted_state = cls.operator(
+            "SELECT revalidate_decision($1)", (cls.halted_label,), program="halted"
+        )
+        cls.halted_refusal = cls.refused_operator(
+            "halted",
+            "SELECT answer_decision($1, 'approved', 'go on then')",
+            (cls.halted_label,),
+        )
+        cls.denied = json.loads(
+            str(
+                cls.operator(
+                    "SELECT answer_decision($1, 'denied', $2)",
+                    (cls.halted_label, "not while we are stopped"),
+                    program="halted",
+                )
+            )
+        )
+        cls.after_denial = cls.as_owner(
+            "SELECT t.status, t.abandoned_reason, t.pending_decision_id IS NULL,"
+            "       d.grant_expires_at IS NULL"
+            "  FROM tasks t JOIN pending_decisions d ON d.id = $2::uuid"
+            " WHERE t.id = $1::uuid",
+            (task, cls.decision_id("halted", cls.halted_label)),
+        ).rows[0]
+        cls.operator(
+            "SELECT clear_program_halt($1::uuid, $2)",
+            (cls.identifiers["halted"], "the target is content again"),
+            program="halted",
+        )
+
+    @classmethod
+    def arrange_guarded(cls):
+        """One open question, and every connection that may not close it."""
+        run, task, _, _ = cls.claim("guarded")
+        cls.guarded_label = cls.park(cls.receipt("guarded", run, task, "POST"))
+        cls.runtime_verbs = {
+            "answer_decision": cls.refusal(
+                "SELECT answer_decision($1, 'approved', 'the model says yes')",
+                (cls.guarded_label,),
+            ),
+            "supersede_decision": cls.refusal(
+                "SELECT supersede_decision($1, 'the model says never mind')",
+                (cls.guarded_label,),
+            ),
+            "halt_program": cls.refusal(
+                "SELECT halt_program($1::uuid, 'the model says stop')",
+                (cls.identifiers["guarded"],),
+            ),
+            "clear_program_halt": cls.refusal(
+                "SELECT clear_program_halt($1::uuid, 'the model says go')",
+                (cls.identifiers["guarded"],),
+            ),
+        }
+        # Criterion 1's second writer, asked while a question of this Program is
+        # still open so that there is a row to copy.
+        cls.forged_question = cls.owner_refusal(
+            FORGED_QUESTION, (cls.identifiers["guarded"], cls.guarded_label)
+        )
+        # And closed, so this class leaves nothing waiting on a person.
+        cls.operator(
+            "SELECT answer_decision($1, 'denied', $2)",
+            (cls.guarded_label, "nobody is going to answer this one"),
+            program="guarded",
+        )
+
+    # -- criterion 1: one vocabulary, and both writers point at it --------------
+
+    def test_both_writers_of_a_question_code_point_at_the_one_registry(self):
+        # Two CHECK lists spelling the same five words is one vocabulary
+        # maintained in two places, and the migration that adds a sixth word to
+        # one of them is the migration that breaks the other.
+        referencing = sorted(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT conrelid::regclass::text FROM pg_constraint"
+                " WHERE contype = 'f' AND confrelid = 'decision_question_codes'::regclass"
+            ).rows
+        )
+        checks = [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT conname FROM pg_constraint"
+                " WHERE contype = 'c' AND conname LIKE '%question_code_check'"
+            ).rows
+        ]
+
+        self.assertEqual(["call_risk_rules", "pending_decisions"], referencing)
+        self.assertEqual([], checks)
+
+    def test_a_question_filed_under_an_unregistered_code_is_refused(self):
+        self.assertIn("pending_decisions_question_code_fkey", self.forged_question)
+        self.assertIn(
+            "call_risk_rules_question_code_fkey",
+            self.owner_refusal(
+                "UPDATE call_risk_rules SET question_code = 'vibes_unclear'"
+                " WHERE rule_id = 'net_unsafe_method'"
+            ),
+        )
+
+    def test_every_code_a_writer_can_produce_is_a_row_of_the_registry(self):
+        # The escalation rules and the static floor are the two writers, and the
+        # floor's code is a literal in a function body that no foreign key can
+        # reach -- so it is asked of the function, not of a list kept here.
+        [unregistered] = self.connection.execute(
+            "SELECT count(*) FROM call_risk_rules r WHERE NOT EXISTS"
+            " (SELECT 1 FROM decision_question_codes c"
+            "   WHERE c.question_code = r.question_code)"
+        ).rows
+        [floor] = self.connection.execute(
+            "SELECT count(*) FROM decision_question_codes WHERE question_code ="
+            " (assess_call_risk('mcp__rk2__run_tool',"
+            "  '{\"tool_name\":\"probe\"}'::jsonb)) ->> 'question_code'"
+        ).rows
+
+        self.assertEqual(0, int(unregistered[0]))
+        self.assertEqual(1, int(floor[0]))
+
+    # -- criterion 2: parking releases everything the run was holding -----------
+
+    def test_parking_leaves_the_task_parked_and_naming_its_question(self):
+        parked = self.after_parking
+
+        self.assertEqual("parked", str(parked["task"]))
+        self.assertTrue(parked["task_names_the_question"])
+        # Not terminal, and not a failed attempt: what is waiting is a person,
+        # and a Task that counted the wait against its attempts would run out of
+        # them by being asked about. The claim counted its own attempt before
+        # any of this; parking counts none on top of it.
+        self.assertTrue(parked["task_unfinished"])
+        self.assertEqual(int(self.attempts_when_claimed), int(parked["attempts"]))
+
+    def test_parking_returns_both_halves_of_the_lease(self):
+        self.assertTrue(self.after_parking["lease_returned"])
+        self.assertEqual(0, int(self.after_parking["identities_held"]))
+
+    def test_parking_closes_every_receipt_the_run_had_open(self):
+        # The sibling is the one this ticket adds: a capability the door would
+        # still resolve, belonging to a run that ended when the question was
+        # filed.
+        status, hook_error, finished = self.sibling_receipt
+
+        self.assertEqual(0, int(self.after_parking["receipts_open"]))
+        self.assertEqual("abandoned", str(status))
+        self.assertTrue(finished)
+        self.assertIn(self.parked_label, str(hook_error))
+        self.assertIn("whether the tool ran is unknown", str(hook_error))
+
+    def test_the_receipt_that_asked_is_parked_and_holds_no_token(self):
+        status, names_the_decision, no_token = self.asked_receipt
+
+        self.assertEqual("parked", str(status))
+        self.assertTrue(names_the_decision)
+        self.assertTrue(no_token)
+
+    def test_the_run_that_asked_is_finished_and_says_why(self):
+        self.assertEqual("parked", str(self.after_parking["run"]))
+        self.assertTrue(self.after_parking["run_closed"])
+
+    # -- criterion 3: the rest of the Program carries on ------------------------
+
+    def test_the_parked_task_is_the_only_one_the_scheduler_refuses(self):
+        self.assertEqual("not_pending", self.parked_refusal)
+        self.assertIsNone(self.sibling_refusal)
+
+    def test_the_next_pass_claims_the_task_that_was_not_parked(self):
+        # The lane slot the parked run held is part of this: a run that ended
+        # without freeing it would leave the Program with a claimable Task and
+        # no capacity to claim it with.
+        self.assertEqual(self.parked_sibling, self.next_task)
+
+    # -- criterion 4: three verbs, and no fourth path ---------------------------
+
+    def test_no_connection_a_model_reaches_may_execute_an_operator_verb(self):
+        reachable = sorted(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT r.rolname || ' ' || p.proname FROM pg_proc p"
+                " CROSS JOIN (VALUES ('rk2_runtime'),('rk2_state'),('rk2_proxy'),('rk2_human'))"
+                "   AS r(rolname)"
+                " WHERE p.pronamespace = 'public'::regnamespace"
+                "   AND p.proname IN ('answer_decision','supersede_decision','halt_program',"
+                "                     'clear_program_halt')"
+                "   AND has_function_privilege(r.rolname, p.oid, 'EXECUTE')"
+            ).rows
+        )
+
+        self.assertEqual(
+            [
+                "rk2_human answer_decision",
+                "rk2_human clear_program_halt",
+                "rk2_human halt_program",
+                "rk2_human supersede_decision",
+            ],
+            reachable,
+        )
+
+    def test_the_runtime_calling_one_is_refused_by_the_verb_and_not_by_a_trigger(self):
+        # Before this ticket `answer_decision` was EXECUTE-able and the write was
+        # refused two tables away by the actor-kind guard. A guard nobody reads
+        # is a guard nobody maintains.
+        for verb, refused in self.runtime_verbs.items():
+            with self.subTest(verb=verb):
+                self.assertIn("permission denied", refused)
+
+    def test_the_recovery_verb_stays_the_runtimes_own(self):
+        # `resume_program` files every row it writes under the runtime's name,
+        # so an operator calling it would sign the runtime's recovery as the
+        # runtime. The operator's half of resuming is clearing the Halt; this
+        # half runs at the next `rk run`, which is where it already ran.
+        holders = {
+            str(role): reached
+            for role, reached in self.connection.execute(
+                "SELECT r.rolname,"
+                "       has_function_privilege(r.rolname, 'resume_program(uuid)', 'EXECUTE')"
+                "  FROM (VALUES ('rk2_runtime'),('rk2_state'),('rk2_proxy'),('rk2_human'))"
+                "    AS r(rolname)"
+            ).rows
+        }
+
+        self.assertEqual(
+            {"rk2_runtime": True, "rk2_state": False, "rk2_proxy": False, "rk2_human": False},
+            holders,
+        )
+
+    # -- criterion 5: an answer is checked against the configuration now --------
+
+    def test_a_question_nothing_moved_under_revalidates_clean(self):
+        self.assertIsNone(self.stale_before)
+
+    def test_an_edited_scope_document_reclassifies_the_request(self):
+        # Not `now_forbidden`, which the same edit also produces: the digest
+        # carries the scope class, so the first thing that stops being true is
+        # that this is the request the operator was shown.
+        self.assertEqual("request_reclassified", str(self.stale_after))
+
+    def test_a_republication_leaves_the_parked_task_where_it_was(self):
+        self.assertEqual(("parked", True), (str(self.still_parked[0]), self.still_parked[1]))
+
+    def test_an_approval_of_a_reclassified_request_is_refused_with_the_next_move(self):
+        self.assertEqual("23514", self.stale_refusal.sqlstate)
+        self.assertIn("request_reclassified", str(self.stale_refusal))
+        self.assertIn("supersede it", self.stale_refusal.fields["H"])
+
+    def test_withdrawing_it_puts_the_task_back_with_no_grant_behind_it(self):
+        status, released, decision, no_grant = self.after_withdrawal
+
+        self.assertEqual("superseded", str(decision))
+        self.assertEqual("pending", str(status))
+        self.assertTrue(released)
+        self.assertTrue(no_grant)
+        self.assertTrue(self.withdrawn["task_returned_to_pending"])
+
+    def test_a_halted_program_refuses_the_approval_and_admits_the_denial(self):
+        # The Halt stops egress, not writing, so a denial is exactly what an
+        # operator should still be able to give: it ends the work rather than
+        # releasing it.
+        status, reason, released, no_grant = self.after_denial
+
+        self.assertEqual("program_halted", str(self.halted_state))
+        self.assertIn("program_halted", str(self.halted_refusal))
+        self.assertEqual("denied", self.denied["status"])
+        self.assertEqual(("abandoned", "decision_denied"), (str(status), str(reason)))
+        self.assertTrue(released)
+        self.assertTrue(no_grant)
+
+    def test_an_approval_that_still_validates_puts_the_task_back_and_grants(self):
+        status, released, decision, by, granted, _ = self.after_answer
+
+        self.assertEqual("approved", str(decision))
+        self.assertEqual("rk2_human", str(by))
+        self.assertEqual("pending", str(status))
+        self.assertTrue(released)
+        self.assertTrue(granted)
+
+    # -- criterion 6: the operator's words stay the operator's ------------------
+
+    def test_the_runtime_cannot_read_what_the_operator_wrote(self):
+        self.assertIn("permission denied", self.runtime_reading_the_answer)
+        self.assertIn("permission denied", self.runtime_reading_the_queue)
+
+    def test_the_runtime_still_reads_everything_else_about_the_question(self):
+        # The narrow claim, made because the wide one would be a runtime locked
+        # out of a table it has to sweep.
+        self.assertEqual("destructive_action", self.runtime_reading_the_question)
+
+    def test_the_answer_is_redacted_out_of_the_event_that_records_it(self):
+        self.assertEqual(OPERATOR_REASON, str(self.after_answer[5]))
+        self.assertNotIn(OPERATOR_REASON, self.answer_event)
+        self.assertIn("[redacted]", self.answer_event)
+
+    # -- and the standing check over all of it ---------------------------------
+
+    def test_the_control_surface_holds_over_everything_this_class_left(self):
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'control_surface'"
+        ).rows
+
         self.assertEqual((0, ""), (int(problems), str(detail)))
 
 
