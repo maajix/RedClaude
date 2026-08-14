@@ -1124,6 +1124,17 @@ CONTROLS = (
         "   AND to_status = 'testable'",
     ),
     Control(
+        # The way back out of `refuted`, taken away. One DELETE, no row anywhere
+        # is wrong afterwards, and every kept refutation becomes permanent: the
+        # retest row is still written and the transition that would act on it
+        # raises. Structural, because the state it produces looks exactly like a
+        # Surface that never moved -- which is the one thing this ticket exists
+        # to tell apart from a claim that is still true.
+        "standing:negative_knowledge",
+        "DELETE FROM transition_rules WHERE machine = 'hypothesis'"
+        "   AND from_status = 'refuted' AND to_status = 'testable'",
+    ),
+    Control(
         # A section registered without the three delta kinds derived from it.
         # Structural for the same reason: a projection section nothing compares
         # is a class of change that stops being detected silently, and every
@@ -12442,6 +12453,1015 @@ class SurfaceFingerprintTest(DatabaseCase):
         ).rows
         problems = self.connection.execute(
             "SELECT problem, subject FROM check_surface_fingerprint()"
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual([], list(problems))
+
+
+#: The Program the kept-refutation case opens. One Program and two
+#: Applications, because 022 handed this ticket a bug that only a second
+#: Application makes visible: a watch compared against "the Program's newest
+#: fingerprint" fires on a change to an Application it is not watching, and a
+#: Program with one Application cannot tell the two comparisons apart.
+NEGATIVE_SLUG = "selftest-negative"
+
+#: One small Application, as a shape. Two routes so that a change to one is an
+#: unrelated change to the other, and a parameter under each so the claim scope
+#: has something under it to reach.
+KEPT = {
+    "GET /notes": [("q", "query", "text"), ("page", "query", "number")],
+    "POST /notes": [("body", "body", "text")],
+}
+
+#: The refutations the case places, in the order it places them. Named once
+#: because two snapshots and every tally below are over the same five.
+CLAIMS = ("settled", "neighbour", "elsewhere", "nested", "imported")
+
+
+class NegativeKnowledgeTest(DatabaseCase):
+    """PH2-34: a refutation is kept, and made due when the Surface moves.
+
+    Everything the ticket asks for is a question about one join and the rows on
+    either side of it, so the fixture is built to make that join decidable four
+    ways at once: two Applications, two routes under one of them, and four
+    refutations placed so that each Surface change bears on exactly one. Two
+    more claims sit outside that join -- `imported`, which is what a refutation
+    without provenance looks like, and `twice` on a third Application, which is
+    one claim refuted, reopened and refuted again.
+
+    The whole sequence runs in `setUpClass` and the tests only read, because
+    the answers are about ORDER -- a claim reopened before cancellation reads
+    it, an import reopened before it could suppress anything -- and a test that
+    moved the world itself would be asserting against an order of its own.
+    Where a standing has to be read at a moment rather than at the end, that
+    moment is captured into a snapshot as the pass returns.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = write(SCOPED.replace('name = "matrix-web"', f'name = "{NEGATIVE_SLUG}"'))
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+
+        cls.kept = cls.application("kept", "http://kept.example.com")
+        cls.other = cls.application("other", "http://other.example.com")
+        cls.member = cls.identity("member")
+        cls.first_kept = cls.compute(cls.kept)
+        cls.first_other = cls.compute(cls.other)
+
+        # Five refutations, placed so that each change below bears on one.
+        # `settled` is the one under test; `neighbour` is the same Application
+        # and the same Property class one route away; `elsewhere` is the same
+        # claim on the other Application; `nested` is one step further down, on
+        # an input of the route `settled` is about; `imported` is what a status
+        # without provenance looks like.
+        cls.settled = cls.settle(
+            cls.kept, "GET /notes", "authorization.function_access", cls.member
+        )
+        cls.neighbour = cls.settle(
+            cls.kept, "POST /notes", "authorization.function_access"
+        )
+        cls.elsewhere = cls.settle(
+            cls.other, "GET /notes", "authorization.function_access"
+        )
+        # The containment path upwards, as a claim: this one is about an input,
+        # and what changes under it in phase 2 is the route the input sits on.
+        # The Property class is one `endpoint_changed` carries, because a class
+        # the mapping does not carry would answer with the mapping instead of
+        # with the scope.
+        cls.nested = cls.settle(
+            cls.kept, "GET /notes#query:q", "authorization.object_ownership"
+        )
+        cls.imported = cls.import_refutation()
+
+        # 007's watch, on the Application that is about to stay still. Written
+        # by hand because nothing in the corpus writes one: 023 read them and
+        # 022 found the read was against the wrong Application.
+        cls.watch = str(
+            cls.scalar(
+                "INSERT INTO hypothesis_retest_triggers (hypothesis_id, kind,"
+                " watched_entity_id, fingerprint)"
+                " VALUES ($1::uuid, 'new_deploy', $2::uuid, $3) RETURNING id::text",
+                (cls.elsewhere, cls.route(cls.other, "GET /notes"),
+                 cls.first_other["fingerprint"]),
+            )
+        )
+
+        # Phase 1: a change of a kind no claim here is about. The server moved,
+        # which puts `information_disclosure.error_detail` and four others back
+        # in question and none of the four refutations.
+        cls.as_owner(
+            "UPDATE technologies SET version = '1.27.0' WHERE entity_id = $1::uuid",
+            (cls.technology(cls.kept),),
+        )
+        cls.second_kept = cls.compute(cls.kept)
+        cls.suppressed = cls.task(cls.settled)
+        cls.import_task = cls.task(cls.imported)
+        # The import's reason as it stood before any pass ran, which is the
+        # moment criterion 6 is about: whatever else is true of a claim nothing
+        # settles, it is not being held down by this ticket's rule.
+        cls.import_reason_first = cls.cancel_reason(cls.import_task)
+        cls.pass_one = cls.rank()
+        cls.after_one = cls.standings()
+
+        # Phase 2: the route this claim is about stops requiring authentication.
+        cls.as_owner(
+            "UPDATE endpoints SET auth_required = false WHERE entity_id = $1::uuid",
+            (cls.route(cls.kept, "GET /notes"),),
+        )
+        cls.third_kept = cls.compute(cls.kept)
+        cls.eligible = cls.task(cls.settled)
+        cls.pass_two = cls.rank()
+        cls.after_two = cls.standings()
+        # Two changes to `kept` have gone past by now and the watch is on
+        # `other`. What it has done so far is the whole of 022's question, and
+        # it has to be read here rather than at the end, because phase 4 is
+        # about the same row doing the opposite.
+        cls.watch_after_two = cls.fired()
+        cls.retests_two = {
+            name: cls.retests(getattr(cls, name))
+            for name in CLAIMS
+        }
+
+        # Phase 3: recompute an unchanged Surface, then run the pass twice
+        # more. Criterion 5 is that none of the three writes anything.
+        cls.repeat_kept = cls.compute(cls.kept)
+        cls.pass_three = cls.rank()
+        cls.pass_four = cls.rank()
+        cls.after_four = cls.standings()
+
+        # Phase 4: the watched Application finally moves, and by a kind that
+        # maps to no class this claim is about -- so if `elsewhere` reopens, the
+        # watch is what reopened it and not the delta rule.
+        cls.as_owner(
+            "UPDATE technologies SET version = '3.1.0' WHERE entity_id = $1::uuid",
+            (cls.technology(cls.other),),
+        )
+        cls.second_other = cls.compute(cls.other)
+        cls.pass_five = cls.rank()
+        cls.after_five = cls.standings()
+        cls.watch_after_five = cls.fired()
+
+        # Phase 5: the runtime restarts. From the database's side that is a new
+        # session -- nothing carried over, no plan cached, `rk2.program_id`
+        # resolved again -- so the pass runs on a connection of its own, and
+        # everything written up to here is read on both sides of it.
+        cls.before_restart = (cls.ledger(), cls.written())
+        cls.pass_six = cls.restarted()
+        cls.after_restart = (cls.ledger(), cls.written())
+        cls.after_six = cls.standings()
+
+        # Phase 6: a claim refuted, reopened and refuted again. On an
+        # Application of its own, because everything above is asserted live as
+        # well as by snapshot and a third Application is the only change that
+        # bears on nothing already written. Two records for one claim is the
+        # shape `(hypothesis_id, transition_id)` was keyed for, and the older
+        # one's retest row goes on pointing at a claim that is `refuted` today
+        # -- which the standing check must not read as a claim nothing reopened.
+        cls.third = cls.application("third", "http://third.example.com")
+        cls.first_third = cls.compute(cls.third)
+        cls.twice = cls.settle(cls.third, "GET /notes", "authorization.function_access")
+        cls.as_owner(
+            "UPDATE endpoints SET auth_required = false WHERE entity_id = $1::uuid",
+            (cls.route(cls.third, "GET /notes"),),
+        )
+        cls.second_third = cls.compute(cls.third)
+        cls.pass_seven = cls.rank()
+        cls.refute_again(cls.twice)
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (NEGATIVE_SLUG,)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()):
+        """One statement as the role that owns the rows, committed.
+
+        With the Program resolved on the same connection, because half of what
+        this fixture calls -- `compute_surface_fingerprint`, `rank_pass` --
+        refuses to run without one.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            return cls.connection.execute(sql, parameters)
+
+    @classmethod
+    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
+        return cls.as_owner(sql, parameters).scalar()
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str, host: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT add_entity($1::uuid, $2, '', 'host', $3, NULL, $4,"
+                " 'observed')::text",
+                (cls.program_id, kind, host, dedup),
+            )
+        )
+
+    @classmethod
+    def application(cls, prefix: str, base_url: str) -> str:
+        """One Application with `KEPT`'s routes and parameters under it."""
+        host = base_url.split("//", 1)[1]
+        application = cls.entity("application", base_url, host)
+        cls.as_owner(
+            "INSERT INTO applications (entity_id, base_url, kind)"
+            " VALUES ($1::uuid, $2, 'web')",
+            (application, base_url),
+        )
+        for key, fields in KEPT.items():
+            method, template = key.split(" ", 1)
+            endpoint = cls.entity("endpoint", f"{base_url}{key}", host)
+            cls.as_owner(
+                "INSERT INTO endpoints (entity_id, application_id, method,"
+                " path_template, auth_required) VALUES ($1::uuid, $2::uuid, $3, $4, true)",
+                (endpoint, application, method, template),
+            )
+            for name, location, value_class in fields:
+                parameter = cls.entity(
+                    "parameter", f"{base_url}{key}#{location}:{name}", host
+                )
+                cls.as_owner(
+                    "INSERT INTO parameters (entity_id, endpoint_id, name, location,"
+                    " value_class, reflected)"
+                    " VALUES ($1::uuid, $2::uuid, $3, $4, $5, false)",
+                    (parameter, endpoint, name, location, value_class),
+                )
+        technology = cls.entity("technology", f"{base_url}#nginx", host)
+        cls.as_owner(
+            "INSERT INTO technologies (entity_id, name, version)"
+            " VALUES ($1::uuid, 'nginx', '1.24.0')",
+            (technology,),
+        )
+        cls.as_owner(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
+            (cls.program_id, application, technology),
+        )
+        return application
+
+    @classmethod
+    def identity(cls, slot: str) -> str:
+        who = cls.entity("identity", f"identity:{slot}", "kept.example.com")
+        cls.as_owner(
+            "INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
+            " VALUES ($1::uuid, $2, 'user', $3)",
+            (who, slot, f"slot://identity/{slot}"),
+        )
+        return who
+
+    @classmethod
+    def compute(cls, application: str) -> dict:
+        return proxy.as_object(
+            cls.scalar("SELECT compute_surface_fingerprint($1::uuid)", (application,))
+        )
+
+    @classmethod
+    def route(cls, application: str, key: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT entity_id::text FROM rk2_surface_reach($1::uuid) WHERE key = $2",
+                (application, key),
+            )
+        )
+
+    @classmethod
+    def technology(cls, application: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT t.entity_id::text FROM technologies t"
+                "  JOIN relationships r ON r.dst_entity_id = t.entity_id"
+                " WHERE r.src_entity_id = $1::uuid AND r.type = 'runs'",
+                (application,),
+            )
+        )
+
+    @classmethod
+    def receipt(cls) -> str:
+        """One receipt of the Program's own traffic, on the replay lane.
+
+        Replay because 040 fences the agent one behind a live capability, and
+        what is under test here is what a refutation cites rather than how the
+        exchange that produced it was authorised.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
+                " scope_class, scope_version)"
+                " VALUES ($1::uuid, 'replay', 'allowed', 'seeded', now(), 'target',"
+                "         (SELECT max(version) FROM program_scope_versions"
+                "           WHERE program_id = $1::uuid)) RETURNING id::text",
+                (cls.program_id,),
+            )
+        )
+
+    @classmethod
+    def settle(
+        cls, application: str, key: str, property_class: str, who: str | None = None
+    ) -> str:
+        """One Hypothesis carried all the way to `refuted` the long way round.
+
+        Every step is the corpus's own: the claim starts `proposed`, reaches
+        `testing` on a receipt, and reaches `refuted` on a receipt that a run of
+        its own Test produced -- which is what 007 means by a settled
+        refutation, and exactly what `record_negative_knowledge` reads back.
+        """
+        subject = cls.route(application, key)
+        hypothesis = str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement, status, identity_a_entity_id)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4, 'proposed', $5::uuid)"
+                " RETURNING id::text",
+                (cls.program_id, subject, property_class,
+                 f"{key} refuses the caller it should refuse", who),
+            )
+        )
+        receipt = cls.receipt()
+        for role, polarity in (("baseline", "refutes"), ("variant", "refutes")):
+            observation = cls.scalar(
+                "INSERT INTO observations (program_id, subject_entity_id, kind, summary,"
+                " provenance_kind, receipt_id)"
+                " VALUES ($1::uuid, $2::uuid, 'response_differential', $3, 'receipt',"
+                " $4::uuid) RETURNING id::text",
+                (cls.program_id, subject, f"the {role} response", receipt),
+            )
+            cls.as_owner(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id,"
+                " polarity, role) VALUES ($1::uuid, $2::uuid, $3, $4)",
+                (hypothesis, observation, polarity, role),
+            )
+        test = cls.scalar(
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+            " VALUES ($1::uuid, $2::uuid, '{}'::jsonb,"
+            "         encode(sha256('{}'::bytea), 'hex')) RETURNING id::text",
+            (cls.program_id, hypothesis),
+        )
+        run = cls.scalar(
+            "INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
+            " VALUES ($1::uuid, $2::uuid, 'replay', 'fails', '[{\"held\": false}]'::jsonb)"
+            " RETURNING id::text",
+            (cls.program_id, test),
+        )
+        cls.as_owner(
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 1)",
+            (cls.program_id, run, receipt),
+        )
+        for was, now, cited in (
+            ("proposed", "testable", None),
+            ("testable", "testing", receipt),
+            ("testing", "refuted", receipt),
+        ):
+            cls.as_owner(
+                "INSERT INTO hypothesis_transitions (program_id, hypothesis_id,"
+                " from_status, to_status, actor_kind, receipt_id, rationale)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4, 'runtime', $5::uuid, $6)",
+                (cls.program_id, hypothesis, was, now, cited,
+                 "the route refused the caller" if now == "refuted" else "seeded"),
+            )
+        return hypothesis
+
+    @classmethod
+    def refute_again(cls, hypothesis: str) -> None:
+        """Carry a reopened claim back to `refuted`, on the run that settled it.
+
+        The same Receipt, because it is the same Test and the same run that
+        produced it. What this arranges is a second RECORD of one claim, which
+        is what a second settling transition means under the record's key.
+        """
+        receipt = cls.scalar(
+            "SELECT receipt_id::text FROM hypothesis_transitions"
+            " WHERE hypothesis_id = $1::uuid AND to_status = 'refuted'"
+            " ORDER BY at, id LIMIT 1",
+            (hypothesis,),
+        )
+        for was, now in (("testable", "testing"), ("testing", "refuted")):
+            cls.as_owner(
+                "INSERT INTO hypothesis_transitions (program_id, hypothesis_id,"
+                " from_status, to_status, actor_kind, receipt_id, rationale)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4, 'runtime', $5::uuid, $6)",
+                (cls.program_id, hypothesis, was, now, receipt,
+                 "the route refused the caller again"),
+            )
+
+    @classmethod
+    def import_refutation(cls) -> str:
+        """A refutation that arrived as a status and nothing else.
+
+        Which is what every refutation in the corpus was before this ticket,
+        and what a claim inserted straight into `refuted` still is: no
+        transition, no receipt, no run, nothing to point at.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement, status)"
+                " VALUES ($1::uuid, $2::uuid, 'injection.markup',"
+                " 'the search term does not come back in the page', 'refuted')"
+                " RETURNING id::text",
+                (cls.program_id, cls.route(cls.kept, "GET /notes#query:q")),
+            )
+        )
+
+    @classmethod
+    def task(cls, hypothesis: str) -> str:
+        """One pending hunt Task asking this claim's question again.
+
+        No subject on purpose: `cancel_reason_for` checks a subject's scope
+        before it reaches anything this ticket wrote, and a Task refused for
+        being out of scope would answer a different question.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO tasks (program_id, kind, status, hypothesis_id)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid) RETURNING id::text",
+                (cls.program_id, hypothesis),
+            )
+        )
+
+    @classmethod
+    def cancel_reason(cls, task: str) -> str | None:
+        answer = cls.scalar(
+            "SELECT cancel_reason_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.id = $1::uuid",
+            (task,),
+        )
+        return None if answer is None else str(answer)
+
+    @classmethod
+    def rank(cls) -> dict:
+        return proxy.as_object(cls.scalar("SELECT rank_pass('selftest')"))
+
+    @classmethod
+    def restarted(cls) -> dict:
+        """One pass on a connection this case has never used before."""
+        connection = pg.connect(cls.harness.migrate)
+        try:
+            with connection.transaction():
+                connection.execute("SET LOCAL ROLE rk2_owner")
+                connection.execute("SELECT set_actor('runtime', 'selftest')")
+                connection.execute(
+                    "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+                )
+                return proxy.as_object(
+                    connection.execute("SELECT rank_pass('selftest')").scalar()
+                )
+        finally:
+            connection.close()
+
+    @classmethod
+    def ledger(cls) -> list:
+        """Every move this Program's claims have made, as the rows saying so."""
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+            for row in cls.as_owner(
+                "SELECT hy.label, t.from_status, t.to_status, t.rationale"
+                "  FROM hypothesis_transitions t"
+                "  JOIN hypotheses hy ON hy.id = t.hypothesis_id"
+                " WHERE t.program_id = $1::uuid ORDER BY t.at, t.id",
+                (cls.program_id,),
+            ).rows
+        ]
+
+    @classmethod
+    def written(cls) -> tuple:
+        """How much this ticket's tables hold, scoped to this Program."""
+        [row] = cls.as_owner(
+            "SELECT (SELECT count(*) FROM negative_knowledge"
+            "         WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM negative_knowledge_retests"
+            "         WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM events"
+            "         WHERE program_id = $1::uuid AND type = 'hypothesis.retest_due')",
+            (cls.program_id,),
+        ).rows
+        return tuple(int(value) for value in row)
+
+    @classmethod
+    def retests(cls, hypothesis: str) -> list:
+        """Why this claim's CURRENT refutation stopped being current, so far."""
+        return cls.retests_of(
+            str(cls.scalar("SELECT rk2_current_negative($1::uuid)", (hypothesis,)))
+        )
+
+    @classmethod
+    def retests_of(cls, negative: str) -> list:
+        """The same, for one record by name, current or superseded.
+
+        The delta is spelled out rather than named, because the identifier says
+        nothing and `endpoint_changed on GET /notes` is the whole assertion.
+        """
+        return [
+            (str(row[0]), None if row[1] is None else str(row[1]),
+             None if row[2] is None else str(row[2]), bool(row[3]))
+            for row in cls.as_owner(
+                "SELECT rt.reason, d.kind, d.subject_key, rt.transition_id IS NOT NULL"
+                "  FROM negative_knowledge_retests rt"
+                "  LEFT JOIN surface_deltas d ON d.id = rt.delta_id"
+                " WHERE rt.negative_id = $1::uuid"
+                " ORDER BY rt.became_due_at, rt.id",
+                (negative,),
+            ).rows
+        ]
+
+    @classmethod
+    def fired(cls) -> str | None:
+        """What 007's watch has recorded, as the fingerprint it last saw."""
+        [row] = cls.as_owner(
+            "SELECT fired_at IS NOT NULL, fingerprint FROM hypothesis_retest_triggers"
+            " WHERE id = $1::uuid",
+            (cls.watch,),
+        ).rows
+        return str(row[1]) if row[0] else None
+
+    @classmethod
+    def standings(cls) -> dict:
+        """What every kept refutation is doing, at one moment.
+
+        Read as a snapshot rather than per test, because three of the six
+        criteria are about a standing at a particular point in the sequence and
+        the sequence runs once.
+        """
+        return {
+            name: str(
+                cls.scalar(
+                    "SELECT rk2_negative_standing(rk2_current_negative($1::uuid))",
+                    (getattr(cls, name),),
+                )
+            )
+            for name in CLAIMS
+        }
+
+    # -- what the fixture is asked ------------------------------------------
+
+    def record(self, hypothesis: str) -> dict:
+        return proxy.as_object(
+            self.owned(
+                "SELECT to_jsonb(n) FROM negative_knowledge n"
+                " WHERE n.id = rk2_current_negative($1::uuid)",
+                (hypothesis,),
+            )
+        )
+
+    def status(self, hypothesis: str) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT status FROM hypotheses WHERE id = $1::uuid", (hypothesis,)
+            ).scalar()
+        )
+
+    def fingerprint(self, record: dict) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT fingerprint FROM surface_fingerprints WHERE id = $1::uuid",
+                (record["fingerprint_id"],),
+            ).scalar()
+        )
+
+    # -- criterion 1: the conditions are kept ---------------------------------
+
+    def test_a_refutation_is_kept_with_the_conditions_it_was_settled_under(self):
+        kept = self.record(self.settled)
+
+        self.assertEqual("settled", kept["basis"])
+        self.assertEqual(self.route(self.kept, "GET /notes"), kept["subject_entity_id"])
+        self.assertEqual("authorization.function_access", kept["property_class"])
+        self.assertEqual(self.member, kept["identity_a_entity_id"])
+        self.assertEqual(self.kept, kept["application_entity_id"])
+        self.assertEqual("the route refused the caller", kept["reason"])
+
+    def test_the_surface_it_was_settled_against_is_the_one_that_stood(self):
+        # The fingerprint recorded is the Application's newest AT SETTLING, and
+        # two more have been computed since. Naming the row rather than the
+        # value, because the value is what a later identical Surface would
+        # compare equal to and the row is what "before this one" is decided by.
+        [held] = self.connection.execute(
+            "SELECT sf.fingerprint FROM negative_knowledge n"
+            "  JOIN surface_fingerprints sf ON sf.id = n.fingerprint_id"
+            " WHERE n.id = rk2_current_negative($1::uuid)",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual(self.first_kept["fingerprint"], str(held[0]))
+
+    def test_the_test_that_settled_it_is_the_claims_own(self):
+        [named] = self.connection.execute(
+            "SELECT te.hypothesis_id = n.hypothesis_id, tr.outcome, n.outcome,"
+            "       n.spec_sha256 = te.spec_sha256, n.receipt_id IS NOT NULL"
+            "  FROM negative_knowledge n"
+            "  JOIN tests te     ON te.id = n.test_id"
+            "  JOIN test_runs tr ON tr.id = n.test_run_id"
+            " WHERE n.id = rk2_current_negative($1::uuid)",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual([True, "fails", "fails", True, True], list(named))
+
+    def test_the_evidence_is_kept_as_it_stood_at_settling(self):
+        edges = self.connection.execute(
+            "SELECT ev.polarity, ev.role FROM negative_knowledge_evidence ev"
+            " WHERE ev.negative_id = rk2_current_negative($1::uuid)"
+            " ORDER BY ev.role",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual([("refutes", "baseline"), ("refutes", "variant")],
+                         [(str(row[0]), str(row[1])) for row in edges])
+
+    def test_a_kept_refutation_cannot_be_rewritten_afterwards(self):
+        # 013's rule, and the reason the conditions are copied rather than
+        # joined: a record that could be edited would be a record of whatever
+        # the last writer thought, not of what was true when the claim failed.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.owner(
+                "UPDATE negative_knowledge SET basis = 'settled'"
+                " WHERE hypothesis_id = $1::uuid",
+                (self.imported,),
+            )
+
+        self.assertIn("purg", str(refused.exception).lower())
+
+    def test_a_refutation_that_left_no_transition_is_kept_as_unverified(self):
+        kept = self.record(self.imported)
+
+        self.assertEqual("unverified", kept["basis"])
+        self.assertIsNone(kept["transition_id"])
+        self.assertIsNone(kept["test_run_id"])
+        self.assertEqual("refuted with no transition to read", kept["reason"])
+
+    # -- criterion 2: an unchanged Surface suppresses the same question -------
+
+    def test_an_unchanged_surface_suppresses_the_task_that_asks_again(self):
+        [row] = self.connection.execute(
+            "SELECT status, abandoned_reason FROM tasks WHERE id = $1::uuid",
+            (self.suppressed,),
+        ).rows
+
+        self.assertEqual("abandoned", str(row[0]))
+        self.assertEqual("settled_negative", str(row[1]))
+
+    def test_the_suppression_is_its_own_reason_and_not_answered(self):
+        # `answered` is the runtime saying the question was settled; this one is
+        # the runtime saying a record is holding it down and could stop.
+        [allowed] = self.connection.execute(
+            "SELECT count(*) FROM pg_constraint"
+            " WHERE conrelid = 'tasks'::regclass AND conname = 'tasks_abandoned_reason_check'"
+            "   AND pg_get_constraintdef(oid) LIKE '%settled\\_negative%'"
+        ).rows
+
+        self.assertEqual(1, int(allowed[0]))
+
+    def test_the_bounded_read_carries_the_refutation_and_not_the_fingerprint(self):
+        # 020's rule survives: a hunter is told a claim was refuted, when and
+        # why, and nothing about the Surface the runtime watches for change.
+        told = proxy.as_object(
+            self.owned("SELECT rk2_hypothesis_negative($1::uuid)", (self.settled,))
+        )
+
+        self.assertEqual({"standing", "settled_at", "reason"}, set(told))
+        self.assertEqual("the route refused the caller", told["reason"])
+
+    def test_the_record_a_hunter_reads_names_its_negative_knowledge(self):
+        record = proxy.as_object(
+            self.owned(
+                "SELECT record FROM v_records WHERE kind = 'hypothesis'"
+                "   AND label = (SELECT label FROM hypotheses WHERE id = $1::uuid)",
+                (self.settled,),
+            )
+        )
+
+        self.assertEqual("due", record["negative_knowledge"]["standing"])
+
+    def test_the_operator_view_names_the_conditions_in_labels(self):
+        [seen] = self.connection.execute(
+            "SELECT v.basis, v.application, v.surface_fingerprint, v.test_outcome,"
+            "       jsonb_array_length(v.evidence)"
+            "  FROM v_negative_knowledge v"
+            "  JOIN hypotheses hy ON hy.label = v.hypothesis"
+            " WHERE hy.id = $1::uuid",
+            (self.neighbour,),
+        ).rows
+
+        self.assertEqual("settled", str(seen[0]))
+        self.assertIsNotNone(seen[1])
+        self.assertEqual(self.first_kept["fingerprint"], str(seen[2]))
+        self.assertEqual("fails", str(seen[3]))
+        self.assertEqual(2, int(seen[4]))
+
+    # -- criterion 3: an unrelated change leaves it current -------------------
+
+    def test_a_change_of_a_class_the_claim_is_not_about_leaves_it_current(self):
+        # Phase 1 moved the server, which puts five Property classes back in
+        # question and not this one. The only thing the pass reopened was the
+        # import, which nothing had settled in the first place.
+        self.assertEqual({"unverified": 1}, self.pass_one["retests"]["by_reason"])
+        self.assertEqual("settled", self.after_one["settled"])
+
+    def test_a_change_to_another_route_leaves_the_neighbouring_claim_current(self):
+        # Phase 2 changed `GET /notes` and `neighbour` is about `POST /notes`.
+        # Same Application, same Property class, same kind of delta: what keeps
+        # it settled is the subject and nothing else.
+        self.assertEqual("settled", self.after_two["neighbour"])
+        self.assertEqual([], self.retests_two["neighbour"])
+        self.assertEqual([], self.retests(self.neighbour))
+
+    def test_a_change_to_another_application_leaves_the_refutation_current(self):
+        self.assertEqual("settled", self.after_two["elsewhere"])
+        self.assertEqual([], self.retests_two["elsewhere"])
+
+    # -- criterion 4: a relevant delta makes it due ---------------------------
+
+    def test_a_relevant_delta_makes_the_refutation_due_and_names_it(self):
+        self.assertEqual("due", self.after_two["settled"])
+        self.assertEqual(
+            [("surface_delta", "endpoint_changed", "GET /notes", True)],
+            self.retests_two["settled"],
+        )
+
+    def test_a_change_above_the_claims_subject_reaches_it_too(self):
+        # The claim is about an input; what moved is the route the input sits
+        # on. `rk2_surface_reach` only walks down, so the scope this ticket
+        # asks it for carries an arm walking up as well -- without which every
+        # claim about a parameter survives its own route changing under it,
+        # which is the containment the ticket's criterion 4 names.
+        self.assertEqual(
+            self.route(self.kept, "GET /notes#query:q"),
+            self.record(self.nested)["subject_entity_id"],
+        )
+        self.assertEqual("due", self.after_two["nested"])
+        self.assertEqual(
+            [("surface_delta", "endpoint_changed", "GET /notes", True)],
+            self.retests_two["nested"],
+        )
+
+    def test_the_claim_re_enters_through_a_transition_and_the_history_stands(self):
+        moves = self.connection.execute(
+            "SELECT from_status, to_status, rationale FROM hypothesis_transitions"
+            " WHERE hypothesis_id = $1::uuid ORDER BY at, id",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual(
+            [("proposed", "testable"), ("testable", "testing"),
+             ("testing", "refuted"), ("refuted", "testable")],
+            [(str(row[0]), str(row[1])) for row in moves],
+        )
+        self.assertEqual("the route refused the caller", str(moves[2][2]))
+        self.assertEqual("retest due: endpoint_changed on GET /notes", str(moves[3][2]))
+
+    def test_the_conditions_it_was_settled_under_are_not_rewritten_by_the_retest(self):
+        # The record still says what the Surface was when the claim failed. A
+        # retest that moved the fingerprint forward would make the claim due
+        # against a Surface it was never settled against.
+        kept = self.record(self.settled)
+
+        self.assertEqual("settled", kept["basis"])
+        self.assertEqual(self.first_kept["fingerprint"], self.fingerprint(kept))
+
+    def test_the_reopened_claim_is_no_longer_suppressed(self):
+        [row] = self.connection.execute(
+            "SELECT status, abandoned_reason FROM tasks WHERE id = $1::uuid",
+            (self.eligible,),
+        ).rows
+
+        self.assertEqual("testable", self.status(self.settled))
+        self.assertEqual("pending", str(row[0]))
+        self.assertIsNone(row[1])
+        self.assertIsNone(self.cancel_reason(self.eligible))
+
+    def test_the_log_says_the_question_was_reopened_and_why(self):
+        # A row event on the retest row, which is 026's shape: the table exists,
+        # so a trigger writes the Event and no call site can forget to. What the
+        # payload carries is the row, and the row names the delta and the
+        # transition rather than restating either.
+        [said] = self.connection.execute(
+            "SELECT e.subject_table, e.payload -> 'after' ->> 'reason', d.kind,"
+            "       d.subject_key,"
+            "       (e.payload -> 'after' ->> 'transition_id')::uuid = rt.transition_id"
+            "  FROM events e"
+            "  JOIN negative_knowledge_retests rt ON rt.id = e.subject_id"
+            "  LEFT JOIN surface_deltas d ON d.id = rt.delta_id"
+            " WHERE e.type = 'hypothesis.retest_due'"
+            "   AND rt.negative_id = rk2_current_negative($1::uuid)",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual("negative_knowledge_retests", str(said[0]))
+        self.assertEqual("surface_delta", str(said[1]))
+        self.assertEqual("endpoint_changed", str(said[2]))
+        self.assertEqual("GET /notes", str(said[3]))
+        self.assertTrue(said[4])
+
+    # -- criterion 5: recomputing and re-running change nothing ---------------
+
+    def test_two_more_passes_over_a_recomputed_surface_write_nothing(self):
+        self.assertEqual(0, self.pass_three["retests"]["due"])
+        self.assertEqual(0, self.pass_three["retests"]["reopened"])
+        self.assertEqual(0, self.pass_four["retests"]["due"])
+        self.assertEqual(self.after_two, self.after_four)
+
+    def test_one_record_stops_being_current_once_however_often_it_is_asked(self):
+        [rows] = self.connection.execute(
+            "SELECT count(*) FROM negative_knowledge_retests"
+            " WHERE negative_id = rk2_current_negative($1::uuid)",
+            (self.settled,),
+        ).rows
+        [events] = self.connection.execute(
+            "SELECT count(*) FROM events e"
+            "  JOIN negative_knowledge_retests rt ON rt.id = e.subject_id"
+            " WHERE e.type = 'hypothesis.retest_due'"
+            "   AND rt.negative_id = rk2_current_negative($1::uuid)",
+            (self.settled,),
+        ).rows
+
+        self.assertEqual(1, int(rows[0]))
+        self.assertEqual(1, int(events[0]))
+
+    def test_a_record_can_only_stop_being_current_once_by_the_key(self):
+        # The rule as a constraint rather than as two `NOT EXISTS` guards: a
+        # second reason for the same record is refused by the database, so a
+        # writer that forgot the guard fails loudly instead of giving the view's
+        # `retest` subquery two rows to return.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.owner(
+                "INSERT INTO negative_knowledge_retests"
+                " (program_id, negative_id, reason, delta_id, transition_id)"
+                " SELECT n.program_id, n.id, 'watch', NULL, NULL"
+                "   FROM negative_knowledge n WHERE n.id = rk2_current_negative($1::uuid)",
+                (self.settled,),
+            )
+
+        self.assertIn("negative_knowledge_retests_negative_id_key",
+                      str(refused.exception))
+
+    def test_a_restart_re_runs_the_pass_and_writes_nothing(self):
+        # Criterion 5's other half. The recomputations above run on the
+        # connection that did the writing; this one runs on a session that has
+        # never seen this Program, which is what the runtime coming back looks
+        # like from here.
+        self.assertEqual(0, self.pass_six["retests"]["due"])
+        self.assertEqual(0, self.pass_six["retests"]["reopened"])
+        self.assertEqual({}, self.pass_six["retests"]["by_reason"])
+        self.assertEqual(self.before_restart, self.after_restart)
+        self.assertEqual(self.after_five, self.after_six)
+
+    def test_a_claim_refuted_twice_keeps_both_records_and_stands_on_the_newer(self):
+        # Idempotence is per settling, not per claim. Two settlings are two sets
+        # of conditions, the older one is `superseded` rather than deleted, and
+        # its retest row is still the row that says why the claim was asked
+        # again -- which is the state the standing check reads, so it is
+        # asserted here and not only at the end.
+        records = self.as_owner(
+            "SELECT rk2_negative_standing(n.id), n.basis"
+            "  FROM negative_knowledge n WHERE n.hypothesis_id = $1::uuid"
+            " ORDER BY n.settled_at, n.id",
+            (self.twice,),
+        ).rows
+        older = str(
+            self.scalar(
+                "SELECT id::text FROM negative_knowledge WHERE hypothesis_id = $1::uuid"
+                " ORDER BY settled_at, id LIMIT 1",
+                (self.twice,),
+            )
+        )
+        problems = self.connection.execute(
+            "SELECT problem, subject, detail FROM check_negative_knowledge()"
+        ).rows
+
+        self.assertEqual(
+            [("superseded", "settled"), ("settled", "settled")],
+            [(str(row[0]), str(row[1])) for row in records],
+        )
+        self.assertEqual("refuted", self.status(self.twice))
+        self.assertEqual(
+            [("surface_delta", "endpoint_changed", "GET /notes", True)],
+            self.retests_of(older),
+        )
+        self.assertEqual([], list(problems))
+
+    def test_recording_the_same_settling_twice_returns_the_record_it_made(self):
+        again = str(
+            self.owned(
+                "SELECT record_negative_knowledge($1::uuid)::text", (self.neighbour,)
+            )
+        )
+        [rows] = self.connection.execute(
+            "SELECT count(*) FROM negative_knowledge WHERE hypothesis_id = $1::uuid",
+            (self.neighbour,),
+        ).rows
+
+        self.assertEqual(self.record(self.neighbour)["id"], again)
+        self.assertEqual(1, int(rows[0]))
+
+    # -- criterion 6: an import is not a settled refutation -------------------
+
+    def test_an_import_is_not_suppression_before_any_pass_has_run(self):
+        # `answered`, not `settled_negative`, and the exact word is the point:
+        # 023 abandons a Task whose claim is already `supported` or `refuted`,
+        # and that rule reads the status alone. So an import is still holding a
+        # question down here -- for 023's reason, which predates this ticket --
+        # and what criterion 6 can be met by is only that it is not held down as
+        # a SETTLED refutation. Which is why the reopen in step (1) has to run
+        # before step (2), rather than the record being enough on its own.
+        self.assertEqual("answered", self.import_reason_first)
+
+    def test_the_first_pass_reopens_what_nothing_on_file_settles(self):
+        self.assertEqual("due", self.after_one["imported"])
+        self.assertEqual("testable", self.status(self.imported))
+        self.assertEqual([("unverified", None, None, True)],
+                         self.retests_two["imported"])
+
+    def test_an_unverified_record_names_no_settling_test(self):
+        [rows] = self.connection.execute(
+            "SELECT count(*) FROM negative_knowledge"
+            " WHERE basis = 'unverified' AND (test_run_id IS NOT NULL OR test_id IS NOT NULL)"
+        ).rows
+
+        self.assertEqual(0, int(rows[0]))
+
+    # -- 022's hand-off: the watch reads its own Application ------------------
+
+    def test_a_watch_does_not_fire_on_another_applications_change(self):
+        # Two passes over two changes to `kept`, and the watch is on `other`.
+        # The comparison 023 wrote was against the Program's newest fingerprint,
+        # which by now is one of `kept`'s and has never been what this watch
+        # recorded.
+        self.assertEqual("settled", self.after_two["elsewhere"])
+        self.assertIsNone(self.watch_after_two)
+
+    def test_a_watch_fires_when_the_application_it_watches_changes(self):
+        self.assertEqual(self.second_other["fingerprint"], self.watch_after_five)
+        self.assertEqual("due", self.after_five["elsewhere"])
+        self.assertEqual("testable", self.status(self.elsewhere))
+        self.assertEqual([("watch", None, None, True)],
+                         self.retests(self.elsewhere))
+
+    def test_the_pass_reports_what_it_reopened(self):
+        self.assertEqual({"watch": 1}, self.pass_five["retests"]["by_reason"])
+        self.assertEqual(1, self.pass_five["retests"]["due"])
+        self.assertEqual(1, self.pass_five["retests"]["watches_fired"])
+        self.assertEqual(1, self.pass_five["retests_fired"])
+
+    # -- the invariant --------------------------------------------------------
+
+    def test_every_cascade_this_file_declares_is_one(self):
+        # 016's rule (e) reads one way only: it refuses a cascade nothing
+        # declared, and says nothing about a declaration whose key does not
+        # cascade. Both halves are needed and neither implies the other -- the
+        # row in `purge_cascade_edges` is what makes the delete action legal,
+        # the delete action is what makes the purge reach the child. The two
+        # repaired keys are here because they had the row's other half missing
+        # for six migrations and nothing noticed.
+        declared = self.connection.execute(
+            "SELECT src.relname, a.attname,"
+            "       CASE con.confdeltype WHEN 'c' THEN 'cascade' ELSE 'kept' END"
+            "  FROM pg_constraint con"
+            "  JOIN pg_class src ON src.oid = con.conrelid"
+            "  JOIN pg_attribute a ON a.attrelid = con.conrelid"
+            "                     AND a.attnum = con.conkey[1]"
+            " WHERE con.contype = 'f' AND src.relnamespace = 'public'::regnamespace"
+            "   AND (src.relname::text, a.attname::text) IN"
+            "       (('hypothesis_retest_triggers', 'watched_entity_id'),"
+            "        ('test_run_receipts', 'receipt_id'),"
+            "        ('negative_knowledge_evidence', 'negative_id'),"
+            "        ('negative_knowledge_retests', 'negative_id'))"
+            " ORDER BY 1, 2"
+        ).rows
+
+        self.assertEqual(
+            [("hypothesis_retest_triggers", "watched_entity_id", "cascade"),
+             ("negative_knowledge_evidence", "negative_id", "cascade"),
+             ("negative_knowledge_retests", "negative_id", "cascade"),
+             ("test_run_receipts", "receipt_id", "cascade")],
+            [(str(row[0]), str(row[1]), str(row[2])) for row in declared],
+        )
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'negative_knowledge'"
+        ).rows
+        problems = self.connection.execute(
+            "SELECT problem, subject, detail FROM check_negative_knowledge()"
         ).rows
 
         self.assertEqual(1, int(registered[0]))

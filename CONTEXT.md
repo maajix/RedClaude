@@ -134,6 +134,19 @@ renders into)
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.
+The conditions are copied, not joined: the claim as it read, the evidence as it
+stood, the test run that settled it, and the surface fingerprint it was settled
+against. One record is doing exactly one of four things, and only the first
+suppresses work: `settled` (the settling test run is on file and nothing has
+invalidated it), `due` (something invalidated it), `unverified` (nothing on file
+settles it -- what an imported refutation is) or `superseded` (a later
+refutation of the same claim replaced it). A record becomes due when a typed
+delta of the right property class lands on the claim's own subject, under it, or
+above it, against a newer fingerprint of the claim's own application -- or when
+a retest trigger someone already recorded against the claim fires, which is a
+relevance judgement made elsewhere and not re-decided here. That happens once
+per record, and the claim goes back to `testable` through a transition naming
+what reopened it.
 _Avoid_: Dead end, ruled out, noise
 
 ## Execution
