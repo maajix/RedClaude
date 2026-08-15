@@ -2041,6 +2041,33 @@ CONTROLS = (
         "                s, equivalence_key(s));"
         " END $ctl$",
     ),
+    Control(
+        # PH2-41 criterion 1 and 4, as the edit that makes them silently false.
+        # The frontier still returns the right SHAPE of row and the arithmetic
+        # over it is still correct, so a queue built on this one pays a chain
+        # that stopped holding and a member somebody withdrew, and every stored
+        # row still looks exactly like a row the frontier derived -- because it
+        # is one. Two names in arm (d) and one control, because a body with
+        # neither call is what dropping either one drifts toward.
+        "standing:check_chain_unlocks",
+        "CREATE OR REPLACE FUNCTION rk2_chain_unlock_frontier(p_program uuid)"
+        " RETURNS TABLE (chain_id uuid, capability text, stamp_id uuid, finding_id uuid,"
+        "                hypothesis_id uuid, subject_entity_id uuid)"
+        " LANGUAGE sql STABLE AS $ctl$"
+        " SELECT DISTINCT c.id, m.capability, z.id, z.finding_id,"
+        "        t.hypothesis_id, h.subject_entity_id"
+        "   FROM chains c"
+        "   JOIN pivot_stamps z ON z.program_id = c.program_id"
+        "   CROSS JOIN LATERAL unnest(z.requires) AS m(capability)"
+        "   JOIN tests t      ON t.program_id = c.program_id"
+        "                    AND t.pivot_provides = m.capability"
+        "   JOIN hypotheses h ON h.id = t.hypothesis_id"
+        "   JOIN entities e   ON e.id = h.subject_entity_id"
+        "  WHERE c.program_id = p_program"
+        "    AND h.superseded_by IS NULL AND e.in_scope"
+        "    AND NOT EXISTS (SELECT 1 FROM chain_steps cs"
+        "                     WHERE cs.chain_id = c.id AND cs.stamp_id = z.id) $ctl$",
+    ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
@@ -14844,6 +14871,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                     "time",
                     "safety",
                     "unlock",
+                    "chain_unlock",
                     "weights_version",
                 },
                 set(json.loads(str(row["factors"]))),
@@ -28474,46 +28502,28 @@ class PivotStampTest(PivotStampFixture, DatabaseCase):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
-CHAIN_SLUG = "selftest-chain"
+class ChainFixture(PivotStampFixture):
+    """The moves that stamp several pivots on their own routes and compose them.
 
+    40 built them and 41 needs every one: a chain unlock is a sound chain one
+    requirement short of a stamp it does not contain, so the arrangement that
+    produces a chain is the arrangement that produces the thing 41 is about.
+    Here rather than copied, for the reason `PivotStampFixture` is here.
 
-class KillChainTest(PivotStampFixture, DatabaseCase):
-    """Ticket 40: pivot stamps compose into a chain, and the chain stays sound.
-
-    The arrangement is 39's carried one step on, six times over. Six pivots are
-    stamped -- each on its own route, so none of them is the member's own
-    request -- and what this case is about begins there: which sets of them are
-    a chain, what the graph between them is when they are, and what stops being
-    true afterwards.
-
-    Everything commits, for 38's reason. The order in `setUpClass` is the order
-    the evidence accrues and it is load-bearing three times: the chains are
-    built while every stamp still stands, the refusals are asked of graphs the
-    six stamps can make between them, and the six ways a built chain goes
-    unsound each move the ground under it -- so each has to be the first thing
-    wrong when it is asked, and the last of them is not put back.
+    Between that fixture and this one and not inside it, because 39's case owns
+    the names `pivot_spec`, `stamped` and `stamp` for three other things: a
+    Test's optional block with one part replaced, the one stamp it issued, and
+    the row behind it. A case that stamps a *set* of pivots is a different
+    shape, and the two do not share a parent below this line.
     """
-
-    slug = CHAIN_SLUG
 
     BUILD = "SELECT build_kill_chain($1::uuid[], $2::jsonb, $3::uuid)"
     READ = "SELECT read_kill_chain($1::uuid)"
-    ENTRY = "SELECT to_jsonb(rk2_chain_entry($1::uuid))"
 
-    #: Two Identity slots, because criterion 3 rejects a chain whose steps ran
-    #: as different accounts without saying which one carried the capability,
-    #: and one slot cannot disagree with itself.
+    #: The Identity slot every pivot below runs as unless a case says otherwise.
+    #: `member` because that is the one `VALID` declares, so a case wanting only
+    #: this slot needs no reconfiguration to have it.
     HERE = "member"
-    THERE = "neighbour"
-
-    #: Two claims, on two subjects. Two rather than one because 034's `duplicate`
-    #: blocker holds every Finding that shares a signature with another validated
-    #: one, and `finding_signature` is the class and the subject's dedup key --
-    #: so two Findings of one class about one subject would each be held by a
-    #: review gate, and criterion 4's arm about review gates would fire on every
-    #: chain in this case instead of on the one it is written for.
-    CLAIM = "the orders API lets a stranger write on a neighbour's order"
-    OTHER = "the orders API hands out more than the order when it answers"
 
     ACTIONS = [
         {"ordinal": 1, "role": "baseline", "kind": "request", "method": "GET"},
@@ -28537,20 +28547,170 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
     ANSWERED = {1: (200, "before the write"), 2: (200, "accepted"),
                 3: (200, "after the write")}
 
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        #: What each stamped pivot was made of, and the stamp it produced, by
+        #: the name the case gave it. Two dictionaries rather than one because
+        #: `members` composes a proposal out of ids and reads nothing else.
+        cls.of = {}
+        cls.stamp = {}
+
+    @classmethod
+    def pivot_spec(cls, route: str, provides: str, requires: list[str], slot: str) -> str:
+        """One pivot Test, told apart from the others by the route it walks."""
+        actions = [
+            action | {"url": f"{BASE}/{route}"} for action in cls.ACTIONS
+        ]
+        stated = json.loads(
+            specification(cls.SHOWN, actions=actions, cleanup=cls.UNDO, impact=cls.IMPACT)
+        )
+        return json.dumps(stated | {"pivot": {
+            "provides": provides,
+            "requires": requires,
+            "identity": slot,
+            "transition": cls.SHOWN[0]["id"],
+            "conditions": cls.CONDITIONS,
+        }})
+
+    @classmethod
+    def stamped(cls, name: str, member: dict, route: str, provides: str,
+                requires: list[str], slot: str) -> None:
+        """One pivot, from the impact Task to the issued stamp, kept by name.
+
+        The whole of 39 in six statements, and every one of them is load-bearing
+        rather than arrangement: a stamp built any other way would be a row a
+        chain composes and 39 would not have issued.
+        """
+        opened = cls.called(
+            cls.OPEN_TASK,
+            (member["finding"], cls.pivot_spec(route, provides, requires, slot)),
+        )
+        test = cls.id_of("tests", opened["test"])
+        cls.grant_for(opened["task"], test, slot)
+        walk = cls.impact_replay(opened["task"], test, cls.ANSWERED, "done", slot=slot)
+        issued = cls.issue(walk)
+        assert issued["refusal"] is None, issued
+        cls.settled(opened["task"])
+        cls.of[name] = {"member": member, "task": opened["task"], "test": test,
+                        "walk": walk, "label": issued["stamp"]}
+        cls.stamp[name] = cls.id_of("pivot_stamps", issued["stamp"])
+
+    @classmethod
+    def members(cls, *names: str) -> str:
+        return pg.quote_array([cls.stamp[name] for name in names])
+
+    @classmethod
+    def build(cls, members: str, *, flow: dict | None = None, run: str | None = None) -> dict:
+        return cls.called(
+            cls.BUILD, (members, None if flow is None else json.dumps(flow), run)
+        )
+
+    @classmethod
+    def read(cls, label: str) -> dict:
+        return cls.called(cls.READ, (cls.id_of("chains", label),))
+
+    @classmethod
+    def project_the_scope(cls) -> None:
+        """The scope policy, decided over this Program's entities once more."""
+        cls.as_the_owner_says([
+            ("SELECT * FROM refresh_scope_projection($1::uuid)", (cls.program_id,)),
+        ])
+
+    @classmethod
+    def re_addressed(cls, entity: str, host: str | None, path: str | None = None) -> None:
+        """One Entity's address changed, and the scope projected over it again.
+
+        `None` puts it back to what `offline_entity` made: a technology
+        fingerprint with no address, which 021 classes `not_addressable` rather
+        than denied. That is the state every subject in this file starts in, and
+        it is why the arm this feeds reads the class rather than the boolean.
+
+        The path is separate from the host because `scope_class_of` asks the
+        request question, and its inclusion arm needs BOTH spellings of the path
+        under the rule's prefix. `VALID` includes `app.example.com` under
+        `/api/`, so a subject given that host and the default `/` is `denied`
+        rather than in scope -- which is the right answer to the question asked
+        and not the one a case putting a subject on the Surface wants.
+
+        Given no path, the two path columns are left exactly as they were. Both
+        are NOT NULL, so there is no "no path" to write, and a default written on
+        every call would be this helper editing a column the caller said nothing
+        about -- which for 040's two calls is a column that ticket's arms never
+        touched.
+        """
+        cls.as_the_owner_says([
+            ("UPDATE entities SET scope_selector_kind = $2, scope_selector = $3,"
+             "                    scope_port = $4,"
+             "                    scope_path_raw = coalesce($5, scope_path_raw),"
+             "                    scope_path_norm = coalesce($5, scope_path_norm)"
+             " WHERE id = $1::uuid",
+             (entity, None if host is None else "host", host,
+              None if host is None else 443, path)),
+        ])
+        cls.project_the_scope()
+
+
+CHAIN_SLUG = "selftest-chain"
+
+
+class KillChainTest(ChainFixture, DatabaseCase):
+    """Ticket 40: pivot stamps compose into a chain, and the chain stays sound.
+
+    The arrangement is 39's carried one step on, six times over. Six pivots are
+    stamped -- each on its own route, so none of them is the member's own
+    request -- and what this case is about begins there: which sets of them are
+    a chain, what the graph between them is when they are, and what stops being
+    true afterwards.
+
+    Everything commits, for 38's reason. The order in `setUpClass` is the order
+    the evidence accrues and it is load-bearing three times: the chains are
+    built while every stamp still stands, the refusals are asked of graphs the
+    six stamps can make between them, and the six ways a built chain goes
+    unsound each move the ground under it -- so each has to be the first thing
+    wrong when it is asked, and the last of them is not put back.
+    """
+
+    slug = CHAIN_SLUG
+
+    ENTRY = "SELECT to_jsonb(rk2_chain_entry($1::uuid))"
+
+    #: A second Identity slot beside the fixture's, because criterion 3 rejects
+    #: a chain whose steps ran as different accounts without saying which one
+    #: carried the capability, and one slot cannot disagree with itself.
+    THERE = "neighbour"
+
+    #: Two claims, on two subjects. Two rather than one because 034's `duplicate`
+    #: blocker holds every Finding that shares a signature with another validated
+    #: one, and `finding_signature` is the class and the subject's dedup key --
+    #: so two Findings of one class about one subject would each be held by a
+    #: review gate, and criterion 4's arm about review gates would fire on every
+    #: chain in this case instead of on the one it is written for.
+    CLAIM = "the orders API lets a stranger write on a neighbour's order"
+    OTHER = "the orders API hands out more than the order when it answers"
+
     #: The six pivots, as `(route, provides, requires, slot)`. Each route is its
     #: own, for 39's reason -- a transition on a route the member was validated
     #: on is refused as the member's own request -- and the capabilities are
     #: chosen so that the six make between them every graph criterion 6 asks
     #: for: a line, a branch, a gap, a cycle, two components and a merge whose
     #: two parents ran as different Identities.
+    #: `ChainFixture.HERE` spelled out rather than inherited into the name: a
+    #: class body reads the names beside it and the ones its module defines, and
+    #: never its own bases -- so `THERE` below resolves and a bare `HERE` would
+    #: not.
     PIVOTS = (
-        ("reach", "7/note", "other_account_data", ["authenticated_session"], HERE),
-        ("token", "8/token", "credential_material", ["other_account_data"], HERE),
-        ("inside", "9/host", "internal_network_reach", ["other_account_data"], HERE),
-        ("back", "10/login", "authenticated_session", ["other_account_data"], HERE),
+        ("reach", "7/note", "other_account_data", ["authenticated_session"],
+         ChainFixture.HERE),
+        ("token", "8/token", "credential_material", ["other_account_data"],
+         ChainFixture.HERE),
+        ("inside", "9/host", "internal_network_reach", ["other_account_data"],
+         ChainFixture.HERE),
+        ("back", "10/login", "authenticated_session", ["other_account_data"],
+         ChainFixture.HERE),
         ("beside", "11/peer", "internal_network_reach", ["authenticated_session"], THERE),
         ("through", "12/exec", "code_execution",
-         ["other_account_data", "internal_network_reach"], HERE),
+         ["other_account_data", "internal_network_reach"], ChainFixture.HERE),
     )
 
     #: What the agent said the capabilities do between its members. Recorded and
@@ -28578,8 +28738,6 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
         # classified is not the same fact as one the policy denies, and the
         # chain's scope arm is about the second.
         cls.project_the_scope()
-        cls.of = {}
-        cls.stamp = {}
         cls.compose_six_pivots()
         cls.scope_when_stamped = cls.scope_version()
 
@@ -28597,46 +28755,6 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
     # -- the arrangement -------------------------------------------------------
 
     @classmethod
-    def pivot_spec(cls, route: str, provides: str, requires: list[str], slot: str) -> str:
-        """One pivot Test, told apart from the other five by the route it walks."""
-        actions = [
-            action | {"url": f"{BASE}/{route}"} for action in cls.ACTIONS
-        ]
-        stated = json.loads(
-            specification(cls.SHOWN, actions=actions, cleanup=cls.UNDO, impact=cls.IMPACT)
-        )
-        return json.dumps(stated | {"pivot": {
-            "provides": provides,
-            "requires": requires,
-            "identity": slot,
-            "transition": cls.SHOWN[0]["id"],
-            "conditions": cls.CONDITIONS,
-        }})
-
-    @classmethod
-    def stamped(cls, name: str, member: dict, route: str, provides: str,
-                requires: list[str], slot: str) -> None:
-        """One pivot, from the impact Task to the issued stamp, kept by name.
-
-        The whole of 39 in six statements, and every one of them is load-bearing
-        rather than arrangement: a stamp built any other way would be a row this
-        ticket composes and 39 would not have issued.
-        """
-        opened = cls.called(
-            cls.OPEN_TASK,
-            (member["finding"], cls.pivot_spec(route, provides, requires, slot)),
-        )
-        test = cls.id_of("tests", opened["test"])
-        cls.grant_for(opened["task"], test, slot)
-        walk = cls.impact_replay(opened["task"], test, cls.ANSWERED, "done", slot=slot)
-        issued = cls.issue(walk)
-        assert issued["refusal"] is None, issued
-        cls.settled(opened["task"])
-        cls.of[name] = {"member": member, "task": opened["task"], "test": test,
-                        "walk": walk, "label": issued["stamp"]}
-        cls.stamp[name] = cls.id_of("pivot_stamps", issued["stamp"])
-
-    @classmethod
     def compose_six_pivots(cls):
         """The evidence every arm below is about, issued once."""
         for name, route, provides, requires, slot in cls.PIVOTS:
@@ -28646,20 +28764,6 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
                 else cls.member["first"],
                 route, provides, requires, slot,
             )
-
-    @classmethod
-    def members(cls, *names: str) -> str:
-        return pg.quote_array([cls.stamp[name] for name in names])
-
-    @classmethod
-    def build(cls, members: str, *, flow: dict | None = None, run: str | None = None) -> dict:
-        return cls.called(
-            cls.BUILD, (members, None if flow is None else json.dumps(flow), run)
-        )
-
-    @classmethod
-    def read(cls, label: str) -> dict:
-        return cls.called(cls.READ, (cls.id_of("chains", label),))
 
     @classmethod
     def build_what_composes(cls):
@@ -28878,31 +28982,6 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
             "       (SELECT count(*) FROM pivot_stamps WHERE program_id = $1::uuid)",
             (cls.program_id,),
         )[0])
-
-    @classmethod
-    def project_the_scope(cls) -> None:
-        """The scope policy, decided over this Program's entities once more."""
-        cls.as_the_owner_says([
-            ("SELECT * FROM refresh_scope_projection($1::uuid)", (cls.program_id,)),
-        ])
-
-    @classmethod
-    def re_addressed(cls, entity: str, host: str | None) -> None:
-        """One Entity's address changed, and the scope projected over it again.
-
-        `None` puts it back to what `offline_entity` made: a technology
-        fingerprint with no address, which 021 classes `not_addressable` rather
-        than denied. That is the state every subject in this file starts in, and
-        it is why the arm this feeds reads the class rather than the boolean.
-        """
-        cls.as_the_owner_says([
-            ("UPDATE entities SET scope_selector_kind = $2, scope_selector = $3,"
-             "                    scope_port = $4"
-             " WHERE id = $1::uuid",
-             (entity, None if host is None else "host", host,
-              None if host is None else 443)),
-        ])
-        cls.project_the_scope()
 
     @classmethod
     def reconfigured(cls, document: str) -> None:
@@ -29196,6 +29275,791 @@ class KillChainTest(PivotStampFixture, DatabaseCase):
     # -- the standing check -----------------------------------------------------
 
     def test_the_standing_check_holds_over_every_chain_this_case_built(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+UNLOCK_SLUG = "selftest-unlock"
+
+
+class ChainUnlockTest(ChainFixture, DatabaseCase):
+    """Ticket 41: what a sound chain is one requirement short of, priced.
+
+    The arrangement is 40's carried one step on. Five pivots are stamped, two of
+    them compose into chains, and what this case is about begins there: both
+    chains are one capability short of a sixth stamp they do not contain, two
+    unstamped Tests claim to provide exactly that capability, and the Ranking
+    pass is asked what those two Tests are worth.
+
+    Everything commits, for 38's reason, and five Ranking passes run in
+    `setUpClass` in an order that is the whole argument. Each pass reads the rows
+    the pass before it left, and between them exactly one thing moves: nobody has
+    said what the member is worth, then somebody does, then the candidates get
+    estimates of their own, then one subject leaves the Surface, then a member is
+    withdrawn. A single pass would be consistent with the unlock term doing
+    nothing at all -- what makes it evidence is that the same three Tasks change
+    places twice and change back.
+
+    The two populations are kept apart on purpose. `alpha` and `beta` are the
+    candidates the derivation minted; `isolated` is a hunt Task of the same kind
+    in the same Program that no chain is waiting on. All three are ranked by the
+    same seven components off the same history, so the only thing that can
+    separate them is the eighth.
+    """
+
+    slug = UNLOCK_SLUG
+
+    RANK = "SELECT rank_pass('runtime')"
+    SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+
+    #: Three claims, on three subjects. Three rather than one for 040's reason:
+    #: `finding_signature` is the vulnerability class and the subject's dedup
+    #: key, and two Findings sharing one would each be held by 034's `duplicate`
+    #: gate -- which is an arm of `rk2_chain_unsoundness`, and would make every
+    #: chain here unsound for a reason this case is not about.
+    CLAIMS = {
+        "first": "the orders API lets a stranger write on a neighbour's order",
+        "second": "the orders API hands out more than the order when it answers",
+        "third": "the orders API runs what the note field says",
+    }
+
+    #: The five pivots, as `(name, route, provides, requires, member)`. Each route
+    #: is its own for 039's reason, and the capabilities are chosen so that the
+    #: two chains built below are short of exactly one thing: `sideways` is
+    #: already reachable from both and must never be on the frontier, `through`
+    #: is one capability short of both and is what the frontier is made of, and
+    #: `deep` is two short and is the negative control for criterion 3 -- the
+    #: frontier is one hop, and a second hop is not reachable until the first has
+    #: been demonstrated.
+    PIVOTS = (
+        ("reach", "21/note", "other_account_data", ["authenticated_session"], "first"),
+        ("token", "22/token", "credential_material", ["other_account_data"], "second"),
+        ("sideways", "23/read", "arbitrary_read", ["credential_material"], "first"),
+        ("through", "24/exec", "code_execution",
+         ["other_account_data", "internal_network_reach"], "third"),
+        ("deep", "25/write", "arbitrary_write",
+         ["internal_network_reach", "privileged_role"], "second"),
+    )
+
+    #: The one capability both chains hold everything but, and so the one a
+    #: candidate Test has to claim to be on the frontier at all.
+    MISSING = "internal_network_reach"
+
+    #: The two candidates, as `(name, route)`. Two rather than one because
+    #: criterion 2's share is a division: a member worth 0.75 that two Tasks
+    #: could each reach is not worth 0.75 twice, and one candidate would make the
+    #: numerator and the share the same number.
+    CANDIDATES = (("alpha", "26/lateral"), ("beta", "27/lateral"))
+
+    #: The band `through`'s member is stated at, and what section 5 pays for it.
+    #: `high` rather than `critical` so that the weight is a fraction and a share
+    #: of it is a different fraction again -- at 1.00 the halving would be
+    #: invisible against a rounding error.
+    BAND = "high"
+    BAND_WEIGHT = 0.75
+    WHY = "the impact run executed what the note field said and the effect was still there after"
+
+    #: What a candidate promises on its own, and what the Task no chain is
+    #: waiting on promises. The isolated one is worth MORE by itself -- 0.30
+    #: against 0.20 -- so nothing but the unlock term can put a candidate in
+    #: front of it, and when the chains stop holding it has to take the lead
+    #: back. `w_unlock` is 0.5, so a full share of `high` is 0.375 and the flip
+    #: is 0.20 + 0.1875 against 0.30 in one direction and 0.20 against 0.30 in
+    #: the other.
+    PIVOT_WORTH = "0.20"
+    ISOLATED_WORTH = "0.30"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.refusals = {}
+        cls.identity = cls.provisioned_identity(cls.HERE)
+        cls.member = {name: cls.validated(claim) for name, claim in cls.CLAIMS.items()}
+        # For 040's reason: a subject that has never been classified is not the
+        # same fact as one the policy denies, and the frontier reads `in_scope`.
+        cls.project_the_scope()
+        for name, route, provides, requires, member in cls.PIVOTS:
+            cls.stamped(name, cls.member[member], route, provides, requires, cls.HERE)
+
+        cls.compose_two_chains()
+        cls.open_the_candidates()
+        cls.frontier_before = cls.frontier()
+
+        cls.rank_before_a_band()
+        cls.rank_once_the_band_is_stated()
+        cls.rank_against_a_task_no_chain_is_waiting_on()
+        cls.rank_with_one_candidate_off_the_surface()
+        cls.rank_with_the_pivot_that_would_join_withdrawn()
+        cls.rank_with_the_member_withdrawn()
+
+        cls.problems = cls.rows_of("SELECT * FROM check_chain_unlocks()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def compose_two_chains(cls):
+        """Two chains that hold, and one proposal the stamps do not support.
+
+        Both are built while every stamp still stands, because the last pass
+        below moves the ground under them and a chain cannot be built out of
+        ground that has already moved. The refused proposal is criterion 6's
+        other half: `token` requires what neither the entry set nor `sideways`
+        supplies, so there is no chain for it to contribute from -- which is
+        stronger than a chain contributing zero, and is why the assertion is
+        about the refusal rather than about a number.
+        """
+        cls.line = cls.build(cls.members("reach", "token"))
+        cls.long = cls.build(cls.members("reach", "token", "sideways"))
+        cls.sound = {name: cls.read(built["chain"])["sound"]
+                     for name, built in (("line", cls.line), ("long", cls.long))}
+        cls.unsound_proposal = cls.build(cls.members("token", "sideways"))
+
+    @classmethod
+    def open_the_candidates(cls):
+        """Two Tests claiming the capability, on subjects still on the Surface.
+
+        Stated and never run: an unstamped Test is what the frontier is looking
+        for, since a Test whose pivot has already been demonstrated is a
+        capability the chain could have rather than one a Task would go and get.
+
+        The subjects are put on the Surface here because `offline_entity` makes
+        a technology fingerprint with no address at all, which 021 classes
+        `not_addressable` -- which is right for a member's subject and wrong for
+        a candidate's, since the frontier will not name a subject nothing can be
+        sent to and `cancel_reason_for` would abandon the Task on the next pass.
+        """
+        cls.candidate = {}
+        for name, route in cls.CANDIDATES:
+            hypothesis, subject = cls.claim_waiting(
+                f"the orders API answers {name} from inside the network")
+            cls.re_addressed(subject, "app.example.com", f"/api/orders/{name}")
+            cls.candidate[name] = {
+                "hypothesis": hypothesis,
+                "subject": subject,
+                "test": cls.stored_pivot(
+                    hypothesis,
+                    cls.pivot_spec(route, cls.MISSING, ["other_account_data"], cls.HERE),
+                ),
+            }
+
+    @classmethod
+    def stored_pivot(cls, hypothesis: str, spec: str) -> str:
+        """One immutable pivot Test of that claim, stated and never run.
+
+        `ReplayFixture.stored` is not enough for this one. 039 refuses a pivot on
+        a Test that states no impact, and 038 keyed the impact class onto a
+        column of `tests` and holds it equal to the block with a CHECK -- so a
+        pivot Test states an impact and the row has to carry its class. 039's
+        own column is derived by a trigger and this one is not, which is the
+        difference between the two decisions and the reason `stored` gets away
+        with knowing about neither.
+
+        The class is read out of the specification in the INSERT rather than
+        passed beside it, which is what the CHECK says: the column is the block
+        and there is nothing for a caller to disagree with it about.
+        """
+        return committed(
+            cls.connection,
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256, impact_class)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb),"
+            "         $3::jsonb -> 'impact' ->> 'class')"
+            " RETURNING id",
+            (cls.program_id, hypothesis, spec),
+        )
+
+    @classmethod
+    def open_the_isolated_task(cls):
+        """One hunt Task of the same kind that no chain is waiting on.
+
+        The control the comparison needs. Written by hand and not by the
+        derivation, because the derivation only ever mints Tasks that ARE on the
+        frontier -- a Task nothing unlocks is what an ordinary hunt Task is, and
+        the estimates on it are the model's sentence about its own claim.
+        """
+        hypothesis, subject = cls.claim_waiting(
+            "the export endpoint hands back its own audit log")
+        cls.re_addressed(subject, "app.example.com", "/api/orders/isolated")
+        cls.as_owner(
+            "INSERT INTO tasks (program_id, kind, hypothesis_id, subject_entity_id,"
+            "                   expected_information_gain, potential_impact)"
+            " VALUES ($1::uuid, 'hunt', $2::uuid, $3::uuid, $4, $4)",
+            (cls.program_id, hypothesis, subject, cls.ISOLATED_WORTH),
+        )
+        cls.isolated = hypothesis
+
+    @classmethod
+    def estimated(cls, hypothesis: str, worth: str) -> None:
+        """What a candidate Task promises on its own.
+
+        Left NULL by the derivation on purpose, so this is the only place the
+        number can come from. `expected_information_gain` and `potential_impact`
+        are set to the same value because `w_gain + w_impact = 1` is a CHECK on
+        the weights -- so `value_for` is that value exactly, and the comparison
+        below is between two numbers a reader can do in their head.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET expected_information_gain = $3, potential_impact = $3"
+            " WHERE program_id = $1::uuid AND kind = 'hunt' AND hypothesis_id = $2::uuid",
+            (cls.program_id, hypothesis, worth),
+        )
+
+    # -- the five passes -------------------------------------------------------
+
+    @classmethod
+    def rank_before_a_band(cls):
+        """(0) The rows are derived, and the number is still zero.
+
+        Both halves matter. The frontier produced four rows and the pass minted
+        the two Tasks to hang them on, so criterion 1 has happened; and every one
+        of those rows names a member whose severity is the `info` /
+        `undetermined` pair `open_finding` was born with, which section 5 counts
+        as nothing. A default is not a measurement.
+        """
+        cls.pass_before_a_band = cls.rank()
+        cls.task = {name: cls.task_of(cls.candidate[name]["hypothesis"])
+                    for name, _ in cls.CANDIDATES}
+        cls.rows_when_derived = cls.unlock_rows()
+        cls.scored_before_a_band = cls.scored()
+
+    @classmethod
+    def rank_once_the_band_is_stated(cls):
+        """(1) Somebody states what the member is worth, and criterion 5 holds.
+
+        The pass derives and withdraws nothing -- the frontier has not moved --
+        and both candidates now carry half of `high`, because two pending Tasks
+        could each reach that member. Their priority is still NULL: an unlock is
+        not an estimate, and a Task nobody has said anything about does not get
+        ranked because something downstream of it would be valuable.
+        """
+        cls.stated = cls.called(
+            cls.SEVERITY,
+            (cls.member["third"]["finding"], cls.BAND, "demonstrated_impact", cls.WHY),
+        )
+        cls.pass_after_the_band = cls.rank()
+        cls.scored_before_estimates = cls.scored()
+
+    @classmethod
+    def rank_against_a_task_no_chain_is_waiting_on(cls):
+        """(2) Criterion 6: the useful low-cost pivot overtakes the isolated Task.
+
+        The two refusals are collected here rather than at the end because
+        `refusal_message` answers with the empty string when nothing was raised,
+        and a DELETE matching no rows never fires a FOR EACH ROW trigger -- so
+        the hand-deletion has to be attempted while there are rows to delete.
+        """
+        for name, _ in cls.CANDIDATES:
+            cls.estimated(cls.candidate[name]["hypothesis"], cls.PIVOT_WORTH)
+        cls.open_the_isolated_task()
+        cls.pass_that_ranked = cls.rank()
+        cls.task["isolated"] = cls.task_of(cls.isolated)
+        cls.scored_when_ranked = cls.scored()
+        cls.terms_when_ranked = cls.unlock_terms()
+
+        cls.refusals["a_hand_written_unlock"] = cls.refuse(
+            "INSERT INTO task_chain_unlocks"
+            "    (program_id, task_id, chain_id, capability, stamp_id, finding_id)"
+            " SELECT $1::uuid, u.task_id, u.chain_id, 'privileged_role', u.stamp_id,"
+            "        u.finding_id"
+            "   FROM task_chain_unlocks u WHERE u.program_id = $1::uuid LIMIT 1",
+            (cls.program_id,),
+        )
+        cls.refusals["a_hand_deleted_unlock"] = cls.refuse(
+            "DELETE FROM task_chain_unlocks WHERE program_id = $1::uuid",
+            (cls.program_id,),
+        )
+
+    @classmethod
+    def rank_with_one_candidate_off_the_surface(cls):
+        """(3) One candidate leaves the Surface, and the other's share doubles.
+
+        Two things in one move, which is why it is one move: the Task is
+        abandoned by step (2) of the pass as `out_of_scope` and its rows are
+        withdrawn by step (3b) of the same pass, and what is left is one pending
+        Task that could reach the member -- so the share stops being a half.
+        """
+        cls.re_addressed(cls.candidate["beta"]["subject"], None)
+        cls.pass_after_a_subject_left = cls.rank()
+        cls.rows_when_one_left = cls.unlock_rows()
+        cls.scored_when_one_left = cls.scored()
+
+    @classmethod
+    def rank_with_the_pivot_that_would_join_withdrawn(cls):
+        """(3b) The stamp the frontier is about stops standing, and comes back.
+
+        The other two words of criterion 4, and the only place they can be shown:
+        `through` is not a step of either chain, so nothing here touches a
+        chain's soundness and both go on holding. What moves is 039's answer
+        about the stamp the chains are waiting FOR -- its member is rejected, so
+        the pivot would not be issued today, so there is nothing to unlock. The
+        stamp row does not move when a Finding is withdrawn, which is why a
+        frontier that read `pivot_stamps` alone would go on paying for it.
+
+        Taken away and given back in one move, because a withdrawal that could
+        not be reversed would be consistent with the frontier having broken
+        rather than having answered.
+        """
+        cls.forge_the_member_status(cls.member["third"]["finding"], "rejected")
+        cls.pass_without_the_pivot = cls.rank()
+        cls.rows_without_the_pivot = cls.unlock_rows()
+        cls.scored_without_the_pivot = cls.scored()
+        cls.sound_without_the_pivot = {name: cls.read(built["chain"])["sound"]
+                                       for name, built in (("line", cls.line),
+                                                           ("long", cls.long))}
+
+        cls.forge_the_member_status(cls.member["third"]["finding"], "validated")
+        cls.pass_when_the_pivot_returned = cls.rank()
+        cls.rows_when_the_pivot_returned = cls.unlock_rows()
+        cls.scored_when_the_pivot_returned = cls.scored()
+
+    @classmethod
+    def rank_with_the_member_withdrawn(cls):
+        """(4) Criterion 4: a member goes, both chains go, and the lead flips back.
+
+        `first` is a member of both chains, so withdrawing it makes both unsound
+        at once -- and nothing in `derive_chain_unlocks` names an invalidated
+        member. The rows go because the frontier reads 040's soundness sentence
+        and an unsound chain is not in it, which is the whole of criterion 4
+        stated as a shape rather than as a case.
+        """
+        cls.forge_the_member_status(cls.member["first"]["finding"], "rejected")
+        cls.sound_at_the_end = {name: cls.read(built["chain"])["sound"]
+                                for name, built in (("line", cls.line), ("long", cls.long))}
+        cls.pass_after_the_member_went = cls.rank()
+        cls.rows_at_the_end = cls.unlock_rows()
+        cls.scored_at_the_end = cls.scored()
+
+    # -- reading the Program back ----------------------------------------------
+
+    @classmethod
+    def rank(cls) -> dict:
+        """One Ranking pass, as the runtime, committed."""
+        return cls.called(cls.RANK)
+
+    @classmethod
+    def frontier(cls) -> list[tuple[str, ...]]:
+        """The frontier as (chain, capability, stamp, member).
+
+        The member is its id and the other three are labels, because the id is
+        what the fixture holds: `ValidatedFindingFixture` keeps the Finding it
+        made by the key `open_finding` answers with, and looking its label up
+        here to compare against a label would be a round trip that could only
+        ever agree with itself.
+        """
+        return [
+            tuple(str(field) for field in row)
+            for row in cls.rows_of(
+                "SELECT c.label, fr.capability, z.label, fr.finding_id::text"
+                "  FROM rk2_chain_unlock_frontier($1::uuid) fr"
+                "  JOIN chains c       ON c.id = fr.chain_id"
+                "  JOIN pivot_stamps z ON z.id = fr.stamp_id"
+                " ORDER BY c.label, fr.capability, z.label",
+                (cls.program_id,),
+            )
+        ]
+
+    @classmethod
+    def unlock_rows(cls) -> list[tuple[str, ...]]:
+        """Every unlock row of this Program, as (Task, chain, capability, member)."""
+        return [
+            tuple(str(field) for field in row)
+            for row in cls.rows_of(
+                "SELECT k.label, c.label, u.capability, u.finding_id::text"
+                "  FROM task_chain_unlocks u"
+                "  JOIN tasks k    ON k.id = u.task_id"
+                "  JOIN chains c   ON c.id = u.chain_id"
+                " WHERE u.program_id = $1::uuid"
+                " ORDER BY k.label, c.label, u.capability",
+                (cls.program_id,),
+            )
+        ]
+
+    @classmethod
+    def unlock_terms(cls) -> dict[str, tuple[float, float]]:
+        """The two summands of `unlock_value`, asked of the two functions.
+
+        Read rather than inferred from the column. `unlock_value` is the sum
+        under a cap, so a case that inferred one summand by subtracting the
+        other from it would be agreeing with itself whatever either was.
+        """
+        return {
+            str(row["label"]): (float(str(row["direct"])), float(str(row["chain"])))
+            for row in cls.connection.execute(
+                "SELECT t.label, unlock_for(t, w) AS direct,"
+                "       chain_unlock_for(t) AS chain"
+                "  FROM tasks t, scheduler_weights w"
+                " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'hunt'",
+                (cls.program_id,),
+            ).dicts()
+        }
+
+    @classmethod
+    def task_of(cls, hypothesis: str) -> str:
+        """The label of the one hunt Task about a claim."""
+        return str(
+            cls.connection.execute(
+                "SELECT label FROM tasks"
+                " WHERE program_id = $1::uuid AND kind = 'hunt' AND hypothesis_id = $2::uuid",
+                (cls.program_id, hypothesis),
+            ).scalar()
+        )
+
+    #: Every column of a ranked Task this case reads, kept in one list because
+    #: three of the assertions are about a component being EQUAL across the three
+    #: Tasks -- which is what makes the fourth attributable to the eighth.
+    COMPONENTS = ("priority", "chain_unlock_value", "unlock_value", "direct_value",
+                  "novelty", "estimated_cost", "estimated_time", "safety_cost",
+                  "confidence_of_execution")
+
+    @classmethod
+    def scored(cls) -> dict[str, dict]:
+        """Every hunt Task of this Program with what the last pass left on it."""
+        return {
+            str(row["label"]): {
+                "status": str(row["status"]),
+                **{name: None if row[name] is None else float(str(row[name]))
+                   for name in cls.COMPONENTS},
+            }
+            for row in cls.connection.execute(
+                "SELECT label, status, " + ", ".join(cls.COMPONENTS)
+                + "  FROM tasks WHERE program_id = $1::uuid AND kind = 'hunt'"
+                " ORDER BY label",
+                (cls.program_id,),
+            ).dicts()
+        }
+
+    def component(self, scored: dict, name: str, task: str) -> float | None:
+        """One component of one Task, by the name this case gave the Task."""
+        return scored[self.task[task]][name]
+
+    # -- criterion 1: the runtime derives an unlock, and nothing else writes one -
+
+    def test_the_frontier_names_the_one_stamp_both_chains_are_short_of(self):
+        # Four rows and not two: the frontier is a pair (chain, Test), because
+        # the same Task unlocks a different chain for each chain that is waiting
+        # on it, and section 5 divides by Tasks rather than by rows precisely
+        # because of that.
+        self.assertEqual(4, len(self.frontier_before))
+        self.assertEqual(
+            {(self.line["chain"], self.MISSING,
+              self.of["through"]["label"], self.member["third"]["finding"]),
+             (self.long["chain"], self.MISSING,
+              self.of["through"]["label"], self.member["third"]["finding"])},
+            set(self.frontier_before),
+        )
+
+    def test_the_pass_minted_one_candidate_task_for_each_claim_on_the_frontier(self):
+        self.assertEqual(2, self.pass_before_a_band["unlock_candidates"])
+        self.assertEqual(4, self.pass_before_a_band["unlocks_derived"])
+        self.assertEqual(0, self.pass_before_a_band["unlocks_withdrawn"])
+        # And the Tasks are the derivation's own: `task_of` found one hunt Task
+        # per candidate claim, which nothing in this case inserted.
+        self.assertEqual(2, len(set(self.task[name] for name, _ in self.CANDIDATES)))
+
+    def test_a_stamp_two_capabilities_short_is_never_on_the_frontier(self):
+        # Criterion 3 as a negative control. `deep` requires two things neither
+        # chain has, and one hop away from a chain is not two: a frontier that
+        # counted it would be paying for a path whose first step nobody has
+        # demonstrated.
+        self.assertNotIn(
+            self.of["deep"]["label"], {row[2] for row in self.frontier_before}
+        )
+        self.assertNotIn(
+            self.member["second"]["finding"], {row[3] for row in self.rows_when_derived}
+        )
+
+    def test_a_capability_a_chain_already_has_is_not_something_to_unlock(self):
+        # `sideways` is stamped, is not a step of `line`, and requires only what
+        # `line` already holds -- so it is missing nothing and there is nothing
+        # for a Task to go and get. Zero capabilities short is not one short.
+        self.assertNotIn(
+            self.of["sideways"]["label"], {row[2] for row in self.frontier_before}
+        )
+
+    def test_nobody_but_the_derivation_may_write_an_unlock(self):
+        self.assertIn(
+            "a chain unlock is derive_chain_unlocks's to write, not a caller's",
+            self.refusals["a_hand_written_unlock"],
+        )
+        self.assertIn(
+            "a chain unlock is derive_chain_unlocks's to write, not a caller's",
+            self.refusals["a_hand_deleted_unlock"],
+        )
+
+    def test_the_two_roles_a_model_can_hold_cannot_read_or_write_an_unlock(self):
+        held = self.rows(
+            "SELECT r.rolname, p.privilege_type"
+            "  FROM unnest(ARRAY['rk2_state','rk2_proxy']) AS r(rolname)"
+            "  CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE'])"
+            "        AS p(privilege_type)"
+            " WHERE has_table_privilege(r.rolname, 'task_chain_unlocks', p.privilege_type)"
+        )
+
+        self.assertEqual((), held)
+
+    # -- criterion 2: what the row says, and what it has no column for ----------
+
+    def test_an_unlock_row_is_four_names_and_carries_no_prediction(self):
+        columns = self.rows(
+            "SELECT a.attname FROM pg_class c JOIN pg_attribute a"
+            "    ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+            " WHERE c.relname = 'task_chain_unlocks' ORDER BY a.attname"
+        )
+
+        # No probability, no expected value, no confidence, no verdict and no
+        # "would succeed": there is nowhere for a prediction to be stored, which
+        # is the shortest proof the row cannot be read as one.
+        self.assertEqual(
+            ["capability", "chain_id", "derived_at", "finding_id", "id",
+             "program_id", "stamp_id", "task_id"],
+            [str(row[0]) for row in columns],
+        )
+
+    def test_the_rows_name_the_task_the_chain_the_capability_and_the_member(self):
+        self.assertEqual(
+            sorted(
+                (self.task[name], chain, self.MISSING, self.member["third"]["finding"])
+                for name, _ in self.CANDIDATES
+                for chain in (self.line["chain"], self.long["chain"])
+            ),
+            sorted(self.rows_when_derived),
+        )
+
+    # -- criterion 3: the member's band is the currency, and a default is not one
+
+    def test_a_member_whose_severity_nobody_stated_is_worth_nothing(self):
+        # The rows are all there -- this is not an absence of evidence. What is
+        # absent is anybody's assessment of the member, and `info` /
+        # `undetermined` is what `open_finding` writes before one exists.
+        self.assertEqual(4, len(self.rows_when_derived))
+        for name, _ in self.CANDIDATES:
+            self.assertEqual(
+                0.0, self.component(self.scored_before_a_band, "chain_unlock_value", name)
+            )
+
+    def test_a_stated_band_is_shared_between_the_tasks_that_could_reach_it(self):
+        self.assertEqual("high", self.stated["severity"])
+        self.assertEqual(0, self.pass_after_the_band["unlocks_derived"])
+        self.assertEqual(0, self.pass_after_the_band["unlocks_withdrawn"])
+
+        # 0.75 for `high`, halved because two pending Tasks could each obtain the
+        # capability. Two chains waiting on the same Task do not double it: the
+        # sum is over distinct members, because what is unlocked is the member
+        # and the chains are two routes to the one thing.
+        for name, _ in self.CANDIDATES:
+            self.assertEqual(
+                round(self.BAND_WEIGHT / 2, 6),
+                self.component(self.scored_before_estimates, "chain_unlock_value", name),
+            )
+
+    def test_every_band_a_finding_can_carry_has_a_weight_beside_it(self):
+        bands = self.rows(
+            "SELECT sw.severity, sw.weight FROM severity_unlock_weights sw"
+            " ORDER BY sw.weight"
+        )
+
+        self.assertEqual(
+            [("info", 0.0), ("low", 0.25), ("medium", 0.5), ("high", 0.75),
+             ("critical", 1.0)],
+            [(str(row[0]), float(str(row[1]))) for row in bands],
+        )
+
+    # -- criterion 5: an unlock constrains a value, it does not replace one ------
+
+    def test_an_unlock_cannot_rank_a_task_nobody_has_estimated(self):
+        for name, _ in self.CANDIDATES:
+            self.assertGreater(
+                self.component(self.scored_before_estimates, "chain_unlock_value", name), 0
+            )
+            self.assertIsNone(
+                self.component(self.scored_before_estimates, "direct_value", name)
+            )
+            self.assertIsNone(self.component(self.scored_before_estimates, "priority", name))
+
+    def test_the_chain_unlock_is_the_whole_of_the_unlock_and_stays_under_the_cap(self):
+        # 026's unlock term and this one share `unlock_value` and `w_unlock`, so
+        # a chain unlock cannot buy a Task past the ceiling a dependency unlock
+        # is already held to. That the two are EQUAL here is an identity rather
+        # than an accident, and the first assertion is why: a sound edge is one
+        # `derive_task_dependencies` wrote, both its rules name a `recon` or a
+        # `validate` Task as the unlocker, and a Task that carries a chain unlock
+        # is a `hunt` Task -- so `unlock_for` is structurally zero for every Task
+        # this term can reach, and the sum is exercised by its bound rather than
+        # by two non-zero summands. Read off the two functions and not off the
+        # column, so that "the column is their sum" is a claim about the pass.
+        for name, _ in self.CANDIDATES:
+            direct, chain = self.terms_when_ranked[self.task[name]]
+            scored = self.scored_when_ranked[self.task[name]]
+
+            self.assertEqual(0.0, direct)
+            self.assertEqual(scored["chain_unlock_value"], chain)
+            self.assertEqual(min(direct + chain, 1.0), scored["unlock_value"])
+            self.assertLessEqual(scored["unlock_value"], 1.0)
+
+    # -- criterion 6: the comparison, and the flip ------------------------------
+
+    def test_a_useful_low_cost_pivot_outranks_a_task_no_chain_is_waiting_on(self):
+        ranked = self.scored_when_ranked
+
+        # The isolated Task promises MORE on its own -- 0.30 against 0.20 -- so
+        # everything below is the unlock term and nothing else.
+        self.assertEqual(0.3, self.component(ranked, "direct_value", "isolated"))
+        self.assertEqual(0.0, self.component(ranked, "chain_unlock_value", "isolated"))
+        for name, _ in self.CANDIDATES:
+            self.assertEqual(0.2, self.component(ranked, "direct_value", name))
+            self.assertGreater(
+                self.component(ranked, "priority", name),
+                self.component(ranked, "priority", "isolated"),
+            )
+
+    def test_the_three_tasks_differ_in_nothing_but_what_they_unlock(self):
+        # The claim above is only about the unlock term if the other seven
+        # components are equal, and they are: three hunt Tasks in one Program
+        # read the same run history, and none of them carries a skill, a lease or
+        # an attempt the others do not.
+        ranked = self.scored_when_ranked
+        for name in ("novelty", "estimated_cost", "estimated_time", "safety_cost",
+                     "confidence_of_execution"):
+            self.assertEqual(
+                [self.component(ranked, name, "alpha")] * 3,
+                [self.component(ranked, name, who)
+                 for who in ("alpha", "beta", "isolated")],
+                name,
+            )
+
+    def test_an_unsound_proposal_is_never_a_chain_and_so_contributes_nothing(self):
+        # The other half of criterion 6, and stronger than a zero: `token`
+        # requires `other_account_data`, which the entry set does not hold and
+        # `sideways` does not provide, so there is no chain for a frontier to
+        # read at all.
+        self.assertEqual(
+            f"step {self.of['token']['label']} requires other_account_data,"
+            " and no step provides it and the Program does not start with it",
+            self.unsound_proposal["refusal"],
+        )
+        self.assertIsNone(self.unsound_proposal["chain"])
+        # And the two that do compose are sound, so the refusal above is about
+        # the members and not about the ground under all three.
+        self.assertEqual({"line": True, "long": True}, self.sound)
+
+        # "Contributes nothing" as a count and not as an inference: the Program
+        # holds the two chains that composed and no third row, so there is no
+        # chain for the frontier to read and every unlock row this case ever saw
+        # named one of the two. A refused proposal that had left a row behind
+        # would be a chain nobody built paying into a queue.
+        self.assertEqual(
+            sorted([self.line["chain"], self.long["chain"]]),
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT label FROM chains WHERE program_id = $1::uuid",
+                    (self.program_id,),
+                )
+            ),
+        )
+        self.assertEqual(
+            {self.line["chain"], self.long["chain"]},
+            {row[1] for row in self.rows_when_derived},
+        )
+
+    # -- criterion 4: what the chains stop supporting ---------------------------
+
+    def test_a_candidate_that_leaves_the_surface_gives_its_share_back(self):
+        self.assertEqual(2, self.pass_after_a_subject_left["unlocks_withdrawn"])
+        self.assertEqual(0, self.pass_after_a_subject_left["unlocks_derived"])
+        self.assertEqual(
+            "abandoned", self.scored_when_one_left[self.task["beta"]]["status"]
+        )
+        self.assertEqual(
+            [(self.task["alpha"], self.line["chain"], self.MISSING,
+              self.member["third"]["finding"]),
+             (self.task["alpha"], self.long["chain"], self.MISSING,
+              self.member["third"]["finding"])],
+            sorted(self.rows_when_one_left),
+        )
+
+        # One pending Task can reach the member now, so it is worth the whole
+        # band to it rather than half of one.
+        self.assertEqual(
+            self.BAND_WEIGHT,
+            self.component(self.scored_when_one_left, "chain_unlock_value", "alpha"),
+        )
+
+    def test_a_pivot_that_would_no_longer_be_stamped_stops_being_worth_reaching(self):
+        # The chains are untouched and still sound, which is what makes this a
+        # different sentence from the one below: what stopped holding is the
+        # stamp they are waiting FOR, and a frontier reading `pivot_stamps`
+        # alone would not have noticed -- rejecting a Finding leaves its stamp
+        # row exactly where it was.
+        self.assertEqual({"line": True, "long": True}, self.sound_without_the_pivot)
+        self.assertEqual(2, self.pass_without_the_pivot["unlocks_withdrawn"])
+        self.assertEqual(0, self.pass_without_the_pivot["unlocks_derived"])
+        self.assertEqual([], self.rows_without_the_pivot)
+        self.assertEqual(
+            0.0, self.component(self.scored_without_the_pivot, "chain_unlock_value", "alpha")
+        )
+
+        # And back: two rows again, the whole band again, and no second candidate
+        # Task minted for a hypothesis that already has one.
+        self.assertEqual(2, self.pass_when_the_pivot_returned["unlocks_derived"])
+        self.assertEqual(0, self.pass_when_the_pivot_returned["unlock_candidates"])
+        self.assertEqual(2, len(self.rows_when_the_pivot_returned))
+        self.assertEqual(
+            self.BAND_WEIGHT,
+            self.component(self.scored_when_the_pivot_returned, "chain_unlock_value", "alpha"),
+        )
+
+    def test_an_invalidated_member_takes_every_unlock_under_it_with_it(self):
+        # Both chains carry `first` and neither survives it, and nothing in the
+        # derivation names an invalidated member: the frontier reads 040's
+        # soundness sentence, an unsound chain drops out of it, and every row
+        # under it is the complement of a frontier it is no longer in.
+        self.assertEqual({"line": False, "long": False}, self.sound_at_the_end)
+        self.assertEqual(2, self.pass_after_the_member_went["unlocks_withdrawn"])
+        self.assertEqual(0, self.pass_after_the_member_went["unlocks_derived"])
+        self.assertEqual([], self.rows_at_the_end)
+
+    def test_the_task_no_chain_is_waiting_on_takes_the_lead_back(self):
+        # The flip, in the same Program with the same three Tasks: the ordering
+        # under test reverses when the reason for it stops holding, which a
+        # single pass could never show.
+        ended = self.scored_at_the_end
+        self.assertEqual(0.0, self.component(ended, "chain_unlock_value", "alpha"))
+        self.assertGreater(
+            self.component(ended, "priority", "isolated"),
+            self.component(ended, "priority", "alpha"),
+        )
+
+    # -- the audit --------------------------------------------------------------
+
+    def test_the_ranking_factors_account_for_the_chain_unlock(self):
+        factors = json.loads(
+            str(
+                self.connection.execute(
+                    "SELECT task_rank_factors(t) FROM tasks t"
+                    " WHERE t.program_id = $1::uuid AND t.label = $2",
+                    (self.program_id, self.task["alpha"]),
+                ).scalar()
+            )
+        )
+
+        self.assertIn("chain_unlock", factors)
+        self.assertEqual(0.0, float(str(factors["chain_unlock"])))
+
+    def test_the_pass_records_what_it_derived_and_what_it_withdrew(self):
+        payload = json.loads(
+            str(
+                self.connection.execute(
+                    "SELECT payload FROM events"
+                    " WHERE program_id = $1::uuid AND type = 'scheduler.ranked'"
+                    " ORDER BY seq DESC LIMIT 1",
+                    (self.program_id,),
+                ).scalar()
+            )
+        )
+
+        self.assertEqual({"candidates": 0, "derived": 0, "withdrawn": 2},
+                         payload["chain_unlocks"])
+
+    def test_the_standing_check_holds_over_every_pass_this_case_ran(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 

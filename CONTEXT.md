@@ -337,6 +337,25 @@ _Avoid_: Blocker, link, prerequisite, dependency edge (an edge between two
 entities is a Relationship; the word is fine in prose about this table, the noun
 in this system is Task dependency)
 
+**Chain unlock**:
+One capability a sound Kill chain is exactly one requirement short of, paired
+with the unrun Test claiming to provide it. Named rather than predicted: the row
+says this Task, that chain, this capability, that member Finding, and there is no
+column a probability or an expected outcome could live in -- whether the
+capability arrives is what running the Task finds out. One hop and never two,
+because a second hop rests on a first nobody has demonstrated. What it is worth
+is read off the severity the member is stated at, and only where a Severity basis
+other than `undetermined` stands under it: the severity a Finding is born with is
+a default rather than an assessment and counts as nothing. That worth is shared
+between the pending Tasks that could each reach the member, and a member two
+chains want is worth its severity once, not twice. Recomputed on every Ranking
+pass and kept only while the rows still support it, so a member withdrawn, a
+pivot the stamp rule would no longer issue, a moved scope version or a subject
+off the Surface all stop it paying without the derivation naming any of them. It
+constrains a value and never replaces one: a Task nobody has estimated stays
+unranked however much waits behind it.
+_Avoid_: Attack path value, potential, expected value, unlock probability
+
 **Slate**:
 The bounded set of tasks the runtime offers the orchestrator to choose from. The
 runtime decides what may be chosen; the orchestrator decides which; the runtime
