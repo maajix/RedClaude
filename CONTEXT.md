@@ -112,6 +112,16 @@ whether two hypotheses are the same one.
 _Avoid_: Category, bug type, vuln type (a vulnerability class is what a *finding*
 has)
 
+**Cell**:
+What makes two claims, or two findings, the same one: the Program, the Property
+class, the subject entity and the identity pair, read as a single key. Most
+findings name no identity and share the anonymous half of it, which is why the
+two identity columns count as equal when both are absent rather than as two
+different cells. One live finding occupies a cell; a hypothesis that settles onto
+an occupied one merges into what is there.
+_Avoid_: Bucket, group, dedup key, fingerprint (a surface fingerprint is a
+different thing)
+
 **Test**:
 An immutable executable specification for settling one hypothesis: the five
 parts `preconditions`, `setup`, `actions`, `assertions`, `cleanup`, and nothing
@@ -158,9 +168,36 @@ _Avoid_: Rerun, reproduction, playback
 A claimed vulnerability resting on one or more hypotheses, moving through
 `candidate -> validating -> validated | rejected -> reported`. It cannot be
 validated without the test run that reproduced it, and only a human moves it to
-reported.
+reported. It is born a candidate and nothing else: at `info`, on no severity
+basis, naming the Property class it rests on, the exact holding Test run that
+settled the claim, and what that run demonstrated. The later states are reached
+by transition, never by birth, so a Finding that is validated is one something
+validated. The cell it occupies is the claim's cell -- Program, Property class,
+subject and identity pair -- and one live Finding occupies it: a second proposal
+onto the same cell merges into the first, adding its evidence and its claim
+rather than opening a rival. Every proposal is kept either way, accepted or
+refused with the sentence that refused it, beside the Findings and reachable
+from none of them.
 _Avoid_: Vulnerability, issue, bug, report (the report is the document a finding
 renders into)
+
+**Demonstrated behaviour**:
+What a candidate says its holding run showed, read off that run rather than
+written by anyone: the kinds of assertion that held, the roles of the exchanges
+they were evaluated over, and how many Receipts are under it. Not a taxonomy --
+a fifth vocabulary of behaviours would be model-authored, and the run has
+already answered the question in the two vocabularies a Test is written in.
+_Avoid_: Impact, severity, proof of concept
+
+**Severity basis**:
+The ground a finding's severity stands on, stated with the severity and never
+apart from it: `undetermined` while nothing has been demonstrated, and otherwise
+one of `demonstrated_impact` (the harness performed it and has the receipts),
+`constrained_inference` (it follows from what was demonstrated, and the step was
+not performed) or `program_context` (the program says this class of thing matters
+here). A candidate is born `undetermined` and stays `info` until one of the other
+three is stated.
+_Avoid_: Confidence, likelihood, CVSS (a report renders one; the basis is not it)
 
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which

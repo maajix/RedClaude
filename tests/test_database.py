@@ -1841,6 +1841,41 @@ CONTROLS = (
         "        SELECT t, p, s, spec_sha256 FROM tests WHERE id = s;"
         " END $ctl$",
     ),
+    Control(
+        # PH2-36 criterion 1: a candidate resting on a run that concluded
+        # nothing. `open_finding` refuses the proposal outright and the birth
+        # guard only asks that a run be named, so this is what the state looks
+        # like when a Finding was written around the front door: a claim
+        # presented as settled by a run that settled nothing.
+        "standing:finding_candidates",
+        "DO $ctl$ DECLARE p uuid; e uuid; h uuid; s uuid; r uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('candidate-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'candidate-selftest', 'tech:candidate-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+        "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
+        "                'a self test')"
+        "     RETURNING id INTO h;"
+        "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+        f"        VALUES (p, h, '{json.dumps(SPECIFICATION)}'::jsonb,"
+        f"                rk2_test_spec_digest('{json.dumps(SPECIFICATION)}'::jsonb))"
+        "     RETURNING id INTO s;"
+        "   INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
+        "        VALUES (p, s, 'replay', 'inconclusive',"
+        "                '{\"assertions\":[],\"failed\":[],\"cleanup\":\"done\"}'::jsonb)"
+        "     RETURNING id INTO r;"
+        "   INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
+        "                         property_class, opened_by_test_run_id, demonstrated)"
+        "        VALUES (p, e, (SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1),"
+        "                'a self test', (SELECT property_class FROM hypotheses WHERE id = h), r,"
+        "                '{\"assertion_kinds\":[\"status_differs\"],"
+        "                  \"roles\":[\"baseline\",\"control\"],\"receipts\":1}'::jsonb);"
+        " END $ctl$",
+    ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
@@ -14412,95 +14447,101 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
     def finding(cls, name: str, subject: str, status: str) -> str:
         """One Finding of the given status, with everything that status needs.
 
-        A candidate needs a Hypothesis with a test spec, because that is what
-        `validate.no_test_spec` asks for. A validated one needs all of that and
-        a run of the spec as well: `findings` refuses `validated` without the
-        `test_runs` row, which is Q27 in the schema -- validated means the
-        runtime re-ran it.
+        Every Finding needs a Hypothesis with a test spec, because that is what
+        `validate.no_test_spec` asks for, and a holding run of that spec: since
+        036 a Finding is born a candidate and a candidate names the run that
+        settled its claim. Q27 in the schema wanted the same `test_runs` row one
+        state later, for `validated`.
 
-        And re-running it leaves a trail. 035's `replay_run_without_receipts`
+        And running the spec leaves a trail. 035's `replay_run_without_receipts`
         reports a replay run that concluded on no exchange at all, which is
         what a bare `test_runs` row is: a validation nothing was validated by.
         So the run is built the way `close_test_replay` builds one -- a
         replay-bound capability, a Receipt of the run's own Lane under it, and
         the citation joining the two -- and the capability is closed against
         the run it produced, which is the state a finished replay is in.
+
+        `validated` is then reached the only way there is to reach it: two
+        transition rows through `validating`, over two Observations of the run's
+        own Receipt, one of them the control the rule asks for. Nothing here
+        writes the status directly -- 015's cache guard refuses that -- so the
+        seeded Finding is one the machine would have produced.
         """
         program_id = cls.identifiers[name]
         hypothesis = cls.hypothesis(name, subject, "worth judging")
         test = str(
             cls.scalar(TEST_SPEC, (program_id, hypothesis, json.dumps(SPECIFICATION)))
         )
-        run = None
-        if status == "validated":
-            holder = str(
-                cls.scalar(
-                    "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
-                    " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session',"
-                    " 'operator', 'low', '{}'::jsonb) RETURNING id::text",
-                    (program_id,),
-                )
+        holder = str(
+            cls.scalar(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session',"
+                " 'operator', 'low', '{}'::jsonb) RETURNING id::text",
+                (program_id,),
             )
-            # The `test_replays` row is what makes the capability replay-bound:
-            # `rk2_capability_lane` reads this table and nothing else, so
-            # without it the Receipt below would claim a Lane its own Tool run
-            # does not hold.
-            capability = str(
-                cls.scalar(
-                    "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
-                    " transport, decision, egress_token_sha256, egress_token_expires_at)"
-                    " VALUES ($1::uuid, $2::uuid, rk2_replay_tool(), '{}'::jsonb,"
-                    "         'running', 'runtime', 'allow', $3,"
-                    "         clock_timestamp() + interval '1 hour') RETURNING id::text",
-                    (program_id, holder, os.urandom(32).hex()),
-                )
+        )
+        # The `test_replays` row is what makes the capability replay-bound:
+        # `rk2_capability_lane` reads this table and nothing else, so without it
+        # the Receipt below would claim a Lane its own Tool run does not hold.
+        capability = str(
+            cls.scalar(
+                "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
+                " transport, decision, egress_token_sha256, egress_token_expires_at)"
+                " VALUES ($1::uuid, $2::uuid, rk2_replay_tool(), '{}'::jsonb,"
+                "         'running', 'runtime', 'allow', $3,"
+                "         clock_timestamp() + interval '1 hour') RETURNING id::text",
+                (program_id, holder, os.urandom(32).hex()),
             )
-            cls.as_owner(
-                "INSERT INTO test_replays (tool_run_id, program_id, test_id, spec_sha256)"
-                " SELECT $1::uuid, $2::uuid, id, spec_sha256 FROM tests WHERE id = $3::uuid",
-                (capability, program_id, test),
+        )
+        cls.as_owner(
+            "INSERT INTO test_replays (tool_run_id, program_id, test_id, spec_sha256)"
+            " SELECT $1::uuid, $2::uuid, id, spec_sha256 FROM tests WHERE id = $3::uuid",
+            (capability, program_id, test),
+        )
+        receipt = str(
+            cls.scalar(
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                " ts_arrival, scope_class, scope_version)"
+                " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed', 'seeded', now(),"
+                "         'target', (SELECT max(version) FROM program_scope_versions"
+                "                     WHERE program_id = $1::uuid)) RETURNING id::text",
+                (program_id, capability),
             )
-            receipt = str(
-                cls.scalar(
-                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
-                    " ts_arrival, scope_class, scope_version)"
-                    " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed', 'seeded', now(),"
-                    "         'target', (SELECT max(version) FROM program_scope_versions"
-                    "                     WHERE program_id = $1::uuid)) RETURNING id::text",
-                    (program_id, capability),
-                )
+        )
+        run = str(
+            cls.scalar(
+                "INSERT INTO test_runs (program_id, test_id, lane, outcome,"
+                " assertion_results)"
+                " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', $3::jsonb)"
+                " RETURNING id::text",
+                (program_id, test,
+                 json.dumps({"assertions": [], "failed": [], "cleanup": "done"})),
             )
-            run = str(
-                cls.scalar(
-                    "INSERT INTO test_runs (program_id, test_id, lane, outcome,"
-                    " assertion_results)"
-                    " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', $3::jsonb)"
-                    " RETURNING id::text",
-                    (program_id, test,
-                     json.dumps({"assertions": [], "failed": [], "cleanup": "done"})),
-                )
-            )
-            cls.as_owner(
-                "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id,"
-                " ordinal, role) VALUES ($1::uuid, $2::uuid, $3::uuid, 1, 'baseline')",
-                (program_id, run, receipt),
-            )
-            cls.as_owner(
-                "UPDATE test_replays SET test_run_id = $2::uuid WHERE tool_run_id = $1::uuid",
-                (capability, run),
-            )
-            cls.as_owner(
-                "UPDATE tool_runs SET status = 'success', finished_at = now()"
-                " WHERE id = $1::uuid",
-                (capability,),
-            )
+        )
+        cls.as_owner(
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id,"
+            " ordinal, role) VALUES ($1::uuid, $2::uuid, $3::uuid, 1, 'baseline')",
+            (program_id, run, receipt),
+        )
+        cls.as_owner(
+            "UPDATE test_replays SET test_run_id = $2::uuid WHERE tool_run_id = $1::uuid",
+            (capability, run),
+        )
+        cls.as_owner(
+            "UPDATE tool_runs SET status = 'success', finished_at = now()"
+            " WHERE id = $1::uuid",
+            (capability,),
+        )
         finding = str(
             cls.scalar(
                 "INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
-                " severity, status, validated_by_test_run_id)"
-                " VALUES ($1::uuid, $2::uuid, $3, 'a seeded finding', 'medium', $4,"
-                " $5::uuid) RETURNING id::text",
-                (program_id, subject, FINDING_CLASS, status, run),
+                " property_class, opened_by_test_run_id, demonstrated)"
+                " VALUES ($1::uuid, $2::uuid, $3, 'a seeded finding',"
+                "         (SELECT property_class FROM hypotheses WHERE id = $4::uuid),"
+                "         $5::uuid, $6::jsonb) RETURNING id::text",
+                (program_id, subject, FINDING_CLASS, hypothesis, run,
+                 json.dumps({"assertion_kinds": ["status_differs"],
+                             "roles": ["baseline", "control"], "receipts": 1})),
             )
         )
         cls.as_owner(
@@ -14508,7 +14549,77 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             " VALUES ($1::uuid, $2::uuid)",
             (finding, hypothesis),
         )
+        # The six identifiers travel together and were all produced above, so
+        # they are handed over as the one thing they are: the seeded Finding and
+        # the rows it was built out of.
+        seeded = {
+            "finding":    finding,
+            "hypothesis": hypothesis,
+            "program_id": program_id,
+            "subject":    subject,
+            "receipt":    receipt,
+            "run":        run,
+        }
+        if status == "validated":
+            cls.validate(seeded)
         return finding
+
+    @classmethod
+    def validate(cls, seeded: dict) -> None:
+        """Walk one candidate to `validated`, satisfying every rule on the way.
+
+        `transition_rules` asks `validating -> validated` for a runtime actor, a
+        Receipt the validating run itself produced, two supporting Observations
+        and one of them a control. 037 is what teaches the runtime to do this;
+        until then the fixture does it by hand, because the alternative is a
+        `validated` row nothing validated.
+        """
+        finding, hypothesis = seeded["finding"], seeded["hypothesis"]
+        program_id, subject = seeded["program_id"], seeded["subject"]
+        receipt, run = seeded["receipt"], seeded["run"]
+        for role, kind in (("baseline", "response_differential"),
+                           ("control", "response_invariant")):
+            observation = str(
+                cls.scalar(
+                    "INSERT INTO observations (program_id, subject_entity_id, kind,"
+                    " summary, provenance_kind, receipt_id)"
+                    " VALUES ($1::uuid, $2::uuid, $3, $4, 'receipt', $5::uuid)"
+                    " RETURNING id::text",
+                    (program_id, subject, kind, f"the {role} answer", receipt),
+                )
+            )
+            cls.as_owner(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id,"
+                " polarity, role) VALUES ($1::uuid, $2::uuid, 'supports', $3)",
+                (hypothesis, observation, role),
+            )
+            cls.as_owner(
+                "INSERT INTO finding_evidence (finding_id, observation_id, ordinal)"
+                " VALUES ($1::uuid, $2::uuid,"
+                "         (SELECT coalesce(max(ordinal), 0) + 1 FROM finding_evidence"
+                "           WHERE finding_id = $1::uuid))",
+                (finding, observation),
+            )
+        cls.as_owner(
+            "INSERT INTO finding_transitions (program_id, finding_id, from_status,"
+            " to_status, actor_kind, rationale)"
+            " VALUES ($1::uuid, $2::uuid, 'candidate', 'validating', 'runtime',"
+            "         'seeded for the slate')",
+            (program_id, finding),
+        )
+        # Set before the second transition, not after: the guard reads
+        # `validated_by_test_run_id` off the row to check whose test it was.
+        cls.as_owner(
+            "UPDATE findings SET validated_by_test_run_id = $2::uuid WHERE id = $1::uuid",
+            (finding, run),
+        )
+        cls.as_owner(
+            "INSERT INTO finding_transitions (program_id, finding_id, from_status,"
+            " to_status, actor_kind, receipt_id, rationale)"
+            " VALUES ($1::uuid, $2::uuid, 'validating', 'validated', 'runtime',"
+            "         $3::uuid, 'seeded for the slate')",
+            (program_id, finding, receipt),
+        )
 
     # -- criterion 1: the same rows and weights reach the same order -----------
 
@@ -22627,23 +22738,22 @@ def specification(
     )
 
 
-class ReplayTestRunTest(DatabaseCase):
-    """Ticket 35: one Test performed through the replay Lane, end to end.
+class ReplayFixture:
+    """One Program, and the moves that carry a claim through a replayed Test.
 
-    Everything runs as `rk2_runtime` and commits, because the thing under test is
-    a sequence of verbs across transactions: the plan is committed before a
-    request is made, each action is recorded as it happens, and the close settles
-    a claim by reading rows the earlier transactions wrote. A case that rolled
-    back would be testing none of that.
+    Opening a Program, stating a claim, storing a Test of it, walking the plan
+    and closing the run are the same statements whatever the case is about, and
+    two tickets are about different things: 35 is about the run, 36 about the
+    Finding a settled claim produces. Shared here so that a change to how a
+    replay is walked is one edit rather than one per ticket that walks one.
 
-    The Receipts are written by the owner rather than by the door. What produces
-    one in production is `write_allowed_receipt` on the proxy's session, which is
-    tested where the door is tested; what this case needs is the Lane on the row,
-    and the control that matters -- that a `replay` Receipt still requires a live
-    capability behind it -- is proved directly in its own arm below.
+    A subclass names its own `slug`, because the teardown purges by it and two
+    cases sharing a Program would each be an assertion about whichever ran
+    first.
     """
 
     settings_for = "runtime"
+    slug = REPLAY_SLUG
 
     OPEN = "SELECT open_test_replay($1::uuid, $2::uuid, $3)"
     RECORD = "SELECT record_test_action($1::uuid, $2::integer, $3)"
@@ -22655,7 +22765,7 @@ class ReplayTestRunTest(DatabaseCase):
         super().setUpClass()
         opened = program.run(
             cls.harness.runtime,
-            write(VALID.replace('name = "acme-web"', f'name = "{REPLAY_SLUG}"')),
+            write(VALID.replace('name = "acme-web"', f'name = "{cls.slug}"')),
         )
         assert opened.ok, opened.violations
         cls.program_id = opened.facts["program_id"]
@@ -22664,16 +22774,6 @@ class ReplayTestRunTest(DatabaseCase):
         )
         cls.owner_connection = pg.connect(cls.harness.migrate)
         cls.refusals = {}
-
-        cls.settle_one_that_holds()
-        cls.settle_one_that_refutes()
-        cls.leave_one_inconclusive()
-        cls.settle_one_that_holds_and_cannot_say_so()
-        cls.refuse_a_request_the_door_would_not_send()
-        cls.refuse_what_a_run_may_not_cite()
-        cls.refuse_a_specification_nobody_should_store()
-        cls.refuse_a_replay_the_conditions_do_not_admit()
-        cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
 
     @classmethod
     def tearDownClass(cls):
@@ -22691,7 +22791,7 @@ class ReplayTestRunTest(DatabaseCase):
                 " UNION"
                 " SELECT sha256 FROM artifact_references"
                 " WHERE program_id IN (SELECT id FROM programs WHERE slug LIKE $1)",
-                (REPLAY_SLUG + "%",),
+                (cls.slug + "%",),
             ).rows
             if row[0] is not None
         ]
@@ -22700,9 +22800,9 @@ class ReplayTestRunTest(DatabaseCase):
             cls.connection.execute(
                 "DELETE FROM artifact_seal WHERE scope_kind = 'program'"
                 "   AND scope_id IN (SELECT id FROM programs WHERE slug LIKE $1)",
-                (REPLAY_SLUG + "%",),
+                (cls.slug + "%",),
             )
-            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (REPLAY_SLUG + "%",))
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (cls.slug + "%",))
             cls.connection.execute(
                 "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
                 ("{" + ",".join(kept) + "}",),
@@ -22729,14 +22829,23 @@ class ReplayTestRunTest(DatabaseCase):
         return refusal_message(cls.connection, sql, parameters)
 
     @classmethod
-    def claim_waiting(cls, statement: str) -> tuple[str, str]:
+    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
+        return cls.connection.execute(sql, parameters).rows
+
+    def rows(self, sql: str, parameters: tuple = ()) -> list:
+        return self.connection.execute(sql, parameters).rows
+
+    @classmethod
+    def claim_waiting(cls, statement: str, subject: str | None = None) -> tuple[str, str]:
         """One claim waiting to be tested, and the subject it is about.
 
         Fresh each time, because the machine allows one claim to be in `testing`
         once and every walk below settles the claim it opened: sharing one would
-        make each arm an assertion about whichever walk got there first.
+        make each arm an assertion about whichever walk got there first. A
+        caller that passes a subject is one that wants two claims about the same
+        thing, which is a different arrangement and never the default.
         """
-        subject = offline_entity(cls.connection, cls.program_id)
+        subject = subject or offline_entity(cls.connection, cls.program_id)
         hypothesis = committed(
             cls.connection,
             "INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
@@ -22833,6 +22942,7 @@ class ReplayTestRunTest(DatabaseCase):
         *,
         answers: dict[int, tuple[int, str | None]],
         cleanup: str = "done",
+        subject: str | None = None,
     ) -> dict:
         """One whole replay: open it, answer each action, close it.
 
@@ -22841,7 +22951,7 @@ class ReplayTestRunTest(DatabaseCase):
         the only way a run reaches the close with an assertion it cannot
         evaluate.
         """
-        hypothesis, subject = cls.claim_waiting(name)
+        hypothesis, subject = cls.claim_waiting(name, subject)
         test = cls.stored(hypothesis, spec)
         plan = cls.called(cls.OPEN, (cls.replay_run(), test, None))
         for action in plan["actions"]:
@@ -22861,6 +22971,36 @@ class ReplayTestRunTest(DatabaseCase):
             "plan": plan,
             "closed": closed,
         }
+
+
+class ReplayTestRunTest(ReplayFixture, DatabaseCase):
+    """Ticket 35: one Test performed through the replay Lane, end to end.
+
+    Everything runs as `rk2_runtime` and commits, because the thing under test is
+    a sequence of verbs across transactions: the plan is committed before a
+    request is made, each action is recorded as it happens, and the close settles
+    a claim by reading rows the earlier transactions wrote. A case that rolled
+    back would be testing none of that.
+
+    The Receipts are written by the owner rather than by the door. What produces
+    one in production is `write_allowed_receipt` on the proxy's session, which is
+    tested where the door is tested; what this case needs is the Lane on the row,
+    and the control that matters -- that a `replay` Receipt still requires a live
+    capability behind it -- is proved directly in its own arm below.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.settle_one_that_holds()
+        cls.settle_one_that_refutes()
+        cls.leave_one_inconclusive()
+        cls.settle_one_that_holds_and_cannot_say_so()
+        cls.refuse_a_request_the_door_would_not_send()
+        cls.refuse_what_a_run_may_not_cite()
+        cls.refuse_a_specification_nobody_should_store()
+        cls.refuse_a_replay_the_conditions_do_not_admit()
+        cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
 
     # -- the three outcomes ----------------------------------------------------
 
@@ -23305,13 +23445,6 @@ class ReplayTestRunTest(DatabaseCase):
             )
         finally:
             human.close()
-
-    @classmethod
-    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
-        return cls.connection.execute(sql, parameters).rows
-
-    def rows(self, sql: str, parameters: tuple = ()) -> list:
-        return self.connection.execute(sql, parameters).rows
 
     # -- criterion 1: the shape is the constraint ------------------------------
 
@@ -24332,6 +24465,581 @@ class ReplayCommandTest(DatabaseCase):
         problems = self.rows("SELECT * FROM check_test_replays()")
 
         self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
+
+
+class CandidateFindingTest(ReplayFixture, DatabaseCase):
+    """Ticket 36: one candidate Finding, opened from a claim its own run settled.
+
+    The arrangement is 35's, because that is the only way a claim reaches
+    `supported` here: a Test is stored, replayed through the door, and closed,
+    and the close writes the transition this ticket's guard reads. Nothing
+    below shortcuts that -- a Finding opened from a claim that was moved into
+    `supported` by hand would be a test of the fixture rather than of the rule.
+
+    The two runs written directly are the exception, and they are written that
+    way because the front door refuses to produce them: `open_test_replay`
+    admits one in-flight replay per claim and only against a `testable` one, so
+    a second run of a settled claim's Test is exactly the row an attacker or a
+    careless migration would have to forge, and the guard has to refuse it.
+    """
+
+    slug = "selftest-finding"
+
+    OPEN_FINDING = "SELECT open_finding($1::uuid, $2::uuid, $3, $4)"
+
+    HELD = [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-control-is-not", "kind": "status_differs", "action": 3, "against": 2},
+        {"id": "the-bodies-differ", "kind": "body_differs", "action": 1, "against": 2},
+    ]
+    ANSWERS = {1: (200, "order one"), 2: (200, "order two"), 3: (403, "denied")}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.klass = str(
+            cls.connection.execute(
+                "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
+            ).scalar()
+        )
+        cls.held = cls.walked(
+            "the orders API leaks a neighbour's order",
+            specification(cls.HELD),
+            answers=cls.ANSWERS,
+        )
+        cls.run_id = cls.held["closed"]["test_run_id"]
+
+        cls.opened = cls.called(
+            cls.OPEN_FINDING,
+            (cls.held["hypothesis"], cls.run_id, cls.klass, "  a neighbour's order is served  "),
+        )
+        cls.merged = cls.called(
+            cls.OPEN_FINDING,
+            (cls.held["hypothesis"], cls.run_id, cls.klass, "the same cell, proposed again"),
+        )
+        cls.refuse_what_did_not_settle_it()
+        cls.refuse_what_the_row_may_not_say()
+        cls.problems = cls.rows_of("SELECT * FROM check_finding_candidates()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def forged_run(cls, outcome: str) -> str:
+        """A second run of the settled claim's Test, written around the verbs.
+
+        `assertion_results` says what such a row would claim for itself, so that
+        the refusal below is about the run's relationship to the claim rather
+        than about a document that could not be read.
+        """
+        return committed(
+            cls.connection,
+            "INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
+            " VALUES ($1::uuid, $2::uuid, 'replay', $3, $4::jsonb) RETURNING id",
+            (
+                cls.program_id,
+                cls.held["test"],
+                outcome,
+                json.dumps(
+                    {
+                        "assertions": [
+                            {"id": assertion["id"], "held": outcome == "holds"}
+                            for assertion in cls.HELD
+                        ],
+                        "failed": [] if outcome == "holds" else [cls.HELD[0]["id"]],
+                        "cleanup": "done",
+                    }
+                ),
+            ),
+        )
+
+    @classmethod
+    def proposed(cls, key: str, parameters: tuple) -> None:
+        """One proposal the guard is expected to refuse, and the sentence it gave."""
+        answer = cls.called(cls.OPEN_FINDING, parameters)
+        assert answer["outcome"] == "refused", answer
+        cls.refusals[key] = answer["refusal"]
+
+    @classmethod
+    def refuse_what_did_not_settle_it(cls):
+        """Criterion 5, one arrangement per vector it names.
+
+        The adjacent claim is a whole second walk rather than a bare row: what
+        the guard compares is the Test's own `hypothesis_id`, and a claim with
+        no Test of its own would be refused a step earlier and prove nothing.
+        """
+        cls.proposed(
+            "unknown_claim",
+            ("00000000-0000-0000-0000-000000000000", cls.run_id, cls.klass, "a claim of nobody"),
+        )
+
+        # A claim that held every assertion and could not be settled: 35's own
+        # arrangement, where the control was never answered. `supported` is what
+        # the guard asks for and `testing` is what this is.
+        unsettled = cls.walked(
+            "the orders API answers a neighbour's order at all",
+            specification(
+                [{"id": "the-variant-is-served", "kind": "status_equals",
+                  "action": 2, "status": 200}]
+            ),
+            answers={1: (200, "order one"), 2: (200, "order two")},
+        )
+        cls.proposed(
+            "claim_not_supported",
+            (unsettled["hypothesis"], unsettled["closed"]["test_run_id"], cls.klass,
+             "a claim that never settled"),
+        )
+
+        # A model completion claim, which is the one vector of criterion 5 that
+        # has no field to arrive through: `open_finding` takes a claim, a run, a
+        # class and a title, and a model filling all four in changes nothing
+        # about what any of them say. So the only way in is the transition, and
+        # the model tries it on the claim above, from where the run left it and
+        # citing a real Receipt of the run it watched -- everything a model could
+        # bring. 007 calls the model `llm`, and the answer is not about the actor
+        # at all: a claim that came back inconclusive has no arm into `supported`
+        # for anybody, and the one arm that exists is the runtime's own.
+        cls.refusals["model_settled_the_claim"] = cls.refuse(
+            "INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status,"
+            "                                    to_status, actor_kind, receipt_id, rationale)"
+            " VALUES ($1::uuid, $2::uuid, 'inconclusive', 'supported', 'llm', $3::uuid,"
+            "         'the model read the answers and is satisfied')",
+            (
+                cls.program_id,
+                unsettled["hypothesis"],
+                str(
+                    cls.rows_of(
+                        "SELECT receipt_id::text FROM test_run_receipts"
+                        " WHERE test_run_id = $1::uuid ORDER BY ordinal LIMIT 1",
+                        (unsettled["closed"]["test_run_id"],),
+                    )[0][0]
+                ),
+            ),
+        )
+        cls.proposed(
+            "model_completion",
+            (unsettled["hypothesis"], unsettled["closed"]["test_run_id"], cls.klass,
+             "a claim the model says is settled"),
+        )
+
+        # A failed replay. The claim it was a Test of is `refuted`, which is the
+        # whole of why a Finding may not rest on it.
+        refuted = cls.walked(
+            "the orders API leaks the whole ledger",
+            specification(
+                [{"id": "the-control-is-refused", "kind": "status_equals",
+                  "action": 3, "status": 403}]
+            ),
+            answers={1: (200, "a"), 2: (200, "b"), 3: (200, "c")},
+        )
+        cls.proposed(
+            "claim_refuted",
+            (refuted["hypothesis"], refuted["closed"]["test_run_id"], cls.klass,
+             "a claim its own Test refuted"),
+        )
+
+        # An adjacent claim: this run settled the neighbour, not this one.
+        adjacent = cls.walked(
+            "the orders API rejects a forged signature",
+            specification(cls.HELD),
+            answers=cls.ANSWERS,
+        )
+        cls.proposed(
+            "adjacent_claim",
+            (cls.held["hypothesis"], adjacent["closed"]["test_run_id"], cls.klass,
+             "the claim beside the one that settled"),
+        )
+
+        # A run of this claim's own Test that did not hold, and one that says it
+        # held and produced none of the evidence the settling transition cited.
+        cls.proposed(
+            "run_did_not_hold",
+            (cls.held["hypothesis"], cls.forged_run("inconclusive"), cls.klass,
+             "a run that concluded nothing"),
+        )
+        cls.proposed(
+            "unrelated_receipt",
+            (cls.held["hypothesis"], cls.forged_run("holds"), cls.klass,
+             "a run that produced no exchange the claim rests on"),
+        )
+
+        cls.proposed(
+            "unknown_class",
+            (cls.held["hypothesis"], cls.run_id, "sql-injection-probably",
+             "a class nobody defined"),
+        )
+        cls.proposed(
+            "no_title",
+            (cls.held["hypothesis"], cls.run_id, cls.klass, "   "),
+        )
+
+    @classmethod
+    def refuse_what_the_row_may_not_say(cls):
+        """Criteria 3 and 4, against the table rather than against the verb.
+
+        Every arm here is an INSERT the runtime is granted and `open_finding`
+        would never make. That is the point: criterion 4 is a property of the
+        row, and a rule that lived only inside the function would be a rule
+        anybody holding INSERT could walk around.
+        """
+        subject = offline_entity(cls.connection, cls.program_id)
+        cell = cls.rows_of(
+            "SELECT property_class, subject_entity_id::text FROM findings WHERE id = $1::uuid",
+            (cls.opened["finding_id"],),
+        )[0]
+        # Every column a case here may name, with the cast its parameter needs.
+        # A key outside this map is a column nobody meant to write.
+        CASTS = {
+            "program_id":              "::uuid",
+            "subject_entity_id":       "::uuid",
+            "opened_by_test_run_id":   "::uuid",
+            "validated_by_test_run_id": "::uuid",
+            "reported_at":             "::timestamptz",
+        }
+
+        def birth(**row) -> str:
+            """One INSERT the runtime is granted and `open_finding` would not make.
+
+            The column list and the parameters come out of the same mapping, so
+            a case that names a column supplies its value in the same breath.
+            Written the other way -- a fixed `$1..$9` and the dict's values as a
+            tuple -- a key the case added would land at position 10 and shift
+            every parameter after it into the wrong column, and the refusal
+            would be about whatever that produced rather than about the rule.
+            """
+            fields = {
+                "program_id":            cls.program_id,
+                "subject_entity_id":     subject,
+                "property_class":        cell[0],
+                "class_id":              cls.klass,
+                "title":                 "written around the verb",
+                "status":                "candidate",
+                "severity":              "info",
+                "severity_basis":        "undetermined",
+                "opened_by_test_run_id": cls.run_id,
+            }
+            assert set(row) <= set(fields) | set(CASTS), sorted(set(row) - set(CASTS))
+            fields.update(row)
+            names = list(fields)
+            run = names.index("opened_by_test_run_id") + 1
+            return cls.refuse(
+                "INSERT INTO findings (" + ", ".join(names) + ", demonstrated)"
+                " VALUES ("
+                + ", ".join(
+                    f"${position}{CASTS.get(name, '')}"
+                    for position, name in enumerate(names, 1)
+                )
+                + f", rk2_demonstrated(${run}::uuid))",
+                tuple(fields.values()),
+            )
+
+        cls.refusals["born_validated"] = birth(status="validated")
+        cls.refusals["born_severe"] = birth(severity="high", severity_basis="demonstrated_impact")
+        cls.refusals["born_with_a_basis"] = birth(severity_basis="demonstrated_impact")
+        cls.refusals["born_reported"] = birth(reported_at="2026-08-15T00:00:00+00")
+        cls.refusals["born_validated_by"] = birth(validated_by_test_run_id=cls.run_id)
+        # Criterion 3, as the index rather than as the merge: the same cell as
+        # the Finding already open, born legally in every other respect.
+        cls.refusals["second_on_the_cell"] = birth(subject_entity_id=str(cell[1]))
+
+        # Criterion 2's vocabulary, against a document nothing derived.
+        cls.refusals["invented_behaviour"] = cls.refuse(
+            "INSERT INTO findings (program_id, subject_entity_id, property_class, class_id,"
+            "                      title, status, severity, severity_basis,"
+            "                      opened_by_test_run_id, demonstrated)"
+            " VALUES ($1::uuid, $2::uuid, $3, $4, 'a behaviour nobody observed', 'candidate',"
+            "         'info', 'undetermined', $5::uuid, $6::jsonb)",
+            (cls.program_id, subject, cell[0], cls.klass, cls.run_id,
+             json.dumps({"assertion_kinds": ["it-just-works"], "roles": ["control"],
+                         "receipts": ["R1"]})),
+        )
+
+        # Criterion 6: the record of a refusal is a record, and stays one.
+        cls.refusals["edited_proposal"] = cls.refuse(
+            "UPDATE finding_proposals SET refusal = 'never mind' WHERE outcome = 'refused'"
+        )
+        cls.refusals["deleted_proposal"] = cls.refuse(
+            "DELETE FROM finding_proposals WHERE outcome = 'refused'"
+        )
+
+    # -- criterion 1: the claim and the run that settled it ---------------------
+
+    def test_a_finding_opens_from_the_claim_its_own_run_settled(self):
+        self.assertEqual("created", self.opened["outcome"])
+        self.assertEqual(
+            [("candidate", "info", "undetermined", True)],
+            [
+                (str(row[0]), str(row[1]), str(row[2]), row[3])
+                for row in self.rows(
+                    "SELECT status, severity, severity_basis,"
+                    "       opened_by_test_run_id = $2::uuid"
+                    "  FROM findings WHERE id = $1::uuid",
+                    (self.opened["finding_id"], self.run_id),
+                )
+            ],
+        )
+
+    def test_the_finding_carries_the_cell_of_the_claim_it_came_from(self):
+        self.assertEqual(
+            [(True, True, True, True)],
+            [
+                tuple(row)
+                for row in self.rows(
+                    "SELECT f.property_class = h.property_class,"
+                    "       f.subject_entity_id = h.subject_entity_id,"
+                    "       f.identity_a_entity_id IS NOT DISTINCT FROM h.identity_a_entity_id,"
+                    "       f.identity_b_entity_id IS NOT DISTINCT FROM h.identity_b_entity_id"
+                    "  FROM findings f, hypotheses h"
+                    " WHERE f.id = $1::uuid AND h.id = $2::uuid",
+                    (self.opened["finding_id"], self.held["hypothesis"]),
+                )
+            ],
+        )
+
+    def test_every_vector_that_did_not_settle_the_claim_is_refused(self):
+        for key, fragment in (
+            ("unknown_claim", "is not a Hypothesis of this Program"),
+            ("claim_not_supported", "a Finding rests on a supported claim"),
+            ("claim_refuted", "is refuted"),
+            ("adjacent_claim", "settles"),
+            ("run_did_not_hold", "concluded inconclusive"),
+            ("unrelated_receipt", "is not the run that settled"),
+            ("unknown_class", "is not a vulnerability class"),
+            ("no_title", "a Finding carries a title"),
+        ):
+            with self.subTest(case=key):
+                self.assertIn(fragment, self.refusals[key])
+
+    def test_a_model_cannot_settle_the_claim_a_finding_would_rest_on(self):
+        """Criterion 5's fourth vector, in the two places it is answered.
+
+        The model is refused the transition, so the claim stays where the run
+        left it, and the proposal that rests on it is refused for being what it
+        now is: a claim nothing settled.
+        """
+        self.assertIn(
+            "illegal transition inconclusive -> supported",
+            self.refusals["model_settled_the_claim"],
+        )
+        # And the only arm that reaches `supported` at all is the runtime's, off
+        # a run, so there is no from_status the model could have written from
+        # either. Read off 007's rule table rather than provoked: reaching the
+        # actor check needs a claim sitting in `testing`, and a claim sits in
+        # `testing` only while a replay is open on it.
+        self.assertEqual(
+            [("testing", "runtime", True)],
+            [
+                (str(row[0]), str(row[1]), row[2])
+                for row in self.rows(
+                    "SELECT from_status, required_actor_kind, requires_receipt"
+                    "  FROM transition_rules"
+                    " WHERE machine = 'hypothesis' AND to_status = 'supported'"
+                )
+            ],
+        )
+        self.assertIn(
+            "a Finding rests on a supported claim", self.refusals["model_completion"]
+        )
+
+    # -- criterion 2: what the run demonstrated, derived ------------------------
+
+    def test_the_demonstrated_behaviour_is_read_off_the_run_that_holds(self):
+        demonstrated = self.opened["demonstrated"]
+
+        self.assertEqual(
+            sorted({assertion["kind"] for assertion in self.HELD}),
+            sorted(demonstrated["assertion_kinds"]),
+        )
+        self.assertEqual(["baseline", "control", "variant"], sorted(demonstrated["roles"]))
+        self.assertEqual(
+            int(
+                self.rows(
+                    "SELECT count(*) FROM test_run_receipts WHERE test_run_id = $1::uuid",
+                    (self.run_id,),
+                )[0][0]
+            ),
+            demonstrated["receipts"],
+        )
+
+    def test_a_behaviour_outside_the_vocabulary_is_refused(self):
+        self.assertNotEqual("", self.refusals["invented_behaviour"])
+
+    def test_the_evidence_the_claim_rests_on_is_cited_by_the_finding(self):
+        self.assertEqual(
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT observation_id::text FROM hypothesis_evidence"
+                    " WHERE hypothesis_id = $1::uuid AND polarity = 'supports'",
+                    (self.held["hypothesis"],),
+                )
+            ),
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT observation_id::text FROM finding_evidence"
+                    " WHERE finding_id = $1::uuid",
+                    (self.opened["finding_id"],),
+                )
+            ),
+        )
+
+    def test_the_claim_is_rolled_up_onto_the_finding_once(self):
+        self.assertEqual(
+            [(str(self.held["hypothesis"]), 1)],
+            [
+                (str(row[0]), int(row[1]))
+                for row in self.rows(
+                    "SELECT hypothesis_id::text, count(*) FROM finding_hypotheses"
+                    " WHERE finding_id = $1::uuid GROUP BY hypothesis_id",
+                    (self.opened["finding_id"],),
+                )
+            ],
+        )
+
+    # -- criterion 3: one cell, one candidate ----------------------------------
+
+    def test_a_second_proposal_on_one_cell_merges_into_the_finding_already_there(self):
+        self.assertEqual("merged", self.merged["outcome"])
+        self.assertEqual(self.opened["finding_id"], self.merged["finding_id"])
+        self.assertEqual(0, self.merged["evidence_added"])
+
+    def test_what_a_merge_reports_is_what_the_finding_holds(self):
+        """The document names a Finding, so it says what that Finding says.
+
+        Derived again from the merging run it would be a reading of a run the
+        row does not name -- here the two happen to agree, and a reader with two
+        runs on one cell has no way to tell which one it was handed.
+        """
+        self.assertEqual(
+            [True],
+            [
+                row[0]
+                for row in self.rows(
+                    "SELECT demonstrated = $2::jsonb FROM findings WHERE id = $1::uuid",
+                    (self.merged["finding_id"], json.dumps(self.merged["demonstrated"])),
+                )
+            ],
+        )
+
+    def test_a_second_finding_written_onto_one_cell_is_refused(self):
+        self.assertIn("findings_cell_idx", self.refusals["second_on_the_cell"])
+
+    def test_an_open_holds_the_cell_it_is_working_on_until_it_commits(self):
+        """Criterion 3, in the arrangement `FOR UPDATE` cannot cover.
+
+        The lock on the row is no lock at all while the cell is empty, so two
+        opens racing for one would both find nothing and both insert, and the
+        loser would be answered by `findings_cell_idx` -- neither a merge nor a
+        refusal, and an aborted transaction takes its `finding_proposals` row
+        with it, so criterion 6 loses the record of the attempt as well.
+
+        Asserted as a lock rather than as a race: a second connection opens on
+        the cell and stays in its transaction, and this one asks whether the
+        cell is free. It is not, and the cell beside it is -- which is the other
+        half of the rule, since a lock that stopped every open would serialise
+        the whole Program rather than one cell of it.
+        """
+        [mine, beside] = self.rows(
+            "SELECT hashtextextended(rk2_finding_cell(program_id, property_class,"
+            "         subject_entity_id, identity_a_entity_id, identity_b_entity_id), 0),"
+            "       hashtextextended(rk2_finding_cell(program_id, property_class,"
+            "         subject_entity_id, id, identity_b_entity_id), 0)"
+            "  FROM findings WHERE id = $1::uuid",
+            (self.opened["finding_id"],),
+        )[0]
+        second = pg.connect(self.harness.runtime)
+        try:
+            second.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (self.program_id,)
+            )
+            second.execute("BEGIN")
+            second.execute(
+                self.OPEN_FINDING,
+                (self.held["hypothesis"], self.run_id, self.klass,
+                 "proposed while another open is in flight"),
+            )
+            self.assertEqual(
+                [(False, True)],
+                [
+                    tuple(row)
+                    for row in self.rows(
+                        "SELECT pg_try_advisory_xact_lock($1::bigint),"
+                        "       pg_try_advisory_xact_lock($2::bigint)",
+                        (str(mine), str(beside)),
+                    )
+                ],
+            )
+        finally:
+            # Rolled back rather than committed: what this case is about is the
+            # lock, and a merge left behind would be a proposal the counts above
+            # never asked for.
+            second.execute("ROLLBACK")
+            second.close()
+
+    # -- criterion 4: a candidate is born knowing nothing it has not earned -----
+
+    def test_a_candidate_cannot_be_born_validated_reported_or_severe(self):
+        for key, fragment in (
+            ("born_validated", "created as a candidate, not as validated"),
+            ("born_severe", "may not be born high"),
+            ("born_with_a_basis", "may not be born on the severity basis"),
+            ("born_reported", "may not be born stating reported_at"),
+            ("born_validated_by", "may not be born stating validated_by_test_run_id"),
+        ):
+            with self.subTest(case=key):
+                self.assertIn(fragment, self.refusals[key])
+
+    def test_severity_and_its_basis_move_together(self):
+        self.assertIn(
+            "findings_severity_needs_a_basis_check",
+            self.refuse(
+                "UPDATE findings SET severity = 'high' WHERE id = $1::uuid",
+                (self.opened["finding_id"],),
+            ),
+        )
+
+    # -- criterion 6: every proposal, kept -------------------------------------
+
+    def test_every_proposal_is_on_file_with_the_sentence_that_answered_it(self):
+        self.assertEqual(
+            [("created", 1), ("merged", 1), ("refused", 9)],
+            [
+                (str(row[0]), int(row[1]))
+                for row in self.rows(
+                    "SELECT outcome, count(*) FROM finding_proposals"
+                    " WHERE program_id = $1::uuid GROUP BY outcome ORDER BY outcome",
+                    (self.program_id,),
+                )
+            ],
+        )
+
+    def test_a_refused_proposal_names_no_finding(self):
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT id FROM finding_proposals"
+                " WHERE outcome = 'refused' AND finding_id IS NOT NULL"
+            ),
+        )
+
+    def test_the_record_of_a_proposal_cannot_be_edited_or_removed(self):
+        self.assertNotEqual("", self.refusals["edited_proposal"])
+        self.assertNotEqual("", self.refusals["deleted_proposal"])
+
+    def test_only_one_finding_exists_for_all_of_it(self):
+        self.assertEqual(
+            [1],
+            [
+                int(row[0])
+                for row in self.rows(
+                    "SELECT count(*) FROM findings WHERE program_id = $1::uuid",
+                    (self.program_id,),
+                )
+            ],
+        )
+
+    def test_the_standing_check_holds_over_what_this_case_wrote(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
 if __name__ == "__main__":
