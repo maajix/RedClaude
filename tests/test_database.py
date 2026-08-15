@@ -2017,6 +2017,30 @@ CONTROLS = (
         "   DELETE FROM capabilities WHERE capability = 'authenticated_session';"
         " END $ctl$",
     ),
+    Control(
+        # PH2-40 criterion 6, at corpus scale: a chain with no steps under it.
+        # `build_kill_chain` refuses an empty proposal in its first sentence, so
+        # this row is not something the verb can leave -- it is what a restore, a
+        # partial purge or a hand-written repair looks like, and it is the one
+        # shape of these tables that makes every other arm of the check
+        # vacuously true. The steps and edges cannot be deleted out from under a
+        # real chain to reach the same state (`reject_mutation_unless_purging`
+        # is ENABLE ALWAYS), which is why the control builds the emptiness
+        # rather than carving it out.
+        "standing:check_kill_chains",
+        "DO $ctl$ DECLARE p uuid; s jsonb;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('chain-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   s := jsonb_build_object('members', '[]'::jsonb,"
+        "                           'entry', to_jsonb(ARRAY['anonymous_reach']),"
+        "                           'vocabulary', rk2_capability_vocabulary_sha256());"
+        "   INSERT INTO chains (program_id, entry, vocabulary_sha256, source, source_sha256)"
+        "        VALUES (p, ARRAY['anonymous_reach'], rk2_capability_vocabulary_sha256(),"
+        "                s, equivalence_key(s));"
+        " END $ctl$",
+    ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
@@ -23063,6 +23087,13 @@ class ReplayFixture:
         that ordinal, because most cases here perform the default plan.
         `record_test_action` compares both against the action being recorded, so
         a case stating its own actions states its own answers to them.
+
+        The scope version is read off the Program rather than written as `1`.
+        Every case here but one opens its Program once and never moves it, so
+        the two are the same number -- but a case that republishes a scope
+        document and then walks a Test would otherwise write Receipts claiming a
+        version the door could not have decided under, and 39 reads the stamp's
+        scope version straight off the transition Receipt.
         """
         if body is not None:
             with cls.connection.transaction():
@@ -23079,10 +23110,11 @@ class ReplayFixture:
             "                      method, scheme, host, port, path, status_code,"
             "                      response_agent_sha, ts_arrival, scope_class, scope_version,"
             "                      identity_entity_id)"
-            " VALUES ($1::uuid, $2::uuid, $3, 'allowed',"
-            "         'allowed as target under scope version 1', $4, 'https',"
-            "         'app.example.com', 443, $5, $6::integer, $7, now(), 'target', 1,"
-            "         $8::uuid)"
+            " SELECT $1::uuid, $2::uuid, $3, 'allowed',"
+            "        'allowed as target under scope version ' || p.scope_version, $4, 'https',"
+            "        'app.example.com', 443, $5, $6::integer, $7, now(), 'target',"
+            "        p.scope_version, $8::uuid"
+            "   FROM programs p WHERE p.id = $1::uuid"
             " RETURNING label",
             (
                 cls.program_id, tool_run, lane, method.upper(),
@@ -26810,9 +26842,10 @@ class ImpactRunFixture(ValidatedFindingFixture):
             "                      ts_arrival, scope_class, scope_version,"
             "                      identity_entity_id)"
             " SELECT $1::uuid, $2::uuid, 'replay', 'allowed',"
-            "        'allowed as target under scope version 1', $3, r.scheme, r.host,"
-            "        r.port, r.path, 200, now(), 'target', 1, $5::uuid"
-            "   FROM rk2_test_route($4) r"
+            "        'allowed as target under scope version ' || p.scope_version, $3,"
+            "        r.scheme, r.host, r.port, r.path, 200, now(), 'target',"
+            "        p.scope_version, $5::uuid"
+            "   FROM rk2_test_route($4) r, programs p WHERE p.id = $1::uuid"
             " RETURNING label",
             (cls.program_id, tool_run, cls.UNDO[0]["method"], cls.UNDO[0]["url"], identity),
         )
@@ -27555,7 +27588,190 @@ class ImpactProofTest(ImpactRunFixture, DatabaseCase):
 PIVOT_SLUG = "selftest-pivot"
 
 
-class PivotStampTest(ImpactRunFixture, DatabaseCase):
+class PivotStampFixture(ImpactRunFixture):
+    """The moves that carry an authorized impact run to a stamped pivot.
+
+    39 built them and 40 needs every one: a chain composes pivot stamps, so the
+    arrangement that produces one is the arrangement that produces the thing 40
+    is about. Here rather than copied, for the reason `ImpactRunFixture` is
+    here -- a change to how a pivot is stamped is one edit, not one per ticket
+    that stamps one.
+
+    What is not here is anything either ticket asserts. Nothing below issues a
+    stamp on its own: a case says which run it means and reads the answer.
+    """
+
+    ISSUE = "SELECT issue_pivot_stamp($1::uuid, $2::uuid)"
+
+    @classmethod
+    def configured(cls, slots: tuple[str, ...] = ("member",), *, wide: bool = False) -> str:
+        """This Program's configuration, with the Identities it declares named.
+
+        The document rather than a path, because two callers want two things
+        from it: `program.run` re-reads it to move the Program, and
+        `identity.provision` re-reads it to find the slot it is seating
+        material into, and both have to be looking at the same declaration.
+
+        `wide` adds a second path to the one inclusion. What that is for is a
+        scope version: 021 moves `programs.scope_version` when the policy
+        digest changes, and a Program that never changes its scope is one where
+        nothing a stamp recorded can go out of date.
+        """
+        declared = "\n".join(
+            f'[[identity]]\nname = "{slot}"\nslot_ref = "slot://identity/{slot}"'
+            for slot in slots
+        )
+        document = VALID.replace('name = "acme-web"', f'name = "{cls.slug}"').replace(
+            '[[identity]]\nname = "member"\nslot_ref = "slot://identity/member"\n',
+            declared + "\n" if declared else "",
+        )
+        if wide:
+            document = document.replace('paths = ["/api/"]', 'paths = ["/api/", "/v2/"]')
+        return document
+
+    @classmethod
+    def provisioned_identity(cls, slot: str, document: str | None = None) -> str:
+        """One Identity of this Program, with material sealed into its slot.
+
+        Opening the Program wrote the `identities` row the configuration
+        declares; this is the second half, and the door will not carry an
+        Identity without it. Provisioned through the real adapter rather than by
+        hand because the slot is an authenticated ciphertext bound to the
+        installation key, and a hand-written row is a slot the proxy could not
+        open.
+        """
+        material = scratch() / f"{cls.slug}-{slot}.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": f"Bearer rk2-{slot}"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            cls.harness.runtime,
+            write(document or cls.configured()),
+            slot,
+            material,
+            root_secret=seal.Root(Path(f"{cls.slug}-root"), SECRET),
+        )
+        assert provisioned.ok, provisioned.violations
+        return str(
+            cls.connection.execute(
+                "SELECT entity_id FROM identities"
+                " WHERE program_id = $1::uuid AND slot_name = $2",
+                (cls.program_id, slot),
+            ).scalar()
+        )
+
+    @classmethod
+    def grant_for(cls, task: str, test: str, slot: str | None) -> dict:
+        """The question the first attempt files, and the operator's answer to it.
+
+        38's park is 39's arrangement: nothing about a pivot is reachable until
+        an operator has approved the impact the Test would have. The slot is
+        part of what is approved -- `rk2_impact_digest` names it -- so a run
+        that sends as nobody is a second question and needs its own answer.
+        """
+        parked = cls.called(cls.OPEN_REPLAY, (cls.run_on(task), test, slot))
+        return {"parked": parked, "answered": cls.approve(parked["parked"])}
+
+    @classmethod
+    def issue(cls, walk: dict) -> dict:
+        """The stamp this run earns, or the sentence that refuses it."""
+        return cls.called(cls.ISSUE, (walk["plan"]["tool_run_id"], walk["run"]))
+
+    @classmethod
+    def settled(cls, task: str) -> None:
+        """One impact Task, ended, so the next Test of this Finding can have one.
+
+        012 allows a Finding one live Task at a time, and each Test proved here
+        is proved under its own. Settling it is the scheduler's move and this is
+        not that: what the arms after it need is the row out of the way, not the
+        attempt counted. `answered` rather than `done`, because 011 closes a
+        Task as done only where a proposal of it was promoted, and an impact run
+        promotes nothing.
+
+        The runs that were holding it are then closed through the real verb, in
+        that order. A settled Task with an unfinished run on it is what 023's
+        standing check calls `open_agent_run_on_settled_task`, and the check is
+        over the corpus rather than over this Program -- so leaving them open is
+        a case that passes until some later one opens a Program and is refused
+        by an integrity failure it did not cause. `finish_task_attempt` on a
+        Task that has already ended does exactly this and nothing else: it
+        closes the run, releases what it held, and leaves the status alone.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            "                 finished_at = now(), priority = NULL,"
+            "                 claimed_at = NULL, lease_expires_at = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+        for run in cls.rows_of(
+            "SELECT ar.id FROM agent_runs ar JOIN tasks t ON t.id = ar.task_id"
+            " WHERE t.program_id = $1::uuid AND t.label = $2 AND ar.finished_at IS NULL"
+            " ORDER BY ar.label",
+            (cls.program_id, task),
+        ):
+            committed(
+                cls.connection,
+                "SELECT finish_task_attempt($1::uuid, 'completed')",
+                (str(run[0]),),
+            )
+
+    @classmethod
+    def as_the_owner_says(cls, statements: list[tuple[str, tuple]]) -> None:
+        """Statements only the owner can make, in one transaction.
+
+        The actor is the runtime and not the operator whose row it edits: 026
+        reads human provenance off `session_user`, the migrate connection is not
+        a member of `rk2_human`, and a session here claiming to be a person
+        would be refused for saying so -- by the guard on the row, and again by
+        the guard on the event the write emits. What this forges is the state,
+        which is the only part of it the arm under test reads.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for sql, parameters in statements:
+                cls.owner_connection.execute(sql, parameters)
+
+    @classmethod
+    def forge_the_member_status(cls, finding: str, status: str) -> None:
+        """A member moved out from under its stamp, and put back.
+
+        007 gives a validated Finding one exit and it needs a `human` actor,
+        which 026 reads off `session_user` and no session in this harness can
+        be -- so the status is written under the guard rather than through it.
+        `findings_status_guard` is the one trigger that refuses a hand-written
+        status: it wants a `finding_transitions` row with the same from and to
+        in the same transaction, which is exactly what a forgery does not have.
+        Off for one statement and ALWAYS again inside the same transaction, per
+        027, so a rollback here would put it back too.
+
+        What this buys is the only reachable version of an invalidated member.
+        It is a forgery and it says so: what the arm under test reads is the
+        column, and the column is the whole of what the refusal asks about.
+        """
+        cls.as_the_owner_says([
+            ("ALTER TABLE findings DISABLE TRIGGER findings_status_guard", ()),
+            ("UPDATE findings SET status = $2 WHERE id = $1::uuid", (finding, status)),
+            ("ALTER TABLE findings ENABLE ALWAYS TRIGGER findings_status_guard", ()),
+        ])
+
+
+class PivotStampTest(PivotStampFixture, DatabaseCase):
     """Ticket 39: a pivot is stamped from the run that showed it, or refused.
 
     The arrangement is 38's carried one step on. A claim is stated, tested,
@@ -27574,7 +27790,6 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
 
     slug = PIVOT_SLUG
 
-    ISSUE = "SELECT issue_pivot_stamp($1::uuid, $2::uuid)"
     PROBLEM = "SELECT rk2_pivot_problem($1::jsonb)"
     HALT = "SELECT halt_program($1::uuid, $2)"
     CLEAR = "SELECT clear_program_halt($1::uuid, $2)"
@@ -27686,51 +27901,6 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
     # -- the arrangement -------------------------------------------------------
 
     @classmethod
-    def provisioned_identity(cls, slot: str) -> str:
-        """One Identity of this Program, with material sealed into its slot.
-
-        Opening the Program wrote the `identities` row the configuration
-        declares; this is the second half, and the door will not carry an
-        Identity without it. Provisioned through the real adapter rather than by
-        hand because the slot is an authenticated ciphertext bound to the
-        installation key, and a hand-written row is a slot the proxy could not
-        open.
-        """
-        material = scratch() / f"{cls.slug}-identity.json"
-        material.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "origins": [
-                        {
-                            "url": "https://app.example.com/",
-                            "headers": [
-                                {"name": "Authorization", "value": "Bearer rk2-pivot-selftest"}
-                            ],
-                            "cookies": [],
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        provisioned = identity.provision(
-            cls.harness.runtime,
-            write(VALID.replace('name = "acme-web"', f'name = "{cls.slug}"')),
-            slot,
-            material,
-            root_secret=seal.Root(Path(f"{cls.slug}-root"), SECRET),
-        )
-        assert provisioned.ok, provisioned.violations
-        return str(
-            cls.connection.execute(
-                "SELECT entity_id FROM identities"
-                " WHERE program_id = $1::uuid AND slot_name = $2",
-                (cls.program_id, slot),
-            ).scalar()
-        )
-
-    @classmethod
     def pivot_spec(cls, **changed) -> str:
         """The pivot specification, with any one part of the pivot block replaced."""
         stated = json.loads(
@@ -27790,18 +27960,6 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
         )
 
     @classmethod
-    def grant_for(cls, task: str, test: str, slot: str | None) -> dict:
-        """The question the first attempt files, and the operator's answer to it.
-
-        38's park is 39's arrangement: nothing about a pivot is reachable until
-        an operator has approved the impact the Test would have. The slot is
-        part of what is approved -- `rk2_impact_digest` names it -- so a run
-        that sends as nobody is a second question and needs its own answer.
-        """
-        parked = cls.called(cls.OPEN_REPLAY, (cls.run_on(task), test, slot))
-        return {"parked": parked, "answered": cls.approve(parked["parked"])}
-
-    @classmethod
     def demonstrated(cls, test: str, task: str, *, answers: dict | None = None,
                      anonymous: bool = False) -> dict:
         """One authorized impact run of a pivot Test, walked to a close."""
@@ -27809,11 +27967,6 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
             task, test, answers or cls.ANSWERED, "done",
             slot=None if anonymous else cls.SLOT,
         )
-
-    @classmethod
-    def issue(cls, walk: dict) -> dict:
-        """The stamp this run earns, or the sentence that refuses it."""
-        return cls.called(cls.ISSUE, (walk["plan"]["tool_run_id"], walk["run"]))
 
     @classmethod
     def while_in_flight(cls, task: str, test: str, plan: dict) -> None:
@@ -27917,25 +28070,6 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
         )
 
     @classmethod
-    def settled(cls, task: str) -> None:
-        """One impact Task, ended, so the next Test of this Finding can have one.
-
-        012 allows a Finding one live Task at a time, and each of the three
-        Tests below is proved under its own. Ending it is `finish_task_attempt`'s
-        job and this is not that: what the arms after it need is the row out of
-        the way, not the attempt counted. `answered` rather than `done`, because
-        011 closes a Task as done only where a proposal of it was promoted, and
-        an impact run promotes nothing.
-        """
-        cls.as_owner(
-            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
-            "                 finished_at = now(), priority = NULL,"
-            "                 claimed_at = NULL, lease_expires_at = NULL"
-            " WHERE program_id = $1::uuid AND label = $2",
-            (cls.program_id, task),
-        )
-
-    @classmethod
     def refuse_what_the_test_does_not_claim(cls):
         """Criterion 2, and the Test that claims nothing to check it against."""
         cls.settled(cls.opened["task"])
@@ -27989,54 +28123,12 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
         cls.while_halted = cls.issue(cls.rechecked)
         cls.as_operator(cls.CLEAR, (cls.program_id, "the operator started it again"))
 
-        cls.forge_the_member_status("rejected")
+        cls.forge_the_member_status(cls.finding, "rejected")
         cls.member_was_rejected = cls.issue(cls.rechecked)
-        cls.forge_the_member_status("validated")
+        cls.forge_the_member_status(cls.finding, "validated")
 
         cls.expire_the_grant(cls.granted["parked"]["parked"])
         cls.after_the_grant_lapsed = cls.issue(cls.rechecked)
-
-    @classmethod
-    def as_the_owner_says(cls, statements: list[tuple[str, tuple]]) -> None:
-        """Statements only the owner can make, in one transaction.
-
-        The actor is the runtime and not the operator whose row it edits: 026
-        reads human provenance off `session_user`, the migrate connection is not
-        a member of `rk2_human`, and a session here claiming to be a person
-        would be refused for saying so -- by the guard on the row, and again by
-        the guard on the event the write emits. What this forges is the state,
-        which is the only part of it the arm under test reads.
-        """
-        with cls.owner_connection.transaction():
-            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
-            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
-            for sql, parameters in statements:
-                cls.owner_connection.execute(sql, parameters)
-
-    @classmethod
-    def forge_the_member_status(cls, status: str) -> None:
-        """A member moved out from under its stamp, and put back.
-
-        007 gives a validated Finding one exit and it needs a `human` actor,
-        which 026 reads off `session_user` and no session in this harness can
-        be -- so the status is written under the guard rather than through it.
-        `findings_status_guard` is the one trigger that refuses a hand-written
-        status: it wants a `finding_transitions` row with the same from and to
-        in the same transaction, which is exactly what a forgery does not have.
-        Off for one statement and ALWAYS again inside the same transaction, per
-        027, so a rollback here would put it back too.
-
-        What this buys is the only reachable version of criterion 5's
-        invalidated member. It is a forgery and it says so: what the arm under
-        test reads is the column, and the column is the whole of what the
-        refusal asks about.
-        """
-        cls.as_the_owner_says([
-            ("ALTER TABLE findings DISABLE TRIGGER findings_status_guard", ()),
-            ("UPDATE findings SET status = $2 WHERE id = $1::uuid",
-             (cls.finding, status)),
-            ("ALTER TABLE findings ENABLE ALWAYS TRIGGER findings_status_guard", ()),
-        ])
 
     @classmethod
     def expire_the_grant(cls, label: str) -> None:
@@ -28379,6 +28471,731 @@ class PivotStampTest(ImpactRunFixture, DatabaseCase):
     # -- the standing check -----------------------------------------------------
 
     def test_the_standing_check_holds_over_every_stamp_this_case_issued(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+CHAIN_SLUG = "selftest-chain"
+
+
+class KillChainTest(PivotStampFixture, DatabaseCase):
+    """Ticket 40: pivot stamps compose into a chain, and the chain stays sound.
+
+    The arrangement is 39's carried one step on, six times over. Six pivots are
+    stamped -- each on its own route, so none of them is the member's own
+    request -- and what this case is about begins there: which sets of them are
+    a chain, what the graph between them is when they are, and what stops being
+    true afterwards.
+
+    Everything commits, for 38's reason. The order in `setUpClass` is the order
+    the evidence accrues and it is load-bearing three times: the chains are
+    built while every stamp still stands, the refusals are asked of graphs the
+    six stamps can make between them, and the six ways a built chain goes
+    unsound each move the ground under it -- so each has to be the first thing
+    wrong when it is asked, and the last of them is not put back.
+    """
+
+    slug = CHAIN_SLUG
+
+    BUILD = "SELECT build_kill_chain($1::uuid[], $2::jsonb, $3::uuid)"
+    READ = "SELECT read_kill_chain($1::uuid)"
+    ENTRY = "SELECT to_jsonb(rk2_chain_entry($1::uuid))"
+
+    #: Two Identity slots, because criterion 3 rejects a chain whose steps ran
+    #: as different accounts without saying which one carried the capability,
+    #: and one slot cannot disagree with itself.
+    HERE = "member"
+    THERE = "neighbour"
+
+    #: Two claims, on two subjects. Two rather than one because 034's `duplicate`
+    #: blocker holds every Finding that shares a signature with another validated
+    #: one, and `finding_signature` is the class and the subject's dedup key --
+    #: so two Findings of one class about one subject would each be held by a
+    #: review gate, and criterion 4's arm about review gates would fire on every
+    #: chain in this case instead of on the one it is written for.
+    CLAIM = "the orders API lets a stranger write on a neighbour's order"
+    OTHER = "the orders API hands out more than the order when it answers"
+
+    ACTIONS = [
+        {"ordinal": 1, "role": "baseline", "kind": "request", "method": "GET"},
+        {"ordinal": 2, "role": "variant", "kind": "request", "method": "POST"},
+        {"ordinal": 3, "role": "control", "kind": "request", "method": "GET"},
+    ]
+    SHOWN = [
+        {"id": "the-transition-happened", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-state-changed", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+    IMPACT = {
+        "class": "write_target_state",
+        "effect": "a stranger writes on a neighbour's order and the write stays written",
+        "cleanup": "the order is PUT back to what the baseline read",
+        "after_state": 3,
+    }
+    CONDITIONS = [
+        {"kind": "scope_holds", "detail": "the neighbour's order is inside the scope document"},
+        {"kind": "identity_leased", "detail": "the operator slot is the one held"},
+    ]
+    ANSWERED = {1: (200, "before the write"), 2: (200, "accepted"),
+                3: (200, "after the write")}
+
+    #: The six pivots, as `(route, provides, requires, slot)`. Each route is its
+    #: own, for 39's reason -- a transition on a route the member was validated
+    #: on is refused as the member's own request -- and the capabilities are
+    #: chosen so that the six make between them every graph criterion 6 asks
+    #: for: a line, a branch, a gap, a cycle, two components and a merge whose
+    #: two parents ran as different Identities.
+    PIVOTS = (
+        ("reach", "7/note", "other_account_data", ["authenticated_session"], HERE),
+        ("token", "8/token", "credential_material", ["other_account_data"], HERE),
+        ("inside", "9/host", "internal_network_reach", ["other_account_data"], HERE),
+        ("back", "10/login", "authenticated_session", ["other_account_data"], HERE),
+        ("beside", "11/peer", "internal_network_reach", ["authenticated_session"], THERE),
+        ("through", "12/exec", "code_execution",
+         ["other_account_data", "internal_network_reach"], HERE),
+    )
+
+    #: What the agent said the capabilities do between its members. Recorded and
+    #: read by nothing, which is the point of asserting it is there.
+    FLOW = {"story": "the session reads the neighbour's note, and the note carries a token"}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # The second slot has to be declared before it can be provisioned, and
+        # `program.run` is the only thing that declares one: 012 projects the
+        # `[[identity]]` blocks of the configuration onto `identities`, so a
+        # Program that grows a slot grows it by being opened again.
+        cls.both = cls.configured((cls.HERE, cls.THERE))
+        cls.reconfigured(cls.both)
+        cls.identity = {slot: cls.provisioned_identity(slot, cls.both)
+                        for slot in (cls.HERE, cls.THERE)}
+
+        cls.member = {"first": cls.validated(cls.CLAIM), "second": cls.validated(cls.OTHER)}
+        # Both subjects are `offline_entity`'s technology row, and 021 gives a
+        # new entity the deny-by-default placeholder until something projects
+        # over it. Recon's own door projects as it inserts; nothing in this
+        # file's chain of fixtures does, so the placeholder is still there. It
+        # is projected once here because a subject that has never been
+        # classified is not the same fact as one the policy denies, and the
+        # chain's scope arm is about the second.
+        cls.project_the_scope()
+        cls.of = {}
+        cls.stamp = {}
+        cls.compose_six_pivots()
+        cls.scope_when_stamped = cls.scope_version()
+
+        cls.build_what_composes()
+        cls.refuse_what_does_not_compose()
+        cls.the_ground_moves_under_a_chain()
+
+        cls.problems = cls.rows_of("SELECT * FROM check_kill_chains()")
+        cls.proposals = cls.rows_of(
+            "SELECT outcome, count(*) FROM chain_proposals"
+            " WHERE program_id = $1::uuid GROUP BY outcome ORDER BY outcome",
+            (cls.program_id,),
+        )
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def pivot_spec(cls, route: str, provides: str, requires: list[str], slot: str) -> str:
+        """One pivot Test, told apart from the other five by the route it walks."""
+        actions = [
+            action | {"url": f"{BASE}/{route}"} for action in cls.ACTIONS
+        ]
+        stated = json.loads(
+            specification(cls.SHOWN, actions=actions, cleanup=cls.UNDO, impact=cls.IMPACT)
+        )
+        return json.dumps(stated | {"pivot": {
+            "provides": provides,
+            "requires": requires,
+            "identity": slot,
+            "transition": cls.SHOWN[0]["id"],
+            "conditions": cls.CONDITIONS,
+        }})
+
+    @classmethod
+    def stamped(cls, name: str, member: dict, route: str, provides: str,
+                requires: list[str], slot: str) -> None:
+        """One pivot, from the impact Task to the issued stamp, kept by name.
+
+        The whole of 39 in six statements, and every one of them is load-bearing
+        rather than arrangement: a stamp built any other way would be a row this
+        ticket composes and 39 would not have issued.
+        """
+        opened = cls.called(
+            cls.OPEN_TASK,
+            (member["finding"], cls.pivot_spec(route, provides, requires, slot)),
+        )
+        test = cls.id_of("tests", opened["test"])
+        cls.grant_for(opened["task"], test, slot)
+        walk = cls.impact_replay(opened["task"], test, cls.ANSWERED, "done", slot=slot)
+        issued = cls.issue(walk)
+        assert issued["refusal"] is None, issued
+        cls.settled(opened["task"])
+        cls.of[name] = {"member": member, "task": opened["task"], "test": test,
+                        "walk": walk, "label": issued["stamp"]}
+        cls.stamp[name] = cls.id_of("pivot_stamps", issued["stamp"])
+
+    @classmethod
+    def compose_six_pivots(cls):
+        """The evidence every arm below is about, issued once."""
+        for name, route, provides, requires, slot in cls.PIVOTS:
+            cls.stamped(
+                name,
+                cls.member["second"] if name in ("token", "inside", "through")
+                else cls.member["first"],
+                route, provides, requires, slot,
+            )
+
+    @classmethod
+    def members(cls, *names: str) -> str:
+        return pg.quote_array([cls.stamp[name] for name in names])
+
+    @classmethod
+    def build(cls, members: str, *, flow: dict | None = None, run: str | None = None) -> dict:
+        return cls.called(
+            cls.BUILD, (members, None if flow is None else json.dumps(flow), run)
+        )
+
+    @classmethod
+    def read(cls, label: str) -> dict:
+        return cls.called(cls.READ, (cls.id_of("chains", label),))
+
+    @classmethod
+    def build_what_composes(cls):
+        """Criteria 1, 2 and 6's two valid shapes, and idempotence.
+
+        Both are built while every stamp still stands, because everything after
+        this section moves the ground under them and a chain cannot be built out
+        of ground that has already moved.
+        """
+        cls.linear = cls.build(cls.members("reach", "token"), flow=cls.FLOW,
+                               run=cls.of["reach"]["walk"]["run"])
+        cls.linear_read = cls.read(cls.linear["chain"])
+        # The same members in the other order: the identity of a chain is the
+        # digest of its members' digests in digest order, so the proposal order
+        # cannot make a second chain.
+        cls.rebuilt = cls.build(cls.members("token", "reach"))
+        cls.branch = cls.build(cls.members("reach", "token", "inside"))
+        cls.branch_read = cls.read(cls.branch["chain"])
+        cls.entry = json.loads(
+            str(cls.connection.execute(cls.ENTRY, (cls.program_id,)).scalar())
+        )
+
+    @classmethod
+    def refuse_what_does_not_compose(cls):
+        """Criterion 3's rejections and criterion 6's empty graph, one each.
+
+        Every one of them is asked of the same six stamps, because a refusal
+        that needed evidence of its own would be a refusal about the evidence
+        rather than about the graph.
+        """
+        cls.refused = {
+            "nothing": cls.build("{}"),
+            "a_hole": cls.build("{" + cls.stamp["reach"] + ",NULL}"),
+            "one_stamp": cls.build(cls.members("reach")),
+            "the_same_step_twice": cls.build(cls.members("reach", "reach")),
+            "a_stamp_nobody_issued": cls.build(pg.quote_array([str(uuid.uuid4())])),
+            "a_story": cls.build(pg.quote_array([str(uuid.uuid4()) for _ in range(17)])),
+            "a_gap": cls.build(cls.members("token", "inside")),
+            "a_cycle": cls.build(cls.members("reach", "back")),
+            "two_chains": cls.build(cls.members("reach", "token", "beside")),
+            "two_identities": cls.build(cls.members("reach", "beside", "through")),
+        }
+        cls.elsewhere = cls.built_elsewhere(cls.members("reach", "token"))
+        cls.two_vocabularies = cls.refuse_the_stamps_that_mean_two_things()
+
+    @classmethod
+    def built_elsewhere(cls, members: str) -> dict:
+        """This Program's stamps, proposed as a chain by a Program that has none.
+
+        `rk2_program_required` fences the caller and `rk2_chain_problem` fences
+        every read it makes, so a cross-Program proposal is refused by the rule
+        that fences everything else rather than by one written for it -- and
+        answers the sentence for a stamp that is not there, because from the
+        other Program it is not. The binding is put back whatever happens,
+        because every arm after this one reads it.
+        """
+        other = program.run(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{cls.slug}-elsewhere"')),
+        )
+        assert other.ok, other.violations
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (other.facts["program_id"],)
+        )
+        try:
+            return cls.build(members)
+        finally:
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+            )
+
+    @classmethod
+    def refuse_the_stamps_that_mean_two_things(cls) -> dict:
+        """A seventh stamp, issued while the vocabulary said something else.
+
+        The one refusal that cannot be arranged out of the six: two stamps
+        disagree about the vocabulary only if the vocabulary moved between them,
+        and 039 made that digest cover the words *and* their descriptions
+        precisely so that re-describing one is enough. Reference data, per 027,
+        so the description is changed by the owner and put back in the same
+        section -- what stays behind is the stamp, which keeps the digest that
+        was in force when it was issued, which is the whole reason it records
+        one.
+
+        The re-walk is `reach`'s own Test under `reach`'s own grant: nothing
+        about which Test it is matters here, only that the run closes and holds.
+        """
+        described = ("UPDATE capabilities SET description = $1"
+                     " WHERE capability = 'internal_network_reach'")
+        original = str(
+            cls.connection.execute(
+                "SELECT description FROM capabilities WHERE capability = $1",
+                ("internal_network_reach",),
+            ).scalar()
+        )
+        cls.as_the_owner_says([(described, (original + ", by any route",))])
+        try:
+            again = cls.issue(
+                cls.impact_replay(cls.of["reach"]["task"], cls.of["reach"]["test"],
+                                  cls.ANSWERED, "done", slot=cls.HERE)
+            )
+            assert again["refusal"] is None, again
+            cls.stamp["reach_again"] = cls.id_of("pivot_stamps", again["stamp"])
+            cls.settled(cls.of["reach"]["task"])
+        finally:
+            cls.as_the_owner_says([(described, (original,))])
+        return cls.build(cls.members("reach", "reach_again"))
+
+    @classmethod
+    def the_ground_moves_under_a_chain(cls):
+        """Criteria 4 and 5: six ways the linear chain stops being readable.
+
+        One chain, read six times. `rk2_chain_unsoundness` answers with the
+        first reason it finds, so the whole arrangement is one rule: each arm
+        has to be the first thing wrong at the moment it is read. Two of the six
+        are reversible and are put back; the three configuration moves at the
+        end are not, and they run in the order that leaves each of them alone
+        with its own sentence -- the last one first, and the head of the chain
+        last because losing the Program's session is what nothing recovers from.
+
+        Nothing here deletes anything. That is criterion 5's second half: the
+        chain, its steps, its edges and every stamp under them are still there
+        afterwards, and the arm at the end reads them off the rows.
+        """
+        chain = cls.linear["chain"]
+        cls.sound_before = cls.read(chain)
+        cls.counted_before = cls.chain_row_counts()
+        cls.unsound = {}
+
+        # Not an arm: the one blocker code this list is asked to ignore, and the
+        # only place 039 and 034 give different answers about the same Finding.
+        # A member somebody wrote up moves to `reported`, which 039 admits and
+        # `report_blockers` holds as hard `not_validated` -- because 034 is
+        # about rendering that Finding's own report and one already sent must
+        # not be sent twice. Read here before anything is broken, because a
+        # chain that went unsound the moment its strongest member was submitted
+        # would be unsound exactly when it is worth having.
+        cls.forge_the_member_status(cls.member["first"]["finding"], "reported")
+        cls.sound_when_reported = cls.read(chain)
+        cls.gates_when_reported = cls.rows_of(
+            "SELECT b.severity, b.code FROM report_blockers($1::uuid) b"
+            " ORDER BY b.severity, b.code",
+            (cls.member["first"]["finding"],),
+        )
+        cls.forge_the_member_status(cls.member["first"]["finding"], "validated")
+
+        # (f) A review gate on a member. The Program published a "we know" list
+        #     and one of these Findings is on it.
+        cls.as_the_owner_says([
+            ("INSERT INTO program_known_issues (program_id, class_id, source, note)"
+             " VALUES ($1::uuid, $2, 'program_policy', $3)",
+             (cls.program_id, cls.klass, "this class is on the published known-issue list")),
+        ])
+        cls.unsound["a_review_gate"] = cls.read(chain)
+
+        # (e) The subject of a step, denied and given back. Through the
+        #     projection and not around it: `in_scope` is a computed column and
+        #     021 refuses a direct write to it, so what moves is the address the
+        #     entity asks its scope question with. Recon rewriting an Entity's
+        #     address is the ordinary way one crosses the exclusion list without
+        #     the policy having changed -- which is what this arm needs, since
+        #     the arm above it answers first for anything that moves the version.
+        subject = cls.member["first"]["subject"]
+        cls.re_addressed(subject, "admin.example.com")
+        cls.unsound["a_subject_out_of_scope"] = cls.read(chain)
+        cls.re_addressed(subject, None)
+
+        # (a) A member withdrawn, which is 039's whole sentence asked again.
+        cls.forge_the_member_status(cls.member["first"]["finding"], "rejected")
+        cls.unsound["a_member_withdrawn"] = cls.read(chain)
+        cls.forge_the_member_status(cls.member["first"]["finding"], "validated")
+
+        # (c) An Identity invalidated, which is `program.run` with the slot no
+        #     longer declared -- the front door, and the only one 012 has.
+        #     `neighbour` stays, so the chain still starts from a session and
+        #     the arm above this one is not what answers.
+        #
+        #     This is also where the front door costs something: dropping a slot
+        #     is a configuration change, and 021 versions the scope on any of
+        #     those, so the scope has moved by the time this is read. It is the
+        #     Identity sentence that comes back because the function asks that
+        #     one first, which is the arrangement decision recorded there.
+        cls.reconfigured(cls.configured((cls.THERE,)))
+        cls.unsound["an_identity_invalidated"] = cls.read(chain)
+
+        # (d) The scope document, now on its own: `member` is declared again, so
+        #     012 clears the invalidation and the arm above goes quiet, and what
+        #     is left is the two versions the last three openings moved through.
+        cls.reconfigured(cls.configured((cls.HERE, cls.THERE), wide=True))
+        cls.unsound["a_scope_that_moved"] = cls.read(chain)
+        cls.scope_when_moved = cls.scope_version()
+
+        # (b) And the head of the chain: every live Identity gone, so holding a
+        #     session is no longer something this Program starts with.
+        cls.reconfigured(cls.configured(()))
+        cls.unsound["a_start_it_no_longer_has"] = cls.read(chain)
+        cls.unknown = cls.called(cls.READ, (str(uuid.uuid4()),))
+        cls.counted_after = cls.chain_row_counts()
+
+    @classmethod
+    def chain_row_counts(cls) -> tuple[int, ...]:
+        """Every row this Program's chains are made of, counted.
+
+        Read before the ground moves and again after, because criterion 5 is a
+        claim about what going unsound does *not* do and a pair of literals
+        cannot make that claim -- they would pass just as well if the six reads
+        had deleted everything and the numbers had been written down after.
+        `chain_proposals` is in the list for the same reason the others are:
+        nothing between the two snapshots builds a chain, so it may not grow.
+        """
+        return tuple(cls.rows_of(
+            "SELECT (SELECT count(*) FROM chains WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM chain_steps WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM chain_edges WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM chain_proposals WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM pivot_stamps WHERE program_id = $1::uuid)",
+            (cls.program_id,),
+        )[0])
+
+    @classmethod
+    def project_the_scope(cls) -> None:
+        """The scope policy, decided over this Program's entities once more."""
+        cls.as_the_owner_says([
+            ("SELECT * FROM refresh_scope_projection($1::uuid)", (cls.program_id,)),
+        ])
+
+    @classmethod
+    def re_addressed(cls, entity: str, host: str | None) -> None:
+        """One Entity's address changed, and the scope projected over it again.
+
+        `None` puts it back to what `offline_entity` made: a technology
+        fingerprint with no address, which 021 classes `not_addressable` rather
+        than denied. That is the state every subject in this file starts in, and
+        it is why the arm this feeds reads the class rather than the boolean.
+        """
+        cls.as_the_owner_says([
+            ("UPDATE entities SET scope_selector_kind = $2, scope_selector = $3,"
+             "                    scope_port = $4"
+             " WHERE id = $1::uuid",
+             (entity, None if host is None else "host", host,
+              None if host is None else 443)),
+        ])
+        cls.project_the_scope()
+
+    @classmethod
+    def reconfigured(cls, document: str) -> None:
+        """The Program opened again on a changed configuration.
+
+        `accept_change` because 012 refuses a changed policy without it: adopting
+        one silently rewrites what every earlier Finding cites, and every use of
+        this here is an operator deliberately moving the ground.
+        """
+        moved = program.run(cls.harness.runtime, write(document), accept_change=True)
+        assert moved.ok, moved.violations
+
+    @classmethod
+    def scope_version(cls) -> int:
+        """Which version of the scope document this Program is read under now."""
+        return int(
+            cls.rows_of(
+                "SELECT scope_version FROM programs WHERE id = $1::uuid", (cls.program_id,)
+            )[0][0]
+        )
+
+    # -- criterion 1: an agent proposes, and the runtime composes ---------------
+
+    def test_a_proposal_is_members_and_a_story_and_nothing_else(self):
+        # The signature is the criterion: there is no argument for an edge, a
+        # depth or a verdict, so there is nothing for an agent to assert.
+        taken = self.rows(
+            "SELECT pg_get_function_arguments(p.oid) FROM pg_proc p"
+            " WHERE p.proname = 'build_kill_chain'"
+        )
+
+        self.assertEqual(
+            ["p_members uuid[], p_flow jsonb DEFAULT NULL::jsonb,"
+             " p_agent_run_id uuid DEFAULT NULL::uuid"],
+            [str(row[0]) for row in taken],
+        )
+
+    def test_only_the_runtime_writes_a_step_or_an_edge_and_only_by_adding_one(self):
+        # 39's rule over the stamp, carried to what composes them: the two roles
+        # a model's own connection can be are `rk2_state` and `rk2_proxy`, and
+        # neither may touch the graph at all. `rk2_runtime` is the harness and
+        # holds INSERT because `build_kill_chain` runs on its connection --
+        # UPDATE and DELETE are what it may never hold, since a derived graph
+        # that can be edited afterwards is an asserted one.
+        held = self.rows(
+            "SELECT c.relname, r.rolname, p.privilege_type"
+            "  FROM pg_class c"
+            "  CROSS JOIN unnest(ARRAY['rk2_runtime','rk2_state','rk2_proxy']) AS r(rolname)"
+            "  CROSS JOIN unnest(ARRAY['INSERT','UPDATE','DELETE']) AS p(privilege_type)"
+            " WHERE c.relname IN ('chain_steps', 'chain_edges')"
+            "   AND has_table_privilege(r.rolname, c.oid, p.privilege_type)"
+            " ORDER BY 1, 2, 3"
+        )
+
+        self.assertEqual(
+            [("chain_edges", "rk2_runtime", "INSERT"),
+             ("chain_steps", "rk2_runtime", "INSERT")],
+            [tuple(str(field) for field in row) for row in held],
+        )
+
+    def test_the_flow_the_agent_proposed_is_kept_beside_the_chain(self):
+        proposed = self.rows(
+            "SELECT p.flow::text, a.role"
+            "  FROM chain_proposals p JOIN agent_runs a ON a.id = p.agent_run_id"
+            " WHERE p.program_id = $1::uuid AND p.outcome = 'built'"
+            "   AND p.agent_run_id IS NOT NULL",
+            (self.program_id,),
+        )
+
+        self.assertEqual(
+            [(self.FLOW, "web_hunter")],
+            [(json.loads(str(row[0])), str(row[1])) for row in proposed],
+        )
+
+    def test_every_attempt_is_recorded_whichever_way_it_went(self):
+        self.assertEqual(
+            # Eleven and not twelve: the cross-Program proposal is recorded
+            # against the Program that made it, which is the other one.
+            {"built": 2, "refused": 11, "repeated": 1},
+            {str(row[0]): int(row[1]) for row in self.proposals},
+        )
+
+    # -- criterion 2: the edges are derived, not asserted -----------------------
+
+    def test_a_line_of_two_steps_has_the_one_edge_the_stamps_imply(self):
+        self.assertIsNone(self.linear["refusal"])
+        self.assertTrue(str(self.linear["chain"]).startswith("KC"))
+        self.assertTrue(self.linear["built"])
+        self.assertEqual([2, 1], [self.linear["steps"], self.linear["edges"]])
+        self.assertEqual(
+            [{"from": self.of["reach"]["label"], "to": self.of["token"]["label"],
+              "capability": "other_account_data"}],
+            self.linear_read["edges"],
+        )
+
+    def test_a_branch_is_one_step_reaching_two_and_both_sit_at_one_depth(self):
+        self.assertEqual([3, 2], [self.branch["steps"], self.branch["edges"]])
+        self.assertEqual(
+            sorted([(self.of["reach"]["label"], 0), (self.of["inside"]["label"], 1),
+                    (self.of["token"]["label"], 1)]),
+            sorted((step["stamp"], step["depth"]) for step in self.branch_read["steps"]),
+        )
+
+    def test_a_step_is_read_back_with_the_stamp_it_is_and_nothing_added(self):
+        first = self.linear_read["steps"][0]
+
+        self.assertEqual(
+            {"stamp": self.of["reach"]["label"], "depth": 0,
+             "member": self.rows("SELECT label FROM findings WHERE id = $1::uuid",
+                                 (self.member["first"]["finding"],))[0][0],
+             "identity": self.HERE, "provides": "other_account_data",
+             "requires": ["authenticated_session"]},
+            {key: first[key] for key in
+             ("stamp", "depth", "member", "identity", "provides", "requires")},
+        )
+        self.assertEqual(self.CONDITIONS, first["conditions"])
+
+    def test_the_capabilities_a_chain_starts_from_are_derived_and_not_declared(self):
+        self.assertEqual(["anonymous_reach", "authenticated_session"], self.entry)
+        self.assertEqual(self.entry, self.linear_read["entry"])
+
+    def test_proposing_the_same_members_in_another_order_is_the_same_chain(self):
+        self.assertEqual(self.linear["chain"], self.rebuilt["chain"])
+        self.assertEqual(self.linear["source_sha256"], self.rebuilt["source_sha256"])
+        self.assertFalse(self.rebuilt["built"])
+
+    def test_a_chain_digests_the_digests_of_its_members(self):
+        stored = self.rows(
+            "SELECT c.source -> 'members' = ("
+            "         SELECT jsonb_agg(s.source_sha256 ORDER BY s.source_sha256)"
+            "           FROM chain_steps cs JOIN pivot_stamps s ON s.id = cs.stamp_id"
+            "          WHERE cs.chain_id = c.id)"
+            "  FROM chains c WHERE c.program_id = $1::uuid ORDER BY c.label",
+            (self.program_id,),
+        )
+
+        self.assertEqual([True, True], [bool(row[0]) for row in stored])
+
+    # -- criterion 3: what is not a chain --------------------------------------
+
+    def test_each_way_a_set_of_stamps_fails_to_be_a_chain_is_refused_by_name(self):
+        self.assertEqual(
+            {
+                "nothing": "a chain of no steps is not an empty chain, it is not a chain,"
+                           " and an empty graph is not a negative result",
+                "a_hole": "the proposal names nothing in one of its places",
+                "one_stamp": "one stamp is a stamp, and a chain composes at least two",
+                "the_same_step_twice":
+                    f"step {self.of['reach']['label']} is named twice, and a step is one step",
+                "a_gap": f"step {self.of['token']['label']} requires other_account_data,"
+                         " and no step provides it and the Program does not start with it",
+                "a_cycle": f"step {self.of['reach']['label']} is its own ancestor, and a chain"
+                           " that assumes what it concludes concludes nothing",
+                "two_chains": f"step {self.of['beside']['label']} is joined to nothing else"
+                              " here, so this is two chains",
+                "two_identities":
+                    f"step {self.of['through']['label']} is reached from steps that ran as"
+                    " different Identities, and the chain does not say which one carried it",
+            },
+            {name: answer["refusal"] for name, answer in self.refused.items()
+             if name not in ("a_stamp_nobody_issued", "a_story")},
+        )
+
+    def test_a_member_this_program_never_stamped_is_named_by_its_id(self):
+        self.assertRegex(
+            str(self.refused["a_stamp_nobody_issued"]["refusal"]),
+            r"^no pivot stamp of this Program is recorded under [0-9a-f-]{36}$",
+        )
+        self.assertEqual("a chain of 17 steps is a story", self.refused["a_story"]["refusal"])
+
+    def test_a_chain_of_another_programs_stamps_is_not_a_chain_here(self):
+        self.assertRegex(
+            str(self.elsewhere["refusal"]),
+            r"^no pivot stamp of this Program is recorded under [0-9a-f-]{36}$",
+        )
+
+    def test_stamps_issued_under_two_vocabularies_do_not_compose(self):
+        self.assertEqual(
+            "the steps were stamped under 2 capability vocabularies,"
+            " and a chain composes words that mean one thing",
+            self.two_vocabularies["refusal"],
+        )
+
+    def test_nothing_refused_left_a_chain_behind(self):
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT p.refusal FROM chain_proposals p"
+                " WHERE p.program_id = $1::uuid AND p.outcome = 'refused'"
+                "   AND p.chain_id IS NOT NULL",
+                (self.program_id,),
+            ),
+        )
+
+    # -- criteria 4 and 5: staying sound, and stopping ---------------------------
+
+    def test_a_chain_every_step_of_which_still_stands_reads_as_sound(self):
+        self.assertIsNone(self.sound_before["unsound"])
+        self.assertTrue(self.sound_before["sound"])
+
+    def test_a_member_that_has_been_reported_keeps_its_chain_sound(self):
+        # 039 admits `validated` and `reported`; `report_blockers` holds
+        # anything but `validated`. Criterion 4's review-gate arm reads the
+        # first of those and not the second, because the two are right about
+        # different questions -- 034 asks whether to render this Finding's own
+        # report again, and a chain asks whether the transitions under it still
+        # hold. Writing the member up does not unmake them.
+        self.assertIsNone(self.sound_when_reported["unsound"])
+        self.assertTrue(self.sound_when_reported["sound"])
+        self.assertEqual(
+            self.linear_read["steps"], self.sound_when_reported["steps"]
+        )
+        # And the blocker really was raised while it was reported, so this is a
+        # gate being declined rather than a gate that never fired.
+        self.assertIn(
+            ["hard", "not_validated"],
+            [[str(field) for field in row] for row in self.gates_when_reported],
+        )
+
+    def test_each_way_the_ground_moves_makes_the_chain_unsound_by_name(self):
+        self.assertEqual(
+            {
+                "a_review_gate":
+                    f"member {self.linear_read['steps'][0]['member']} is held by a review"
+                    " gate -- known_issue: this class is on the published known-issue list",
+                "a_subject_out_of_scope":
+                    f"the subject of step {self.of['reach']['label']} is no longer in scope",
+                "a_member_withdrawn":
+                    f"step {self.of['reach']['label']} no longer stands: member finding"
+                    f" {self.linear_read['steps'][0]['member']} is rejected, and a pivot"
+                    " composes validated Findings",
+                "an_identity_invalidated":
+                    f"step {self.of['reach']['label']} went out as identity {self.HERE},"
+                    " which has been invalidated",
+                "a_scope_that_moved":
+                    f"step {self.of['reach']['label']} was obtained under scope version"
+                    f" {self.scope_when_stamped} and this Program is now at version"
+                    f" {self.scope_when_moved}",
+                "a_start_it_no_longer_has":
+                    "the chain starts from authenticated_session and this Program no longer"
+                    " offers it without a step",
+            },
+            {name: answer["unsound"] for name, answer in self.unsound.items()},
+        )
+
+    def test_the_scope_version_named_is_the_one_the_stamps_carry(self):
+        # The sentence above is built from two readings rather than two
+        # literals, so this is where they are held to being the right two: one
+        # version under every stamp, and a later one under the Program.
+        self.assertEqual(
+            [self.scope_when_stamped],
+            [int(row[0]) for row in self.rows(
+                "SELECT DISTINCT s.scope_version FROM pivot_stamps s"
+                " WHERE s.program_id = $1::uuid",
+                (self.program_id,),
+            )],
+        )
+        self.assertLess(self.scope_when_stamped, self.scope_when_moved)
+
+    def test_an_unsound_chain_renders_nothing_at_all(self):
+        for name, answer in self.unsound.items():
+            with self.subTest(name):
+                self.assertFalse(answer["sound"])
+                self.assertEqual(self.linear["chain"], answer["chain"])
+                self.assertIsNone(answer["steps"])
+                self.assertIsNone(answer["edges"])
+
+    def test_a_chain_this_program_never_built_is_not_a_chain_it_may_read(self):
+        self.assertEqual(
+            {"chain": None, "sound": False,
+             "unsound": "no chain of this Program is recorded under that id"},
+            self.unknown,
+        )
+
+    def test_going_unsound_deleted_no_row_it_was_built_from(self):
+        self.assertEqual(self.counted_before, self.counted_after)
+        # And that the snapshots are of something: a pair of zeroes would agree
+        # with each other and say nothing about criterion 5.
+        self.assertTrue(all(count > 0 for count in self.counted_before))
+
+    def test_a_chain_carries_no_column_a_stored_verdict_could_live_in(self):
+        columns = self.rows(
+            "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a"
+            "    ON a.attrelid = c.oid AND a.attnum > 0"
+            " WHERE c.relname IN ('chains', 'chain_steps', 'chain_edges')"
+            "   AND a.attname IN ('sound', 'unsound', 'verdict', 'reportable', 'status')"
+        )
+
+        self.assertEqual((), columns)
+
+    # -- the standing check -----------------------------------------------------
+
+    def test_the_standing_check_holds_over_every_chain_this_case_built(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 

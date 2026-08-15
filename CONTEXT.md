@@ -276,6 +276,26 @@ underneath is a different one. What a chain in a later ticket composes over is
 these, never the word "so".
 _Avoid_: Chain, escalation, link, exploit step
 
+**Kill chain**:
+Pivot stamps composed into a graph, where an edge is not something anybody wrote
+down but the fact that one stamp provides a capability another requires. An agent
+may propose which stamps belong together and tell a story about the flow; the
+runtime derives the edges, the depths and the order, and keeps the story beside
+the answer rather than inside it. What a chain may assume rather than obtain is
+read off the Program -- reaching the target, always, and holding a session
+exactly when an operator provisioned a live Identity -- because a chain allowed to
+declare its own starting capabilities would declare all of them. Soundness is
+never stored: a chain is sound only for as long as a read says so, and it is
+recomputed from the members, the entry set, the Identities, the scope version,
+the subjects' scope class and the review gates on every ask. When one of those
+moves the chain answers with the sentence saying which, renders no steps and no
+edges at all, and keeps every row it was built from -- the record of what the
+harness believed and what changed underneath it. Depth and not an ordinal,
+because a branch puts two steps in the same place. A chain of no steps is not an
+empty chain and not a negative result: it is the one shape that would pass every
+rule vacuously, so it is refused by the verb and reported by the standing check.
+_Avoid_: Attack path, exploit chain, story, verdict
+
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.
