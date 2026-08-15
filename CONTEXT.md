@@ -247,6 +247,35 @@ made where there is no proof -- and `high` or `critical` on nothing but
 `program_context`, which reads a document rather than the target.
 _Avoid_: Confidence, likelihood, CVSS (a report renders one; the basis is not it)
 
+**Capability**:
+What holding a position gets you, as distinct from what a Finding is about, which
+is a property class, and from what is wrong with the target, which is a
+vulnerability class. A closed vocabulary of ten words owned by migrations,
+because `session` and `authenticated_session` are one capability to their authors
+and two to anything counting. The vocabulary is one value with one digest, and
+every pivot stamp records which digest it was issued under -- so a word added,
+removed or re-described later leaves old stamps saying what they said instead of
+quietly meaning something new.
+_Avoid_: Permission, privilege, access level, property class, vulnerability class
+
+**Pivot stamp**:
+The runtime's record that it saw a capability obtained: one immutable row per
+body of evidence, naming the member Finding, its subject, the Identity the door
+recorded, the Test and its digest, the run, the transition and the Receipt it is
+read from, the capability provided, the capabilities required, the conditions --
+one of which states the scope the claim is made in -- the scope version the run
+ran under and the capability vocabulary. The claim is written before the run,
+in the Test specification an operator's impact grant is over -- a pivot claim
+authored beside a finished run is a claim fitted to its answer. Demonstrating it
+is structural rather than rhetorical: the named transition assertion held, and
+the request it reads is one the member's own validating Test never made, because
+a transition drawn from that set demonstrates the member a second time and
+nothing else. Its identity is the digest of everything it rests on, so issuing
+twice from unchanged evidence is the same stamp and anything that moved
+underneath is a different one. What a chain in a later ticket composes over is
+these, never the word "so".
+_Avoid_: Chain, escalation, link, exploit step
+
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.
@@ -357,7 +386,8 @@ _Avoid_: Agent type, persona, profile, worker
 The unit of authority a role holds, naming a class of tool rather than one tool.
 Moving a tool between groups changes what every role holding either can do,
 which is why the group is what a role is granted.
-_Avoid_: Scope, permission set, namespace, capability
+_Avoid_: Scope, permission set, namespace, capability (a Capability is what a run
+obtains against a target, never what a role is granted here)
 
 **Pre-tool gate**:
 The runtime's decision on one tool call, taken before the call runs and from the
@@ -600,7 +630,8 @@ _Avoid_: Guard, preflight, health check, validation
 An executable capability that lives in the repo, is versioned with the code, and
 is testable in CI. A playbook references skills; a skill never references a
 playbook.
-_Avoid_: Tool, capability, module
+_Avoid_: Tool, capability (a Capability is what a run obtains against a target,
+never what a Skill teaches), module
 
 **Playbook**:
 An investigation strategy in the knowledge base, versioned with knowledge rather

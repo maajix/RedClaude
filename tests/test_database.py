@@ -50,7 +50,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from redkraken import (
     _launch,
@@ -878,6 +878,31 @@ FORBIDDEN_IMPACT = json.dumps(
             "effect": "the orders API stops answering the users it belongs to",
             "cleanup": "the load is stopped and the service is left to recover",
             "after_state": 2,
+        },
+    }
+)
+
+#: The same Test again, claiming a pivot it would demonstrate. Well formed by
+#: every rule 39 puts on the block, which is the point: what the control below
+#: breaks is not the Test but the vocabulary underneath it.
+PIVOTED = json.dumps(
+    SPECIFICATION
+    | {
+        "cleanup": [{"method": "DELETE", "url": "https://app.example.com/orders/2"}],
+        "impact": {
+            "class": "write_target_state",
+            "effect": "a neighbour's order note is rewritten",
+            "cleanup": "the note is PUT back to the text the baseline read",
+            "after_state": 2,
+        },
+        "pivot": {
+            "provides": "other_account_data",
+            "requires": ["authenticated_session"],
+            "identity": "operator",
+            "transition": "the-variant-is-served",
+            "conditions": [
+                {"kind": "scope_holds", "detail": "the neighbour's order is in scope"}
+            ],
         },
     }
 )
@@ -1961,6 +1986,35 @@ CONTROLS = (
         f"        VALUES (p, h, '{FORBIDDEN_IMPACT}'::jsonb,"
         f"                rk2_test_spec_digest('{FORBIDDEN_IMPACT}'::jsonb),"
         "                 'degrade_availability');"
+        " END $ctl$",
+    ),
+    Control(
+        # PH2-39 criterion 4: a stored Test asking for a capability the
+        # vocabulary no longer holds. `provides` is a foreign key and
+        # `apply_pivot_claim` reads every word of `requires` against the
+        # vocabulary as the Test is written, so no verb and no hand can produce
+        # this pair in one statement -- what it is, seen from outside, is a
+        # migration that retired a word and left the claims spelled in it
+        # standing. The Test is unchanged and still immutable; the ground under
+        # it moved.
+        "standing:check_pivot_stamps",
+        "DO $ctl$ DECLARE p uuid; e uuid; h uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('pivot-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'pivot-selftest', 'tech:pivot-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+        "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
+        "                'a self test')"
+        "     RETURNING id INTO h;"
+        "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256, impact_class)"
+        f"        VALUES (p, h, $j${PIVOTED}$j$::jsonb,"
+        f"                 rk2_test_spec_digest($j${PIVOTED}$j$::jsonb),"
+        "                 'write_target_state');"
+        "   DELETE FROM capabilities WHERE capability = 'authenticated_session';"
         " END $ctl$",
     ),
     # --- the role split ------------------------------------------------------
@@ -22988,6 +23042,9 @@ class ReplayFixture:
         status: int = 200,
         body: str | None = None,
         lane: str = "replay",
+        identity: str | None = None,
+        method: str = "GET",
+        path: str | None = None,
     ) -> str:
         """One exchange the door would have written, by the label it names it with.
 
@@ -22997,6 +23054,15 @@ class ReplayFixture:
         without the runtime holding either page. The bytes are registered first
         because the column is a foreign key into the store, and a Receipt naming
         a page nobody kept is a Receipt no reader could check the Test against.
+
+        `identity` is who the request went out as, and is null unless a caller
+        says otherwise: an anonymous exchange is what most of this file is about
+        and 39's transition is what it is not.
+
+        `method` and `path` default to the route the default plan states for
+        that ordinal, because most cases here perform the default plan.
+        `record_test_action` compares both against the action being recorded, so
+        a case stating its own actions states its own answers to them.
         """
         if body is not None:
             with cls.connection.transaction():
@@ -23011,14 +23077,18 @@ class ReplayFixture:
             cls.owner_as_runtime(),
             "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
             "                      method, scheme, host, port, path, status_code,"
-            "                      response_agent_sha, ts_arrival, scope_class, scope_version)"
+            "                      response_agent_sha, ts_arrival, scope_class, scope_version,"
+            "                      identity_entity_id)"
             " VALUES ($1::uuid, $2::uuid, $3, 'allowed',"
-            "         'allowed as target under scope version 1', 'GET', 'https',"
-            "         'app.example.com', 443, $4, $5::integer, $6, now(), 'target', 1)"
+            "         'allowed as target under scope version 1', $4, 'https',"
+            "         'app.example.com', 443, $5, $6::integer, $7, now(), 'target', 1,"
+            "         $8::uuid)"
             " RETURNING label",
             (
-                cls.program_id, tool_run, lane, f"/api/orders/{ordinal}", status,
+                cls.program_id, tool_run, lane, method.upper(),
+                path or f"/api/orders/{ordinal}", status,
                 None if body is None else artifact.digest(body.encode()),
+                identity,
             ),
         )
 
@@ -26539,7 +26609,224 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
 IMPACT_SLUG = "selftest-impact"
 
 
-class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
+class ImpactRunFixture(ValidatedFindingFixture):
+    """The moves that carry a validated Finding through one authorized impact run.
+
+    38 built them and 39 needs every one: a pivot is stamped from an impact run
+    that held, so the arrangement that produces one is the arrangement that
+    produces the thing 39 is about. Here rather than copied, for the reason
+    `ValidatedFindingFixture` is here -- a change to how an impact run is opened
+    is one edit, not one per ticket that opens one.
+
+    What is not here is anything either ticket asserts. `impact_replay` walks
+    the run and says nothing about it; the refusals each case is interested in
+    are collected by that case.
+    """
+
+    OPEN_TASK = "SELECT open_impact_task($1::uuid, $2::jsonb)"
+    OPEN_REPLAY = "SELECT open_impact_replay($1::uuid, $2::uuid, $3)"
+    CLOSE_REPLAY = "SELECT close_impact_replay($1::uuid, $2, $3)"
+
+    #: The requests that undo it. A Test stating an impact states these or it is
+    #: not a valid specification.
+    UNDO = [{"method": "PUT", "url": f"{BASE}/1"}]
+
+    REASON = "the write is reversible and I want it proved before we report it"
+
+    @classmethod
+    def id_of(cls, table: str, label: str) -> str:
+        """The id behind a label, because the verbs answer in one and take the other.
+
+        The table name is interpolated and every call site passes a literal:
+        every row these cases look up is found the same way, and a helper per
+        table would be the same statement written twice.
+        """
+        return str(
+            cls.connection.execute(
+                f"SELECT id FROM {table} WHERE program_id = $1::uuid AND label = $2",
+                (cls.program_id, label),
+            ).scalar()
+        )
+
+    @classmethod
+    def run_on(cls, task: str) -> str:
+        """One agent run holding the impact Task, claimed as the slate would.
+
+        The Task is claimed by the owner rather than through `claim_task`,
+        which needs a live offer on a slate no case here is running. What
+        matters to the verbs below is that the lease is held: `authorize_tool_run`
+        refuses a run whose Task is not, so a run arranged any other way would
+        be refused before its first request rather than at the assertion it was
+        written for.
+
+        The ending is cleared with the claim, because a Task that ended and is
+        claimed again is claimed: 012 makes the abandonment reason a property of
+        the status, and a row carrying both is one the constraint refuses.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
+            "                 lease_expires_at = now() + interval '30 minutes',"
+            "                 finished_at = NULL, abandoned_reason = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+        return committed(
+            cls.connection,
+            "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+            " SELECT $1::uuid, t.id, 'web_hunter', 'operator', 'low', '{}'::jsonb"
+            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2"
+            " RETURNING id",
+            (cls.program_id, task),
+        )
+
+    @classmethod
+    def as_operator(cls, sql: str, parameters: tuple = ()):
+        """Something only the operator's own connection may say.
+
+        `answer_decision` and `revalidate_decision` are granted to `rk2_human`
+        and to nothing else, so asking either as the runtime would be
+        exercising a path no operator has -- which is the path 38's criterion 2
+        exists to close.
+        """
+        connection = pg.connect(cls.harness.human)
+        try:
+            connection.execute(operator.BIND, (cls.program_id,))
+            with connection.transaction():
+                return connection.execute(sql, parameters).scalar()
+        finally:
+            connection.close()
+
+    @classmethod
+    def approve(cls, label: str) -> dict:
+        """The operator's answer to the question `open_impact_replay` filed."""
+        return json.loads(
+            str(
+                cls.as_operator(
+                    operator.ANSWER_DECISION,
+                    (label, "approved", cls.REASON, "30 minutes"),
+                )
+            )
+        )
+
+    @classmethod
+    def leased(cls, run: str, slot: str) -> str:
+        """One Identity of this Program, leased to the run about to send under it.
+
+        Written by the owner, because granting a lease is the scheduler's and
+        neither the runtime nor the proxy may write one. The expiry is the
+        holder's Task lease rather than a fresh half hour: 023's standing check
+        reads one clock, and two values half a millisecond apart are two clocks.
+
+        Two rules stand between an Identity and a request and both want this
+        row -- `rk2_replay_plan` refuses a run holding a slot it does not lease,
+        and `enforce_allowed_receipt_capability` refuses an allowed Receipt
+        naming an Identity the run has no live lease on.
+        """
+        cls.as_owner(
+            "INSERT INTO identity_leases (program_id, identity_entity_id,"
+            "                             holder_agent_run_id, expires_at)"
+            " SELECT $1::uuid, i.entity_id, a.id, t.lease_expires_at"
+            "   FROM identities i, agent_runs a JOIN tasks t ON t.id = a.task_id"
+            "  WHERE i.program_id = $1::uuid AND i.slot_name = $3"
+            "    AND i.invalidated_at IS NULL"
+            "    AND a.id = $2::uuid AND a.program_id = $1::uuid",
+            (cls.program_id, run, slot),
+        )
+        return str(
+            cls.connection.execute(
+                "SELECT entity_id FROM identities"
+                " WHERE program_id = $1::uuid AND slot_name = $2",
+                (cls.program_id, slot),
+            ).scalar()
+        )
+
+    @classmethod
+    def impact_replay(cls, task: str, test: str, answers: dict, cleanup: str,
+                      detail: str | None = None, *, undo: bool = True,
+                      slot: str | None = None) -> dict:
+        """One whole impact replay under the grant: open it, answer it, close it.
+
+        `undo` is whether the request the specification names as its cleanup was
+        actually sent. Separate from `cleanup`, which is only the supervisor's
+        word for what happened, because 38's criterion 4 is about what the door
+        saw. `slot` is the Identity the run is opened under and the one the door
+        records on every Receipt, which is what 39 reads the transition off; a
+        run that names none sends as nobody, which is what most of this file is
+        about.
+        """
+        run = cls.run_on(task)
+        identity = None if slot is None else cls.leased(run, slot)
+        plan = cls.called(cls.OPEN_REPLAY, (run, test, slot))
+        cls.while_in_flight(task, test, plan)
+        for action in plan["actions"]:
+            answer = answers.get(int(action["ordinal"]))
+            if answer is None:
+                continue
+            status, body = answer
+            receipt = cls.receipted(
+                plan["tool_run_id"], int(action["ordinal"]),
+                status=status, body=body, identity=identity,
+                method=str(action["method"]), path=urlsplit(str(action["url"])).path,
+            )
+            committed(cls.connection, cls.RECORD,
+                      (plan["tool_run_id"], action["ordinal"], receipt))
+        if undo:
+            cls.undone(plan["tool_run_id"], identity)
+        closed = cls.called(cls.CLOSE_REPLAY, (plan["tool_run_id"], cleanup, detail))
+        if slot is not None:
+            # The Identity goes back when the run stops sending. Not
+            # `release_leases`, which gives back the Task lease too: the Task is
+            # still claimed here and 023 reads a claimed Task with no lease as a
+            # problem of its own. What a run that ends really does is
+            # `finish_task_attempt`, and settling the Task is the scheduler's
+            # move rather than the walk's.
+            cls.as_owner(
+                "UPDATE identity_leases SET released_at = now()"
+                " WHERE program_id = $1::uuid AND holder_agent_run_id = $2::uuid"
+                "   AND released_at IS NULL",
+                (cls.program_id, run),
+            )
+        return {"run": run, "plan": plan, "identity": identity, "closed": closed}
+
+    @classmethod
+    def undone(cls, tool_run: str, identity: str | None = None) -> str:
+        """The Receipt for the one request this Test states as its undo.
+
+        Written by hand, like every Receipt in this file, because the door writes
+        them and no case here is running one. Two things about it are the point:
+        it answers no recorded action, since a cleanup request is not part of the
+        plan the assertions are evaluated over, and its route is the one `UNDO`
+        names -- which is what `close_impact_replay` looks for.
+
+        The Identity is the run's, because the capability is: a run that holds a
+        slot sends every request under it, cleanup included, and
+        `enforce_allowed_receipt_capability` refuses an anonymous Receipt from a
+        run that declared one.
+        """
+        return committed(
+            cls.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+            "                      method, scheme, host, port, path, status_code,"
+            "                      ts_arrival, scope_class, scope_version,"
+            "                      identity_entity_id)"
+            " SELECT $1::uuid, $2::uuid, 'replay', 'allowed',"
+            "        'allowed as target under scope version 1', $3, r.scheme, r.host,"
+            "        r.port, r.path, 200, now(), 'target', 1, $5::uuid"
+            "   FROM rk2_test_route($4) r"
+            " RETURNING label",
+            (cls.program_id, tool_run, cls.UNDO[0]["method"], cls.UNDO[0]["url"], identity),
+        )
+
+    @classmethod
+    def while_in_flight(cls, task: str, test: str, plan: dict) -> None:
+        """What a case wants to ask while the run is open and nothing has closed it.
+
+        Nothing, by default: the walk offers the moment and a case with no
+        question about it asks none.
+        """
+
+
+class ImpactProofTest(ImpactRunFixture, DatabaseCase):
     """Ticket 38: an impact is authorized before it is proved, and proved apart.
 
     The arrangement is 37's carried one step on. A claim is stated, tested,
@@ -26557,9 +26844,6 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
 
     slug = IMPACT_SLUG
 
-    OPEN_TASK = "SELECT open_impact_task($1::uuid, $2::jsonb)"
-    OPEN_REPLAY = "SELECT open_impact_replay($1::uuid, $2::uuid, $3)"
-    CLOSE_REPLAY = "SELECT close_impact_replay($1::uuid, $2, $3)"
     SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
     PROBLEM = "SELECT rk2_test_spec_problem($1::jsonb)"
     REVALIDATE = "SELECT revalidate_decision($1)"
@@ -26590,11 +26874,6 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
     ANSWERED = {1: (200, "note: nothing"), 2: (200, "accepted"),
                 3: (200, "note: rewritten by a stranger")}
 
-    #: The requests that undo it. A Test stating an impact states these or it is
-    #: not a valid specification.
-    UNDO = [{"method": "PUT", "url": f"{BASE}/1"}]
-
-    REASON = "the write is reversible and I want it proved before we report it"
     RATIONALE = "a stranger rewrote a neighbour's note and the note stayed rewritten"
 
     @classmethod
@@ -26635,76 +26914,6 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
         does.
         """
         return specification(cls.SHOWN, cleanup=cls.UNDO, impact=cls.IMPACT | changed)
-
-    @classmethod
-    def id_of(cls, table: str, label: str) -> str:
-        """The id behind a label, because the verbs answer in one and take the other.
-
-        The table name is interpolated and the two call sites pass a literal:
-        every row this case looks up is found the same way, and a helper per
-        table would be the same statement written twice.
-        """
-        return str(
-            cls.connection.execute(
-                f"SELECT id FROM {table} WHERE program_id = $1::uuid AND label = $2",
-                (cls.program_id, label),
-            ).scalar()
-        )
-
-    @classmethod
-    def run_on(cls, task: str) -> str:
-        """One agent run holding the impact Task, claimed as the slate would.
-
-        The Task is claimed by the owner rather than through `claim_task`,
-        which needs a live offer on a slate no case here is running. What
-        matters to the verbs below is that the lease is held: `authorize_tool_run`
-        refuses a run whose Task is not, so a run arranged any other way would
-        be refused before its first request rather than at the assertion it was
-        written for.
-        """
-        cls.as_owner(
-            "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
-            "                 lease_expires_at = now() + interval '30 minutes'"
-            " WHERE program_id = $1::uuid AND label = $2",
-            (cls.program_id, task),
-        )
-        return committed(
-            cls.connection,
-            "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
-            " SELECT $1::uuid, t.id, 'web_hunter', 'operator', 'low', '{}'::jsonb"
-            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2"
-            " RETURNING id",
-            (cls.program_id, task),
-        )
-
-    @classmethod
-    def as_operator(cls, sql: str, parameters: tuple = ()):
-        """Something only the operator's own connection may say.
-
-        `answer_decision` and `revalidate_decision` are granted to `rk2_human`
-        and to nothing else, so asking either as the runtime would be
-        exercising a path no operator has -- which is the path criterion 2
-        exists to close.
-        """
-        connection = pg.connect(cls.harness.human)
-        try:
-            connection.execute(operator.BIND, (cls.program_id,))
-            with connection.transaction():
-                return connection.execute(sql, parameters).scalar()
-        finally:
-            connection.close()
-
-    @classmethod
-    def approve(cls, label: str) -> dict:
-        """The operator's answer to the question `open_impact_replay` filed."""
-        return json.loads(
-            str(
-                cls.as_operator(
-                    operator.ANSWER_DECISION,
-                    (label, "approved", cls.REASON, "30 minutes"),
-                )
-            )
-        )
 
     @classmethod
     def refuse_the_specifications_that_state_no_impact(cls):
@@ -26826,7 +27035,7 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
     def prove(cls):
         """Criteria 3 and 4: the granted run, and the two runs that show nothing."""
         cls.claim_before = cls.claim_state()
-        cls.proved = cls.impact_replay(cls.ANSWERED, "done")
+        cls.proved = cls.replayed(cls.ANSWERED, "done")
         cls.claim_after = cls.claim_state()
 
         # The detection opener, offered the same Test: 35's verb settles the
@@ -26837,65 +27046,31 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
 
         # Criterion 4 is the conjunction. The same grant covers all of these, so
         # what refuses them is the reading of the run and nothing else.
-        cls.uncleaned = cls.impact_replay(
+        cls.uncleaned = cls.replayed(
             cls.ANSWERED, "failed", "the PUT that undoes it answered 500", undo=False
         )
-        cls.unheld = cls.impact_replay({**cls.ANSWERED, 2: (403, "denied")}, "done")
+        cls.unheld = cls.replayed({**cls.ANSWERED, 2: (403, "denied")}, "done")
         # The same run again, reported the same way, with the undo never sent.
         # The word and the evidence are different things and this is the arm
         # where they disagree.
-        cls.unproven_cleanup = cls.impact_replay(cls.ANSWERED, "done", undo=False)
+        cls.unproven_cleanup = cls.replayed(cls.ANSWERED, "done", undo=False)
 
     @classmethod
-    def impact_replay(cls, answers: dict, cleanup: str, detail: str | None = None,
-                      *, undo: bool = True) -> dict:
-        """One whole impact replay under the grant: open it, answer it, close it.
-
-        `undo` is whether the request the specification names as its cleanup was
-        actually sent. Separate from `cleanup`, which is only the supervisor's
-        word for what happened, because criterion 4 is about what the door saw.
-        """
-        run = cls.run_on(cls.opened["task"])
-        plan = cls.called(cls.OPEN_REPLAY, (run, cls.test, None))
-        cls.second_in_flight = cls.refuse(
-            cls.OPEN_REPLAY, (cls.run_on(cls.opened["task"]), cls.test, None)
+    def replayed(cls, answers: dict, cleanup: str, detail: str | None = None,
+                 *, undo: bool = True) -> dict:
+        """The shared walk, over this case's one Task and one Test."""
+        return cls.impact_replay(
+            cls.opened["task"], cls.test, answers, cleanup, detail, undo=undo
         )
-        for action in plan["actions"]:
-            answer = answers.get(int(action["ordinal"]))
-            if answer is None:
-                continue
-            status, body = answer
-            receipt = cls.receipted(
-                plan["tool_run_id"], int(action["ordinal"]), status=status, body=body
-            )
-            committed(cls.connection, cls.RECORD,
-                      (plan["tool_run_id"], action["ordinal"], receipt))
-        if undo:
-            cls.undone(plan["tool_run_id"])
-        return {"run": run, "plan": plan,
-                "closed": cls.called(cls.CLOSE_REPLAY, (plan["tool_run_id"], cleanup, detail))}
 
     @classmethod
-    def undone(cls, tool_run: str) -> str:
-        """The Receipt for the one request this Test states as its undo.
+    def while_in_flight(cls, task: str, test: str, plan: dict) -> None:
+        """One impact replay of a Finding at a time, asked while one is open.
 
-        Written by hand, like every Receipt in this file, because the door writes
-        them and no case here is running one. Two things about it are the point:
-        it answers no recorded action, since a cleanup request is not part of the
-        plan the assertions are evaluated over, and its route is the one `UNDO`
-        names -- which is what `close_impact_replay` looks for.
+        The only question that can be asked neither before the walk nor after
+        it, so the walk offers the moment and this is what 38 does with it.
         """
-        return committed(
-            cls.owner_as_runtime(),
-            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
-            "                      method, scheme, host, port, path, status_code,"
-            "                      ts_arrival, scope_class, scope_version)"
-            " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed',"
-            "         'allowed as target under scope version 1', 'PUT', 'https',"
-            "         'app.example.com', 443, '/api/orders/1', 200, now(), 'target', 1)"
-            " RETURNING label",
-            (cls.program_id, tool_run),
-        )
+        cls.second_in_flight = cls.refuse(cls.OPEN_REPLAY, (cls.run_on(task), test, None))
 
     @classmethod
     def claim_state(cls) -> tuple:
@@ -27374,6 +27549,836 @@ class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
     # -- the standing check -----------------------------------------------------
 
     def test_the_standing_check_holds_over_everything_this_case_proved(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+PIVOT_SLUG = "selftest-pivot"
+
+
+class PivotStampTest(ImpactRunFixture, DatabaseCase):
+    """Ticket 39: a pivot is stamped from the run that showed it, or refused.
+
+    The arrangement is 38's carried one step on. A claim is stated, tested,
+    opened as a candidate, validated, and proved through an authorized impact
+    run -- and what this case is about begins there: the Test that run performed
+    also said, before anything was sent, which capability the transition would
+    hand the harness. A stamp is the runtime's record that it watched that
+    happen.
+
+    Everything commits, for 38's reason: the subject is a sequence across
+    transactions. The order in `setUpClass` is the order the evidence accrues,
+    and it is load-bearing twice -- the three refusals at the end move the
+    ground (the Program is Halted, the member is written up, the grant lapses)
+    and could not be asked before the runs they are asked about.
+    """
+
+    slug = PIVOT_SLUG
+
+    ISSUE = "SELECT issue_pivot_stamp($1::uuid, $2::uuid)"
+    PROBLEM = "SELECT rk2_pivot_problem($1::jsonb)"
+    HALT = "SELECT halt_program($1::uuid, $2)"
+    CLEAR = "SELECT clear_program_halt($1::uuid, $2)"
+
+    CLAIM = "the orders API lets a stranger write on a neighbour's order"
+
+    #: The slot the transition goes out under, and the only one there is: an
+    #: Identity is a thing the configuration declares, and this Program's
+    #: configuration declares one. Sealed material is what makes it usable --
+    #: `enforce_allowed_receipt_capability` wants an `identity_slots` row and a
+    #: live lease before the door may write a Receipt naming an Identity, so a
+    #: slot nobody provisioned is a slot nothing can be sent as.
+    SLOT = "member"
+
+    #: The requests the pivot Test makes, and the reason they are spelled here
+    #: rather than defaulted: the member Finding was validated on GET
+    #: /api/orders/{1,2,3}, and criterion 2 refuses a transition drawn from that
+    #: set. A pivot Test that reused the default actions would be showing the
+    #: member again.
+    ACTIONS = [
+        {"ordinal": 1, "role": "baseline", "kind": "request",
+         "method": "GET", "url": f"{BASE}/7/note"},
+        {"ordinal": 2, "role": "variant", "kind": "request",
+         "method": "POST", "url": f"{BASE}/7/note"},
+        {"ordinal": 3, "role": "control", "kind": "request",
+         "method": "GET", "url": f"{BASE}/7/note"},
+    ]
+    SHOWN = [
+        {"id": "the-note-is-rewritten", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-note-came-back-changed", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+    IMPACT = {
+        "class": "write_target_state",
+        "effect": "a stranger writes on a neighbour's order and the note stays written",
+        "cleanup": "the note is PUT back to the text the baseline read",
+        "after_state": 3,
+    }
+    PIVOT = {
+        "provides": "other_account_data",
+        "requires": ["authenticated_session"],
+        "identity": SLOT,
+        "transition": "the-note-is-rewritten",
+        "conditions": [
+            {"kind": "scope_holds",
+             "detail": "the neighbour's order is inside the scope document"},
+            {"kind": "identity_leased", "detail": "the operator slot is the one held"},
+        ],
+    }
+    ANSWERED = {1: (200, "note: nothing"), 2: (200, "accepted"),
+                3: (200, "note: written by a stranger")}
+
+    #: A second impact Test of the same Finding that claims no pivot at all.
+    #: 38's Test, in other words: the thing 39 is optional on top of.
+    QUIET = [
+        {"id": "the-write-is-accepted", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-order-changed", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+    QUIET_IMPACT = {
+        "class": "write_target_state",
+        "effect": "the order the member is about is rewritten",
+        "cleanup": "the order is PUT back",
+        "after_state": 3,
+    }
+
+    #: And a third, whose transition is a request the member's own validating
+    #: run already made. Well formed, authorized, holding -- and showing
+    #: nothing that was not already shown.
+    ECHOED = [
+        {"id": "the-second-order-answers", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-third-differs", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+    PLAIN = {1: (200, "order one"), 2: (200, "order two"), 3: (200, "order three")}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.made = cls.validated(cls.CLAIM)
+        cls.finding = cls.made["finding"]
+        cls.identity = cls.provisioned_identity(cls.SLOT)
+
+        cls.refuse_the_blocks_that_are_not_pivots()
+
+        cls.opened = cls.called(cls.OPEN_TASK, (cls.finding, cls.pivot_spec()))
+        cls.test = cls.id_of("tests", cls.opened["test"])
+        cls.granted = cls.grant_for(cls.opened["task"], cls.test, cls.SLOT)
+
+        cls.refuse_what_never_ran()
+        cls.stamp_the_run_that_showed_it()
+        cls.refuse_what_the_run_does_not_show()
+        cls.refuse_what_the_test_does_not_claim()
+        cls.recheck_the_ground_under_a_stamp()
+        cls.settled(cls.opened["task"])
+
+        cls.proposals = cls.rows_of(
+            "SELECT outcome, count(*) FROM pivot_proposals"
+            " WHERE program_id = $1::uuid GROUP BY outcome ORDER BY outcome",
+            (cls.program_id,),
+        )
+        cls.refusals_recorded = {
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT refusal FROM pivot_proposals"
+                " WHERE program_id = $1::uuid AND outcome = 'refused'",
+                (cls.program_id,),
+            )
+        }
+        cls.problems = cls.rows_of("SELECT * FROM check_pivot_stamps()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def provisioned_identity(cls, slot: str) -> str:
+        """One Identity of this Program, with material sealed into its slot.
+
+        Opening the Program wrote the `identities` row the configuration
+        declares; this is the second half, and the door will not carry an
+        Identity without it. Provisioned through the real adapter rather than by
+        hand because the slot is an authenticated ciphertext bound to the
+        installation key, and a hand-written row is a slot the proxy could not
+        open.
+        """
+        material = scratch() / f"{cls.slug}-identity.json"
+        material.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "origins": [
+                        {
+                            "url": "https://app.example.com/",
+                            "headers": [
+                                {"name": "Authorization", "value": "Bearer rk2-pivot-selftest"}
+                            ],
+                            "cookies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{cls.slug}"')),
+            slot,
+            material,
+            root_secret=seal.Root(Path(f"{cls.slug}-root"), SECRET),
+        )
+        assert provisioned.ok, provisioned.violations
+        return str(
+            cls.connection.execute(
+                "SELECT entity_id FROM identities"
+                " WHERE program_id = $1::uuid AND slot_name = $2",
+                (cls.program_id, slot),
+            ).scalar()
+        )
+
+    @classmethod
+    def pivot_spec(cls, **changed) -> str:
+        """The pivot specification, with any one part of the pivot block replaced."""
+        stated = json.loads(
+            specification(cls.SHOWN, actions=cls.ACTIONS, cleanup=cls.UNDO, impact=cls.IMPACT)
+        )
+        return json.dumps(stated | {"pivot": cls.PIVOT | changed})
+
+    @classmethod
+    def pivot_problem(cls, spec: str) -> str | None:
+        problem = cls.connection.execute(cls.PROBLEM, (spec,)).scalar()
+        return None if problem is None else str(problem)
+
+    @classmethod
+    def refuse_the_blocks_that_are_not_pivots(cls):
+        """Criterion 1: every shape the optional block may not have.
+
+        Asked of `rk2_pivot_problem` because that is what the trigger on `tests`
+        raises: a sentence per shape is what the writer of a Test reads, and the
+        trigger only ever says the sentence back.
+        """
+        without_impact = json.loads(cls.pivot_spec())
+        del without_impact["impact"]
+        cls.shapes = {
+            "not_an_object": cls.pivot_problem(json.dumps(
+                json.loads(cls.pivot_spec()) | {"pivot": "to another account"})),
+            "stray_key": cls.pivot_problem(cls.pivot_spec(when="tuesday")),
+            "no_impact": cls.pivot_problem(json.dumps(without_impact)),
+            "unknown_capability": cls.pivot_problem(cls.pivot_spec(provides="read_the_minds")),
+            "requires_nothing": cls.pivot_problem(cls.pivot_spec(requires=[])),
+            "requires_a_word_nobody_defines": cls.pivot_problem(
+                cls.pivot_spec(requires=["telepathy"])),
+            "requires_one_thing_twice": cls.pivot_problem(
+                cls.pivot_spec(requires=["authenticated_session", "authenticated_session"])),
+            "requires_what_it_provides": cls.pivot_problem(
+                cls.pivot_spec(requires=["other_account_data"])),
+            "no_identity": cls.pivot_problem(cls.pivot_spec(identity="")),
+            "transition_is_no_assertion": cls.pivot_problem(
+                cls.pivot_spec(transition="the-moon-is-cheese")),
+            "no_conditions": cls.pivot_problem(cls.pivot_spec(conditions=[])),
+            "no_scope_condition": cls.pivot_problem(cls.pivot_spec(
+                conditions=[{"kind": "identity_leased",
+                             "detail": "the operator slot is the one held"}])),
+            "condition_kind": cls.pivot_problem(cls.pivot_spec(
+                conditions=[{"kind": "the_stars_align", "detail": "they do"}])),
+            "condition_detail": cls.pivot_problem(cls.pivot_spec(
+                conditions=[{"kind": "scope_holds", "detail": ""}])),
+            "condition_stray_key": cls.pivot_problem(cls.pivot_spec(
+                conditions=[{"kind": "scope_holds", "detail": "it does", "when": "tuesday"}])),
+        }
+        cls.a_test_that_claims_no_pivot = cls.pivot_problem(
+            specification(cls.QUIET, cleanup=cls.UNDO, impact=cls.QUIET_IMPACT)
+        )
+        # The same sentence again, from the trigger rather than the function:
+        # what a Test writer actually runs into.
+        cls.refused_at_the_door = cls.refuse(
+            cls.OPEN_TASK, (cls.finding, cls.pivot_spec(provides="read_the_minds"))
+        )
+
+    @classmethod
+    def grant_for(cls, task: str, test: str, slot: str | None) -> dict:
+        """The question the first attempt files, and the operator's answer to it.
+
+        38's park is 39's arrangement: nothing about a pivot is reachable until
+        an operator has approved the impact the Test would have. The slot is
+        part of what is approved -- `rk2_impact_digest` names it -- so a run
+        that sends as nobody is a second question and needs its own answer.
+        """
+        parked = cls.called(cls.OPEN_REPLAY, (cls.run_on(task), test, slot))
+        return {"parked": parked, "answered": cls.approve(parked["parked"])}
+
+    @classmethod
+    def demonstrated(cls, test: str, task: str, *, answers: dict | None = None,
+                     anonymous: bool = False) -> dict:
+        """One authorized impact run of a pivot Test, walked to a close."""
+        return cls.impact_replay(
+            task, test, answers or cls.ANSWERED, "done",
+            slot=None if anonymous else cls.SLOT,
+        )
+
+    @classmethod
+    def issue(cls, walk: dict) -> dict:
+        """The stamp this run earns, or the sentence that refuses it."""
+        return cls.called(cls.ISSUE, (walk["plan"]["tool_run_id"], walk["run"]))
+
+    @classmethod
+    def while_in_flight(cls, task: str, test: str, plan: dict) -> None:
+        """Criterion 5, asked of a run that has not concluded.
+
+        The only moment it can be asked: before the walk there is no Tool run to
+        name, and after it the run has closed. Set on every walk and read once,
+        because the sentence does not depend on which walk offered it.
+        """
+        cls.unclosed = cls.called(cls.ISSUE, (plan["tool_run_id"], None))
+
+    @classmethod
+    def refuse_what_never_ran(cls):
+        """Criterion 5's missing and cross-Program pivots, before anything ran."""
+        cls.missing = cls.called(cls.ISSUE, (str(uuid.uuid4()), None))
+        # A run of this Program that the operator never authorized as impact:
+        # the member's own second detection replay, which 37 performed to build
+        # the validator's packet.
+        cls.detection = cls.called(
+            cls.ISSUE, (cls.made["again"]["plan"]["tool_run_id"], None)
+        )
+
+    @classmethod
+    def issued_elsewhere(cls, walk: dict) -> dict:
+        """The same holding run, asked for by a Program it does not belong to.
+
+        `rk2_program_required` fences every read the refusal makes, so a
+        cross-Program issuance is refused by the rule that fences everything
+        else rather than by one written for it. The binding is put back
+        whatever happens, because every later arm reads it.
+        """
+        other = program.run(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{cls.slug}-elsewhere"')),
+        )
+        assert other.ok, other.violations
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (other.facts["program_id"],)
+        )
+        try:
+            return cls.called(cls.ISSUE, (walk["plan"]["tool_run_id"], None))
+        finally:
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+            )
+
+    @classmethod
+    def stamp_the_run_that_showed_it(cls):
+        """Criteria 1 to 4, and both halves of criterion 6."""
+        cls.first = cls.demonstrated(cls.test, cls.opened["task"])
+        cls.stamped = cls.issue(cls.first)
+        cls.stamp = cls.stamp_row(cls.stamped["stamp"])
+        cls.repeated = cls.issue(cls.first)
+        cls.foreign = cls.issued_elsewhere(cls.first)
+
+        # The same Test, the same grant, the same answers -- and a second run.
+        # Different Receipts, a different run, so different evidence, so a
+        # second stamp rather than the first one handed back.
+        cls.second = cls.demonstrated(cls.test, cls.opened["task"])
+        cls.again = cls.issue(cls.second)
+
+    @classmethod
+    def stamp_row(cls, label: str) -> tuple:
+        """Everything criterion 4 says a stamp records, read back off the row."""
+        return tuple(
+            None if field is None else str(field)
+            for field in cls.rows_of(
+                "SELECT s.provides, s.requires::text, s.conditions::text, s.transition,"
+                "       s.scope_version,"
+                "       (s.vocabulary_sha256 = rk2_capability_vocabulary_sha256())::text,"
+                "       (s.source_sha256 = equivalence_key(s.source))::text,"
+                "       f.label, t.label, (s.identity_entity_id = $2::uuid)::text,"
+                "       (s.transition_receipt_id = (SELECT a.receipt_id"
+                "         FROM test_replay_actions a"
+                "        WHERE a.tool_run_id = s.tool_run_id AND a.ordinal = 2))::text,"
+                "       (SELECT e.actor_kind FROM events e"
+                "         WHERE e.subject_id = s.id AND e.type = 'pivot.stamped'),"
+                "       (s.source ->> 'member_validated_by'"
+                "          = f.validated_by_test_run_id::text)::text"
+                "  FROM pivot_stamps s"
+                "  JOIN findings f ON f.id = s.finding_id"
+                "  JOIN tests t ON t.id = s.test_id"
+                " WHERE s.program_id = $3::uuid AND s.label = $1",
+                (label, cls.identity, cls.program_id),
+            )[0]
+        )
+
+    @classmethod
+    def refuse_what_the_run_does_not_show(cls):
+        """Criterion 5's inferred pivots: the run said something else, or nothing."""
+        cls.did_not_hold = cls.issue(
+            cls.demonstrated(cls.test, cls.opened["task"],
+                             answers={**cls.ANSWERED, 2: (403, "denied")})
+        )
+        # Its own grant, because the Identity is inside the digest an approval
+        # is over: the same Test sent as nobody is a different thing to have
+        # authorized, and the operator is asked about it separately.
+        cls.granted_anonymously = cls.grant_for(cls.opened["task"], cls.test, None)
+        cls.went_out_as_nobody = cls.issue(
+            cls.demonstrated(cls.test, cls.opened["task"], anonymous=True)
+        )
+
+    @classmethod
+    def settled(cls, task: str) -> None:
+        """One impact Task, ended, so the next Test of this Finding can have one.
+
+        012 allows a Finding one live Task at a time, and each of the three
+        Tests below is proved under its own. Ending it is `finish_task_attempt`'s
+        job and this is not that: what the arms after it need is the row out of
+        the way, not the attempt counted. `answered` rather than `done`, because
+        011 closes a Task as done only where a proposal of it was promoted, and
+        an impact run promotes nothing.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            "                 finished_at = now(), priority = NULL,"
+            "                 claimed_at = NULL, lease_expires_at = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+
+    @classmethod
+    def refuse_what_the_test_does_not_claim(cls):
+        """Criterion 2, and the Test that claims nothing to check it against."""
+        cls.settled(cls.opened["task"])
+        quiet = cls.called(
+            cls.OPEN_TASK,
+            (cls.finding, specification(cls.QUIET, cleanup=cls.UNDO, impact=cls.QUIET_IMPACT)),
+        )
+        quiet_test = cls.id_of("tests", quiet["test"])
+        cls.grant_for(quiet["task"], quiet_test, cls.SLOT)
+        cls.claims_no_pivot = cls.issue(cls.demonstrated(quiet_test, quiet["task"]))
+        cls.settled(quiet["task"])
+
+        # The default actions, which are the member's own: same method, same
+        # route, and so a transition that transitions to nothing.
+        echoed = cls.called(cls.OPEN_TASK, (cls.finding, cls.echoed_spec()))
+        echoed_test = cls.id_of("tests", echoed["test"])
+        cls.grant_for(echoed["task"], echoed_test, cls.SLOT)
+        cls.members_own_request = cls.issue(
+            cls.demonstrated(echoed_test, echoed["task"], answers=cls.PLAIN)
+        )
+        cls.settled(echoed["task"])
+
+    @classmethod
+    def echoed_spec(cls) -> str:
+        stated = json.loads(
+            specification(cls.ECHOED, cleanup=cls.UNDO,
+                          impact=cls.QUIET_IMPACT | {"after_state": 3})
+        )
+        return json.dumps(
+            stated | {"pivot": cls.PIVOT | {"transition": "the-second-order-answers"}}
+        )
+
+    @classmethod
+    def recheck_the_ground_under_a_stamp(cls):
+        """Criterion 3, asked at issuing time about a run that already closed.
+
+        One run, issued from three times, and the order is the only one these
+        arms can be written in. The refusal answers in one order and each arm
+        has to be the first thing wrong: the Halt is lifted afterwards because
+        nothing else would reach the door, the member is put back because every
+        arm after it reads a member that still stands, and the grant is lapsed
+        last of all because nothing runs under it again.
+
+        Last of the four, because the arms before it each opened a Task on this
+        Finding and settled it: the pivot Task is claimed again here, by the
+        same move the scheduler would make.
+        """
+        cls.rechecked = cls.demonstrated(cls.test, cls.opened["task"])
+
+        cls.as_operator(cls.HALT, (cls.program_id, "an operator stopped the world"))
+        cls.while_halted = cls.issue(cls.rechecked)
+        cls.as_operator(cls.CLEAR, (cls.program_id, "the operator started it again"))
+
+        cls.forge_the_member_status("rejected")
+        cls.member_was_rejected = cls.issue(cls.rechecked)
+        cls.forge_the_member_status("validated")
+
+        cls.expire_the_grant(cls.granted["parked"]["parked"])
+        cls.after_the_grant_lapsed = cls.issue(cls.rechecked)
+
+    @classmethod
+    def as_the_owner_says(cls, statements: list[tuple[str, tuple]]) -> None:
+        """Statements only the owner can make, in one transaction.
+
+        The actor is the runtime and not the operator whose row it edits: 026
+        reads human provenance off `session_user`, the migrate connection is not
+        a member of `rk2_human`, and a session here claiming to be a person
+        would be refused for saying so -- by the guard on the row, and again by
+        the guard on the event the write emits. What this forges is the state,
+        which is the only part of it the arm under test reads.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for sql, parameters in statements:
+                cls.owner_connection.execute(sql, parameters)
+
+    @classmethod
+    def forge_the_member_status(cls, status: str) -> None:
+        """A member moved out from under its stamp, and put back.
+
+        007 gives a validated Finding one exit and it needs a `human` actor,
+        which 026 reads off `session_user` and no session in this harness can
+        be -- so the status is written under the guard rather than through it.
+        `findings_status_guard` is the one trigger that refuses a hand-written
+        status: it wants a `finding_transitions` row with the same from and to
+        in the same transaction, which is exactly what a forgery does not have.
+        Off for one statement and ALWAYS again inside the same transaction, per
+        027, so a rollback here would put it back too.
+
+        What this buys is the only reachable version of criterion 5's
+        invalidated member. It is a forgery and it says so: what the arm under
+        test reads is the column, and the column is the whole of what the
+        refusal asks about.
+        """
+        cls.as_the_owner_says([
+            ("ALTER TABLE findings DISABLE TRIGGER findings_status_guard", ()),
+            ("UPDATE findings SET status = $2 WHERE id = $1::uuid",
+             (cls.finding, status)),
+            ("ALTER TABLE findings ENABLE ALWAYS TRIGGER findings_status_guard", ()),
+        ])
+
+    @classmethod
+    def expire_the_grant(cls, label: str) -> None:
+        """The day after an approval, which no verb in this corpus can reach.
+
+        026 holds a closed decision immutable, `revalidate_decision` only
+        reports, and nothing withdraws or shortens a live grant -- so a lapsed
+        one can only be arranged by the owner saying so. Two guards stand in the
+        way and both come off for the one statement: the immutability trigger,
+        and the actor-kind guard, which refuses any write to a row an operator
+        answered from a session that is not an operator's. One transaction, and
+        027's rule that every trigger on a managed table is ALWAYS is restored
+        inside it, so a rollback here would put both back too.
+        """
+        cls.as_the_owner_says([
+            ("ALTER TABLE pending_decisions"
+             " DISABLE TRIGGER pending_decisions_closes_once", ()),
+            ("ALTER TABLE pending_decisions"
+             " DISABLE TRIGGER pending_decisions_actor_kind_guard", ()),
+            ("UPDATE pending_decisions SET grant_expires_at = now() - interval '1 minute'"
+             " WHERE program_id = $1::uuid AND label = $2",
+             (cls.program_id, label)),
+            # 038's park check is deferred, and a table with a deferred trigger
+            # event queued against it cannot be altered. Firing it here costs
+            # nothing: it has nothing to say about a decision that is not
+            # pending, and this one was answered long ago.
+            ("SET CONSTRAINTS ALL IMMEDIATE", ()),
+            ("ALTER TABLE pending_decisions"
+             " ENABLE ALWAYS TRIGGER pending_decisions_actor_kind_guard", ()),
+            ("ALTER TABLE pending_decisions"
+             " ENABLE ALWAYS TRIGGER pending_decisions_closes_once", ()),
+        ])
+
+    # -- criterion 1: the claim is in the specification -------------------------
+
+    def test_a_pivot_block_that_is_not_one_is_refused_shape_by_shape(self):
+        self.assertEqual(
+            {
+                "not_an_object": "the pivot of a Test is an object",
+                "stray_key": "the pivot carries no key named when",
+                "no_impact": "a Test that claims a pivot states the impact it would have",
+                "unknown_capability":
+                    "the pivot provides no capability this harness has a word for",
+                "requires_nothing": "the pivot requires between 1 and 8 capabilities",
+                "requires_a_word_nobody_defines": "telepathy is not a capability",
+                "requires_one_thing_twice":
+                    "the pivot requires authenticated_session twice",
+                "requires_what_it_provides": "the pivot requires the capability it provides",
+                "no_identity": "the pivot names no Identity the transition is performed under",
+                "transition_is_no_assertion":
+                    "the pivot names no assertion of this Test as its transition",
+                "no_conditions": "the pivot states between 1 and 8 conditions",
+                "no_scope_condition": "the pivot states no scope_holds condition",
+                "condition_kind": "pivot condition 1 states no kind a condition may have",
+                "condition_detail": "pivot condition 1 states no detail",
+                "condition_stray_key": "pivot condition 1 carries no key named when",
+            },
+            self.shapes,
+        )
+
+    def test_a_test_that_claims_no_pivot_is_left_exactly_as_it_was(self):
+        self.assertIsNone(self.a_test_that_claims_no_pivot)
+
+    def test_the_shape_rule_stands_between_a_bad_claim_and_the_table(self):
+        self.assertIn(
+            "the pivot provides no capability this harness has a word for",
+            self.refused_at_the_door,
+        )
+
+    def test_the_column_is_read_out_of_the_block_rather_than_asked_for(self):
+        claimed = self.rows(
+            "SELECT pivot_provides FROM tests WHERE id = $1::uuid", (self.test,)
+        )
+
+        self.assertEqual("other_account_data", str(claimed[0][0]))
+
+    def test_a_capability_a_stamp_names_is_a_word_the_vocabulary_defines(self):
+        loose = self.rows(
+            "SELECT s.label FROM pivot_stamps s"
+            " WHERE s.program_id = $1::uuid"
+            "   AND EXISTS (SELECT 1 FROM unnest(s.requires) need"
+            "                WHERE NOT EXISTS (SELECT 1 FROM capabilities c"
+            "                                   WHERE c.capability = need))",
+            (self.program_id,),
+        )
+
+        self.assertEqual((), loose)
+
+    # -- criteria 2, 3 and 4: what one stamp is made of -------------------------
+
+    def test_the_run_that_held_is_stamped(self):
+        self.assertIsNone(self.stamped["refusal"])
+        self.assertTrue(self.stamped["issued"])
+        self.assertTrue(str(self.stamped["stamp"]).startswith("PV"))
+        self.assertEqual("other_account_data", self.stamped["provides"])
+        self.assertEqual(["authenticated_session"], self.stamped["requires"])
+
+    def test_the_stamp_records_exactly_what_the_run_showed(self):
+        (provides, requires, conditions, transition, scope_version, vocabulary,
+         digest, member, test, identity, receipt, actor, validated_by) = self.stamp
+
+        self.assertEqual("other_account_data", provides)
+        self.assertEqual("{authenticated_session}", requires)
+        self.assertEqual(json.dumps(self.PIVOT["conditions"]), json.dumps(json.loads(conditions)))
+        self.assertEqual("the-note-is-rewritten", transition)
+        self.assertEqual("1", scope_version)
+        self.assertEqual("true", vocabulary, "the vocabulary it was issued under")
+        self.assertEqual("true", digest, "the source hash covers the source")
+        self.assertEqual(self.finding, self.id_of("findings", member))
+        self.assertEqual(self.test, self.id_of("tests", test))
+        self.assertEqual("true", identity, "the Identity the door recorded")
+        self.assertEqual("true", receipt, "the Receipt that answered the transition")
+        self.assertEqual("runtime", actor)
+        self.assertEqual("true", validated_by, "the run the member was validated by")
+
+    def test_the_transition_receipt_is_one_of_this_runs_own_actions(self):
+        foreign = self.rows(
+            "SELECT s.label FROM pivot_stamps s"
+            " WHERE s.program_id = $1::uuid"
+            "   AND NOT EXISTS (SELECT 1 FROM test_replay_actions a"
+            "                    WHERE a.tool_run_id = s.tool_run_id"
+            "                      AND a.receipt_id = s.transition_receipt_id)",
+            (self.program_id,),
+        )
+
+        self.assertEqual((), foreign)
+
+    def test_a_transition_the_member_was_itself_validated_on_is_refused(self):
+        self.assertIsNone(self.members_own_request["stamp"])
+        self.assertIn(
+            "so it demonstrates the member again", self.members_own_request["refusal"]
+        )
+
+    def test_nothing_below_the_owner_may_rewrite_a_stamp(self):
+        held = self.rows(
+            "SELECT r.role, p.privilege"
+            "  FROM (VALUES ('rk2_runtime'), ('rk2_human'), ('rk2_state'), ('rk2_proxy'))"
+            "         AS r(role),"
+            "       (VALUES ('UPDATE'), ('DELETE'), ('TRUNCATE')) AS p(privilege)"
+            " WHERE has_table_privilege(r.role, 'pivot_stamps', p.privilege)"
+        )
+
+        self.assertEqual([], [(str(role), str(privilege)) for role, privilege in held])
+
+    def test_the_runtime_may_not_edit_the_stamp_it_wrote(self):
+        refusal = refusal_message(
+            self.connection,
+            "UPDATE pivot_stamps SET provides = 'code_execution'"
+            " WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )
+
+        self.assertIn("permission denied", refusal)
+
+    # -- criterion 5: what is refused -------------------------------------------
+
+    def test_every_refusal_names_the_first_thing_that_was_wrong(self):
+        self.assertEqual(
+            {
+                "missing": "no authorized impact run of this Program is recorded"
+                           " under that Tool run",
+                "detection": "no authorized impact run of this Program is recorded"
+                             " under that Tool run",
+                "foreign": "no authorized impact run of this Program is recorded"
+                           " under that Tool run",
+                "unclosed": "the run has not been closed, so nothing has concluded yet",
+                "claims_no_pivot_ending": "claims no pivot",
+                "did_not_hold": "the run concluded refutes,"
+                                " and a pivot is stamped from a run that held",
+                "halted": "the Program is halted",
+                "lapsed": "the grant the run opened under is no longer live",
+            },
+            {
+                "missing": self.missing["refusal"],
+                "detection": self.detection["refusal"],
+                "foreign": self.foreign["refusal"],
+                "unclosed": self.unclosed["refusal"],
+                "claims_no_pivot_ending": self.claims_no_pivot["refusal"].split(" ", 2)[2],
+                "did_not_hold": self.did_not_hold["refusal"],
+                "halted": self.while_halted["refusal"],
+                "lapsed": self.after_the_grant_lapsed["refusal"],
+            },
+        )
+
+    def test_no_refusal_left_a_stamp_behind(self):
+        for name, answer in (
+            ("missing", self.missing), ("detection", self.detection),
+            ("foreign", self.foreign), ("unclosed", self.unclosed),
+            ("claims_no_pivot", self.claims_no_pivot),
+            ("did_not_hold", self.did_not_hold),
+            ("went_out_as_nobody", self.went_out_as_nobody),
+            ("members_own_request", self.members_own_request),
+            ("while_halted", self.while_halted),
+            ("member_was_rejected", self.member_was_rejected),
+            ("after_the_grant_lapsed", self.after_the_grant_lapsed),
+        ):
+            with self.subTest(refusal=name):
+                self.assertIsNone(answer["stamp"])
+
+    def test_a_member_that_no_longer_stands_takes_its_pivots_with_it(self):
+        """Criterion 5's invalidated member, asked of a run that already held.
+
+        The run is unchanged and so is everything it recorded. What moved is
+        the Finding it was about, and the recheck is at issuing time for
+        exactly that reason.
+        """
+        self.assertIn(
+            "is rejected, and a pivot composes validated Findings",
+            self.member_was_rejected["refusal"],
+        )
+
+    def test_a_transition_that_went_out_as_nobody_is_not_a_pivot(self):
+        self.assertIn(
+            f"the claim names identity {self.SLOT} and the transition went out as nobody",
+            self.went_out_as_nobody["refusal"],
+        )
+
+    def test_every_attempt_is_recorded_whether_it_was_refused_or_not(self):
+        self.assertEqual(
+            {"issued": 2, "repeated": 1},
+            {str(outcome): int(str(n)) for outcome, n in self.proposals
+             if str(outcome) != "refused"},
+        )
+        for answer in (self.missing, self.unclosed, self.did_not_hold, self.while_halted):
+            with self.subTest(refusal=answer["refusal"]):
+                self.assertIn(answer["refusal"], self.refusals_recorded)
+
+    def test_a_proposal_names_the_subject_identity_and_conditions_it_claims(self):
+        """Criterion 1, on the proposal rather than on the stamp.
+
+        The block names a capability and a slot; the subject and the member are
+        what the run is about. A proposal that stored neither would be a record
+        an operator has to join four tables to read, and a refused one would be
+        a record of a claim with the claim missing.
+        """
+        proposed = self.rows(
+            "SELECT (p.subject_entity_id = s.subject_entity_id)::text, p.identity_slot,"
+            "       (p.conditions = s.conditions)::text"
+            "  FROM pivot_proposals p JOIN pivot_stamps s ON s.id = p.stamp_id"
+            " WHERE p.program_id = $1::uuid AND p.outcome = 'issued'",
+            (self.program_id,),
+        )
+
+        self.assertEqual(
+            [("true", self.SLOT, "true")] * 2,
+            [(str(subject), str(slot), str(conditions))
+             for subject, slot, conditions in proposed],
+        )
+
+    def test_a_refused_proposal_still_says_what_was_claimed(self):
+        refused = self.rows(
+            "SELECT identity_slot, conditions::text, subject_entity_id IS NOT NULL"
+            "  FROM pivot_proposals"
+            " WHERE program_id = $1::uuid AND outcome = 'refused' AND test_id = $2::uuid"
+            " ORDER BY at LIMIT 1",
+            (self.program_id, self.test),
+        )
+
+        slot, conditions, subject = refused[0]
+        self.assertEqual(self.SLOT, str(slot))
+        self.assertEqual(self.PIVOT["conditions"], json.loads(str(conditions)))
+        self.assertTrue(subject, "the subject the capability was claimed against")
+
+    def test_a_refusal_about_a_run_nobody_has_is_still_recorded(self):
+        orphaned = self.rows(
+            "SELECT count(*) FROM pivot_proposals"
+            " WHERE program_id = $1::uuid AND tool_run_id IS NULL AND outcome = 'refused'",
+            (self.program_id,),
+        )
+
+        self.assertEqual(1, int(str(orphaned[0][0])))
+
+    # -- criterion 6: idempotence, and what a second stamp is -------------------
+
+    def test_the_same_evidence_returns_the_same_stamp(self):
+        self.assertEqual(self.stamped["stamp"], self.repeated["stamp"])
+        self.assertEqual(self.stamped["source_sha256"], self.repeated["source_sha256"])
+        self.assertFalse(self.repeated["issued"])
+
+    def test_a_second_run_of_the_same_test_is_a_second_stamp(self):
+        self.assertTrue(self.again["issued"])
+        self.assertNotEqual(self.stamped["stamp"], self.again["stamp"])
+        self.assertNotEqual(self.stamped["source_sha256"], self.again["source_sha256"])
+
+    def test_one_stamp_per_body_of_evidence_and_no_more(self):
+        rows = self.rows(
+            "SELECT count(*), count(DISTINCT source_sha256) FROM pivot_stamps"
+            " WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )
+
+        self.assertEqual((2, 2), (int(str(rows[0][0])), int(str(rows[0][1]))))
+
+    def test_the_source_carries_every_lever_a_new_stamp_should_turn(self):
+        source = json.loads(
+            str(
+                self.rows(
+                    "SELECT source::text FROM pivot_stamps"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (self.program_id, self.stamped["stamp"]),
+                )[0][0]
+            )
+        )
+
+        self.assertEqual(
+            {"member", "member_validated_by", "subject", "identity", "test", "test_spec",
+             "test_run", "tool_run", "transition_receipt", "transition", "provides",
+             "requires", "conditions", "scope_version", "vocabulary"},
+            set(source),
+        )
+
+    def test_the_digest_covers_every_column_a_reader_would_join_on(self):
+        """Criterion 4: no column of a stamp is outside what its hash is over.
+
+        Read off the constraint rather than off a row, because a row agreeing
+        is one row and the question is whether a row could disagree. Two
+        source fields have no column -- the run that validated the member, and
+        the spec digest -- and they are in the object to move the hash when the
+        evidence moves.
+        """
+        agreement = str(
+            self.rows(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c"
+                " WHERE c.conrelid = 'pivot_stamps'::regclass AND c.contype = 'c'"
+                "   AND pg_get_constraintdef(c.oid) LIKE '%scope_version%'"
+            )[0][0]
+        )
+        columns = self.rows(
+            "SELECT a.attname FROM pg_attribute a"
+            " WHERE a.attrelid = 'pivot_stamps'::regclass AND a.attnum > 0"
+            "   AND a.attname NOT IN ('id', 'program_id', 'label', 'issued_at',"
+            "                         'source', 'source_sha256')"
+        )
+
+        self.assertEqual(
+            [],
+            [str(name) for (name,) in columns if str(name) not in agreement],
+        )
+
+    # -- the standing check -----------------------------------------------------
+
+    def test_the_standing_check_holds_over_every_stamp_this_case_issued(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
