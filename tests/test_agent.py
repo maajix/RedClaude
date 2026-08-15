@@ -425,20 +425,21 @@ class AssertionTest(unittest.TestCase):
                 self.assertEqual(["launch:cli_path"], sources(violations))
 
     def test_a_role_with_no_served_tool_is_refused_before_a_model_is_started(self):
-        # `reporter` runs no model, and `validator` holds one group this
-        # runtime does not serve -- so a validator launch would start a model
-        # at its own effort with no verdict tool to reach, and the one thing it
-        # could produce is prose. The four roles that keep a served tool still
-        # launch, which is what makes this a refusal of two rows rather than of
-        # the roster.
-        for role in ("reporter", "validator", "no_such_role"):
+        # `reporter` runs no model at all, so there is nothing here for it to be
+        # assessed as. `validator` was refused beside it until 037 served
+        # `validate.judge`: a launch would have started a model at its own
+        # effort with no verdict tool to reach, and the one thing it could have
+        # produced is prose. The five roles that hold a served tool still
+        # launch, which is what makes this a refusal of one row and one typo
+        # rather than of the roster.
+        for role in ("reporter", "no_such_role"):
             with self.subTest(role=role):
                 violations = self.assess(options(self.launch, self.cli), role=role)
 
                 self.assertEqual([agent.INVALID_LAUNCH], codes(violations))
                 self.assertEqual(["launch:role"], sources(violations))
 
-        for role in ("orchestrator", "recon", "web_hunter", "js_analyst"):
+        for role in ("orchestrator", "recon", "web_hunter", "js_analyst", "validator"):
             with self.subTest(role=role):
                 self.assertEqual(
                     (),
@@ -726,10 +727,189 @@ class MissionTest(unittest.TestCase):
         self.assertEqual(2, carried["mission_attempts"])
 
 
+class JudgementTest(unittest.TestCase):
+    """The one packet a validator may read, and the one answer it latches.
+
+    Criterion 4: the whole output of a validation session is a word and a list
+    of assertion identifiers, and it is produced once. The database decides what
+    the Finding becomes -- these are the properties of the thing handed to it.
+    """
+
+    PACKET = {
+        "finding": {"label": "F1", "status": "validating", "severity": "high"},
+        "test": {"assertions": [{"id": "the-variant-is-served", "kind": "status_equals"}]},
+    }
+
+    def judgement(self, packet_document=None) -> _launch.Judgement:
+        return _launch.Judgement(
+            self.PACKET if packet_document is None else packet_document
+        )
+
+    def test_the_packet_is_served_back_exactly_as_the_job_carried_it(self):
+        # Unchanged is the property. `rk2_validation_packet` selected these
+        # fields through a column allowlist a migration states, and a handler
+        # that summarised, reordered or annotated them would be a second
+        # selection nothing checked.
+        judged = self.judgement()
+
+        answer = judged.read({"finding_label": "F1"})
+
+        self.assertTrue(answer["served"])
+        self.assertEqual("F1", answer["finding"])
+        self.assertEqual(self.PACKET, answer["packet"])
+        self.assertEqual(1, judged.reads)
+
+    def test_a_session_given_no_packet_serves_nothing_rather_than_an_empty_one(self):
+        # A run that was started to judge nothing is every run but a validator's.
+        # An empty document served as a document would be a model asked to judge
+        # a Finding out of no evidence at all.
+        judged = _launch.Judgement()
+
+        self.assertIsNone(judged.finding)
+        self.assertEqual({"served": False, "reason": "no_packet"}, judged.read({}))
+
+    def test_a_finding_this_session_was_not_given_is_refused_with_the_one_it_was(self):
+        # Named rather than silent, so a model that misread its own packet can
+        # correct itself while it is still running.
+        judged = self.judgement()
+
+        answer = judged.read({"finding_label": "F9"})
+
+        self.assertFalse(answer["served"])
+        self.assertEqual("other_finding", answer["reason"])
+        self.assertEqual("F1", answer["finding"])
+        self.assertNotIn("packet", answer)
+
+    def test_the_answer_is_a_verdict_and_the_assertions_it_says_did_not_hold(self):
+        judged = self.judgement()
+
+        answer = judged.judge(
+            {
+                "finding_label": "F1",
+                "verdict": "refuted",
+                "failed_assertion_ids": ["the-variant-is-served"],
+            }
+        )
+
+        self.assertTrue(answer["accepted"])
+        self.assertEqual(1, answer["attempts"])
+        self.assertEqual(
+            {
+                "finding_label": "F1",
+                "verdict": "refuted",
+                "failed_assertion_ids": ["the-variant-is-served"],
+            },
+            judged.answer,
+        )
+
+    def test_a_second_verdict_is_refused_rather_than_replacing_the_first(self):
+        # The distinction `Choice` is on the other side of. A session that
+        # answers `insufficient` and then `confirmed` about a document that did
+        # not change in between is a session reasoning from having already
+        # answered, which is exactly what the blindness exists to keep out.
+        judged = self.judgement()
+        judged.judge({"finding_label": "F1", "verdict": "insufficient"})
+
+        answer = judged.judge({"finding_label": "F1", "verdict": "confirmed"})
+
+        self.assertFalse(answer["accepted"])
+        self.assertEqual("already_judged", answer["reason"])
+        self.assertEqual(2, answer["attempts"])
+        self.assertEqual("insufficient", judged.answer["verdict"])
+
+    def test_a_verdict_about_another_finding_latches_nothing_and_leaves_the_turn_open(self):
+        # Refused and not counted as the answer: the session still has its one
+        # answer to give, which is what makes naming the right label useful.
+        judged = self.judgement()
+
+        answer = judged.judge({"finding_label": "F9", "verdict": "confirmed"})
+
+        self.assertFalse(answer["accepted"])
+        self.assertEqual("other_finding", answer["reason"])
+        self.assertEqual("F1", answer["finding"])
+        self.assertIsNone(judged.answer)
+
+        self.assertTrue(judged.judge({"finding_label": "F1", "verdict": "confirmed"})["accepted"])
+
+    def test_an_answer_with_no_failed_assertions_carries_an_empty_list_and_not_nothing(self):
+        # `record_verdict` takes a `text[]`, and a confirmed verdict naming
+        # nothing is the ordinary case. Absent and empty would be two spellings
+        # of it for the runtime to tell apart.
+        judged = self.judgement()
+
+        judged.judge({"finding_label": "F1", "verdict": "confirmed"})
+
+        self.assertEqual([], judged.answer["failed_assertion_ids"])
+
+    def test_the_answer_does_not_tell_the_model_the_finding_became_anything(self):
+        # `MissionTest`'s property for the other latch. The row and the
+        # Finding's status are one transaction the runtime opens after this
+        # process ends, and it rebuilds the packet first: an answer accepted
+        # here may still be filed as stale there.
+        judged = self.judgement()
+
+        answer = judged.judge({"finding_label": "F1", "verdict": "confirmed"})
+
+        self.assertNotIn("validated", json.dumps(answer))
+        self.assertNotIn("recorded", json.dumps(answer))
+
+    def test_a_run_that_judged_nothing_has_nothing_to_carry_back(self):
+        judged = self.judgement()
+
+        self.assertIsNone(judged.answer)
+        self.assertEqual(0, judged.attempts)
+
+    def test_the_tries_cross_back_beside_the_verdict_rather_than_only_the_verdict(self):
+        judged = self.judgement()
+        judged.judge({"finding_label": "F1", "verdict": "confirmed"})
+        judged.judge({"finding_label": "F1", "verdict": "refuted"})
+
+        carried = agent.AgentRunResult(
+            agent_run_id="ar",
+            role=fixtures.ROLE,
+            sdk_version=None,
+            cli_version=None,
+            api_key_source=agent.EXPECTED_KEY_SOURCE,
+            tool_ready=1,
+            tools_served=(),
+            denials=(),
+            answers=1,
+            stop_reason="end_turn",
+            text="",
+            verdict=judged.answer,
+            verdict_attempts=judged.attempts,
+        ).as_dict()
+
+        self.assertEqual("confirmed", carried["verdict"]["verdict"])
+        self.assertEqual(2, carried["verdict_attempts"])
+
+    def test_a_packet_whose_finding_has_no_label_is_a_packet_nobody_can_judge(self):
+        # The label is what both handlers check against, so a document that
+        # carries none is one where every call would be `other_finding`. It is
+        # answered as no packet at all rather than as a packet with a hole.
+        for shape in ({}, {"finding": "F1"}, {"finding": {}}, {"finding": {"label": ""}}):
+            with self.subTest(packet=shape):
+                judged = self.judgement(shape)
+
+                self.assertIsNone(judged.finding)
+                self.assertEqual("no_packet", judged.read({"finding_label": "F1"})["reason"])
+
+    def test_the_job_field_is_read_as_nothing_where_it_is_not_a_document(self):
+        # A malformed field leaves a session with no packet rather than raising:
+        # the runtime reads that back as a validation nobody answered, where a
+        # raise would be a run that never started over a field most runs do not
+        # carry at all.
+        for stated in (None, "F1", ["finding"], 7):
+            with self.subTest(judgement=stated):
+                self.assertIsNone(_launch._judged(stated))
+
+        self.assertEqual({"finding": {}}, _launch._judged({"finding": {}}))
+
+
 class ServedToolTest(unittest.TestCase):
     """What the child offers the model, and what each handler does with a call."""
 
-    def served(self, stack, reader=None, mission=None, door=None):
+    def served(self, stack, reader=None, mission=None, door=None, judgement=None):
         surface = _launch.Surface()
         offered = stack.enter_context(packaged())
         _launch.server(
@@ -737,6 +917,7 @@ class ServedToolTest(unittest.TestCase):
             reader or packet.Reader(packet.Packet()),
             mission or _launch.Submission(),
             door,
+            judgement=judgement,
         )
         return surface, offered
 
@@ -852,6 +1033,59 @@ class ServedToolTest(unittest.TestCase):
 
         self.assertTrue(answer["accepted"])
         self.assertEqual({"observations": [{"summary": "seen"}]}, mission.result)
+
+    def test_a_validation_packet_is_served_from_the_job_and_from_no_other_read(self):
+        # Criterion 3 seen from the child: the document is held, not fetched.
+        # There is no database on this side of the boundary and no second call
+        # that could reach one, so what the session may consider is what
+        # `open_validation_session` recorded the digest of.
+        judgement = _launch.Judgement({"finding": {"label": "F1"}, "test": {"actions": []}})
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack, judgement=judgement)
+            surface.open()
+
+            answer = self.answer(offered["get_validation_packet"], {"finding_label": "F1"})
+
+        self.assertTrue(answer["served"])
+        self.assertEqual({"finding": {"label": "F1"}, "test": {"actions": []}}, answer["packet"])
+
+    def test_a_verdict_is_latched_in_the_child_and_decided_by_nobody_here(self):
+        judgement = _launch.Judgement({"finding": {"label": "F1"}})
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack, judgement=judgement)
+            surface.open()
+
+            answer = self.answer(
+                offered["submit_verdict"],
+                {
+                    "finding_label": "F1",
+                    "verdict": "confirmed",
+                    "failed_assertion_ids": [],
+                },
+            )
+            refused = self.answer(
+                offered["submit_verdict"], {"finding_label": "F1", "verdict": "refuted"}
+            )
+
+        self.assertTrue(answer["accepted"])
+        self.assertEqual("already_judged", refused["reason"])
+        self.assertEqual("confirmed", judgement.answer["verdict"])
+
+    def test_a_run_that_was_given_no_finding_still_serves_both_tools_and_judges_none(self):
+        # The allowlist is the role's and not the job's -- `net.request`'s
+        # reason -- so the tools exist for every run and answer honestly on the
+        # ones that were started to judge nothing.
+        with contextlib.ExitStack() as stack:
+            surface, offered = self.served(stack)
+            surface.open()
+
+            served = self.answer(offered["get_validation_packet"], {"finding_label": "F1"})
+            judged = self.answer(
+                offered["submit_verdict"], {"finding_label": "F1", "verdict": "confirmed"}
+            )
+
+        self.assertEqual("no_packet", served["reason"])
+        self.assertEqual("other_finding", judged["reason"])
 
     def test_every_call_that_was_answered_is_on_the_surfaces_record(self):
         with contextlib.ExitStack() as stack:

@@ -113,7 +113,13 @@ SERVER_VERSION = "0.1.0"
 #: make the allowlist a function of the job, and the assertion checks that
 #: allowlist against the roster -- so a launch with no capability would refuse
 #: to start rather than start with nothing to spend.
-SERVED_GROUPS = ("state.read", "state.propose", "net.request")
+#:
+#: `validate.judge` joins them with 037 and is the one group served to a role
+#: that holds nothing else. Both of its tools answer out of the job document
+#: rather than out of a connection, for the reason every other served tool does:
+#: the container's one network reaches the capability proxy, so a packet the
+#: runtime did not send is a packet no handler can fetch.
+SERVED_GROUPS = ("state.read", "state.propose", "net.request", "validate.judge")
 
 #: The one group served in part, and exactly which of its members. `sched.pick`
 #: is five tools built by four tickets: the two here are the Slate the
@@ -375,6 +381,15 @@ class AgentRunRequest:
     two answers to what a session was offered. None for every run that is
     executing a Task rather than choosing one, and a run with none has an empty
     Slate, which is the honest answer for a worker nobody offered a choice.
+
+    `judgement` is 037's document and travels for the same reason again, with
+    one difference worth stating: it is not a bounded projection of a larger
+    thing the child could otherwise reach. It is the whole world a validator
+    session gets. `rk2_validation_packet` built it from a column allowlist and
+    this field carries it unchanged, so what the session may consider is exactly
+    what a migration permitted, rather than what a compiler here decided to
+    include. None for every role that is not judging one, and a session with
+    none is served nothing to judge.
     """
 
     agent_run_id: str
@@ -388,6 +403,7 @@ class AgentRunRequest:
     subagent_cap: int = roster.DEFAULT_SUBAGENTS
     token_cap: int | None = None
     capsule: capsule_module.Capsule | None = None
+    judgement: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +445,14 @@ class AgentRunResult:
     when it does not. Nothing with `pick_attempts` at zero is a session that
     chose nothing; nothing with attempts behind it is one whose calls carried
     no label to record.
+
+    `verdict` is the same kind of report from a validator session: what one
+    blind judgement answered, checked against a closed schema and against
+    nothing else. What the Finding becomes is `record_verdict`'s decision, taken
+    from the row that answer produces and from the reproduction the validation
+    was opened against, so a session that answers `confirmed` about a replay
+    that did not hold is a session whose answer is filed and acted on by nobody.
+    `verdict_attempts` counts the calls for `mission_attempts`' reason.
     """
 
     agent_run_id: str
@@ -448,6 +472,8 @@ class AgentRunResult:
     output_tokens: int = 0
     choice: str | None = None
     pick_attempts: int = 0
+    verdict: Mapping[str, object] | None = None
+    verdict_attempts: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -470,6 +496,8 @@ class AgentRunResult:
             "output_tokens": self.output_tokens,
             "choice": self.choice,
             "pick_attempts": self.pick_attempts,
+            "verdict": None if self.verdict is None else dict(self.verdict),
+            "verdict_attempts": self.verdict_attempts,
         }
 
 
@@ -512,6 +540,7 @@ def agent_run(
             "subagent_cap": request.subagent_cap,
             "token_cap": request.token_cap,
             "capsule": (request.capsule or capsule_module.Capsule()).as_dict(),
+            "judgement": None if request.judgement is None else dict(request.judgement),
         }
         return _spawn(request, job)
     except StartupRefusal as refusal:
@@ -690,15 +719,14 @@ def assess(
     # assessed as, and a door that started one would be a door that made it an
     # agent.
     #
-    # A role whose enforced surface is empty is refused for the same reason,
-    # and it is not a hypothetical: the roster states all six roles, this
-    # runtime serves two groups, and `validator` holds exactly `validate.judge`
-    # -- so a validator launch would start a model at its own effort for its
-    # own turn ceiling with no verdict tool to reach. What it could produce is
-    # prose, and prose is the one thing this runtime does not accept as a
-    # result. The intersection shrinking to nothing is how the roster says a
-    # role's ticket has not landed yet; the door should say so too, rather than
-    # spend a run finding out.
+    # A role whose enforced surface is empty is refused for the same reason. It
+    # was the validator's case until 037 served `validate.judge`: a launch would
+    # have started a model at its own effort for its own turn ceiling with no
+    # verdict tool to reach, and what it could have produced is prose, which is
+    # the one thing this runtime does not accept as a result. The check stays
+    # because the condition is what it always was -- the intersection shrinking
+    # to nothing is how the roster says a role's ticket has not landed yet, and
+    # the door should say so rather than spend a run finding out.
     known = role in roster.ROLES and not roster.ROLES[role].rendered
     launchable = known and bool(roster.ROLES[role].allowed_tools(SERVED))
     if not launchable:
@@ -980,6 +1008,10 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
             choice if isinstance(choice := result.get("choice"), str) and choice else None
         ),
         pick_attempts=int(result.get("pick_attempts") or 0),
+        verdict=(
+            dict(answer) if isinstance(answer := result.get("verdict"), Mapping) else None
+        ),
+        verdict_attempts=int(result.get("verdict_attempts") or 0),
     )
 
 

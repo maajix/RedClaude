@@ -82,6 +82,7 @@ from redkraken import (
     state,
     tls,
     tool,
+    validation,
 )
 from redkraken.outcome import (
     AWAITING_DECISION,
@@ -813,6 +814,55 @@ PARKED_CONTROL = (
     "   {closed}"
     " END $ctl$"
 )
+
+
+#: One candidate Finding, assembled by hand, with one hole: whatever happens to
+#: it afterwards. Written once because a Finding has five rows behind it -- the
+#: Program, the subject it is about, the claim, the Test of that claim and the
+#: run -- and repeating them per control would bury which one line is the
+#: falsification.
+#:
+#: The run it rests on concluded nothing, which is 036's own falsification and
+#: is left that way for 037's too. Every hand-written Finding is a Finding on a
+#: claim no transition ever settled, so `standing:finding_candidates` reports
+#: any control built from this shape whatever else it does; the controls assert
+#: that their own check is among the ones that failed rather than that it was
+#: the only one.
+CANDIDATE_CONTROL = (
+    "DO $ctl$ DECLARE p uuid; e uuid; h uuid; s uuid; r uuid; f uuid;"
+    " BEGIN"
+    "   PERFORM set_actor('runtime', 'selftest');"
+    "   INSERT INTO programs (slug, name) VALUES ('{slug}', 'Self test')"
+    "     RETURNING id INTO p;"
+    "   INSERT INTO entities (program_id, type, label, dedup_key)"
+    "        VALUES (p, 'technology', '{slug}', 'tech:{slug}')"
+    "     RETURNING id INTO e;"
+    "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+    "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
+    "                'a self test')"
+    "     RETURNING id INTO h;"
+    "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+    "        VALUES (p, h, '{spec}'::jsonb, rk2_test_spec_digest('{spec}'::jsonb))"
+    "     RETURNING id INTO s;"
+    "   INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
+    "        VALUES (p, s, 'replay', 'inconclusive',"
+    "                '{{\"assertions\":[],\"failed\":[],\"cleanup\":\"done\"}}'::jsonb)"
+    "     RETURNING id INTO r;"
+    "   INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
+    "                         property_class, opened_by_test_run_id, demonstrated)"
+    "        VALUES (p, e, (SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1),"
+    "                'a self test', (SELECT property_class FROM hypotheses WHERE id = h), r,"
+    "                '{{\"assertion_kinds\":[\"status_differs\"],"
+    "                   \"roles\":[\"baseline\",\"control\"],\"receipts\":1}}'::jsonb)"
+    "     RETURNING id INTO f;"
+    "   {extra}"
+    " END $ctl$"
+)
+
+#: The Test the shape above stores, rendered once. `CANDIDATE_CONTROL` is a
+#: format string and this document is full of braces, so it goes in as a field
+#: rather than as text with every brace doubled.
+SPECIFIED = json.dumps(SPECIFICATION)
 
 
 #: Every check the gate runs, and the edit that makes it fail. Each runs in a
@@ -1848,33 +1898,23 @@ CONTROLS = (
         # like when a Finding was written around the front door: a claim
         # presented as settled by a run that settled nothing.
         "standing:finding_candidates",
-        "DO $ctl$ DECLARE p uuid; e uuid; h uuid; s uuid; r uuid;"
-        " BEGIN"
-        "   PERFORM set_actor('runtime', 'selftest');"
-        "   INSERT INTO programs (slug, name) VALUES ('candidate-selftest', 'Self test')"
-        "     RETURNING id INTO p;"
-        "   INSERT INTO entities (program_id, type, label, dedup_key)"
-        "        VALUES (p, 'technology', 'candidate-selftest', 'tech:candidate-selftest')"
-        "     RETURNING id INTO e;"
-        "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
-        "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
-        "                'a self test')"
-        "     RETURNING id INTO h;"
-        "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
-        f"        VALUES (p, h, '{json.dumps(SPECIFICATION)}'::jsonb,"
-        f"                rk2_test_spec_digest('{json.dumps(SPECIFICATION)}'::jsonb))"
-        "     RETURNING id INTO s;"
-        "   INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
-        "        VALUES (p, s, 'replay', 'inconclusive',"
-        "                '{\"assertions\":[],\"failed\":[],\"cleanup\":\"done\"}'::jsonb)"
-        "     RETURNING id INTO r;"
-        "   INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
-        "                         property_class, opened_by_test_run_id, demonstrated)"
-        "        VALUES (p, e, (SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1),"
-        "                'a self test', (SELECT property_class FROM hypotheses WHERE id = h), r,"
-        "                '{\"assertion_kinds\":[\"status_differs\"],"
-        "                  \"roles\":[\"baseline\",\"control\"],\"receipts\":1}'::jsonb);"
-        " END $ctl$",
+        CANDIDATE_CONTROL.format(slug="candidate-selftest", spec=SPECIFIED, extra=""),
+    ),
+    Control(
+        # PH2-37 criterion 6: a session served a packet about a Finding that is
+        # not under judgement. `open_validation` writes the attempt and the
+        # transition into `validating` in one statement each of one
+        # transaction, so the verb cannot leave the pair apart -- what this is,
+        # seen from outside, is a validator still thinking about a Finding
+        # whose fate somebody else already decided.
+        "standing:validations",
+        CANDIDATE_CONTROL.format(
+            slug="validation-selftest",
+            spec=SPECIFIED,
+            extra="INSERT INTO validation_attempts (program_id, finding_id,"
+                  "                                 replay_test_run_id, packet_sha256)"
+                  "     VALUES (p, f, r, repeat('a', 64));",
+        ),
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -9442,13 +9482,15 @@ class ExecutionSliceTest(DatabaseCase):
     def test_a_task_cannot_be_closed_as_done_without_a_promoted_proposal(self):
         # The structural half of the same claim, asked of the row directly: no
         # writer, however privileged, closes a Task the runtime did not accept.
+        # 037 gave the sentence a second arm -- a validator produces a verdict
+        # and no proposal -- so it names the result and not the shape of one.
         with self.assertRaises(pg.DatabaseError) as raised:
             self.owner(
                 "UPDATE tasks SET status = 'done' WHERE program_id = $1::uuid",
                 (self.identifiers["prose"],),
             )
 
-        self.assertIn("no proposal of it has been promoted", str(raised.exception))
+        self.assertIn("no result of it has been accepted", str(raised.exception))
 
     # -- criterion 5: nothing left open, and closing again changes nothing ----
 
@@ -14444,16 +14486,10 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         )
 
     @classmethod
-    def finding(cls, name: str, subject: str, status: str) -> str:
-        """One Finding of the given status, with everything that status needs.
+    def replay_run(cls, program_id: str, test: str) -> tuple[str, str]:
+        """One holding replay run of the given Test, and the Receipt under it.
 
-        Every Finding needs a Hypothesis with a test spec, because that is what
-        `validate.no_test_spec` asks for, and a holding run of that spec: since
-        036 a Finding is born a candidate and a candidate names the run that
-        settled its claim. Q27 in the schema wanted the same `test_runs` row one
-        state later, for `validated`.
-
-        And running the spec leaves a trail. 035's `replay_run_without_receipts`
+        Running a spec leaves a trail. 035's `replay_run_without_receipts`
         reports a replay run that concluded on no exchange at all, which is
         what a bare `test_runs` row is: a validation nothing was validated by.
         So the run is built the way `close_test_replay` builds one -- a
@@ -14461,17 +14497,10 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         the citation joining the two -- and the capability is closed against
         the run it produced, which is the state a finished replay is in.
 
-        `validated` is then reached the only way there is to reach it: two
-        transition rows through `validating`, over two Observations of the run's
-        own Receipt, one of them the control the rule asks for. Nothing here
-        writes the status directly -- 015's cache guard refuses that -- so the
-        seeded Finding is one the machine would have produced.
+        Called twice for a validated Finding: once for the run that settled the
+        claim, once for the reproduction 037 judges it on. They are two runs of
+        one Test, which is what `rk2_validation_refusal` asks for.
         """
-        program_id = cls.identifiers[name]
-        hypothesis = cls.hypothesis(name, subject, "worth judging")
-        test = str(
-            cls.scalar(TEST_SPEC, (program_id, hypothesis, json.dumps(SPECIFICATION)))
-        )
         holder = str(
             cls.scalar(
                 "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
@@ -14508,11 +14537,13 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                 (program_id, capability),
             )
         )
+        # `finished_at` because 037 will not judge a reproduction that has not
+        # finished, and a run whose capability is closed has.
         run = str(
             cls.scalar(
                 "INSERT INTO test_runs (program_id, test_id, lane, outcome,"
-                " assertion_results)"
-                " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', $3::jsonb)"
+                " assertion_results, finished_at)"
+                " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', $3::jsonb, now())"
                 " RETURNING id::text",
                 (program_id, test,
                  json.dumps({"assertions": [], "failed": [], "cleanup": "done"})),
@@ -14532,6 +14563,24 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             " WHERE id = $1::uuid",
             (capability,),
         )
+        return run, receipt
+
+    @classmethod
+    def finding(cls, name: str, subject: str, status: str) -> str:
+        """One Finding of the given status, with everything that status needs.
+
+        Every Finding needs a Hypothesis with a test spec, because that is what
+        `validate.no_test_spec` asks for, and a holding run of that spec: since
+        036 a Finding is born a candidate and a candidate names the run that
+        settled its claim. Q27 in the schema wanted the same `test_runs` row one
+        state later, for `validated`.
+        """
+        program_id = cls.identifiers[name]
+        hypothesis = cls.hypothesis(name, subject, "worth judging")
+        test = str(
+            cls.scalar(TEST_SPEC, (program_id, hypothesis, json.dumps(SPECIFICATION)))
+        )
+        run, receipt = cls.replay_run(program_id, test)
         finding = str(
             cls.scalar(
                 "INSERT INTO findings (program_id, subject_entity_id, class_id, title,"
@@ -14549,7 +14598,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             " VALUES ($1::uuid, $2::uuid)",
             (finding, hypothesis),
         )
-        # The six identifiers travel together and were all produced above, so
+        # The seven identifiers travel together and were all produced above, so
         # they are handed over as the one thing they are: the seeded Finding and
         # the rows it was built out of.
         seeded = {
@@ -14559,6 +14608,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             "subject":    subject,
             "receipt":    receipt,
             "run":        run,
+            "test":       test,
         }
         if status == "validated":
             cls.validate(seeded)
@@ -14566,17 +14616,21 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
 
     @classmethod
     def validate(cls, seeded: dict) -> None:
-        """Walk one candidate to `validated`, satisfying every rule on the way.
+        """Walk one candidate to `validated` the way 037 walks one.
 
         `transition_rules` asks `validating -> validated` for a runtime actor, a
         Receipt the validating run itself produced, two supporting Observations
-        and one of them a control. 037 is what teaches the runtime to do this;
-        until then the fixture does it by hand, because the alternative is a
-        `validated` row nothing validated.
+        and one of them a control. The evidence is seeded; the walk is not.
+        037 refuses a Finding moved out of judgement by hand, so the status is
+        reached through the verbs that reach it: a request, a reproduction that
+        is a second run of the one Test, the packet those two runs make, and a
+        verdict about that packet. No session is opened -- `open_validation`
+        takes a null agent run for exactly this, and a validator sitting in the
+        fixture would be a Task in every ranking these tests measure.
         """
         finding, hypothesis = seeded["finding"], seeded["hypothesis"]
         program_id, subject = seeded["program_id"], seeded["subject"]
-        receipt, run = seeded["receipt"], seeded["run"]
+        receipt, test = seeded["receipt"], seeded["test"]
         for role, kind in (("baseline", "response_differential"),
                            ("control", "response_invariant")):
             observation = str(
@@ -14600,26 +14654,20 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                 "           WHERE finding_id = $1::uuid))",
                 (finding, observation),
             )
-        cls.as_owner(
-            "INSERT INTO finding_transitions (program_id, finding_id, from_status,"
-            " to_status, actor_kind, rationale)"
-            " VALUES ($1::uuid, $2::uuid, 'candidate', 'validating', 'runtime',"
-            "         'seeded for the slate')",
-            (program_id, finding),
-        )
-        # Set before the second transition, not after: the guard reads
-        # `validated_by_test_run_id` off the row to check whose test it was.
-        cls.as_owner(
-            "UPDATE findings SET validated_by_test_run_id = $2::uuid WHERE id = $1::uuid",
-            (finding, run),
-        )
-        cls.as_owner(
-            "INSERT INTO finding_transitions (program_id, finding_id, from_status,"
-            " to_status, actor_kind, receipt_id, rationale)"
-            " VALUES ($1::uuid, $2::uuid, 'validating', 'validated', 'runtime',"
-            "         $3::uuid, 'seeded for the slate')",
-            (program_id, finding, receipt),
-        )
+        reproduction, _ = cls.replay_run(program_id, test)
+        for verb, arguments in (
+            ("SELECT request_validation($1::uuid, $2::uuid) ->> 'outcome'",
+             (program_id, finding)),
+            ("SELECT open_validation($1::uuid, $2::uuid, $3::uuid) ->> 'outcome'",
+             (program_id, finding, reproduction)),
+            ("SELECT record_verdict($1::uuid, $2::uuid, 'confirmed') ->> 'outcome'",
+             (program_id, finding)),
+        ):
+            # Read, not ignored: every one of these verbs answers a refusal with
+            # a row rather than an error, and a fixture that dropped the answer
+            # would seed a candidate and call it validated.
+            outcome = str(cls.scalar(verb, arguments))
+            assert outcome in ("queued", "opened", "answered"), (verb, outcome)
 
     # -- criterion 1: the same rows and weights reach the same order -----------
 
@@ -22935,24 +22983,24 @@ class ReplayFixture:
         return cls.owner_connection
 
     @classmethod
-    def walked(
+    def performed(
         cls,
-        name: str,
-        spec: str,
+        test: str,
         *,
         answers: dict[int, tuple[int, str | None]],
         cleanup: str = "done",
-        subject: str | None = None,
     ) -> dict:
-        """One whole replay: open it, answer each action, close it.
+        """One whole replay of one stored Test: open it, answer it, close it.
 
         `answers` says what the door came back with for each ordinal, and an
         ordinal absent from it is an action that produced no Receipt -- which is
         the only way a run reaches the close with an assertion it cannot
         evaluate.
+
+        Separate from `walked` because 037 replays a Test that already exists:
+        a reproduction is a second run of the Finding's own Test, and a helper
+        that stored a Test of its own each time could not produce one.
         """
-        hypothesis, subject = cls.claim_waiting(name, subject)
-        test = cls.stored(hypothesis, spec)
         plan = cls.called(cls.OPEN, (cls.replay_run(), test, None))
         for action in plan["actions"]:
             answer = answers.get(int(action["ordinal"]))
@@ -22964,12 +23012,26 @@ class ReplayFixture:
             )
             committed(cls.connection, cls.RECORD, (plan["tool_run_id"], action["ordinal"], receipt))
         closed = cls.called(cls.CLOSE, (plan["tool_run_id"], cleanup, None))
+        return {"plan": plan, "closed": closed}
+
+    @classmethod
+    def walked(
+        cls,
+        name: str,
+        spec: str,
+        *,
+        answers: dict[int, tuple[int, str | None]],
+        cleanup: str = "done",
+        subject: str | None = None,
+    ) -> dict:
+        """One claim, one Test of it, and one replay that settles it."""
+        hypothesis, subject = cls.claim_waiting(name, subject)
+        test = cls.stored(hypothesis, spec)
         return {
             "hypothesis": hypothesis,
             "subject": subject,
             "test": test,
-            "plan": plan,
-            "closed": closed,
+            **cls.performed(test, answers=answers, cleanup=cleanup),
         }
 
 
@@ -24090,24 +24152,39 @@ REPLAY_COMMAND_SLUG = "selftest-replay-command"
 NOTES = "http://app.example.com/notes"
 
 
-class ReplayCommandTest(DatabaseCase):
-    """`rk test replay`, from the plan to the settled claim, through a real door.
+class LiveDoorFixture:
+    """One Program, one target and one real door between them.
 
-    Everything that makes a replay a replay happens between two processes here.
-    The runtime half is `replay.run`, the function the CLI calls. The door is a
+    Everything a command-level case needs to run a Test for real. The door is a
     real `proxy.listen` with the proxy role behind it, so every Receipt is
     written by `write_allowed_receipt` on the fence's own session and carries
     whatever Lane that function derived -- the runtime never says the word.
 
     The target is reached through the `connector` seam for the reason
     `ProxyEgressTest` gives: `127.0.0.1` can never be a Program's scope, so what
-    this case fakes is the address, and nothing about the decision that
+    this fixture fakes is the address, and nothing about the decision that
     authorised it.
 
-    This case commits, and purges what it wrote at the end.
+    Shared by 35's case and 37's, because a validation is a replay with a
+    judgement after it: a second copy of this scaffolding would be a second
+    door, differing from the first wherever a later edit reached only one.
+
+    A subclass names its own `slug`, for `ReplayFixture`'s reason: the teardown
+    purges by it, and two cases sharing a Program would each be an assertion
+    about whichever ran first.
+
+    These cases commit, and purge what they wrote at the end.
     """
 
     settings_for = "migrate"
+    slug = REPLAY_COMMAND_SLUG
+
+    #: The counterparty behind the door. A subclass names another when what it
+    #: is about is the target changing its mind.
+    TARGET = LiveTarget
+
+    #: The three destinations a Test reaches unless an arm asks for others.
+    URLS = (f"{NOTES}/1", f"{NOTES}/2", f"{NOTES}/3")
 
     @classmethod
     def setUpClass(cls):
@@ -24120,7 +24197,7 @@ class ReplayCommandTest(DatabaseCase):
 
         source = SCOPED.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
         cls.configuration = write(
-            source.replace('name = "matrix-web"', f'name = "{REPLAY_COMMAND_SLUG}"')
+            source.replace('name = "matrix-web"', f'name = "{cls.slug}"')
         )
         opened = program.run(cls.harness.runtime, cls.configuration)
         assert opened.ok, opened.violations
@@ -24129,7 +24206,7 @@ class ReplayCommandTest(DatabaseCase):
 
         # `SCOPED` declares `X-Bounty-Id`, and a declared header with no
         # provisioned value is a request the door refuses before it dials.
-        value = scratch() / "replay-bounty-id.txt"
+        value = scratch() / f"{cls.slug}-bounty-id.txt"
         value.write_text("rk2-replay-selftest-bounty", encoding="utf-8")
         sealed = header.provision(
             cls.harness.runtime,
@@ -24140,7 +24217,7 @@ class ReplayCommandTest(DatabaseCase):
         )
         assert sealed.ok, sealed.violations
 
-        cls.target, _ = counterparty(LiveTarget)
+        cls.target, _ = counterparty(cls.TARGET)
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
         cls.server = proxy.listen(
             ("127.0.0.1", 0),
@@ -24154,34 +24231,6 @@ class ReplayCommandTest(DatabaseCase):
         cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
 
         cls.owner_connection = pg.connect(cls.harness.migrate)
-        try:
-            cls.held = cls.walk(
-                "the notes API serves a neighbour's note",
-                [
-                    {"id": "the-variant-is-served", "kind": "status_equals",
-                     "action": 2, "status": 200},
-                    {"id": "the-answers-agree", "kind": "body_equals",
-                     "action": 1, "against": 2},
-                ],
-            )
-            cls.refuted = cls.walk(
-                "the notes API hides the third note",
-                [{"id": "the-control-is-refused", "kind": "status_equals",
-                  "action": 3, "status": 404}],
-            )
-            cls.outside = cls.walk(
-                "the admin console is reachable",
-                [{"id": "one", "kind": "status_equals", "action": 2, "status": 200}],
-                urls=(f"{NOTES}/1", "http://admin.example.com/console", f"{NOTES}/3"),
-            )
-            cls.untrusted = cls.walk(
-                "the notes API answers over TLS as well",
-                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
-                urls=tuple(f"https://app.example.com/notes/{n}" for n in (1, 2, 3)),
-            )
-        except BaseException:
-            cls.tearDownClass()
-            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -24200,7 +24249,7 @@ class ReplayCommandTest(DatabaseCase):
                 "                             request_wire_sha, response_wire_sha])"
                 "  FROM receipts r JOIN programs p ON p.id = r.program_id"
                 " WHERE p.slug = $1",
-                (REPLAY_COMMAND_SLUG,),
+                (cls.slug,),
             ).rows
             if row[0] is not None
         ]
@@ -24210,7 +24259,7 @@ class ReplayCommandTest(DatabaseCase):
                 "SELECT s.ciphertext_sha256 FROM artifact_seal s JOIN programs p"
                 "    ON p.id = s.scope_id AND s.scope_kind = 'program'"
                 " WHERE p.slug = $1",
-                (REPLAY_COMMAND_SLUG,),
+                (cls.slug,),
             ).rows
         ]
         with cls.connection.transaction():
@@ -24218,9 +24267,9 @@ class ReplayCommandTest(DatabaseCase):
             cls.connection.execute(
                 "DELETE FROM artifact_seal WHERE scope_kind = 'program'"
                 "   AND scope_id IN (SELECT id FROM programs WHERE slug = $1)",
-                (REPLAY_COMMAND_SLUG,),
+                (cls.slug,),
             )
-            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (REPLAY_COMMAND_SLUG,))
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (cls.slug,))
             if stored:
                 cls.connection.execute(
                     "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
@@ -24251,21 +24300,12 @@ class ReplayCommandTest(DatabaseCase):
             "127.0.0.1", cls.target.server_address[1], timeout=timeout
         ), None
 
-    @classmethod
-    def walk(
-        cls,
-        statement: str,
-        assertions: list[dict],
-        *,
-        urls: tuple[str, str, str] = (f"{NOTES}/1", f"{NOTES}/2", f"{NOTES}/3"),
-    ) -> Report:
-        """One claim, one Test of it, and one `rk test replay` over that Test.
+    def rows(self, sql: str, parameters: tuple = ()) -> list:
+        return self.connection.execute(sql, parameters).rows
 
-        A claim of its own each time, and an agent run of its own: the machine
-        admits one replay of a claim in flight at a time and settles it on the
-        way out, so four walks sharing one would be four assertions about
-        whichever ran first.
-        """
+    @classmethod
+    def claimed(cls, statement: str) -> str:
+        """One claim of this Program's, waiting to be tested."""
         subject = offline_entity(cls.runtime, cls.program_id)
         hypothesis = committed(
             cls.runtime,
@@ -24284,7 +24324,14 @@ class ReplayCommandTest(DatabaseCase):
                 " VALUES ($1::uuid, $2::uuid, 'proposed', 'testable', 'runtime', 'seeded')",
                 (cls.program_id, hypothesis),
             )
-        test = committed(
+        return hypothesis
+
+    @classmethod
+    def stored(
+        cls, hypothesis: str, assertions: list[dict], urls: tuple[str, str, str]
+    ) -> str:
+        """One immutable Test of that claim, over those three destinations."""
+        return committed(
             cls.runtime,
             "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
             " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))"
@@ -24306,24 +24353,88 @@ class ReplayCommandTest(DatabaseCase):
                 }),
             ),
         )
-        agent_run = committed(
+
+    @classmethod
+    def agent_run(cls) -> str:
+        """One claimed Agent run, by the label a command takes it under.
+
+        A run of its own each time: the machine admits one replay of a claim in
+        flight at a time and settles it on the way out, so walks sharing one
+        would be assertions about whichever ran first.
+        """
+        return committed(
             cls.runtime,
             "SELECT label FROM agent_runs WHERE id = $1::uuid",
             (claimed_agent_run(
                 cls.runtime, cls.owner_connection, cls.program_id, role="recon", kind="recon"
             ),),
         )
+
+    @classmethod
+    def walk(
+        cls,
+        statement: str,
+        assertions: list[dict],
+        *,
+        hypothesis: str | None = None,
+        urls: tuple[str, str, str] = URLS,
+    ) -> Report:
+        """One claim, one Test of it, and one `rk test replay` over that Test.
+
+        The claim is made here unless one is handed in, which is what a caller
+        that has to open a Finding on it afterwards does: `open_finding` names
+        the Hypothesis and the run together, so it needs the identifier this
+        would otherwise have thrown away.
+        """
         return replay.run(
             cls.harness.runtime,
             cls.configuration,
-            agent_run=agent_run,
-            test=test,
+            agent_run=cls.agent_run(),
+            test=cls.stored(hypothesis or cls.claimed(statement), assertions, urls),
             identity_slot=None,
             proxy_url=cls.proxy_url,
         )
 
-    def rows(self, sql: str, parameters: tuple = ()) -> list:
-        return self.connection.execute(sql, parameters).rows
+
+class ReplayCommandTest(LiveDoorFixture, DatabaseCase):
+    """`rk test replay`, from the plan to the settled claim, through a real door.
+
+    Everything that makes a replay a replay happens between two processes here:
+    the runtime half is `replay.run`, the function the CLI calls, and the other
+    half is `LiveDoorFixture`'s proxy with a target behind it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            cls.held = cls.walk(
+                "the notes API serves a neighbour's note",
+                [
+                    {"id": "the-variant-is-served", "kind": "status_equals",
+                     "action": 2, "status": 200},
+                    {"id": "the-answers-agree", "kind": "body_equals",
+                     "action": 1, "against": 2},
+                ],
+            )
+            cls.refuted = cls.walk(
+                "the notes API hides the third note",
+                [{"id": "the-control-is-refused", "kind": "status_equals",
+                  "action": 3, "status": 404}],
+            )
+            cls.outside = cls.walk(
+                "the admin console is reachable",
+                [{"id": "one", "kind": "status_equals", "action": 2, "status": 200}],
+                urls=(f"{NOTES}/1", "http://admin.example.com/console", f"{NOTES}/3"),
+            )
+            cls.untrusted = cls.walk(
+                "the notes API answers over TLS as well",
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                urls=tuple(f"https://app.example.com/notes/{n}" for n in (1, 2, 3)),
+            )
+        except BaseException:
+            cls.tearDownClass()
+            raise
 
     def test_a_test_that_holds_is_reported_as_one_document(self):
         self.assertTrue(self.held.ok, self.held.violations)
@@ -25040,6 +25151,1297 @@ class CandidateFindingTest(ReplayFixture, DatabaseCase):
 
     def test_the_standing_check_holds_over_what_this_case_wrote(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+class BlindValidationTest(ReplayFixture, DatabaseCase):
+    """Ticket 37: one candidate Finding, judged out of a packet and nothing else.
+
+    The arrangement is 36's carried one step on. A claim is stated, tested
+    through the door, settled and opened as a candidate Finding -- and then
+    somebody asks for it to be validated. What this case is about begins there:
+    the claim goes back to `testable`, the Test is replayed a second time, and
+    the document a session is served is built from that second run.
+
+    Every session is opened and closed inside `setUpClass` rather than inside
+    the test that reads it, because the roster runs one validator at a time: two
+    arms each holding a session open would be assertions about whichever one got
+    there first. The arms that are about a judgement in flight are collected
+    while the one session that is open is open, which is the only moment they
+    are answerable.
+    """
+
+    slug = "selftest-validate"
+
+    OPEN_FINDING = "SELECT open_finding($1::uuid, $2::uuid, $3, $4)"
+    REQUEST = "SELECT request_validation($1::uuid, $2::uuid)"
+    REOPEN = "SELECT reopen_for_reproduction($1::uuid, $2::uuid)"
+    SESSION = "SELECT open_validation_session($1::uuid, $2::uuid, $3::uuid)"
+    SERVE = "SELECT open_validation($1::uuid, $2::uuid, $3::uuid, NULL)"
+    VERDICT = "SELECT record_verdict($1::uuid, $2::uuid, $3, $4::text[])"
+    ABANDON = "SELECT abandon_validation($1::uuid, $2::uuid, $3)"
+    FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
+    REFUSAL = "SELECT rk2_validation_refusal($1::uuid, $2::uuid, $3::uuid)"
+
+    #: 36's Test, and so the whole vocabulary a verdict may name a failure out
+    #: of: `enforce_verdict_input` reads the assertion identifiers off the spec
+    #: the Finding's own run performed.
+    HELD = [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-control-is-not", "kind": "status_differs", "action": 3, "against": 2},
+        {"id": "the-bodies-differ", "kind": "body_differs", "action": 1, "against": 2},
+    ]
+    ANSWERS = {1: (200, "order one"), 2: (200, "order two"), 3: (403, "denied")}
+
+    #: The two places a person's words end up on the way to a candidate: the
+    #: title the hunter gave its Finding, and the claim it wrote. Criterion 2 is
+    #: that neither sentence is anywhere in what a validator is handed, so both
+    #: are written here to be searched for rather than described.
+    TITLE = "a neighbour's order comes back and I would report this one as high"
+    STATEMENT = "the orders API hands over a neighbour's order to anyone who asks"
+
+    #: A Finding nobody opened and a run nobody performed, for the two arms that
+    #: are about a name rather than about a row.
+    NOBODY = "00000000-0000-0000-0000-000000000000"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.klass = str(
+            cls.connection.execute(
+                "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
+            ).scalar()
+        )
+
+        cls.confirmed = cls.served(cls.STATEMENT)
+        cls.refuse_what_a_judgement_may_not_say(cls.confirmed)
+        cls.answer(cls.confirmed, "confirmed")
+
+        cls.partial = cls.served("the orders API hands over a neighbour's invoice")
+        cls.answer(cls.partial, "insufficient",
+                   failed=("the-control-is-not", "the-bodies-differ"))
+
+        cls.go_stale()
+        cls.drop_one_and_carry_on()
+        cls.refuse_what_cannot_be_served()
+        cls.problems = cls.rows_of("SELECT * FROM check_validations()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def candidate(cls, statement: str) -> dict:
+        """One candidate Finding, by 36's route and no other."""
+        walk = cls.walked(statement, specification(cls.HELD), answers=cls.ANSWERS)
+        opened = cls.called(
+            cls.OPEN_FINDING,
+            (walk["hypothesis"], walk["closed"]["test_run_id"], cls.klass, cls.TITLE),
+        )
+        assert opened["outcome"] == "created", opened
+        return {**walk, "statement": statement, "finding": opened["finding_id"],
+                "born": walk["closed"]["test_run_id"]}
+
+    @classmethod
+    def reproduced(cls, made: dict, answers: dict | None = None) -> dict:
+        """The request, the claim reopened, and the second run of its own Test.
+
+        Three verbs rather than one because they are three decisions: somebody
+        asks, the machine makes the claim testable again, and 35 performs the
+        replay exactly as it performed the first one. Nothing here shortcuts the
+        door -- a reproduction written by hand would be the thing criterion 6 is
+        about rather than the thing it protects.
+        """
+        asked = cls.called(cls.REQUEST, (cls.program_id, made["finding"]))
+        assert asked["outcome"] == "queued", asked
+        reopened = cls.called(cls.REOPEN, (cls.program_id, made["finding"]))
+        assert reopened["outcome"] == "reopened", reopened
+        again = cls.performed(made["test"], answers=answers or cls.ANSWERS)
+        return {**made, "asked": asked, "reopened": reopened, "again": again,
+                "replay": again["closed"]["test_run_id"]}
+
+    @classmethod
+    def served(cls, statement: str) -> dict:
+        """A candidate, reproduced, and the session the packet went to."""
+        made = cls.reproduced(cls.candidate(statement))
+        opened = cls.called(cls.SESSION, (cls.program_id, made["finding"], made["replay"]))
+        assert opened["outcome"] == "opened", opened
+        return {**made, "opened": opened}
+
+    @classmethod
+    def answer(cls, session: dict, verdict: str, failed: tuple = ()) -> dict:
+        """The verdict, and the close that follows it whatever it was.
+
+        Both, because the roster runs one validator at a time and a session left
+        open would refuse the next arrangement rather than fail its own test.
+        """
+        session["verdict"] = cls.called(
+            cls.VERDICT, (cls.program_id, session["finding"], verdict, pg.quote_array(failed))
+        )
+        session["finished"] = cls.called(
+            cls.FINISH, (session["opened"]["agent_run_id"], "completed")
+        )
+        return session
+
+    @classmethod
+    def go_stale(cls):
+        """Criterion 6's changed Artifact, in the general case the digest catches.
+
+        The claim is reopened under the session rather than an Artifact purged,
+        because what is being tested is the digest and not one of the arms: the
+        packet carries the claim's status, so a claim that moved while a
+        validator was thinking is a document that would now read differently.
+        The purge has an arm of its own below.
+
+        The claim is settled again afterwards. `testable -> supported` is not a
+        transition anybody has, so the only way back is the way it came, and a
+        Finding left on a claim nothing settled is 36's own report rather than
+        anything this case means to say.
+        """
+        cls.stale = cls.served("the orders API hands over a neighbour's address")
+        cls.as_owner(
+            "INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status,"
+            "                                    to_status, actor_kind, rationale)"
+            " VALUES ($1::uuid, $2::uuid, 'supported', 'testable', 'runtime',"
+            "         'reopened while a validator was reading it')",
+            (cls.program_id, cls.stale["hypothesis"]),
+        )
+        cls.stale["verdict"] = cls.called(
+            cls.VERDICT, (cls.program_id, cls.stale["finding"], "confirmed", pg.quote_array(()))
+        )
+        cls.stale["finished"] = cls.called(
+            cls.FINISH, (cls.stale["opened"]["agent_run_id"], "completed")
+        )
+        cls.performed(cls.stale["test"], answers=cls.ANSWERS)
+
+    @classmethod
+    def drop_one_and_carry_on(cls):
+        """The session that answers nothing, and what the Finding does after it.
+
+        One arrangement rather than four, because the four things it is about
+        are one sequence: while a validation is in flight nothing else may be
+        opened, a session that dies is closed by the runtime rather than left,
+        the seat it held goes to whoever was refused it, and the Finding it
+        dropped comes round again on the Task it already had.
+        """
+        cls.dropped = cls.served("the orders API hands over a neighbour's receipt")
+        cls.waiting = cls.reproduced(cls.candidate("the orders API hands over the refunds"))
+
+        # 018's cap for the role, asked where a validation is opened rather than
+        # claimed, and the Finding's own: one judgement of one Finding at a time.
+        cls.refusals["one_at_a_time"] = cls.called(
+            cls.SESSION, (cls.program_id, cls.waiting["finding"], cls.waiting["replay"])
+        )["refusal"]
+        cls.refusals["already_in_flight"] = cls.called(
+            cls.SERVE, (cls.program_id, cls.dropped["finding"], cls.dropped["replay"])
+        )["refusal"]
+
+        cls.dropped["abandoned"] = cls.called(
+            cls.ABANDON,
+            (cls.program_id, cls.dropped["finding"],
+             "the session stopped without answering"),
+        )
+        cls.dropped["finished"] = cls.called(
+            cls.FINISH, (cls.dropped["opened"]["agent_run_id"], "aborted")
+        )
+
+        cls.waiting["opened"] = cls.called(
+            cls.SESSION, (cls.program_id, cls.waiting["finding"], cls.waiting["replay"])
+        )
+        assert cls.waiting["opened"]["outcome"] == "opened", cls.waiting["opened"]
+        cls.answer(cls.waiting, "refuted", failed=("the-variant-is-served",))
+
+        cls.retried = cls.reproduced(cls.dropped)
+        cls.retried["opened"] = cls.called(
+            cls.SESSION, (cls.program_id, cls.retried["finding"], cls.retried["replay"])
+        )
+        assert cls.retried["opened"]["outcome"] == "opened", cls.retried["opened"]
+        cls.answer(cls.retried, "confirmed")
+
+    @classmethod
+    def forged(cls, test: str, lane: str, *, finished: bool) -> str:
+        """A run of the Finding's own Test, written around the verbs.
+
+        The front door produces none of these: 35 admits one replay at a time,
+        on the replay Lane, and closes every run it opens. So they are exactly
+        the rows a careless migration or a caller with INSERT would have to
+        write, which is what makes them worth refusing by name.
+        """
+        return committed(
+            cls.connection,
+            "INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results,"
+            "                       finished_at)"
+            " VALUES ($1::uuid, $2::uuid, $3, 'holds', $4::jsonb,"
+            "         CASE WHEN $5::boolean THEN now() END) RETURNING id",
+            (
+                cls.program_id, test, lane,
+                json.dumps({
+                    "assertions": [{"id": held["id"], "held": True} for held in cls.HELD],
+                    "failed": [],
+                    "cleanup": "done",
+                }),
+                "true" if finished else "false",
+            ),
+        )
+
+    @classmethod
+    def cited(cls, run: str, lane: str) -> None:
+        """One Receipt of the given Lane, cited by a hand-written run.
+
+        The door writes Receipts and this case may not, so the owner writes it.
+        `proxy_internal` is the Lane that matters: it is the door's own
+        housekeeping, it was never anybody's evidence, and it is the one foreign
+        Receipt a single Program can produce -- another Program's would be
+        refused by the composite key before the packet ever saw it.
+        """
+        receipt = committed(
+            cls.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, lane, decision, reason, method, scheme,"
+            "                      host, port, path, status_code, ts_arrival,"
+            "                      scope_class, scope_version)"
+            " VALUES ($1::uuid, $2, 'allowed', 'allowed as target under scope version 1',"
+            "         'GET', 'https', 'app.example.com', 443, '/api/orders/1', 200, now(),"
+            "         'target', 1) RETURNING id",
+            (cls.program_id, lane),
+        )
+        committed(
+            cls.connection,
+            "INSERT INTO test_run_receipts (test_run_id, receipt_id, ordinal, role)"
+            " VALUES ($1::uuid, $2::uuid, 1, 'baseline') RETURNING ordinal",
+            (run, receipt),
+        )
+
+    @classmethod
+    def serve_refused(cls, key: str, finding: str, replay: str) -> None:
+        """One packet that may not be served, and the sentence that refused it."""
+        answer = cls.called(cls.SERVE, (cls.program_id, finding, replay))
+        assert answer["outcome"] == "refused", answer
+        cls.refusals[key] = answer["refusal"]
+
+    @classmethod
+    def refuse_what_cannot_be_served(cls):
+        """Criterion 6, one arrangement per thing that makes a packet unservable.
+
+        Most of them share one Finding, because none of them changes anything:
+        a refusal files its record and leaves the request queued, so the same
+        candidate can be offered a birth run, another Test's run, an agent-Lane
+        run and an unfinished one in turn. The two that do change something --
+        a Finding that is no longer a candidate, an Artifact that is gone -- get
+        a Finding of their own.
+        """
+        quiet = cls.candidate("the orders API hands over a neighbour's export")
+        cls.serve_refused("nobody_asked", quiet["finding"], quiet["born"])
+        assert cls.called(cls.REQUEST, (cls.program_id, quiet["finding"]))["outcome"] \
+            == "queued"
+
+        cls.serve_refused("the_birth_run", quiet["finding"], quiet["born"])
+        cls.serve_refused("no_such_run", quiet["finding"], cls.NOBODY)
+
+        beside = cls.candidate("the orders API hands over a neighbour's basket")
+        cls.serve_refused("another_test", quiet["finding"], beside["born"])
+
+        cls.serve_refused(
+            "another_lane", quiet["finding"], cls.forged(quiet["test"], "agent", finished=True)
+        )
+        cls.serve_refused(
+            "unfinished", quiet["finding"], cls.forged(quiet["test"], "replay", finished=False)
+        )
+
+        stray = cls.forged(quiet["test"], "replay", finished=True)
+        cls.cited(stray, "proxy_internal")
+        cls.serve_refused("foreign_receipt", quiet["finding"], stray)
+
+        # A Finding that has been judged already. Its own validation is over, so
+        # what a second packet about it would be is a second answer to a settled
+        # question.
+        cls.serve_refused(
+            "not_a_candidate", cls.confirmed["finding"], cls.confirmed["replay"]
+        )
+
+        # The Artifact arm, on a reproduction whose pages nothing else shares:
+        # the store is keyed by digest, so purging the answer every other walk
+        # in this case gave would purge it out from under all of them.
+        page = "a photograph of nobody in particular"
+        gone = cls.reproduced(
+            cls.candidate("the orders API hands over a neighbour's photograph"),
+            answers={1: (200, page), 2: (200, "order two"), 3: (403, "denied")},
+        )
+        committed(
+            cls.connection,
+            "UPDATE artifacts SET purged_at = now() WHERE sha256 = $1 RETURNING sha256",
+            (artifact.digest(page.encode()),),
+        )
+        cls.serve_refused("purged_artifact", gone["finding"], gone["replay"])
+
+        # And the one arm no caller can reach through the verb: an attempt row
+        # names a Finding, so a packet about a Finding that does not exist is
+        # refused by the foreign key before it can be filed. The sentence is
+        # still the function's, and this is where it is read.
+        cls.refusals["no_such_finding"] = str(
+            cls.connection.execute(
+                cls.REFUSAL, (cls.program_id, cls.NOBODY, cls.NOBODY)
+            ).scalar()
+        )
+
+    @classmethod
+    def transition(cls, finding: str, to_status: str) -> str:
+        """One hand-written move out of judgement, with its uuids written in.
+
+        Spelled rather than parameterised because two of the three arms below
+        need a verdict written in the same transaction as the transition that
+        reads it, and a `DO` block takes no parameters.
+        """
+        return (
+            "INSERT INTO finding_transitions (program_id, finding_id, from_status,"
+            "                                 to_status, actor_kind, rationale)"
+            f" VALUES ('{cls.program_id}'::uuid, '{finding}'::uuid, 'validating',"
+            f"         '{to_status}', 'runtime', 'written around the verb')"
+        )
+
+    @classmethod
+    def judged_by_hand(cls, finding: str, verdict: str, to_status: str,
+                       validated_by: str | None = None) -> str:
+        """A verdict and the move it is supposed to justify, in one statement."""
+        pointed = (
+            "  UPDATE findings"
+            f"     SET validated_by_test_run_id = '{validated_by}'::uuid,"
+            "         validated_run_outcome = 'holds'"
+            f"   WHERE id = '{finding}'::uuid;"
+        ) if validated_by else ""
+        return (
+            "DO $judge$ BEGIN"
+            "  INSERT INTO verdicts (program_id, finding_id, verdict)"
+            f"       VALUES ('{cls.program_id}'::uuid, '{finding}'::uuid, '{verdict}');"
+            + pointed
+            + "  " + cls.transition(finding, to_status) + ";"
+            " END $judge$"
+        )
+
+    @classmethod
+    def refuse_what_a_judgement_may_not_say(cls, session: dict):
+        """Criteria 4 and 5, against a judgement that is genuinely in flight.
+
+        Every arm needs a Finding in `validating` with an attempt open on it,
+        which is true exactly once per session, so they are collected here
+        rather than written as tests: each one runs in a transaction of its own
+        and rolls back, and the session goes on to be answered normally.
+        """
+        finding = session["finding"]
+        cls.refusals["fourth_word"] = cls.refuse(
+            "INSERT INTO verdicts (program_id, finding_id, verdict)"
+            " VALUES ($1::uuid, $2::uuid, 'probably')",
+            (cls.program_id, finding),
+        )
+        cls.refusals["unknown_assertion_written"] = cls.refuse(
+            "INSERT INTO verdicts (program_id, finding_id, verdict, failed_assertion_ids)"
+            " VALUES ($1::uuid, $2::uuid, 'insufficient', $3::text[])",
+            (cls.program_id, finding, pg.quote_array(("the-hunter-was-right",))),
+        )
+
+        # The same three things the two rows above are about, asked through the
+        # verb instead of the table -- and answered with a sentence rather than
+        # a raise. That difference is the point of the arm: everything here is
+        # chosen by the child, and a raised exception would take down the
+        # transaction that closes the attempt, leaving the Finding under a
+        # session that has already stopped and that nothing may replace. The
+        # session is still open afterwards, which is what lets it be answered
+        # normally below.
+        for key, verdict, failed in (
+            ("unknown_assertion", "insufficient", ("the-hunter-was-right",)),
+            ("confirmed_with_failures", "confirmed", ("the-control-is-not",)),
+            ("said_a_fourth_word", "probably", ()),
+        ):
+            answered = cls.called(
+                cls.VERDICT, (cls.program_id, finding, verdict, pg.quote_array(failed))
+            )
+            assert answered["outcome"] == "refused", answered
+            cls.refusals[key] = answered["refusal"]
+
+        # Read here rather than in the test, because the session goes on to be
+        # answered: what the three refusals have to have left behind is the
+        # arrangement they found, and a moment later it is gone.
+        cls.after_refusals = [
+            tuple(str(field) for field in row)
+            for row in cls.rows_of(
+                "SELECT f.status, va.outcome, count(v.id)"
+                "  FROM findings f"
+                "  JOIN validation_attempts va ON va.finding_id = f.id"
+                "  LEFT JOIN verdicts v ON v.finding_id = f.id"
+                " WHERE f.id = $1::uuid GROUP BY f.status, va.outcome",
+                (finding,),
+            )
+        ]
+
+        cls.refusals["no_verdict"] = cls.refuse(cls.transition(finding, "validated"))
+        cls.refusals["wrong_status"] = cls.refuse(
+            cls.judged_by_hand(finding, "insufficient", "validated")
+        )
+        cls.refusals["another_run"] = cls.refuse(
+            cls.judged_by_hand(finding, "confirmed", "validated",
+                               validated_by=session["born"])
+        )
+
+    # -- criterion 1: the packet is an allowlist -------------------------------
+
+    def test_the_packet_is_exactly_the_keys_the_allowlist_names(self):
+        """The document, read against the table the migration checks itself with.
+
+        The allowlist is asserted against `pg_depend` when the file applies, so
+        what is left to say here is that the columns it permits are the fields
+        that actually arrive: a column read into a key nobody named, or a name
+        with no key behind it, is a difference `pg_depend` cannot see.
+        """
+        packet = self.confirmed["opened"]["packet"]
+        named = {f"finding.{key}" for key in packet["finding"]}
+        named |= {f"hypothesis.{key}" for key in packet["hypothesis"]}
+        named |= {f"test.{key}" for key in packet["test"]}
+        for run in packet["runs"].values():
+            named |= {f"runs.{key}" for key in run if key != "receipts"}
+            for receipt in run["receipts"]:
+                named |= {f"receipts.{key}" for key in receipt}
+        for held in packet["artifacts"]:
+            named |= {f"artifacts.{key}" for key in held}
+
+        self.assertEqual(
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT DISTINCT unnest(packet_keys) FROM validation_packet_columns"
+                )
+            ),
+            sorted(named),
+        )
+
+    def test_the_packet_holds_both_runs_and_says_which_is_which(self):
+        packet = self.confirmed["opened"]["packet"]
+        self.assertEqual(["opened", "replay"], sorted(packet["runs"]))
+        self.assertNotEqual(self.confirmed["born"], self.confirmed["replay"])
+        self.assertEqual(
+            [(True, True)],
+            [
+                tuple(row)
+                for row in self.rows(
+                    "SELECT tr.started_at = $2::timestamptz, tr.lane = $3"
+                    "  FROM test_runs tr WHERE tr.id = $1::uuid",
+                    (self.confirmed["replay"],
+                     packet["runs"]["replay"]["started_at"],
+                     packet["runs"]["replay"]["lane"]),
+                )
+            ],
+        )
+
+    def test_every_page_the_receipts_name_is_offered_as_a_digest(self):
+        """Criterion 1's Artifact facts: which pages exist, not what is on them."""
+        packet = self.confirmed["opened"]["packet"]
+        self.assertEqual(
+            sorted(
+                str(row[0])
+                for row in self.rows(
+                    "SELECT DISTINCT sha.value"
+                    "  FROM test_run_receipts trr"
+                    "  JOIN receipts r ON r.id = trr.receipt_id"
+                    "  CROSS JOIN LATERAL (VALUES (r.request_agent_sha),"
+                    "                             (r.response_agent_sha)) AS sha(value)"
+                    " WHERE trr.test_run_id = ANY($1::uuid[]) AND sha.value IS NOT NULL",
+                    (pg.quote_array((self.confirmed["born"], self.confirmed["replay"])),),
+                )
+            ),
+            sorted(held["sha256"] for held in packet["artifacts"]),
+        )
+
+    def test_the_packet_reaches_none_of_the_tables_the_hunting_is_recorded_in(self):
+        """Criterion 2, against the parse tree rather than against the output.
+
+        The migration refuses to apply if the packet reads a column of any of
+        these; this asserts the same thing of the function that is installed, so
+        a later `CREATE OR REPLACE` that widened it would be caught here rather
+        than at the next migration that happens to re-run the check.
+        """
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT DISTINCT c.relname FROM pg_depend d"
+                "  JOIN pg_class c ON c.oid = d.refobjid"
+                " WHERE d.classid = 'pg_proc'::regclass"
+                "   AND d.objid = 'rk2_validation_packet(uuid,uuid,uuid)'::regprocedure"
+                "   AND d.refclassid = 'pg_class'::regclass"
+                "   AND c.relname = ANY($1::text[])",
+                (pg.quote_array(("proposals", "proposal_drops", "agent_runs", "agent_capsules",
+                        "hypothesis_transitions", "decision_queue", "finding_proposals")),),
+            ),
+        )
+
+    # -- criterion 2: nobody's words -------------------------------------------
+
+    def test_no_prose_anybody_wrote_reaches_the_packet(self):
+        served = json.dumps(self.confirmed["opened"]["packet"])
+        for what, prose in (
+            ("the title the hunter gave it", self.TITLE),
+            ("the claim it was written about", self.STATEMENT),
+            ("the Test's own preconditions", "the orders API is in scope"),
+        ):
+            with self.subTest(prose=what):
+                self.assertNotIn(prose, served)
+
+    # -- criterion 3: a fresh session, and the database half of what it holds ---
+
+    def test_the_session_is_a_fresh_top_level_run_at_the_rosters_model(self):
+        """The run the packet went to, in the four things the database can say.
+
+        What tools it holds is 018's roster and is asserted where the roster is;
+        what is asserted here is that this is a session of its own -- no parent,
+        no mission, the role's own model -- rather than a turn inside the one
+        that produced the Finding.
+        """
+        self.assertEqual(
+            [(True, True, True, True, True)],
+            [
+                tuple(row)
+                for row in self.rows(
+                    "SELECT ar.parent_run_id IS NULL, ar.mission_packet = '{}'::jsonb,"
+                    "       ar.role = 'validator', ar.model = r.model, ar.effort = r.effort"
+                    "  FROM agent_runs ar JOIN roles r ON r.role = ar.role"
+                    " WHERE ar.label = $1",
+                    (self.confirmed["opened"]["agent_run"],),
+                )
+            ],
+        )
+
+    def test_the_task_the_session_ran_closes_on_the_verdict_it_gave(self):
+        """012's completion question, answered by a role that proposes nothing."""
+        self.assertEqual(
+            ("done", True), (self.confirmed["finished"]["task_status"],
+                             self.confirmed["finished"]["accepted"])
+        )
+
+    # -- criterion 4: three words and a closed vocabulary ----------------------
+
+    def test_a_verdict_is_one_of_three_words(self):
+        self.assertIn("verdicts_verdict_check", self.refusals["fourth_word"])
+
+    def test_a_verdict_names_only_assertions_the_test_states(self):
+        self.assertIn(
+            "the assertion the-hunter-was-right is not one this Finding's Test states",
+            self.refusals["unknown_assertion_written"],
+        )
+
+    def test_the_verb_refuses_what_the_trigger_would_raise_about(self):
+        """Criterion 4 again, and the reason it is asked twice.
+
+        A validator picks its own word and names its own assertions, so all
+        three of these are ordinary answers arriving through the front door. An
+        exception here would be a refusal that also aborts the transaction that
+        would have closed the attempt -- which leaves the Finding under
+        judgement by a session that has stopped, and `open_validation` refuses
+        to replace those. So the verb answers with a sentence and the attempt
+        stays open for `abandon_validation`, while the trigger above goes on
+        raising for every writer that is not the verb.
+        """
+        for key, fragment in (
+            ("unknown_assertion", "the assertion the-hunter-was-right is not one"),
+            ("confirmed_with_failures", "a confirmed verdict names no failed assertion"),
+            ("said_a_fourth_word",
+             "probably is not one of confirmed, refuted or insufficient"),
+        ):
+            with self.subTest(case=key):
+                self.assertIn(fragment, self.refusals[key])
+        self.assertEqual([("validating", "open", "0")], self.after_refusals)
+
+    def test_a_confirmed_verdict_names_no_failure(self):
+        self.assertIn(
+            "a confirmed verdict names no failed assertion",
+            self.refusals["confirmed_with_failures"],
+        )
+
+    # -- criterion 5: the verdict is input, the database decides ---------------
+
+    def test_a_confirmed_verdict_validates_the_finding_on_the_run_it_was_served(self):
+        self.assertEqual(
+            ("answered", "confirmed", "validated"),
+            (self.confirmed["verdict"]["outcome"], self.confirmed["verdict"]["verdict"],
+             self.confirmed["verdict"]["status"]),
+        )
+        self.assertEqual(
+            [("validated", True, "holds")],
+            [
+                (str(row[0]), row[1], str(row[2]))
+                for row in self.rows(
+                    "SELECT status, validated_by_test_run_id = $2::uuid,"
+                    "       validated_run_outcome"
+                    "  FROM findings WHERE id = $1::uuid",
+                    (self.confirmed["finding"], self.confirmed["replay"]),
+                )
+            ],
+        )
+
+    def test_an_insufficient_verdict_leaves_the_candidate_standing(self):
+        """The spec's own words: recorded without destroying the candidate."""
+        self.assertEqual("candidate", self.partial["verdict"]["status"])
+        self.assertEqual(
+            [("candidate", None, "{the-bodies-differ,the-control-is-not}")],
+            [
+                (str(row[0]), row[1], str(row[2]))
+                for row in self.rows(
+                    "SELECT f.status, f.validated_by_test_run_id,"
+                    "       (SELECT array_agg(named ORDER BY named)"
+                    "          FROM unnest(v.failed_assertion_ids) AS named)"
+                    "  FROM findings f JOIN verdicts v ON v.finding_id = f.id"
+                    " WHERE f.id = $1::uuid",
+                    (self.partial["finding"],),
+                )
+            ],
+        )
+
+    def test_a_refuted_verdict_rejects_the_finding(self):
+        self.assertEqual("rejected", self.waiting["verdict"]["status"])
+        self.assertEqual(
+            [("rejected", None)],
+            [
+                (str(row[0]), row[1])
+                for row in self.rows(
+                    "SELECT status, validated_by_test_run_id FROM findings"
+                    " WHERE id = $1::uuid",
+                    (self.waiting["finding"],),
+                )
+            ],
+        )
+
+    def test_a_finding_cannot_be_moved_out_of_judgement_by_hand(self):
+        for key, fragment in (
+            ("no_verdict", "no verdict was given on the Finding"),
+            ("wrong_status", "which makes it candidate, not validated"),
+            ("another_run", "is validated by the run its validation was opened against"),
+        ):
+            with self.subTest(case=key):
+                self.assertIn(fragment, self.refusals[key])
+
+    def test_a_verdict_is_a_record_and_stays_one(self):
+        self.assertNotEqual(
+            "",
+            self.refuse(
+                "UPDATE verdicts SET verdict = 'refuted' WHERE finding_id = $1::uuid",
+                (self.confirmed["finding"],),
+            ),
+        )
+        self.assertNotEqual(
+            "",
+            self.refuse(
+                "DELETE FROM verdicts WHERE finding_id = $1::uuid",
+                (self.confirmed["finding"],),
+            ),
+        )
+        # And a verdict about a Finding nobody is judging is not a verdict at
+        # all: the one already validated above is the nearest thing to a Finding
+        # a second opinion could be offered about.
+        self.assertIn(
+            "a verdict answers a Finding under judgement",
+            self.refuse(
+                "INSERT INTO verdicts (program_id, finding_id, verdict)"
+                " VALUES ($1::uuid, $2::uuid, 'refuted')",
+                (self.program_id, self.confirmed["finding"]),
+            ),
+        )
+
+    # -- criterion 6: everything that makes it fail closed ---------------------
+
+    def test_every_packet_that_cannot_be_served_is_refused_by_name(self):
+        for key, fragment in (
+            ("no_such_finding", "no Finding"),
+            ("nobody_asked", "nothing asked for"),
+            ("the_birth_run", "a reproduction is a second run"),
+            ("no_such_run", "no Test run"),
+            ("another_test", "a run of another Test than the one"),
+            ("another_lane", "is on the agent Lane"),
+            ("unfinished", "the run offered has not finished"),
+            ("foreign_receipt", "which is not this Program's evidence"),
+            ("purged_artifact", "a Receipt names is no longer held"),
+            ("not_a_candidate", "a validation begins on a candidate"),
+            ("already_in_flight", "is already in flight"),
+            ("one_at_a_time", "the roster runs 1 validator session(s) at a time"),
+        ):
+            with self.subTest(case=key):
+                self.assertIn(fragment, self.refusals[key])
+
+    def test_a_refusal_is_filed_with_no_packet_behind_it(self):
+        """Criterion 6's other half: a packet nobody could serve leaves a record."""
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT id FROM validation_attempts"
+                " WHERE outcome = 'refused'"
+                "   AND (refusal IS NULL OR packet_sha256 IS NOT NULL"
+                "        OR replay_test_run_id IS NOT NULL OR closed_at IS NULL)"
+            ),
+        )
+
+    def test_a_verdict_about_a_packet_that_moved_is_kept_and_not_acted_on(self):
+        self.assertEqual("stale", self.stale["verdict"]["outcome"])
+        self.assertNotEqual(self.stale["verdict"]["served"], self.stale["verdict"]["now"])
+        self.assertEqual(
+            [("candidate", "stale", None,
+              "answered confirmed on a packet that had changed since it was served")],
+            [
+                (str(row[0]), str(row[1]), row[2], str(row[3]))
+                for row in self.rows(
+                    "SELECT f.status, va.outcome, va.verdict_id, va.refusal"
+                    "  FROM findings f JOIN validation_attempts va ON va.finding_id = f.id"
+                    " WHERE f.id = $1::uuid",
+                    (self.stale["finding"],),
+                )
+            ],
+        )
+        # Kept, but on the attempt: the word is what became of one reading, and
+        # the attempt is the row about that reading. No verdict row, because
+        # what the session said was about a document that is no longer there,
+        # and the table of answers is a table of answers to something.
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT id FROM verdicts WHERE finding_id = $1::uuid",
+                (self.stale["finding"],),
+            ),
+        )
+
+    def test_a_session_that_answers_nothing_gives_the_finding_back(self):
+        self.assertEqual("unanswered", self.dropped["abandoned"]["outcome"])
+        self.assertEqual(
+            [("unanswered", "the session stopped without answering", True)],
+            [
+                (str(row[0]), str(row[1]), row[2])
+                for row in self.rows(
+                    "SELECT outcome, refusal, packet_sha256 IS NOT NULL"
+                    "  FROM validation_attempts WHERE id = $1::uuid",
+                    (self.dropped["abandoned"]["attempt"],),
+                )
+            ],
+        )
+        self.assertEqual("pending", self.dropped["finished"]["task_status"])
+
+    def test_the_finding_a_dropped_session_left_goes_round_on_the_same_task(self):
+        """The second attempt, and the one Task `tasks_live_dedup_idx` allows."""
+        self.assertEqual(
+            self.dropped["opened"]["task"], self.retried["opened"]["task"]
+        )
+        self.assertEqual(
+            [(2, "done")],
+            [
+                (int(row[0]), str(row[1]))
+                for row in self.rows(
+                    "SELECT attempts, status FROM tasks WHERE label = $1",
+                    (self.retried["opened"]["task"],),
+                )
+            ],
+        )
+        self.assertEqual("validated", self.retried["verdict"]["status"])
+
+    def test_every_attempt_is_on_file_with_what_became_of_it(self):
+        self.assertEqual(
+            [("answered", 4), ("refused", 10), ("stale", 1), ("unanswered", 1)],
+            [
+                (str(row[0]), int(row[1]))
+                for row in self.rows(
+                    "SELECT outcome, count(*) FROM validation_attempts"
+                    " WHERE program_id = $1::uuid GROUP BY outcome ORDER BY outcome",
+                    (self.program_id,),
+                )
+            ],
+        )
+
+    def test_what_was_served_is_what_the_attempt_recorded(self):
+        """The anchor the whole of criterion 6 hangs off, asserted once."""
+        self.assertEqual(
+            [True],
+            [
+                row[0]
+                for row in self.rows(
+                    "SELECT va.packet_sha256 = rk2_validation_digest($2::jsonb)"
+                    "  FROM validation_attempts va WHERE va.id = $1::uuid",
+                    (self.confirmed["opened"]["attempt"],
+                     json.dumps(self.confirmed["opened"]["packet"])),
+                )
+            ],
+        )
+
+    def test_the_standing_check_holds_over_what_this_case_wrote(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+        [[problems, detail]] = self.rows(
+            "SELECT problems, detail FROM run_standing_checks() WHERE name = 'validations'"
+        )
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+
+JUDGE_COMMAND_SLUG = "selftest-judge-command"
+
+
+class ShiftingTarget(LiveTarget):
+    """The live target, with one path it can be told to stop serving.
+
+    Criterion 6's missing holding replay has to be caused rather than described,
+    and the only thing that can cause it is the counterparty: a Test that held
+    when the Finding was born holds again every time until what it asks about
+    changes. The flag is a class attribute because the handler is constructed
+    per request and there is nothing to hand it one through; the case that sets
+    it clears it, and every walk either side of that request is answered the way
+    `LiveTarget` answers everything.
+    """
+
+    moved = False
+
+    def do_GET(self) -> None:
+        if not ShiftingTarget.moved:
+            super().do_GET()
+            return
+        self.record()
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_GET
+    do_HEAD = do_GET
+
+
+class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
+    """`rk finding validate`, from the candidate to the Finding the rules moved.
+
+    `BlindValidationTest` asks what the rules do with a verdict. This asks what
+    the command does around them, and the difference is where the reproduction
+    comes from: there the second run of the Test is written by the case, here it
+    is `replay.run` against a real door with a real target behind it. So the
+    packet a session is handed is built out of Receipts the proxy wrote, and
+    criterion 6's "missing holding replay" is a thing this case can cause by
+    giving the target something else to say.
+
+    The child is a stub, and it is a stub that judges: it builds a real
+    `_launch.Judgement` around the document the request carried and answers
+    through it. What the model would have decided is not a thing a test can
+    have, but everything either side of that decision is exercised -- the packet
+    reaching the boundary, the label check, the latch, and the answer travelling
+    back on `AgentRunResult.verdict`.
+    """
+
+    slug = JUDGE_COMMAND_SLUG
+    TARGET = ShiftingTarget
+
+    #: What this Test claims, chosen for what the target actually does: it
+    #: answers every note the same way, so a Test that holds against it is one
+    #: that says the notes come back and read alike. `CandidateFindingTest`
+    #: states the sharper shape against a stub door that can be told to serve
+    #: three different answers; a live target that would need three answers
+    #: would need three targets.
+    HELD = [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-control-answers-too", "kind": "status_equals", "action": 3, "status": 200},
+        {"id": "the-bodies-agree", "kind": "body_equals", "action": 1, "against": 2},
+    ]
+
+    #: The hunter's own words, written here to be searched for. Criterion 2 is
+    #: that neither reaches the session, and the objective is checked for them
+    #: as well as the packet: the runtime writes that sentence, so the runtime
+    #: is where a leak would come from.
+    TITLE = "a neighbour's note comes back and I would report this one as high"
+    STATEMENT = "the notes API hands over a neighbour's note to anyone who asks"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.klass = str(
+            cls.connection.execute(
+                "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
+            ).scalar()
+        )
+        cls.environment = {
+            execution.IMAGE: AGENT_IMAGE,
+            execution.NETWORK: "rk2-agent-network",
+            execution.PROXY_CONTAINER: "rk2-proxy",
+            execution.PROXY_URL: cls.proxy_url,
+            execution.CERTIFICATE: "/run/root.pem",
+        }
+        cls.requests: list[agent.AgentRunRequest] = []
+        cls.reads: list[dict] = []
+        try:
+            cls.confirmed = cls.validated(cls.STATEMENT, cls.judges("confirmed"))
+            cls.refuted = cls.validated(
+                "the notes API hands over a neighbour's invoice",
+                cls.judges("refuted", failed=("the-control-answers-too",)),
+            )
+            cls.silent = cls.validated(
+                "the notes API hands over a neighbour's receipt", cls.says_nothing
+            )
+            cls.unstarted = cls.validated(
+                "the notes API hands over a neighbour's export", cls.never_starts
+            )
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def candidate(cls, statement: str) -> dict:
+        """One candidate Finding, by 35's replay and 36's verb over its run."""
+        hypothesis = cls.claimed(statement)
+        performed = cls.walk(statement, cls.HELD, hypothesis=hypothesis)
+        assert performed.ok, performed.violations
+        assert performed.facts["test_run"]["outcome"] == "holds", performed.facts
+        opened = cls.called(
+            "SELECT open_finding($1::uuid, $2::uuid, $3, $4)",
+            (hypothesis, performed.facts["test_run"]["id"], cls.klass, cls.TITLE),
+        )
+        assert opened["outcome"] == "created", opened
+        # Nobody asks for the validation here. The command is the ask: it queues
+        # the Finding itself, and a request written in the fixture would be a
+        # request the command then finds already made.
+        return {"statement": statement, "hypothesis": hypothesis, "born": performed,
+                "finding": opened["finding"], "finding_id": opened["finding_id"]}
+
+    @classmethod
+    def validated(cls, statement: str, launch) -> dict:
+        """One candidate, and one `rk finding validate` over it."""
+        made = cls.candidate(statement)
+        return {
+            **made,
+            "report": validation.run(
+                cls.harness.runtime,
+                cls.configuration,
+                finding=made["finding"],
+                agent_run=cls.agent_run(),
+                environment=cls.environment,
+                launch=launch,
+            ),
+        }
+
+    @classmethod
+    def judges(cls, verdict: str, failed: tuple = ()):
+        """A child that reads its packet the way the served tools would."""
+
+        def launch(request: agent.AgentRunRequest) -> agent.AgentRunResult:
+            cls.requests.append(request)
+            judgement = _launch.Judgement(request.judgement)
+            cls.reads.append(judgement.read({"finding_label": judgement.finding}))
+            judgement.judge({
+                "finding_label": judgement.finding,
+                "verdict": verdict,
+                "failed_assertion_ids": list(failed),
+            })
+            return cls.stopped(request, judgement)
+
+        return launch
+
+    @classmethod
+    def says_nothing(cls, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        """A session that ran, read its packet and never answered."""
+        cls.requests.append(request)
+        judgement = _launch.Judgement(request.judgement)
+        cls.reads.append(judgement.read({"finding_label": judgement.finding}))
+        return cls.stopped(request, judgement)
+
+    @classmethod
+    def never_starts(cls, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        """A boundary that could not be provided, which starts no session."""
+        cls.requests.append(request)
+        raise isolation.Unavailable("no such image")
+
+    @classmethod
+    def stopped(
+        cls, request: agent.AgentRunRequest, judgement: _launch.Judgement
+    ) -> agent.AgentRunResult:
+        """What a validator session carries back, in the runtime's own shape."""
+        return agent.AgentRunResult(
+            agent_run_id=request.agent_run_id,
+            role=request.role,
+            sdk_version="0.1.0",
+            cli_version="1.0.0",
+            api_key_source=agent.EXPECTED_KEY_SOURCE,
+            tool_ready=1,
+            tools_served=tuple(agent.BARE[name] for name in roster.TOOL_GROUPS["validate.judge"]),
+            denials=(),
+            answers=1,
+            stop_reason="end_turn",
+            text="",
+            input_tokens=900,
+            output_tokens=120,
+            verdict=judgement.answer,
+            verdict_attempts=judgement.attempts,
+        )
+
+    @classmethod
+    def called(cls, sql: str, parameters: tuple) -> dict:
+        """One verb of this Program's, committed, as the runtime."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            answered = cls.runtime.execute(sql, parameters).scalar()
+        return json.loads(str(answered))
+
+    def facts(self, arrangement: dict) -> dict:
+        return arrangement["report"].facts
+
+    def status_of(self, arrangement: dict) -> str:
+        """What the Finding is now, read off the row rather than off the report."""
+        return str(
+            self.rows(
+                "SELECT status::text FROM findings WHERE id = $1::uuid",
+                (arrangement["finding_id"],),
+            )[0][0]
+        )
+
+    # -- criteria 1 and 2, over a packet the door's own Receipts built ---------
+
+    def test_the_command_reports_the_same_keys_whatever_became_of_the_session(self):
+        for name in ("confirmed", "refuted", "silent", "unstarted"):
+            with self.subTest(name):
+                self.assertEqual(set(validation.FACTS), set(self.facts(getattr(self, name))))
+
+    def test_the_command_is_the_ask_and_the_queue_records_what_became_of_it(self):
+        """011's queue, written by the command and settled by the answer.
+
+        Nothing else asks. The orchestrator will have a verb of its own one day
+        and the row is the same row, which is the point of asking here: an
+        operator naming a Finding on the command line has made the request that
+        every verb below refuses a Finding without, and a second process reading
+        the queue sees it.
+        """
+        self.assertIn(
+            "request",
+            {held.name for held in self.confirmed["report"].assertions if held.ok},
+        )
+        self.assertEqual(
+            [("done",)],
+            [
+                (str(row[0]),)
+                for row in self.rows(
+                    "SELECT state FROM validation_queue WHERE finding_id = $1::uuid",
+                    (self.confirmed["finding_id"],),
+                )
+            ],
+        )
+
+    def test_the_session_is_handed_a_packet_and_nothing_else_to_reach_with(self):
+        # Criterion 3 from the runtime's side: no state packet, no capsule and
+        # no capability. A validator that could reach a target could reproduce
+        # the Finding itself, and a validator with the Program's state could
+        # find the hunter's Hypothesis and read the sentence it is meant not to
+        # have.
+        [started] = [
+            request for request in self.requests
+            if request.judgement["finding"]["label"] == self.confirmed["finding"]
+        ]
+
+        self.assertEqual(roster.VALIDATOR, started.role)
+        self.assertIsNone(started.packet)
+        self.assertIsNone(started.capsule)
+        self.assertIsNone(started.egress)
+        self.assertEqual(self.program_id, started.program_id)
+
+    def test_neither_the_hunters_title_nor_its_claim_reaches_the_session(self):
+        # Criterion 2, asked of everything that crossed the boundary: the
+        # document, the sentence the runtime wrote around it, and the whole
+        # request beside them.
+        for request in self.requests:
+            carried = json.dumps(
+                {"objective": request.objective, "judgement": request.judgement}
+            )
+            with self.subTest(run=request.agent_run_id):
+                self.assertNotIn(self.TITLE, carried)
+                self.assertNotIn("neighbour's note to anyone", carried)
+                self.assertIn(request.judgement["finding"]["label"], request.objective)
+
+    def test_the_document_is_built_out_of_what_the_door_wrote(self):
+        # The reproduction is a real walk, so the Receipts in the packet are
+        # `write_allowed_receipt`'s own rows: the statuses are the target's and
+        # the Lane is the one the door derived, from a run this case never
+        # wrote a row of.
+        served = self.requests[0].judgement
+        reproduction = served["runs"]["replay"]["receipts"]
+
+        self.assertEqual(
+            [(1, "baseline"), (2, "variant"), (3, "control")],
+            [(receipt["ordinal"], receipt["role"]) for receipt in reproduction],
+        )
+        self.assertEqual([200, 200, 200], [receipt["status_code"] for receipt in reproduction])
+        self.assertEqual({"replay"}, {receipt["lane"] for receipt in reproduction})
+        self.assertEqual({"app.example.com"}, {receipt["host"] for receipt in reproduction})
+        self.assertEqual("holds", served["runs"]["replay"]["outcome"])
+
+    # -- criteria 4 and 5, over the verdict the child gave --------------------
+
+    def test_a_confirmed_verdict_validates_the_finding_the_rules_agreed_about(self):
+        answered = self.facts(self.confirmed)["validation"]
+
+        self.assertTrue(self.confirmed["report"].ok, self.confirmed["report"].violations)
+        self.assertEqual("answered", answered["outcome"])
+        self.assertEqual("confirmed", answered["verdict"])
+        self.assertEqual("validated", answered["status"])
+        self.assertEqual([], answered["failed"])
+        self.assertEqual("validated", self.status_of(self.confirmed))
+
+    def test_a_refuted_verdict_names_the_assertion_it_says_did_not_hold(self):
+        answered = self.facts(self.refuted)["validation"]
+
+        self.assertEqual("refuted", answered["verdict"])
+        self.assertEqual(["the-control-answers-too"], answered["failed"])
+        self.assertEqual("rejected", self.status_of(self.refuted))
+        self.assertEqual(
+            [("refuted", "{the-control-answers-too}")],
+            [
+                (str(row[0]), str(row[1]))
+                for row in self.rows(
+                    "SELECT v.verdict::text, v.failed_assertion_ids"
+                    "  FROM validation_attempts va JOIN verdicts v ON v.id = va.verdict_id"
+                    " WHERE va.finding_id = $1::uuid AND va.outcome = 'answered'",
+                    (self.refuted["finding_id"],),
+                )
+            ],
+        )
+
+    def test_the_run_that_judged_it_is_closed_and_its_task_settled(self):
+        # The session is a claimed Task and an open run from the moment the
+        # packet is served, and both are the runtime's to close whatever the
+        # child did. A Task is settled by the answer rather than by the
+        # session ending: the two that answered nothing go back to the queue
+        # with their attempt spent.
+        for name, stopped, settled in (
+            ("confirmed", "completed", "done"),
+            ("silent", "completed", "pending"),
+            # Nothing stopped: the boundary was never provided, so the run was
+            # aborted rather than ended by a child.
+            ("unstarted", "aborted", "pending"),
+        ):
+            with self.subTest(name):
+                answered = self.facts(getattr(self, name))["validation"]
+                [[reason, finished]] = self.rows(
+                    "SELECT stop_reason, finished_at IS NOT NULL FROM agent_runs"
+                    " WHERE label = $1 AND program_id = $2::uuid",
+                    (answered["agent_run"], self.program_id),
+                )
+
+                self.assertEqual(stopped, str(reason))
+                self.assertTrue(finished)
+                self.assertEqual(settled, answered["task_status"])
+
+    # -- criterion 6, over the two ways a session leaves nothing behind -------
+
+    def test_a_session_that_answered_nothing_gives_the_finding_back(self):
+        answered = self.facts(self.silent)["validation"]
+
+        self.assertFalse(self.silent["report"].ok)
+        self.assertEqual("unanswered", answered["outcome"])
+        self.assertEqual("candidate", self.status_of(self.silent))
+
+    def test_an_answer_the_rules_turn_down_gives_the_finding_back(self):
+        """The path where a child answered and the answer was not accepted.
+
+        `record_verdict` refuses an assertion identifier the Test does not state
+        rather than raising about it, and a refusal writes nothing: the attempt
+        is still open, and `open_validation` will not open a second one over it.
+        So this path has to give the Finding back exactly as a session that said
+        nothing does. It is the one arm where a validator answered, the answer
+        is on record as refused, and the Finding is a candidate again.
+        """
+        made = self.candidate("the notes API hands over a neighbour's postcard")
+
+        answer = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding=made["finding"],
+            agent_run=self.agent_run(),
+            environment=self.environment,
+            launch=self.judges("refuted", failed=("the-hunter-was-right",)),
+        )
+
+        self.assertFalse(answer.ok)
+        self.assertEqual("refused", answer.facts["validation"]["outcome"])
+        self.assertIn(
+            "the assertion the-hunter-was-right is not one",
+            " ".join(refused.detail for refused in answer.violations),
+        )
+        self.assertEqual("candidate", self.status_of(made))
+        self.assertEqual(
+            [("unanswered", "the validator answered and the answer was not accepted")],
+            [
+                (str(row[0]), str(row[1]))
+                for row in self.rows(
+                    "SELECT outcome, refusal FROM validation_attempts"
+                    " WHERE finding_id = $1::uuid",
+                    (made["finding_id"],),
+                )
+            ],
+        )
+
+    def test_a_boundary_that_could_not_be_provided_leaves_no_validation_open(self):
+        answered = self.facts(self.unstarted)["validation"]
+
+        self.assertFalse(self.unstarted["report"].ok)
+        self.assertEqual("unanswered", answered["outcome"])
+        self.assertEqual("candidate", self.status_of(self.unstarted))
+        self.assertEqual(
+            [], [violation.source for violation in self.unstarted["report"].violations
+                 if violation.source == "cleanup"]
+        )
+
+    def test_a_finding_whose_test_no_longer_reproduces_is_never_served(self):
+        # Criterion 6's missing holding replay, caused rather than described:
+        # the Test is real, the door is real, and what makes the reproduction
+        # fail is the target no longer answering. No packet is built, no session
+        # is started, and the Finding is still a candidate.
+        made = self.candidate("the notes API hands over a neighbour's draft")
+        before = len(self.requests)
+
+        ShiftingTarget.moved = True
+        try:
+            answer = validation.run(
+                self.harness.runtime,
+                self.configuration,
+                finding=made["finding"],
+                agent_run=self.agent_run(),
+                environment=self.environment,
+                launch=self.judges("confirmed"),
+            )
+        finally:
+            ShiftingTarget.moved = False
+
+        self.assertFalse(answer.ok)
+        self.assertEqual(before, len(self.requests))
+        self.assertIsNone(answer.facts["validation"])
+        self.assertEqual("refutes", answer.facts["reproduction"]["test_run"]["outcome"])
+        self.assertIn(
+            "there is no holding replay to judge",
+            " ".join(refused.detail for refused in answer.violations),
+        )
+        self.assertEqual("candidate", self.status_of(made))
+
+    def test_a_finding_of_another_program_is_refused_before_anything_is_reopened(self):
+        answer = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding="F99999",
+            agent_run=self.agent_run(),
+            environment=self.environment,
+            launch=self.judges("confirmed"),
+        )
+
+        self.assertFalse(answer.ok)
+        self.assertEqual(
+            ["argument:--finding"], [refused.source for refused in answer.violations]
+        )
+        self.assertIsNone(answer.facts["reproduction"])
+
+    def test_a_machine_that_describes_no_boundary_starts_no_validator(self):
+        answer = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding=self.confirmed["finding"],
+            agent_run=self.agent_run(),
+            environment={},
+            launch=self.judges("confirmed"),
+        )
+
+        self.assertFalse(answer.ok)
+        self.assertEqual(
+            [f"environment:{execution.IMAGE}"],
+            [refused.source for refused in answer.violations],
+        )
+
+    def test_the_standing_check_holds_over_every_validation_this_command_ran(self):
+        problems = self.rows("SELECT * FROM check_validations()")
+
+        self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
 
 
 if __name__ == "__main__":

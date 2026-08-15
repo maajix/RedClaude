@@ -65,6 +65,12 @@ RUNTIME = "runtime"
 #: those is a role that can be renamed in two places out of three.
 ORCHESTRATOR = "orchestrator"
 
+#: The other role the runtime starts by name, for the same reason. 037 opens a
+#: validator session directly rather than through a claim, because a validator
+#: judges one Finding somebody asked about rather than whichever Task the
+#: ranking preferred.
+VALIDATOR = "validator"
+
 #: The task-kind vocabulary of migration 0019. Held here so the compile can
 #: check the mapping is total and injective without a database.
 TASK_KINDS = ("recon", "hunt", "analyze", "validate", "report")
@@ -715,7 +721,14 @@ CONTRACTS: dict[str, Contract] = {
             "verdict": Argument(
                 "string", required=True, enum=("confirmed", "refuted", "insufficient")
             ),
-            "failed_assertion_ids": Argument("array", items_pattern="^A-[0-9]{3}$"),
+            # 035's own spelling for an assertion identifier, not a shape
+            # invented here. `rk2_test_spec_problem` refuses a Test whose
+            # assertion is identified any other way, so a pattern of this
+            # roster's own would have closed the argument against every
+            # identifier a Test can actually carry.
+            "failed_assertion_ids": Argument(
+                "array", items_pattern="^[a-z][a-z0-9-]{2,62}$"
+            ),
         },
     ),
 }

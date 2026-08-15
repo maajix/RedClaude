@@ -34,6 +34,7 @@ from redkraken import (
     scope,
     state,
     tool,
+    validation,
 )
 from redkraken.outcome import (
     DATABASE_UNREACHABLE,
@@ -888,6 +889,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replaying.set_defaults(run=_test_replay)
 
+    findings = commands.add_parser(
+        "finding", help="what a candidate Finding has to survive to become a real one"
+    )
+    judgements = findings.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    judging = judgements.add_parser(
+        "validate",
+        help=(
+            "reproduce one candidate Finding and have a blind session judge the "
+            f"reproduction, which is all it is shown (${DATABASE_URL})"
+        ),
+        description=(
+            "Three steps in one command: the claim is reopened and its Test is "
+            "replayed through the door, the reproduction is served to a fresh "
+            "top-level session as its whole world, and what that session answers "
+            "is filed as input. What the Finding becomes is the database's "
+            "decision, not this command's."
+        ),
+    )
+    _add_url(judging, RUNTIME)
+    judging.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program this Finding belongs to",
+    )
+    judging.add_argument(
+        "--finding",
+        required=True,
+        metavar="label",
+        help="the candidate Finding to validate, by its label",
+    )
+    judging.add_argument(
+        "--agent-run",
+        dest="agent_run",
+        required=True,
+        metavar="label",
+        help=(
+            "the agent run the reproducing replay is performed under, by its "
+            "label; the validator's own session is opened by the command"
+        ),
+    )
+    judging.add_argument(
+        "--identity",
+        dest="identity",
+        metavar="slot",
+        help=(
+            "the Identity the door is to present while reproducing, by the slot "
+            "this Program holds; the value is never given to this process"
+        ),
+    )
+    judging.set_defaults(run=_finding_validate)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1568,6 +1623,33 @@ def _test_replay(arguments: argparse.Namespace) -> int:
                 identity_slot=arguments.identity,
                 proxy_url=endpoint,
                 ca_file=_path(TRUST, arguments.ca_file),
+            ),
+        )
+    )
+
+
+def _finding_validate(arguments: argparse.Namespace) -> int:
+    """A connection and a boundary.
+
+    The door's address and its certificate are not arguments here, unlike
+    `rk test replay`: this command starts a session as well as a replay, so it
+    already has to be told the whole boundary, and the boundary states both. Two
+    ways to say where the door is would be two things to keep in step.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, validation.RUN)
+    if runtime is None:
+        return _render(report(validation.RUN, ledger))
+    return _render(
+        _guarded(
+            validation.RUN,
+            lambda: validation.run(
+                runtime,
+                arguments.config,
+                finding=arguments.finding,
+                agent_run=arguments.agent_run,
+                environment=os.environ,
+                identity_slot=arguments.identity,
             ),
         )
     )

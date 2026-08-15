@@ -269,6 +269,81 @@ class Choice:
         }
 
 
+class Judgement:
+    """The one packet a validator session may read, and the one answer it gives.
+
+    Latching rather than superseding, which is `Submission`'s side of the
+    distinction `Choice` is on the other side of: a verdict is a claim about
+    evidence and the first one stands. A session that answers `insufficient` and
+    then, having thought about it more, `confirmed`, is a session arguing with
+    itself about a document that did not change in between -- and the second
+    answer is the one produced by having already produced the first, which is
+    exactly the reasoning the blindness exists to keep out.
+
+    The packet is held rather than fetched. There is no database on this side of
+    the boundary, so what the session may consider is what the job document
+    carried: `rk2_validation_packet` selected it through a column allowlist a
+    migration states, and this class hands over that document unchanged.
+
+    The label is checked and does not decide. A Finding this session was not
+    given is answered as refused with the one it was given named, so a model
+    that misread its packet can correct itself while it is still running -- and
+    the answer still crosses back, because `record_verdict` re-checks every
+    condition the packet was served under and is the only thing able to decide
+    what became of it.
+    """
+
+    def __init__(self, packet: Mapping[str, object] | None = None) -> None:
+        self.packet = dict(packet or {})
+        self.answer: dict | None = None
+        self.attempts = 0
+        self.reads = 0
+
+    @property
+    def finding(self) -> str | None:
+        stated = self.packet.get("finding")
+        if not isinstance(stated, Mapping):
+            return None
+        label = stated.get("label")
+        return label if isinstance(label, str) and label else None
+
+    def read(self, arguments: Mapping[str, object]) -> dict:
+        self.reads += 1
+        asked = arguments.get("finding_label")
+        if self.finding is None:
+            return {"served": False, "reason": "no_packet"}
+        if asked != self.finding:
+            return {"served": False, "reason": "other_finding", "finding": self.finding}
+        return {"served": True, "finding": self.finding, "packet": self.packet}
+
+    def judge(self, arguments: Mapping[str, object]) -> dict:
+        self.attempts += 1
+        if self.answer is not None:
+            return {"accepted": False, "reason": "already_judged", "attempts": self.attempts}
+        if arguments.get("finding_label") != self.finding:
+            return {
+                "accepted": False,
+                "reason": "other_finding",
+                "finding": self.finding,
+                "attempts": self.attempts,
+            }
+        failed = arguments.get("failed_assertion_ids") or []
+        self.answer = {
+            "finding_label": self.finding,
+            "verdict": str(arguments.get("verdict") or ""),
+            "failed_assertion_ids": [str(named) for named in failed],
+        }
+        return {
+            "accepted": True,
+            "attempts": self.attempts,
+            # Not "recorded". The row and the Finding's status are one
+            # transaction the runtime opens after this process ends, and it
+            # rebuilds the packet first: an answer accepted here is one that
+            # may still be filed as stale there.
+            "note": "received; the row and what the Finding becomes are the runtime's step",
+        }
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -310,6 +385,22 @@ DESCRIPTIONS = {
         "re-checks the Task before it claims it and refuses a label this Slate no "
         "longer carries."
     ),
+    "get_validation_packet": (
+        "Fetch the one validation packet this session was started with: the Finding "
+        "as facts, the claim it rests on, the Test's actions and assertions, both "
+        "Test runs with their Receipts, and the Artifacts they name by hash. It is "
+        "the whole of what you may consider. There is no other read, no way to reach "
+        "the reasoning that produced the Finding, and nothing here is prose somebody "
+        "wrote to persuade you."
+    ),
+    "submit_verdict": (
+        "Answer the one Finding you were given: confirmed if the packet shows the "
+        "behaviour reproducing, refuted if it shows it does not, insufficient if the "
+        "packet cannot tell you either way. Name the identifiers of the assertions "
+        "that failed. Calling it again is refused; the first answer is the one that "
+        "stands. Your answer is an input -- the runtime rebuilds the packet, checks "
+        "it has not changed, and the database decides what the Finding becomes."
+    ),
     "http_request": (
         "Send one HTTP request to a target through the capability proxy, which "
         "decides it against this Program's scope and writes the Receipt and the "
@@ -348,8 +439,9 @@ def server(
     submission: Submission,
     door: agent.Egress | None = None,
     choice: Choice | None = None,
+    judgement: Judgement | None = None,
 ):
-    """The runtime's MCP server: five reads, one request, one proposal, one choice.
+    """Five reads, one request, one proposal, one choice and one judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -378,11 +470,14 @@ def server(
         "get_artifact": reader.artifact,
     }
     picking = Choice() if choice is None else choice
+    judging = Judgement() if judgement is None else judgement
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
     tools.append(_request(surface, door))
     tools.append(_propose(surface, submission))
     tools.append(_slate(surface, picking))
     tools.append(_pick(surface, picking))
+    tools.append(_packet(surface, judging))
+    tools.append(_judge(surface, judging))
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
 
@@ -520,6 +615,43 @@ def _pick(surface: Surface, choice: Choice):
     async def handler(arguments: dict) -> dict:
         surface.serve(name)
         return _content(choice.pick(dict(arguments or {})))
+
+    return handler
+
+
+def _packet(surface: Surface, judgement: Judgement):
+    """The one document a validator session may read, served out of the job.
+
+    Out of the job for the reason `get_slate` is: there is no database on this
+    side of the boundary. What it costs here is nothing and what it buys is the
+    ticket's whole property -- the packet was built by a function whose column
+    dependencies a migration asserts, so a session cannot be shown a field by a
+    handler that decided to add one.
+    """
+    name = "get_validation_packet"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(judgement.read(dict(arguments or {})))
+
+    return handler
+
+
+def _judge(surface: Surface, judgement: Judgement):
+    """The one answer this session gives, latched where the runtime can read it.
+
+    Held rather than written, exactly like a pick: what comes back is a request,
+    and `record_verdict` is where it becomes a row -- or does not, because the
+    packet the session judged stopped reading the same way while it was
+    thinking.
+    """
+    name = "submit_verdict"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(judgement.judge(dict(arguments or {})))
 
     return handler
 
@@ -684,6 +816,10 @@ async def run(
     # into it as one section, so this process reads the one copy it was given
     # rather than a field beside it that could say something else.
     choice = Choice(_slate_entries(job.get("capsule")))
+    # Empty for every run that was not started to judge one, which is every run
+    # but a validator's. An empty one serves no packet and latches no answer,
+    # which is the honest state for a session nobody gave a Finding.
+    judgement = Judgement(_judged(job.get("judgement")))
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
     # SDK version would do for one role, so an absent SDK and an unknown role
@@ -696,7 +832,7 @@ async def run(
         else options_for(
             job,
             runtime,
-            server(surface, reader, submission, door, choice),
+            server(surface, reader, submission, door, choice, judgement),
             launch,
             gate,
         )
@@ -767,7 +903,21 @@ async def run(
         "output_tokens": spent_out,
         "choice": choice.task,
         "pick_attempts": choice.attempts,
+        "verdict": judgement.answer,
+        "verdict_attempts": judgement.attempts,
     }
+
+
+def _judged(stated: object) -> Mapping[str, object] | None:
+    """The packet a job carried, or nothing where it carried none.
+
+    Anything that is not a mapping is nothing rather than an error, for the
+    reason a malformed capsule is an empty Slate: a session with no packet
+    serves no read and latches no answer, and the runtime reads that back as a
+    validation nobody answered. A raise here would be a run that never started
+    over a field most runs do not carry at all.
+    """
+    return stated if isinstance(stated, Mapping) else None
 
 
 def _slate_entries(stated: object) -> list[Mapping[str, object]]:

@@ -189,6 +189,30 @@ a fifth vocabulary of behaviours would be model-authored, and the run has
 already answered the question in the two vocabularies a Test is written in.
 _Avoid_: Impact, severity, proof of concept
 
+**Validation packet**:
+The whole world one blind validator session is given: the candidate Finding's own
+facts, the claim's label and status, the Test it rests on, the run it was born
+from and the run that reproduced it just now, the Receipts of both, and the
+Artifacts those name by hash and size. Built from an empty object upward by a
+positive column allowlist, so a field is in it because a migration named it and
+for no other reason -- the hunter's title, its reasoning and its prose are not
+absent by filtering, they were never selected. It is served once and digested,
+and it travels with the job: the session has no database, no network and no
+second version to fetch.
+_Avoid_: Evidence bundle, dossier, context, prompt
+
+**Verdict**:
+What one blind validator answered about one packet -- `confirmed`, `refuted` or
+`insufficient` -- with the identifiers of the assertions it says did not hold.
+Input, not a decision: the Finding moves because the rules rebuilt the packet,
+found it digests the same, and admitted the transition that word implies. A word
+answered about evidence that has moved since is not one of these: it is written
+on the attempt that served the packet, where it records what that reading came
+to, and it never becomes a verdict about the Finding itself. The
+first answer stands, because a session that answers twice is arguing with itself
+about a document that did not change in between.
+_Avoid_: Decision, judgement, ruling, review
+
 **Severity basis**:
 The ground a finding's severity stands on, stated with the severity and never
 apart from it: `undetermined` while nothing has been demonstrated, and otherwise
