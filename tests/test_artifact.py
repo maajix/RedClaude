@@ -28,11 +28,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import typing
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from redkraken import artifact, pg
+from redkraken import artifact, pg, seal
 from redkraken.outcome import EXIT_DATABASE_UNREACHABLE, EXIT_INVALID_CONFIGURATION
 from tests.fixtures import VALID, scratch, write
 
@@ -397,13 +398,22 @@ class SealArgumentTest(unittest.TestCase):
 
                 self.assertEqual([], [item for item in names if "sha" in item or "hash" in item])
 
-    def test_the_key_is_a_path_of_its_own_and_not_a_configuration_key(self):
+    def test_the_key_is_a_location_of_its_own_and_not_a_configuration_key(self):
+        # A file, or a secret reference into an authorised vault. What §1 rules
+        # out is the third option -- a key read out of the configuration file the
+        # agent's own Program is described by -- and that is the last assertion
+        # here rather than the annotation.
+        #
+        # By identity and not by spelling: `seal.Location` is where the places a
+        # key may be kept are enumerated, so a third one added there does not
+        # have to be added here as well.
         for name, function in (("seal", artifact.seal_wire), ("open", artifact.open_wire)):
             with self.subTest(name):
                 parameters = inspect.signature(function).parameters
 
                 self.assertIn("key", parameters)
-                self.assertEqual("Path", parameters["key"].annotation)
+                self.assertIs(seal.Location, typing.get_type_hints(function)["key"])
+        self.assertEqual(Path | str, seal.Location.__value__)
         self.assertNotIn("key", VALID)
 
     def test_opening_without_authorization_is_refused_before_a_connection(self):

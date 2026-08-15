@@ -17,7 +17,7 @@ import hmac
 import json
 from pathlib import Path
 
-from redkraken import config, migrate, pg, program, seal
+from redkraken import config, migrate, pg, program, seal, vault
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 from redkraken.store import digest
 
@@ -43,7 +43,7 @@ def provision(
     value_path: Path,
     *,
     root_secret: seal.Root | None = None,
-    key_path: Path | None = None,
+    key_path: seal.Location | None = None,
 ) -> Report:
     """Seal one operator-provided header value into this Program's slot.
 
@@ -96,6 +96,9 @@ def provision(
                 code=INVALID_CONFIGURATION,
                 source="argument:--key",
             )
+            return report(COMMAND, ledger, **facts)
+        except vault.Refused as refusal:
+            ledger.refuse("header_key", refusal.violation.detail, [refusal.violation])
             return report(COMMAND, ledger, **facts)
 
     connection = migrate.open_connection(ledger, runtime)

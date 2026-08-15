@@ -91,7 +91,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urljoin, urlsplit
 
-from redkraken import config, identity, migrate, pg, program, scope, seal, tls
+from redkraken import config, identity, migrate, pg, program, scope, seal, tls, vault
 from redkraken.outcome import (
     AWAITING_DECISION,
     INTEGRITY_FAILED,
@@ -2861,7 +2861,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 0,
     authority: Path | None = None,
-    key: Path | None = None,
+    key: seal.Location | None = None,
 ) -> Report:
     """Run the fence until it is interrupted.
 
@@ -2917,6 +2917,9 @@ def serve(
                 code=INVALID_CONFIGURATION,
                 source="argument:--key",
             )
+            return report(SERVE, ledger, endpoint=None, certificate=certificate)
+        except vault.Refused as refusal:
+            ledger.refuse("artifact_key", refusal.violation.detail, [refusal.violation])
             return report(SERVE, ledger, endpoint=None, certificate=certificate)
         ledger.hold("artifact_key", "wire-only target responses will be sealed")
     else:

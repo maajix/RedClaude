@@ -6009,7 +6009,7 @@ class ProxyEgressTest(DatabaseCase):
         # One installation has one root.  The sealed-artifact case later in
         # this module deliberately uses the same material against the key
         # generation this proxy may establish first.
-        cls.root_secret = seal.Root(Path("live-proxy-selftest-root"), SECRET)
+        cls.root_secret = seal.Root("live-proxy-selftest-root", SECRET)
 
         # Every configuration above declares `X-Bounty-Id`, and a declared header
         # with no provisioned value is a request the door refuses before it dials.
@@ -6760,7 +6760,7 @@ class ProxyEgressTest(DatabaseCase):
             path,
             "member",
             material,
-            root_secret=seal.Root(Path("wrong-identity-root"), b"w" * seal.KEY_BYTES),
+            root_secret=seal.Root("wrong-identity-root", b"w" * seal.KEY_BYTES),
         )
         self.assertFalse(wrong.ok)
         rootchecks = [
@@ -6784,7 +6784,7 @@ class ProxyEgressTest(DatabaseCase):
         # is what this asserts: the Identity is opened first, so its refusal is
         # the one that comes back and the header is never reached.
         self.server.root_secret = seal.Root(
-            Path("wrong-proxy-identity-root"), b"z" * seal.KEY_BYTES
+            "wrong-proxy-identity-root", b"z" * seal.KEY_BYTES
         )
         try:
             status, decision = self.attempt(capability, self.identifiers[name])
@@ -9230,7 +9230,7 @@ class ExecutionSliceTest(DatabaseCase):
         # provisioned value is a request the door refuses before it dials. So
         # this exists for the same reason the target does: what is under test is
         # what reaches the wire, and a Program that cannot reach it tests nothing.
-        cls.root_secret = seal.Root(Path("live-execution-selftest-root"), SECRET)
+        cls.root_secret = seal.Root("live-execution-selftest-root", SECRET)
         value = scratch() / "execution-bounty-id.txt"
         value.write_text("rk2-selftest-bounty-20", encoding="utf-8")
         for name, path in cls.configurations.items():
@@ -24375,7 +24375,7 @@ class LiveDoorFixture:
         cls.root = scratch() / "replay-store"
         # One installation has one root, and this is the one `ProxyEgressTest`
         # establishes the key generation under.
-        root_secret = seal.Root(Path("live-proxy-selftest-root"), SECRET)
+        root_secret = seal.Root("live-proxy-selftest-root", SECRET)
 
         source = SCOPED.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
         cls.configuration = write(
@@ -27691,7 +27691,7 @@ class PivotStampFixture(ImpactRunFixture):
             write(document or cls.configured()),
             slot,
             material,
-            root_secret=seal.Root(Path(f"{cls.slug}-root"), SECRET),
+            root_secret=seal.Root(f"{cls.slug}-root", SECRET),
         )
         assert provisioned.ok, provisioned.violations
         return str(

@@ -43,13 +43,25 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from redkraken import vault
+
 #: The algorithm this module writes. Stored beside every ciphertext, because a
 #: ciphertext whose construction is implied by the code that happens to be
 #: installed cannot be opened once that code has moved on.
 ALG = "rk-hkdf-sha256-ctr-hmac-v1"
 
-#: Where the root secret is, for a process that is allowed to know.
+#: Where the root secret is, for a process that is allowed to know: a file, or a
+#: secret reference into one of the operator's authorised vaults.
 KEY_VARIABLE = "RK_ARTIFACT_KEY"
+
+#: Where key material is kept, which is two places and not one. A `Path` is a
+#: file on this host; a `str` is a secret reference, kept as the string it is
+#: because `Path("op://v/i/f")` collapses to `op:/v/i/f` and an operator would
+#: get back a refusal naming a reference they never wrote. Named rather than
+#: spelled out at each signature that carries one, so that adding a third place
+#: is one edit here and not one per caller -- and so that a parameter still
+#: typed `Path` is visibly a parameter a reference cannot reach.
+type Location = Path | str
 
 BLOCK = hashlib.sha256().digest_size
 KEY_BYTES = 32
@@ -289,9 +301,12 @@ class Root:
     The secret is kept out of `repr` on purpose. This object is held by
     report-building code, and a dataclass that printed its own key would put it
     in the first traceback anything logged.
+
+    `source` says where it came from and is not itself material: a path, or a
+    secret reference. It exists so a refusal can name the thing to go and fix.
     """
 
-    path: Path
+    source: str
     secret: bytes = field(repr=False)
 
     def check(self, salt: bytes, *, generation: int) -> bytes:
@@ -369,25 +384,67 @@ class Root:
         )
 
 
-def key_from_environment(given: Path | str | None = None) -> Path | None:
-    """The root secret's file, from the argument or from the variable behind it."""
+def key_from_environment(given: Location | None = None) -> Location | None:
+    """Where the root secret is, from the argument or the variable behind it.
+
+    A secret reference is returned as the string it is. Turning it into a `Path`
+    would collapse `op://vault/item/field` into `op:/vault/item/field` and the
+    refusal an operator got back would name a reference they never wrote.
+    """
     value = given or os.environ.get(KEY_VARIABLE)
-    return Path(value) if value else None
+    if not value:
+        return None
+    return str(value) if vault.Reference.looks_like(str(value)) else Path(value)
 
 
-def load_root(path: Path | str) -> Root:
-    """Read the root secret, or say why this file is not one.
+def load_root(location: Location) -> Root:
+    """Read the root secret from wherever the operator keeps it.
 
-    Three refusals, all before anything is sealed or opened. A file that is not
-    there, a file another account can read, and a file with less material in it
-    than a key needs. The mode check is not decoration: key material outside the
-    database is only outside the database for accounts that cannot read it.
+    Two places, and the vault is the one an unattended campaign should use: a
+    key in the operator's vault is a key this host does not store, so a host
+    that is lost loses no material. A path is still supported because a machine
+    with no vault access has to be able to open what it already sealed.
+
+    A vault that refuses raises `vault.Refused` and not `Unusable`, so it passes
+    through this module rather than being rewritten by it. The two mean opposite
+    things to whoever reads the report: `Unusable` is a file on this host to go
+    and fix, while a locked vault or a rate-limited service account is correct
+    configuration that could not be reached, and flattening the second into the
+    first would send an operator to correct a reference that is right. Every
+    caller catches both.
+    """
+    if vault.Reference.looks_like(str(location)):
+        return _root(str(location), vault.read(str(location)).reveal().encode("utf-8"))
+    return _root_from_file(Path(location))
+
+
+def _root(source: str, secret: bytes) -> Root:
+    """One root secret, or the one refusal that is about the material itself.
+
+    Length is checked in both branches and so is checked here, because a vault
+    field and a file that are each too short are the same mistake and an
+    operator reading two different sentences for it would look for two
+    different causes.
+    """
+    if len(secret) < KEY_BYTES:
+        raise Unusable(f"key material at {source} is {len(secret)} byte(s); {KEY_BYTES} is the minimum")
+    return Root(source, secret)
+
+
+def _root_from_file(path: Path) -> Root:
+    """Read the root secret from a file, or say why this file is not one.
+
+    Two refusals of its own, both before anything is sealed or opened: a file
+    that is not there, and a file another account can read. Too little material
+    in it is the third and is `_root`'s, because a vault field can be too short
+    in exactly the same way. The mode check is not decoration: key material
+    outside the database is only outside the database for accounts that cannot
+    read it.
 
     One trailing newline is dropped, because `openssl rand -hex 32 > key` -- the
     documented way to make one -- writes it, and treating it as material would
     make the same secret two different keys depending on how it was written down.
     """
-    path = Path(path)
     try:
         info = path.stat()
     except FileNotFoundError as error:
@@ -410,11 +467,7 @@ def load_root(path: Path | str) -> Root:
         secret = secret[:-2]
     elif secret.endswith(b"\n"):
         secret = secret[:-1]
-    if len(secret) < KEY_BYTES:
-        raise Unusable(
-            f"key material at {path} is {len(secret)} byte(s); {KEY_BYTES} is the minimum"
-        )
-    return Root(path, secret)
+    return _root(str(path), secret)
 
 
 def _subkeys(key: bytes, nonce: bytes) -> tuple[bytes, bytes]:

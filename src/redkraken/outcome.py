@@ -30,6 +30,16 @@ BACKUP_FAILED = "backup_failed"
 #: minted and spent, and what failed is outside it. Reported as an invalid
 #: configuration it would send an operator to fix a file that is correct.
 TARGET_UNREACHABLE = "target_unreachable"
+#: The operator's vault would not answer for a secret this harness is authorised
+#: to read: no credential reached `op`, the account's own grant refused the
+#: vault, or the service account is over its rate limit. Its own class for the
+#: same reason as the one above -- the configuration naming the secret is
+#: correct, and what refused is outside this machine. Reported as an invalid
+#: configuration it would send an operator to fix a reference that is right.
+#: A reference that is wrong -- an unauthorised vault, an item that is not
+#: there -- stays `invalid_configuration`, because that one really is a file to
+#: go and fix.
+VAULT_UNREADABLE = "vault_unreadable"
 #: The startup assertion refused an agent run: a credential vector was present,
 #: or the effective launch configuration could not be verified. Its own class
 #: because it is the only one here that is measured against a running version
@@ -57,6 +67,7 @@ EXIT_BACKUP_FAILED = 10
 EXIT_TARGET_UNREACHABLE = 11
 EXIT_AWAITING_DECISION = 12
 EXIT_STARTUP_REFUSED = 13
+EXIT_VAULT_UNREADABLE = 14
 
 #: Reported and exited first-to-last when several classes are observed at once.
 #: An unsupported runtime outranks a missing dependency, which outranks operator
@@ -69,10 +80,13 @@ EXIT_STARTUP_REFUSED = 13
 #: does not match it, and a schema that does not match explains an invariant
 #: that no longer holds. An archive that was never produced sorts after all of
 #: those because it is reported by a command that stops before the gate, so it
-#: never competes with an integrity failure for the same exit. A target nobody
-#: reached sorts after all of them: every class above it is a statement about
-#: this machine, and any one of them explains a request that did not complete
-#: better than the outside world does. An open human decision is last of all, and it is the only
+#: never competes with an integrity failure for the same exit. The two classes
+#: that name something outside this machine sort after all of them: every class
+#: above them is a statement about this machine, and any one of them explains a
+#: request that did not complete better than the outside world does. A vault
+#: that would not open comes first of the two, because a credential nobody could
+#: read explains a target nobody reached and not the other way round. An open
+#: human decision is last of all, and it is the only
 #: entry here that is not a fault: everything above it is something to fix, so if
 #: one of them is also present it is what an operator should be told about.
 PRECEDENCE = (
@@ -85,6 +99,7 @@ PRECEDENCE = (
     (SCHEMA_DRIFT, EXIT_SCHEMA_DRIFT),
     (INTEGRITY_FAILED, EXIT_INTEGRITY_FAILED),
     (BACKUP_FAILED, EXIT_BACKUP_FAILED),
+    (VAULT_UNREADABLE, EXIT_VAULT_UNREADABLE),
     (TARGET_UNREACHABLE, EXIT_TARGET_UNREACHABLE),
     (AWAITING_DECISION, EXIT_AWAITING_DECISION),
 )

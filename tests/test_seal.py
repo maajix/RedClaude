@@ -15,7 +15,8 @@ cross-Program reference -- and each must raise rather than return a shortened or
 garbled plaintext. There is no partial answer to give.
 
 `Root` is the key material, and what is tested is what it refuses: a file that
-is not there, a file another account can read, a file too short to be a key. The
+is not there, a file another account can read, a file too short to be a key --
+and the same questions asked of a key that came out of an authorised vault. The
 root check is the one derived value that is safe to store, and it is what makes
 "wrong key material" a fact the runtime can establish before it touches a single
 byte of ciphertext.
@@ -33,13 +34,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from redkraken import seal
+from redkraken import seal, vault
+from redkraken.outcome import VAULT_UNREADABLE
 from tests.fixtures import scratch
 
 
 #: A body long enough to cross several keystream blocks, so an off-by-one in the
 #: counter shows up as a wrong answer rather than as a coincidence.
 BODY = b"".join(f"wire line {number}\n".encode() for number in range(97))
+
+#: One authorised reference, so the vault-sourced root has a location to name.
+REFERENCE = "op://a4g3qhvisxxcyvfzjtfpariwfe/harness-key/password"
 
 PROGRAM = "0198b7a0-0000-7000-8000-000000000001"
 OTHER = "0198b7a0-0000-7000-8000-000000000002"
@@ -260,6 +265,49 @@ class RootTest(unittest.TestCase):
     def test_a_key_file_that_is_not_there_is_refused(self):
         with self.assertRaises(seal.Unusable):
             seal.load_root(scratch() / "absent.key")
+
+    def test_a_reference_survives_the_variable_as_the_reference_it_is(self):
+        # `Path("op://v/i/f")` is `op:/v/i/f`, and an operator whose refusal
+        # named a reference they never wrote would be debugging this line.
+        with mock.patch.dict(os.environ, {seal.KEY_VARIABLE: REFERENCE}):
+            self.assertEqual(REFERENCE, seal.key_from_environment())
+
+    def test_a_root_can_come_out_of_an_authorised_vault(self):
+        # An unattended campaign holds no key file, so a host that is lost
+        # loses no material.
+        with mock.patch.object(vault, "read", return_value=vault.Secret("a" * 64, REFERENCE)):
+            root = seal.load_root(REFERENCE)
+
+        self.assertEqual((REFERENCE, b"a" * 64), (root.source, root.secret))
+        self.assertNotIn("a" * 64, repr(root))
+
+    def test_a_vault_that_refuses_passes_through_rather_than_becoming_unusable(self):
+        # `Unusable` is key material on this host to go and correct. A vault
+        # that would not answer is not that, and a caller told it was would
+        # send an operator to fix a reference that is already right -- so the
+        # refusal keeps its own class and its own source all the way out.
+        refusal = vault.Refused(
+            f"{REFERENCE} could not be read: the service account is over its rate limit",
+            code=VAULT_UNREADABLE,
+            source="vault:rate_limited",
+        )
+        with mock.patch.object(vault, "read", side_effect=refusal):
+            with self.assertRaises(vault.Refused) as caught:
+                seal.load_root(REFERENCE)
+
+        self.assertEqual(VAULT_UNREADABLE, caught.exception.violation.code)
+        self.assertEqual("vault:rate_limited", caught.exception.violation.source)
+
+    def test_a_vault_field_too_short_to_be_a_key_is_refused_like_a_file(self):
+        # This one *is* `Unusable`, and deliberately: the vault answered, and
+        # what it answered with is material too short to be a key. That is the
+        # operator's field to correct, exactly as a short key file would be.
+        secret = vault.Secret("short", vault.Reference.parse(REFERENCE))
+        with mock.patch.object(vault, "read", return_value=secret):
+            with self.assertRaises(seal.Unusable) as caught:
+                seal.load_root(REFERENCE)
+
+        self.assertIn("32", str(caught.exception))
 
     def test_a_key_file_another_account_can_read_is_refused(self):
         with self.assertRaises(seal.Unusable) as refusal:

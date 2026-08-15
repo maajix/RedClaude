@@ -29,23 +29,24 @@ class ArchiveTest(unittest.TestCase):
 
     def setUp(self):
         self.target = scratch() / "rk2.dump"
-        self.patched = mock.patch.multiple(
-            backup, _binary=mock.DEFAULT, _version=mock.DEFAULT, _run=mock.DEFAULT
-        )
+        self.patched = mock.patch.multiple(backup, _binary=mock.DEFAULT, _version=mock.DEFAULT)
         self.doubles = self.patched.start()
         self.addCleanup(self.patched.stop)
         self.doubles["_binary"].return_value = "/usr/bin/pg_dump"
         self.doubles["_version"].return_value = "pg_dump (PostgreSQL) 18.4"
 
     def dump(self, outcome):
-        def run(binary, arguments, target, timeout):
+        def run(binary, arguments, *, environment, timeout, stdin=None):
             # What the real program does before it connects, which is why a
             # failure leaves something at the destination to clean up.
             self.target.write_bytes(b"PGDMP\x00partial")
             return outcome
 
-        self.doubles["_run"].side_effect = run
-        return backup.dump(settings(), self.target)
+        # Scoped to the one call rather than to the test case: `child.run` is
+        # shared with the vault, and a patch left standing for a whole class is
+        # one another module's tests can end up running inside.
+        with mock.patch.object(backup.child, "run", side_effect=run):
+            return backup.dump(settings(), self.target)
 
     def test_an_archive_that_was_written_is_reported_with_its_digest(self):
         report = self.dump(subprocess.CompletedProcess(args=[], returncode=0, stderr="", stdout=""))

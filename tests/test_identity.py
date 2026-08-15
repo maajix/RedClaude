@@ -1,7 +1,11 @@
+import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from redkraken import identity
+from redkraken import identity, migrate, vault
+from redkraken.outcome import INVALID_CONFIGURATION
+from tests.fixtures import VALID, write
 
 
 class SessionTest(unittest.TestCase):
@@ -166,6 +170,88 @@ class SessionTest(unittest.TestCase):
 
         with self.assertRaisesRegex(identity.Invalid, "slot plaintext exceeds"):
             identity.Session.from_material(material)
+
+
+#: One authorised reference, standing where a credential would have been.
+REFERENCE = "op://4exeximtkfyxd2eywo3m7jpfwu/engagement/password"
+
+#: What the vault gives back for it: the whole header value and not the token
+#: alone, because a string is a reference or it is not and nothing is
+#: substituted inside one.
+CREDENTIAL = "Bearer RK-SYNTHETIC-CREDENTIAL-3f9a"
+
+#: The reference as `vault.read` really returns it, taken apart. A `Secret`
+#: holds a `Reference` and not the string one was spelled with, and a fixture
+#: that handed it the string would be documenting a contract nothing has.
+PARSED = vault.Reference.parse(REFERENCE)
+
+
+class ProvisionedMaterialTest(unittest.TestCase):
+    """Where a credential enters the harness, which is the one place it may.
+
+    `rk identity provision` is the only caller of the vault, and the window is
+    between parsing the operator's material and validating it. What is asserted
+    here is that window's two properties: a reference becomes a value before the
+    document is read as a document, and nothing the command reports afterwards
+    holds the value it resolved.
+    """
+
+    def material(self, value: str) -> Path:
+        document = {
+            "schema_version": 1,
+            "origins": [
+                {
+                    "url": "https://app.example.com/",
+                    "headers": [{"name": "Authorization", "value": value}],
+                    "cookies": [],
+                }
+            ],
+        }
+        return write(json.dumps(document), name="identity.json")
+
+    def provision(self, path: Path):
+        # Stopped at the database, which is everything after the window this
+        # tests. `provision` reports the refused connection and returns.
+        return identity.provision(None, write(VALID), "member", path)
+
+    def test_a_reference_is_a_value_before_the_document_is_validated(self):
+        # Before, so that every refusal below it names a position rather than a
+        # value -- `origins[0].headers[0].value` and never what is in it.
+        with mock.patch.object(vault, "read", return_value=vault.Secret(CREDENTIAL, PARSED)):
+            with mock.patch.object(identity.Session, "from_material") as parsed:
+                with mock.patch.object(migrate, "open_connection", return_value=None):
+                    self.provision(self.material(REFERENCE))
+
+        headers = parsed.call_args.args[0]["origins"][0]["headers"]
+        self.assertEqual(CREDENTIAL, headers[0]["value"])
+
+    def test_nothing_the_command_reports_carries_what_it_resolved(self):
+        with mock.patch.object(vault, "read", return_value=vault.Secret(CREDENTIAL, PARSED)):
+            with mock.patch.object(migrate, "open_connection", return_value=None):
+                report = self.provision(self.material(REFERENCE))
+
+        self.assertNotIn(CREDENTIAL, json.dumps(report.as_dict()))
+
+    def test_a_vault_that_refuses_stops_the_command_before_the_database(self):
+        refusal = vault.Refused(
+            f"{REFERENCE} names no item in that vault",
+            code=INVALID_CONFIGURATION,
+            source="vault:no_such_item",
+        )
+        with mock.patch.object(vault, "read", side_effect=refusal):
+            with mock.patch.object(migrate, "open_connection", side_effect=AssertionError("connected")):
+                report = self.provision(self.material(REFERENCE))
+
+        self.assertEqual(["vault:no_such_item"], [item.source for item in report.violations])
+
+    def test_material_with_no_reference_in_it_never_asks_the_vault(self):
+        # An operator who keeps their material on disk is not made to have a
+        # 1Password account.
+        with mock.patch.object(vault, "read", side_effect=AssertionError("read")):
+            with mock.patch.object(migrate, "open_connection", return_value=None):
+                report = self.provision(self.material("Bearer plain-token"))
+
+        self.assertNotIn("vault", [item.source for item in report.violations])
 
 
 if __name__ == "__main__":

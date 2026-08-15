@@ -67,7 +67,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import config, migrate, pg, program, seal, state
+from redkraken import config, migrate, pg, program, seal, state, vault
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -565,7 +565,7 @@ def seal_wire(
     redacted: Path,
     *,
     root: Path,
-    key: Path,
+    key: seal.Location,
     content_type: str | None = None,
 ) -> Report:
     """Store one exchange as two artifacts: the redacted view, and the wire view encrypted.
@@ -726,7 +726,7 @@ def open_wire(
     configuration_path: Path,
     *,
     root: Path,
-    key: Path,
+    key: seal.Location,
     label: str,
     into: Path,
     authorize: str | None = None,
@@ -992,7 +992,7 @@ def _source(ledger: Ledger, source: Path, *, flag: str = "--from") -> bytes | No
         return None
 
 
-def _secret(ledger: Ledger, key: Path) -> seal.Root | None:
+def _secret(ledger: Ledger, key: seal.Location) -> seal.Root | None:
     """The root secret, or a refusal that never reached a database.
 
     `seal.load_root` refuses a key file this process will not use -- missing, not
@@ -1000,13 +1000,19 @@ def _secret(ledger: Ledger, key: Path) -> seal.Root | None:
     Those are configuration problems and they are reported as configuration
     problems, before a connection is opened, because a key file the group can
     read is a key file that has to be replaced rather than retried.
+
+    A key kept in the vault refuses differently and keeps its own class. A
+    locked vault is not a key to correct, so it is not reported as one.
     """
     try:
-        return seal.load_root(Path(key))
+        return seal.load_root(key)
     except seal.Unusable as error:
         ledger.fail(
             "key", str(error), code=INVALID_CONFIGURATION, source="argument:--key"
         )
+        return None
+    except vault.Refused as refusal:
+        ledger.refuse("key", refusal.violation.detail, [refusal.violation])
         return None
 
 

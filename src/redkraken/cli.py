@@ -2057,7 +2057,7 @@ def _path(source: _Source, given: Path | None) -> Path | None:
     return Path(value) if value else None
 
 
-def _key(ledger: Ledger, given: Path | None) -> Path | None:
+def _key(ledger: Ledger, given: Path | None) -> seal.Location | None:
     """The key file, from the argument or from the variable behind it.
 
     Refused rather than defaulted, and for a sharper version of the store's

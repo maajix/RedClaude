@@ -19,7 +19,7 @@ from email.message import Message
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from redkraken import config, migrate, pg, program, seal
+from redkraken import config, migrate, pg, program, seal, vault
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 from redkraken.store import digest
 
@@ -409,7 +409,7 @@ def provision(
     material_path: Path,
     *,
     root_secret: seal.Root | None = None,
-    key_path: Path | None = None,
+    key_path: seal.Location | None = None,
 ) -> Report:
     """Seal operator-provided material into one configured Identity slot.
 
@@ -442,6 +442,13 @@ def provision(
         document = json.loads(raw)
         if not isinstance(document, dict):
             raise Invalid("Identity material must be an object")
+        # Before validation and after parsing, which is the only window where a
+        # credential out of the vault is a credential and not yet a document.
+        # Everything below this line treats what it holds as material the
+        # operator wrote, and every refusal it can raise names a position --
+        # `origins[0].headers[1].value` -- rather than a value, so a secret that
+        # fails validation is still a secret nobody wrote down.
+        document, references = vault.resolve(document)
         session = Session.from_material(document)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, Invalid) as error:
         ledger.fail(
@@ -450,6 +457,9 @@ def provision(
             code=INVALID_CONFIGURATION,
             source="argument:--from",
         )
+        return report(COMMAND, ledger, **facts)
+    except vault.Refused as refusal:
+        ledger.refuse("identity_material", refusal.violation.detail, [refusal.violation])
         return report(COMMAND, ledger, **facts)
 
     root = root_secret
@@ -472,6 +482,12 @@ def provision(
                 code=INVALID_CONFIGURATION,
                 source="argument:--key",
             )
+            return report(COMMAND, ledger, **facts)
+        except vault.Refused as refusal:
+            # In the vault's own words. A locked vault is not a key to correct,
+            # and reporting it as one sends an operator to a reference that is
+            # already right.
+            ledger.refuse("identity_key", refusal.violation.detail, [refusal.violation])
             return report(COMMAND, ledger, **facts)
 
     connection = migrate.open_connection(ledger, runtime)
@@ -547,12 +563,16 @@ def provision(
         "origins": len(session.origins),
         "headers": sum(len(origin.headers) for origin in session.origins),
         "cookies": sum(1 for _ in session.jar),
+        # How many values came out of the vault rather than out of the file, so
+        # an operator can tell the two apart without either being printed.
+        "references": references,
     }
     ledger.hold(
         "identity",
         f"{label} revision {written}: {facts['identity']['origins']} origin(s), "
         f"{facts['identity']['headers']} static header(s), "
-        f"{facts['identity']['cookies']} cookie(s)",
+        f"{facts['identity']['cookies']} cookie(s), "
+        f"{references} vault reference(s)",
     )
     return report(COMMAND, ledger, **facts)
 

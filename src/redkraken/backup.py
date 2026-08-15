@@ -23,7 +23,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from redkraken import migrate, pg
+from redkraken import child, migrate, pg
 from redkraken.outcome import (
     BACKUP_FAILED,
     INVALID_CONFIGURATION,
@@ -86,7 +86,7 @@ def dump(settings: pg.Settings, destination: Path, *, timeout: float = DEFAULT_T
         )
         return report("db dump", ledger, target=settings.describe(), archive=str(target))
 
-    completed = _run(
+    completed = child.run(
         binary,
         [
             "--format=custom",
@@ -96,8 +96,8 @@ def dump(settings: pg.Settings, destination: Path, *, timeout: float = DEFAULT_T
             f"--file={target}",
             *_connection_arguments(settings),
         ],
-        settings,
-        timeout,
+        environment=_environment(settings),
+        timeout=timeout,
     )
     if isinstance(completed, str):
         _discard(ledger, target)
@@ -107,7 +107,7 @@ def dump(settings: pg.Settings, destination: Path, *, timeout: float = DEFAULT_T
         _discard(ledger, target)
         ledger.fail(
             "dump",
-            f"{DUMP} exited {completed.returncode}: {_tail(completed.stderr)}",
+            f"{DUMP} exited {completed.returncode}: {child.tail(completed.stderr, limit=STDERR_LIMIT)}",
             code=BACKUP_FAILED,
             source="pg_dump",
         )
@@ -167,7 +167,7 @@ def restore(
     if not _assert_empty(ledger, settings):
         return report("db restore", ledger, target=settings.describe(), archive=str(source))
 
-    completed = _run(
+    completed = child.run(
         binary,
         [
             # One transaction: either the whole archive is there or the database
@@ -178,8 +178,8 @@ def restore(
             *_connection_arguments(settings),
             str(source),
         ],
-        settings,
-        timeout,
+        environment=_environment(settings),
+        timeout=timeout,
     )
     if isinstance(completed, str):
         ledger.fail("restore", completed, code=BACKUP_FAILED, source="pg_restore")
@@ -187,7 +187,7 @@ def restore(
     if completed.returncode != 0:
         ledger.fail(
             "restore",
-            f"{RESTORE} exited {completed.returncode}: {_tail(completed.stderr)}",
+            f"{RESTORE} exited {completed.returncode}: {child.tail(completed.stderr, limit=STDERR_LIMIT)}",
             code=BACKUP_FAILED,
             source="pg_restore",
         )
@@ -351,30 +351,6 @@ def _environment(settings: pg.Settings) -> dict[str, str]:
     environment["PGCONNECT_TIMEOUT"] = str(math.ceil(settings.connect_timeout))
     environment["PGAPPNAME"] = settings.application_name
     return environment
-
-
-def _run(
-    binary: str, arguments: list[str], settings: pg.Settings, timeout: float
-) -> subprocess.CompletedProcess | str:
-    """Run one client program, or say in one sentence why it could not run."""
-    try:
-        return subprocess.run(
-            [binary, *arguments],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=_environment(settings),
-        )
-    except subprocess.TimeoutExpired:
-        return f"{binary} did not finish within {timeout:g} seconds"
-    except OSError as error:
-        return f"{binary} could not be run: {error.strerror or error}"
-
-
-def _tail(stderr: str) -> str:
-    text = " ".join(stderr.split())
-    return text[-STDERR_LIMIT:] if len(text) > STDERR_LIMIT else text or "no output"
 
 
 def _digest(path: Path) -> tuple[str, int]:

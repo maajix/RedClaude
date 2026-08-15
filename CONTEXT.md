@@ -644,6 +644,22 @@ the set is bound to that runtime version.
 _Avoid_: API key, credential, auth source (an auth source is what the CLI
 reports having resolved, after the fact)
 
+**Vault reference**:
+An `op://vault/item[/section]/field` string standing where a credential would
+have been in operator-provided material, naming its vault by ID and only ever
+one of the two the operator authorised. It is resolved on the control side,
+between parsing that material and validating it, and a string is a reference or
+it is not -- nothing is substituted inside one, so a credential that happens to
+contain `op://` can never make the runtime read anything. What it resolves to
+comes back wrapped in one type that gives the reference back from `repr`,
+refuses to pickle and cannot be serialised -- a barrier on the way out of the
+module and not a container the credential lives in, since a credential has to
+become a string to be sealed. Past that point the protection is that the window
+is a line or two and that the token which authorises the read is on the far side
+of every agent boundary.
+_Avoid_: Secret, credential, placeholder, template variable (a template variable
+is interpolated into a larger string, which is the thing this is not)
+
 **Agent boundary**:
 The container one agent run's process lives in: attached to a single internal
 network whose only peer is the capability proxy, external DNS blackholed, and

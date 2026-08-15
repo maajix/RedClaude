@@ -1090,7 +1090,7 @@ class ExchangeTest(unittest.TestCase):
         previous = handler.response_headers
         handler.response_headers = (("Set-Cookie", f"session={marker}; Secure; HttpOnly"),)
         self.addCleanup(setattr, handler, "response_headers", previous)
-        root = seal.Root(Path("test-only-root"), b"p" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"p" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
 
@@ -1125,7 +1125,7 @@ class ExchangeTest(unittest.TestCase):
 
     def test_a_named_identity_is_injected_without_entering_the_agent_view(self):
         marker = "rk2-target-bearer-identity-8c40d1"
-        root = seal.Root(Path("test-only-root"), b"i" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"i" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
         self.fence.decided = proxy.Authorization(
@@ -1190,7 +1190,7 @@ class ExchangeTest(unittest.TestCase):
         agent view agreed perfectly about a header neither of them had.
         """
         marker = "rk2-bounty-identifier-4d81ba"
-        root = seal.Root(Path("test-only-root"), b"h" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"h" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
         self.fence.required = [("X-Bounty-Id", marker)]
@@ -1231,7 +1231,7 @@ class ExchangeTest(unittest.TestCase):
         business; the door owns this field, so it takes the agent's copy out
         first -- case-insensitively, because the wire is.
         """
-        root = seal.Root(Path("test-only-root"), b"h" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"h" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
         self.fence.required = [("X-Bounty-Id", "rk2-the-program-value")]
@@ -1290,7 +1290,7 @@ class ExchangeTest(unittest.TestCase):
         )
         self.addCleanup(setattr, handler, "response_headers", prior_headers)
         self.addCleanup(setattr, handler, "answer", prior_answer)
-        root = seal.Root(Path("test-only-root"), b"r" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"r" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
         self.fence.decided = proxy.Authorization(
@@ -1362,7 +1362,7 @@ class ExchangeTest(unittest.TestCase):
         self.addCleanup(target.server_close)
         self.addCleanup(target.shutdown)
         self.mtls = (target, server_authority)
-        root = seal.Root(Path("test-only-root"), b"m" * seal.KEY_BYTES)
+        root = seal.Root("test-only-root", b"m" * seal.KEY_BYTES)
         self.server.root_secret = root
         self.addCleanup(setattr, self.server, "root_secret", None)
         self.fence.decided = proxy.Authorization(
@@ -1426,7 +1426,7 @@ class ExchangeTest(unittest.TestCase):
             "https://target.example.test/",
             [("Set-Cookie", f"cookie{index}=x") for index in range(6_000)],
         )
-        binding.root = seal.Root(Path("test-only-root"), b"o" * seal.KEY_BYTES)
+        binding.root = seal.Root("test-only-root", b"o" * seal.KEY_BYTES)
         binding.salt = b"s" * seal.SALT_BYTES
         binding.generation = 1
 
