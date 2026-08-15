@@ -887,6 +887,15 @@ def build_parser() -> argparse.ArgumentParser:
             "holds; the value is never given to this process"
         ),
     )
+    replaying.add_argument(
+        "--impact",
+        action="store_true",
+        help=(
+            "run a Test that states an impact: it needs a live operator grant, "
+            "it records a demonstration rather than evidence, and it settles "
+            "nothing about the claim the Finding rests on"
+        ),
+    )
     replaying.set_defaults(run=_test_replay)
 
     findings = commands.add_parser(
@@ -1623,6 +1632,7 @@ def _test_replay(arguments: argparse.Namespace) -> int:
                 identity_slot=arguments.identity,
                 proxy_url=endpoint,
                 ca_file=_path(TRUST, arguments.ca_file),
+                verbs=replay.IMPACT if arguments.impact else replay.DETECTION,
             ),
         )
     )

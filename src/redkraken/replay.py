@@ -26,6 +26,15 @@ unevaluated, which is what makes the run inconclusive.
 The cleanup is reported honestly. A Test that created something and could not
 remove it has left the target changed, and `skipped` and `failed` are different
 facts about that: one means the run never got there, the other means it tried.
+
+Ticket 38 added a second pair of verbs around the same walk, still in the
+`replay` Lane and still under the same capability. A Test that states an
+impact runs through `open_impact_replay`, which asks for an operator grant and
+parks the Task when there is none, and closes through `close_impact_replay`,
+which records a demonstration and settles nothing. Which pair of verbs is used
+is the only difference: the plan, the door, the walk and the report are the
+same, because what a replay does to the target is the same either way and the
+difference is entirely in what may be concluded from it.
 """
 
 from __future__ import annotations
@@ -46,25 +55,47 @@ from redkraken.outcome import (
 )
 
 
-__all__ = ["COMMAND", "FACTS", "RUN", "run"]
+__all__ = ["COMMAND", "DETECTION", "FACTS", "IMPACT", "RUN", "run"]
 
 
 COMMAND = "test"
 RUN = f"{COMMAND} replay"
 
-#: What this command reports on every path, refused or performed, so a caller
-#: parses one document whichever happened.
-FACTS = ("program_id", "program_slug", "tool_run", "test_run")
+#: What this command reports on every path, refused, parked or performed, so a
+#: caller parses one document whichever happened.
+FACTS = ("program_id", "program_slug", "tool_run", "test_run", "decision")
 
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 AGENT_RUN = "SELECT id FROM agent_runs WHERE program_id = $1::uuid AND label = $2"
 TEST = "SELECT id FROM tests WHERE program_id = $1::uuid AND label = $2"
-OPEN = "SELECT open_test_replay($1::uuid, $2::uuid, $3)"
 RECORD = "SELECT record_test_action($1::uuid, $2::integer, $3)"
-CLOSE = "SELECT close_test_replay($1::uuid, $2, $3)"
 
-#: The three words `close_test_replay` admits for what became of the cleanup.
+#: The three words either close verb admits for what became of the cleanup.
 DONE, FAILED, SKIPPED = "done", "failed", "skipped"
+
+
+@dataclass(frozen=True)
+class _Verbs:
+    """The pair of verbs one replay is opened and closed by.
+
+    Both pairs answer the same two documents -- a plan to walk and a reading of
+    what the walk produced -- so nothing below this declaration asks which one
+    it is running. What differs is entirely inside the database: one settles a
+    claim, the other proves an impact under a grant and settles nothing.
+    """
+
+    open_sql: str
+    close_sql: str
+
+
+DETECTION = _Verbs(
+    "SELECT open_test_replay($1::uuid, $2::uuid, $3)",
+    "SELECT close_test_replay($1::uuid, $2, $3)",
+)
+IMPACT = _Verbs(
+    "SELECT open_impact_replay($1::uuid, $2::uuid, $3)",
+    "SELECT close_impact_replay($1::uuid, $2, $3)",
+)
 
 
 def run(
@@ -76,6 +107,7 @@ def run(
     identity_slot: str | None,
     proxy_url: str,
     ca_file: Path | None = None,
+    verbs: _Verbs = DETECTION,
 ) -> Report:
     """Perform one Test for one agent run, and file the run it produced."""
     ledger = Ledger()
@@ -142,7 +174,11 @@ def run(
             with connection.transaction():
                 connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
                 plan = json.loads(
-                    str(connection.execute(OPEN, (run_id, test_id, identity_slot)).scalar())
+                    str(
+                        connection.execute(
+                            verbs.open_sql, (run_id, test_id, identity_slot)
+                        ).scalar()
+                    )
                 )
         except pg.DatabaseError as error:
             ledger.fail(
@@ -150,6 +186,28 @@ def run(
                 f"the registry refused this replay: {_said(error)}",
                 code=INVALID_CONFIGURATION,
                 source="argument:--test",
+            )
+            return _report(ledger, answers)
+
+        # Ticket 38 criterion 2. An impact Test with no live grant parks its
+        # Task and opens nothing: there is no Tool run, so there is no
+        # capability, so nothing below this line could have reached the target.
+        # It is a hold and not a violation -- the harness did the right thing,
+        # and what it is waiting for is a person.
+        if "tool_run_id" not in plan:
+            answers.decision = {
+                "label": plan["parked"],
+                "question": plan["question"],
+                "task": plan["task"],
+                "test": plan["test"],
+                "finding": plan["finding"],
+                "impact_class": plan["impact_class"],
+                "risk_class": plan["risk_class"],
+            }
+            ledger.hold(
+                "authorization",
+                f"{plan['refusal']}: {plan['task']} is parked as {plan['parked']} "
+                f"and nothing was sent",
             )
             return _report(ledger, answers)
 
@@ -174,7 +232,7 @@ def run(
         capability = plan.get("capability")
         if not capability:
             return _abandon(
-                ledger, answers, connection, plan,
+                ledger, answers, connection, verbs, plan,
                 f"the risk gate answered {plan.get('decision')} rather than allow",
                 name="capability", cleanup=SKIPPED, source="risk_gate",
             )
@@ -184,13 +242,13 @@ def run(
             trust, missing = _trust(plan, ca_file)
         except (OSError, ssl.SSLError) as error:
             return _abandon(
-                ledger, answers, connection, plan,
+                ledger, answers, connection, verbs, plan,
                 f"the door's certificate at {ca_file} cannot be used: {error}",
                 name="trust_root", cleanup=SKIPPED, source="argument:--ca",
             )
         if missing is not None:
             return _abandon(
-                ledger, answers, connection, plan, missing,
+                ledger, answers, connection, verbs, plan, missing,
                 name="trust_root", cleanup=SKIPPED, source="argument:--ca",
             )
         if trust is not None:
@@ -206,7 +264,10 @@ def run(
         try:
             performed = _perform(ledger, connection, plan, door)
         except BaseException as error:
-            _closing(connection, plan, SKIPPED, f"the supervisor could not finish it: {error!r}")
+            _closing(
+                connection, verbs, plan, SKIPPED,
+                f"the supervisor could not finish it: {error!r}",
+            )
             raise
 
         try:
@@ -215,13 +276,14 @@ def run(
                 closed = json.loads(
                     str(
                         connection.execute(
-                            CLOSE, (plan["tool_run_id"], performed.cleanup, performed.detail)
+                            verbs.close_sql,
+                            (plan["tool_run_id"], performed.cleanup, performed.detail),
                         ).scalar()
                     )
                 )
         except pg.DatabaseError as error:
             return _abandon(
-                ledger, answers, connection, plan,
+                ledger, answers, connection, verbs, plan,
                 f"what this replay recorded was refused: {_said(error)}",
                 name="outcome", cleanup=performed.cleanup, source="test_run",
             )
@@ -234,6 +296,7 @@ def run(
         "cleanup": closed["cleanup"],
         "actions": closed["actions"],
         "hypothesis_status": closed["hypothesis_status"],
+        "demonstration": closed.get("demonstration"),
     }
     _conclude(ledger, plan, closed)
     return _report(ledger, answers)
@@ -279,6 +342,7 @@ class _Answers:
     program_id: str | None = None
     tool_run: dict | None = None
     test_run: dict | None = None
+    decision: dict | None = None
 
 
 def _perform(
@@ -425,21 +489,29 @@ def _conclude(ledger: Ledger, plan: Mapping[str, object], closed: Mapping[str, o
     A conclusion the epistemic machine refused is the same fact reached the other
     way: every assertion held and the claim still does not carry the verdict, so
     it fails too, carrying the refusal that says what the Test would need.
+
+    An impact run that held and demonstrated nothing anyway is the third shape
+    of the same thing, and it arrives under the other name the two close verbs
+    withhold their conclusion under. A held claim on that path is not a result:
+    an impact run settles nothing, and the status reported for the claim is the
+    one it already had.
     """
     outcome = str(closed["outcome"])
-    refused = closed.get("settle_refused")
+    withheld = closed.get("settle_refused") or closed.get("demonstration_refused")
     said = (
         f"{plan['test']} {outcome} over {closed['actions']} action(s); "
         f"the claim is {closed['hypothesis_status']}"
     )
-    if refused:
-        said += f", because {refused}"
+    if withheld:
+        said += f", because {withheld}"
+    if closed.get("demonstration"):
+        said += f"; the impact is demonstrated by {closed['demonstration']}"
     failed = list(closed["failed"])
     if failed:
         said += f"; failed: {', '.join(failed)}"
     if closed["cleanup"] != DONE:
         said += f"; cleanup {closed['cleanup']}"
-    if outcome == "inconclusive" or refused:
+    if outcome == "inconclusive" or withheld:
         ledger.fail("run", said, code=INVALID_CONFIGURATION, source="test_run")
     else:
         ledger.hold("run", said)
@@ -458,6 +530,7 @@ def _report(ledger: Ledger, answers: _Answers) -> Report:
         program_slug=answers.slug,
         tool_run=answers.tool_run,
         test_run=answers.test_run,
+        decision=answers.decision,
     )
 
 
@@ -465,6 +538,7 @@ def _abandon(
     ledger: Ledger,
     answers: _Answers,
     connection: pg.Connection,
+    verbs: _Verbs,
     plan: Mapping[str, object],
     detail: str,
     *,
@@ -480,13 +554,19 @@ def _abandon(
     replay that got this far recorded no action, so there is nothing for
     `evaluate_test_assertions` to read and nothing it could conclude.
     """
-    answers.tool_run.update(status=_closing(connection, plan, cleanup, detail), detail=detail)
+    answers.tool_run.update(
+        status=_closing(connection, verbs, plan, cleanup, detail), detail=detail
+    )
     ledger.fail(name, detail, code=INVALID_CONFIGURATION, source=source)
     return _report(ledger, answers)
 
 
 def _closing(
-    connection: pg.Connection, plan: Mapping[str, object], cleanup: str, detail: str
+    connection: pg.Connection,
+    verbs: _Verbs,
+    plan: Mapping[str, object],
+    cleanup: str,
+    detail: str,
 ) -> str:
     """Close an open replay on the way out of a failure, best effort.
 
@@ -503,7 +583,7 @@ def _closing(
         with connection.transaction():
             connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
             closed = connection.execute(
-                CLOSE, (plan["tool_run_id"], cleanup, detail)
+                verbs.close_sql, (plan["tool_run_id"], cleanup, detail)
             ).scalar()
     except (pg.ConnectionError_, pg.DatabaseError, OSError):
         return "running"

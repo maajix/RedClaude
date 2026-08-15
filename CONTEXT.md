@@ -213,6 +213,26 @@ first answer stands, because a session that answers twice is arguing with itself
 about a document that did not change in between.
 _Avoid_: Decision, judgement, ruling, review
 
+**Impact demonstration**:
+What a validated detection was proved to be worth, and the only thing this
+harness calls demonstrated impact: one holding replay of a Test that stated the
+impact it would have, run under a live operator grant for that exact
+specification, whose after-state action came back with a Receipt, and whose undo
+was both reported done and sent -- every request the Test names as its cleanup
+answered by a Receipt of its own, because the report is the supervisor's word and
+the Receipts are what happened. All four or none of it -- a run that held and
+could not undo itself demonstrates nothing, and neither does one nobody granted.
+Whether the undo worked is not asked; only another Test could answer that. The
+class is one of six, and the split is not a scale: three an operator may grant
+(`read_other_data`, `write_target_state`, `escalate_privilege`) and three are
+things nobody may, at any severity, on any Finding (`degrade_availability`,
+`reach_third_party`, `pivot_out_of_scope`) -- the question is not asked, so no
+answer to it exists. None of it reaches the claim underneath: an impact run
+settles no hypothesis, writes no Observation and produces no Evidence, because
+the detection was validated before it opened and this is the second question
+about it.
+_Avoid_: Exploit, proof of concept, weaponisation
+
 **Severity basis**:
 The ground a finding's severity stands on, stated with the severity and never
 apart from it: `undetermined` while nothing has been demonstrated, and otherwise
@@ -220,7 +240,11 @@ one of `demonstrated_impact` (the harness performed it and has the receipts),
 `constrained_inference` (it follows from what was demonstrated, and the step was
 not performed) or `program_context` (the program says this class of thing matters
 here). A candidate is born `undetermined` and stays `info` until one of the other
-three is stated.
+three is stated. Each is refused for its own reason, and the reasons are what
+keep the three apart: no demonstration behind `demonstrated_impact`, a
+demonstration already behind `constrained_inference` -- an inference is what is
+made where there is no proof -- and `high` or `critical` on nothing but
+`program_context`, which reads a document rather than the target.
 _Avoid_: Confidence, likelihood, CVSS (a report renders one; the basis is not it)
 
 **Negative knowledge**:

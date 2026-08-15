@@ -864,6 +864,24 @@ CANDIDATE_CONTROL = (
 #: rather than as text with every brace doubled.
 SPECIFIED = json.dumps(SPECIFICATION)
 
+#: The same Test, stating an impact nobody may ever grant. The shape rule admits
+#: it -- the block is well formed and `degrade_availability` is a class the
+#: vocabulary holds -- and `open_impact_task` is what refuses it, so this is a
+#: Test written around the front door: a demonstration of the one thing that is
+#: never demonstrated, specified and stored and waiting for a run.
+FORBIDDEN_IMPACT = json.dumps(
+    SPECIFICATION
+    | {
+        "cleanup": [{"method": "DELETE", "url": "https://app.example.com/orders/2"}],
+        "impact": {
+            "class": "degrade_availability",
+            "effect": "the orders API stops answering the users it belongs to",
+            "cleanup": "the load is stopped and the service is left to recover",
+            "after_state": 2,
+        },
+    }
+)
+
 
 #: Every check the gate runs, and the edit that makes it fail. Each runs in a
 #: transaction that is rolled back, so the database is unchanged afterwards --
@@ -1915,6 +1933,35 @@ CONTROLS = (
                   "                                 replay_test_run_id, packet_sha256)"
                   "     VALUES (p, f, r, repeat('a', 64));",
         ),
+    ),
+    Control(
+        # PH2-38 criterion 5: a Test specifying an impact nobody may ever grant.
+        # `open_impact_task` refuses the class when the Test is written and
+        # `open_impact_replay` asks again before a request goes out, so no verb
+        # produces this row -- what it is, seen from outside, is a forbidden
+        # demonstration sitting in the corpus as though it were work waiting to
+        # be picked up. The spec constraint admits it, because the block is well
+        # formed and the class is one the vocabulary holds: which class may be
+        # asked about is a mapping a later migration can move, and the standing
+        # check is what re-reads that mapping against every stored Test.
+        "standing:check_impact_authorization",
+        "DO $ctl$ DECLARE p uuid; e uuid; h uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('impact-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'impact-selftest', 'tech:impact-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+        "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
+        "                'a self test')"
+        "     RETURNING id INTO h;"
+        "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256, impact_class)"
+        f"        VALUES (p, h, '{FORBIDDEN_IMPACT}'::jsonb,"
+        f"                rk2_test_spec_digest('{FORBIDDEN_IMPACT}'::jsonb),"
+        "                 'degrade_availability');"
+        " END $ctl$",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -22764,26 +22811,31 @@ def specification(
     setup: list[dict] | None = None,
     cleanup: list[dict] | None = None,
     actions: list[dict] | None = None,
+    impact: dict | None = None,
 ) -> str:
     """One Test specification, as the column takes it.
 
     The three roles are the default because every Test needs all three and only
     the arms about the shape rule are interested in one that does not.
+
+    `impact` is absent unless a caller states one, rather than defaulted to an
+    empty object: 38 made the key optional so that every Test written before it
+    still validates, and a key spelled `null` is a different document with a
+    different digest.
     """
-    return json.dumps(
-        {
-            "preconditions": [{"kind": "scope_holds", "detail": "the orders API is in scope"}],
-            "setup": setup or [],
-            "actions": actions
-            or [
-                {"ordinal": ordinal, "role": role, "kind": "request",
-                 "method": "GET", "url": f"{BASE}/{ordinal}"}
-                for ordinal, role in enumerate(("baseline", "variant", "control"), start=1)
-            ],
-            "assertions": assertions,
-            "cleanup": cleanup or [],
-        }
-    )
+    stated = {
+        "preconditions": [{"kind": "scope_holds", "detail": "the orders API is in scope"}],
+        "setup": setup or [],
+        "actions": actions
+        or [
+            {"ordinal": ordinal, "role": role, "kind": "request",
+             "method": "GET", "url": f"{BASE}/{ordinal}"}
+            for ordinal, role in enumerate(("baseline", "variant", "control"), start=1)
+        ],
+        "assertions": assertions,
+        "cleanup": cleanup or [],
+    }
+    return json.dumps(stated if impact is None else stated | {"impact": impact})
 
 
 class ReplayFixture:
@@ -25101,11 +25153,26 @@ class CandidateFindingTest(ReplayFixture, DatabaseCase):
                 self.assertIn(fragment, self.refusals[key])
 
     def test_severity_and_its_basis_move_together(self):
+        # 038 put a trigger in front of this column. The pair still cannot be
+        # separated and a hand-written UPDATE is still refused; what refuses it
+        # is now the earlier rule, which asks who stated the severity rather
+        # than what accompanies it. The CHECK underneath is asserted to still
+        # exist, because it is what holds the pair together inside
+        # `state_severity` -- the one writer the trigger admits.
         self.assertIn(
-            "findings_severity_needs_a_basis_check",
+            "nothing has stated a severity",
             self.refuse(
                 "UPDATE findings SET severity = 'high' WHERE id = $1::uuid",
                 (self.opened["finding_id"],),
+            ),
+        )
+        self.assertEqual(
+            1,
+            len(
+                self.rows(
+                    "SELECT 1 FROM pg_constraint"
+                    " WHERE conname = 'findings_severity_needs_a_basis_check'"
+                )
             ),
         )
 
@@ -25153,34 +25220,22 @@ class CandidateFindingTest(ReplayFixture, DatabaseCase):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
-class BlindValidationTest(ReplayFixture, DatabaseCase):
-    """Ticket 37: one candidate Finding, judged out of a packet and nothing else.
+class ValidatedFindingFixture(ReplayFixture):
+    """The moves that carry a claim from a stated Hypothesis to a validated Finding.
 
-    The arrangement is 36's carried one step on. A claim is stated, tested
-    through the door, settled and opened as a candidate Finding -- and then
-    somebody asks for it to be validated. What this case is about begins there:
-    the claim goes back to `testable`, the Test is replayed a second time, and
-    the document a session is served is built from that second run.
-
-    Every session is opened and closed inside `setUpClass` rather than inside
-    the test that reads it, because the roster runs one validator at a time: two
-    arms each holding a session open would be assertions about whichever one got
-    there first. The arms that are about a judgement in flight are collected
-    while the one session that is open is open, which is the only moment they
-    are answerable.
+    36 opens the candidate, 37 judges it, and 38 begins where that judgement
+    ended: impact is proved on a Finding somebody already validated. The route
+    is the same route in all three, so it is here rather than copied -- a change
+    to how a Finding gets validated is one edit, not one per ticket that needs
+    one validated.
     """
-
-    slug = "selftest-validate"
 
     OPEN_FINDING = "SELECT open_finding($1::uuid, $2::uuid, $3, $4)"
     REQUEST = "SELECT request_validation($1::uuid, $2::uuid)"
     REOPEN = "SELECT reopen_for_reproduction($1::uuid, $2::uuid)"
     SESSION = "SELECT open_validation_session($1::uuid, $2::uuid, $3::uuid)"
-    SERVE = "SELECT open_validation($1::uuid, $2::uuid, $3::uuid, NULL)"
     VERDICT = "SELECT record_verdict($1::uuid, $2::uuid, $3, $4::text[])"
-    ABANDON = "SELECT abandon_validation($1::uuid, $2::uuid, $3)"
     FINISH = "SELECT finish_task_attempt($1::uuid, $2)"
-    REFUSAL = "SELECT rk2_validation_refusal($1::uuid, $2::uuid, $3::uuid)"
 
     #: 36's Test, and so the whole vocabulary a verdict may name a failure out
     #: of: `enforce_verdict_input` reads the assertion identifiers off the spec
@@ -25192,16 +25247,9 @@ class BlindValidationTest(ReplayFixture, DatabaseCase):
     ]
     ANSWERS = {1: (200, "order one"), 2: (200, "order two"), 3: (403, "denied")}
 
-    #: The two places a person's words end up on the way to a candidate: the
-    #: title the hunter gave its Finding, and the claim it wrote. Criterion 2 is
-    #: that neither sentence is anywhere in what a validator is handed, so both
-    #: are written here to be searched for rather than described.
+    #: The title the hunter gave its Finding. A sentence rather than a name
+    #: because 37 searches a served packet for it.
     TITLE = "a neighbour's order comes back and I would report this one as high"
-    STATEMENT = "the orders API hands over a neighbour's order to anyone who asks"
-
-    #: A Finding nobody opened and a run nobody performed, for the two arms that
-    #: are about a name rather than about a row.
-    NOBODY = "00000000-0000-0000-0000-000000000000"
 
     @classmethod
     def setUpClass(cls):
@@ -25211,21 +25259,6 @@ class BlindValidationTest(ReplayFixture, DatabaseCase):
                 "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
             ).scalar()
         )
-
-        cls.confirmed = cls.served(cls.STATEMENT)
-        cls.refuse_what_a_judgement_may_not_say(cls.confirmed)
-        cls.answer(cls.confirmed, "confirmed")
-
-        cls.partial = cls.served("the orders API hands over a neighbour's invoice")
-        cls.answer(cls.partial, "insufficient",
-                   failed=("the-control-is-not", "the-bodies-differ"))
-
-        cls.go_stale()
-        cls.drop_one_and_carry_on()
-        cls.refuse_what_cannot_be_served()
-        cls.problems = cls.rows_of("SELECT * FROM check_validations()")
-
-    # -- the arrangement -------------------------------------------------------
 
     @classmethod
     def candidate(cls, statement: str) -> dict:
@@ -25246,8 +25279,8 @@ class BlindValidationTest(ReplayFixture, DatabaseCase):
         Three verbs rather than one because they are three decisions: somebody
         asks, the machine makes the claim testable again, and 35 performs the
         replay exactly as it performed the first one. Nothing here shortcuts the
-        door -- a reproduction written by hand would be the thing criterion 6 is
-        about rather than the thing it protects.
+        door -- a reproduction written by hand would be the thing 37's criterion
+        6 is about rather than the thing it protects.
         """
         asked = cls.called(cls.REQUEST, (cls.program_id, made["finding"]))
         assert asked["outcome"] == "queued", asked
@@ -25279,6 +25312,65 @@ class BlindValidationTest(ReplayFixture, DatabaseCase):
             cls.FINISH, (session["opened"]["agent_run_id"], "completed")
         )
         return session
+
+    @classmethod
+    def validated(cls, statement: str) -> dict:
+        """One Finding all the way to `validated`, which is where 38 starts."""
+        made = cls.answer(cls.served(statement), "confirmed")
+        assert made["verdict"]["status"] == "validated", made["verdict"]
+        return made
+
+
+class BlindValidationTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 37: one candidate Finding, judged out of a packet and nothing else.
+
+    The arrangement is 36's carried one step on. A claim is stated, tested
+    through the door, settled and opened as a candidate Finding -- and then
+    somebody asks for it to be validated. What this case is about begins there:
+    the claim goes back to `testable`, the Test is replayed a second time, and
+    the document a session is served is built from that second run.
+
+    Every session is opened and closed inside `setUpClass` rather than inside
+    the test that reads it, because the roster runs one validator at a time: two
+    arms each holding a session open would be assertions about whichever one got
+    there first. The arms that are about a judgement in flight are collected
+    while the one session that is open is open, which is the only moment they
+    are answerable.
+    """
+
+    slug = "selftest-validate"
+
+    SERVE = "SELECT open_validation($1::uuid, $2::uuid, $3::uuid, NULL)"
+    ABANDON = "SELECT abandon_validation($1::uuid, $2::uuid, $3)"
+    REFUSAL = "SELECT rk2_validation_refusal($1::uuid, $2::uuid, $3::uuid)"
+
+    #: The second place a person's words end up on the way to a candidate: the
+    #: claim the hunter wrote, beside the title the fixture gives every Finding.
+    #: Criterion 2 is that neither sentence is anywhere in what a validator is
+    #: handed, so both are written down to be searched for rather than described.
+    STATEMENT = "the orders API hands over a neighbour's order to anyone who asks"
+
+    #: A Finding nobody opened and a run nobody performed, for the two arms that
+    #: are about a name rather than about a row.
+    NOBODY = "00000000-0000-0000-0000-000000000000"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.confirmed = cls.served(cls.STATEMENT)
+        cls.refuse_what_a_judgement_may_not_say(cls.confirmed)
+        cls.answer(cls.confirmed, "confirmed")
+
+        cls.partial = cls.served("the orders API hands over a neighbour's invoice")
+        cls.answer(cls.partial, "insufficient",
+                   failed=("the-control-is-not", "the-bodies-differ"))
+
+        cls.go_stale()
+        cls.drop_one_and_carry_on()
+        cls.refuse_what_cannot_be_served()
+        cls.problems = cls.rows_of("SELECT * FROM check_validations()")
+
+    # -- the arrangement -------------------------------------------------------
 
     @classmethod
     def go_stale(cls):
@@ -26442,6 +26534,847 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
         problems = self.rows("SELECT * FROM check_validations()")
 
         self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
+
+
+IMPACT_SLUG = "selftest-impact"
+
+
+class ImpactProofTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 38: an impact is authorized before it is proved, and proved apart.
+
+    The arrangement is 37's carried one step on. A claim is stated, tested,
+    opened as a candidate and validated -- and what this case is about begins
+    there: somebody writes a second Test that states an impact, and the machine
+    refuses to send it until a human has said so.
+
+    Everything commits, because the subject is a sequence across transactions
+    that a rollback would erase: the question is asked in one, answered by an
+    operator on a connection of its own in another, and the run that answers it
+    happens in several more. The order in `setUpClass` is the order the ticket
+    puts things in -- nothing may be sent before the grant exists, so every arm
+    about the refusal is collected before the approval is given.
+    """
+
+    slug = IMPACT_SLUG
+
+    OPEN_TASK = "SELECT open_impact_task($1::uuid, $2::jsonb)"
+    OPEN_REPLAY = "SELECT open_impact_replay($1::uuid, $2::uuid, $3)"
+    CLOSE_REPLAY = "SELECT close_impact_replay($1::uuid, $2, $3)"
+    SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+    PROBLEM = "SELECT rk2_test_spec_problem($1::jsonb)"
+    REVALIDATE = "SELECT revalidate_decision($1)"
+
+    CLAIM = "the orders API lets anyone rewrite a neighbour's order note"
+
+    #: A second validated Finding, with no impact Task and so no demonstration.
+    #: The two bases that are not a demonstration are stated about this one,
+    #: which is the situation they exist for.
+    OTHER_CLAIM = "the orders API leaks a neighbour's order note to anyone who asks"
+
+    #: What the impact Test says it will do. The after-state is action 3
+    #: because the specification the case builds reads the note back there, and
+    #: the rule 38 puts on the block is that the reading is asserted about.
+    IMPACT = {
+        "class": "write_target_state",
+        "effect": "the note on a neighbour's order is rewritten by a stranger",
+        "cleanup": "the note is PUT back to the text the baseline read",
+        "after_state": 3,
+    }
+    SHOWN = [
+        {"id": "the-write-is-accepted", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-note-changed", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+
+    #: Action 3 reads back what action 2 wrote, so it answers differently from
+    #: the baseline. That difference is the whole of what is being proved.
+    ANSWERED = {1: (200, "note: nothing"), 2: (200, "accepted"),
+                3: (200, "note: rewritten by a stranger")}
+
+    #: The requests that undo it. A Test stating an impact states these or it is
+    #: not a valid specification.
+    UNDO = [{"method": "PUT", "url": f"{BASE}/1"}]
+
+    REASON = "the write is reversible and I want it proved before we report it"
+    RATIONALE = "a stranger rewrote a neighbour's note and the note stayed rewritten"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.made = cls.validated(cls.CLAIM)
+        cls.finding = cls.made["finding"]
+
+        cls.opened = cls.called(cls.OPEN_TASK, (cls.finding, cls.impact_spec()))
+        cls.test = cls.id_of("tests", cls.opened["test"])
+
+        cls.refuse_the_specifications_that_state_no_impact()
+        cls.refuse_what_no_grant_admits()
+        cls.park()
+        cls.refuse_severity_nothing_has_shown()
+
+        cls.answered = cls.approve(cls.parked["parked"])
+        # Read before the granted run claims it back: 029 releases a parked Task
+        # to `pending`, and what happens to it after that is the next arm.
+        cls.released = str(
+            cls.rows_of(
+                "SELECT status FROM tasks WHERE program_id = $1::uuid AND label = $2",
+                (cls.program_id, cls.opened["task"]),
+            )[0][0]
+        )
+        cls.prove()
+        cls.state_the_severity()
+        cls.problems = cls.rows_of("SELECT * FROM check_impact_authorization()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def impact_spec(cls, **changed) -> str:
+        """The impact specification, with any one part of the block replaced.
+
+        Called as `impact_spec(**{"class": ...})` where the part is the class,
+        because `class` is a keyword and the block spells it the way the schema
+        does.
+        """
+        return specification(cls.SHOWN, cleanup=cls.UNDO, impact=cls.IMPACT | changed)
+
+    @classmethod
+    def id_of(cls, table: str, label: str) -> str:
+        """The id behind a label, because the verbs answer in one and take the other.
+
+        The table name is interpolated and the two call sites pass a literal:
+        every row this case looks up is found the same way, and a helper per
+        table would be the same statement written twice.
+        """
+        return str(
+            cls.connection.execute(
+                f"SELECT id FROM {table} WHERE program_id = $1::uuid AND label = $2",
+                (cls.program_id, label),
+            ).scalar()
+        )
+
+    @classmethod
+    def run_on(cls, task: str) -> str:
+        """One agent run holding the impact Task, claimed as the slate would.
+
+        The Task is claimed by the owner rather than through `claim_task`,
+        which needs a live offer on a slate no case here is running. What
+        matters to the verbs below is that the lease is held: `authorize_tool_run`
+        refuses a run whose Task is not, so a run arranged any other way would
+        be refused before its first request rather than at the assertion it was
+        written for.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
+            "                 lease_expires_at = now() + interval '30 minutes'"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+        return committed(
+            cls.connection,
+            "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+            " SELECT $1::uuid, t.id, 'web_hunter', 'operator', 'low', '{}'::jsonb"
+            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2"
+            " RETURNING id",
+            (cls.program_id, task),
+        )
+
+    @classmethod
+    def as_operator(cls, sql: str, parameters: tuple = ()):
+        """Something only the operator's own connection may say.
+
+        `answer_decision` and `revalidate_decision` are granted to `rk2_human`
+        and to nothing else, so asking either as the runtime would be
+        exercising a path no operator has -- which is the path criterion 2
+        exists to close.
+        """
+        connection = pg.connect(cls.harness.human)
+        try:
+            connection.execute(operator.BIND, (cls.program_id,))
+            with connection.transaction():
+                return connection.execute(sql, parameters).scalar()
+        finally:
+            connection.close()
+
+    @classmethod
+    def approve(cls, label: str) -> dict:
+        """The operator's answer to the question `open_impact_replay` filed."""
+        return json.loads(
+            str(
+                cls.as_operator(
+                    operator.ANSWER_DECISION,
+                    (label, "approved", cls.REASON, "30 minutes"),
+                )
+            )
+        )
+
+    @classmethod
+    def refuse_the_specifications_that_state_no_impact(cls):
+        """Criterion 1: every shape the optional block may not have.
+
+        Asked of `rk2_test_spec_problem` rather than of an INSERT because the
+        column's CHECK is that function: a sentence per shape is what the writer
+        of a Test reads, and the constraint only ever says the sentence back.
+        """
+        cls.shapes = {
+            "not_an_object": cls.spec_problem(json.dumps(
+                json.loads(cls.impact_spec()) | {"impact": "a write"})),
+            "stray_key": cls.spec_problem(cls.impact_spec(when="tuesday")),
+            "no_class": cls.spec_problem(cls.impact_spec(**{"class": ""})),
+            "no_effect": cls.spec_problem(cls.impact_spec(effect="")),
+            "no_cleanup_sentence": cls.spec_problem(cls.impact_spec(cleanup="")),
+            "no_after_state": cls.spec_problem(cls.impact_spec(after_state="third")),
+            "after_state_not_performed": cls.spec_problem(cls.impact_spec(after_state=9)),
+            "after_state_unasserted": cls.spec_problem(
+                specification(
+                    [{"id": "the-write-is-accepted", "kind": "status_equals",
+                      "action": 2, "status": 200}],
+                    cleanup=cls.UNDO, impact=cls.IMPACT,
+                )
+            ),
+            "nothing_undoes_it": cls.spec_problem(
+                specification(cls.SHOWN, impact=cls.IMPACT)
+            ),
+        }
+        cls.detection_spec_still_validates = cls.spec_problem(specification(cls.HELD))
+
+        # The column and the block are one fact, and the CHECK says so. Written
+        # by hand because no verb can produce the disagreement.
+        cls.forged_class = cls.refuse(
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256, impact_class)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb),"
+            "         'escalate_privilege')",
+            (cls.program_id, cls.made["hypothesis"], cls.impact_spec()),
+        )
+
+    @classmethod
+    def spec_problem(cls, spec: str) -> str | None:
+        problem = cls.connection.execute(cls.PROBLEM, (spec,)).scalar()
+        return None if problem is None else str(problem)
+
+    @classmethod
+    def refuse_what_no_grant_admits(cls):
+        """Criterion 5, and the two verbs that ask about the class.
+
+        The forbidden three are refused where a Test would be written, which is
+        the earliest moment anything can say so: the alternative is a Test row,
+        a Task row and a question an operator might feel able to answer.
+        """
+        cls.forbidden = {
+            klass: cls.refuse(cls.OPEN_TASK, (cls.finding, cls.impact_spec(**{"class": klass})))
+            for klass in ("degrade_availability", "reach_third_party", "pivot_out_of_scope")
+        }
+        cls.unknown_class = cls.refuse(
+            cls.OPEN_TASK, (cls.finding, cls.impact_spec(**{"class": "read_the_minds"}))
+        )
+        cls.detection_task = cls.refuse(
+            cls.OPEN_TASK, (cls.finding, specification(cls.HELD))
+        )
+
+    @classmethod
+    def park(cls):
+        """Criterion 2: the request with no grant behind it, and what happens instead."""
+        cls.parked_run = cls.run_on(cls.opened["task"])
+        cls.parked = cls.called(cls.OPEN_REPLAY, (cls.parked_run, cls.test, None))
+
+        # The same wall, reached again by a second run before anyone answered.
+        # One key, one open question: the second run joins the first rather than
+        # filing a copy that the park would then point away from.
+        cls.asked_again = cls.called(
+            cls.OPEN_REPLAY, (cls.run_on(cls.opened["task"]), cls.test, None)
+        )
+        cls.nothing_was_sent = cls.rows_of(
+            "SELECT (SELECT count(*) FROM tool_runs WHERE agent_run_id = $1::uuid),"
+            "       (SELECT count(*) FROM receipts r"
+            "          JOIN tool_runs tr ON tr.id = r.tool_run_id"
+            "         WHERE tr.agent_run_id = $1::uuid),"
+            "       (SELECT status FROM tasks WHERE program_id = $2::uuid AND label = $3),"
+            "       (SELECT stop_reason FROM agent_runs WHERE id = $1::uuid),"
+            "       (SELECT finished_at IS NOT NULL FROM agent_runs WHERE id = $1::uuid),"
+            "       (SELECT count(*) FROM identity_leases"
+            "         WHERE holder_agent_run_id = $1::uuid AND released_at IS NULL)",
+            (cls.parked_run, cls.program_id, cls.opened["task"]),
+        )[0]
+        # Read as the runtime, which is the point: 029 took the answer away from
+        # it and left it every other column, and `test_id` is one of those.
+        cls.question = cls.rows_of(
+            "SELECT question_code, test_id = $2::uuid, tool_run_id IS NULL,"
+            "       agent_run_id IS NULL, task_id IS NOT NULL, question, risk_class"
+            "  FROM pending_decisions WHERE program_id = $1::uuid AND label = $3",
+            (cls.program_id, cls.test, cls.parked["parked"]),
+        )[0]
+        cls.still_worth_asking = cls.as_operator(
+            cls.REVALIDATE, (cls.parked["parked"],)
+        )
+
+    @classmethod
+    def refuse_severity_nothing_has_shown(cls):
+        """Criterion 6, asked while there is nothing to point at.
+
+        Before the run rather than after it, because after it there is a
+        demonstration and this arm would be a statement about the wrong Finding.
+        """
+        cls.severities = {
+            "nothing_shown": cls.refuse(
+                cls.SEVERITY, (cls.finding, "critical", "demonstrated_impact", cls.RATIONALE)
+            ),
+            "no_such_basis": cls.refuse(
+                cls.SEVERITY, (cls.finding, "high", "it_feels_high", cls.RATIONALE)
+            ),
+        }
+        cls.blockers_before = cls.blockers()
+
+    @classmethod
+    def prove(cls):
+        """Criteria 3 and 4: the granted run, and the two runs that show nothing."""
+        cls.claim_before = cls.claim_state()
+        cls.proved = cls.impact_replay(cls.ANSWERED, "done")
+        cls.claim_after = cls.claim_state()
+
+        # The detection opener, offered the same Test: 35's verb settles the
+        # claim, and the claim is not what an impact run is about.
+        cls.detection_refusal = cls.refuse(
+            cls.OPEN, (cls.run_on(cls.opened["task"]), cls.test, None)
+        )
+
+        # Criterion 4 is the conjunction. The same grant covers all of these, so
+        # what refuses them is the reading of the run and nothing else.
+        cls.uncleaned = cls.impact_replay(
+            cls.ANSWERED, "failed", "the PUT that undoes it answered 500", undo=False
+        )
+        cls.unheld = cls.impact_replay({**cls.ANSWERED, 2: (403, "denied")}, "done")
+        # The same run again, reported the same way, with the undo never sent.
+        # The word and the evidence are different things and this is the arm
+        # where they disagree.
+        cls.unproven_cleanup = cls.impact_replay(cls.ANSWERED, "done", undo=False)
+
+    @classmethod
+    def impact_replay(cls, answers: dict, cleanup: str, detail: str | None = None,
+                      *, undo: bool = True) -> dict:
+        """One whole impact replay under the grant: open it, answer it, close it.
+
+        `undo` is whether the request the specification names as its cleanup was
+        actually sent. Separate from `cleanup`, which is only the supervisor's
+        word for what happened, because criterion 4 is about what the door saw.
+        """
+        run = cls.run_on(cls.opened["task"])
+        plan = cls.called(cls.OPEN_REPLAY, (run, cls.test, None))
+        cls.second_in_flight = cls.refuse(
+            cls.OPEN_REPLAY, (cls.run_on(cls.opened["task"]), cls.test, None)
+        )
+        for action in plan["actions"]:
+            answer = answers.get(int(action["ordinal"]))
+            if answer is None:
+                continue
+            status, body = answer
+            receipt = cls.receipted(
+                plan["tool_run_id"], int(action["ordinal"]), status=status, body=body
+            )
+            committed(cls.connection, cls.RECORD,
+                      (plan["tool_run_id"], action["ordinal"], receipt))
+        if undo:
+            cls.undone(plan["tool_run_id"])
+        return {"run": run, "plan": plan,
+                "closed": cls.called(cls.CLOSE_REPLAY, (plan["tool_run_id"], cleanup, detail))}
+
+    @classmethod
+    def undone(cls, tool_run: str) -> str:
+        """The Receipt for the one request this Test states as its undo.
+
+        Written by hand, like every Receipt in this file, because the door writes
+        them and no case here is running one. Two things about it are the point:
+        it answers no recorded action, since a cleanup request is not part of the
+        plan the assertions are evaluated over, and its route is the one `UNDO`
+        names -- which is what `close_impact_replay` looks for.
+        """
+        return committed(
+            cls.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+            "                      method, scheme, host, port, path, status_code,"
+            "                      ts_arrival, scope_class, scope_version)"
+            " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed',"
+            "         'allowed as target under scope version 1', 'PUT', 'https',"
+            "         'app.example.com', 443, '/api/orders/1', 200, now(), 'target', 1)"
+            " RETURNING label",
+            (cls.program_id, tool_run),
+        )
+
+    @classmethod
+    def claim_state(cls) -> tuple:
+        """Everything about the claim an impact run is forbidden to move."""
+        return tuple(
+            str(field)
+            for field in cls.rows_of(
+                "SELECT (SELECT status FROM hypotheses WHERE id = $1::uuid),"
+                "       (SELECT count(*) FROM hypothesis_transitions"
+                "         WHERE hypothesis_id = $1::uuid),"
+                "       (SELECT count(*) FROM hypothesis_evidence"
+                "         WHERE hypothesis_id = $1::uuid),"
+                "       (SELECT count(*) FROM observations WHERE program_id = $2::uuid),"
+                "       (SELECT status FROM findings WHERE id = $3::uuid)",
+                (cls.made["hypothesis"], cls.program_id, cls.finding),
+            )[0]
+        )
+
+    @classmethod
+    def state_the_severity(cls):
+        """Criterion 6: the three bases, and the scope document moving under one."""
+        cls.stated = cls.called(
+            cls.SEVERITY, (cls.finding, "high", "demonstrated_impact", cls.RATIONALE)
+        )
+        cls.blockers_after = cls.blockers()
+
+        # The other two bases are stated about a second Finding, because they are
+        # what somebody says when there is no demonstration -- and this one has
+        # one. Asking for an inference about it is the arm that says so.
+        cls.not_an_inference = cls.refuse(
+            cls.SEVERITY,
+            (cls.finding, "medium", "constrained_inference",
+             "the behaviour is there but nobody has shown what it is worth"),
+        )
+        cls.plain = cls.validated(cls.OTHER_CLAIM)["finding"]
+        cls.inferred = cls.called(
+            cls.SEVERITY,
+            (cls.plain, "medium", "constrained_inference",
+             "the behaviour is there but nobody has shown what it is worth"),
+        )
+        cls.from_context = cls.called(
+            cls.SEVERITY,
+            (cls.plain, "low", "program_context",
+             "this program says it pays nothing for a note nobody reads"),
+        )
+        # And the ceiling on the weakest basis: a document cannot make a Finding
+        # somebody else's emergency.
+        cls.too_high = cls.refuse(
+            cls.SEVERITY,
+            (cls.plain, "critical", "program_context",
+             "this program says it pays a great deal for anything at all"),
+        )
+        cls.by_hand = cls.refuse(
+            "UPDATE findings SET severity = 'critical', severity_basis = 'program_context'"
+            " WHERE id = $1::uuid",
+            (cls.finding,),
+        )
+
+        # The scope document moves, and the statement that weighed the old one
+        # says so. A soft blocker rather than a hard one: what a severity rested
+        # on has changed, which is a thing to look at rather than a thing to
+        # stop for.
+        moved = program.run(
+            cls.harness.runtime,
+            write(
+                VALID.replace('name = "acme-web"', f'name = "{cls.slug}"').replace(
+                    '[[scope.exclude]]',
+                    '[[scope.exclude]]\nhost = "billing.example.com"\n'
+                    'ports = [443]\nprotocols = ["https"]\npaths = ["/"]\n\n'
+                    '[[scope.exclude]]',
+                    1,
+                )
+            ),
+            accept_change=True,
+        )
+        assert moved.ok, moved.violations
+        cls.blockers_moved = cls.blockers()
+
+    @classmethod
+    def blockers(cls) -> dict:
+        return {
+            str(code): (str(severity), str(detail))
+            for severity, code, detail in cls.rows_of(
+                "SELECT * FROM report_blockers($1::uuid)", (cls.finding,)
+            )
+        }
+
+    # -- criterion 1: the optional block, and what it may say -------------------
+
+    def test_a_test_states_its_impact_or_states_none(self):
+        self.assertIsNone(self.detection_spec_still_validates)
+        self.assertEqual(
+            {
+                "not_an_object": "the impact of a Test is an object",
+                "stray_key": "the impact carries no key named when",
+                "no_class": "the impact states no class",
+                "no_effect": "the impact states no effect",
+                "no_cleanup_sentence": "the impact states no cleanup",
+                "no_after_state":
+                    "the impact names no action that reads the state it leaves",
+                "after_state_not_performed":
+                    "the impact reads the state after action 9, which this Test does"
+                    " not perform",
+                "after_state_unasserted":
+                    "no assertion reads action 3, so the after-state is fetched and"
+                    " never checked",
+                "nothing_undoes_it":
+                    "a Test that states an impact states the requests that undo it",
+            },
+            self.shapes,
+        )
+
+    def test_the_column_and_the_block_are_one_fact(self):
+        self.assertIn("tests_impact_class_agrees_check", self.forged_class)
+
+    def test_the_impact_task_carries_the_class_the_specification_states(self):
+        self.assertEqual("write_target_state", self.opened["impact_class"])
+        self.assertEqual("approval_required", self.opened["risk_class"])
+
+        klass, spec_class = self.rows(
+            "SELECT impact_class, spec -> 'impact' ->> 'class' FROM tests WHERE id = $1::uuid",
+            (self.test,),
+        )[0]
+
+        self.assertEqual(("write_target_state", "write_target_state"),
+                         (str(klass), str(spec_class)))
+
+    def test_the_impact_task_is_a_hunt_of_its_own_naming_the_finding(self):
+        kind, finding, hypothesis = self.rows(
+            "SELECT t.kind, f.label, t.hypothesis_id = $2::uuid FROM tasks t"
+            "  JOIN findings f ON f.id = t.finding_id"
+            " WHERE t.program_id = $1::uuid AND t.label = $3",
+            (self.program_id, self.made["hypothesis"], self.opened["task"]),
+        )[0]
+
+        self.assertEqual(("hunt", self.opened["finding"], True),
+                         (str(kind), str(finding), bool(hypothesis)))
+
+    # -- criterion 2: nothing is sent before somebody says so -------------------
+
+    def test_no_grant_means_no_tool_run_and_so_nothing_that_could_be_sent(self):
+        calls, receipts, task, stop, finished, leases = self.nothing_was_sent
+
+        self.assertEqual(0, int(calls))
+        self.assertEqual(0, int(receipts))
+        self.assertEqual("parked", str(task))
+        self.assertEqual("parked", str(stop))
+        self.assertTrue(bool(finished))
+        self.assertEqual(0, int(leases))
+
+    def test_the_refusal_names_the_test_and_the_question_it_parked_on(self):
+        self.assertEqual(
+            f"no live operator grant covers {self.opened['test']}", self.parked["refusal"]
+        )
+        self.assertEqual(
+            {"finding": self.opened["finding"], "test": self.opened["test"],
+             "task": self.opened["task"], "impact_class": "write_target_state",
+             "risk_class": "approval_required"},
+            {key: self.parked[key]
+             for key in ("finding", "test", "task", "impact_class", "risk_class")},
+        )
+
+    def test_the_question_is_about_a_test_rather_than_about_a_call(self):
+        code, about_the_test, no_call, no_run, parks_a_task, question, risk = self.question
+
+        self.assertEqual("impact_unauthorized", str(code))
+        self.assertEqual((True, True, True, True),
+                         (bool(about_the_test), bool(no_call), bool(no_run),
+                          bool(parks_a_task)))
+        self.assertEqual("approval_required", str(risk))
+        self.assertEqual(
+            f"[approval_required] prove write_target_state on {self.opened['finding']}"
+            f" via {self.opened['test']} against app.example.com (identity none)"
+            f" -- impact_classes:write_target_state"
+            f" | effect: {self.IMPACT['effect']}"
+            f" | undone by: {self.IMPACT['cleanup']}",
+            str(question),
+        )
+
+    def test_the_question_says_what_would_be_done_and_what_would_undo_it(self):
+        """Criterion 1: the grant is over an explicit side effect and cleanup.
+
+        Both sentences are inside the digest the question is rendered from, so
+        an approval cannot survive somebody rewriting either of them -- which is
+        what `equivalence_key` being computed over the digest means.
+        """
+        digest = self.rows(
+            "SELECT request_digest FROM pending_decisions"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (self.program_id, self.parked["parked"]),
+        )[0][0]
+        carried = json.loads(str(digest))
+
+        self.assertEqual(
+            (self.IMPACT["effect"], self.IMPACT["cleanup"], None),
+            (carried["effect"], carried["undone_by"], carried["identity_slot"]),
+        )
+        self.assertEqual(
+            self.rows("SELECT spec_sha256 FROM tests WHERE id = $1::uuid",
+                      (self.test,))[0][0],
+            carried["spec_sha256"],
+        )
+
+    def test_asking_the_same_question_twice_asks_it_once(self):
+        """A second run reaching the same wall joins the question already open.
+
+        026's unique index only covers approvals, so nothing underneath would
+        stop a second copy -- and each park overwrites `tasks.pending_decision_id`,
+        which would leave the first copy pointing at a Task that no longer points
+        back at it.
+        """
+        asked = self.rows(
+            "SELECT count(*) FROM pending_decisions"
+            " WHERE program_id = $1::uuid AND test_id = $2::uuid",
+            (self.program_id, self.test),
+        )[0][0]
+
+        self.assertEqual(1, int(asked))
+        self.assertEqual(self.parked["parked"], self.asked_again["parked"])
+
+    def test_a_question_about_impact_names_a_task_that_is_waiting(self):
+        """Criterion 2's park, as a condition of the question rather than a habit.
+
+        Written by hand against a Task that is running, because no verb produces
+        the disagreement: the opener files the question and parks the Task in one
+        transaction, which is why the trigger is deferred to the commit.
+        """
+        refusal = self.refuse(
+            "INSERT INTO pending_decisions (program_id, task_id, test_id, tool,"
+            "                               risk_class, risk_rule, question_code,"
+            "                               request_digest, equivalence_key, question,"
+            "                               deadline_at)"
+            " SELECT $1::uuid, t.id, $3::uuid, rk2_replay_tool(), 'approval_required',"
+            "        'impact_classes:write_target_state', 'impact_unauthorized',"
+            "        $4::jsonb, equivalence_key($4::jsonb),"
+            "        render_decision_question($4::jsonb, 'approval_required',"
+            "                                 'impact_classes:write_target_state'),"
+            "        now() + interval '30 minutes'"
+            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2",
+            (self.program_id, self.opened["task"], self.test,
+             json.dumps({"kind": "impact", "asked": "by hand"})),
+        )
+
+        self.assertIn("asks about impact and task", refusal)
+        self.assertIn("is claimed on nothing", refusal)
+
+    def test_the_new_subject_column_is_inside_029s_rule(self):
+        """029: the runtime may read every column of a question but the answer.
+
+        A column added after that migration is outside a grant that was
+        generated once, so this asks about the one this ticket added.
+        """
+        reads_the_subject, reads_the_answer = self.rows(
+            "SELECT has_column_privilege('rk2_runtime', 'pending_decisions',"
+            "                            'test_id', 'SELECT'),"
+            "       has_column_privilege('rk2_runtime', 'pending_decisions',"
+            "                            'answer', 'SELECT')"
+        )[0]
+
+        self.assertEqual((True, False),
+                         (bool(reads_the_subject), bool(reads_the_answer)))
+
+    def test_a_question_nobody_has_answered_yet_is_still_worth_asking(self):
+        self.assertIsNone(self.still_worth_asking)
+
+    def test_the_answer_lets_the_task_go_round_again(self):
+        self.assertEqual("approved", self.answered["status"])
+        self.assertEqual("pending", self.released)
+
+    def test_the_granted_run_names_the_approval_it_ran_under(self):
+        self.assertEqual(self.parked["parked"], self.proved["plan"]["grant"])
+
+        grant, key = self.rows(
+            "SELECT d.label, ir.equivalence_key = d.equivalence_key"
+            "  FROM impact_replays ir JOIN pending_decisions d"
+            "    ON d.id = ir.pending_decision_id"
+            " WHERE ir.tool_run_id = $1::uuid",
+            (self.proved["plan"]["tool_run_id"],),
+        )[0]
+
+        self.assertEqual((self.parked["parked"], True), (str(grant), bool(key)))
+
+    def test_one_impact_replay_of_a_finding_at_a_time(self):
+        self.assertIn("is already in flight", self.second_in_flight)
+
+    # -- criterion 3: the claim is exactly as validation left it ----------------
+
+    def test_an_impact_run_settles_nothing_about_the_claim(self):
+        self.assertEqual(self.claim_before, self.claim_after)
+        self.assertEqual("supported", self.proved["closed"]["hypothesis_status"])
+        self.assertEqual("validated", self.claim_after[4])
+
+    def test_no_observation_was_written_about_what_the_impact_run_saw(self):
+        seen = self.rows(
+            "SELECT count(*) FROM impact_replays ir"
+            "  JOIN test_replay_actions a ON a.tool_run_id = ir.tool_run_id"
+            "  JOIN observations o ON o.receipt_id = a.receipt_id"
+            " WHERE ir.program_id = $1::uuid",
+            (self.program_id,),
+        )[0][0]
+
+        self.assertEqual(0, int(seen))
+
+    def test_the_detection_opener_refuses_a_test_that_states_an_impact(self):
+        self.assertIn("states an impact", self.detection_refusal)
+
+    # -- criterion 4: what a demonstration is made of ---------------------------
+
+    def test_a_holding_run_that_cleaned_up_after_itself_demonstrates_the_impact(self):
+        closed = self.proved["closed"]
+
+        self.assertEqual("holds", closed["outcome"])
+        self.assertIsNone(closed["demonstration_refused"])
+        self.assertIsNotNone(closed["demonstration"])
+
+        klass, cleanup, undone, receipts, after = self.rows(
+            "SELECT d.impact_class, d.cleanup, d.cleanup_receipts, d.receipts,"
+            "       a.ordinal = ($2::jsonb ->> 'after_state')::integer"
+            "  FROM impact_demonstrations d"
+            "  JOIN test_replay_actions a ON a.tool_run_id = d.tool_run_id"
+            "   AND a.receipt_id = d.after_state_receipt_id"
+            " WHERE d.id = $1::uuid",
+            (closed["demonstration"], json.dumps(self.IMPACT)),
+        )[0]
+
+        self.assertEqual(
+            ("write_target_state", "done", len(self.UNDO), 3, True),
+            (str(klass), str(cleanup), int(undone), int(receipts), bool(after)),
+        )
+
+    def test_a_run_that_left_the_target_changed_demonstrates_nothing(self):
+        closed = self.uncleaned["closed"]
+
+        self.assertEqual("holds", closed["outcome"])
+        self.assertIsNone(closed["demonstration"])
+        self.assertEqual(
+            "no impact is demonstrated: the cleanup was reported failed"
+            " (the PUT that undoes it answered 500)",
+            closed["demonstration_refused"],
+        )
+
+    def test_a_cleanup_nobody_performed_is_not_a_cleanup(self):
+        """The word and the evidence, told apart.
+
+        `done` is what the supervisor said; the Receipts are what the door saw.
+        The operator's grant was over a side effect and its undoing, so a run
+        that sent none of the requests that undo it has not done what was granted
+        however it reports itself.
+        """
+        closed = self.unproven_cleanup["closed"]
+
+        self.assertEqual("holds", closed["outcome"])
+        self.assertIsNone(closed["demonstration"])
+        self.assertEqual(0, int(closed["cleanup_receipts"]))
+        self.assertEqual(
+            "no impact is demonstrated: the cleanup was reported done and 0 of the"
+            f" {len(self.UNDO)} requests that undo it were sent",
+            closed["demonstration_refused"],
+        )
+
+    def test_a_run_that_did_not_hold_demonstrates_nothing(self):
+        closed = self.unheld["closed"]
+
+        self.assertEqual("refutes", closed["outcome"])
+        self.assertIsNone(closed["demonstration"])
+        self.assertEqual(
+            "no impact is demonstrated: the run concluded refutes",
+            closed["demonstration_refused"],
+        )
+
+    def test_exactly_one_demonstration_came_out_of_four_runs(self):
+        shown = self.rows(
+            "SELECT count(*) FROM impact_demonstrations WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )[0][0]
+
+        self.assertEqual(1, int(shown))
+
+    # -- criterion 5: what no grant admits --------------------------------------
+
+    def test_the_three_forbidden_classes_are_refused_where_a_test_is_written(self):
+        for klass, refusal in self.forbidden.items():
+            with self.subTest(impact_class=klass):
+                self.assertIn(f"impact class {klass} is forbidden", refusal)
+        self.assertIn("no impact class named read_the_minds", self.unknown_class)
+        self.assertIn("this specification states no impact", self.detection_task)
+
+    def test_a_forbidden_class_cannot_even_become_a_question(self):
+        refusal = self.refuse(
+            "INSERT INTO pending_decisions (program_id, task_id, test_id, tool, risk_class,"
+            "                               risk_rule, question_code, request_digest,"
+            "                               equivalence_key, question, deadline_at)"
+            " SELECT $1::uuid, t.id, $3::uuid, rk2_replay_tool(), 'forbidden',"
+            "        'impact_classes:degrade_availability', 'impact_unauthorized',"
+            "        '{}'::jsonb, equivalence_key('{}'::jsonb),"
+            "        render_decision_question('{}'::jsonb, 'forbidden',"
+            "                                 'impact_classes:degrade_availability'),"
+            "        now() + interval '30 minutes'"
+            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2",
+            (self.program_id, self.opened["task"], self.test),
+        )
+
+        self.assertIn("pending_decisions_never_forbidden", refusal)
+
+    # -- criterion 6: severity is stated, with a basis --------------------------
+
+    def test_a_severity_rests_on_something_that_exists(self):
+        self.assertIn("no impact has been demonstrated", self.severities["nothing_shown"])
+        self.assertIn(
+            "severity rests on a demonstration, a constrained inference or the"
+            " Program context",
+            self.severities["no_such_basis"],
+        )
+
+    def test_the_demonstrated_severity_names_the_demonstration_it_read(self):
+        self.assertEqual(self.proved["closed"]["demonstration"], self.stated["demonstration"])
+        self.assertEqual(("high", "demonstrated_impact"),
+                         (self.stated["severity"], self.stated["basis"]))
+
+    def test_every_basis_is_recorded_with_the_words_that_argued_it(self):
+        stated = self.rows(
+            "SELECT basis, severity, actor_kind, impact_demonstration_id IS NOT NULL"
+            "  FROM severity_statements WHERE finding_id = ANY($1::uuid[])"
+            " ORDER BY created_at, id",
+            (pg.quote_array((self.finding, self.plain)),),
+        )
+
+        self.assertEqual(
+            [("demonstrated_impact", "high", "runtime", True),
+             ("constrained_inference", "medium", "runtime", False),
+             ("program_context", "low", "runtime", False)],
+            [(str(basis), str(severity), str(actor), bool(shown))
+             for basis, severity, actor, shown in stated],
+        )
+
+    def test_a_finding_with_a_demonstration_is_not_a_thing_to_infer_about(self):
+        self.assertIn("has a demonstrated impact and needs no inference",
+                      self.not_an_inference)
+
+    def test_the_program_document_alone_does_not_reach_the_top_two_bands(self):
+        self.assertIn("the Program context alone does not make", self.too_high)
+
+    def test_the_column_says_what_the_latest_statement_said(self):
+        demonstrated = self.rows(
+            "SELECT severity, severity_basis FROM findings WHERE id = $1::uuid",
+            (self.finding,),
+        )[0]
+        plain = self.rows(
+            "SELECT severity, severity_basis FROM findings WHERE id = $1::uuid",
+            (self.plain,),
+        )[0]
+
+        self.assertEqual(("high", "demonstrated_impact"),
+                         tuple(str(field) for field in demonstrated))
+        self.assertEqual(("low", "program_context"),
+                         tuple(str(field) for field in plain))
+
+    def test_the_severity_column_cannot_be_moved_by_hand(self):
+        self.assertIn("the latest severity stated for", self.by_hand)
+
+    def test_the_report_gate_asks_about_the_band_and_the_vector_separately(self):
+        self.assertIn("severity_unstated", self.blockers_before)
+        self.assertNotIn("severity_unstated", self.blockers_after)
+        self.assertNotIn("severity_scope_moved", self.blockers_after)
+        self.assertEqual("soft", self.blockers_moved["severity_scope_moved"][0])
+
+    def test_nothing_but_state_severity_writes_the_band(self):
+        writers = self.rows(
+            "SELECT proname FROM pg_proc"
+            " WHERE pronamespace = 'public'::regnamespace"
+            "   AND prosrc ~ 'UPDATE findings SET severity'"
+        )
+
+        self.assertEqual(["state_severity"], [str(name) for name, in writers])
+
+    # -- the standing check -----------------------------------------------------
+
+    def test_the_standing_check_holds_over_everything_this_case_proved(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
 if __name__ == "__main__":
