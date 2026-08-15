@@ -1391,6 +1391,113 @@ class ToolCommandTest(unittest.TestCase):
         self.assertFalse(root.exists())
 
 
+class ReplayCommandTest(unittest.TestCase):
+    """`rk test replay`, up to the point where a database and a door are needed.
+
+    A replay names two things by label and nothing by value: which agent run
+    performs it and which Test it performs. The specification is already stored
+    and already digested, so there is no plan file, no method and no url on this
+    command line -- an operator who could pass one could perform a request the
+    Test never stated, under a Receipt the Test would then be credited with.
+
+    The door is named the way `rk proxy request` names it, because it is the same
+    fence and the same secret travelling to it.
+    """
+
+    def arguments(self, *extra: str) -> tuple[str, ...]:
+        return (
+            "test", "replay",
+            "--config", str(write(SCOPED)),
+            "--agent-run", "AR1",
+            "--test", "T1",
+            *extra,
+        )
+
+    def test_the_door_is_named_alongside_the_connection(self):
+        result = run(*self.arguments())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("test replay", report["command"])
+        self.assertEqual(
+            ["environment:RK_DATABASE_URL", "environment:RK_PROXY_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_a_replay_without_a_run_a_test_or_a_configuration_is_a_usage_error(self):
+        for missing, value in (("--agent-run", "AR1"), ("--test", "T1"), ("--config", None)):
+            with self.subTest(missing):
+                given = [
+                    item
+                    for item in self.arguments()
+                    if item != missing and item != value and not item.endswith(".toml")
+                ]
+
+                result = run(*given)
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn(missing, result.stderr)
+        self.assertEqual(EXIT_USAGE, run("test").returncode)
+
+    def test_a_capability_may_not_be_sent_anywhere_but_the_loopback_interface(self):
+        # The same refusal `rk proxy request` makes, for the same reason: this
+        # command holds one plaintext capability and the endpoint decides where
+        # it is allowed to go. Refused before the configuration is read.
+        for endpoint, why in (
+            ("http://proxy.example.net:8080", "not on this machine"),
+            ("https://127.0.0.1:8080", "not plain HTTP"),
+            ("127.0.0.1:8080", "not a URL at all"),
+        ):
+            with self.subTest(why):
+                result = run(
+                    *self.arguments(
+                        "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                        "--proxy", endpoint,
+                    )
+                )
+
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+                self.assertEqual(
+                    ["environment:RK_PROXY_URL"],
+                    [item["source"] for item in json.loads(result.stdout)["violations"]],
+                )
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(
+            *self.arguments(
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                "--proxy", "http://127.0.0.1:8080",
+            )
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("test replay", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            *self.arguments(
+                "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+                "--proxy", "http://127.0.0.1:8080",
+            )
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+    def test_a_refused_configuration_reaches_no_door_and_opens_no_connection(self):
+        observed = observe(
+            "test", "replay",
+            "--config", str(write(SCOPED.replace("requests = 100", "requests = 0"))),
+            "--agent-run", "AR1",
+            "--test", "T1",
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--proxy", "http://127.0.0.1:1",
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+
 class InterruptedCommandTest(unittest.TestCase):
     """A database that stops answering after the command has started.
 

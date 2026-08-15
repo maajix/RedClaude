@@ -75,6 +75,7 @@ from redkraken import (
     program,
     proposal,
     proxy,
+    replay,
     roster,
     scope,
     seal,
@@ -151,6 +152,39 @@ HYPOTHESIS = (
     "INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
     " VALUES ($1, $2, (SELECT id FROM property_classes ORDER BY id LIMIT 1), 'a self test')"
     " RETURNING id"
+)
+
+#: One Test specification the shape rule accepts, for every fixture that needs a
+#: Test and is not about what a Test may say. Three actions under the three
+#: roles and one assertion, which is the smallest thing 035's constraint admits:
+#: a Test with no control could never support the claim it was written for, and
+#: a Test that asserts nothing settles nothing.
+SPECIFICATION = {
+    "preconditions": [{"kind": "identity_leased", "detail": "the operator slot is leased"}],
+    "setup": [],
+    "actions": [
+        {"ordinal": 1, "role": "baseline", "kind": "request",
+         "method": "GET", "url": "https://app.example.com/orders/1"},
+        {"ordinal": 2, "role": "variant", "kind": "request",
+         "method": "GET", "url": "https://app.example.com/orders/2"},
+        {"ordinal": 3, "role": "control", "kind": "request",
+         "method": "GET", "url": "https://app.example.com/orders/3"},
+    ],
+    "assertions": [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+    ],
+    "cleanup": [],
+}
+
+#: One stored Test, digested by the function the constraint checks it with. The
+#: digest is not computed in Python for a reason worth stating: it is taken over
+#: the jsonb rendering, whose keys the server sorts, and `json.dumps` does not
+#: produce that ordering -- so a second implementation here would be a second
+#: answer that happens to agree until a key is added.
+TEST_SPEC = (
+    "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+    " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))"
+    " RETURNING id::text"
 )
 
 #: What the database is, in the terms criterion 6 is about: its size on disk,
@@ -1770,6 +1804,42 @@ CONTROLS = (
         # rubric before it is scored.
         "standing:browser_runs",
         "GRANT SELECT ON browser_probes TO rk2_state",
+    ),
+    Control(
+        # PH2-35 criterion 6: a replay whose Tool run ended and left no Test
+        # run. `close_test_replay` writes the two in one transaction and an
+        # abandoned run stays running, so the verbs cannot reach this state --
+        # what it is, seen from outside, is work that was performed, billed and
+        # closed as a success, with nothing anywhere saying what it found.
+        "standing:test_replays",
+        "DO $ctl$ DECLARE p uuid; e uuid; h uuid; s uuid; k uuid; a uuid; t uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('replay-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, label, dedup_key)"
+        "        VALUES (p, 'technology', 'replay-selftest', 'tech:replay-selftest')"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+        "        VALUES (p, e, (SELECT id FROM property_classes ORDER BY id LIMIT 1),"
+        "                'a self test')"
+        "     RETURNING id INTO h;"
+        "   INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+        f"        VALUES (p, h, '{json.dumps(SPECIFICATION)}'::jsonb,"
+        f"                rk2_test_spec_digest('{json.dumps(SPECIFICATION)}'::jsonb))"
+        "     RETURNING id INTO s;"
+        "   INSERT INTO tasks (program_id, kind, subject_entity_id) VALUES (p, 'recon', e)"
+        "     RETURNING id INTO k;"
+        "   INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
+        "        VALUES (p, k, 'recon', 'operator', 'low', '{}'::jsonb)"
+        "     RETURNING id INTO a;"
+        "   INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args, status,"
+        "                          transport, finished_at)"
+        "        VALUES (p, a, k, rk2_replay_tool(), '{}'::jsonb, 'success', 'runtime', now())"
+        "     RETURNING id INTO t;"
+        "   INSERT INTO test_replays (tool_run_id, program_id, test_id, spec_sha256)"
+        "        SELECT t, p, s, spec_sha256 FROM tests WHERE id = s;"
+        " END $ctl$",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -12502,6 +12572,9 @@ class NegativeKnowledgeTest(DatabaseCase):
 
     settings_for = "migrate"
 
+    #: The Tool run every allowed Receipt here names, made on first use.
+    held: str | None = None
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -12756,21 +12829,48 @@ class NegativeKnowledgeTest(DatabaseCase):
         )
 
     @classmethod
-    def receipt(cls) -> str:
-        """One receipt of the Program's own traffic, on the replay lane.
+    def capability(cls) -> str:
+        """The one live capability every Receipt below is written under.
 
-        Replay because 040 fences the agent one behind a live capability, and
-        what is under test here is what a refutation cites rather than how the
-        exchange that produced it was authorised.
+        035 fences the replay lane the way 040 fences the agent one, so there
+        is no lane left on which an allowed Receipt costs nothing -- which is
+        the point of both fences. What the trigger asks for is a Tool run that
+        is still running, was allowed, holds an unexpired token and belongs to
+        an Agent run that has not finished; no Task, because the trigger's
+        other arm is the run that holds no lease and these Receipts are not
+        about a Task. One chain serves all of them: what is under test here is
+        what a refutation cites, not how many exchanges produced it.
         """
+        if cls.held is None:
+            run = cls.scalar(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session', 'operator',"
+                " 'low', '{}'::jsonb) RETURNING id::text",
+                (cls.program_id,),
+            )
+            cls.held = str(
+                cls.scalar(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
+                    " transport, decision, egress_token_sha256, egress_token_expires_at)"
+                    " VALUES ($1::uuid, $2::uuid, 'mcp__rk2__net_request', '{}'::jsonb,"
+                    "         'running', 'runtime', 'allow', $3,"
+                    "         clock_timestamp() + interval '1 hour') RETURNING id::text",
+                    (cls.program_id, run, "e" * 64),
+                )
+            )
+        return cls.held
+
+    @classmethod
+    def receipt(cls) -> str:
+        """One receipt of the Program's own traffic, under that capability."""
         return str(
             cls.scalar(
-                "INSERT INTO receipts (program_id, lane, decision, reason, ts_arrival,"
-                " scope_class, scope_version)"
-                " VALUES ($1::uuid, 'replay', 'allowed', 'seeded', now(), 'target',"
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                " ts_arrival, scope_class, scope_version)"
+                " VALUES ($1::uuid, $2::uuid, 'agent', 'allowed', 'seeded', now(), 'target',"
                 "         (SELECT max(version) FROM program_scope_versions"
                 "           WHERE program_id = $1::uuid)) RETURNING id::text",
-                (cls.program_id,),
+                (cls.program_id, cls.capability()),
             )
         )
 
@@ -12810,21 +12910,22 @@ class NegativeKnowledgeTest(DatabaseCase):
                 " polarity, role) VALUES ($1::uuid, $2::uuid, $3, $4)",
                 (hypothesis, observation, polarity, role),
             )
-        test = cls.scalar(
-            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
-            " VALUES ($1::uuid, $2::uuid, '{}'::jsonb,"
-            "         encode(sha256('{}'::bytea), 'hex')) RETURNING id::text",
-            (cls.program_id, hypothesis),
-        )
+        test = cls.scalar(TEST_SPEC, (cls.program_id, hypothesis, json.dumps(SPECIFICATION)))
+        # The agent lane, because that is the lane of the Receipt above and 042
+        # refuses a run that cites the other party's evidence. Nothing here
+        # replayed anything: the requests were the agent's, and what is under
+        # test is what the refutation reads back, not who made it.
         run = cls.scalar(
             "INSERT INTO test_runs (program_id, test_id, lane, outcome, assertion_results)"
-            " VALUES ($1::uuid, $2::uuid, 'replay', 'fails', '[{\"held\": false}]'::jsonb)"
+            " VALUES ($1::uuid, $2::uuid, 'agent', 'refutes', $3::jsonb)"
             " RETURNING id::text",
-            (cls.program_id, test),
+            (cls.program_id, test,
+             json.dumps({"assertions": [{"id": "the-variant-is-served", "held": False}],
+                         "failed": ["the-variant-is-served"], "cleanup": "done"})),
         )
         cls.as_owner(
-            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal)"
-            " VALUES ($1::uuid, $2::uuid, $3::uuid, 1)",
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 1, 'variant')",
             (cls.program_id, run, receipt),
         )
         for was, now, cited in (
@@ -13075,7 +13176,7 @@ class NegativeKnowledgeTest(DatabaseCase):
             (self.settled,),
         ).rows
 
-        self.assertEqual([True, "fails", "fails", True, True], list(named))
+        self.assertEqual([True, "refutes", "refutes", True, True], list(named))
 
     def test_the_evidence_is_kept_as_it_stood_at_settling(self):
         edges = self.connection.execute(
@@ -13165,7 +13266,7 @@ class NegativeKnowledgeTest(DatabaseCase):
         self.assertEqual("settled", str(seen[0]))
         self.assertIsNotNone(seen[1])
         self.assertEqual(self.first_kept["fingerprint"], str(seen[2]))
-        self.assertEqual("fails", str(seen[3]))
+        self.assertEqual("refutes", str(seen[3]))
         self.assertEqual(2, int(seen[4]))
 
     # -- criterion 3: an unrelated change leaves it current -------------------
@@ -14142,21 +14243,41 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             " VALUES ($1, 9, 'text/plain', 'agent_visible')",
             (ANALYZED_SHA,),
         )
+        # An allowed receipt names the capability it was served under, on every
+        # lane that can carry one: 040 fences the agent lane and 035 fences the
+        # replay lane the same way, so the exchange is built rather than dodged.
+        # It is the smallest thing the trigger accepts -- a running, allowed
+        # tool run under an open agent run and no Task, so no lease is in play.
+        # The scope class and the policy version it was classified under are
+        # 021's biconditional: a receipt of the Program's own traffic carries
+        # both.
+        served = str(
+            cls.scalar(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session', 'operator',"
+                " 'low', '{}'::jsonb) RETURNING id::text",
+                (program_id,),
+            )
+        )
+        capability = str(
+            cls.scalar(
+                "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
+                " transport, decision, egress_token_sha256, egress_token_expires_at)"
+                " VALUES ($1::uuid, $2::uuid, 'mcp__rk2__net_request', '{}'::jsonb,"
+                "         'running', 'runtime', 'allow', $3,"
+                "         clock_timestamp() + interval '1 hour') RETURNING id::text",
+                (program_id, served, "f" * 64),
+            )
+        )
         receipt = str(
             cls.scalar(
-                # The replay lane, because 040 fences the agent one: an allowed
-                # agent receipt has to name a live capability held by a running
-                # tool run, which is a whole exchange this fixture does not have
-                # and `ready_for` does not ask about. The scope class and the
-                # policy version it was classified under are 021's biconditional
-                # -- a receipt of the Program's own traffic carries both.
-                "INSERT INTO receipts (program_id, lane, decision, reason,"
+                "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
                 " ts_arrival, response_agent_sha, scope_class, scope_version)"
-                " VALUES ($1::uuid, 'replay', 'allowed', 'seeded', now(), $2,"
+                " VALUES ($1::uuid, $2::uuid, 'agent', 'allowed', 'seeded', now(), $3,"
                 "         'target', (SELECT max(version) FROM program_scope_versions"
                 "                     WHERE program_id = $1::uuid))"
                 " RETURNING id::text",
-                (program_id, ANALYZED_SHA),
+                (program_id, capability, ANALYZED_SHA),
             )
         )
         cls.as_owner(
@@ -14296,27 +14417,82 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         a run of the spec as well: `findings` refuses `validated` without the
         `test_runs` row, which is Q27 in the schema -- validated means the
         runtime re-ran it.
+
+        And re-running it leaves a trail. 035's `replay_run_without_receipts`
+        reports a replay run that concluded on no exchange at all, which is
+        what a bare `test_runs` row is: a validation nothing was validated by.
+        So the run is built the way `close_test_replay` builds one -- a
+        replay-bound capability, a Receipt of the run's own Lane under it, and
+        the citation joining the two -- and the capability is closed against
+        the run it produced, which is the state a finished replay is in.
         """
         program_id = cls.identifiers[name]
         hypothesis = cls.hypothesis(name, subject, "worth judging")
         test = str(
-            cls.scalar(
-                "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
-                " VALUES ($1::uuid, $2::uuid, '{}'::jsonb,"
-                "         encode(sha256('{}'::bytea), 'hex')) RETURNING id::text",
-                (program_id, hypothesis),
-            )
+            cls.scalar(TEST_SPEC, (program_id, hypothesis, json.dumps(SPECIFICATION)))
         )
         run = None
         if status == "validated":
+            holder = str(
+                cls.scalar(
+                    "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                    " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session',"
+                    " 'operator', 'low', '{}'::jsonb) RETURNING id::text",
+                    (program_id,),
+                )
+            )
+            # The `test_replays` row is what makes the capability replay-bound:
+            # `rk2_capability_lane` reads this table and nothing else, so
+            # without it the Receipt below would claim a Lane its own Tool run
+            # does not hold.
+            capability = str(
+                cls.scalar(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
+                    " transport, decision, egress_token_sha256, egress_token_expires_at)"
+                    " VALUES ($1::uuid, $2::uuid, rk2_replay_tool(), '{}'::jsonb,"
+                    "         'running', 'runtime', 'allow', $3,"
+                    "         clock_timestamp() + interval '1 hour') RETURNING id::text",
+                    (program_id, holder, os.urandom(32).hex()),
+                )
+            )
+            cls.as_owner(
+                "INSERT INTO test_replays (tool_run_id, program_id, test_id, spec_sha256)"
+                " SELECT $1::uuid, $2::uuid, id, spec_sha256 FROM tests WHERE id = $3::uuid",
+                (capability, program_id, test),
+            )
+            receipt = str(
+                cls.scalar(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version)"
+                    " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed', 'seeded', now(),"
+                    "         'target', (SELECT max(version) FROM program_scope_versions"
+                    "                     WHERE program_id = $1::uuid)) RETURNING id::text",
+                    (program_id, capability),
+                )
+            )
             run = str(
                 cls.scalar(
                     "INSERT INTO test_runs (program_id, test_id, lane, outcome,"
                     " assertion_results)"
-                    " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', '[]'::jsonb)"
+                    " VALUES ($1::uuid, $2::uuid, 'replay', 'holds', $3::jsonb)"
                     " RETURNING id::text",
-                    (program_id, test),
+                    (program_id, test,
+                     json.dumps({"assertions": [], "failed": [], "cleanup": "done"})),
                 )
+            )
+            cls.as_owner(
+                "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id,"
+                " ordinal, role) VALUES ($1::uuid, $2::uuid, $3::uuid, 1, 'baseline')",
+                (program_id, run, receipt),
+            )
+            cls.as_owner(
+                "UPDATE test_replays SET test_run_id = $2::uuid WHERE tool_run_id = $1::uuid",
+                (capability, run),
+            )
+            cls.as_owner(
+                "UPDATE tool_runs SET status = 'success', finished_at = now()"
+                " WHERE id = $1::uuid",
+                (capability,),
             )
         finding = str(
             cls.scalar(
@@ -22411,6 +22587,1751 @@ class BrowserCommandTest(DatabaseCase):
         ]
 
         self.assertEqual([], problems)
+
+
+REPLAY_SLUG = "selftest-replay"
+
+#: The three destinations the Test below reaches, all `target` under the fixture
+#: scope. Spelled once because the specifications built from them have to name
+#: the same urls the Receipts are written against -- a differential over two
+#: urls that are not the ones the plan named would be a differential over
+#: nothing.
+BASE = "https://app.example.com/api/orders"
+
+
+def specification(
+    assertions: list[dict],
+    *,
+    setup: list[dict] | None = None,
+    cleanup: list[dict] | None = None,
+    actions: list[dict] | None = None,
+) -> str:
+    """One Test specification, as the column takes it.
+
+    The three roles are the default because every Test needs all three and only
+    the arms about the shape rule are interested in one that does not.
+    """
+    return json.dumps(
+        {
+            "preconditions": [{"kind": "scope_holds", "detail": "the orders API is in scope"}],
+            "setup": setup or [],
+            "actions": actions
+            or [
+                {"ordinal": ordinal, "role": role, "kind": "request",
+                 "method": "GET", "url": f"{BASE}/{ordinal}"}
+                for ordinal, role in enumerate(("baseline", "variant", "control"), start=1)
+            ],
+            "assertions": assertions,
+            "cleanup": cleanup or [],
+        }
+    )
+
+
+class ReplayTestRunTest(DatabaseCase):
+    """Ticket 35: one Test performed through the replay Lane, end to end.
+
+    Everything runs as `rk2_runtime` and commits, because the thing under test is
+    a sequence of verbs across transactions: the plan is committed before a
+    request is made, each action is recorded as it happens, and the close settles
+    a claim by reading rows the earlier transactions wrote. A case that rolled
+    back would be testing none of that.
+
+    The Receipts are written by the owner rather than by the door. What produces
+    one in production is `write_allowed_receipt` on the proxy's session, which is
+    tested where the door is tested; what this case needs is the Lane on the row,
+    and the control that matters -- that a `replay` Receipt still requires a live
+    capability behind it -- is proved directly in its own arm below.
+    """
+
+    settings_for = "runtime"
+
+    OPEN = "SELECT open_test_replay($1::uuid, $2::uuid, $3)"
+    RECORD = "SELECT record_test_action($1::uuid, $2::integer, $3)"
+    EVALUATE = "SELECT evaluate_test_assertions($1::uuid)"
+    CLOSE = "SELECT close_test_replay($1::uuid, $2, $3)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{REPLAY_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+        cls.owner_connection = pg.connect(cls.harness.migrate)
+        cls.refusals = {}
+
+        cls.settle_one_that_holds()
+        cls.settle_one_that_refutes()
+        cls.leave_one_inconclusive()
+        cls.settle_one_that_holds_and_cannot_say_so()
+        cls.refuse_a_request_the_door_would_not_send()
+        cls.refuse_what_a_run_may_not_cite()
+        cls.refuse_a_specification_nobody_should_store()
+        cls.refuse_a_replay_the_conditions_do_not_admit()
+        cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
+
+    @classmethod
+    def tearDownClass(cls):
+        # Read before the purge and deleted after it: the bytes are shared and
+        # outlive the Program whose Receipts named them, and a seal is scoped by
+        # a kind and an id rather than by a foreign key, so nothing about
+        # deleting a Program reaches either.
+        kept = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
+                "  FROM receipts"
+                " WHERE program_id IN (SELECT id FROM programs WHERE slug LIKE $1)"
+                " UNION"
+                " SELECT sha256 FROM artifact_references"
+                " WHERE program_id IN (SELECT id FROM programs WHERE slug LIKE $1)",
+                (REPLAY_SLUG + "%",),
+            ).rows
+            if row[0] is not None
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program'"
+                "   AND scope_id IN (SELECT id FROM programs WHERE slug LIKE $1)",
+                (REPLAY_SLUG + "%",),
+            )
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (REPLAY_SLUG + "%",))
+            cls.connection.execute(
+                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                ("{" + ",".join(kept) + "}",),
+            )
+        cls.owner_connection.close()
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def called(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One verb whose answer is a document, committed."""
+        return json.loads(committed(cls.connection, sql, parameters))
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()) -> None:
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute(sql, parameters)
+
+    @classmethod
+    def refuse(cls, sql: str, parameters: tuple = ()) -> str:
+        return refusal_message(cls.connection, sql, parameters)
+
+    @classmethod
+    def claim_waiting(cls, statement: str) -> tuple[str, str]:
+        """One claim waiting to be tested, and the subject it is about.
+
+        Fresh each time, because the machine allows one claim to be in `testing`
+        once and every walk below settles the claim it opened: sharing one would
+        make each arm an assertion about whichever walk got there first.
+        """
+        subject = offline_entity(cls.connection, cls.program_id)
+        hypothesis = committed(
+            cls.connection,
+            "INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+            " VALUES ($1::uuid, $2::uuid,"
+            "         (SELECT id FROM property_classes ORDER BY id LIMIT 1), $3)"
+            " RETURNING id",
+            (cls.program_id, subject, statement),
+        )
+        cls.as_owner(
+            "INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status,"
+            " to_status, actor_kind, rationale)"
+            " VALUES ($1::uuid, $2::uuid, 'proposed', 'testable', 'runtime', 'seeded')",
+            (cls.program_id, hypothesis),
+        )
+        return hypothesis, subject
+
+    @classmethod
+    def stored(cls, hypothesis: str, spec: str) -> str:
+        """One immutable Test of that claim."""
+        return committed(
+            cls.connection,
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))"
+            " RETURNING id",
+            (cls.program_id, hypothesis, spec),
+        )
+
+    @classmethod
+    def replay_run(cls) -> str:
+        return claimed_agent_run(
+            cls.connection, cls.owner_connection, cls.program_id, role="recon", kind="recon"
+        )
+
+    @classmethod
+    def receipted(
+        cls,
+        tool_run: str,
+        ordinal: int,
+        *,
+        status: int = 200,
+        body: str | None = None,
+        lane: str = "replay",
+    ) -> str:
+        """One exchange the door would have written, by the label it names it with.
+
+        `response_agent_sha` is what a body assertion compares, and it is a
+        digest rather than the bytes for the reason the column is: what a Test
+        asks is whether two answers were the same, and two digests answer that
+        without the runtime holding either page. The bytes are registered first
+        because the column is a foreign key into the store, and a Receipt naming
+        a page nobody kept is a Receipt no reader could check the Test against.
+        """
+        if body is not None:
+            with cls.connection.transaction():
+                cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                cls.connection.execute(
+                    "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+                    " VALUES ($1, $2::bigint, 'text/plain', 'agent_visible')"
+                    " ON CONFLICT (sha256) DO NOTHING",
+                    (artifact.digest(body.encode()), len(body.encode())),
+                )
+        return committed(
+            cls.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+            "                      method, scheme, host, port, path, status_code,"
+            "                      response_agent_sha, ts_arrival, scope_class, scope_version)"
+            " VALUES ($1::uuid, $2::uuid, $3, 'allowed',"
+            "         'allowed as target under scope version 1', 'GET', 'https',"
+            "         'app.example.com', 443, $4, $5::integer, $6, now(), 'target', 1)"
+            " RETURNING label",
+            (
+                cls.program_id, tool_run, lane, f"/api/orders/{ordinal}", status,
+                None if body is None else artifact.digest(body.encode()),
+            ),
+        )
+
+    @classmethod
+    def owner_as_runtime(cls) -> pg.Connection:
+        """The owner's connection, with the role and the actor already set.
+
+        A Receipt is the proxy's row and neither the runtime nor this case may
+        write one, so every arm that needs one becomes the owner for a statement.
+        The role is set for the session rather than per transaction because this
+        connection does nothing else.
+        """
+        cls.owner_connection.execute("SET ROLE rk2_owner")
+        return cls.owner_connection
+
+    @classmethod
+    def walked(
+        cls,
+        name: str,
+        spec: str,
+        *,
+        answers: dict[int, tuple[int, str | None]],
+        cleanup: str = "done",
+    ) -> dict:
+        """One whole replay: open it, answer each action, close it.
+
+        `answers` says what the door came back with for each ordinal, and an
+        ordinal absent from it is an action that produced no Receipt -- which is
+        the only way a run reaches the close with an assertion it cannot
+        evaluate.
+        """
+        hypothesis, subject = cls.claim_waiting(name)
+        test = cls.stored(hypothesis, spec)
+        plan = cls.called(cls.OPEN, (cls.replay_run(), test, None))
+        for action in plan["actions"]:
+            answer = answers.get(int(action["ordinal"]))
+            if answer is None:
+                continue
+            status, body = answer
+            receipt = cls.receipted(
+                plan["tool_run_id"], int(action["ordinal"]), status=status, body=body
+            )
+            committed(cls.connection, cls.RECORD, (plan["tool_run_id"], action["ordinal"], receipt))
+        closed = cls.called(cls.CLOSE, (plan["tool_run_id"], cleanup, None))
+        return {
+            "hypothesis": hypothesis,
+            "subject": subject,
+            "test": test,
+            "plan": plan,
+            "closed": closed,
+        }
+
+    # -- the three outcomes ----------------------------------------------------
+
+    @classmethod
+    def settle_one_that_holds(cls):
+        """Every assertion answered, and answered the way the Test predicted."""
+        cls.held = cls.walked(
+            "the orders API leaks a neighbour's order",
+            specification(
+                [
+                    {"id": "the-variant-is-served", "kind": "status_equals",
+                     "action": 2, "status": 200},
+                    {"id": "the-control-is-not", "kind": "status_differs",
+                     "action": 3, "against": 2},
+                    {"id": "the-bodies-differ", "kind": "body_differs",
+                     "action": 1, "against": 2},
+                ]
+            ),
+            answers={1: (200, "order one"), 2: (200, "order two"), 3: (403, "denied")},
+        )
+
+    @classmethod
+    def settle_one_that_refutes(cls):
+        """One assertion answered and answered the other way."""
+        cls.refuted = cls.walked(
+            "the orders API leaks the whole ledger",
+            specification(
+                [{"id": "the-control-is-refused", "kind": "status_equals",
+                  "action": 3, "status": 403}]
+            ),
+            answers={1: (200, "order one"), 2: (200, "order two"), 3: (200, "order three")},
+        )
+
+    @classmethod
+    def leave_one_inconclusive(cls):
+        """One assertion nothing answered, because its action never happened."""
+        cls.unsettled = cls.walked(
+            "the orders API accepts an unsigned token",
+            specification(
+                [{"id": "the-variant-is-served", "kind": "status_equals",
+                  "action": 2, "status": 200}]
+            ),
+            answers={1: (200, "order one"), 3: (403, "denied")},
+            cleanup="failed",
+        )
+
+    @classmethod
+    def settle_one_that_holds_and_cannot_say_so(cls):
+        """Every assertion held, and 007 still refuses the conclusion.
+
+        The Test performs a control -- the shape rule admits no Test that does
+        not -- and the door never answered it, so the run files a baseline and a
+        variant and no control at all. That is one Observation short of what
+        `testing -> supported` asks for, and the assertions do not care: the only
+        one stated names an action that was answered, so the run holds.
+
+        The state this produces is the one that has to be closeable. A refusal
+        raised out of the settling would take the Test run and its Receipts down
+        with it and leave the Tool run running, which is the one state no check
+        reports and no retry can leave.
+        """
+        cls.unsupported = cls.walked(
+            "the orders API answers a neighbour's order at all",
+            specification(
+                [{"id": "the-variant-is-served", "kind": "status_equals",
+                  "action": 2, "status": 200}]
+            ),
+            answers={1: (200, "order one"), 2: (200, "order two")},
+        )
+
+    @classmethod
+    def refuse_a_request_the_door_would_not_send(cls):
+        """The other Receipt a replay produces: the one the door refused.
+
+        `write_blocked_receipt` is the proxy's verb and the only writer of a
+        refusal, and it derived the Lane from `NEW.lane = 'agent'` until this
+        ticket. A refused replay request that landed in the agent Lane would be
+        a request nothing about this Test caused, sitting where the budget and
+        the Halt checks read the agent's traffic -- so the Lane is taken from
+        the capability that was presented, here as everywhere else.
+        """
+        hypothesis, _ = cls.claim_waiting("the orders API answers a request it refused")
+        plan = cls.called(
+            cls.OPEN,
+            (cls.replay_run(),
+             cls.stored(hypothesis, specification(
+                 [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}])),
+             None),
+        )
+        door = pg.connect(cls.harness.proxy)
+        try:
+            door.execute("SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,))
+            cls.blocked = str(
+                door.execute(
+                    "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)",
+                    (
+                        cls.program_id,
+                        json.dumps({"method": "GET", "scheme": "https",
+                                    "host": "app.example.com", "port": 443,
+                                    "path": "/api/orders/4"}),
+                        plan["capability"],
+                    ),
+                ).scalar()
+            )
+        finally:
+            door.close()
+        committed(cls.connection, cls.CLOSE, (plan["tool_run_id"], "skipped", "refused"))
+
+    # -- criterion 6's three refusals -----------------------------------------
+
+    @classmethod
+    def refuse_what_a_run_may_not_cite(cls):
+        """An agent-Lane Receipt, another run's Receipt, and a foreign Artifact.
+
+        All three against the run that already holds, because the trigger reads
+        the row as it is asked to write it and a closed run is exactly the state
+        a later writer would find.
+        """
+        run = cls.held["closed"]["test_run_id"]
+        other = cls.walked(
+            "the orders API rejects a forged signature",
+            specification(
+                [{"id": "the-variant-is-served", "kind": "status_equals",
+                  "action": 2, "status": 200}]
+            ),
+            answers={1: (200, "a"), 2: (200, "b"), 3: (403, "c")},
+        )
+        borrowed = cls.rows_of(
+            "SELECT receipt_id::text FROM test_run_receipts WHERE test_run_id = $1::uuid"
+            " ORDER BY ordinal LIMIT 1",
+            (other["closed"]["test_run_id"],),
+        )[0][0]
+        cls.refusals["another_run"] = cls.refuse(
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 9, 'variant')",
+            (cls.program_id, run, borrowed),
+        )
+
+        # An agent-Lane Receipt of this Program, under a Tool run of its own.
+        agent_run = cls.replay_run()
+        tool_run = committed(
+            cls.connection,
+            "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args, status,"
+            "                       transport)"
+            " SELECT ar.program_id, ar.id, ar.task_id, 'mcp__rk2__net_request',"
+            "        '{\"url\": \"https://app.example.com/api/orders/1\", \"method\": \"GET\","
+            "          \"identity_slot\": \"\"}'::jsonb, 'running', 'runtime'"
+            "   FROM agent_runs ar WHERE ar.id = $2::uuid AND ar.program_id = $1::uuid"
+            " RETURNING id",
+            (cls.program_id, agent_run),
+        )
+        committed(cls.connection, "SELECT authorize_tool_run($1::uuid)", (tool_run,))
+        agent_receipt = cls.receipted(tool_run, 1, lane="agent")
+        cls.refusals["agent_lane"] = cls.refuse(
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
+            " VALUES ($1::uuid, $2::uuid,"
+            "         (SELECT id FROM receipts WHERE label = $3), 8, 'variant')",
+            (cls.program_id, run, agent_receipt),
+        )
+        # And the same two faults offered to `record_test_action`, which is where
+        # a runtime would offer them. They are separate arms because they are
+        # separate faults, and the second one is written by hand under the
+        # replay's own Tool run: the door derives the Lane from that Tool run, so
+        # an agent-Lane Receipt sitting under a replay is precisely the row that
+        # can only arrive from a writer that went around it.
+        claim, _ = cls.claim_waiting("the orders API answers an agent as well")
+        open_replay = cls.called(
+            cls.OPEN,
+            (cls.replay_run(),
+             cls.stored(claim, specification(
+                 [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}])),
+             None),
+        )
+        cls.refusals["another_run_recorded"] = cls.refuse(
+            cls.RECORD, (open_replay["tool_run_id"], 2, agent_receipt)
+        )
+        cls.refusals["agent_lane_recorded"] = cls.refuse(
+            cls.RECORD,
+            (open_replay["tool_run_id"], 2,
+             cls.receipted(open_replay["tool_run_id"], 2, lane="agent")),
+        )
+        # And the fault the trigger cannot see, because nothing about the row is
+        # wrong except which action it is filed under: a Receipt this replay
+        # really produced, of the exchange action 1 planned, offered as the
+        # answer to action 2. The three ordinals differ only by path, so this is
+        # a run that performed its plan out of order -- and recorded that way it
+        # would produce a differential between two requests nobody planned to
+        # compare.
+        cls.refusals["wrong_request"] = cls.refuse(
+            cls.RECORD,
+            (open_replay["tool_run_id"], 2, cls.receipted(open_replay["tool_run_id"], 1)),
+        )
+        committed(cls.connection, cls.CLOSE, (open_replay["tool_run_id"], "skipped", None))
+
+        # An Artifact sealed to another Program, named by a Receipt of this one.
+        # `artifact_seal` is what makes bytes a Program's, so this is the only
+        # form "foreign Artifact" can take: the bytes themselves are global.
+        #
+        # The wire half rather than the agent half, because that is the one a
+        # seal is identified by -- and because two Programs that fetched the same
+        # public page hold the same agent hash honestly, so a rule that read the
+        # agent half would refuse a Receipt with nothing wrong with it.
+        stranger = program.run(
+            cls.harness.runtime,
+            write(VALID.replace('name = "acme-web"', f'name = "{REPLAY_SLUG}-stranger"')),
+        )
+        assert stranger.ok, stranger.violations
+        wire = artifact.digest(b"the wire bytes another Program paid for")
+        agent_view = artifact.digest(b"the redacted view that Program holds")
+        cls.as_owner(
+            "INSERT INTO secret_kek (gen, salt, root_check)"
+            " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
+            " ON CONFLICT (gen) DO NOTHING"
+        )
+        cls.as_owner(
+            "INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
+            " VALUES ($1, 41, 'credential_bearing', true), ($2, 36, 'agent_visible', false)"
+            " ON CONFLICT (sha256) DO NOTHING",
+            (wire, agent_view),
+        )
+        cls.as_owner(
+            "INSERT INTO artifact_references (program_id, sha256, kind)"
+            " VALUES ($1::uuid, $2, 'runtime')",
+            (stranger.facts["program_id"], agent_view),
+        )
+        cls.as_owner(
+            "INSERT INTO artifact_seal (sha256, scope_kind, scope_id, visibility, byte_size,"
+            "                           alg, nonce, kek_gen, ciphertext_sha256, agent_sha256)"
+            " VALUES ($1, 'program', $2::uuid, 'credential_bearing', 41,"
+            "         'rk-hkdf-sha256-ctr-hmac-v1', decode(repeat('00', 32), 'hex'), 1, $3, $4)",
+            (
+                wire, stranger.facts["program_id"],
+                artifact.digest(b"the envelope that Program keeps"), agent_view,
+            ),
+        )
+        # Written under a replay of its own, while that replay's capability is
+        # still live: a Receipt of another Tool run is refused by the arm above,
+        # so the only way to reach this one is a Receipt the run really produced
+        # that happens to name bytes another Program sealed.
+        hypothesis, _ = cls.claim_waiting("the orders API answers with somebody else's page")
+        test = cls.stored(
+            hypothesis,
+            specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}]
+            ),
+        )
+        plan = cls.called(cls.OPEN, (cls.replay_run(), test, None))
+        sealed = committed(
+            cls.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+            "                      method, scheme, host, port, path, status_code,"
+            "                      response_wire_sha, ts_arrival, scope_class, scope_version)"
+            " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed',"
+            "         'allowed as target under scope version 1', 'GET', 'https',"
+            "         'app.example.com', 443, '/api/orders/1', 200, $3, now(), 'target', 1)"
+            " RETURNING label",
+            (cls.program_id, plan["tool_run_id"], wire),
+        )
+        for ordinal in (1, 2, 3):
+            committed(
+                cls.connection, cls.RECORD,
+                (plan["tool_run_id"], ordinal,
+                 cls.receipted(plan["tool_run_id"], ordinal, body=f"page {ordinal}")),
+            )
+        closed = cls.called(cls.CLOSE, (plan["tool_run_id"], "done", None))
+        cls.refusals["foreign_artifact"] = cls.refuse(
+            "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
+            " VALUES ($1::uuid, $2::uuid,"
+            "         (SELECT id FROM receipts WHERE label = $3), 7, 'variant')",
+            (cls.program_id, closed["test_run_id"], sealed),
+        )
+
+    # -- criterion 1's shape rule ---------------------------------------------
+
+    @classmethod
+    def refuse_a_specification_nobody_should_store(cls):
+        hypothesis, _ = cls.claim_waiting("the orders API is written down wrong")
+        cases = {
+            "no_control": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": ordinal, "role": role, "kind": "request",
+                     "method": "GET", "url": f"{BASE}/{ordinal}"}
+                    for ordinal, role in enumerate(("baseline", "variant", "variant"), start=1)
+                ],
+            ),
+            "no_assertion": specification([]),
+            "unknown_action": specification(
+                [{"id": "one", "kind": "status_equals", "action": 9, "status": 200}]
+            ),
+            "repeated_identifier": specification(
+                [
+                    {"id": "one", "kind": "status_equals", "action": 1, "status": 200},
+                    {"id": "one", "kind": "status_equals", "action": 2, "status": 200},
+                ]
+            ),
+            "compares_with_itself": specification(
+                [{"id": "one", "kind": "status_differs", "action": 2, "against": 2}]
+            ),
+            "unknown_kind": specification(
+                [{"id": "one", "kind": "body_contains", "action": 2, "against": 1}]
+            ),
+            "invented_part": json.dumps(
+                {**json.loads(specification([])), "teardown": []}
+            ),
+            "lowercase_method": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": ordinal, "role": role, "kind": "request",
+                     "method": "get", "url": f"{BASE}/{ordinal}"}
+                    for ordinal, role in enumerate(("baseline", "variant", "control"), start=1)
+                ],
+            ),
+            "relative_url": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                cleanup=[{"method": "DELETE", "url": "/api/orders/1"}],
+            ),
+            "invented_precondition": json.dumps(
+                {
+                    **json.loads(
+                        specification([{"id": "one", "kind": "status_equals",
+                                        "action": 1, "status": 200}])
+                    ),
+                    "preconditions": [
+                        {"kind": "the target is having a good day", "detail": "it is"}
+                    ],
+                }
+            ),
+            # The two spellings of one path: a dot segment the door resolves
+            # after the scope classed the path it was written with, and the
+            # percent-encoding of the same dot.
+            "dot_segment": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": 1, "role": "baseline", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/1"},
+                    {"ordinal": 2, "role": "variant", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/../../admin"},
+                    {"ordinal": 3, "role": "control", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/3"},
+                ],
+            ),
+            "encoded_dot": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                setup=[{"method": "GET", "url": f"{BASE}/%2e%2e/admin"}],
+            ),
+        }
+        # Both readings of each one. The constraint answers whether the row is
+        # refused, and the function answers what is wrong with it: the message a
+        # constraint raises names the constraint, so an author who only had the
+        # refusal would be told the spec is malformed and not where.
+        cls.said = {}
+        for name, spec in cases.items():
+            cls.refusals[f"spec:{name}"] = cls.refuse(
+                "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+                " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))",
+                (cls.program_id, hypothesis, spec),
+            )
+            cls.said[name] = str(
+                cls.connection.execute(
+                    "SELECT rk2_test_spec_problem($1::jsonb)", (spec,)
+                ).scalar()
+            )
+        # And the digest, which is the identity: a Test whose digest is over
+        # something other than its own specification is a Test two readers would
+        # disagree about.
+        cls.refusals["spec:digest"] = cls.refuse(
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest('{\"a\": 1}'::jsonb))",
+            (
+                cls.program_id, hypothesis,
+                specification([{"id": "one", "kind": "status_equals",
+                               "action": 1, "status": 200}]),
+            ),
+        )
+        # Storing the same specification against the same claim twice.
+        good = specification(
+            [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}]
+        )
+        cls.stored(hypothesis, good)
+        cls.refusals["spec:twice"] = cls.refuse(
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))",
+            (cls.program_id, hypothesis, good),
+        )
+
+    # -- criterion 2's conditions ---------------------------------------------
+
+    @classmethod
+    def refuse_a_replay_the_conditions_do_not_admit(cls):
+        # A url the current scope does not admit, refused before anything is sent.
+        hypothesis, _ = cls.claim_waiting("the admin console is reachable")
+        outside = cls.stored(
+            hypothesis,
+            specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": 1, "role": "baseline", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/1"},
+                    {"ordinal": 2, "role": "variant", "kind": "request",
+                     "method": "GET", "url": "https://admin.example.com/console"},
+                    {"ordinal": 3, "role": "control", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/3"},
+                ],
+            ),
+        )
+        cls.refusals["out_of_scope"] = cls.refuse(cls.OPEN, (cls.replay_run(), outside, None))
+
+        # An Identity slot this run does not hold.
+        inside = cls.stored(
+            hypothesis,
+            specification(
+                [{"id": "two", "kind": "status_equals", "action": 2, "status": 200}]
+            ),
+        )
+        cls.refusals["identity"] = cls.refuse(
+            cls.OPEN, (cls.replay_run(), inside, "operator")
+        )
+
+        # A claim that is not waiting to be tested. The one settled above is
+        # `supported`, and a Test may only be run against a `testable` claim.
+        settled = cls.stored(
+            cls.held["hypothesis"],
+            specification(
+                [{"id": "three", "kind": "status_equals", "action": 3, "status": 403}]
+            ),
+        )
+        cls.refusals["not_testable"] = cls.refuse(cls.OPEN, (cls.replay_run(), settled, None))
+
+        # Two replays of one claim at once.
+        first = cls.called(cls.OPEN, (cls.replay_run(), inside, None))
+        cls.refusals["already_running"] = cls.refuse(cls.OPEN, (cls.replay_run(), inside, None))
+        committed(cls.connection, cls.CLOSE, (first["tool_run_id"], "skipped", "abandoned"))
+
+        # And a Halted Program, which is the one refusal that outranks all of them.
+        human = pg.connect(cls.harness.human)
+        try:
+            human.execute("SELECT halt_program($1::uuid, $2)", (cls.program_id, "a self test"))
+            cls.refusals["halted"] = cls.refuse(cls.OPEN, (cls.replay_run(), inside, None))
+            human.execute(
+                "SELECT clear_program_halt($1::uuid, $2)", (cls.program_id, "the self test ended")
+            )
+        finally:
+            human.close()
+
+    @classmethod
+    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
+        return cls.connection.execute(sql, parameters).rows
+
+    def rows(self, sql: str, parameters: tuple = ()) -> list:
+        return self.connection.execute(sql, parameters).rows
+
+    # -- criterion 1: the shape is the constraint ------------------------------
+
+    def test_a_specification_that_could_not_settle_its_claim_is_refused(self):
+        for name in ("no_control", "no_assertion", "unknown_action", "repeated_identifier",
+                     "compares_with_itself", "unknown_kind", "invented_part",
+                     "lowercase_method", "relative_url", "invented_precondition",
+                     "dot_segment", "encoded_dot"):
+            with self.subTest(case=name):
+                self.assertNotEqual("", self.refusals[f"spec:{name}"])
+
+    def test_each_refusal_names_what_is_wrong_with_the_specification(self):
+        self.assertEqual(
+            {
+                "no_control": "a Test performs at least one control action",
+                "no_assertion": "a Test states between 1 and 32 assertions",
+                "unknown_action": "assertion one names action 9,"
+                                  " which this Test does not perform",
+                "repeated_identifier": "two assertions are identified as one",
+                "compares_with_itself": "assertion one compares action 2 against itself",
+                "unknown_kind": "assertion one states no kind this runtime evaluates",
+                "invented_part": "the specification carries no part named teardown",
+                "lowercase_method": "action 1 states its method in lower case",
+                "relative_url": "cleanup request 1 states no absolute http or https url"
+                                " in canonical form",
+                "invented_precondition": "precondition 1 states no kind a precondition"
+                                         " may have",
+                "dot_segment": "action 2 states a path that resolves somewhere else",
+                "encoded_dot": "setup request 1 states a path that resolves somewhere else",
+            },
+            self.said,
+        )
+
+    def test_the_digest_is_the_identity_and_cannot_disagree_with_the_test(self):
+        self.assertNotEqual("", self.refusals["spec:digest"])
+        self.assertNotEqual("", self.refusals["spec:twice"])
+
+    def test_changing_any_part_of_a_test_produces_a_different_test(self):
+        [[before, after, unchanged]] = self.rows(
+            "SELECT rk2_test_spec_digest($1::jsonb), rk2_test_spec_digest($2::jsonb),"
+            "       rk2_test_spec_digest($1::jsonb)",
+            (
+                specification([{"id": "one", "kind": "status_equals",
+                                "action": 1, "status": 200}]),
+                specification([{"id": "one", "kind": "status_equals",
+                                "action": 1, "status": 201}]),
+            ),
+        )
+
+        self.assertNotEqual(before, after)
+        self.assertEqual(before, unchanged)
+
+    # -- criterion 2: what is verified before the claim moves ------------------
+
+    def test_the_conditions_are_checked_before_the_hypothesis_moves(self):
+        for name, said in (
+            ("out_of_scope", "outside the current scope"),
+            ("identity", "Identity lease refused"),
+            ("not_testable", "testable claim"),
+            ("already_running", "already in flight"),
+            ("halted", "Halted"),
+        ):
+            with self.subTest(case=name):
+                self.assertIn(said, self.refusals[name])
+
+    def test_a_refused_replay_leaves_the_claim_where_it_was(self):
+        [[status]] = self.rows(
+            "SELECT status FROM hypotheses WHERE statement = $1",
+            ("the admin console is reachable",),
+        )
+
+        self.assertEqual("testable", status)
+
+    def test_the_risk_gate_decides_before_the_first_request(self):
+        # The capability comes back with the plan, which is `authorize_tool_run`
+        # having already classed the run and allowed it: a caller that had to
+        # mint one itself would be a caller that could make a request first.
+        self.assertEqual("allow", self.held["plan"]["decision"])
+        self.assertTrue(self.held["plan"]["capability"])
+        self.assertEqual("constrained", self.held["plan"]["risk_class"])
+
+    # -- criterion 3: every action is in the replay Lane -----------------------
+
+    def test_every_receipt_a_replay_produced_carries_the_replay_lane(self):
+        lanes = self.rows(
+            "SELECT DISTINCT r.lane FROM test_run_receipts trr"
+            "  JOIN receipts r ON r.id = trr.receipt_id"
+            " WHERE trr.test_run_id = $1::uuid",
+            (self.held["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual([("replay",)], [tuple(row) for row in lanes])
+
+    def test_the_lane_is_read_off_the_tool_run_rather_than_taken_from_a_caller(self):
+        [[replaying, acting]] = self.rows(
+            "SELECT rk2_capability_lane($1::uuid), rk2_capability_lane($2::uuid)",
+            (
+                self.held["plan"]["tool_run_id"],
+                # An agent run's Tool run: no `test_replays` row, so no replay.
+                self.rows_of(
+                    "SELECT id::text FROM tool_runs"
+                    " WHERE program_id = $1::uuid AND tool = 'mcp__rk2__net_request' LIMIT 1",
+                    (self.program_id,),
+                )[0][0],
+            ),
+        )
+
+        self.assertEqual(["replay", "agent"], [replaying, acting])
+
+    def test_a_replay_receipt_still_needs_a_live_capability_behind_it(self):
+        # The widened guard, proved the only way it can be: a `replay` Receipt
+        # naming a Tool run that holds no capability. Before 035 this row would
+        # have been written, because the guard read `lane = 'agent'` alone.
+        agent_run = self.replay_run()
+        tool_run = committed(
+            self.connection,
+            "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport)"
+            " VALUES ($1::uuid, $2::uuid, 'mcp__rk2__replay', '{}'::jsonb, 'running', 'runtime')"
+            " RETURNING id",
+            (self.program_id, agent_run),
+        )
+
+        said = refusal_message(
+            self.owner_as_runtime(),
+            "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason, method,"
+            "                      scheme, host, port, path, status_code, ts_arrival,"
+            "                      scope_class, scope_version)"
+            " VALUES ($1::uuid, $2::uuid, 'replay', 'allowed', 'allowed', 'GET', 'https',"
+            "         'app.example.com', 443, '/api/orders/1', 200, now(), 'target', 1)",
+            (self.program_id, tool_run),
+        )
+
+        self.assertIn("allowed replay receipt lacks a live authorized capability", said)
+
+    def test_a_request_the_door_refused_is_a_replay_receipt_too(self):
+        [[lane, decision, purpose]] = self.rows(
+            "SELECT lane, decision, purpose FROM receipts WHERE label = $1", (self.blocked,)
+        )
+
+        self.assertEqual(("replay", "blocked", "target_traffic"), (lane, decision, purpose))
+
+    def test_a_replay_tool_run_is_classed_and_named_like_every_other(self):
+        [[tool, risk, decision]] = self.rows(
+            "SELECT tool, risk_class, decision FROM tool_runs WHERE id = $1::uuid",
+            (self.held["plan"]["tool_run_id"],),
+        )
+
+        self.assertEqual("mcp__rk2__replay", tool)
+        self.assertEqual("constrained", risk)
+        self.assertEqual("allow", decision)
+
+    # -- criterion 4: the roles are explicit all the way through ---------------
+
+    def test_the_role_of_an_action_reaches_the_test_run_receipt(self):
+        roles = self.rows(
+            "SELECT ordinal, role FROM test_run_receipts"
+            " WHERE test_run_id = $1::uuid ORDER BY ordinal",
+            (self.held["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual(
+            [(1, "baseline"), (2, "variant"), (3, "control")],
+            [(int(row[0]), str(row[1])) for row in roles],
+        )
+
+    def test_the_role_reaches_the_evidence_the_run_filed(self):
+        evidence = self.rows(
+            "SELECT ev.role, ev.polarity FROM hypothesis_evidence ev"
+            " WHERE ev.hypothesis_id = $1::uuid ORDER BY ev.role",
+            (self.held["hypothesis"],),
+        )
+
+        self.assertEqual(
+            [("baseline", "supports"), ("control", "supports"), ("variant", "supports")],
+            [(str(row[0]), str(row[1])) for row in evidence],
+        )
+
+    def test_a_role_cannot_be_read_off_the_order_the_rows_were_written_in(self):
+        # The plan below numbers its control first, so any reader inferring the
+        # role from the ordinal would call action 1 a baseline.
+        walked = self.walked(
+            "the orders API answers a control first",
+            specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 403}],
+                actions=[
+                    {"ordinal": 1, "role": "control", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/1"},
+                    {"ordinal": 2, "role": "baseline", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/2"},
+                    {"ordinal": 3, "role": "variant", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/3"},
+                ],
+            ),
+            answers={1: (403, "denied"), 2: (200, "one"), 3: (200, "two")},
+        )
+
+        roles = self.rows(
+            "SELECT ordinal, role FROM test_run_receipts"
+            " WHERE test_run_id = $1::uuid ORDER BY ordinal",
+            (walked["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual(
+            [(1, "control"), (2, "baseline"), (3, "variant")],
+            [(int(row[0]), str(row[1])) for row in roles],
+        )
+
+    def test_the_caller_never_supplies_a_role(self):
+        # `record_test_action` takes an ordinal and a Receipt, and reads the role
+        # out of the pinned specification. Three parameters, and none of them is
+        # the word that decides what the evidence means.
+        [[arguments]] = self.rows(
+            "SELECT pg_get_function_arguments(oid) FROM pg_proc WHERE proname = $1",
+            ("record_test_action",),
+        )
+
+        self.assertEqual("p_tool_run_id uuid, p_ordinal integer, p_receipt text", arguments)
+
+    # -- criterion 5: the outcome is derived, not supplied ---------------------
+
+    def test_a_run_whose_assertions_all_held_holds(self):
+        self.assertEqual("holds", self.held["closed"]["outcome"])
+        self.assertEqual([], self.held["closed"]["failed"])
+        self.assertEqual("supported", self.held["closed"]["hypothesis_status"])
+
+    def test_a_run_with_a_failed_assertion_refutes_and_names_it(self):
+        self.assertEqual("refutes", self.refuted["closed"]["outcome"])
+        self.assertEqual(["the-control-is-refused"], self.refuted["closed"]["failed"])
+        self.assertEqual("refuted", self.refuted["closed"]["hypothesis_status"])
+
+    def test_a_run_that_could_not_evaluate_an_assertion_is_inconclusive(self):
+        self.assertEqual("inconclusive", self.unsettled["closed"]["outcome"])
+        self.assertEqual([], self.unsettled["closed"]["failed"])
+        self.assertEqual("inconclusive", self.unsettled["closed"]["hypothesis_status"])
+
+    def test_the_stored_results_carry_every_assertion_and_the_cleanup(self):
+        [[results]] = self.rows(
+            "SELECT assertion_results FROM test_runs WHERE id = $1::uuid",
+            (self.held["closed"]["test_run_id"],),
+        )
+        document = json.loads(results) if isinstance(results, str) else results
+
+        self.assertEqual(
+            ["the-variant-is-served", "the-control-is-not", "the-bodies-differ"],
+            [item["id"] for item in document["assertions"]],
+        )
+        self.assertEqual([True, True, True], [item["held"] for item in document["assertions"]])
+        self.assertEqual([], document["failed"])
+        self.assertEqual("done", document["cleanup"])
+
+    def test_an_unevaluated_assertion_is_recorded_as_a_verdict_nobody_reached(self):
+        [[results]] = self.rows(
+            "SELECT assertion_results FROM test_runs WHERE id = $1::uuid",
+            (self.unsettled["closed"]["test_run_id"],),
+        )
+        document = json.loads(results) if isinstance(results, str) else results
+
+        self.assertEqual([None], [item["held"] for item in document["assertions"]])
+        self.assertEqual("failed", document["cleanup"])
+
+    def test_the_same_run_evaluated_again_answers_the_same_thing(self):
+        [[again]] = self.rows(self.EVALUATE, (self.held["plan"]["tool_run_id"],))
+        document = json.loads(again) if isinstance(again, str) else again
+
+        self.assertEqual("holds", document["outcome"])
+        self.assertEqual([], document["failed"])
+
+    def test_the_outcome_is_a_function_of_the_receipts_and_not_of_the_caller(self):
+        # `close_test_replay` takes a Tool run, a cleanup state and a detail.
+        # None of them is the outcome, which is the whole of "derived".
+        [[arguments]] = self.rows(
+            "SELECT pg_get_function_arguments(oid) FROM pg_proc WHERE proname = $1",
+            ("close_test_replay",),
+        )
+
+        self.assertEqual(
+            "p_tool_run_id uuid, p_cleanup text, p_detail text DEFAULT NULL::text", arguments
+        )
+
+    def test_the_close_reports_how_the_tool_run_ended(self):
+        # Read off the row it just wrote rather than restated, and the two words
+        # are not the outcome's: a run that concluded `refutes` answered its
+        # question and its Tool run succeeded, while one that settled nothing
+        # ended in `error` -- which is what makes the command's exit code a fact
+        # about the Tool run rather than a second opinion about the Test.
+        for run, status in (
+            (self.held, "success"), (self.refuted, "success"), (self.unsettled, "error"),
+        ):
+            with self.subTest(outcome=run["closed"]["outcome"]):
+                self.assertEqual(status, run["closed"]["status"])
+                self.assertEqual(
+                    status,
+                    str(
+                        self.rows(
+                            "SELECT status FROM tool_runs WHERE id = $1::uuid",
+                            (run["plan"]["tool_run_id"],),
+                        )[0][0]
+                    ),
+                )
+
+    def test_the_three_words_a_run_may_conclude_are_the_three_a_claim_may_reach(self):
+        [[outcomes]] = self.rows(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+            " WHERE conname = 'test_runs_outcome_check'"
+        )
+
+        for word in ("holds", "refutes", "inconclusive"):
+            self.assertIn(word, outcomes)
+        self.assertNotIn("fails", outcomes)
+
+    # -- criterion 6: what a run may not cite ----------------------------------
+
+    def test_a_receipt_from_another_tool_run_is_refused(self):
+        self.assertIn("another tool run", self.refusals["another_run"])
+
+    def test_an_agent_lane_receipt_is_refused_at_both_places_it_could_arrive(self):
+        self.assertIn("cannot cite a lane=agent receipt", self.refusals["agent_lane"])
+        self.assertIn("is lane agent", self.refusals["agent_lane_recorded"])
+        self.assertIn("not produced by this replay", self.refusals["another_run_recorded"])
+
+    def test_a_receipt_naming_another_programs_artifact_is_refused(self):
+        self.assertIn("sealed to another Program", self.refusals["foreign_artifact"])
+
+    def test_a_receipt_that_answers_another_action_is_refused(self):
+        # The message names both sides, because the fault is the pairing and a
+        # reader who was told only "refused" would have to guess which of the
+        # two rows was the wrong one.
+        self.assertIn("answers GET https://app.example.com/api/orders/1",
+                      self.refusals["wrong_request"])
+        self.assertIn("action 2 states GET https://app.example.com/api/orders/2",
+                      self.refusals["wrong_request"])
+
+    def test_the_refused_rows_are_not_there(self):
+        [[cited]] = self.rows(
+            "SELECT count(*) FROM test_run_receipts WHERE test_run_id = $1::uuid",
+            (self.held["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual(3, int(cited))
+
+    # -- what the run leaves behind -------------------------------------------
+
+    def test_the_run_is_recorded_in_the_replay_lane(self):
+        [[lane, actions]] = self.rows(
+            "SELECT lane, (SELECT count(*) FROM test_run_receipts trr"
+            "                WHERE trr.test_run_id = tr.id)"
+            "  FROM test_runs tr WHERE tr.id = $1::uuid",
+            (self.held["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual("replay", lane)
+        self.assertEqual(3, int(actions))
+
+    def test_the_claim_moved_to_testing_on_the_first_action_and_not_before(self):
+        moves = self.rows(
+            "SELECT from_status, to_status, receipt_id IS NOT NULL"
+            "  FROM hypothesis_transitions WHERE hypothesis_id = $1::uuid"
+            " ORDER BY at, from_status",
+            (self.held["hypothesis"],),
+        )
+
+        self.assertEqual(
+            [("proposed", "testable", False), ("testable", "testing", True),
+             ("testing", "supported", True)],
+            [(str(row[0]), str(row[1]), bool(row[2])) for row in moves],
+        )
+
+    def test_a_replay_that_recorded_nothing_leaves_the_claim_testable(self):
+        hypothesis, _ = self.claim_waiting("the orders API answers at all")
+        test = self.stored(
+            hypothesis,
+            specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}]
+            ),
+        )
+        plan = self.called(self.OPEN, (self.replay_run(), test, None))
+        closed = self.called(self.CLOSE, (plan["tool_run_id"], "skipped", "nothing was sent"))
+
+        [[status]] = self.rows(
+            "SELECT status FROM hypotheses WHERE id = $1::uuid", (hypothesis,)
+        )
+        self.assertEqual("inconclusive", closed["outcome"])
+        self.assertEqual("testable", closed["hypothesis_status"])
+        self.assertEqual("testable", status)
+
+    # -- when the settle is refused --------------------------------------------
+
+    def test_a_run_that_holds_on_too_little_evidence_settles_inconclusive(self):
+        # Ticket 07 counts the Observations over the whole claim and this walk
+        # left it one short, so the conclusion the assertions reached is not one
+        # the machine will let the claim carry. The run says both things: the
+        # Test held, and the claim stayed unsettled.
+        closed = self.unsupported["closed"]
+
+        self.assertEqual("holds", closed["outcome"])
+        self.assertEqual("inconclusive", closed["hypothesis_status"])
+        self.assertIn("needs a control observation", closed["settle_refused"])
+
+    def test_the_refused_settle_still_closes_the_tool_run(self):
+        # The state worth avoiding is `running`: a refusal raised out of the
+        # close would roll the whole close back, and every check that would
+        # report the wreckage asks for a Tool run that is not running.
+        [[status, outcome]] = self.rows(
+            "SELECT tr.status, run.outcome"
+            "  FROM tool_runs tr"
+            "  JOIN test_replays tp ON tp.tool_run_id = tr.id"
+            "  JOIN test_runs run   ON run.id = tp.test_run_id"
+            " WHERE tr.id = $1::uuid",
+            (self.unsupported["plan"]["tool_run_id"],),
+        )
+
+        self.assertEqual("success", str(status))
+        self.assertEqual("holds", str(outcome))
+        self.assertEqual("success", self.unsupported["closed"]["status"])
+
+    def test_the_claim_records_what_was_asked_for_and_what_was_settled(self):
+        moves = self.rows(
+            "SELECT from_status, to_status, rationale"
+            "  FROM hypothesis_transitions WHERE hypothesis_id = $1::uuid"
+            " ORDER BY at, from_status",
+            (self.unsupported["hypothesis"],),
+        )
+        settle = [row for row in moves if str(row[0]) == "testing"]
+
+        # One row, not two: the refused `supported` never landed.
+        self.assertEqual(1, len(settle))
+        self.assertEqual("inconclusive", str(settle[0][1]))
+        self.assertIn("holds", str(settle[0][2]))
+        self.assertIn("could not settle as supported", str(settle[0][2]))
+
+    def test_the_receipts_the_refused_settle_walked_over_are_still_cited(self):
+        # The subtransaction is around the settle alone, so nothing the run
+        # recorded before it is undone by the refusal.
+        [[cited]] = self.rows(
+            "SELECT count(*) FROM test_run_receipts WHERE test_run_id = $1::uuid",
+            (self.unsupported["closed"]["test_run_id"],),
+        )
+
+        self.assertEqual(2, int(cited))
+
+    def test_a_settle_that_was_not_refused_says_nothing_about_a_refusal(self):
+        self.assertIsNone(self.held["closed"]["settle_refused"])
+        self.assertIsNone(self.refuted["closed"]["settle_refused"])
+
+    def test_a_replay_closes_once(self):
+        said = self.refuse(self.CLOSE, (self.held["plan"]["tool_run_id"], "done", None))
+
+        self.assertIn("already closed", said)
+
+    def test_an_action_cannot_be_recorded_after_the_close(self):
+        said = self.refuse(
+            self.RECORD,
+            (self.held["plan"]["tool_run_id"], 1,
+             self.rows_of(
+                 "SELECT r.label FROM test_run_receipts trr JOIN receipts r"
+                 "   ON r.id = trr.receipt_id WHERE trr.test_run_id = $1::uuid LIMIT 1",
+                 (self.held["closed"]["test_run_id"],),
+             )[0][0]),
+        )
+
+        self.assertIn("already closed", said)
+
+    def test_one_receipt_answers_one_action(self):
+        walked = self.walked(
+            "the orders API answers twice the same way",
+            specification(
+                [{"id": "one", "kind": "body_differs", "action": 1, "against": 2}]
+            ),
+            answers={1: (200, "one"), 2: (200, "two"), 3: (403, "three")},
+        )
+        receipt = self.rows_of(
+            "SELECT r.label FROM test_run_receipts trr JOIN receipts r ON r.id = trr.receipt_id"
+            " WHERE trr.test_run_id = $1::uuid AND trr.ordinal = 1",
+            (walked["closed"]["test_run_id"],),
+        )[0][0]
+
+        # Not the same run -- that one is closed -- but the same Receipt offered
+        # to a live one, which is the shape a differential-against-itself takes.
+        hypothesis, _ = self.claim_waiting("the orders API is asked about one answer twice")
+        test = self.stored(
+            hypothesis,
+            specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}]
+            ),
+        )
+        plan = self.called(self.OPEN, (self.replay_run(), test, None))
+        said = self.refuse(self.RECORD, (plan["tool_run_id"], 1, receipt))
+        committed(self.connection, self.CLOSE, (plan["tool_run_id"], "skipped", None))
+
+        self.assertIn("not produced by this replay", said)
+
+    def test_the_in_flight_rows_are_not_published_to_the_model(self):
+        published = self.rows(
+            "SELECT table_name FROM state_read_surface"
+            " WHERE table_name IN ('test_replays', 'test_replay_actions')"
+        )
+
+        self.assertEqual([], list(published))
+
+    def test_the_role_is_published_so_a_writeup_can_name_the_control(self):
+        [[count]] = self.rows(
+            "SELECT count(*) FROM state_read_surface"
+            " WHERE table_name = 'test_run_receipts' AND column_name = 'role'"
+        )
+
+        self.assertEqual(1, int(count))
+
+    def test_the_standing_check_holds_over_every_replay_this_case_walked(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+    def test_the_standing_check_is_registered_and_runs(self):
+        [[registered]] = self.rows(
+            "SELECT count(*) FROM standing_checks WHERE name = 'test_replays'"
+        )
+        [[problems]] = self.rows(
+            "SELECT problems FROM run_standing_checks() WHERE name = 'test_replays'"
+        )
+
+        self.assertEqual(1, int(registered))
+        self.assertEqual(0, int(problems))
+
+    # -- the rules that were written when there was one Lane -------------------
+
+    def test_a_replay_receipt_with_no_tool_run_behind_it_is_reported(self):
+        # Every standing rule about egress named `agent` because `agent` was the
+        # only Lane a request could be made in. A replay's Receipts are egress by
+        # every other measure, so a rule that reads the Lane and not the fact
+        # would hold over a set the harness no longer only writes.
+        reported = self.broken(
+            "INSERT INTO receipts (program_id, lane, decision, reason, method, scheme,"
+            "                      host, port, path, ts_arrival, ts_egress,"
+            "                      scope_class, scope_version)"
+            " VALUES ($1::uuid, 'replay', 'blocked', 'self test', 'GET', 'https',"
+            "         'app.example.com', 443, '/api/orders/9', now(), now(), 'target', 1)",
+            "SELECT problem, detail FROM check_receipt_integrity($1::uuid, interval '1 hour')",
+        )
+
+        self.assertIn(
+            ("egress_without_tool_run", "app.example.com GET /api/orders/9"), reported
+        )
+
+    def test_an_allowed_replay_receipt_naming_no_tool_run_is_refused_outright(self):
+        # The read-side detector above is the last line of three, which is why
+        # the row it reports had to be `blocked` to exist at all. The first line
+        # is 038's capability guard and it answers before the CHECK gets to,
+        # because a served request with no Tool run has no capability either --
+        # the two rules are the same fact seen from two distances.
+        said = self.broke(
+            "INSERT INTO receipts (program_id, lane, decision, reason, method, scheme,"
+            "                      host, port, path, ts_arrival, scope_class, scope_version)"
+            " VALUES ($1::uuid, 'replay', 'allowed', 'self test', 'GET', 'https',"
+            "         'app.example.com', 443, '/api/orders/9', now(), 'target', 1)"
+        )
+
+        self.assertIn(
+            "allowed replay receipt lacks a live authorized capability and Identity", said
+        )
+
+    def test_the_two_write_time_rules_name_the_replay_lane_as_well(self):
+        # The middle line, which nothing above can reach: the guard refuses the
+        # served-with-no-run row first, and the handshake row this case does
+        # reach could be refused by either. What a CHECK says is readable, and
+        # what it has to say is that neither of them stops at `agent`.
+        written = {
+            name: str(self.rows(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = $1",
+                (name,),
+            )[0][0])
+            for name in ("receipts_served_agent_needs_tool_run",
+                         "receipts_agent_transport_records_both_sides")
+        }
+
+        for name, rule in written.items():
+            with self.subTest(rule=name):
+                self.assertIn("'replay'::text", rule)
+
+    def test_a_replay_receipt_carrying_one_side_of_the_handshake_is_refused(self):
+        # A Receipt that describes the handshake the agent saw and not the one
+        # the proxy made is a claim about a connection nobody watched, and a
+        # replay goes through the same door and is interceptable the same way.
+        said = self.broke(
+            "INSERT INTO receipts (program_id, lane, decision, reason, method, scheme,"
+            "                      host, port, path, ts_arrival, scope_class, scope_version,"
+            "                      agent_tls_version)"
+            " VALUES ($1::uuid, 'replay', 'blocked', 'self test', 'GET', 'https',"
+            "         'app.example.com', 443, '/api/orders/9', now(), 'target', 1, 'TLSv1.3')"
+        )
+
+        self.assertIn("receipts_agent_transport_records_both_sides", said)
+
+    def test_every_rule_that_reads_the_lane_reads_both_of_them(self):
+        # Two of the five cannot be shown by writing a row: the handshake rule
+        # is now a CHECK, so its detector arm is unreachable by construction,
+        # and the budget arm would need the Program's widest budget in requests
+        # made -- thousands of them -- to report anything. What both are is a
+        # predicate, and the predicate is what this reads.
+        arms = {
+            name: str(self.rows(
+                "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = $1", (name,)
+            )[0][0])
+            for name in ("check_transport_claims", "check_egress_budget",
+                         "check_receipt_integrity")
+        }
+
+        for name, body in arms.items():
+            with self.subTest(rule=name):
+                self.assertNotIn("lane = 'agent'", body)
+                self.assertIn("lane IN ('agent', 'replay')", body)
+
+    def broke(self, sql: str) -> str:
+        """What the machine said when the row was refused, and no row after it."""
+        return refusal_message(self.owner_as_runtime(), sql, (self.program_id,))
+
+    def broken(self, write: str, read: str) -> list[tuple[str, ...]]:
+        """What a check reports about one row that should never have been written.
+
+        Written and read inside one transaction that is then thrown away, so the
+        arm is shown to fire without leaving the fault behind for the standing
+        check at the end of this case to find.
+        """
+        connection = self.owner_as_runtime()
+        reported: list[tuple[str, ...]] = []
+        try:
+            with connection.transaction():
+                connection.execute("SELECT set_actor('runtime', 'selftest')")
+                connection.execute(write, (self.program_id,))
+                reported = [
+                    tuple(str(field) for field in row)
+                    for row in connection.execute(read, (self.program_id,)).rows
+                ]
+                raise Rollback
+        except Rollback:
+            pass
+        return reported
+
+
+REPLAY_COMMAND_SLUG = "selftest-replay-command"
+
+#: What the Tests below reach, one path per action. `http`, because the point of
+#: this case is the walk and not the tunnel: an https Test would prove what
+#: `ProxyEgressTest` already proves about interception and would cost this case
+#: a certificate authority to do it. In scope under `SCOPED` on port 80.
+NOTES = "http://app.example.com/notes"
+
+
+class ReplayCommandTest(DatabaseCase):
+    """`rk test replay`, from the plan to the settled claim, through a real door.
+
+    Everything that makes a replay a replay happens between two processes here.
+    The runtime half is `replay.run`, the function the CLI calls. The door is a
+    real `proxy.listen` with the proxy role behind it, so every Receipt is
+    written by `write_allowed_receipt` on the fence's own session and carries
+    whatever Lane that function derived -- the runtime never says the word.
+
+    The target is reached through the `connector` seam for the reason
+    `ProxyEgressTest` gives: `127.0.0.1` can never be a Program's scope, so what
+    this case fakes is the address, and nothing about the decision that
+    authorised it.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        cls.root = scratch() / "replay-store"
+        # One installation has one root, and this is the one `ProxyEgressTest`
+        # establishes the key generation under.
+        root_secret = seal.Root(Path("live-proxy-selftest-root"), SECRET)
+
+        source = SCOPED.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
+        cls.configuration = write(
+            source.replace('name = "matrix-web"', f'name = "{REPLAY_COMMAND_SLUG}"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.runtime.execute(proxy.BIND, (cls.program_id,))
+
+        # `SCOPED` declares `X-Bounty-Id`, and a declared header with no
+        # provisioned value is a request the door refuses before it dials.
+        value = scratch() / "replay-bounty-id.txt"
+        value.write_text("rk2-replay-selftest-bounty", encoding="utf-8")
+        sealed = header.provision(
+            cls.harness.runtime,
+            cls.configuration,
+            "X-Bounty-Id",
+            value,
+            root_secret=root_secret,
+        )
+        assert sealed.ok, sealed.violations
+
+        cls.target, _ = counterparty(LiveTarget)
+        cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
+        cls.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=cls.fence,
+            store=Store(cls.root),
+            connector=cls.dial,
+            resolver=cls.look_up,
+            root_secret=root_secret,
+        )
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+        cls.owner_connection = pg.connect(cls.harness.migrate)
+        try:
+            cls.held = cls.walk(
+                "the notes API serves a neighbour's note",
+                [
+                    {"id": "the-variant-is-served", "kind": "status_equals",
+                     "action": 2, "status": 200},
+                    {"id": "the-answers-agree", "kind": "body_equals",
+                     "action": 1, "against": 2},
+                ],
+            )
+            cls.refuted = cls.walk(
+                "the notes API hides the third note",
+                [{"id": "the-control-is-refused", "kind": "status_equals",
+                  "action": 3, "status": 404}],
+            )
+            cls.outside = cls.walk(
+                "the admin console is reachable",
+                [{"id": "one", "kind": "status_equals", "action": 2, "status": 200}],
+                urls=(f"{NOTES}/1", "http://admin.example.com/console", f"{NOTES}/3"),
+            )
+            cls.untrusted = cls.walk(
+                "the notes API answers over TLS as well",
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                urls=tuple(f"https://app.example.com/notes/{n}" for n in (1, 2, 3)),
+            )
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.fence.close()
+        cls.target.shutdown()
+        cls.target.server_close()
+        cls.runtime.close()
+        cls.owner_connection.close()
+
+        stored = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
+                "  FROM receipts r JOIN programs p ON p.id = r.program_id"
+                " WHERE p.slug = $1",
+                (REPLAY_COMMAND_SLUG,),
+            ).rows
+            if row[0] is not None
+        ]
+        ciphertexts = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT s.ciphertext_sha256 FROM artifact_seal s JOIN programs p"
+                "    ON p.id = s.scope_id AND s.scope_kind = 'program'"
+                " WHERE p.slug = $1",
+                (REPLAY_COMMAND_SLUG,),
+            ).rows
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program'"
+                "   AND scope_id IN (SELECT id FROM programs WHERE slug = $1)",
+                (REPLAY_COMMAND_SLUG,),
+            )
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (REPLAY_COMMAND_SLUG,))
+            if stored:
+                cls.connection.execute(
+                    "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                    ("{" + ",".join(stored) + "}",),
+                )
+        keep = Store(cls.root)
+        for sha256 in (*stored, *ciphertexts):
+            keep.discard(sha256)
+        super().tearDownClass()
+
+    @classmethod
+    def look_up(cls, host: str, port: int) -> tuple[str, ...]:
+        """Every name this Program may reach answers with the pinned address."""
+        return (PINNED,)
+
+    @classmethod
+    def dial(
+        cls,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
+        """The one target this machine is running, whatever name was authorised."""
+        return http.client.HTTPConnection(
+            "127.0.0.1", cls.target.server_address[1], timeout=timeout
+        ), None
+
+    @classmethod
+    def walk(
+        cls,
+        statement: str,
+        assertions: list[dict],
+        *,
+        urls: tuple[str, str, str] = (f"{NOTES}/1", f"{NOTES}/2", f"{NOTES}/3"),
+    ) -> Report:
+        """One claim, one Test of it, and one `rk test replay` over that Test.
+
+        A claim of its own each time, and an agent run of its own: the machine
+        admits one replay of a claim in flight at a time and settles it on the
+        way out, so four walks sharing one would be four assertions about
+        whichever ran first.
+        """
+        subject = offline_entity(cls.runtime, cls.program_id)
+        hypothesis = committed(
+            cls.runtime,
+            "INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
+            " VALUES ($1::uuid, $2::uuid,"
+            "         (SELECT id FROM property_classes ORDER BY id LIMIT 1), $3)"
+            " RETURNING id",
+            (cls.program_id, subject, statement),
+        )
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute(
+                "INSERT INTO hypothesis_transitions (program_id, hypothesis_id, from_status,"
+                " to_status, actor_kind, rationale)"
+                " VALUES ($1::uuid, $2::uuid, 'proposed', 'testable', 'runtime', 'seeded')",
+                (cls.program_id, hypothesis),
+            )
+        test = committed(
+            cls.runtime,
+            "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256)"
+            " VALUES ($1::uuid, $2::uuid, $3::jsonb, rk2_test_spec_digest($3::jsonb))"
+            " RETURNING label",
+            (
+                cls.program_id, hypothesis,
+                json.dumps({
+                    "preconditions": [],
+                    "setup": [],
+                    "actions": [
+                        {"ordinal": ordinal, "role": role, "kind": "request",
+                         "method": "GET", "url": url}
+                        for ordinal, (role, url) in enumerate(
+                            zip(("baseline", "variant", "control"), urls, strict=True), start=1
+                        )
+                    ],
+                    "assertions": assertions,
+                    "cleanup": [],
+                }),
+            ),
+        )
+        agent_run = committed(
+            cls.runtime,
+            "SELECT label FROM agent_runs WHERE id = $1::uuid",
+            (claimed_agent_run(
+                cls.runtime, cls.owner_connection, cls.program_id, role="recon", kind="recon"
+            ),),
+        )
+        return replay.run(
+            cls.harness.runtime,
+            cls.configuration,
+            agent_run=agent_run,
+            test=test,
+            identity_slot=None,
+            proxy_url=cls.proxy_url,
+        )
+
+    def rows(self, sql: str, parameters: tuple = ()) -> list:
+        return self.connection.execute(sql, parameters).rows
+
+    def test_a_test_that_holds_is_reported_as_one_document(self):
+        self.assertTrue(self.held.ok, self.held.violations)
+        self.assertEqual(replay.RUN, self.held.command)
+        self.assertEqual(REPLAY_COMMAND_SLUG, self.held.facts["program_slug"])
+        self.assertEqual("holds", self.held.facts["test_run"]["outcome"])
+        self.assertEqual([], self.held.facts["test_run"]["failed"])
+        self.assertEqual("supported", self.held.facts["test_run"]["hypothesis_status"])
+        self.assertEqual(3, self.held.facts["test_run"]["actions"])
+        self.assertEqual("done", self.held.facts["test_run"]["cleanup"])
+
+    def test_the_walk_is_reported_action_by_action(self):
+        performed = {
+            stated.name: stated.detail
+            for stated in self.held.assertions
+            if stated.name.startswith("action:") and stated.ok
+        }
+
+        self.assertEqual(["action:1", "action:2", "action:3"], sorted(performed))
+        self.assertIn("the baseline action answered 200", performed["action:1"])
+        self.assertIn("the variant action answered 200", performed["action:2"])
+        self.assertIn("the control action answered 200", performed["action:3"])
+
+    def test_every_receipt_the_door_wrote_for_it_carries_the_replay_lane(self):
+        lanes = self.rows(
+            "SELECT r.lane, count(*) FROM receipts r"
+            "  JOIN tool_runs tr ON tr.id = r.tool_run_id"
+            " WHERE tr.label = $1 GROUP BY r.lane",
+            (self.held.facts["tool_run"]["label"],),
+        )
+
+        self.assertEqual([("replay", 3)], [(str(row[0]), int(row[1])) for row in lanes])
+
+    def test_the_run_it_filed_names_the_three_roles_in_the_planned_order(self):
+        roles = self.rows(
+            "SELECT trr.ordinal, trr.role FROM test_run_receipts trr"
+            " WHERE trr.test_run_id = $1::uuid ORDER BY trr.ordinal",
+            (self.held.facts["test_run"]["id"],),
+        )
+
+        self.assertEqual(
+            [(1, "baseline"), (2, "variant"), (3, "control")],
+            [(int(row[0]), str(row[1])) for row in roles],
+        )
+
+    def test_the_evidence_it_filed_is_what_the_claim_moved_on(self):
+        evidence = self.rows(
+            "SELECT ev.role, ev.polarity, ob.kind FROM hypothesis_evidence ev"
+            "  JOIN observations ob ON ob.id = ev.observation_id"
+            " WHERE ev.hypothesis_id = (SELECT te.hypothesis_id FROM test_runs run"
+            "                             JOIN tests te ON te.id = run.test_id"
+            "                            WHERE run.id = $1::uuid)"
+            " ORDER BY ev.role",
+            (self.held.facts["test_run"]["id"],),
+        )
+
+        self.assertEqual(
+            [("baseline", "supports", "response_invariant"),
+             ("control", "supports", "response_invariant"),
+             ("variant", "supports", "response_invariant")],
+            [(str(row[0]), str(row[1]), str(row[2])) for row in evidence],
+        )
+
+    def test_a_test_the_target_refuted_is_still_a_command_that_worked(self):
+        # The Test ran, the door let it through and the claim is answered. A
+        # refutation is a result, so the command holds and says which assertion
+        # did not.
+        self.assertTrue(self.refuted.ok, self.refuted.violations)
+        self.assertEqual("refutes", self.refuted.facts["test_run"]["outcome"])
+        self.assertEqual(["the-control-is-refused"], self.refuted.facts["test_run"]["failed"])
+        self.assertEqual("refuted", self.refuted.facts["test_run"]["hypothesis_status"])
+
+    def test_a_test_that_reaches_outside_the_scope_sends_nothing_at_all(self):
+        self.assertFalse(self.outside.ok)
+        self.assertIsNone(self.outside.facts["test_run"])
+        self.assertIsNone(self.outside.facts["tool_run"])
+        self.assertEqual(
+            ["argument:--test"],
+            [refused.source for refused in self.outside.violations],
+        )
+        self.assertIn(
+            "outside the current scope: http://admin.example.com/console",
+            self.outside.violations[0].detail,
+        )
+
+    def test_an_https_test_without_the_doors_certificate_is_refused_and_closed(self):
+        # Refused before a request, and the replay it had already opened is
+        # closed rather than left in flight: an open replay whose Tool run ended
+        # is the one state the standing check reports as a fault. The reported
+        # status is the row's own and not the cleanup word: `abandoned` is what
+        # the replay was cleaned up as, and no `tool_runs` row is ever in it.
+        self.assertFalse(self.untrusted.ok)
+        self.assertEqual("error", self.untrusted.facts["tool_run"]["status"])
+        self.assertIn(
+            "argument:--ca", [refused.source for refused in self.untrusted.violations]
+        )
+
+        [[status, outcome]] = self.rows(
+            "SELECT tr.status, (SELECT outcome FROM test_runs t"
+            "                    WHERE t.id = tp.test_run_id)"
+            "  FROM tool_runs tr JOIN test_replays tp ON tp.tool_run_id = tr.id"
+            " WHERE tr.label = $1",
+            (self.untrusted.facts["tool_run"]["label"],),
+        )
+        self.assertEqual("error", status)
+        self.assertEqual("inconclusive", outcome)
+
+    def test_a_claim_nothing_settled_is_left_where_a_later_run_can_take_it_up(self):
+        [[status]] = self.rows(
+            "SELECT status FROM hypotheses WHERE program_id = $1::uuid AND statement = $2",
+            (self.program_id, "the notes API answers over TLS as well"),
+        )
+
+        self.assertEqual("testable", status)
+
+    def test_every_path_reports_the_same_keys(self):
+        # The same promise `rk tool run` and `rk browser run` make: a caller
+        # parses one document whether the Test held, was refuted, was refused
+        # before it dialled, or died with the run open.
+        for name, answer in (("held", self.held), ("refuted", self.refuted),
+                             ("outside", self.outside), ("untrusted", self.untrusted)):
+            with self.subTest(name):
+                self.assertEqual(set(replay.FACTS), set(answer.facts))
+
+    def test_the_target_saw_each_walk_in_order_and_the_declared_header_on_each(self):
+        # Two walks reached it and two did not, which is the same claim from the
+        # target's side: nothing was sent for the Test the scope refused, and
+        # nothing for the one that had no root to verify the tunnel against.
+        self.assertEqual(
+            ["/notes/1", "/notes/2", "/notes/3"] * 2,
+            [path for _, path, _ in self.target.seen],
+        )
+        for method, path, headers in self.target.seen:
+            with self.subTest(path=path):
+                self.assertEqual("GET", method)
+                self.assertIn(("x-bounty-id", "rk2-replay-selftest-bounty"), headers)
+
+    def test_the_standing_check_holds_over_every_replay_the_command_ran(self):
+        problems = self.rows("SELECT * FROM check_test_replays()")
+
+        self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
 
 
 if __name__ == "__main__":

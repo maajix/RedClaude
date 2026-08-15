@@ -30,6 +30,7 @@ from redkraken import (
     pg,
     program,
     proxy,
+    replay,
     scope,
     state,
     tool,
@@ -826,6 +827,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mission.set_defaults(run=_browser_run)
 
+    testing = commands.add_parser(
+        "test", help="perform one Test through the replay Lane and settle what it claims"
+    )
+    replays = testing.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    replaying = replays.add_parser(
+        "replay",
+        help=(
+            "run one Test specification -- setup, actions, cleanup -- behind the "
+            f"door, and record the outcome its assertions derive (${DATABASE_URL})"
+        ),
+    )
+    _add_url(replaying, RUNTIME)
+    replaying.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program whose scope decides this Test",
+    )
+    replaying.add_argument(
+        PROXY.flag,
+        dest="proxy_url",
+        metavar="http://127.0.0.1:port",
+        help=f"where the door is listening (default: ${PROXY.variable})",
+    )
+    replaying.add_argument(
+        TRUST.flag,
+        dest="ca_file",
+        type=Path,
+        metavar="path",
+        help=(
+            "the door's certificate, which an https target is verified against "
+            "and nothing else; the door reports it when it starts "
+            f"(default: ${TRUST.variable})"
+        ),
+    )
+    replaying.add_argument(
+        "--agent-run",
+        dest="agent_run",
+        required=True,
+        metavar="label",
+        help="the agent run this replay is performed under, by its label",
+    )
+    replaying.add_argument(
+        "--test",
+        required=True,
+        metavar="label",
+        help="the Test to perform, by its label; its specification is already fixed",
+    )
+    replaying.add_argument(
+        "--identity",
+        dest="identity",
+        metavar="slot",
+        help=(
+            "the Identity the door is to present, by the slot this Program "
+            "holds; the value is never given to this process"
+        ),
+    )
+    replaying.set_defaults(run=_test_replay)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1477,6 +1539,35 @@ def _browser_run(arguments: argparse.Namespace) -> int:
                 steps=steps,
                 identity_slot=arguments.identity,
                 door=door,
+            ),
+        )
+    )
+
+
+def _test_replay(arguments: argparse.Namespace) -> int:
+    """A connection, a door and a Test.
+
+    No image and no boundary, unlike `rk browser run`: a replay is the runtime
+    performing a specification rather than an agent being given a machine to
+    decide on, so the only thing it needs beside the database is the address the
+    capability may be spent at.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, replay.RUN)
+    endpoint = _proxy(ledger, arguments.proxy_url)
+    if runtime is None or endpoint is None:
+        return _render(report(replay.RUN, ledger))
+    return _render(
+        _guarded(
+            replay.RUN,
+            lambda: replay.run(
+                runtime,
+                arguments.config,
+                agent_run=arguments.agent_run,
+                test=arguments.test,
+                identity_slot=arguments.identity,
+                proxy_url=endpoint,
+                ca_file=_path(TRUST, arguments.ca_file),
             ),
         )
     )

@@ -113,15 +113,46 @@ _Avoid_: Category, bug type, vuln type (a vulnerability class is what a *finding
 has)
 
 **Test**:
-An immutable executable specification for settling one hypothesis:
-preconditions, setup, actions, assertions, cleanup. Actions are structured
-request specs, never shell strings. A changed test is a new test.
+An immutable executable specification for settling one hypothesis: the five
+parts `preconditions`, `setup`, `actions`, `assertions`, `cleanup`, and nothing
+else. Actions are structured request specs, never shell strings, and each carries
+its own ordinal and one of the three roles. Preconditions are prose under a typed
+word: what has to hold before the run is worth starting, stated for a reader
+rather than evaluated, because the four conditions the runtime can decide — scope,
+risk, the Identity lease, the budget — it decides against canonical state at the
+moment the replay opens. A Test performs between 3 and 32 actions and at least
+one of every role, because a specification that could never support the claim it
+was written for is one nobody should be able to store. Identity is the digest of
+the specification: a changed test is a new test.
 _Avoid_: Check, scan, probe, PoC
 
 **Test run**:
 One execution of a test, producing receipts and an outcome. Replaying a test run
-is what makes a finding validated.
+is what makes a finding validated. The outcome is `holds`, `refutes` or
+`inconclusive`, derived from the run's own Receipts rather than reported by
+whatever performed it: one assertion that cannot be answered makes the run
+inconclusive, one that fails refutes, and the failed identifiers and the state of
+the cleanup are recorded beside it. An inconclusive run files no Evidence and
+settles nothing — an Observation is a statement about the target, and a run that
+could not evaluate its own assertions has none to make. A run's outcome is not
+by itself a claim's verdict: the close asks the epistemic machine whether the
+transition it would make is admitted, and settles `inconclusive` with the
+refusal recorded when it is not, because a run that held every assertion it
+stated may still rest on too few Observations to support the claim — a control
+the door blocked is an action that files none.
 _Avoid_: Execution, attempt, trial
+
+**Replay**:
+The runtime performing one Test through the door, as a Tool run marked a replay
+before its capability exists. That order is the whole of the guarantee: the mark
+is what the Lane is derived from, so every Receipt the run produces carries
+`replay` without the runtime ever saying the word, and a Receipt from any other
+capability is refused rather than recorded under the wrong Lane. One claim has at
+most one replay in flight. Nothing about a replay is a decision the process
+makes: the urls, the methods and the roles all come out of the stored
+specification, and what it contributes is only which actions it managed to
+record.
+_Avoid_: Rerun, reproduction, playback
 
 **Finding**:
 A claimed vulnerability resting on one or more hypotheses, moving through
@@ -393,7 +424,9 @@ _Avoid_: Token, secret, canary token, callback id
 **Lane**:
 Which party caused a request: `agent` (a subagent acted), `replay` (the runtime
 re-executed a test), or `proxy_internal` (the proxy acted as a client of the
-target on its own behalf). Only the first two can back an observation.
+target on its own behalf). Only the first two can back an observation, and every
+standing rule about egress reads both of them: a rule that named `agent` alone
+would be a rule a replay's requests are invisible to.
 _Avoid_: Channel, source, origin (an origin is who put a Surface row there,
 which is a different question about a different record)
 
