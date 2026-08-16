@@ -52,7 +52,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from redkraken import (
     _launch,
@@ -65,6 +65,7 @@ from redkraken import (
     capsule,
     config,
     decisions,
+    door,
     evaluation,
     evidence,
     execution,
@@ -88,6 +89,7 @@ from redkraken import (
     seal,
     skill,
     state,
+    store,
     tls,
     tool,
     validation,
@@ -112,7 +114,9 @@ from tests.fixtures import (
     DECISION_QUEUE_COLUMNS,
     EXPORTED,
     FIRST,
+    GATEWAY,
     PINNED,
+    PROBE,
     ROLE,
     SLATE_COLUMNS,
     SCOPE_ENTITIES,
@@ -122,9 +126,11 @@ from tests.fixtures import (
     WITHDRAWN,
     Target,
     boundary,
+    contained_url,
     counterparty,
     docker,
     latched,
+    role_url,
     scratch,
     startup_refusal,
     tls_counterparty,
@@ -22728,7 +22734,7 @@ class BrowserCommandTest(DatabaseCase):
                 f"type=bind,src={cls.key},dst=/root.key,readonly",
             ),
             environment={
-                "RK_DOOR_URL": cls.door_url(),
+                "RK_DOOR_URL": contained_url(cls.harness.proxy),
                 "RK_DOOR_LISTEN": str(cls.PORT),
                 "RK_DOOR_STORE": "/wire",
                 "RK_DOOR_AUTHORITY": "/authority",
@@ -22762,7 +22768,7 @@ class BrowserCommandTest(DatabaseCase):
             "run", "--detach", "--rm", "--pull", "never",
             "--name", name,
             "--network", cls.network,
-            "--add-host", "host.docker.internal:host-gateway",
+            "--add-host", f"{GATEWAY}:host-gateway",
             "--mount", f"type=bind,src={ROOT},dst=/repo,readonly",
             *[argument for mount in mounts for argument in ("--mount", mount)],
             "--env", "PYTHONPATH=/repo/src:/repo",
@@ -22784,24 +22790,6 @@ class BrowserCommandTest(DatabaseCase):
                 raise AssertionError(f"{name} stopped: {logs.stdout}{logs.stderr}")
             time.sleep(0.2)
         raise AssertionError(f"{name} never listened: {docker('logs', name, check=False).stderr}")
-
-    @classmethod
-    def door_url(cls) -> str:
-        """How a container reaches the database this suite is running against.
-
-        A loopback address is this machine's from the host's namespace and the
-        container's own from inside one, so it -- and only it -- is rewritten to
-        the gateway the engine publishes back. Anything else is a server that is
-        somewhere, and somewhere is reachable from both.
-        """
-        settings = cls.harness.proxy
-        host = settings.host
-        if host in ("127.0.0.1", "localhost", "::1") or host.startswith("/"):
-            host = "host.docker.internal"
-        return (
-            f"postgres://{quote(settings.user)}:{quote(settings.password or '')}"
-            f"@{host}:{settings.port}/{quote(settings.database)}"
-        )
 
     @classmethod
     def walk(cls, twin: str) -> Report:
@@ -23118,6 +23106,505 @@ class BrowserCommandTest(DatabaseCase):
         ]
 
         self.assertEqual([], problems)
+
+
+@unittest.skipUnless(CONTAINERS, CONTAINER_REASON)
+class ContainedDoorTest(DatabaseCase):
+    """PH2-82 criteria 1, 3 and 4: the shipped door, on the network it verifies.
+
+    `rk proxy door` is asked to do the one thing nothing shipped could do
+    before -- put the production fence on an internal network as its only peer --
+    and then the three commands that read `execution.boundary` are held to the
+    machine it left behind. Nothing here arranges a proxy: the container under
+    test is started by `door.start` and serves `proxy.serve` over the same
+    `rk2_proxy` role a production door holds.
+
+    The difference between the door's two attachments is what most of this
+    asserts. A child on the Agent network reaches the door and nothing else --
+    not the internet, not a name server, not this machine -- while the door
+    itself reached the database over the second one before it ever said it was
+    listening. So a child's only egress is a request the fence saw, which is
+    proved here by making one and reading the decision header off the refusal.
+
+    One door for the class: starting it is two container starts and an authority
+    mint, and every test below is a question about the same machine.
+    """
+
+    settings_for = "migrate"
+
+    #: What the door listens on inside its own container, and what the children's
+    #: proxy URL names. Fixed rather than ephemeral for the reason `door.main`
+    #: gives: the port is read out of the URL the boundary already carries, so
+    #: there is nowhere for an engine-chosen one to be written down.
+    PORT = 18081
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {AGENT_IMAGE}")
+        super().setUpClass()
+
+        suffix = uuid.uuid4().hex[:12]
+        cls.container = f"rk2-door-{suffix}"
+        cls.network = f"rk2-door-agent-{suffix}"
+        cls.egress = f"rk2-door-egress-{suffix}"
+        # A routable network of this suite's own rather than the default bridge
+        # `door.EGRESS` names, so the second attachment is something this class
+        # can take away again -- and so a run that leaks one leaks a name with
+        # this suffix in it rather than changing the machine's own network.
+        cls.open_network = f"rk2-door-open-{suffix}"
+        # A second internal network, empty for the life of this class, so the
+        # egress refusals below have something to name as the Agent network that
+        # is not the one the door is already on.
+        cls.spare = f"rk2-door-spare-{suffix}"
+        cls.networks = (cls.network, cls.egress, cls.open_network, cls.spare)
+        cls.home = scratch() / f"door-{suffix}"
+        cls.store = cls.home / "store"
+        cls.authority = cls.home / "authority"
+        cls.private = cls.home / "private"
+        # The three optional mounts, which a real installation supplies and the
+        # boundary does not require. The child's home is the one it writes.
+        cls.application = cls.home / "application"
+        cls.sdk = cls.home / "sdk"
+        cls.child_home = cls.home / "child-home"
+        for directory in (cls.store, cls.authority, cls.application, cls.sdk, cls.child_home):
+            directory.mkdir(parents=True)
+            # The door runs as nobody, and `door._writable` refuses a directory
+            # that user could not write. A bind mount is entered without walking
+            # the parents, so the mode on the directory itself is the whole
+            # question.
+            directory.chmod(0o777)
+        # The control: a directory this operator owns and nobody else may write,
+        # which is what an installation that forgot the `chown` actually has.
+        cls.private.mkdir(parents=True)
+        cls.private.chmod(0o700)
+
+        try:
+            docker("network", "create", "--internal", cls.network)
+            docker("network", "create", "--internal", cls.spare)
+            docker("network", "create", cls.egress)
+            docker("network", "create", cls.open_network)
+            cls.opened = door.start(cls.environment(), egress=cls.egress)
+        except BaseException:
+            cls.tearDownClass()
+            raise
+        if not cls.opened.ok:
+            cls.tearDownClass()
+            raise AssertionError(f"the door did not start: {cls.opened.violations}")
+
+    @classmethod
+    def tearDownClass(cls):
+        docker("rm", "--force", getattr(cls, "container", ""), check=False)
+        for network in reversed(getattr(cls, "networks", ())):
+            docker("network", "rm", network, check=False)
+        # Given back before it is removed: the door writes its authority and its
+        # wire directory as 65534, and this process cannot unlink a file in a
+        # directory it does not own.
+        home = getattr(cls, "home", None)
+        if home is not None and home.exists():
+            docker(
+                "run", "--rm", "--pull", "never",
+                "--mount", f"type=bind,src={home},dst=/given",
+                AGENT_IMAGE, "chown", "--recursive", f"{os.getuid()}:{os.getgid()}", "/given",
+                check=False,
+            )
+            shutil.rmtree(home, ignore_errors=True)
+        super().tearDownClass()
+
+    @classmethod
+    def environment(cls, **overrides) -> dict[str, str]:
+        """The five variables `README.md` documents, and the two the door adds.
+
+        Built here rather than in each test because the refusals below differ
+        from the arrangement that works by one variable each, and a second copy
+        of the other six is a second place for one of them to be wrong.
+        """
+        described = {
+            execution.IMAGE: AGENT_IMAGE,
+            execution.NETWORK: cls.network,
+            execution.PROXY_CONTAINER: cls.container,
+            execution.PROXY_URL: f"http://{cls.container}:{cls.PORT}",
+            execution.CERTIFICATE: str(cls.authority / tls.CERTIFICATE_NAME),
+            proxy.AUTHORITY_VARIABLE: str(cls.authority),
+            proxy.DATABASE_VARIABLE: contained_url(cls.harness.proxy),
+            store.ROOT_VARIABLE: str(cls.store),
+        }
+        for name, value in overrides.items():
+            if value is None:
+                described.pop(name, None)
+            else:
+                described[name] = value
+        return described
+
+    @classmethod
+    def boundary(cls) -> isolation.AgentContainer:
+        """The door as a child is handed it: the same five names, as one record."""
+        return isolation.AgentContainer(
+            image=AGENT_IMAGE,
+            network=cls.network,
+            proxy_container=cls.container,
+            proxy_url=f"http://{cls.container}:{cls.PORT}",
+            certificate=cls.authority / tls.CERTIFICATE_NAME,
+        )
+
+    # -- criterion 1: one shipped command puts the door where it belongs --------
+
+    def test_the_door_is_the_agent_network_s_only_peer(self):
+        self.assertTrue(self.opened.ok, self.opened.violations)
+        self.assertEqual(self.container, self.opened.facts["container"])
+        self.assertEqual(f"http://{self.container}:{self.PORT}", self.opened.facts["endpoint"])
+        self.assertEqual([self.network, self.egress], self.opened.facts["networks"])
+        # The assertion `isolation.run` makes before every child, asked of the
+        # machine this command built rather than of a fixture arranged for it.
+        isolation.one_peer(
+            isolation.engine_for(isolation.ENGINE), self.network, self.container, self.container
+        )
+
+    def test_the_door_bound_wide_and_signs_with_the_certificate_children_verify(self):
+        # Wide is the whole reason `door` exists: loopback inside a container is
+        # the one address the network's other peer has no route to.
+        self.assertEqual(f"http://0.0.0.0:{self.PORT}", self.opened.facts["bound"])
+        certificate = Path(self.opened.facts["certificate"])
+        self.assertEqual(self.authority / tls.CERTIFICATE_NAME, certificate)
+        self.assertTrue(certificate.is_file())
+        self.assertIn("BEGIN CERTIFICATE", certificate.read_text(encoding="utf-8"))
+        # The signing key stayed with the authority and never became something a
+        # child is handed.
+        self.assertTrue((self.authority / tls.KEY_NAME).exists())
+
+    # -- criterion 3: two attachments, and only one of them goes anywhere -------
+
+    def test_a_child_on_the_agent_network_reaches_the_door_and_nothing_else(self):
+        probe = PROBE + """
+print(json.dumps({
+    'door': reaches(%r, %d),
+    'internet_tcp': reaches('1.1.1.1', 443),
+    'external_dns': resolves('example.com'),
+    'gateway': resolves(%r),
+    'database': reaches(%r, %d),
+}))
+""" % (
+            self.container,
+            self.PORT,
+            GATEWAY,
+            self.harness.proxy.host,
+            self.harness.proxy.port,
+        )
+
+        result = isolation.run(self.boundary(), ("python3", "-c", probe), timeout=20)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        facts = json.loads(result.stdout)
+        self.assertTrue(facts["door"])
+        self.assertFalse(facts["internet_tcp"])
+        self.assertFalse(facts["external_dns"])
+        self.assertFalse(facts["gateway"])
+        self.assertFalse(facts["database"])
+
+    def test_the_door_reaches_over_the_attachment_the_children_do_not_have(self):
+        # The other half of the test above, asked of the door itself. The same
+        # two questions a child answers `False` to are answered `True` here, from
+        # inside the same container, because the door is on a second network the
+        # children are not on. That is criterion 3 in one pair: the route out
+        # exists, and it exists only where the fence is.
+        # The database as the door was told to reach it, rather than as this
+        # process reaches it: the two spellings differ by exactly the gateway.
+        fence = pg.settings_from_url(contained_url(self.harness.proxy))
+        probe = PROBE + """
+print(json.dumps({'database': reaches(%r, %d), 'gateway': resolves(%r)}))
+""" % (fence.host, fence.port, fence.host)
+
+        answered = docker("exec", self.container, "python3", "-c", probe)
+
+        self.assertEqual({"database": True, "gateway": True}, json.loads(answered.stdout))
+
+    def test_a_child_s_request_is_answered_by_the_fence_behind_the_door(self):
+        # Hermetic on purpose. A request naming no Program is refused before the
+        # door dials anything, so what this proves is that the socket the child
+        # reached has the production fence behind it and a database under that --
+        # not that this machine can reach the internet.
+        probe = """
+import http.client, json
+connection = http.client.HTTPConnection(%r, %d, timeout=10)
+connection.request('GET', 'http://example.com/', headers={'Host': 'example.com'})
+answer = connection.getresponse()
+print(json.dumps({'status': answer.status, 'decision': answer.getheader(%r)}))
+""" % (self.container, self.PORT, proxy.DECISION)
+
+        result = isolation.run(self.boundary(), ("python3", "-c", probe), timeout=20)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            {"status": 407, "decision": proxy.NO_PROGRAM}, json.loads(result.stdout)
+        )
+
+    # -- criterion 4: the three commands that read the boundary -----------------
+
+    def test_a_tool_on_the_proxy_adapter_reaches_this_door(self):
+        # `rk tool run` and `rk browser run` both arrive here: a tool that
+        # declares the proxy adapter is put on a network of its own with the
+        # door as its only peer, which is a second network the door has to be
+        # joinable to while it is already serving the Agent's.
+        probe = PROBE + """
+print(json.dumps({
+    'door': reaches(os.environ['HTTP_PROXY'].split('//', 1)[1].split(':')[0], %d),
+    'internet_tcp': reaches('1.1.1.1', 443),
+    'external_dns': resolves('example.com'),
+}))
+""" % self.PORT
+
+        answer = isolation.run_tool(
+            isolation.ToolContainer(image=AGENT_IMAGE, door=self.boundary()),
+            ("python3", "-c", probe),
+            ceilings=isolation.Ceilings(
+                timeout_seconds=30.0,
+                memory_mb=256,
+                cpu_quota=1.0,
+                pids_limit=32,
+                max_output_bytes=4096,
+            ),
+            network="proxy",
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        facts = json.loads(answer.stdout.data)
+        self.assertTrue(facts["door"])
+        self.assertFalse(facts["internet_tcp"])
+        self.assertFalse(facts["external_dns"])
+        # The adapter is given back, and the Agent network still has one peer.
+        isolation.one_peer(
+            isolation.engine_for(isolation.ENGINE), self.network, self.container, self.container
+        )
+
+    def test_the_boundary_the_door_left_behind_is_the_one_rk_run_reads(self):
+        # `rk run`, `rk tool run` and `rk browser run` each build their container
+        # from `execution.boundary` and nothing else, so a boundary described by
+        # these five variables is the one all three would run against.
+        container, absent = execution.boundary(self.environment())
+
+        self.assertEqual((), absent)
+        self.assertEqual(self.boundary(), container)
+
+    def test_the_three_commands_accept_this_machine_and_refuse_only_their_own_arguments(self):
+        """The criterion itself: the shipped commands, on the machine `door` built.
+
+        Each is given a configuration that is not there, so each stops at its own
+        first argument. What is asserted is what is *not* said: no violation names
+        a boundary variable, which is what a command that had found this machine
+        unconfigured would say and say first. The pair below removes one variable
+        and gets exactly that, so the silence here is a boundary that was read and
+        accepted rather than one that was never looked at.
+        """
+        absent = self.home / "not-a-configuration.toml"
+        plan = self.home / "no-steps.json"
+        plan.write_text("[]", encoding="utf-8")
+        runtime = role_url(self.harness.runtime)
+        calls = {
+            "rk run": (
+                "run", "--url", runtime, "--state-url", role_url(self.harness.state),
+                "--config", str(absent),
+            ),
+            "rk tool run": (
+                "tool", "run", "--url", runtime, "--artifacts", str(self.store),
+                "--config", str(absent), "--image", AGENT_IMAGE,
+                "--agent-run", "none", "--tool", "none",
+            ),
+            "rk browser run": (
+                "browser", "run", "--url", runtime, "--artifacts", str(self.store),
+                "--config", str(absent), "--image", AGENT_IMAGE,
+                "--authority", str(self.authority), "--agent-run", "none",
+                "--plan", str(plan),
+            ),
+        }
+
+        for command, arguments in calls.items():
+            with self.subTest(command=command):
+                answered = self.rk(*arguments)
+
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, answered["exit_code"], answered)
+                self.assertEqual(
+                    [("invalid_configuration", "config")],
+                    [(item["code"], item["source"]) for item in answered["violations"]],
+                )
+
+    def test_a_command_on_a_machine_missing_one_of_the_five_says_so_first(self):
+        # The control for the test above. `rk run` is the one of the three that
+        # names the partial boundary itself; the other two are handed whatever
+        # `execution.boundary` returns and refuse further in.
+        answered = self.rk(
+            "run", "--url", role_url(self.harness.runtime),
+            "--state-url", role_url(self.harness.state),
+            "--config", str(self.home / "not-a-configuration.toml"),
+            **{execution.CERTIFICATE: None},
+        )
+
+        self.assertEqual(
+            [f"environment:{execution.CERTIFICATE}"],
+            [item["source"] for item in answered["violations"]],
+        )
+
+    def test_a_child_is_given_the_application_the_sdk_and_a_home_it_can_write(self):
+        # The three optional variables. A boundary without them is a boundary,
+        # which is why they are optional; an installation that sets them expects
+        # them inside the child, on its import path, and the home writable --
+        # the CLI keeps session state there and a read-only one is a launch that
+        # fails an hour in.
+        container, absent = execution.boundary(
+            self.environment(
+                **{
+                    execution.APPLICATION: str(self.application),
+                    execution.SDK: str(self.sdk),
+                    execution.HOME: str(self.child_home),
+                }
+            )
+        )
+        self.assertEqual((), absent)
+        probe = PROBE + """
+print(json.dumps({
+    'application': os.path.isdir(%r),
+    'sdk': os.path.isdir(%r),
+    'home': os.path.isdir(%r),
+    'writable': writable(%r),
+    'imported': [entry for entry in os.environ['PYTHONPATH'].split(':')],
+}))
+""" % (
+            isolation.APPLICATION,
+            isolation.SDK,
+            isolation.HOME_DIR,
+            f"{isolation.HOME_DIR}/session",
+        )
+
+        result = isolation.run(container, ("python3", "-c", probe), timeout=20)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        facts = json.loads(result.stdout)
+        self.assertTrue(facts["application"])
+        self.assertTrue(facts["sdk"])
+        self.assertTrue(facts["home"])
+        self.assertTrue(facts["writable"])
+        self.assertEqual([isolation.APPLICATION, isolation.SDK], facts["imported"])
+
+    def rk(self, *arguments: str, **overrides) -> dict:
+        """One shipped command, run as an operator runs it, and its report read.
+
+        A subprocess rather than a call into `cli`: what criterion 4 asks about is
+        the command, and a command that reads `os.environ` is only proved to read
+        this machine's environment by being given one.
+        """
+        described = self.environment(**overrides)
+        result = subprocess.run(
+            [sys.executable, "-m", "redkraken", *arguments],
+            cwd=str(ROOT),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(ROOT / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                **{
+                    name: described[name]
+                    for name in (*execution.REQUIRED, *(name for name, _ in execution.OPTIONAL))
+                    if name in described
+                },
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertTrue(result.stdout, result.stderr)
+        return json.loads(result.stdout)
+
+    # -- the refusals ----------------------------------------------------------
+
+    def refused(self, *, egress: str | None = None, **overrides) -> Report:
+        """One `door.start` that is expected to refuse before it starts anything."""
+        result = door.start(self.environment(**overrides), egress=egress or self.egress)
+        self.assertFalse(result.ok, result.facts)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        return result
+
+    def test_a_boundary_that_is_not_described_is_refused(self):
+        refusal = self.refused(**{execution.IMAGE: None})
+
+        self.assertIn("no Agent boundary is described", refusal.violations[0].detail)
+        self.assertIn(execution.IMAGE, refusal.violations[0].detail)
+
+    def test_a_network_that_is_not_internal_is_refused(self):
+        refusal = self.refused(
+            **{
+                execution.NETWORK: self.open_network,
+                execution.PROXY_CONTAINER: f"{self.container}-second",
+            }
+        )
+
+        self.assertIn("not internal", refusal.violations[0].detail)
+
+    def test_a_network_that_already_has_a_peer_is_refused(self):
+        # This one is the door itself. A network whose peer arrived before the
+        # door did is a network something had a route across for as long as it
+        # took to start one.
+        refusal = self.refused(**{execution.PROXY_CONTAINER: f"{self.container}-second"})
+
+        self.assertIn("already has peers", refusal.violations[0].detail)
+        self.assertIn(self.container, refusal.violations[0].detail)
+
+    def test_a_container_already_holding_the_door_s_name_is_refused(self):
+        refusal = self.refused()
+
+        self.assertIn("already exists", refusal.violations[0].detail)
+        self.assertIn("rm --force", refusal.violations[0].detail)
+
+    def test_a_store_the_door_could_not_write_is_refused(self):
+        refusal = self.refused(**{store.ROOT_VARIABLE: str(self.private)})
+
+        self.assertIn(f"chown {isolation.UID}:{isolation.GID}", refusal.violations[0].detail)
+
+    def test_a_certificate_that_is_not_the_door_s_own_is_refused(self):
+        refusal = self.refused(
+            **{execution.CERTIFICATE: str(self.home / "somebody-elses.pem")}
+        )
+
+        self.assertIn("does not name the authority this door signs with", refusal.violations[0].detail)
+
+    def test_a_secret_reference_for_the_artifact_key_is_refused(self):
+        # Resolving one inside the container would mean a service-account token
+        # inside the container, so the contained door takes a file or nothing.
+        refusal = self.refused(**{seal.KEY_VARIABLE: "op://BugBounty/rk2/key"})
+
+        self.assertIn("cannot resolve a secret reference", refusal.violations[0].detail)
+
+    def test_an_egress_network_that_is_the_agent_network_is_refused(self):
+        # One network cannot be both. The door would be reachable from the
+        # network it is supposed to be the only way out of.
+        refusal = self.refused(
+            egress=self.spare,
+            **{execution.NETWORK: self.spare, execution.PROXY_CONTAINER: f"{self.container}-2"},
+        )
+
+        self.assertIn("cannot be the Agent network", refusal.violations[0].detail)
+
+    def test_an_egress_network_with_no_route_out_is_refused(self):
+        # An internal second attachment is a door that comes up, binds, and finds
+        # neither the database nor the internet on the other side.
+        refusal = self.refused(
+            egress=self.network,
+            **{execution.NETWORK: self.spare, execution.PROXY_CONTAINER: f"{self.container}-2"},
+        )
+
+        self.assertIn("was created --internal", refusal.violations[0].detail)
+
+    def test_an_egress_network_that_already_has_a_peer_is_refused(self):
+        # This one is the door already running. The door binds every interface it
+        # has, so a peer on the way out is a peer that can reach the fence without
+        # a capability having been minted for it -- which is the whole of what the
+        # internal network is for.
+        refusal = self.refused(
+            egress=self.egress,
+            **{execution.NETWORK: self.spare, execution.PROXY_CONTAINER: f"{self.container}-2"},
+        )
+
+        self.assertIn("already has peers", refusal.violations[0].detail)
+        self.assertIn(self.container, refusal.violations[0].detail)
 
 
 REPLAY_SLUG = "selftest-replay"

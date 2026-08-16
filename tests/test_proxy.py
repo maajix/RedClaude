@@ -439,6 +439,70 @@ class HeaderTest(unittest.TestCase):
         self.assertNotEqual(first, proxy.query_sha256("http://a.example.test/v1?id=3"))
 
 
+class BindPolicyTest(unittest.TestCase):
+    """82 criteria 1 and 2: where a door may listen, and what it takes.
+
+    Two rules that have to hold together. `rk proxy serve` binds loopback and
+    nothing else, because a capability on a routable interface is bearer material
+    anybody who can reach the interface may spend -- and adding a contained door
+    must not have made a second way to put one there. So the wide bind takes both
+    a caller that says it means it and a process that is really inside a
+    container, and neither alone will do.
+    """
+
+    def test_loopback_needs_nothing_said_about_it(self):
+        for host in ("127.0.0.1", "::1", "localhost"):
+            with self.subTest(host=host):
+                self.assertIsNone(proxy._unbindable(host, False))
+                self.assertIsNone(proxy._unbindable(host, True))
+
+    def test_a_routable_bind_is_refused_however_the_command_is_run(self):
+        # The half `rk proxy serve` never passes: whatever this machine is, the
+        # command that does not ask to bind wide does not bind wide.
+        for host in ("0.0.0.0", "::", "192.168.1.10"):
+            with self.subTest(host=host):
+                refused = proxy._unbindable(host, False)
+
+                self.assertIsNotNone(refused)
+                self.assertIn("bearer material", refused)
+
+    def test_asking_to_bind_wide_is_not_enough_on_a_host(self):
+        # The argument is the thing being checked, so the answer to "may it be"
+        # cannot come from the asker. A door started with the flag on a host
+        # would be exactly the listener the rule above exists to prevent, and it
+        # would look like it was working.
+        with mock.patch.object(proxy, "CONTAINER_MARKERS", (Path("/no/such/marker"),)):
+            refused = proxy._unbindable("0.0.0.0", True)
+
+        self.assertIsNotNone(refused)
+        self.assertIn("this is not a container", refused)
+
+    def test_asking_to_bind_wide_inside_a_container_is_allowed(self):
+        for marker in proxy.CONTAINER_MARKERS:
+            with self.subTest(marker=marker):
+                with mock.patch.object(proxy, "CONTAINER_MARKERS", (marker,)):
+                    with mock.patch.object(Path, "exists", lambda self: self == marker):
+                        self.assertIsNone(proxy._unbindable("0.0.0.0", True))
+
+    def test_serve_refuses_a_routable_bind_before_it_opens_anything(self):
+        # Nothing else in `serve` has run: no authority, no key, no database. A
+        # refusal that had opened a session first would be a refusal that told an
+        # operator about the wrong problem.
+        refused = proxy.serve(
+            pg.settings_from_url("postgresql://nobody@127.0.0.1:1/nothing"),
+            root=Path("/nonexistent"),
+            host="0.0.0.0",
+        )
+
+        self.assertFalse(refused.ok)
+        self.assertEqual(
+            [("invalid_configuration", "argument:--host")],
+            [(violation.code, violation.source) for violation in refused.violations],
+        )
+        self.assertIn("bearer material", refused.violations[0].detail)
+        self.assertIsNone(refused.facts["endpoint"])
+
+
 class AddressTest(unittest.TestCase):
     """Criteria 2 and 3, in the parts that need no socket and no decision."""
 

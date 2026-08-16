@@ -15,8 +15,9 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
-from redkraken import _launch, _startup, agent, isolation, tls
+from redkraken import _launch, _startup, agent, door, isolation, tls
 from redkraken.document import FENCE
 
 
@@ -644,6 +645,33 @@ def writable(path):
     except OSError:
         return False
 """
+
+
+#: The name the engine publishes this machine back under, as the door spells
+#: it. Taken from there rather than written again: the suites start containers
+#: of their own, and a connection string that named this machine by a different
+#: word than the door's children see would be a fixture proving nothing.
+GATEWAY = door.GATEWAY
+
+
+def role_url(settings, *, host: str | None = None) -> str:
+    """One role's connection string, as a process on this machine spells it."""
+    return (
+        f"postgres://{quote(settings.user)}:{quote(settings.password or '')}"
+        f"@{host or settings.host}:{settings.port}/{quote(settings.database)}"
+    )
+
+
+def contained_url(settings) -> str:
+    """How a container reaches the database this suite is running against.
+
+    A loopback address is this machine's from the host's namespace and the
+    container's own from inside one, so it -- and only it -- is rewritten to the
+    gateway the engine publishes back. Anything else is a server that is
+    somewhere, and somewhere is reachable from both.
+    """
+    inside = settings.host in ("127.0.0.1", "localhost", "::1") or settings.host.startswith("/")
+    return role_url(settings, host=GATEWAY if inside else None)
 
 
 def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:

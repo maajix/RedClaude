@@ -22,6 +22,7 @@ from redkraken import (
     callback,
     decisions,
     doctor,
+    door,
     evaluation,
     evidence,
     execution,
@@ -44,6 +45,7 @@ from redkraken.outcome import (
     INVALID_CONFIGURATION,
     Ledger,
     Report,
+    render as _render,
     report,
 )
 
@@ -61,11 +63,9 @@ STATE_URL = "RK_STATE_URL"
 #: reachable from `RK_DATABASE_URL`: a control verb the runtime could execute is
 #: a control verb a model's tool call can reach through the runtime.
 HUMAN_URL = "RK_HUMAN_URL"
-#: The egress door's own connection, held as `rk2_proxy`: EXECUTE on two writers
-#: and no receipt DML at all. Spelled out rather than folded into
-#: `RK_DATABASE_URL` because a fence running as the runtime would be a fence with
-#: the privileges of the thing it fences.
-PROXY_DATABASE_URL = "RK_PROXY_DATABASE_URL"
+#: The egress door's own connection, held as `rk2_proxy`. Named where the door
+#: is, because `door.main` reads it inside a container this command never sees.
+PROXY_DATABASE_URL = proxy.DATABASE_VARIABLE
 
 DEFAULT_DATABASE = "rk2"
 
@@ -1118,10 +1118,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     packing_verify.set_defaults(run=_evidence_verify)
 
-    door = commands.add_parser(
+    # Not `door`: the module by that name is what the subcommand two blocks down
+    # calls, and a local shadowing it here is a parser being asked for a default.
+    doors = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
-    operations = door.add_subparsers(dest="operation", required=True, metavar="operation")
+    operations = doors.add_subparsers(dest="operation", required=True, metavar="operation")
 
     listener = operations.add_parser(
         "serve",
@@ -1168,6 +1170,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     listener.set_defaults(run=_proxy_serve)
+
+    doorway = operations.add_parser(
+        "door",
+        help=(
+            "start the door in a container, as the Agent network's one peer, so "
+            "children have something to reach"
+        ),
+    )
+    doorway.add_argument(
+        "--egress",
+        default=door.EGRESS,
+        metavar="network",
+        help=(
+            "the second attachment, over which the door reaches the database and "
+            "the internet; the Agent network carries no route to either "
+            f"(default: {door.EGRESS})"
+        ),
+    )
+    doorway.add_argument(
+        "--timeout",
+        type=float,
+        default=door.START_TIMEOUT,
+        metavar="seconds",
+        help=(
+            "how long the door gets to bind and open its fence before it is given "
+            f"up on and taken away (default: {door.START_TIMEOUT:g})"
+        ),
+    )
+    doorway.set_defaults(run=_proxy_door)
 
     spend = operations.add_parser(
         "request",
@@ -2166,6 +2197,23 @@ def _proxy_serve(arguments: argparse.Namespace) -> int:
     )
 
 
+def _proxy_door(arguments: argparse.Namespace) -> int:
+    """The one command that starts something and returns while it is still running.
+
+    Everything it needs is already in the environment, because everything it
+    needs is what `rk run` will read there too: a command with flags of its own
+    for the image, the network or the proxy URL would be a second place those
+    could be said, and the day the two disagreed the boundary would verify
+    against a door no child was pointed at.
+    """
+    return _render(
+        _guarded(
+            door.COMMAND,
+            lambda: door.start(os.environ, egress=arguments.egress, timeout=arguments.timeout),
+        )
+    )
+
+
 def _proxy_request(arguments: argparse.Namespace) -> int:
     ledger = Ledger()
     runtime = _url(ledger, RUNTIME, arguments.url, proxy.REQUEST)
@@ -2333,11 +2381,6 @@ def _guarded(command: str, operation: Callable[[], Report]) -> Report:
         return _refusal(command, "connection", str(error), DATABASE_UNREACHABLE)
     except pg.DatabaseError as error:
         return _refusal(command, "database", str(error), INVALID_CONFIGURATION)
-
-
-def _render(result: Report) -> int:
-    print(json.dumps(result.as_dict(), indent=2))
-    return result.exit_code
 
 
 def _refusal(command: str, name: str, detail: str, code: str) -> Report:

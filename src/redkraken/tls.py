@@ -136,6 +136,15 @@ LEAF_EXTENSIONS = (
 )
 
 
+#: What the two halves of an authority are called inside its directory. Named
+#: because the certificate is handed out and the key never is, so anything that
+#: has to point at one of them from outside -- `RK_PROXY_CA_FILE`, a door started
+#: in a container whose authority directory is a bind mount -- points at a name
+#: this module decides rather than at a spelling it guessed.
+CERTIFICATE_NAME = "ca.pem"
+KEY_NAME = "ca-key.pem"
+
+
 class Unusable(Exception):
     """This directory cannot hold an authority, or this host cannot be certified."""
 
@@ -284,8 +293,8 @@ def authority(directory: Path | str) -> Authority:
     child would report it as a network fault an hour later.
     """
     directory = Path(directory)
-    certificate = directory / "ca.pem"
-    key = directory / "ca-key.pem"
+    certificate = directory / CERTIFICATE_NAME
+    key = directory / KEY_NAME
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as error:

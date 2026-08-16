@@ -60,6 +60,111 @@ Give it a Program configuration to validate that too:
 rk doctor --config program.toml
 ```
 
+## The Agent boundary
+
+Every command that starts a container -- `rk run`, `rk tool run`, `rk browser
+run` -- reads the same five variables and refuses if any is unset. Nothing is
+defaulted: an image name guessed here would start a child in whatever the guess
+matched, and a proxy URL guessed here would point a child's only route at
+whatever answers on that port.
+
+| Variable | What it names |
+| -------- | ------------- |
+| `RK_AGENT_IMAGE` | The image children run in. Never pulled implicitly. |
+| `RK_AGENT_NETWORK` | A Docker network created `--internal`, whose only peer is the door. |
+| `RK_AGENT_PROXY_CONTAINER` | The door's container name on that network. |
+| `RK_AGENT_PROXY_URL` | `http://<container>:<port>`, uncredentialed. Children get it as `HTTP_PROXY`, and the door binds the port it names. |
+| `RK_PROXY_CA_FILE` | The certificate children verify every target against: `<authority>/ca.pem`. |
+
+Three more are optional and absent by default, because absent is the contained
+value: `RK_AGENT_APPLICATION`, `RK_AGENT_SDK` and `RK_AGENT_HOME` name the
+application, the SDK and the home mounted inside a child. A container with no
+home mounted has no credential at all rather than somebody else's.
+
+### Satisfying them
+
+`rk proxy door` puts the production fence on the Agent network as its only
+peer, and returns while it is still running. It takes no flags for the five
+variables above -- a second place to say them is a day the boundary verifies
+against a door no child was pointed at -- and reads three more of its own:
+
+| Variable | What it names |
+| -------- | ------------- |
+| `RK_PROXY_DATABASE_URL` | The door's own connection, held as `rk2_proxy`. Not `RK_DATABASE_URL`: a fence running as the runtime is a fence with the privileges of the thing it fences. |
+| `RK_ARTIFACT_ROOT` | Where exchanges are filed. |
+| `RK_PROXY_AUTHORITY` | Where the door mints and keeps its signing material. |
+| `RK_ARTIFACT_KEY` | Optional. A **file**, not an `op://` reference: resolving one inside the container would mean a service-account token inside the container. Without it, sealed responses are refused. |
+
+The door runs as `65534:65534` with every capability dropped and a read-only
+root filesystem, so both directories it writes have to be writable by that
+user. It creates neither -- a directory this command made would be owned by the
+operator, which is the state it refuses on the next line:
+
+```sh
+mkdir -p /var/lib/rk2/artifacts /var/lib/rk2/authority
+sudo chown 65534:65534 /var/lib/rk2/artifacts /var/lib/rk2/authority
+
+docker network create --internal rk2-agent
+docker network create rk2-egress
+export RK_AGENT_IMAGE=rk2-agent:local
+export RK_AGENT_NETWORK=rk2-agent
+export RK_AGENT_PROXY_CONTAINER=rk2-door
+export RK_AGENT_PROXY_URL=http://rk2-door:18080
+export RK_PROXY_CA_FILE=/var/lib/rk2/authority/ca.pem
+export RK_PROXY_DATABASE_URL="postgres://rk2_proxy:...@host.docker.internal:5432/rk2"
+export RK_ARTIFACT_ROOT=/var/lib/rk2/artifacts
+export RK_PROXY_AUTHORITY=/var/lib/rk2/authority
+
+rk proxy door
+```
+
+The door runs `python3 -m redkraken.door` inside `RK_AGENT_IMAGE`, from this
+checkout mounted read-only, so that image needs a Python 3 and an `openssl` on
+its `PATH` -- the second is what mints the authority. The connection string is
+written from the container's point of view, which is why the example says
+`host.docker.internal`: the door is given that name explicitly, because a
+Postgres on this machine has no other spelling from inside a container.
+
+Everything decidable without starting anything is decided first: the boundary
+is described, both directories are writable by the user the door runs as, the
+key is a file and not a reference, `RK_PROXY_CA_FILE` names the authority this
+door will sign with, no container already holds the door's name, and both
+networks are what they claim -- the Agent's internal and empty, the egress one
+routable and empty. Then the door starts on its egress attachment alone -- so
+it has a database to reach before it is anywhere a child could see it -- and
+joins the Agent network only once it says it is serving.
+
+The door is on two networks and the difference between them is the point. The
+Agent network carries no route anywhere: no database, no internet, no host. The
+second attachment carries both, and nothing but the door is on it, so a child
+reaches the internet only by asking the door to go -- which is the same thing
+as saying the fence sees every request. `--egress` names that second network
+(`rk2-egress` by default) and `--timeout` how long the door gets to bind and
+open its fence before it is given up on and taken away.
+
+That second network is a network of the operator's own rather than the engine's
+default `bridge`, and the door refuses to start on one that already has peers.
+The door binds every interface it has, so a peer on the way out is a peer that
+could reach the fence without a capability ever having been minted for it.
+
+The door outlives the command that started it, and is not removed when it fails:
+a door that vanished would take the only account of why with it. So `rk proxy
+door` refuses to start where one already exists, and taking it away is the
+operator's own `docker rm --force rk2-door`.
+
+The command asserts the topology from out here, where an engine exists. A
+process inside a container cannot enumerate the peers of the networks it is on,
+and a door holding an engine socket would be a worse hole than the one this
+closes -- so `python3 -m redkraken.door` run by hand somewhere else binds wide
+on a network nobody vouched for. The door is only the door when `rk proxy door`
+is what put it there.
+
+`rk proxy serve` is the other door: the one an operator runs in a terminal, on
+loopback. It refuses a routable bind, because what arrives at a listening fence
+is bearer material anybody who can reach the port may spend. The contained door
+is the one exception, and only because the whole of what can reach its port is
+the child the capability was minted for.
+
 ## The Program configuration
 
 A configuration is versioned and declarative. The schema is closed: an

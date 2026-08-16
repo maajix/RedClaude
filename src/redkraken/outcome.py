@@ -7,6 +7,7 @@ outcome class without parsing prose.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -189,6 +190,19 @@ class Report:
             "assertions": [assertion.as_dict() for assertion in self.assertions],
             "violations": [violation.as_dict() for violation in self.violations],
         }
+
+
+def render(result: Report) -> int:
+    """Print one report where a caller reads it, and hand back its status.
+
+    Here rather than in whichever module happens to own a command, because there
+    is more than one thing that ends by printing a report: `cli` does it for
+    every subcommand, and `door.main` does it from inside a container no `cli`
+    process is watching. Two copies of two lines is two spellings of what a
+    command's output is.
+    """
+    print(json.dumps(result.as_dict(), indent=2))
+    return result.exit_code
 
 
 def report(command: str, ledger: Ledger, **facts: object) -> Report:

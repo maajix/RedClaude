@@ -732,6 +732,19 @@ run and never defaulted: a default would be the operator's own machine, with the
 operator's own home.
 _Avoid_: Sandbox, jail, isolation layer, VM
 
+**Door**:
+The capability proxy as a peer on a network: the one process a contained child
+can reach, and the only thing between it and a target. It is on two networks
+and the difference is the whole of the boundary -- the Agent's, which is
+internal and carries no route to the database, the internet or this machine,
+and its own way out, which carries both and has nothing else on it. So a child
+reaches the internet only by asking the door to go, and the fence sees every
+request. Two of them exist and they differ by exactly one bind: the operator's,
+on loopback, and the contained one, bound wide on a network whose peers the
+command that started it enumerated from outside. The word covers where the
+Halt, the scope policy and the capability check are enforced.
+_Avoid_: Proxy (the proxy is what the door runs), gateway, egress node, MITM
+
 **Startup assertion**:
 The runtime's version-bound refusal to begin an agent run while any credential
 vector is present or the effective launch configuration cannot be verified,

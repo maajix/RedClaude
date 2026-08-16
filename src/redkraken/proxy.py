@@ -157,6 +157,14 @@ REQUEST = f"{COMMAND} request"
 #: `rk2_proxy`, so no single exported variable runs both sides of the fence.
 PROXY_URL = "RK_PROXY_URL"
 
+#: The door's own connection, held as `rk2_proxy`: EXECUTE on two writers and no
+#: receipt DML at all. Spelled out rather than folded into `RK_DATABASE_URL`
+#: because a fence running as the runtime would be a fence with the privileges of
+#: the thing it fences. Named here rather than beside the CLI's other roles
+#: because both things that open it are here: the command, and the door `start`
+#: puts in a container.
+DATABASE_VARIABLE = "RK_PROXY_DATABASE_URL"
+
 #: Where the door keeps the authority it signs intercepted connections with. A
 #: directory rather than a file, because it holds a private key as well as the
 #: certificate, and the two must not be handed out together.
@@ -770,6 +778,57 @@ def _loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+#: The files a container runtime leaves behind to say a process is inside one.
+#: Docker writes the first, Podman the second. Read rather than trusted from an
+#: argument, because the argument is the thing being checked: a caller asking to
+#: bind wide is asking for the rule to be relaxed, and the answer to "may it be"
+#: cannot come from the asker.
+CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
+
+
+def _in_a_container() -> bool:
+    """Whether this process is inside a container.
+
+    Distinct from `serve`'s `contained` argument, which is a caller saying it
+    means to bind wide.  One is a claim and the other is the fact it is held to.
+    """
+    return any(marker.exists() for marker in CONTAINER_MARKERS)
+
+
+def _unbindable(host: str, contained: bool) -> str | None:
+    """Why this address may not be listened on, or None if it may.
+
+    Loopback is always allowed and needs no argument: nothing off this machine
+    can reach it.
+
+    Anything wider is bearer material on a routable interface, which is the hole
+    `endpoint` refuses from the other side, so it needs two things at once. The
+    caller has to say it means it -- `rk proxy serve` never does, which is what
+    keeps this from becoming a second way to expose a door on a host -- and the
+    process has to actually be in a container, so that "routable" means routable
+    from the container network and nothing else. The second is checked here
+    rather than left to the operator because a door started with the flag on a
+    host would be exactly the listener the first rule exists to prevent, and it
+    would look like it was working.
+
+    Which container network, and whether the door is its only peer, is not
+    knowable from in here: it takes an engine, and a door holding an engine
+    socket would be a worse hole than the one this closes. `door.start` asks
+    that question from outside, before and after this process binds.
+    """
+    if _loopback(host):
+        return None
+    if not contained:
+        return f"{host} is not a loopback interface, and a capability is bearer material"
+    if not _in_a_container():
+        return (
+            f"{host} is not a loopback interface and this is not a container; "
+            "a door binds wide only where a container network is the whole of "
+            "what can reach it"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2862,6 +2921,8 @@ def serve(
     port: int = 0,
     authority: Path | None = None,
     key: seal.Location | None = None,
+    contained: bool = False,
+    announce: Callable[[str], None] | None = None,
 ) -> Report:
     """Run the fence until it is interrupted.
 
@@ -2869,16 +2930,25 @@ def serve(
     holds learns that from the report rather than after a database session has
     been opened for a process that cannot listen.
 
-    And it binds nowhere but this machine. `endpoint` refuses to send a
-    capability to a proxy that is not local; a listener on a routable interface
+    And by default it binds nowhere but this machine. `endpoint` refuses to send
+    a capability to a proxy that is not local; a listener on a routable interface
     is the same hole from the other side, because what arrives at it is bearer
-    material that anybody who can reach the port may spend.
+    material that anybody who can reach the port may spend. `contained` is the
+    one exception, for the door that has to be an Agent network's peer -- see
+    `_unbindable` for what it costs and `door` for who pays it. `rk proxy serve`
+    never passes it.
+
+    `announce` is called with the endpoint the moment the socket is bound and
+    before anything is served on it. The report is written when the listener
+    closes, which is far too late to be a readiness signal, and a starter that
+    guessed instead would be a race nobody can reproduce.
     """
     ledger = Ledger()
-    if not _loopback(host):
+    unbindable = _unbindable(host, contained)
+    if unbindable is not None:
         ledger.fail(
             "listener",
-            f"{host} is not a loopback interface, and a capability is bearer material",
+            unbindable,
             code=INVALID_CONFIGURATION,
             source="argument:--host",
         )
@@ -2944,6 +3014,7 @@ def serve(
             source="argument:--port",
         )
         return report(SERVE, ledger, endpoint=None, certificate=certificate)
+    endpoint = f"http://{host}:{server.server_address[1]}"
     ledger.hold("listener", f"listening on {host}:{server.server_address[1]}")
 
     connection = migrate.open_connection(ledger, settings)
@@ -2951,6 +3022,11 @@ def serve(
         server.server_close()
         return report(SERVE, ledger, endpoint=None, certificate=certificate)
     server.fence = Fence(connection)
+    # Announced here rather than at the bind, because a socket with no fence
+    # behind it answers every request with a refusal: a starter that took the
+    # bind for readiness would hand back a door that is up and useless.
+    if announce is not None:
+        announce(endpoint)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2958,12 +3034,7 @@ def serve(
     finally:
         server.server_close()
         connection.close()
-    return report(
-        SERVE,
-        ledger,
-        endpoint=f"http://{host}:{server.server_address[1]}",
-        certificate=certificate,
-    )
+    return report(SERVE, ledger, endpoint=endpoint, certificate=certificate)
 
 
 # ---------------------------------------------------------------------------

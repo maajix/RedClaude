@@ -107,18 +107,31 @@ class Unavailable(RuntimeError):
     """The configured engine, image or topology cannot provide isolation."""
 
 
-def _hardened(engine: str, name: str) -> list[str]:
-    """The restrictions every container this module starts runs under.
+def hardened(name: str, *, ephemeral: bool = True) -> list[str]:
+    """The restrictions every container this harness starts runs under.
 
     One list rather than one per caller.  An Agent child and an offline tool
     differ in what they are given -- a network, a scratch size, a memory ceiling
     -- and not at all in what they are denied, so a second copy of the denials
-    is a second place for one of them to quietly lose a line.
+    is a second place for one of them to quietly lose a line.  Public, and about
+    this harness rather than this module, for the same reason: `door` starts the
+    proxy peer this module then holds every child to, and a door denied less
+    than the children around it is the hole.
+
+    The engine is not named here, only the arguments it takes.  A caller that
+    runs the command itself puts the engine in front; one that hands it to
+    `engine_command` does not, and neither has to know which of those the other
+    is doing.
+
+    `ephemeral` is the one thing a caller decides here, and only because the
+    door is the one container this harness starts that outlives the command
+    starting it.  A one-shot child that is gone is a child whose output has
+    already been read; a door that is gone is a door whose reason for going is
+    gone with it.
     """
     return [
-        engine,
         "run",
-        "--rm",
+        *(["--rm"] if ephemeral else []),
         # Never pulled implicitly: which build ran is half of what its output
         # means, and a pull here would decide that from the network.
         "--pull",
@@ -222,7 +235,7 @@ def run(
     """
     if isinstance(argv, (str, bytes)):
         raise Unavailable("an Agent container argv must be a sequence, not one string")
-    engine = _engine(container.engine)
+    engine = engine_for(container.engine)
     command = tuple(argv)
     if not command or any(not isinstance(item, str) or not item or "\0" in item for item in command):
         raise Unavailable("an Agent container needs a non-empty argv of plain strings")
@@ -233,14 +246,14 @@ def run(
     if not certificate.is_file():
         raise Unavailable(f"the run trust root is not a readable file: {certificate}")
 
-    proxy_host = _proxy_host(container.proxy_url)
+    proxy_host, _ = proxy_peer(container.proxy_url)
     image_environment = _image_environment(engine, container.image)
     watched = sorted(set(image_environment) & set(_startup.WATCHED_ENV_VECTORS))
     if watched:
         raise Unavailable(
             "the Agent image declares watched credential vectors: " + ", ".join(watched)
         )
-    _one_peer(engine, container.network, container.proxy_container, proxy_host)
+    one_peer(engine, container.network, container.proxy_container, proxy_host)
 
     inherited = os.environ if source_environment is None else source_environment
     environment = container_environment(container, inherited)
@@ -248,7 +261,8 @@ def run(
 
     name = f"rk2-agent-{uuid.uuid4().hex}"
     docker = [
-        *_hardened(engine, name),
+        engine,
+        *hardened(name),
         "--network",
         container.network,
         "--dns",
@@ -286,7 +300,7 @@ def run(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as error:
-        _remove(engine, name, host_environment)
+        remove(engine, name, host_environment)
         raise Unavailable(f"the Agent container exceeded its {timeout:g}s runtime") from error
 
 
@@ -397,7 +411,7 @@ def run_tool(
     if not 1 <= scratch_mb <= 1024:
         raise Unavailable(f"a tool's scratch tmpfs is between 1MB and 1GB, not {scratch_mb}")
 
-    engine = _engine(container.engine)
+    engine = engine_for(container.engine)
     watched = sorted(
         set(_image_environment(engine, container.image)) & set(_startup.WATCHED_ENV_VECTORS)
     )
@@ -440,7 +454,8 @@ def run_tool(
             mounts.append(f"type=bind,src={certificate},dst={CA_FILE},readonly")
 
         docker = [
-            *_hardened(engine, name),
+            engine,
+            *hardened(name),
             *routing,
             # The scratch a tool is given, and the reason it is a parameter: a
             # command-line tool needs somewhere to put a few kilobytes, and a
@@ -480,7 +495,7 @@ def run_tool(
             answer = _bounded(
                 process,
                 ceilings,
-                stop=lambda: _remove(engine, name, host_environment),
+                stop=lambda: remove(engine, name, host_environment),
             )
         if answer.timed_out or answer.overflowed:
             # The process is gone and whatever it wrote is a fragment, but the
@@ -646,7 +661,7 @@ def _adapter(
     A network of its own rather than the Agent's.  That network's whole claim is
     that the only peer on it is the proxy: a tool attached to it would be a
     second peer, which is both a route between the tool and whatever agent
-    process is running beside it and a topology `_one_peer` would refuse for the
+    process is running beside it and a topology `one_peer` would refuse for the
     next run either of them made.  So a tool that declares the proxy adapter gets
     the same shape of boundary rather than a share of somebody else's -- created
     here, the proxy joined to it under the hostname the door's URL names, held to
@@ -655,18 +670,12 @@ def _adapter(
     The caller names the network before this is called, so a step that fails
     part of the way through is still a network the `finally` knows to remove.
     """
-    proxy_host = _proxy_host(door.proxy_url)
-    _engine_command(
+    proxy_host, _ = proxy_peer(door.proxy_url)
+    engine_command(
         engine, ("network", "create", "--internal", network), host_environment,
         f"the tool egress network cannot be created: {network}",
     )
-    _engine_command(
-        engine,
-        ("network", "connect", "--alias", proxy_host, network, door.proxy_container),
-        host_environment,
-        f"the proxy cannot be joined to the tool egress network: {door.proxy_container}",
-    )
-    _one_peer(engine, network, door.proxy_container, proxy_host)
+    join(engine, network, door.proxy_container, proxy_host, host_environment)
 
 
 def _unadapt(
@@ -680,14 +689,14 @@ def _unadapt(
     raise over the run's own answer -- what is left behind is one empty network
     with this run's name on it, which is a thing an operator can see and remove.
     """
-    _engine_command(
+    engine_command(
         engine, ("network", "disconnect", "--force", network, proxy_container),
         host_environment, None,
     )
-    _engine_command(engine, ("network", "rm", network), host_environment, None)
+    engine_command(engine, ("network", "rm", network), host_environment, None)
 
 
-def _engine_command(
+def engine_command(
     engine: str,
     arguments: Sequence[str],
     host_environment: Mapping[str, str],
@@ -707,7 +716,7 @@ def _engine_command(
         raise Unavailable(f"{refusal}: {detail[-1] if detail else 'no reason given'}")
 
 
-def _remove(engine: str, name: str, host_environment: Mapping[str, str]) -> None:
+def remove(engine: str, name: str, host_environment: Mapping[str, str]) -> None:
     """Take one named container away, now, and never mind whether it was there."""
     subprocess.run(
         [engine, "rm", "--force", name],
@@ -762,7 +771,7 @@ def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
             raise Unavailable(f"an Agent container mount is not a directory: {source}")
         if _carries_operator_home(source):
             raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
-        if not readonly and not _writable_by_the_child(source):
+        if not readonly and not writable_by_the_child(source):
             raise Unavailable(f"an Agent container home the child cannot write: {source}")
         mount = f"type=bind,src={source},dst={destination}"
         arguments.extend(("--mount", f"{mount},readonly" if readonly else mount))
@@ -782,7 +791,7 @@ def _carries_operator_home(source: Path) -> bool:
     return source == home or source in home.parents
 
 
-def _writable_by_the_child(source: Path) -> bool:
+def writable_by_the_child(source: Path) -> bool:
     """Whether the container's own unprivileged user could write this directory.
 
     Decided from the directory's ownership and mode rather than from
@@ -797,7 +806,7 @@ def _writable_by_the_child(source: Path) -> bool:
     return status.st_mode & 0o003 == 0o003
 
 
-def _engine(name: str) -> str:
+def engine_for(name: str) -> str:
     found = shutil.which(name)
     if found is None:
         raise Unavailable(f"the configured container engine is not on PATH: {name}")
@@ -835,7 +844,14 @@ def _image_environment(engine: str, image: str) -> set[str]:
     return {str(item).partition("=")[0] for item in configured}
 
 
-def _proxy_host(url: str) -> str:
+def proxy_peer(url: str) -> tuple[str, int]:
+    """The name and port the Agent proxy URL claims, or a refusal.
+
+    Both halves out of one parse.  The name is what the topology assertion below
+    looks for among the network's aliases; the port is what the door itself has
+    to bind, which is why the port is returned at all -- see `door.main` for who
+    binds it and what goes wrong when the two disagree.
+    """
     try:
         parsed = urlsplit(url)
         port = parsed.port
@@ -852,22 +868,56 @@ def _proxy_host(url: str) -> str:
         or parsed.fragment
     ):
         raise Unavailable("the Agent proxy URL must be an uncredentialed http://host:port")
-    return parsed.hostname
+    return parsed.hostname, port
 
 
-def _one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) -> None:
+def peers(engine: str, network: str) -> tuple[bool, dict[str, str]]:
+    """Whether this network is internal, and the identity and name of each peer.
+
+    One parse for the two questions everything below asks of a network, and the
+    only place the engine's spelling of either is read.  The identity is the key
+    because that is what a container's own record can be compared against; the
+    name is what an operator is told, because an identity in a refusal is a
+    refusal nobody can act on.
+    """
     topology = _inspect(engine, "network", network)
-    if topology.get("Internal") is not True:
+    attached = topology.get("Containers") or {}
+    if not isinstance(attached, dict):
+        raise Unavailable(f"the peer set of {network} cannot be read")
+    return topology.get("Internal") is True, {
+        str(identity): str((peer or {}).get("Name") or identity)
+        for identity, peer in attached.items()
+    }
+
+
+def empty_network(engine: str, network: str) -> None:
+    """Refuse unless this network is internal and nothing is on it yet.
+
+    The question `one_peer` cannot ask.  That one says the proxy is alone, which
+    can only be true once the proxy exists; a peer that was already there is a
+    peer that had a route to the door for however long it took to start it.  So
+    a door is put on a network that is provably empty first, and held to
+    `one_peer` after.
+    """
+    internal, attached = peers(engine, network)
+    if not internal:
         raise Unavailable(f"the Agent network is not internal: {network}")
-    peers = topology.get("Containers") or {}
-    if not isinstance(peers, dict):
-        raise Unavailable(f"the Agent network peer set cannot be read: {network}")
+    if attached:
+        raise Unavailable(
+            "the Agent network already has peers: " + ", ".join(sorted(attached.values()))
+        )
+
+
+def one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) -> None:
+    internal, attached = peers(engine, network)
+    if not internal:
+        raise Unavailable(f"the Agent network is not internal: {network}")
 
     proxy = _inspect(engine, "container", proxy_container)
     proxy_id = str(proxy.get("Id") or "")
-    attached = (proxy.get("NetworkSettings") or {}).get("Networks") or {}
-    endpoint = attached.get(network) if isinstance(attached, dict) else None
-    if proxy_id not in peers or not isinstance(endpoint, dict):
+    joined = (proxy.get("NetworkSettings") or {}).get("Networks") or {}
+    endpoint = joined.get(network) if isinstance(joined, dict) else None
+    if proxy_id not in attached or not isinstance(endpoint, dict):
         raise Unavailable(f"the configured proxy is not attached to the Agent network: {network}")
     aliases = {str(item) for item in (endpoint.get("Aliases") or [])}
     aliases.update(
@@ -880,12 +930,32 @@ def _one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) 
     if proxy_host not in aliases:
         raise Unavailable(f"the Agent proxy URL does not name the network's proxy peer: {proxy_host}")
 
-    others = sorted(
-        str(peer.get("Name") or identity)
-        for identity, peer in peers.items()
-        if identity != proxy_id
-    )
+    others = sorted(name for identity, name in attached.items() if identity != proxy_id)
     if others:
         raise Unavailable(
             "the Agent network has peers other than the proxy: " + ", ".join(others)
         )
+
+
+def join(
+    engine: str,
+    network: str,
+    proxy_container: str,
+    proxy_host: str,
+    host_environment: Mapping[str, str],
+) -> None:
+    """Attach the door to one network under the name its peers dial, and hold it there.
+
+    Two things that are one thing.  An attachment whose alias is not the name the
+    children's proxy URL resolves is an attachment nothing on the network can
+    use, and an attachment that turns out to have brought a second peer with it
+    is a network with a route across it.  Both are asked here, so neither the
+    tool adapter nor the door's own start can do the first and forget the second.
+    """
+    engine_command(
+        engine,
+        ("network", "connect", "--alias", proxy_host, network, proxy_container),
+        host_environment,
+        f"the door cannot be joined to {network}: {proxy_container}",
+    )
+    one_peer(engine, network, proxy_container, proxy_host)
