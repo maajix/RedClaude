@@ -47,6 +47,18 @@ takes stored Artifacts and nothing else -- that is the whole of what
 Artifact text in, the exact JSON out. `check` runs a case twice under a bare
 environment and refuses if the two runs disagree, because a script whose output
 depends on the run is a script whose evidence is not reproducible.
+
+**A reference is maintainer material, and nothing here can hand it to a model.**
+`references/` is the SDK format's progressive-disclosure directory, opened by
+the model with a file tool -- and `Read` is forbidden to every role, so in this
+system there is no such tool and no such open. What a reference is here is what
+a Playbook's reference already is: text a person reads, hashed into the version
+manifest so that editing one is visible on every Task recorded afterwards. That
+is what made v1's operator references keepable at all. They were loaded into
+every Agent's context; here they belong to one technique and reach nobody at
+run time. `bb:references` names them, because the manifest has to hash what it
+versions, and the *body* never points at them: an instruction to open one would
+be an instruction no role can carry out.
 """
 
 from __future__ import annotations

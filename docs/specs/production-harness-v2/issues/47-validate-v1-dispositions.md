@@ -8,13 +8,15 @@
 
 **Deviation on criterion 2:** 132 of the 223 rows do not resolve to anything current,
 because the thing is not built yet. Tickets 48 through 56 are the tickets that build it,
-and they are all still open, so the criterion as written cannot be true today and will
-not be until 57 closes. What ships instead is the strongest form of the criterion that is
-true now: 91 rows resolve to a production role, Skill, Playbook, Property class,
-vocabulary entry, runtime control or registered retirement, and the other 132 resolve to
-one of the nine registered migration tickets, which the checker verifies is a real ticket
-and still open. The moment such a ticket is marked resolved, every row that promised
-something to it fails until the thing exists.
+and they were all open on the day this resolved, so the criterion as written cannot be
+true today and will not be until 57 closes. What ships instead is the strongest form of
+the criterion that is true now: 91 rows resolve to a production role, Skill, Playbook,
+Property class, vocabulary entry, runtime control or registered retirement, and the other
+132 resolve to one of the nine registered migration tickets, which the checker verifies is
+a real ticket that has not been closed while a row still cites it. The moment such a
+ticket is marked resolved, every row that promised something to it fails until the thing
+exists. That is what a migration ticket landing looks like in the counts, and ticket 48
+was the first: 101 and 122 after it.
 
 - [x] Every one of the 223 manifest rows has exactly one disposition, rationale, replacement identifier and verification reference.
 - [x] Replacement identifiers resolve to a current production role, Skill, Property-class vocabulary entry, Playbook, reference attachment, runtime control or explicit scope retirement.
@@ -60,7 +62,11 @@ replacement is still missing.
       operator_reference  112   absorbed 73  retired 39
       sink_pack             9   absorbed 9
       reserved              3   superseded 3
-      total               223   built 39  promised 132  retired 52
+      total               223   built 49  promised 122  retired 52
+
+The per-kind lines are the census by disposition and never move. `built` and `promised`
+move once per migration ticket, which is what the last line is for; the numbers above are
+the ones `tests/test_dispositions.py` pins today, after ticket 48 crossed ten rows.
 
 ### What this does not prove, and where ticket 57 comes in
 

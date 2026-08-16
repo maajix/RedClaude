@@ -32,6 +32,11 @@ BASELINE_FILES = {
     "v1-dispositions.tsv",
     "v1-dispositions.json",
 }
+#: The directory name a Skill or a Playbook keeps maintainer prose under. Spelled
+#: here rather than imported from `skill.py`, because this check reads the tree as
+#: files and importing the application would make the boundary depend on the thing
+#: it is checking.
+REFERENCE_DIRECTORY = "references"
 FIELDS = ("kind", "source", "lines", "sha256")
 EXPECTED_COUNTS = {
     "agent_definition": 11,
@@ -472,11 +477,22 @@ def production_boundary_errors(
             except UnicodeDecodeError:
                 errors.append(f"{relative}: non-UTF-8 production file")
                 continue
+            # Markdown ships in the wheel, and one kind of it is prose nobody
+            # executes: a `references/` file is maintainer material, since `Read`
+            # is forbidden to every role and no model can open one. There a bare
+            # word is a word -- "prototype pollution" is a defect class, "the
+            # docs" is a noun -- which is the exemption
+            # `forbidden_python_dependencies` already makes for docstrings.
+            # `SKILL.md` and `playbook.md` do not get it and must not: they are
+            # read by a model, so a bare `/tmp` in one is an instruction to write
+            # where this boundary refuses to go, and only the bare-token sweep
+            # catches a root spelled without a separator.
+            prose = path.suffix == ".md" and path.parent.name == REFERENCE_DIRECTORY
             for line_number, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if not stripped or stripped.startswith(("#", "//", "--")):
                     continue
-                if forbidden_reference(stripped, forbidden_roots, scan_bare_tokens=True):
+                if forbidden_reference(stripped, forbidden_roots, scan_bare_tokens=not prose):
                     errors.append(f"{relative}:{line_number}: forbidden tree dependency")
     return errors
 

@@ -13,12 +13,16 @@ is to write the violation somewhere the corpus is not.
 """
 
 import json
+import re
 import unittest
 from pathlib import Path
 
 from redkraken import roster, skill
 from redkraken.document import FENCE
 from tests.fixtures import frontmatter, scratch
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 #: The smallest skill that compiles. Every negative below is this document with
@@ -445,9 +449,82 @@ class Corpus(unittest.TestCase):
 
     def test_every_declared_check_in_the_shipped_corpus_passes(self):
         self.assertEqual(
-            ("compare-responses/compare.py#1", "compare-responses/compare.py#2"),
+            (
+                "analyse-source/extract_paths.py#1",
+                "analyse-source/extract_paths.py#2",
+                "analyse-source/extract_paths.py#3",
+                "compare-responses/compare.py#1",
+                "compare-responses/compare.py#2",
+            ),
             skill.check_all(),
         )
+
+    def test_the_v1_code_review_packs_are_bound_to_the_skill_that_reads_source(self):
+        # Ticket 48. v1 shipped `playbooks/code-review/` -- one README and nine
+        # language sink lists -- as context every Agent carried. The migration's
+        # claim is not that the knowledge was kept but that it was *bound*, so
+        # the check is both halves: these ten belong to the one technique that
+        # reads source, and no other shipped skill has any reference at all.
+        self.assertEqual(
+            (
+                "code-review.md",
+                "sinks-csharp.md",
+                "sinks-go.md",
+                "sinks-java.md",
+                "sinks-js.md",
+                "sinks-kotlin.md",
+                "sinks-php.md",
+                "sinks-python.md",
+                "sinks-ruby.md",
+                "sinks-rust.md",
+            ),
+            skill.SKILLS["analyse-source"].references,
+        )
+        self.assertEqual(
+            {"analyse-source"},
+            {name for name, one in skill.SKILLS.items() if one.references},
+        )
+
+    def test_each_pack_is_headed_by_classes_the_selector_can_select_on(self):
+        # Ticket 48. Binding ten filenames proves the attachment and nothing
+        # about what is inside them, so this reads the packs: a sink list is
+        # organised by Property class because that is the vocabulary a Playbook
+        # triggers on, and a heading that is nearly a class -- an event kind, a
+        # family that was renamed -- is a match that arrives carrying a word
+        # nothing downstream selects on.
+        from tools import check_dispositions
+
+        classes = check_dispositions.resolvable_names(
+            ROOT, check_dispositions.read_policy()
+        )["property_class"]
+        packs = [
+            name
+            for name in skill.SKILLS["analyse-source"].references
+            if name.startswith("sinks-")
+        ]
+        self.assertEqual(9, len(packs))
+        for name in packs:
+            text = (
+                skill.CORPUS / "analyse-source" / skill.REFERENCE_DIR / name
+            ).read_text(encoding="utf-8")
+            headings = re.findall(r"^## (\S+)$", text, re.MULTILINE)
+            with self.subTest(pack=name):
+                self.assertTrue(headings)
+                self.assertEqual([], sorted(set(headings) - classes))
+                # The closing section is the pack's own refusal to be read as a
+                # verdict list, which is the failure mode a sink list has.
+                self.assertIn("\n## What a match is not\n", text)
+
+    def test_no_skill_body_sends_a_model_to_a_file_it_cannot_open(self):
+        # `Read` is forbidden to every role, so a reference is material a
+        # maintainer opens and nothing a running Agent can reach. A body that
+        # named one would be an instruction the runtime cannot carry out, which
+        # is worse than an absent reference: the model would go looking.
+        for name, one_skill in skill.SKILLS.items():
+            body = one_skill.source.decode("utf-8").split(FENCE, 2)[-1]
+            for reference in (*one_skill.references, skill.REFERENCE_DIR + "/"):
+                with self.subTest(skill=name, reference=reference):
+                    self.assertNotIn(reference, body)
 
     def test_the_corpus_ships_inside_the_package(self):
         # Not a style point. `rk` runs what it was installed with, and a corpus

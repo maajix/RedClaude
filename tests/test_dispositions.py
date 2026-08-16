@@ -58,7 +58,10 @@ class DispositionLedgerTest(unittest.TestCase):
             "  operator_reference  112   absorbed 73  retired 39\n"
             "  sink_pack             9   absorbed 9\n"
             "  reserved              3   superseded 3\n"
-            "  total               223   built 39  promised 132  retired 52",
+            # The per-kind lines are the census by disposition and do not move.
+            # `built` and `promised` do, once per migration ticket: 48 built the
+            # ten references the analyst's Skill owed, so ten rows crossed.
+            "  total               223   built 49  promised 122  retired 52",
             self.report,
         )
 
@@ -478,16 +481,26 @@ class DispositionPolicyTest(unittest.TestCase):
         ):
             check_dispositions.read_policy(path)
 
-    def test_every_registered_migration_ticket_is_a_ticket_that_is_open(self):
+    def test_a_registered_ticket_is_open_or_has_no_row_left_citing_it(self):
         # The set is small enough to read, so read it: a number in here that
-        # names nothing, or names something already closed, would silently turn
-        # every row citing it into a refusal nobody expected.
+        # names nothing would silently turn every row citing it into a refusal
+        # nobody expected. A registered ticket stays registered after it lands
+        # -- 48 is resolved and its ten rows are built -- so what has to hold is
+        # the pair: an open ticket is a promise anybody can still call in, and a
+        # resolved one is a promise with nothing left citing it.
         policy = check_dispositions.read_policy()
+        promised = {
+            row["verification"].removeprefix("ticket:")
+            for row in check_dispositions.read_ledger()
+            if row["verification"].startswith("ticket:")
+        }
 
         for number in policy["migration_tickets"]:
-            status = check_dispositions.ticket_status(ROOT, policy["issue_root"], number)
+            with self.subTest(ticket=number):
+                status = check_dispositions.ticket_status(ROOT, policy["issue_root"], number)
 
-            self.assertEqual("ready-for-agent", status, number)
+                self.assertIn(status, ("ready-for-agent", "resolved"), number)
+                self.assertEqual(status == "resolved", number not in promised, number)
 
 
 class DispositionVocabularyTest(unittest.TestCase):

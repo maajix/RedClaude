@@ -3,6 +3,8 @@ description: Read a stored source Artifact and ground every route, parameter and
 bb:roles: ["js_analyst"]
 bb:tool_groups: ["exec.tool_run", "state.propose", "state.read"]
 bb:evidence_profile: successful_tool_run
+bb:scripts: [{"name": "extract_paths.py", "description": "Path-shaped and URL-shaped string literals in one stored Artifact, as one JSON object.", "checks": [{"artifacts": ["const r=[\"/api/v2/orders\",`/api/v2/orders/${id}`];fetch(\"https://cdn.example.com/app.js\");const t=\"not a path\";"], "stdout": {"paths": ["/api/v2/orders", "/api/v2/orders/${id}"], "scanned_literals": 4, "urls": ["https://cdn.example.com/app.js"]}}, {"artifacts": ["const re=/api/;let n=1;"], "stdout": {"paths": [], "scanned_literals": 0, "urls": []}}, {"artifacts": ["fetch(\"/api/orders?id=1&sort=asc\");const cdn=\"//cdn.example.com/app.js\";const root=\"/\";"], "stdout": {"paths": ["/api/orders?id=1&sort=asc"], "scanned_literals": 3, "urls": []}}]}]
+bb:references: ["code-review.md", "sinks-csharp.md", "sinks-go.md", "sinks-java.md", "sinks-js.md", "sinks-kotlin.md", "sinks-php.md", "sinks-python.md", "sinks-ruby.md", "sinks-rust.md"]
 bb:runtime-tools: ["jq"]
 ---
 
@@ -22,14 +24,19 @@ Complete this step holding the hash and the bytes it names.
 ## 2. Extract with a tool, not by eye
 
 Where the document is JSON -- a source map, a manifest, a configuration -- run
-`jq` through `mcp__rk2__run_tool` over the stored Artifact. The run is recorded,
-its output is a new Artifact, and the extraction is something a second party can
-repeat.
+`jq` through `mcp__rk2__run_tool` over the stored Artifact.
 
-Reading a route list out of a minified bundle by eye produces a list nobody can
-check and that will not survive a validator. Where no registered tool fits the
-document, say what you read and quote it, so the quote is checkable against the
-Artifact hash even though the extraction was not.
+Where it is not -- a bundle, a chunk, a template -- run `extract_paths.py`
+through `mcp__rk2__run_skill_script` over the same Artifact. It answers with the
+path-shaped and URL-shaped literals the file holds, and with how many strings it
+looked at, so what comes back reads as the proportion it is.
+
+Either way the run is recorded, its output is a new Artifact, and the extraction
+is something a second party can repeat. Reading a route list out of a minified
+bundle by eye produces a list nobody can check and that will not survive a
+validator. Where neither fits the document, say what you read and quote it, so
+the quote is checkable against the Artifact hash even though the extraction was
+not.
 
 ## 3. Ground every proposed route
 

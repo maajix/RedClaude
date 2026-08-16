@@ -749,7 +749,11 @@ playbook. Named for what it does -- enumerating a surface, comparing responses,
 taking browser evidence -- and never for a vulnerability family or a workflow,
 because a family name is a bucket and a technique either ran or did not. Its
 version is the digest of its own dependency manifest, computed rather than
-declared, so what a Task records is what actually ran.
+declared, so what a Task records is what actually ran. It may carry references,
+and those are maintainer material for the same reason a Playbook's are: `Read`
+is forbidden to every role, so there is no file tool to open one with. They are
+hashed into the manifest, so editing one moves the version, and the body never
+points at one.
 _Avoid_: Tool, capability (a Capability is what a run obtains against a target,
 never what a Skill teaches), module
 

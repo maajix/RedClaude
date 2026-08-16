@@ -143,6 +143,47 @@ class BaselineCliTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("deploy/Dockerfile:2: forbidden tree dependency", result.stderr)
 
+    def test_shipped_prose_may_use_a_forbidden_root_as_an_english_word(self):
+        # The Skill and Playbook corpora are markdown inside `src`, so they are
+        # scanned, and in a reference -- maintainer prose no model can open --
+        # a bare word is a word: "prototype pollution" is a defect class and
+        # "the docs" is a noun. This is the exemption the Python scan already
+        # makes for docstrings.
+        result = run_source(
+            "src/redkraken/skills/a-technique/references/pack.md",
+            "A deep merge is the prototype pollution shape, and the docs say so.\n",
+        )
+
+        self.assertNotIn("forbidden tree dependency", result.stderr)
+
+    def test_a_skill_body_is_not_prose_and_keeps_the_bare_token_sweep(self):
+        # The exemption is for text a person reads. `SKILL.md` is text a model
+        # reads, so a bare root in one is an instruction to use it -- and `/tmp`
+        # is spelled without a separator, which only this sweep catches.
+        result = run_source(
+            "src/redkraken/skills/a-technique/SKILL.md",
+            "Write the intermediate bundle to /tmp and read it back.\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "src/redkraken/skills/a-technique/SKILL.md:1: forbidden tree dependency",
+            result.stderr,
+        )
+
+    def test_shipped_prose_may_not_point_into_a_forbidden_tree(self):
+        # The other half: dropping the bare-token sweep must not drop the check.
+        result = run_source(
+            "src/redkraken/skills/a-technique/references/pack.md",
+            "The rule this replaces is in docs/prototype/SKILL-FORMAT.md.\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "src/redkraken/skills/a-technique/references/pack.md:1: forbidden tree dependency",
+            result.stderr,
+        )
+
     def test_python_encoding_cookie_does_not_bypass_boundary(self):
         result = run_source(
             "src/latin1.py",
