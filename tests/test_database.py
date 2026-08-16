@@ -32675,6 +32675,10 @@ class Surface:
     #: needs it, and a recon pass records nothing here for a route it never saw
     #: a typed body on.
     request_content_type: str | None = None
+    #: Whether the parameter was seen coming back. Defaulted for the same
+    #: reason: it is a thing a recon pass observed rather than a thing every
+    #: route has, and one Playbook triggers on it.
+    reflected: bool = False
 
 
 class PlaybookCorpusSelectionTest(DatabaseCase):
@@ -32732,10 +32736,29 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # what a reader can reach before presenting anything.
         "attack-surface": Surface("spa", None, "GET", "/openapi.json", False, None),
         "authentication": Surface("spa", None, "POST", "/session", False, ("body", "email")),
+        # The eight `web` Surfaces, which are the only ones in this table whose
+        # Application kind is the one a browser renders. Six of them are a GET
+        # on a `web` Application and are told apart by one further fact each:
+        # what the route carries, what points at it, or what runs in front of it.
+        "browser-framing": Surface("web", None, "POST", "/transfer", True, ("body", "text"),
+                                   "application/x-www-form-urlencoded"),
+        # Auth left unknown on all five of the unauthenticated-looking reads
+        # below, rather than false: `attack-surface` is `read_method` with
+        # `unauthenticated_endpoint`, so a Surface that stated `false` would
+        # match it as well.
+        "browser-messaging": Surface("web", None, "GET", "/widget", None, None),
+        "browser-realtime": Surface("websocket", None, "GET", "/socket", None,
+                                    ("query", "text")),
+        "browser-script": Surface("web", None, "GET", "/search", None, ("query", "text"),
+                                  None, True),
+        "browser-storage": Surface("web", None, "GET", "/profile", True, None),
+        "client-side-path-traversal": Surface("web", None, "GET", "/view/{ref}", None,
+                                              ("path", "text")),
         # Two cookie-bearing Surfaces, told apart by method rather than by
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
         "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", "text")),
+        "external-resources": Surface("web", None, "GET", "/embed", None, ("query", "url")),
         "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", "text")),
         "grpc": Surface("spa", "grpc", "POST", "/billing.Admin/ListAll", True,
                         ("body", "text")),
@@ -32759,6 +32782,9 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                    ("body", "text"), "application/json"),
         "realtime": Surface("websocket", None, "GET", "/socket", True, None),
         "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
+        # The one Surface that runs a technology in front of the Application
+        # rather than inside it, which is what `tech_cdn` is.
+        "web-cache": Surface("web", "cloudflare", "GET", "/dashboard", None, None),
         "webauthn": Surface("spa", "webauthn", "POST", "/account/recovery-email", True,
                             ("body", "text")),
         "webhooks": Surface("spa", None, "POST", "/webhooks", True, ("body", "url")),
@@ -32839,6 +32865,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 )
             cls.subjects = {name: cls.surface(name) for name in cls.SURFACES}
             cls.lead_into_the_routing_subject()
+            cls.embed_the_messaging_subject()
 
     @classmethod
     def base_url(cls, name: str) -> str:
@@ -32883,13 +32910,14 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         if one.parameter is not None:
             location, value_class = one.parameter
             cls.connection.execute(
-                "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
-                " VALUES ($1::uuid, $2::uuid, 'subject', $3, $4)",
+                "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class,"
+                " reflected) VALUES ($1::uuid, $2::uuid, 'subject', $3, $4, $5)",
                 (
                     cls.entity("parameter", f"parameter:{base_url}{one.path}"),
                     endpoint,
                     location,
                     value_class,
+                    one.reflected,
                 ),
             )
         return endpoint
@@ -32922,6 +32950,36 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
             "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
             " VALUES ($1::uuid, $2::uuid, $3::uuid, 'redirects_to')",
             (cls.program_id, payment, cls.subjects["routing"]),
+        )
+
+    @classmethod
+    def embed_the_messaging_subject(cls):
+        """The document that loads the messaging subject into itself.
+
+        `embedded_document` is the method above one fact later: it is read at
+        the far end of an `embeds`, so the widget cannot carry it alone -- a
+        page has to load it. This is the account page of the same Application,
+        which is where the fixture that grades this Playbook puts the widget.
+
+        A second endpoint rather than a second Surface, for the same reason the
+        payment step is one: nothing asserts about it, it carries no fact any
+        Playbook in the catalogue triggers on, and the assertions below walk
+        `SURFACES`.
+        """
+        method, path = "GET", "/account"
+        page = cls.entity(
+            "endpoint", f"endpoint:{method} {cls.base_url('browser-messaging')}{path}"
+        )
+        cls.connection.execute(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) SELECT $1::uuid, application_id, $2, $3, true"
+            "   FROM endpoints WHERE entity_id = $4::uuid",
+            (page, method, path, cls.subjects["browser-messaging"]),
+        )
+        cls.connection.execute(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'embeds')",
+            (cls.program_id, page, cls.subjects["browser-messaging"]),
         )
 
     @classmethod
@@ -32986,7 +33044,9 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # when it stops being true: a Playbook that two roles can load is a
         # Playbook whose Skill set no longer picks out who does this work, and a
         # Playbook that none can is unreachable. `attack-surface` is the recon
-        # one; every other topic here is web_hunter's.
+        # one and `external-resources` is the js_analyst one -- it reads a
+        # served document for what it points at, which is that role's whole job;
+        # every other topic here is web_hunter's.
         self.assertEqual(
             {
                 "agentic-ai": ["web_hunter"],
@@ -32994,7 +33054,14 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "api-authorization": ["web_hunter"],
                 "attack-surface": ["recon"],
                 "authentication": ["web_hunter"],
+                "browser-framing": ["web_hunter"],
+                "browser-messaging": ["web_hunter"],
+                "browser-realtime": ["web_hunter"],
+                "browser-script": ["web_hunter"],
+                "browser-storage": ["web_hunter"],
+                "client-side-path-traversal": ["web_hunter"],
                 "cookies": ["web_hunter"],
+                "external-resources": ["js_analyst"],
                 "graphql": ["web_hunter"],
                 "grpc": ["web_hunter"],
                 "identity-lifecycle": ["web_hunter"],
@@ -33006,6 +33073,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
                 "routing": ["web_hunter"],
+                "web-cache": ["web_hunter"],
                 "webauthn": ["web_hunter"],
                 "webhooks": ["web_hunter"],
                 "workload-identities": ["web_hunter"],
@@ -33186,8 +33254,17 @@ class PlaybookEvaluationTest(DatabaseCase):
         depends on the Program carrying a scope version, and `add_entity`
         projects scope: an Entity in a Program nobody opened properly is an
         Entity no Playbook could have been selected on.
+
+        The whole fixture id goes into the slug rather than its first word.
+        `programs.slug` is unique, `program.run` resumes a Program that already
+        holds the slug rather than opening a second one, and
+        `evaluation_programs` is keyed on the Program -- so two fixtures sharing
+        a first word would arrange the second one into the first one's Program
+        and collide there. `client-channel-pair`, `client-path-pair` and
+        `client-storage-pair` are three such, and the longest id here leaves the
+        slug well inside `config.SLUG`.
         """
-        slug = f"{EVALUATION_PREFIX}-{fixture_id.split('-')[0]}-{variant}"
+        slug = f"{EVALUATION_PREFIX}-{fixture_id}-{variant}"
         opened = program.run(
             cls.harness.runtime, write(SCOPED.replace('name = "matrix-web"', f'name = "{slug}"'))
         )
@@ -33421,7 +33498,14 @@ class PlaybookEvaluationTest(DatabaseCase):
         return [
             tuple(str(field) for field in row)
             for row in self.connection.execute(
-                "SELECT severity, problem, detail FROM check_playbook_tests() ORDER BY 1, 2, 3"
+                # `COLLATE "C"` rather than the database's own collation, so
+                # this order is the one Python's `sorted` produces and the case
+                # below can state its expectation by sorting paths. A linguistic
+                # collation puts `webauthn` before `web-cache` because it weighs
+                # the hyphen last; byte order does not.
+                "SELECT severity, problem, detail FROM check_playbook_tests()"
+                " ORDER BY severity COLLATE \"C\", problem COLLATE \"C\","
+                " detail COLLATE \"C\""
             ).rows
         ]
 

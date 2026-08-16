@@ -27,7 +27,7 @@ _Avoid_: Asset, node, object
 
 **Relationship**:
 A typed, directed edge between two entities that is not a containment
-(`resolves_to`, `serves`, `runs`, `owns`, `member_of`, `redirects_to`,
+(`resolves_to`, `serves`, `runs`, `owns`, `member_of`, `redirects_to`, `embeds`,
 `same_as`). Containment is a foreign key and is not a relationship.
 _Avoid_: Edge, link, association
 
