@@ -296,6 +296,35 @@ empty chain and not a negative result: it is the one shape that would pass every
 rule vacuously, so it is refused by the verb and reported by the standing check.
 _Avoid_: Attack path, exploit chain, story, verdict
 
+**Report**:
+The document a human reads about a Finding or a Kill chain, and a projection of
+rows rather than a thing anybody writes. The renderer is a mapping in and a
+string out: no model, no connection, no target, no clock, so two callers holding
+equal projections get equal bytes and there is nothing else to keep in step.
+What may render is not decided by the renderer -- a Finding renders when every
+blocker standing against it is soft, a chain renders when the soundness read
+returns nothing -- and a record that has not earned a report is refused whole
+rather than rendered with the missing parts left out. The form names which
+sections appear and in what order; it may order and include registered blocks
+and may not author one, and exactly one form per subject is the complete one
+that carries every section a submission needs. A form is held in a
+`report_templates` row and an operator names it by that identifier, so the word
+in the schema is template and the word for the thing it describes is form.
+Impact is stated under two words that are not interchangeable: an effect is what
+an observation witnessed, a demonstration is what an impact run proved.
+Limitations are read off state and never written: a soft blocker, a review
+signal, an unfinished cleanup, an assertion that settled nothing, a single
+holding run, fewer demonstrations than witnessed effects, evidence that may only
+be cited by hash. A chain report says
+which of two things it is -- each transition demonstrated separately and composed
+afterwards, or one run that walked the whole path -- and that is computed from
+the runs behind the stamps, not claimed. Narrative is off unless somebody names
+a file, is confined to the sections that argue rather than record, is marked in
+the document where it starts, and may rephrase what the projection says and add
+no identifier or factual field it does not carry.
+_Avoid_: Write-up, submission, disclosure, narrative (the last is one optional
+part of a report, not the report)
+
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.

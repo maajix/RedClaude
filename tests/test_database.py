@@ -76,6 +76,7 @@ from redkraken import (
     proposal,
     proxy,
     replay,
+    reporting,
     roster,
     scope,
     seal,
@@ -1214,6 +1215,15 @@ CONTROLS = (
         "standing:report_grounding",
         "INSERT INTO report_blocks (id, name, description)"
         " VALUES ('selftest_block', 'Self test', 'a block no template includes')",
+    ),
+    Control(
+        # Criterion 3 as a standing check: the complete form of a subject
+        # carries every block the criterion names for it. Removing one is the
+        # cheapest way a form stops submitting what a platform asks for, and it
+        # is one line in a migration that nothing else would object to.
+        "standing:report_projection",
+        "DELETE FROM report_template_blocks"
+        " WHERE template_id = 'platform.long_form' AND block_id = 'limitations'",
     ),
     Control(
         "standing:playbook_integrity",
@@ -30061,6 +30071,820 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
 
     def test_the_standing_check_holds_over_every_pass_this_case_ran(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+REPORT_SLUG = "selftest-report"
+
+
+class ReportProjectionTest(ChainFixture, DatabaseCase):
+    """Ticket 42: a report is a projection of what holds, and of nothing else.
+
+    The arrangement is 40's, carried one step on and one step wider. Two claims
+    are validated, two pivots are stamped and composed into a chain -- and what
+    this case is about begins there: the impact and the reproduction are written
+    onto the Finding, the projection is read back, the renderer turns it into
+    bytes, and the bytes are filed.
+
+    `tests/test_reporting.py` owns the renderer and this owns the projection.
+    The split is the same one criterion 1 makes: the renderer is a mapping in
+    and a string out and can be tested against a written-out bundle, and what
+    cannot be tested that way is whether the database produces that bundle. The
+    two meet in three arms here, which hand a real bundle to the real renderer.
+
+    Everything commits, for 38's reason. The order in `setUpClass` is the order
+    the evidence accrues and it is load-bearing twice: the pivots are stamped
+    before the severity is stated, because `demonstrated_impact` is refused
+    until there is a demonstration; and criterion 2's refusals are collected
+    before the composition exists, because composing is what clears them.
+    """
+
+    slug = REPORT_SLUG
+
+    COMPOSE = "SELECT compose_finding_report($1::uuid, $2::jsonb)"
+    CVSS = "SELECT apply_computed_cvss($1::uuid)"
+    SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+    FINDING_SOURCE = "SELECT read_finding_report($1::uuid, $2)"
+    CHAIN_SOURCE = "SELECT read_chain_report($1::uuid, $2)"
+    FILE = "SELECT record_rendering($1::uuid, $2, $3, $4)"
+
+    #: The two complete forms, which are what criterion 3 is a claim about. The
+    #: short forms are deliberately shorter and this case asks nothing of them.
+    FORM = "platform.long_form"
+    CHAIN_FORM = "platform.chain_long_form"
+
+    #: Two claims on two subjects, for 40's reason: `finding_signature` is the
+    #: class and the subject's dedup key, so two Findings of one class about one
+    #: subject would each carry 034's `duplicate` gate -- which is a hard blocker
+    #: and would refuse every render in this file for a reason it is not about.
+    CLAIM = "the orders API lets a stranger write on a neighbour's order"
+    OTHER = "the orders API hands out more than the order when it answers"
+
+    #: Two pivots, on two routes of their own, composing into the one chain this
+    #: case renders. Two rather than 40's six because the graph is 40's subject:
+    #: what is needed here is a chain that is sound, and the shortest one is.
+    PIVOTS = (
+        ("reach", "41/note", "other_account_data", ["authenticated_session"], "first"),
+        ("token", "42/token", "credential_material", ["other_account_data"], "second"),
+    )
+
+    #: What the hunter says the Finding does, in 034's vocabulary. Two effects
+    #: rather than one because criterion 5 is about rows in a different order,
+    #: and one row has no order to be in.
+    EFFECTS = ("cross_account_read", "cross_account_write")
+
+    BAND = "high"
+    RATIONALE = "a stranger read and wrote a neighbour's order and the write stayed written"
+
+    #: The form this case forges each way a form can be wrong onto, so that no
+    #: arm of `check_report_projection` is asserted by editing a form the rest of
+    #: the suite renders from. Deleted again once the six arms have been read.
+    FORGED = "selftest.form"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.identity = cls.provisioned_identity(cls.HERE)
+        cls.member = {"first": cls.validated(cls.CLAIM), "second": cls.validated(cls.OTHER)}
+        # For 040's reason: a subject that has never been classified is not the
+        # same fact as one the policy denies, and the scope block prints the
+        # class rather than the boolean.
+        cls.project_the_scope()
+        cls.finding = cls.member["first"]["finding"]
+        cls.read_what_the_finding_already_cites()
+
+        for name, route, provides, requires, member in cls.PIVOTS:
+            cls.stamped(name, cls.member[member], route, provides, requires, cls.HERE)
+
+        cls.refuse_before_there_is_anything_to_say()
+        cls.compose_and_render()
+        cls.refuse_what_the_tables_refuse()
+        cls.render_the_chain()
+        cls.render_the_same_rows_in_another_order()
+        cls.forge_each_way_a_form_can_be_wrong()
+
+        cls.problems = cls.rows_of("SELECT * FROM check_report_projection()")
+        cls.grounding = cls.rows_of("SELECT * FROM check_report_grounding()")
+
+    @classmethod
+    def tearDownClass(cls):
+        """The two rows 034 left with no way out of a dropped Program.
+
+        `finding_effects` names its witness observation and
+        `finding_chain_step_citations` names its cited one, both with no
+        `ON DELETE`. Dropping the Program cascades into `observations` and into
+        those two in an order PostgreSQL picks, and when it picks the
+        observation first the teardown fails on a constraint neither table is
+        wrong about. Cleared here because this is the only case in the file that
+        has such a row, and a schema change to a numbered migration for the
+        benefit of a teardown would be the harness editing the product.
+        """
+        cls.as_the_owner_says([
+            ("DELETE FROM finding_chain_steps WHERE program_id = $1::uuid", (cls.program_id,)),
+            ("DELETE FROM finding_effects WHERE program_id = $1::uuid", (cls.program_id,)),
+        ])
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def read_what_the_finding_already_cites(cls):
+        """The witnesses and the tokens the composition below is built out of.
+
+        Read rather than written down. 034's no-new-facts rule says a mechanism
+        sentence may only print a value that is in a row the Finding cites, so a
+        composition with a literal path in it would be a composition that passes
+        until somebody edits the specification the fixture walks -- and then
+        fails with a message about a new fact rather than about the edit.
+        """
+        cls.label = str(
+            cls.connection.execute(
+                "SELECT label FROM findings WHERE id = $1::uuid", (cls.finding,)
+            ).scalar()
+        )
+        cls.witness = [
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT observation_id::text FROM finding_evidence"
+                " WHERE finding_id = $1::uuid ORDER BY ordinal",
+                (cls.finding,),
+            )
+        ]
+        cls.cited = [
+            (str(path), str(status))
+            for path, status in cls.rows_of(
+                "SELECT DISTINCT r.path, r.status_code::text"
+                "  FROM finding_cited_receipts fcr JOIN receipts r ON r.id = fcr.receipt_id"
+                " WHERE fcr.finding_id = $1::uuid ORDER BY 1",
+                (cls.finding,),
+            )
+        ]
+        assert len(cls.witness) == 3, cls.witness
+        assert len(cls.cited) == 3, cls.cited
+        #: The variant's exchange and the control's, which is what both
+        #: mechanism sentences below are about.
+        cls.variant, cls.control = cls.cited[1], cls.cited[2]
+
+    @classmethod
+    def composition(cls, **changes) -> str:
+        """What the hunter judged, as `compose_finding_report` takes it.
+
+        Two mechanisms rather than one of them twice: `generic.control` states
+        the differential against the control and needs one citation, and
+        `filter.bypass_differential` needs two -- so the citation minimum 034
+        put on a mechanism is exercised by a step that has one.
+        """
+        stated = {
+            "effects": [
+                {"effect": cls.EFFECTS[0], "witness": cls.witness[0]},
+                {"effect": cls.EFFECTS[1], "witness": cls.witness[1]},
+            ],
+            "steps": [
+                {
+                    "mechanism": "generic.control",
+                    "params": {"control_path": cls.control[0],
+                               "control_status": cls.control[1],
+                               "path": cls.variant[0]},
+                    "citations": [{"observation": cls.witness[0]},
+                                  {"observation": cls.witness[1]}],
+                },
+                {
+                    "mechanism": "filter.bypass_differential",
+                    "params": {"blocked_token": cls.control[0],
+                               "blocked_status": cls.control[1],
+                               "allowed_token": cls.variant[0],
+                               "allowed_status": cls.variant[1]},
+                    "citations": [{"observation": cls.witness[1]},
+                                  {"observation": cls.witness[2]}],
+                },
+            ],
+        }
+        return json.dumps(stated | changes)
+
+    @classmethod
+    def bundle_of(cls, sql: str, parameters: tuple) -> dict:
+        """One source bundle, in the shape the renderer is handed it."""
+        return json.loads(str(cls.connection.execute(sql, parameters).scalar()))
+
+    @classmethod
+    def not_rendered(cls, bundle: dict) -> reporting.Refused:
+        """The refusal a bundle answers with, for the arms about criterion 2."""
+        try:
+            reporting.render(bundle)
+        except reporting.Refused as refused:
+            return refused
+        raise AssertionError("the renderer produced bytes for a bundle it must refuse")
+
+    @classmethod
+    def refuse_before_there_is_anything_to_say(cls):
+        """Criterion 2 on a Finding 034 designed to be unrenderable.
+
+        Every validated Finding starts here: `finding_effects` and
+        `finding_chain_steps` are empty, both are hard blockers, and the band
+        nobody has stated is a third. The renderer refuses and so does the file
+        the bytes would be kept in, which is the half of criterion 2 that costs
+        something -- a rendering made before a blocker appeared cannot be filed
+        after one.
+        """
+        cls.blocked = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.refused_while_blocked = cls.not_rendered(cls.blocked)
+        cls.filed_while_blocked = cls.called(
+            cls.FILE, (cls.finding, cls.FORM, "bytes nobody may keep", reporting.VERSION)
+        )
+
+    @classmethod
+    def compose_and_render(cls):
+        """The three writes that make a Finding reportable, and the document.
+
+        In this order because each is refused before the one above it: the CVSS
+        vector is computed from the effects, and 38 states a band on a basis
+        that has to exist. The middle snapshot is taken because what is left
+        after composing is the evidence that composing cleared exactly the two
+        blockers it is there for and no others.
+        """
+        cls.composed = cls.called(cls.COMPOSE, (cls.finding, cls.composition()))
+        assert cls.composed["outcome"] == "composed", cls.composed
+        cls.stale = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+
+        committed(cls.connection, cls.CVSS, (cls.finding,))
+        cls.stated = cls.called(
+            cls.SEVERITY, (cls.finding, cls.BAND, "demonstrated_impact", cls.RATIONALE)
+        )
+        assert cls.stated["severity"] == cls.BAND, cls.stated
+
+        cls.bundle = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.document = reporting.render(cls.bundle)
+        cls.filed = cls.called(
+            cls.FILE, (cls.finding, cls.FORM, cls.document, reporting.VERSION)
+        )
+        cls.kept = cls.rows_of(
+            "SELECT content = $2, source_digest,"
+            "       content_sha256 = encode(sha256(convert_to(content,'UTF8')),'hex'),"
+            "       renderer_version"
+            "  FROM report_renderings WHERE id = $1::uuid",
+            (cls.filed["rendering"], cls.document),
+        )
+
+    @classmethod
+    def refuse_what_the_tables_refuse(cls):
+        """Every way a composition is wrong, as a sentence rather than an abort.
+
+        The last four are 034's own rules, and the point of asking them here is
+        that they arrive as a returned refusal: `chain_step_grounding` is a
+        DEFERRED constraint trigger, so without the `SET CONSTRAINTS` in the
+        composer each of these would abort the caller's transaction at commit,
+        long after the call that was wrong.
+        """
+        step = json.loads(cls.composition())["steps"]
+        cls.refusals = {
+            "another_programs_finding": cls.called(
+                cls.COMPOSE, (str(uuid.uuid4()), cls.composition())
+            ),
+            "nothing_at_all": cls.called(cls.COMPOSE, (cls.finding, json.dumps({}))),
+            "no_effect": cls.called(cls.COMPOSE, (cls.finding, cls.composition(effects=[]))),
+            "no_step": cls.called(cls.COMPOSE, (cls.finding, cls.composition(steps=[]))),
+            "an_effect_nobody_named": cls.called(
+                cls.COMPOSE,
+                (cls.finding,
+                 cls.composition(effects=[{"effect": "telepathy",
+                                           "witness": cls.witness[0]}])),
+            ),
+            "a_witness_that_is_not_an_observation": cls.called(
+                cls.COMPOSE,
+                (cls.finding,
+                 cls.composition(effects=[{"effect": cls.EFFECTS[0],
+                                           "witness": str(uuid.uuid4())}])),
+            ),
+            "a_slot_left_empty": cls.called(
+                cls.COMPOSE,
+                (cls.finding,
+                 cls.composition(steps=[step[0] | {"params": {"control_path": cls.control[0],
+                                                              "control_status": cls.control[1]}}])),
+            ),
+            "a_fact_no_cited_row_carries": cls.called(
+                cls.COMPOSE,
+                (cls.finding,
+                 cls.composition(steps=[step[0] | {"params": {"control_path": "/admin/users",
+                                                              "control_status": cls.control[1],
+                                                              "path": cls.variant[0]}}])),
+            ),
+            "too_few_citations": cls.called(
+                cls.COMPOSE,
+                (cls.finding,
+                 cls.composition(steps=[step[1] | {"citations": [{"observation": cls.witness[1]}]}])),
+            ),
+        }
+        # Nothing above may have replaced what held. Every refusal after the
+        # first two happens inside the composer's own catching block, and the
+        # DELETE that clears the previous composition is inside it too.
+        cls.after_the_refusals = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+
+    @classmethod
+    def render_the_chain(cls):
+        """The chain side: one sound chain, and the two reads that answer nothing.
+
+        The unsound arm is asked of a chain that is not there rather than of one
+        this case makes unsound. 040 owns the six ways a chain stops holding and
+        asserts every one of them; what criterion 2 adds is that the renderer
+        refuses whatever `sound` is false for, and the reason travels.
+        """
+        cls.chain = cls.build(cls.members("reach", "token"))
+        assert cls.chain["refusal"] is None, cls.chain
+        cls.chain_id = cls.id_of("chains", cls.chain["chain"])
+        cls.chain_bundle = cls.bundle_of(cls.CHAIN_SOURCE, (cls.chain_id, cls.CHAIN_FORM))
+        cls.chain_document = reporting.render(cls.chain_bundle)
+
+        cls.absent = cls.bundle_of(cls.CHAIN_SOURCE, (str(uuid.uuid4()), cls.CHAIN_FORM))
+        cls.refused_absent = cls.not_rendered(cls.absent)
+        cls.wrong_form = {
+            "a_Finding_read_on_a_chain_form": cls.connection.execute(
+                cls.FINDING_SOURCE, (cls.finding, cls.CHAIN_FORM)
+            ).scalar(),
+            "a_chain_read_on_a_Finding_form": cls.connection.execute(
+                cls.CHAIN_SOURCE, (cls.chain_id, cls.FORM)
+            ).scalar(),
+        }
+
+    @classmethod
+    def render_the_same_rows_in_another_order(cls):
+        """Criterion 5, which is a claim about rows and not about a mapping.
+
+        The same two effects and the same two citations, deleted and written
+        back in the opposite physical order. Their ordinals are unchanged, so
+        this is the same composition arriving in a different sequence -- which
+        is what "equivalent input rows in different order" means for a table
+        whose row order is not a fact about anything.
+
+        Written as the owner because there is no verb for it: `compose_finding_report`
+        derives the ordinal from the position in the array it is given, so a
+        different array is a different composition rather than the same one
+        shuffled.
+        """
+        cls.before_the_shuffle = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.document_before_the_shuffle = reporting.render(cls.before_the_shuffle)
+        effect = (
+            "INSERT INTO finding_effects"
+            " (program_id, finding_id, ordinal, effect_id, witness_observation_id)"
+            " VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid)"
+        )
+        citation = (
+            "INSERT INTO finding_chain_step_citations"
+            " (program_id, step_id, ordinal, observation_id)"
+            " SELECT $1::uuid, s.id, $3, $4::uuid FROM finding_chain_steps s"
+            "  WHERE s.finding_id = $2::uuid AND s.ordinal = 1"
+        )
+        cls.as_the_owner_says([
+            ("DELETE FROM finding_effects WHERE finding_id = $1::uuid", (cls.finding,)),
+            (effect, (cls.program_id, cls.finding, 2, cls.EFFECTS[1], cls.witness[1])),
+            (effect, (cls.program_id, cls.finding, 1, cls.EFFECTS[0], cls.witness[0])),
+            ("DELETE FROM finding_chain_step_citations c USING finding_chain_steps s"
+             " WHERE s.id = c.step_id AND s.finding_id = $1::uuid AND s.ordinal = 1",
+             (cls.finding,)),
+            (citation, (cls.program_id, cls.finding, 2, cls.witness[1])),
+            (citation, (cls.program_id, cls.finding, 1, cls.witness[0])),
+        ])
+        cls.shuffled = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.document_after_the_shuffle = reporting.render(cls.shuffled)
+
+    @classmethod
+    def while_forged(cls, forge: list, restore: list) -> list:
+        """What the check says about a state nothing legitimate can produce."""
+        cls.as_the_owner_says(forge)
+        try:
+            return [
+                tuple(str(field) for field in row)
+                for row in cls.rows_of("SELECT * FROM check_report_projection()")
+            ]
+        finally:
+            cls.as_the_owner_says(restore)
+
+    @classmethod
+    def forge_each_way_a_form_can_be_wrong(cls):
+        """A negative control for every arm of `check_report_projection`.
+
+        Each is forged onto a form of this case's own and put back, because
+        `report_templates` is a global table: a form left broken would be broken
+        for every case that renders after this one, and a form this case edited
+        in place would be the arm asserted by breaking the thing under test.
+
+        The last one is not about a form. A step whose mechanism grew a slot
+        after the step was written is the only way `step_slot_unfilled` can
+        happen -- 034's trigger refuses a step that leaves a slot empty -- so the
+        forge is the mechanism moving under a step that was correct when written.
+        """
+        cls.as_the_owner_says([
+            ("INSERT INTO report_templates (id, platform, name, notes, subject, complete)"
+             " VALUES ($1,'rk2','Self test form','the form this case forges onto','finding',false)",
+             (cls.FORGED,)),
+            ("INSERT INTO report_template_blocks (template_id, ordinal, block_id)"
+             " VALUES ($1, 1, 'scope_block')", (cls.FORGED,)),
+        ])
+        cls.form_problems = {
+            "incomplete": cls.while_forged(
+                [("UPDATE report_templates SET complete = true WHERE id = $1", (cls.FORGED,))],
+                [("UPDATE report_templates SET complete = false WHERE id = $1", (cls.FORGED,))],
+            ),
+            "half_numbered": cls.while_forged(
+                [("UPDATE report_template_blocks SET ordinal = 2 WHERE template_id = $1",
+                  (cls.FORGED,))],
+                [("UPDATE report_template_blocks SET ordinal = 1 WHERE template_id = $1",
+                  (cls.FORGED,))],
+            ),
+            "the_other_subjects_block": cls.while_forged(
+                [("INSERT INTO report_template_blocks (template_id, ordinal, block_id)"
+                  " VALUES ($1, 2, 'chain_header')", (cls.FORGED,))],
+                [("DELETE FROM report_template_blocks"
+                  " WHERE template_id = $1 AND ordinal = 2", (cls.FORGED,))],
+            ),
+            "no_blocks_at_all": cls.while_forged(
+                [("DELETE FROM report_template_blocks WHERE template_id = $1", (cls.FORGED,))],
+                [("INSERT INTO report_template_blocks (template_id, ordinal, block_id)"
+                  " VALUES ($1, 1, 'scope_block')", (cls.FORGED,))],
+            ),
+            "a_slot_that_appeared_later": cls.while_forged(
+                [("UPDATE report_mechanisms"
+                  "    SET slots = slots || 'nowhere'::text,"
+                  "        template = template || ' Filed under {nowhere}.'"
+                  "  WHERE id = 'generic.control'", ())],
+                [("UPDATE report_mechanisms"
+                  "    SET slots = array_remove(slots, 'nowhere'),"
+                  "        template = replace(template, ' Filed under {nowhere}.', '')"
+                  "  WHERE id = 'generic.control'", ())],
+            ),
+        }
+        cls.as_the_owner_says([
+            ("DELETE FROM report_template_blocks WHERE template_id = $1", (cls.FORGED,)),
+            ("DELETE FROM report_templates WHERE id = $1", (cls.FORGED,)),
+        ])
+
+    # -- reading the document ---------------------------------------------------
+
+    @staticmethod
+    def sections(bundle: dict, document: str) -> dict:
+        """The rendered document as its sections, keyed by the block each is.
+
+        Bodies as well as headings, because the arms below are about what a
+        section says: a form whose sections are all present and all empty
+        renders a document that looks complete and establishes nothing.
+
+        Keyed by block id and not by heading, so that renaming a section in
+        `report_blocks` -- which a platform may want -- does not rewrite this
+        case. A heading the bundle does not name is kept under its own text,
+        which the ordering arm then reports rather than hiding in a KeyError.
+        """
+        named = {str(block["name"]): str(block["id"]) for block in bundle["blocks"]}
+        found: dict = {}
+        key = None
+        for line in document.splitlines():
+            if line.startswith("## "):
+                key = named.get(line[3:], line[3:])
+                found[key] = []
+            elif key is not None and line:
+                found[key].append(line)
+        return found
+
+    @property
+    def said(self) -> dict:
+        return self.sections(self.bundle, self.document)
+
+    @property
+    def chain_said(self) -> dict:
+        return self.sections(self.chain_bundle, self.chain_document)
+
+    # -- criterion 2: only what holds renders -----------------------------------
+
+    def test_a_finding_with_nothing_composed_onto_it_does_not_render(self):
+        self.assertEqual("report_blockers", self.refused_while_blocked.source)
+        # Not `cvss_stale`, which is the fourth blocker of this shape and cannot
+        # fire yet: a Finding with no effect has no computed vector to be stale
+        # against. It arrives the moment the composition does, which is the arm
+        # below.
+        self.assertEqual(
+            ["no_chain", "no_effect", "severity_unstated"],
+            sorted(reason.split(":")[0] for reason in self.refused_while_blocked.reasons),
+        )
+
+    def test_the_bytes_of_a_blocked_finding_cannot_be_filed_either(self):
+        self.assertEqual("blocked", self.filed_while_blocked["outcome"])
+        self.assertIn("no_effect", self.filed_while_blocked["refusal"])
+        self.assertEqual(
+            [],
+            [str(row[0]) for row in
+             self.rows("SELECT id FROM report_renderings WHERE content = $1",
+                       ("bytes nobody may keep",))],
+        )
+
+    def test_composing_the_impact_and_the_reproduction_clears_those_two(self):
+        self.assertEqual(
+            {"outcome": "composed", "effects": 2, "steps": 2, "citations": 4},
+            {key: self.composed[key] for key in ("outcome", "effects", "steps", "citations")},
+        )
+        # What the composer answers is what is LEFT, rather than a grade of what
+        # it was given: `unwitnessed_effect` is a hard blocker no trigger
+        # enforces, and a composer that graded its own input would carry a
+        # second copy of it.
+        self.assertEqual(
+            ["cvss_stale", "severity_unstated"],
+            sorted(str(item["code"]) for item in self.composed["blockers"]),
+        )
+        self.assertEqual(
+            ["cvss_stale", "severity_unstated"],
+            sorted(str(item["code"]) for item in self.stale["blockers"]
+                   if item["severity"] == "hard"),
+        )
+
+    def test_a_soft_blocker_renders_and_arrives_as_a_limitation(self):
+        # 034's review signal on this Finding is soft. The document is produced,
+        # and the thing that would have refused it if it were hard is printed in
+        # the section criterion 3 names for exactly this.
+        self.assertEqual([], [item for item in self.bundle["blockers"]
+                              if item["severity"] == "hard"])
+        self.assertIn("review_signal", " ".join(self.said["limitations"]))
+
+    def test_an_unsound_chain_does_not_render_and_says_why(self):
+        self.assertEqual("chains", self.refused_absent.source)
+        self.assertEqual(
+            ("no chain of this Program is recorded under that id",),
+            self.refused_absent.reasons,
+        )
+
+    def test_a_form_for_the_other_subject_answers_nothing_at_all(self):
+        self.assertEqual({"a_Finding_read_on_a_chain_form": None,
+                          "a_chain_read_on_a_Finding_form": None}, self.wrong_form)
+
+    # -- the composer ------------------------------------------------------------
+
+    def test_a_composition_the_tables_refuse_comes_back_as_a_sentence(self):
+        answers = {name: answer["refusal"] for name, answer in self.refusals.items()}
+        self.assertEqual(
+            ["refused"] * len(self.refusals),
+            [answer["outcome"] for answer in self.refusals.values()],
+        )
+        self.assertEqual(
+            "no Finding of this Program is recorded under that id",
+            answers["another_programs_finding"],
+        )
+        for name in ("nothing_at_all", "no_effect"):
+            self.assertIn("effects must be a non-empty array", answers[name])
+        self.assertIn("steps must be a non-empty array", answers["no_step"])
+        # The two the tables refuse by their own keys arrive as PostgreSQL wrote
+        # them, so what is asserted is the column each names rather than a
+        # sentence this file would be restating.
+        for name, column in (("an_effect_nobody_named", "effect_id"),
+                             ("a_witness_that_is_not_an_observation",
+                              "witness_observation_id")):
+            self.assertIn("violates foreign key constraint", answers[name])
+            self.assertIn(column, answers[name])
+        self.assertIn("needs slot path", answers["a_slot_left_empty"])
+        self.assertIn('would print "/admin/users"', answers["a_fact_no_cited_row_carries"])
+        self.assertIn("needs 2 citations, has 1", answers["too_few_citations"])
+
+    def test_a_refused_composition_leaves_the_one_that_held(self):
+        self.assertEqual(self.bundle["digest"], self.after_the_refusals["digest"])
+        self.assertEqual(
+            [(2, 2, 4)],
+            [
+                (int(effects), int(steps), int(citations))
+                for effects, steps, citations in self.rows(
+                    "SELECT (SELECT count(*) FROM finding_effects WHERE finding_id = $1::uuid),"
+                    "       (SELECT count(*) FROM finding_chain_steps WHERE finding_id = $1::uuid),"
+                    "       (SELECT count(*) FROM finding_chain_step_citations c"
+                    "          JOIN finding_chain_steps s ON s.id = c.step_id"
+                    "         WHERE s.finding_id = $1::uuid)",
+                    (self.finding,),
+                )
+            ],
+        )
+
+    # -- criterion 3: what a report says ----------------------------------------
+
+    def test_the_form_carries_every_subject_the_criterion_names(self):
+        self.assertEqual(
+            [],
+            [
+                str(row[0])
+                for row in self.rows(
+                    "SELECT b FROM unnest(rk2_report_required_blocks('finding')) b"
+                    " WHERE NOT EXISTS (SELECT 1 FROM report_template_blocks tb"
+                    "                    WHERE tb.template_id = $1 AND tb.block_id = b)",
+                    (self.FORM,),
+                )
+            ],
+        )
+        self.assertEqual(
+            [str(block["id"]) for block in self.bundle["blocks"]], list(self.said)
+        )
+
+    def test_every_section_of_the_rendered_report_says_something(self):
+        self.assertEqual([], [name for name, body in self.said.items() if not body])
+
+    def test_the_report_carries_the_facts_the_criterion_asks_for(self):
+        said = self.said
+        scope = " ".join(said["scope_block"])
+        self.assertIn(self.slug, scope)
+        self.assertIn(f"version: {self.bundle['scope']['version']}", scope)
+        self.assertIn("not_addressable", scope)
+
+        self.assertIn(str(self.bundle["subject"]["dedup_key"]),
+                      " ".join(said["affected_assets"]))
+        # The reproduction is the immutable specification, by its digest, and
+        # the roles it was written under are what criterion 3's controls block
+        # groups by.
+        self.assertIn(str(self.bundle["spec_sha256"]), " ".join(said["repro_steps"]))
+        for role in ("Baseline:", "Variant:", "Control:"):
+            self.assertIn(role, said["controls"])
+        self.assertIn("the-variant-is-served: held", " ".join(said["controls"]))
+
+        # The impact, the mechanism sentences with their slots filled from the
+        # Finding's own rows, and the exchanges by identifier.
+        self.assertIn("cross-account data disclosure", " ".join(said["impact_sentence"]))
+        chain = " ".join(said["attack_chain"])
+        self.assertIn(f"against `{self.control[0]}` returns `{self.control[1]}`", chain)
+        self.assertIn(f"carrying `{self.variant[0]}` reaches the sink", chain)
+        manifest = " ".join(said["evidence_manifest"])
+        for path, status in self.cited:
+            self.assertIn(f"{path} -> {status}", manifest)
+        self.assertIn(str(self.bundle["severity"]["vector"]), " ".join(said["severity_block"]))
+        self.assertIn(self.BAND, " ".join(said["severity_block"]))
+        self.assertEqual([str(self.bundle["class"]["remediation"])], said["remediation"])
+
+    def test_the_impact_section_separates_what_was_witnessed_from_what_was_proved(self):
+        """Criterion 3's "demonstrated impact", which is 038's row and not 034's.
+
+        This Finding is the shape that tells the two apart: two effects an
+        observation witnessed, and one impact run behind them -- the first
+        pivot's, the second having been stamped on the other member. So the
+        section has to print both lists and the limitation has to say the
+        counts do not match.
+        """
+        proved = [
+            str(row[0])
+            for row in self.rows(
+                "SELECT d.impact_class FROM impact_demonstrations d"
+                "  JOIN receipts r ON r.id = d.after_state_receipt_id"
+                " WHERE d.finding_id = $1::uuid ORDER BY d.impact_class, r.label",
+                (self.finding,),
+            )
+        ]
+        self.assertEqual(1, len(proved))
+        self.assertEqual(proved, [str(item["class"]) for item in self.bundle["demonstrations"]])
+
+        said = " ".join(self.said["impact_sentence"])
+        self.assertIn("Witnessed effects:", said)
+        self.assertIn("Demonstrated impact:", said)
+        self.assertIn(proved[0], said)
+
+    def test_an_effect_no_run_proved_is_a_limitation_and_not_a_silence(self):
+        # The two vocabularies -- `report_effects` and `impact_classes` -- are
+        # not mapped onto one another, so this cannot name which effect went
+        # unproved. It says how many of each there are, which is what the rows
+        # actually establish.
+        self.assertIn(
+            "2 effect(s) are witnessed and 1 impact run(s) demonstrated an impact class",
+            " ".join(self.said["limitations"]),
+        )
+
+    def test_the_chain_report_carries_the_composition_and_its_evidence(self):
+        said = self.chain_said
+        self.assertEqual(
+            [str(block["id"]) for block in self.chain_bundle["blocks"]], list(said)
+        )
+        self.assertIn(str(self.chain["chain"]), " ".join(said["chain_header"]))
+        transitions = " ".join(said["chain_transitions"])
+        for name, _route, provides, _requires, _member in self.PIVOTS:
+            self.assertIn(f"provides {provides}", transitions)
+            self.assertIn(str(self.of[name]["label"]), transitions)
+        self.assertIn("specification sha256", " ".join(said["chain_evidence"]))
+
+    def test_the_chain_report_carries_every_members_limitations(self):
+        # A chain is at most as well established as its members, so a limitation
+        # stated on a member's own report and dropped here would be one the
+        # composition hid.
+        self.assertIn("member_review_signal", " ".join(self.chain_said["limitations"]))
+
+    # -- criterion 4: composed is not executed -----------------------------------
+
+    def test_the_chain_report_says_which_kind_of_demonstration_it_is(self):
+        # Two stamps from two impact runs. 039's door issues one stamp per run,
+        # so `executed` is what a run that walked the whole chain would produce
+        # and nothing in this file can forge it -- `pivot_stamps` is immutable.
+        # The renderer's two wordings are pinned in `tests/test_reporting.py`.
+        self.assertEqual("composed", self.chain_bundle["execution"])
+        self.assertEqual(
+            2,
+            len({str(row[0]) for row in self.rows(
+                "SELECT DISTINCT s.tool_run_id::text FROM chain_steps cs"
+                "  JOIN pivot_stamps s ON s.id = cs.stamp_id WHERE cs.chain_id = $1::uuid",
+                (self.chain_id,),
+            )}),
+        )
+        self.assertIn("demonstrated separately",
+                      " ".join(self.chain_said["chain_composition"]))
+
+    # -- criterion 5: the same rows in another order ------------------------------
+
+    def test_the_same_rows_written_in_another_order_render_the_same_bytes(self):
+        self.assertEqual(self.before_the_shuffle, self.shuffled)
+        self.assertEqual(
+            self.before_the_shuffle["digest"], self.shuffled["digest"]
+        )
+        self.assertEqual(self.document_before_the_shuffle, self.document_after_the_shuffle)
+
+    def test_the_shuffle_really_did_move_the_rows(self):
+        # Without this the arm above would pass over a shuffle that did nothing.
+        # The ordinals are what the bundle reads and they are unchanged; the ids
+        # are uuidv7 and the rows were written back in the other order, so what
+        # moved is exactly the thing that must not matter.
+        self.assertEqual(
+            [(1, self.EFFECTS[0]), (2, self.EFFECTS[1])],
+            [
+                (int(ordinal), str(effect))
+                for ordinal, effect in self.rows(
+                    "SELECT ordinal, effect_id FROM finding_effects"
+                    " WHERE finding_id = $1::uuid ORDER BY ordinal",
+                    (self.finding,),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(2, 1)],
+            [
+                (int(first), int(second))
+                for first, second in self.rows(
+                    "SELECT ordinal, lead(ordinal) OVER (ORDER BY id) FROM finding_effects"
+                    " WHERE finding_id = $1::uuid ORDER BY id LIMIT 1",
+                    (self.finding,),
+                )
+            ],
+        )
+
+    # -- the filed bytes ----------------------------------------------------------
+
+    def test_the_bytes_a_human_reads_are_filed_with_their_source(self):
+        self.assertEqual("recorded", self.filed["outcome"])
+        self.assertEqual(self.bundle["digest"], self.filed["source_digest"])
+        self.assertEqual(
+            [(True, str(self.bundle["digest"]), True, reporting.VERSION)],
+            [
+                (bool(content), str(digest), bool(hashed), str(version))
+                for content, digest, hashed, version in self.kept
+            ],
+        )
+
+    def test_the_read_surface_the_reporter_uses_cannot_write(self):
+        # Criterion 1 is a property of the whole path from the command to the
+        # bytes, and a read surface that could write would make it a property of
+        # nobody.
+        self.assertEqual(
+            [("chain_source_bundle", "s"), ("chain_source_digest", "s"),
+             ("read_chain_report", "s"), ("read_finding_report", "s"),
+             ("report_source_bundle", "s")],
+            [
+                (str(name), str(volatility))
+                for name, volatility in self.rows(
+                    "SELECT proname, provolatile FROM pg_proc"
+                    " WHERE pronamespace = 'public'::regnamespace"
+                    "   AND proname = ANY ($1::text[]) ORDER BY proname",
+                    (pg.quote_array(["read_finding_report", "read_chain_report",
+                                     "report_source_bundle", "chain_source_bundle",
+                                     "chain_source_digest"]),),
+                )
+            ],
+        )
+
+    # -- the standing check --------------------------------------------------------
+
+    def test_the_check_names_each_way_a_form_can_be_wrong(self):
+        self.assertEqual(
+            {"complete_form_missing", "submission_incomplete"},
+            {rule for rule, _obj, _detail in self.form_problems["incomplete"]},
+        )
+        self.assertEqual(
+            sorted(set(str(row[0]) for row in self.rows(
+                "SELECT unnest(rk2_report_required_blocks('finding'))"
+            )) - {"scope_block"}),
+            sorted(detail for rule, obj, detail in self.form_problems["incomplete"]
+                   if rule == "submission_incomplete" and obj == self.FORGED),
+        )
+        self.assertEqual(
+            [("template_ordinals", self.FORGED, "ordinals run to 2 over 1 block(s)")],
+            self.form_problems["half_numbered"],
+        )
+        self.assertEqual(
+            [("block_subject_mismatch", f"{self.FORGED}/chain_header", "finding")],
+            self.form_problems["the_other_subjects_block"],
+        )
+        self.assertEqual(
+            [("template_empty", self.FORGED, "no blocks")],
+            self.form_problems["no_blocks_at_all"],
+        )
+        self.assertEqual(
+            [("step_slot_unfilled", f"{self.label} step 1", "nowhere")],
+            self.form_problems["a_slot_that_appeared_later"],
+        )
+
+    def test_the_standing_checks_hold_over_everything_this_case_rendered(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.grounding])
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ from redkraken import (
     program,
     proxy,
     replay,
+    reporting,
     scope,
     state,
     tool,
@@ -952,6 +953,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     judging.set_defaults(run=_finding_validate)
 
+    reports = commands.add_parser(
+        "report", help="render what holds, for a Finding or for a kill chain"
+    )
+    forms = reports.add_subparsers(dest="operation", required=True, metavar="subject")
+
+    rendering = _report_form(
+        forms,
+        "finding",
+        "scope, subject, reproduction, baseline, variant and controls, the "
+        "effects an observation witnessed and the impact a run demonstrated, "
+        "limitations, evidence and remediation",
+    )
+    # Finding-side only, and absent rather than refused on the other:
+    # `report_renderings.finding_id` is not nullable and an approval is a
+    # transition of one Finding, so there is no row a chain report could be
+    # filed as.
+    rendering.add_argument(
+        "--record",
+        action="store_true",
+        help=(
+            "file the exact bytes as the rendering an approval may name; the "
+            "source digest is computed by the database, not sent from here"
+        ),
+    )
+
+    _report_form(
+        forms,
+        "chain",
+        "what it starts from, whether it was composed from separate "
+        "demonstrations or walked end to end by one run, its transitions "
+        "and their evidence",
+    ).set_defaults(record=False)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1241,6 +1275,74 @@ def _add_url(parser: argparse.ArgumentParser, source: _Source) -> None:
         help=f"the connection string (default: ${source.variable})",
     )
     parser.set_defaults(url_source=source)
+
+
+def _report_form(
+    forms: argparse._SubParsersAction, subject: str, about: str
+) -> argparse.ArgumentParser:
+    """One `rk report` subcommand, up to what only one of the two subjects has.
+
+    A builder rather than two longhand parsers because the difference between
+    them is one flag and one sentence: everything else -- the connection, the
+    Program, the label, the form, where the bytes go, whether prose is offered
+    -- is the same question asked about a different row.
+    """
+    form = forms.add_parser(
+        subject,
+        help=f"render one {subject} (${DATABASE_URL})",
+        description=(
+            f"Render one {subject}: {about}. The document is a projection "
+            "of state and nothing else: equal rows in any order render the "
+            "same bytes, and a record that has not earned a report is "
+            "refused rather than rendered with the missing parts left out."
+        ),
+    )
+    _add_url(form, RUNTIME)
+    form.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help=f"the configuration naming the Program this {subject} belongs to",
+    )
+    form.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help=f"the {subject} to render, by its label",
+    )
+    form.add_argument(
+        "--template",
+        required=True,
+        metavar="id",
+        help=(
+            "the form to render it under, by the `report_templates` identifier "
+            "that holds it; a form for the other subject is refused rather "
+            "than rendered empty"
+        ),
+    )
+    form.add_argument(
+        "--out",
+        type=Path,
+        metavar="path",
+        help=(
+            "where to write the document; written over if it exists, because "
+            "a rendering is a pure function of the source and the form. "
+            "Without one the command still reports the bytes and their hash"
+        ),
+    )
+    form.add_argument(
+        "--narrative",
+        type=Path,
+        metavar="path",
+        help=(
+            "a JSON object of section identifier to one authored paragraph. "
+            "Off unless named, and a paragraph stating anything the "
+            "projection does not is refused"
+        ),
+    )
+    form.set_defaults(run=_report, subject=subject)
+    return form
 
 
 def _add_program(parser: argparse.ArgumentParser) -> None:
@@ -1660,6 +1762,35 @@ def _finding_validate(arguments: argparse.Namespace) -> int:
                 agent_run=arguments.agent_run,
                 environment=os.environ,
                 identity_slot=arguments.identity,
+            ),
+        )
+    )
+
+
+def _report(arguments: argparse.Namespace) -> int:
+    """One connection and nothing else.
+
+    No boundary, no door and no artifact store: a report is a projection of what
+    the database already holds, so the one thing this command has to be told is
+    where that is. `--record` is a flag on the Finding form only; the chain form
+    defaults it false, so this reads one namespace and not two shapes.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, reporting.RUN)
+    if runtime is None:
+        return _render(report(reporting.RUN, ledger))
+    return _render(
+        _guarded(
+            reporting.RUN,
+            lambda: reporting.run(
+                runtime,
+                arguments.config,
+                subject=arguments.subject,
+                label=arguments.label,
+                template=arguments.template,
+                narrative_path=arguments.narrative,
+                out=arguments.out,
+                record=arguments.record,
             ),
         )
     )
