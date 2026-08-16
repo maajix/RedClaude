@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "issue_root": "docs/specs/production-harness-v2/issues",
+  "migration_tickets": ["48", "49", "50", "51", "52", "53", "54", "55", "56"],
+  "retirements": [
+    {
+      "scope": "android",
+      "reason": "The harness reaches a target through one capability proxy that speaks HTTP and TLS, and a Scope Policy that names hosts. An Android engagement needs a device or emulator, an instrumentation runtime inside it, a store account and traffic that is not the proxy's, and none of those four is expressible in the compiled scope or the door. Shipping the knowledge without the boundary would mean an Agent reaching a device outside every control this system has.",
+      "reversal": "A Scope Policy that can name a device as a target, and a door that can carry the device's traffic under the same Receipt rules as the web path. The one Agent definition, two Skills, ten Playbook topics and thirty-nine references are still in the frozen census with their digests, so this ledger is where they come back from and nothing has to be recovered from memory."
+    }
+  ]
+}

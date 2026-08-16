@@ -163,4 +163,11 @@ The suite is standard library only and runs offline:
 ```sh
 python3 -m unittest discover -q
 python3 tools/check_baseline.py
+python3 -m tools.check_dispositions
 ```
+
+The last of these is the migration ledger: for each of the 223 artifacts the
+census froze, what became of it. A row either names something this checkout has
+and cites the file that proves it works, or names the open migration ticket
+committed to building it -- and fails the moment that ticket is marked resolved
+with the thing still missing.

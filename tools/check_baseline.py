@@ -21,6 +21,17 @@ CHECKOUT = Path(__file__).resolve().parents[1]
 BASELINE = CHECKOUT / "baseline"
 MANIFEST = BASELINE / "v1-manifest.tsv"
 STATUS = BASELINE / "status.json"
+#: What `baseline/` may hold, closed. A baseline directory that tolerates
+#: unknown files is one where a second manifest can sit beside the frozen one
+#: and nobody can tell which was read. The two disposition files are here rather
+#: than beside the code they resolve against for the same reason the census is:
+#: they are read by a repository check, never by the application.
+BASELINE_FILES = {
+    "status.json",
+    "v1-manifest.tsv",
+    "v1-dispositions.tsv",
+    "v1-dispositions.json",
+}
 FIELDS = ("kind", "source", "lines", "sha256")
 EXPECTED_COUNTS = {
     "agent_definition": 11,
@@ -158,20 +169,41 @@ def collect_v1(v1: Path) -> list[dict[str, str]]:
     return sorted(rows, key=lambda row: (row["kind"], row["source"]))
 
 
-def read_manifest(path: Path = MANIFEST) -> list[dict[str, str]]:
+def read_table(path: Path, fields: tuple[str, ...], noun: str) -> list[dict[str, str]]:
+    """One of `baseline/`'s tab-separated tables, keyed by `source`.
+
+    Shared because that directory now holds two of them and they have to be read
+    identically: a table read under a different quoting rule is a different
+    table, and these are the files that must mean the same thing on every
+    machine. The semantics of each stay with its own reader; what is here is the
+    file format and the two properties both have, that every row has exactly the
+    declared fields and that a source appears once.
+    """
     try:
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
-            if tuple(reader.fieldnames or ()) != FIELDS:
-                raise BaselineError(f"manifest fields must be: {', '.join(FIELDS)}")
+            if tuple(reader.fieldnames or ()) != fields:
+                raise BaselineError(f"{noun} fields must be: {', '.join(fields)}")
             rows = list(reader)
     except FileNotFoundError as error:
-        raise BaselineError(f"missing frozen manifest: {path}") from error
+        raise BaselineError(f"missing {noun} file: {path}") from error
 
+    for row in rows:
+        # `None` is the key `DictReader` files a long row's surplus under and the
+        # value it pads a short one with, so a row that is not exactly the
+        # declared width shows up as one or the other. A surplus column reads
+        # clean otherwise, which is the quiet way a frozen table gains a field.
+        if None in row or any(value is None or "\t" in value for value in row.values()):
+            raise BaselineError(f"malformed {noun} row: {row.get('source')}")
     sources = [row["source"] for row in rows]
     duplicates = sorted(source for source, count in Counter(sources).items() if count > 1)
     if duplicates:
-        raise BaselineError("duplicate manifest source: " + ", ".join(duplicates))
+        raise BaselineError(f"duplicate {noun} source: " + ", ".join(duplicates))
+    return rows
+
+
+def read_manifest(path: Path = MANIFEST) -> list[dict[str, str]]:
+    rows = read_table(path, FIELDS, "manifest")
     counts = Counter(row["kind"] for row in rows)
     if counts != Counter(EXPECTED_COUNTS):
         raise BaselineError(
@@ -493,10 +525,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not arguments.repo.is_dir():
             raise BaselineError(f"production tree does not exist: {arguments.repo}")
-        if any(path.is_symlink() for path in (STATUS, MANIFEST)):
+        if any(path.is_symlink() for path in BASELINE.iterdir()):
             raise BaselineError("baseline files may not be symlinks")
-        if set(path.name for path in BASELINE.iterdir()) != {STATUS.name, MANIFEST.name}:
-            raise BaselineError("baseline directory may contain only status.json and v1-manifest.tsv")
+        if {path.name for path in BASELINE.iterdir()} != BASELINE_FILES:
+            raise BaselineError(
+                "baseline directory may hold only: " + ", ".join(sorted(BASELINE_FILES))
+            )
         status = read_status()
         manifest = read_manifest()
         production_paths = [

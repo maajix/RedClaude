@@ -10,5 +10,5 @@
 - [ ] The four surviving v1 capability Skills are rewritten in the production format with role compatibility, evidence profile and runnable checks.
 - [ ] Fourteen routing Skills resolve to Property-class vocabulary, five superseded Skills resolve to runtime/reporting controls, three workflow Skills resolve to scheduler behavior and two Android Skills resolve to retirement.
 - [ ] Replacement capability Skills needed by Playbooks exist even where no one-to-one v1 Skill survived.
-- [ ] All 112 operator references and 9 sink packs are assigned to bounded Skill or Playbook references rather than global Agent context.
+- [ ] All 73 in-scope operator references and 9 sink packs are assigned to bounded Skill or Playbook references rather than global Agent context; the other 39 are Android and carry the retirement record instead.
 - [ ] No v1 tool allowlist, workflow lifecycle, reporter prose authority, credential handling or engagement data is copied into production unchanged.
