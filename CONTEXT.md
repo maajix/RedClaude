@@ -199,7 +199,8 @@ for no other reason -- the hunter's title, its reasoning and its prose are not
 absent by filtering, they were never selected. It is served once and digested,
 and it travels with the job: the session has no database, no network and no
 second version to fetch.
-_Avoid_: Evidence bundle, dossier, context, prompt
+_Avoid_: Evidence bundle (that is the directory a triager receives; this is what
+a validator is served), dossier, context, prompt
 
 **Verdict**:
 What one blind validator answered about one packet -- `confirmed`, `refuted` or
@@ -325,6 +326,36 @@ no identifier or factual field it does not carry.
 _Avoid_: Write-up, submission, disclosure, narrative (the last is one optional
 part of a report, not the report)
 
+**Evidence bundle**:
+A directory holding one Report and everything a recipient needs to check it
+without reaching this database: the document, the projection it was rendered
+from, the replay specification behind it -- one for a Finding, one per step for a
+chain -- what the validating run answered, the metadata of every cited exchange,
+the redacted Agent-view bytes, a manifest hashing every file, and the verifier
+itself. Which files a bundle of each subject carries is a table, so giving one a
+file is adding a row. The verifier travels inside what it verifies and imports
+nothing from this tree, so a recipient needs no install and no network; it checks
+the manifest against the directory in both directions, holds the artifact index
+against the manifest so the bundle's two indexes cannot disagree, and rescans
+every packed file for what redaction should have removed. A bundle its own
+verifier refuses is deleted rather than left where it was written. What a bundle
+carries is decided by what the readers select rather than by anything stripped
+afterwards: sealed wire artifacts, capabilities, cookies, secret headers, runtime
+keys and other Programs' material are outside the queries, and what was left out
+is stated as a counted line per category with the categories that counted zero
+omitted. Redaction is a stored rule with two witnesses, a probe it must match and
+a counter-probe it must not, because the pattern is held in the database and
+applied in Python and a rule that has quietly stopped matching produces a bundle
+indistinguishable from a clean one. What replaces a match names the rule and the
+length and never a digest of what was taken, because the values these rules match
+have few enough possibilities to walk through offline. Export is not a read: it
+rechecks that the record still holds and refuses stale, invalidated or
+review-gated material, and it refuses a rendering the rows have moved out from
+under. Two exports of unchanged rows differ only in the packing timestamp, which
+the manifest excludes from its own digest.
+_Avoid_: Export (the command is `rk evidence export`; the noun is the bundle),
+archive, package, attachment, dump
+
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.
@@ -442,7 +473,8 @@ The closed statement of every role this harness runs and what each one may call,
 compiled against a measured inventory of the SDK/CLI pair's own tools. One
 document, so the schema, the launch and the gate cannot each hold a different
 answer.
-_Avoid_: Registry, config, agent list, manifest
+_Avoid_: Registry, config, agent list, manifest (a manifest is the index inside
+an evidence bundle)
 
 **Role**:
 One row of the roster: how it runs, who may start it, which task kinds it

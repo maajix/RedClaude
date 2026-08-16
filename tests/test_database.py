@@ -42,6 +42,8 @@ import secrets
 import shutil
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -63,6 +65,7 @@ from redkraken import (
     capsule,
     config,
     decisions,
+    evidence,
     execution,
     header,
     identity,
@@ -84,6 +87,7 @@ from redkraken import (
     tls,
     tool,
     validation,
+    verifier,
 )
 from redkraken.outcome import (
     AWAITING_DECISION,
@@ -1224,6 +1228,15 @@ CONTROLS = (
         "standing:report_projection",
         "DELETE FROM report_template_blocks"
         " WHERE template_id = 'platform.long_form' AND block_id = 'limitations'",
+    ),
+    Control(
+        # 43's first arm, and the one that fails silently everywhere else. A
+        # pattern that stops matching removes nothing and produces a bundle
+        # indistinguishable from a redacted one, so the probe is what makes the
+        # break visible -- and breaking the pattern is the way to see the probe
+        # working.
+        "standing:evidence_export",
+        "UPDATE redaction_rules SET pattern = 'nothing matches this' WHERE id = 'email'",
     ),
     Control(
         "standing:playbook_integrity",
@@ -22990,6 +23003,12 @@ class ReplayFixture:
         )
         cls.owner_connection = pg.connect(cls.harness.migrate)
         cls.refusals = {}
+        #: Every body an exchange here came back with, by the hash the Receipt
+        #: names it under. `receipted` registers the `artifacts` row and not the
+        #: bytes, because nothing before 43 read one back; a case that needs a
+        #: store on disk fills one from this rather than guessing what the walk
+        #: answered.
+        cls.bodies = {}
 
     @classmethod
     def tearDownClass(cls):
@@ -23134,6 +23153,7 @@ class ReplayFixture:
         scope version straight off the transition Receipt.
         """
         if body is not None:
+            cls.bodies[artifact.digest(body.encode())] = body
             with cls.connection.transaction():
                 cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
                 cls.connection.execute(
@@ -30074,31 +30094,33 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
 
 
 REPORT_SLUG = "selftest-report"
+EVIDENCE_SLUG = "selftest-evidence"
 
 
-class ReportProjectionTest(ChainFixture, DatabaseCase):
-    """Ticket 42: a report is a projection of what holds, and of nothing else.
+class ReportFixture(ChainFixture):
+    """The moves that carry a validated Finding as far as a rendered document.
 
     The arrangement is 40's, carried one step on and one step wider. Two claims
     are validated, two pivots are stamped and composed into a chain -- and what
-    this case is about begins there: the impact and the reproduction are written
-    onto the Finding, the projection is read back, the renderer turns it into
-    bytes, and the bytes are filed.
-
-    `tests/test_reporting.py` owns the renderer and this owns the projection.
-    The split is the same one criterion 1 makes: the renderer is a mapping in
-    and a string out and can be tested against a written-out bundle, and what
-    cannot be tested that way is whether the database produces that bundle. The
-    two meet in three arms here, which hand a real bundle to the real renderer.
+    it is for begins there: the impact and the reproduction are written onto the
+    Finding, the projection is read back, the renderer turns it into bytes, and
+    the bytes are filed.
 
     Everything commits, for 38's reason. The order in `setUpClass` is the order
     the evidence accrues and it is load-bearing twice: the pivots are stamped
     before the severity is stated, because `demonstrated_impact` is refused
-    until there is a demonstration; and criterion 2's refusals are collected
+    until there is a demonstration; and 42's criterion 2 refusals are collected
     before the composition exists, because composing is what clears them.
-    """
 
-    slug = REPORT_SLUG
+    Two tickets are about different things on top of it -- 42 about whether the
+    document is a projection of what holds, 43 about whether a bundle of it can
+    be checked by somebody who cannot reach this database -- and both need a
+    Finding carried the whole way, so the route is here rather than copied.
+
+    A subclass names its own `slug`, for `ReplayFixture`'s reason: the teardown
+    purges by it, and two cases sharing a Program would each be an assertion
+    about whichever ran first.
+    """
 
     COMPOSE = "SELECT compose_finding_report($1::uuid, $2::jsonb)"
     CVSS = "SELECT apply_computed_cvss($1::uuid)"
@@ -30516,6 +30538,19 @@ class ReportProjectionTest(ChainFixture, DatabaseCase):
             ("DELETE FROM report_templates WHERE id = $1", (cls.FORGED,)),
         ])
 
+
+class ReportProjectionTest(ReportFixture, DatabaseCase):
+    """Ticket 42: a report is a projection of what holds, and of nothing else.
+
+    `tests/test_reporting.py` owns the renderer and this owns the projection.
+    The split is the same one criterion 1 makes: the renderer is a mapping in
+    and a string out and can be tested against a written-out bundle, and what
+    cannot be tested that way is whether the database produces that bundle. The
+    two meet in three arms here, which hand a real bundle to the real renderer.
+    """
+
+    slug = REPORT_SLUG
+
     # -- reading the document ---------------------------------------------------
 
     @staticmethod
@@ -30885,6 +30920,730 @@ class ReportProjectionTest(ChainFixture, DatabaseCase):
     def test_the_standing_checks_hold_over_everything_this_case_rendered(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.grounding])
+
+
+class EvidenceBundleTest(ReportFixture, DatabaseCase):
+    """Ticket 43: what leaves this harness, and whether anybody else can check it.
+
+    42's arrangement carried one step further. A Finding is validated, composed
+    and rendered, a chain is built out of two stamped pivots -- and what this
+    case is about begins there: the document, the projection behind it, the
+    exchanges, the bytes and the hashes are packed into a directory, and the
+    directory is then held against a verifier that is given nothing else.
+
+    Three things are planted for it. The bodies the exchanges answer with carry
+    an address, a telephone number and a synthetic bearer token, because a
+    redaction with nothing to remove is a redaction nobody has seen work. One
+    cited Receipt is given a sealed wire artifact, because the material
+    criterion 2 is most about is material this fixture would otherwise not have.
+    And the store on disk is filled from the bodies the walk answered with,
+    because `receipted` registers the `artifacts` row and nothing before this
+    ticket ever read the bytes back.
+
+    The standalone half of criterion 3 is asked the only way it can be answered:
+    `verify.py` is copied out of the bundle, run by `python3` in a working
+    directory that is not this repository and with `PYTHONPATH` emptied, and its
+    exit status is read. A verifier tested by importing it from the package it
+    must not need would be a verifier nobody had run standalone.
+    """
+
+    slug = EVIDENCE_SLUG
+
+    #: A synthetic credential, and the whole reason criterion 6 is checkable. It
+    #: is shaped to match `bearer` -- sixteen characters of token after the
+    #: scheme -- and it is planted in an Agent-visible body, which is where a
+    #: real one would end up if the door's stripping ever failed. Nothing real:
+    #: a marker in a test file is a marker in a repository.
+    MARKER = "Bearer rk2SyntheticCanary0123456789"
+
+    #: Another person's address and another person's number, in the answer the
+    #: variant came back with. Both are `example.com` and both are inside the
+    #: reserved 555 range, so neither reaches anybody if this file is read aloud.
+    NEIGHBOUR = "alice@example.com"
+    NUMBER = "+1 (555) 123-4567"
+
+    #: 37's answers with the three above written into them. The assertions the
+    #: Finding is validated on are `status_equals`, `status_differs` and
+    #: `body_differs`, so what a body says is free as long as two of them differ.
+    ANSWERS = {
+        1: (200, "order one, and nothing anybody would redact"),
+        2: (200, f'{{"order": 2, "owner": "{NEIGHBOUR}", "call": "{NUMBER}", '
+                 f'"authorization": "{MARKER}"}}'),
+        3: (403, "denied"),
+    }
+
+    #: The wire view of one cited exchange: sealed, credential-bearing, and
+    #: nowhere in this bundle. The digest is of a string that is never packaged,
+    #: which is the point -- what `evidence_exclusions` counts is a row that
+    #: exists, and what the bundle carries is the Agent view of the same
+    #: exchange.
+    SEALED = "the request as it went out, with the Authorization header on it"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = scratch()
+        cls.configuration = write(cls.configured())
+        cls.fill_the_store()
+        assert cls.wired is not None, "the walk sealed no wire view"
+        cls.file_the_rendering_this_case_exports()
+
+        cls.exported = cls.export("first")
+        assert cls.exported.ok, cls.exported.violations
+        #: The bundle every arm below reads. Not `cls.bundle`: 42's arrangement
+        #: keeps the source bundle it renders under that name, and one of the two
+        #: is a dictionary of rows and the other a directory of bytes.
+        cls.where = cls.root / "first"
+        cls.manifest = json.loads((cls.where / verifier.MANIFEST).read_text(encoding="utf-8"))
+        cls.again = cls.export("second")
+        cls.chain_export = cls.export(
+            "chain", subject="chain", label=cls.chain["chain"], template=cls.CHAIN_FORM
+        )
+        assert cls.chain_export.ok, cls.chain_export.violations
+        cls.chain_manifest = json.loads(
+            (cls.root / "chain" / verifier.MANIFEST).read_text(encoding="utf-8")
+        )
+        cls.standalone = cls.checked_without_this_repository(cls.where)
+        cls.tampered = cls.checked_after(cls.where, "third")
+
+        cls.into_an_occupied_directory = cls.export("first")
+        cls.of_a_blocked_finding = cls.export(
+            "blocked", label=cls.label_of(cls.member["second"]["finding"])
+        )
+        cls.of_a_stale_rendering = cls.after_the_rows_moved()
+
+        cls.export_problems = cls.rows_of("SELECT * FROM check_evidence_export()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def fill_the_store(cls):
+        """The bytes behind the Receipts, on disk where the exporter reads them.
+
+        `receipted` writes the `artifacts` row and keeps the body; this is the
+        other half, and it is here rather than in the fixture because a store on
+        disk is what this ticket needs and no earlier one did.
+        """
+        cls.store_root = scratch()
+        keep = Store(cls.store_root)
+        for body in cls.bodies.values():
+            keep.put(body.encode())
+
+    #: Set once the wire view below has been attached, so the walk seals one
+    #: exchange and not every exchange it writes.
+    wired = None
+
+    @classmethod
+    def receipted(cls, tool_run: str, ordinal: int, **asked) -> str:
+        """37's exchange, with the wire view a live one would have on the first.
+
+        The seal is put on here rather than afterwards because `receipts` carries
+        `receipts_allowed_capability`, which fires on UPDATE as well as on INSERT
+        and asks whether the Tool run behind the row still holds a live
+        capability. It does at exactly this moment and it does not once the run
+        has closed -- so an arrangement that sealed a wire view later would be
+        one that had to break that trigger to get there, which is the trigger
+        that makes a Receipt evidence of a request some door let through.
+
+        What is being arranged is not the sealing. 07 owns that and asserts it.
+        It is the row `evidence_exclusions` counts, so criterion 2's list is read
+        off something that exists rather than asserted to be empty. The
+        `artifact_seal` row goes in with it and is not decoration: 07's standing
+        check reads an encrypted artifact with no seal describing it as a finding
+        of its own, so writing the artifact alone would break a check about the
+        door in order to test a check about export.
+        """
+        label = super().receipted(tool_run, ordinal, **asked)
+        if cls.wired is None and asked.get("body") is not None:
+            cls.seal_the_wire_view_of(label, artifact.digest(asked["body"].encode()))
+        return label
+
+    @classmethod
+    def seal_the_wire_view_of(cls, label: str, agent_view: str) -> None:
+        """The sealed counterpart of one Agent view, and the Receipt naming it."""
+        cls.sealed_sha = artifact.digest(cls.SEALED.encode())
+        cls.as_the_owner_says([
+            ("INSERT INTO secret_kek (gen, salt, root_check)"
+             " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
+             " ON CONFLICT (gen) DO NOTHING", ()),
+            ("INSERT INTO artifacts (sha256, byte_size, content_type, visibility, encrypted)"
+             " VALUES ($1, $2::bigint, 'message/http', 'credential_bearing', true)"
+             " ON CONFLICT (sha256) DO NOTHING",
+             (cls.sealed_sha, len(cls.SEALED.encode()))),
+            ("INSERT INTO artifact_seal (sha256, scope_kind, scope_id, visibility, byte_size,"
+             "                           alg, nonce, kek_gen, ciphertext_sha256, agent_sha256)"
+             " VALUES ($1, 'program', $2::uuid, 'credential_bearing', $3::bigint,"
+             "         'rk-hkdf-sha256-ctr-hmac-v1', decode(repeat('00', 32), 'hex'), 1, $4, $5)"
+             " ON CONFLICT (sha256) DO NOTHING",
+             (cls.sealed_sha, cls.program_id, len(cls.SEALED.encode()),
+              artifact.digest(b"the envelope this Program keeps"), agent_view)),
+            ("UPDATE receipts SET response_wire_sha = $2"
+             " WHERE program_id = $3::uuid AND label = $1",
+             (label, cls.sealed_sha, cls.program_id)),
+        ])
+        cls.wired = label
+
+    @classmethod
+    def file_the_rendering_this_case_exports(cls):
+        """The document a human is taken to have read, filed now.
+
+        Its own rather than the one 42's arrangement filed, because everything
+        that arrangement does afterwards is a mutation, and a staleness arm
+        asserting against a digest another ticket's fixture happened to leave
+        behind would be an arm about that fixture.
+        """
+        cls.fresh_source = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.filed_here = cls.called(
+            cls.FILE,
+            (cls.finding, cls.FORM, reporting.render(cls.fresh_source), reporting.VERSION),
+        )
+        assert cls.filed_here["outcome"] == "recorded", cls.filed_here
+
+    @classmethod
+    def label_of(cls, finding: str) -> str:
+        return str(
+            cls.connection.execute(
+                "SELECT label FROM findings WHERE id = $1::uuid", (finding,)
+            ).scalar()
+        )
+
+    @classmethod
+    def export(cls, into: str, **changes) -> Report:
+        """One export of this case's Finding, unless a caller says otherwise."""
+        asked = {
+            "subject": "finding",
+            "label": cls.label,
+            "template": cls.FORM,
+            "out": cls.root / into,
+            "root": cls.store_root,
+        } | changes
+        return evidence.export(cls.harness.runtime, cls.configuration, **asked)
+
+    @classmethod
+    def after_the_rows_moved(cls) -> Report:
+        """Criterion 4's third word, on a Finding somebody has already read.
+
+        The hunter recomposes, which is what a hunter does when a mechanism
+        sentence reads wrong. The same two effects and the same two steps, with
+        the first step's differential stated against the baseline exchange rather
+        than the variant's -- another fact the Finding already cites, so nothing
+        here is a forgery and no blocker changes.
+
+        That is exactly what makes it the case criterion 4 is about. The document
+        still renders, the bundle would still verify, every hash in it would be
+        internally consistent, and the only thing wrong with it is that it is not
+        the document somebody read.
+        """
+        cls.recomposed = cls.called(
+            cls.COMPOSE,
+            (cls.finding, cls.composition(steps=[
+                json.loads(cls.composition())["steps"][0]
+                | {"params": {"control_path": cls.control[0],
+                              "control_status": cls.control[1],
+                              "path": cls.cited[0][0]}},
+                json.loads(cls.composition())["steps"][1],
+            ])),
+        )
+        assert cls.recomposed["outcome"] == "composed", cls.recomposed
+        cls.moved = cls.called_stale()
+        return cls.export("stale")
+
+    @classmethod
+    def called_stale(cls) -> dict:
+        return json.loads(
+            str(
+                cls.connection.execute(
+                    "SELECT evidence_stale_rendering($1::uuid, $2)", (cls.finding, cls.FORM)
+                ).scalar()
+            )
+        )
+
+    @classmethod
+    def checked_without_this_repository(cls, bundle: Path) -> subprocess.CompletedProcess:
+        """Criterion 3, asked of the copy that travels rather than of the module.
+
+        Run out of a directory of its own with `PYTHONPATH` emptied, so an
+        import of anything in this tree fails rather than silently succeeding
+        because the suite happens to be running from the repository root.
+        """
+        elsewhere = scratch()
+        shutil.copy(bundle / "verify.py", elsewhere / "verify.py")
+        return subprocess.run(
+            [sys.executable, "verify.py", str(bundle)],
+            cwd=elsewhere,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    @classmethod
+    def checked_after(cls, bundle: Path, into: str) -> dict:
+        """What the verifier says about each way a copy can be interfered with.
+
+        A copy, so that the arms above still hold of the bundle that was
+        exported. Three edits, because they are three different failures: bytes
+        changed under a name the manifest hashes, a file added that nothing
+        names, and a manifest edited to say something else.
+        """
+        answers = {}
+        for name, edit in (
+            ("edited", cls.reworded),
+            ("added", lambda where: (where / "extra.txt").write_text("a file nobody named")),
+            ("removed", lambda where: (where / "receipts.json").unlink()),
+            ("rewritten", cls.retitled),
+        ):
+            where = cls.root / f"{into}-{name}"
+            shutil.copytree(bundle, where)
+            edit(where)
+            answers[name] = verifier.verify(where)
+        return answers
+
+    @staticmethod
+    def reworded(where: Path) -> None:
+        """One character of the document changed, and the length left alone.
+
+        Same length on purpose: a shorter document fails the size check as well,
+        and an arm that read two problems could not say which of the two found
+        it. What is being asked is whether the hash alone catches an edit.
+        """
+        data = (where / "report.md").read_bytes()
+        (where / "report.md").write_bytes(data[:-2] + b"X" + data[-1:])
+
+    @staticmethod
+    def retitled(where: Path) -> None:
+        """The manifest saying a different Finding, with every file hash intact."""
+        document = json.loads((where / verifier.MANIFEST).read_text(encoding="utf-8"))
+        document["label"] = "F-somebody-elses"
+        (where / verifier.MANIFEST).write_text(json.dumps(document, indent=2, sort_keys=True))
+
+    # -- reading the bundle ------------------------------------------------------
+
+    @property
+    def packed(self) -> dict:
+        """Every file of the exported bundle, by the path the manifest names."""
+        return {
+            item["path"]: (self.where / item["path"]).read_bytes()
+            for item in self.manifest["files"]
+        }
+
+    def unpacked(self, path: str) -> object:
+        return json.loads((self.where / path).read_text(encoding="utf-8"))
+
+    # -- criterion 1: what a bundle carries --------------------------------------
+
+    def test_the_bundle_carries_every_file_the_registry_says_it_does(self):
+        required = [
+            str(row[0])
+            for row in self.rows(
+                "SELECT path FROM evidence_bundle_files WHERE subject = 'finding' ORDER BY path"
+            )
+        ]
+        self.assertEqual(required, sorted(self.manifest["required"]))
+        for path in required:
+            self.assertTrue((self.where / path).is_file(), path)
+
+    def test_the_document_in_the_bundle_is_the_document_the_renderer_makes(self):
+        self.assertEqual(
+            reporting.render(self.unpacked("source.json")),
+            (self.where / "report.md").read_text(encoding="utf-8"),
+        )
+
+    def test_the_bundle_carries_the_specification_that_was_replayed(self):
+        carried = self.unpacked("spec.json")["specifications"]
+        self.assertEqual(1, len(carried))
+        self.assertEqual(
+            self.rows(
+                "SELECT t.spec_sha256 FROM findings f"
+                "  JOIN test_runs tr ON tr.id = f.validated_by_test_run_id"
+                "  JOIN tests t ON t.id = tr.test_id WHERE f.id = $1::uuid",
+                (self.finding,),
+            )[0][0],
+            carried[0]["sha256"],
+        )
+        self.assertEqual(
+            [action["ordinal"] for action in carried[0]["spec"]["actions"]],
+            sorted(action["ordinal"] for action in carried[0]["spec"]["actions"]),
+        )
+
+    def test_a_chain_carries_the_specification_behind_every_step(self):
+        """042 prints a specification digest against each transition, and a digest
+        of a document the bundle does not carry is a number a recipient can read
+        and hold against nothing. One `spec.json` for both subjects, so the file
+        is read one way whichever kind of bundle it came in."""
+        carried = json.loads(
+            (self.root / "chain" / "spec.json").read_text(encoding="utf-8")
+        )["specifications"]
+
+        self.assertEqual(
+            [
+                str(row[0])
+                for row in self.rows(
+                    "SELECT t.spec_sha256 FROM chain_steps cs"
+                    "  JOIN pivot_stamps s ON s.id = cs.stamp_id"
+                    "  JOIN test_runs tr ON tr.id = s.test_run_id"
+                    "  JOIN tests t ON t.id = tr.test_id"
+                    " WHERE cs.chain_id = $1::uuid ORDER BY t.label",
+                    (self.id_of("chains", self.chain["chain"]),),
+                )
+            ],
+            [item["sha256"] for item in carried],
+        )
+        self.assertTrue(all(item["spec"]["actions"] for item in carried))
+
+    def test_the_bundle_carries_what_the_validating_run_answered(self):
+        answered = self.unpacked("assertions.json")
+        # 008's word and not a synonym: what leaves has to be readable against
+        # the vocabulary the tables use, so that a recipient asking what
+        # `holds` means finds one answer rather than a translation.
+        self.assertEqual("holds", answered["outcome"])
+        self.assertEqual(
+            sorted(assertion["id"] for assertion in self.HELD),
+            [assertion["id"] for assertion in answered["assertions"]],
+        )
+        self.assertTrue(all(assertion["held"] for assertion in answered["assertions"]))
+
+    def test_the_bundle_carries_the_metadata_of_every_cited_exchange(self):
+        cited = self.rows(
+            "SELECT count(DISTINCT receipt_id) FROM finding_cited_receipts"
+            " WHERE finding_id = $1::uuid",
+            (self.finding,),
+        )[0][0]
+        receipts = self.unpacked("receipts.json")
+        self.assertEqual(cited, len(receipts))
+        for receipt in receipts:
+            self.assertEqual({"GET", "POST"} & {receipt["method"]}, {receipt["method"]})
+            self.assertRegex(receipt["arrival"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            self.assertEqual("app.example.com", receipt["host"])
+
+    def test_every_packed_artifact_is_named_by_its_hash_and_by_what_cites_it(self):
+        packed = self.unpacked("artifacts.json")
+        self.assertTrue(packed)
+        for item in packed:
+            self.assertEqual(f"artifacts/{item['agent_sha256']}", item["path"])
+            self.assertEqual(
+                item["sha256"],
+                artifact.digest((self.where / item["path"]).read_bytes()),
+            )
+            self.assertTrue(item["cited_by"])
+
+    def test_the_manifest_hashes_every_file_in_the_bundle(self):
+        named = {item["path"]: item["sha256"] for item in self.manifest["files"]}
+        found = {
+            path.relative_to(self.where).as_posix(): artifact.digest(path.read_bytes())
+            for path in self.where.rglob("*")
+            if path.is_file() and path.name != verifier.MANIFEST
+        }
+        self.assertEqual(found, named)
+
+    # -- criterion 2: what a bundle does not carry --------------------------------
+
+    def test_the_sealed_wire_view_is_excluded_and_the_exclusion_is_stated(self):
+        self.assertIn(
+            "wire_artifact", [item["code"] for item in self.manifest["excluded"]]
+        )
+        self.assertNotIn(self.sealed_sha, (self.where / verifier.MANIFEST).read_text())
+        for path, data in self.packed.items():
+            self.assertNotIn(self.SEALED.encode(), data, path)
+            self.assertNotIn(self.sealed_sha.encode(), data, path)
+
+    def test_no_credential_bearing_artifact_is_packaged_at_all(self):
+        sealed = {
+            str(row[0])
+            for row in self.rows(
+                "SELECT sha256 FROM artifacts WHERE visibility = 'credential_bearing'"
+            )
+        }
+        self.assertIn(self.sealed_sha, sealed)
+        self.assertEqual(
+            set(),
+            sealed & {item["agent_sha256"] for item in self.unpacked("artifacts.json")},
+        )
+
+    def test_the_identity_the_exchanges_ran_as_is_named_and_never_carried(self):
+        """Criterion 2's Identity clause, asked of the bundle that has one.
+
+        Of the chain and not of the Finding, because only the chain's exchanges
+        went out under a slot: 37's blind validation sends as nobody, and 39's
+        pivots send as `member`. The Finding's bundle is the negative half of the
+        same statement and is asserted below -- an exclusion line for an Identity
+        no cited exchange used would be a bundle claiming to have withheld
+        something it never had.
+        """
+        excluded = {item["code"]: item for item in self.chain_manifest["excluded"]}
+        self.assertIn("identity_material", excluded)
+        # One, not one per exchange: both pivots went out under `member`, and
+        # what the line counts is the Identities whose material is missing.
+        self.assertEqual(1, excluded["identity_material"]["items"])
+        self.assertEqual(
+            self.rows(
+                "SELECT count(DISTINCT identity_entity_id) FROM receipts"
+                " WHERE id = ANY (chain_evidence_receipts($1::uuid))",
+                (self.id_of("chains", self.chain["chain"]),),
+            )[0][0],
+            excluded["identity_material"]["items"],
+        )
+        for where in (self.where, self.root / "chain"):
+            for path in sorted(where.rglob("*")):
+                if path.is_file():
+                    self.assertNotIn(b"rk2-member", path.read_bytes(), str(path))
+
+    def test_a_bundle_states_no_exclusion_it_had_nothing_to_exclude_for(self):
+        """The other side of the line above, and the reason the counts are there.
+
+        Every cited exchange of this Finding was anonymous, so the Finding's
+        bundle must not carry the Identity line at all. A list that named every
+        category a bundle could have withheld would read the same whether the
+        harness had withheld anything or not, which is a disclosure that tells a
+        recipient nothing.
+        """
+        self.assertNotIn(
+            "identity_material", [item["code"] for item in self.manifest["excluded"]]
+        )
+        self.assertTrue(all(item["items"] > 0 for item in self.manifest["excluded"]))
+        self.assertEqual(
+            0,
+            self.rows(
+                "SELECT count(*) FROM receipts"
+                " WHERE id = ANY (finding_evidence_receipts($1::uuid))"
+                "   AND identity_entity_id IS NOT NULL",
+                (self.finding,),
+            )[0][0],
+        )
+
+    def test_every_read_the_export_makes_is_bound_to_one_program(self):
+        """Criterion 2's last clause, asked of the functions rather than of a run.
+
+        A Receipt id this Program does not own cannot be reached through any of
+        them -- and the arm that matters is the second, because a caller can name
+        any id it likes and the binding has to be in the read. `SECURITY DEFINER`
+        is asked about separately: a definer function would run as the owner and
+        the row policy would stop applying, which is the one way the predicate
+        below could be true and the function still answer for somebody else.
+        """
+        self.assertEqual(
+            0,
+            self.rows(
+                "SELECT count(*) FROM evidence_receipts(ARRAY[$1::uuid])",
+                (str(uuid.uuid4()),),
+            )[0][0],
+        )
+        reads = self.rows(
+            "SELECT proname, prosecdef, prosrc ~ 'rk2_program_required'"
+            "  FROM pg_proc WHERE pronamespace = 'public'::regnamespace"
+            "   AND proname IN ('evidence_receipts','evidence_artifacts','evidence_exclusions',"
+            "                   'finding_evidence_receipts','chain_evidence_receipts',"
+            "                   'evidence_stale_rendering')"
+            " ORDER BY proname"
+        )
+        self.assertEqual(6, len(reads))
+        for name, definer, bound in reads:
+            self.assertFalse(bool(definer), name)
+            self.assertTrue(bool(bound), name)
+
+    # -- criterion 6: the synthetic marker and the secret scan --------------------
+
+    def test_the_marker_is_in_the_store_and_in_no_file_of_the_bundle(self):
+        held = [body for body in self.bodies.values() if self.MARKER in body]
+        self.assertTrue(held, "the arrangement never planted the marker")
+        self.assertTrue(Store(self.store_root).holds(artifact.digest(held[0].encode())))
+        for path, data in self.packed.items():
+            self.assertNotIn(self.MARKER.encode(), data, path)
+
+    def test_another_persons_address_and_number_are_replaced_by_a_marker(self):
+        applied = {item["rule"] for item in self.manifest["redactions"]}
+        self.assertEqual({"bearer", "email", "phone"}, applied)
+        for path, data in self.packed.items():
+            self.assertNotIn(self.NEIGHBOUR.encode(), data, path)
+            self.assertNotIn(self.NUMBER.encode(), data, path)
+
+    def test_what_a_redaction_leaves_says_which_rule_took_it_and_how_much(self):
+        found = [
+            marker
+            for data in self.packed.values()
+            for marker in verifier.MARKER.findall(data.decode("latin-1"))
+        ]
+        self.assertEqual(len(self.manifest["redactions"]), len(found))
+        removed = {
+            "email": self.NEIGHBOUR.encode(),
+            "phone": self.NUMBER.encode(),
+            "bearer": self.MARKER.encode(),
+        }
+        for item in self.manifest["redactions"]:
+            self.assertEqual(len(removed[item["rule"]]), item["bytes"])
+
+    def test_no_digest_of_what_was_removed_leaves_in_the_bundle(self):
+        """A telephone number or an address has few enough possible values to
+        walk through offline, so a SHA-256 of one in a marker or a mark would be
+        the value with an extra step -- and the bundle would be a redaction in
+        name. The range stays answerable to somebody holding the full artifact,
+        which is the access this does not hand out."""
+        for item in self.manifest["redactions"]:
+            self.assertNotIn("sha256", item)
+        leaked = {
+            artifact.digest(value.encode())
+            for value in (self.NEIGHBOUR, self.NUMBER, self.MARKER)
+        }
+        for path, data in self.packed.items():
+            for value in leaked:
+                self.assertNotIn(value.encode(), data, path)
+
+    def test_every_rule_still_matches_the_string_it_was_written_for(self):
+        for identifier, pattern, probe in self.rows(
+            "SELECT id, pattern, probe FROM redaction_rules ORDER BY id"
+        ):
+            self.assertRegex(str(probe), str(pattern), identifier)
+
+    def test_every_rule_still_declines_the_string_it_must_leave_alone(self):
+        """The other half of the pair, under `re` rather than under POSIX.
+
+        `check_evidence_export` asks this of PostgreSQL. Asking it here asks it of
+        the engine that actually redacts, which is the only one whose answer
+        reaches a bundle.
+        """
+        for identifier, pattern, counter in self.rows(
+            "SELECT id, pattern, counter_probe FROM redaction_rules ORDER BY id"
+        ):
+            self.assertNotRegex(str(counter), str(pattern), identifier)
+
+    # -- criterion 3: the verifier needs nothing ----------------------------------
+
+    def test_the_bundle_passes_the_verifier_it_carries(self):
+        self.assertEqual(0, self.standalone.returncode, self.standalone.stderr)
+        self.assertTrue(json.loads(self.standalone.stdout)["ok"])
+
+    def test_the_verifier_that_shipped_is_the_verifier_in_this_tree(self):
+        self.assertEqual(
+            Path(verifier.__file__).read_bytes(), (self.where / "verify.py").read_bytes()
+        )
+
+    def test_the_verifier_refuses_a_bundle_somebody_edited(self):
+        self.assertEqual(
+            {"file_hash_mismatch"},
+            {problem["code"] for problem in self.tampered["edited"]["problems"]},
+        )
+        self.assertEqual(
+            {"file_unlisted"},
+            {problem["code"] for problem in self.tampered["added"]["problems"]},
+        )
+        self.assertEqual(
+            {"file_missing"},
+            {problem["code"] for problem in self.tampered["removed"]["problems"]},
+        )
+        self.assertEqual(
+            {"manifest_digest_mismatch"},
+            {problem["code"] for problem in self.tampered["rewritten"]["problems"]},
+        )
+
+    def test_the_command_reads_a_bundle_the_same_way_the_shipped_copy_does(self):
+        self.assertTrue(evidence.verify(self.where).ok)
+        answered = evidence.verify(self.root / "third-added")
+        self.assertFalse(answered.ok)
+        self.assertEqual(["file_unlisted"], answered.facts["bundle"]["problems"])
+
+    # -- criterion 5: two exports of the same rows --------------------------------
+
+    def test_a_second_export_of_unchanged_rows_is_the_same_bundle(self):
+        self.assertTrue(self.again.ok, self.again.violations)
+        first = {path: data for path, data in self.packed.items()}
+        second = {
+            item["path"]: (self.root / "second" / item["path"]).read_bytes()
+            for item in self.manifest["files"]
+        }
+        self.assertEqual(first, second)
+
+    def test_the_two_manifests_differ_only_in_when_they_were_packed(self):
+        second = json.loads(
+            (self.root / "second" / verifier.MANIFEST).read_text(encoding="utf-8")
+        )
+        self.assertEqual(self.manifest["digest"], second["digest"])
+        self.assertEqual(
+            {key: value for key, value in self.manifest.items() if key != verifier.PACKAGING},
+            {key: value for key, value in second.items() if key != verifier.PACKAGING},
+        )
+        self.assertIn("exported_at", second[verifier.PACKAGING])
+
+    # -- criterion 4: what may not be exported ------------------------------------
+
+    def test_a_finding_nothing_has_been_composed_onto_is_refused(self):
+        self.assertFalse(self.of_a_blocked_finding.ok)
+        self.assertEqual(
+            {"no_effect", "no_chain", "severity_unstated"},
+            {
+                violation.detail.split(":")[0]
+                for violation in self.of_a_blocked_finding.violations
+            },
+        )
+        self.assertFalse((self.root / "blocked").exists())
+
+    def test_a_rendering_made_from_a_source_that_has_moved_is_refused(self):
+        self.assertTrue(self.moved["stale"])
+        self.assertFalse(self.of_a_stale_rendering.ok)
+        self.assertIn(
+            "re-render and have it read again",
+            " ".join(violation.detail for violation in self.of_a_stale_rendering.violations),
+        )
+        self.assertFalse((self.root / "stale").exists())
+
+    def test_the_rendering_this_case_filed_was_not_stale_when_it_exported(self):
+        self.assertEqual(
+            "the rendering filed at %s is still of this source" % self.moved["rendered_at"],
+            next(
+                assertion.detail
+                for assertion in self.exported.assertions
+                if assertion.name == "rendering"
+            ),
+        )
+
+    def test_a_bundle_is_not_written_into_a_directory_that_holds_one(self):
+        self.assertFalse(self.into_an_occupied_directory.ok)
+        self.assertIn(
+            "is not empty",
+            " ".join(
+                violation.detail for violation in self.into_an_occupied_directory.violations
+            ),
+        )
+        self.assertEqual(self.manifest, json.loads(
+            (self.where / verifier.MANIFEST).read_text(encoding="utf-8")
+        ))
+
+    # -- the chain side -----------------------------------------------------------
+
+    def test_a_chain_packs_the_transitions_and_no_assertion_outcome(self):
+        """The one file a chain bundle has no answer for. A chain has no single
+        validating run, so there is nothing for it to have answered -- and which
+        subject carries which file is the registry's decision, so this asks the
+        registry rather than repeating a rule the exporter also holds."""
+        self.assertTrue(self.chain_export.ok, self.chain_export.violations)
+        where = self.root / "chain"
+        self.assertEqual(
+            [
+                str(row[0])
+                for row in self.rows(
+                    "SELECT path FROM evidence_bundle_files"
+                    " WHERE subject = 'chain' ORDER BY path"
+                )
+            ],
+            sorted(self.chain_manifest["required"]),
+        )
+        self.assertNotIn(
+            "assertions.json",
+            [str(row[0]) for row in self.rows(
+                "SELECT path FROM evidence_bundle_files WHERE subject = 'chain'"
+            )],
+        )
+        self.assertFalse((where / "assertions.json").exists())
+        self.assertEqual(
+            len(self.PIVOTS), len(json.loads((where / "receipts.json").read_text()))
+        )
+        self.assertTrue(verifier.verify(where)["ok"])
+
+    # -- the standing check --------------------------------------------------------
+
+    def test_the_check_holds_over_everything_this_case_exported(self):
+        self.assertEqual(
+            [], [tuple(str(field) for field in row) for row in self.export_problems]
+        )
 
 
 if __name__ == "__main__":

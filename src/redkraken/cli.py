@@ -22,6 +22,7 @@ from redkraken import (
     callback,
     decisions,
     doctor,
+    evidence,
     execution,
     header,
     identity,
@@ -986,6 +987,86 @@ def build_parser() -> argparse.ArgumentParser:
         "and their evidence",
     ).set_defaults(record=False)
 
+    bundles = commands.add_parser(
+        "evidence",
+        help="pack what holds into a bundle somebody else can check, and check one",
+    )
+    packing = bundles.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    packing_export = packing.add_parser(
+        "export",
+        help=f"write one Finding or chain as a redacted bundle (${DATABASE_URL})",
+        description=(
+            "Pack one Finding or chain: the rendered document, the projection it "
+            "came from, the exchanges behind it and the Agent view of what "
+            "crossed the wire, each under the hash of its bytes. Credentials, "
+            "capabilities, cookies, secret headers and the sealed wire view are "
+            "excluded and the exclusion is stated rather than left to be "
+            "inferred; everything packed is redacted against every rule in "
+            "`redaction_rules`. The verifier travels inside the bundle and is run "
+            "over it before this command reports success."
+        ),
+    )
+    _add_url(packing_export, RUNTIME)
+    packing_export.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program this record belongs to",
+    )
+    packing_export.add_argument(
+        "--subject",
+        required=True,
+        choices=sorted(evidence.GATHER),
+        help="whether the label names a Finding or a kill chain",
+    )
+    packing_export.add_argument(
+        "--label", required=True, metavar="label", help="the record to pack, by its label"
+    )
+    packing_export.add_argument(
+        "--template",
+        required=True,
+        metavar="id",
+        help="the form to render the document under, by its `report_templates` identifier",
+    )
+    packing_export.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="dir",
+        help=(
+            "where to write the bundle; it must not exist or must be empty, "
+            "because a bundle written over another leaves files its manifest "
+            "does not name"
+        ),
+    )
+    _add_root(
+        packing_export,
+        help=(
+            "where the artifact bytes to be redacted and packed live "
+            f"(default: ${ARTIFACTS.variable})"
+        ),
+    )
+    packing_export.set_defaults(run=_evidence_export)
+
+    packing_verify = packing.add_parser(
+        "verify",
+        help="check one unpacked bundle, with no database and no configuration",
+        description=(
+            "Hold one bundle against its own manifest: every named file present "
+            "and hashing to what was recorded, no file present that the manifest "
+            "does not name, the manifest still what it says it is, and no "
+            "redaction rule matching what survives in any packed file. The same "
+            "check the bundle carries as `verify.py`, offered here so that an "
+            "operator who has this repository need not go and find that copy."
+        ),
+    )
+    packing_verify.add_argument(
+        "bundle", type=Path, metavar="dir", help="the unpacked bundle to check"
+    )
+    packing_verify.set_defaults(run=_evidence_verify)
+
     door = commands.add_parser(
         "proxy", help="the egress door: run it, and spend one capability through it"
     )
@@ -1794,6 +1875,40 @@ def _report(arguments: argparse.Namespace) -> int:
             ),
         )
     )
+
+
+def _evidence_export(arguments: argparse.Namespace) -> int:
+    """A connection and a store, because a bundle carries bytes as well as rows.
+
+    No door, no key and no image: the packaged artifacts are the Agent view,
+    which is filed in the store as itself, and a sealed wire artifact is never
+    reached -- so a command able to unseal one would be a capability this
+    operation has no use for.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, evidence.EXPORT)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(evidence.EXPORT, ledger))
+    return _render(
+        _guarded(
+            evidence.EXPORT,
+            lambda: evidence.export(
+                runtime,
+                arguments.config,
+                subject=arguments.subject,
+                label=arguments.label,
+                template=arguments.template,
+                out=arguments.out,
+                root=root,
+            ),
+        )
+    )
+
+
+def _evidence_verify(arguments: argparse.Namespace) -> int:
+    """One directory and nothing else, which is the point of the verifier."""
+    return _render(_guarded(evidence.VERIFY, lambda: evidence.verify(arguments.bundle)))
 
 
 def _plan(ledger: Ledger, path: Path) -> list | None:

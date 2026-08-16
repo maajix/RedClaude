@@ -43,7 +43,7 @@ from redkraken import config, migrate, pg, program
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 
 
-__all__ = ["COMMAND", "FACTS", "RUN", "Refused", "VERSION", "render", "run"]
+__all__ = ["COMMAND", "FACTS", "RUN", "Refused", "VERSION", "projected", "render", "run"]
 
 
 COMMAND = "report"
@@ -638,6 +638,50 @@ def run(
         return _rendered(ledger, answers, connection, prose, out=out, record=record)
 
 
+def projected(
+    ledger: Ledger,
+    connection: pg.Connection,
+    *,
+    program_id: str,
+    subject: str,
+    label: str,
+    template: str,
+) -> tuple[str, dict] | None:
+    """Which row a label names, and the projection of that row onto one form.
+
+    `None` when either question has no answer, with the reason already in the
+    ledger; the two refusals are the same two whichever command asked, and they
+    name the argument that was wrong rather than the query that returned nothing.
+
+    Shared rather than written twice because the second reader arrived with 043.
+    Rendering a document and packing one are the same two reads, and a bundle
+    whose `source.json` came from a different projection than its `report.md` is
+    a bundle where every hash agrees and the document is about something else.
+    """
+    identify, read = SUBJECTS[subject]
+    rows = connection.execute(identify, (program_id, label)).rows
+    if not rows:
+        ledger.fail(
+            "subject",
+            f"{label} is not a {subject} of this Program",
+            code=INVALID_CONFIGURATION,
+            source="argument:--label",
+        )
+        return None
+    subject_id = str(rows[0][0])
+
+    answered = connection.execute(read, (subject_id, template)).scalar()
+    if answered is None:
+        ledger.fail(
+            "source",
+            f"{template} is not a form for a {subject}",
+            code=INVALID_CONFIGURATION,
+            source="argument:--template",
+        )
+        return None
+    return subject_id, json.loads(str(answered))
+
+
 def _rendered(
     ledger: Ledger,
     answers: _Answers,
@@ -648,28 +692,17 @@ def _rendered(
     record: bool,
 ) -> Report:
     """The three steps that need the database open, and every way out of them."""
-    identify, read = SUBJECTS[answers.subject]
-    rows = connection.execute(identify, (answers.program_id, answers.label)).rows
-    if not rows:
-        ledger.fail(
-            "subject",
-            f"{answers.label} is not a {answers.subject} of this Program",
-            code=INVALID_CONFIGURATION,
-            source="argument:--label",
-        )
+    found = projected(
+        ledger,
+        connection,
+        program_id=answers.program_id,
+        subject=answers.subject,
+        label=answers.label,
+        template=answers.template,
+    )
+    if found is None:
         return _report(ledger, answers)
-    subject_id = str(rows[0][0])
-
-    answered = connection.execute(read, (subject_id, answers.template)).scalar()
-    if answered is None:
-        ledger.fail(
-            "source",
-            f"{answers.template} is not a form for a {answers.subject}",
-            code=INVALID_CONFIGURATION,
-            source="argument:--template",
-        )
-        return _report(ledger, answers)
-    bundle = json.loads(str(answered))
+    subject_id, bundle = found
     ledger.hold(
         "source",
         f"{answers.label} projects onto {len(bundle.get('blocks') or ())} section(s) "

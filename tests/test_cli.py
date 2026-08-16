@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 import redkraken
-from redkraken import pg
+from redkraken import pg, verifier
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -1496,6 +1496,190 @@ class ReplayCommandTest(unittest.TestCase):
 
         self.assertEqual([], observed["events"])
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+
+class EvidenceCommandTest(unittest.TestCase):
+    """`rk evidence`, and the asymmetry between its two operations.
+
+    `export` needs a connection and a store, because a bundle carries rows and
+    bytes. `verify` needs a directory. That difference is the whole argument of
+    the ticket -- a check only the party being checked can run is not a check --
+    so it is asserted here on the command line rather than left to the module.
+    """
+
+    def exporting(self, *extra: str) -> tuple[str, ...]:
+        return (
+            "evidence", "export",
+            "--config", str(write(VALID)),
+            "--subject", "finding",
+            "--label", "F-0007",
+            "--template", "hackerone-v1",
+            "--out", str(scratch() / "bundle"),
+            *extra,
+        )
+
+    def bundle(self) -> Path:
+        """One well-formed bundle on disk, written the way the exporter writes."""
+        where = scratch() / "bundle"
+        where.mkdir()
+        (where / "report.md").write_bytes(b"# F-0007\n")
+        shipped = Path(verifier.__file__).read_bytes()
+        (where / verifier.VERIFIER).write_bytes(shipped)
+        document = {
+            "schema": verifier.SCHEMA,
+            "required": ["report.md", verifier.VERIFIER],
+            "files": [
+                {"path": "report.md", "bytes": 9, "sha256": verifier.digest(b"# F-0007\n")},
+                {
+                    "path": verifier.VERIFIER,
+                    "bytes": len(shipped),
+                    "sha256": verifier.digest(shipped),
+                },
+            ],
+            "redaction_rules": [],
+        }
+        (where / verifier.MANIFEST).write_text(
+            json.dumps(
+                document
+                | {
+                    "digest": verifier.manifest_digest(document),
+                    verifier.PACKAGING: {"exported_at": "2026-08-16T00:00:00Z"},
+                },
+                sort_keys=True,
+            )
+        )
+        return where
+
+    def test_the_store_is_named_alongside_the_connection_when_neither_is_set(self):
+        result = run(*self.exporting())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("evidence export", report["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_ROOT", "environment:RK_DATABASE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_an_export_missing_any_of_what_it_packs_is_a_usage_error(self):
+        for missing in ("--config", "--subject", "--label", "--template", "--out"):
+            with self.subTest(missing):
+                given = list(self.exporting())
+                at = given.index(missing)
+
+                result = run(*given[:at], *given[at + 2:])
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn(missing, result.stderr)
+        self.assertEqual(EXIT_USAGE, run("evidence").returncode)
+
+    def test_there_is_no_subject_beyond_the_two_that_can_be_rendered(self):
+        """`--subject` decides which Receipts a bundle is about, and the two
+        gatherers are named in SQL. A third value would reach a `KeyError`
+        rather than a refusal."""
+        result = run(*self.exporting()[:4], "--subject", "program", "--label", "P1")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--subject", result.stderr)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(
+            *self.exporting(
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                "--artifacts", str(scratch()),
+            )
+        )
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("evidence export", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            *self.exporting(
+                "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+                "--artifacts", str(scratch()),
+            )
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+    def test_a_destination_that_already_holds_a_bundle_is_refused(self):
+        result = run(
+            *self.exporting()[:-1],
+            str(self.bundle()),
+            "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            "--artifacts", str(scratch()),
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertEqual(
+            ["argument:--out"],
+            [item["source"] for item in json.loads(result.stdout)["violations"]],
+        )
+
+    def test_a_bundle_is_checked_with_no_connection_string_and_no_configuration(self):
+        result = run("evidence", "verify", str(self.bundle()))
+
+        self.assertEqual(EXIT_OK, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("evidence verify", report["command"])
+        self.assertTrue(report["bundle"]["verified"])
+
+    def test_a_bundle_that_was_edited_is_refused_by_the_same_command(self):
+        where = self.bundle()
+        (where / "report.md").write_bytes(b"# F-0008\n")
+
+        result = run("evidence", "verify", str(where))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        self.assertEqual(
+            ["file_hash_mismatch"],
+            json.loads(result.stdout)["bundle"]["problems"],
+        )
+
+    def test_verifying_a_bundle_reaches_nothing_and_changes_nothing(self):
+        """The property that makes the shipped copy and this subcommand the same
+        check. A verify that opened a socket or wrote a file would be doing
+        something a recipient's copy could not do."""
+        observed = observe("evidence", "verify", str(self.bundle()))
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_OK, observed["exit"])
+
+    def test_the_copy_in_the_bundle_runs_under_a_python_that_has_no_package(self):
+        """The whole argument of the ticket, run rather than read.
+
+        `test_verifier` asks the module's source what it imports. This runs the
+        copy a recipient actually receives, from a directory that is not this
+        repository, under an interpreter told nothing about `redkraken` -- and
+        holds the answer against what `rk evidence verify` said about the same
+        bundle. A recipient who cannot reproduce that answer has a report and
+        not evidence.
+        """
+        where = self.bundle()
+
+        theirs = subprocess.run(
+            [sys.executable, str(where / verifier.VERIFIER), str(where)],
+            cwd=str(where.parent),
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        ours = run("evidence", "verify", str(where))
+
+        self.assertEqual(EXIT_OK, theirs.returncode, theirs.stderr)
+        self.assertEqual(EXIT_OK, ours.returncode, ours.stderr)
+        answer = json.loads(theirs.stdout)
+        self.assertTrue(answer["ok"])
+        self.assertEqual(json.loads(ours.stdout)["bundle"]["files"], answer["files"])
+
+    def test_verify_takes_one_directory_and_no_flags(self):
+        self.assertEqual(EXIT_USAGE, run("evidence", "verify").returncode)
+        self.assertEqual(
+            EXIT_USAGE, run("evidence", "verify", str(self.bundle()), "--config", "x").returncode
+        )
 
 
 class InterruptedCommandTest(unittest.TestCase):
