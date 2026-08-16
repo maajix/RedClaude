@@ -60,6 +60,21 @@ BASELINE = "check_server_baseline"
 ROLE_CATALOGUE = "check_role_catalogue"
 STANDING = "run_standing_checks"
 
+#: How the standing family is asked, and the one seam that decides how narrow
+#: the question is. `$1` names the Programs the Program-scoped checks are about:
+#: NULL is every Program, which is what `rk db verify` means, and the empty
+#: array is none of them, which is how a caller asks for the corpus-wide
+#: invariants alone. `$2` drops the corpus-wide rows entirely, for a caller
+#: holding a transaction open over one Program's write -- re-asking a corpus
+#: invariant there would judge rows nobody has committed, and one that is
+#: momentarily false mid-transaction would roll back a sound write.
+#:
+#: Which checks the Program list applies to is the registry's answer, not this
+#: module's: `standing_checks.program_scoped` carries the flag and the checker
+#: itself carries the filter, because only the checker knows which of its
+#: columns holds a slug.
+STANDING_QUERY = f"SELECT name, problems, detail FROM {STANDING}($1::text[], $2::boolean)"
+
 #: The families by name, and the subset a runtime connection asks for. The role
 #: catalogue is the runner's: `0029_roles_and_grants.sql` revokes it from PUBLIC
 #: for that reason, and ticket 66 closes the default-privilege grant that
@@ -119,8 +134,13 @@ def run(
     connection: pg.Connection,
     expected: list[str] | None = None,
     families: Sequence[str] = ALL_FAMILIES,
+    programs: Sequence[str] | None = None,
 ) -> tuple[Check, ...]:
-    """Every registered check in the named families, in the order an operator reads them."""
+    """Every registered check in the named families, in the order an operator reads them.
+
+    `programs` narrows the standing family; see `STANDING_QUERY` for what naming
+    Programs, or naming none, asks for.
+    """
     checks: list[Check] = []
 
     if BASELINE_FAMILY in families:
@@ -143,20 +163,43 @@ def run(
             checks.append(Check(ROLES_FAMILY, str(name), bool(ok), str(detail)))
 
     if STANDING_FAMILY in families:
-        for name, problems, detail in connection.execute(
-            f"SELECT name, problems, detail FROM {STANDING}()"
-        ).rows:
-            count = int(problems)
-            checks.append(
-                Check(
-                    STANDING_FAMILY,
-                    str(name),
-                    count == 0,
-                    f"{count} problem(s)" + (f": {detail}" if count and detail else ""),
-                )
-            )
+        checks.extend(_standing_checks(connection, programs, scoped_only=False))
 
     return tuple(checks)
+
+
+def _standing_checks(
+    connection: pg.Connection, programs: Sequence[str] | None, *, scoped_only: bool
+) -> list[Check]:
+    """The standing family, run and read back as Checks. No problems is a pass."""
+    rows = connection.execute(
+        STANDING_QUERY,
+        (None if programs is None else pg.quote_array(list(programs)), scoped_only),
+    ).rows
+    checks = []
+    for name, problems, detail in rows:
+        count = int(problems)  # type: ignore[arg-type]
+        checks.append(
+            Check(
+                STANDING_FAMILY,
+                str(name),
+                count == 0,
+                f"{count} problem(s)" + (f": {detail}" if count and detail else ""),
+            )
+        )
+    return checks
+
+
+def program_checks(connection: pg.Connection, slug: str) -> tuple[Check, ...]:
+    """The standing checks that are about one Program, asked about that one.
+
+    Separate from `run` because the caller is: a command holding a transaction
+    open over one Program's write, asking whether what it just wrote leaves that
+    Program sound. Running the corpus-wide checks there would answer a question
+    nobody asked against rows nobody has committed, and a corpus-wide invariant
+    that is momentarily false mid-transaction would roll back a sound adoption.
+    """
+    return tuple(_standing_checks(connection, (slug,), scoped_only=True))
 
 
 def entitled_by_a_restore(connection: pg.Connection, check: Check) -> Check:
@@ -185,6 +228,7 @@ def verify(
     expected: list[str] | None = None,
     families: Sequence[str] = ALL_FAMILIES,
     store: Path | None = None,
+    programs: Sequence[str] | None = None,
     *,
     restored: bool = False,
 ) -> Report:
@@ -200,6 +244,12 @@ def verify(
     them -- but it fails the gate exactly as they do, which is what makes a
     corrupt artifact something `rk db verify` refuses over rather than a thing
     only `rk artifact audit` ever notices.
+
+    `programs` is passed through to `run`. A caller that names Programs is asking
+    a narrower question than `rk db verify` asks and gets a narrower answer; the
+    report does not pretend otherwise, because the families that ran are already
+    a fact in it and this only changes what the standing family was asked about.
+    `rk db verify` itself never names any, so the gate is as strict as it was.
 
     `restored` is the caller saying it has just loaded an archive, and it buys
     exactly one named tolerance -- see `RESTORE_ENTITLEMENT`. It is a parameter
@@ -218,7 +268,7 @@ def verify(
         return report("db verify", ledger, checks=0)
 
     try:
-        checks = run(connection, expected, families)
+        checks = run(connection, expected, families, programs)
         if restored:
             checks = tuple(entitled_by_a_restore(connection, check) for check in checks)
     except pg.DatabaseError as error:
@@ -358,11 +408,17 @@ def _headers(keep: Store, sealed: Sequence[Sequence[object]], already: set[str])
 
 
 def _installed(connection: pg.Connection) -> bool:
-    """Whether this database has the gate at all."""
+    """Whether this database has the gate at all.
+
+    The standing runner is probed at the arity this module calls it with, not at
+    the one every other caller uses: a database migrated to before ticket 81 has
+    the no-argument form and would pass a laxer probe, then fail inside `run`
+    with an undefined function rather than being reported as drift.
+    """
     return bool(
         connection.execute(
             "SELECT to_regprocedure($1) IS NOT NULL AND to_regprocedure($2) IS NOT NULL"
             "   AND to_regprocedure($3) IS NOT NULL",
-            (f"{BASELINE}(text[])", f"{ROLE_CATALOGUE}()", f"{STANDING}()"),
+            (f"{BASELINE}(text[])", f"{ROLE_CATALOGUE}()", f"{STANDING}(text[],boolean)"),
         ).scalar()
     )

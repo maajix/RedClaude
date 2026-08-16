@@ -65,6 +65,19 @@ BUDGET_LIMITS = (
     "tokens",
     "window_seconds",
 )
+#: The ceilings that cannot all be true at once, as `(narrower, wider)` pairs.
+#: A run is spent inside a Lane and a Lane inside the campaign, so a per-run
+#: ceiling above either promises every claim more than there is -- and the
+#: runtime then refuses every Task and calls it an exhausted budget, which is
+#: the true answer to the wrong question. Only the per-run ceiling is compared
+#: upwards, because a Lane ceiling above the campaign's is slack rather than a
+#: contradiction: the tighter one binds first and the wider one never does.
+BUDGET_CEILINGS = (
+    ("run_requests", "lane_requests"),
+    ("run_requests", "requests"),
+    ("run_tokens", "lane_tokens"),
+    ("run_tokens", "tokens"),
+)
 SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
 IDENTITY_KEYS = ("name", "slot_ref")
@@ -423,6 +436,17 @@ def _budgets(reader: _Reader, root: dict) -> dict | None:
     for limit in BUDGET_LIMITS:
         raw = reader.required(table, "budgets", limit)
         limits[limit] = None if raw is None else reader.positive_integer(raw, f"budgets.{limit}")
+    # Refused here rather than left to the runtime's standing check, which reads
+    # the Program row and so only fires once the row exists -- by which point the
+    # configuration that produced it has already been adopted.
+    for narrower, wider in BUDGET_CEILINGS:
+        if limits[narrower] is None or limits[wider] is None:
+            continue
+        if limits[narrower] > limits[wider]:
+            reader.fail(
+                f"budgets.{narrower}",
+                f"must not exceed budgets.{wider}, which is {limits[wider]}",
+            )
     return limits
 
 

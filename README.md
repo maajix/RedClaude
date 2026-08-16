@@ -113,6 +113,14 @@ kind = "dns"
 host = "oob.example.net"
 ```
 
+The nine budget limits state three nested allowances, and the nesting is
+checked: an Agent run is spent inside a Lane and a Lane inside the campaign, so
+`run_tokens` above `lane_tokens` or `tokens`, or `run_requests` above
+`lane_requests` or `requests`, is refused by name. Only the per-run ceiling is
+compared upwards. A Lane allowed more than the campaign holds is slack rather
+than a contradiction, because the campaign total binds first and the Lane never
+does.
+
 A scope entry names a hostname, an address, or a wildcard such as
 `*.example.com`. An inclusion's wildcard must name at least two labels of its
 own, so `*.com` is refused. That is a floor, not a public-suffix rule: `*.co.uk`

@@ -198,6 +198,11 @@ def _encode(document: Mapping[str, Any]) -> bytes:
 #: security, because the runtime connection sees every Program's rows.
 REVISION = "SELECT coalesce(max(seq), 0) FROM events WHERE program_id = $1::uuid"
 
+#: Which Program this capsule is about, by the name the standing checks report
+#: Programs under. Read rather than carried because the caller has the id: the
+#: checks are the schema's and the schema names Programs by slug.
+SLUG = "SELECT slug FROM programs WHERE id = $1::uuid"
+
 #: Where the Program stands. The halt is a left join and not a second read
 #: because "no row" and "cleared" are the same standing to a resuming session,
 #: and `coalesce` says so in the record instead of in Python.
@@ -399,13 +404,22 @@ def compile(
     The cost is one more `run_standing_checks()` per pass, which is the price of
     the integrity section meaning what it says.
 
+    They are asked about this Program alone, because this is the one Program the
+    document describes. A neighbour's contradictory configuration is not a fact
+    about this session, and putting it here would spend the model's attention on
+    somebody else's fault and name a Program this session may not read.
+
     `slate` is the one thing that is carried and not read, because reading it
     would change it: `offer_slate` consumes the outstanding Slate and writes a
     new one, so a capsule that read the Slate itself would either take the one
     this pass is about to hand out or quietly offer a second.
     """
     limits = limits or packet.Limits()
-    checks = integrity.run(connection, families=(integrity.STANDING_FAMILY,))
+    checks = integrity.run(
+        connection,
+        families=(integrity.STANDING_FAMILY,),
+        programs=(str(_scalar(connection.execute(SLUG, (program_id,)))),),
+    )
     staged = {
         "lifecycle": _lifecycle(connection, program_id),
         "budget": _budget(connection, program_id),

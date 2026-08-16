@@ -191,10 +191,15 @@ CAPSULE_READS = {
     execution.capsule_module.WORK: ("T9", 8, {"kind": "work"}),
 }
 
-#: The one statement the standing family is read with. Spelled from `integrity`'s
-#: own names rather than written out, so a recorder answering it is answering
-#: the statement the capsule actually sends.
-STANDING = f"SELECT name, problems, detail FROM {integrity.STANDING}()"
+#: The one statement the standing family is read with. Taken from `integrity`
+#: rather than written out, so a recorder answering it is answering the statement
+#: the capsule actually sends.
+STANDING = integrity.STANDING_QUERY
+
+#: The slug the capsule asks the standing checks about, matching the one its
+#: `PROGRAM` section reports: a capsule naming one Program in its lifecycle
+#: section and asking about another would be two documents.
+PROGRAM_SLUG = CAPSULE_READS[execution.capsule_module.PROGRAM][0]
 
 
 def digested(document: object) -> list[tuple]:
@@ -392,6 +397,8 @@ class Recorder:
             return [(self.working,)]
         if sql == execution.capsule_module.DIGESTS:
             return digested(parameters[0])
+        if sql == execution.capsule_module.SLUG:
+            return [(PROGRAM_SLUG,)]
         if sql == STANDING:
             return list(self.standing)
         if sql in (execution.RANK, execution.QUOTA):

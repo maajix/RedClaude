@@ -2635,6 +2635,18 @@ class NegativeControlTest(DatabaseCase):
 #: them by prefix and each test can still have one nobody else touches.
 RUN_SLUG = "selftest-run"
 
+#: Put a Program's per-run token ceiling back to what its newest revision says.
+#: The undo for `ProgramRunTest.poison`, written against the revision rather than
+#: against a value captured beforehand so that it is the same undo whether the
+#: test repaired the row with a corrected file or left it as it poisoned it.
+RESTORE_CEILING = (
+    "UPDATE programs p"
+    "   SET run_token_budget = (c.document #>> '{budgets,run_tokens}')::bigint"
+    "  FROM (SELECT DISTINCT ON (program_id) program_id, document"
+    "          FROM program_configurations ORDER BY program_id, revision DESC) c"
+    " WHERE c.program_id = p.id AND p.slug = $1"
+)
+
 
 class ProgramRunTest(DatabaseCase):
     """PH2-04: `rk run` opens a Program once and resumes that one afterwards.
@@ -2951,6 +2963,102 @@ class ProgramRunTest(DatabaseCase):
         self.assertIsNotNone(program_id)
         self.assertEqual(1, self.programs(slug))
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
+
+    def as_runtime(self, statement: str, values: tuple) -> None:
+        """Write on the runtime's own connection, as the actor `_revise` writes as.
+
+        A row a privileged role could write and this one could not would not be
+        the row the command has to survive.
+        """
+        with self.connection.transaction():
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(statement, values)
+
+    def poison(self, slug: str) -> None:
+        """Put this Program's per-run token ceiling above its campaign's, and undo it after.
+
+        `token_budget + 1` is the contradictory row: a run promised more than the
+        whole campaign has, so `budget_refusal_for` refuses every Task from the
+        first one and reports it as an exhausted budget. The loader refuses such
+        a file since 81, so the only way this row exists is the way it existed
+        before it did -- written by a policy nobody checked this about. That is
+        the row that has to be repairable.
+
+        The undo is registered before the damage, so a failing assertion in
+        between still leaves the class's later tests -- and the gate at the end
+        of it -- reading rows nobody poisoned. It restores the ceiling the
+        Program's newest revision states rather than the one the row held, so it
+        is the same undo whether or not the test repaired the row itself.
+        """
+        self.addCleanup(self.as_runtime, RESTORE_CEILING, (slug,))
+        self.as_runtime(
+            "UPDATE programs SET run_token_budget = token_budget + 1 WHERE slug = $1", (slug,)
+        )
+
+    def unsound(self, slug: str) -> int:
+        """How many Program-scoped checks this Program fails, asked about it alone."""
+        return int(
+            self.connection.execute(
+                "SELECT sum(problems) FROM run_standing_checks($1::text[], true)",
+                (pg.quote_array([slug]),),
+            ).scalar()
+        )
+
+    def test_a_corrected_file_repairs_ceilings_and_a_neighbour_never_sees_them(self):
+        # Ticket 81, criteria 1 and 2. The gate used to read the Program-scoped
+        # checks corpus-wide and before the write, which made a contradictory
+        # row unrepairable by the one command that could repair it -- and made
+        # it every other Program's refusal at the same time.
+        slug = f"{RUN_SLUG}-ceilings"
+        opened = self.run_for(slug)
+        assert opened.ok, opened.violations
+
+        # Two problems rather than one: the row contradicts its own ceilings and
+        # no longer states what the revision behind it states. Both are things
+        # `rk run` used to refuse over, corpus-wide, before writing anything.
+        self.poison(slug)
+        self.assertEqual(2, self.unsound(slug))
+
+        # Nobody else's refusal.
+        neighbour = self.run_for(f"{RUN_SLUG}-ceilings-neighbour")
+        self.assertTrue(neighbour.ok, neighbour.violations)
+
+        # And the corrected file is adopted rather than refused by the row it
+        # corrects: the ceiling it states is the ceiling the Program ends up on.
+        corrected = VALID.replace("run_tokens = 40000", "run_tokens = 30000")
+        repaired = self.run_for(slug, corrected, accept_change=True)
+
+        self.assertTrue(repaired.ok, repaired.violations)
+        self.assertEqual(
+            30000,
+            self.connection.execute(
+                "SELECT run_token_budget FROM programs WHERE slug = $1", (slug,)
+            ).scalar(),
+        )
+        self.assertEqual(0, self.unsound(slug))
+
+    def test_a_file_that_leaves_the_ceilings_disagreeing_writes_nothing(self):
+        # The other half: adopting late is not adopting blindly. Rerunning the
+        # unchanged file records no revision, so it repairs nothing, and the run
+        # says so and rolls back rather than leaving the Program half-resumed.
+        slug = f"{RUN_SLUG}-ceilings-guard"
+        opened = self.run_for(slug)
+        assert opened.ok, opened.violations
+        self.poison(slug)
+
+        refused = self.run_for(slug)
+
+        self.assertFalse(refused.ok)
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, refused.exit_code)
+        self.assertIn("program_configuration", refused.violations[0].detail)
+        revisions = self.revisions(opened.facts["program_id"])
+        self.assertEqual([1], [revision for revision, _, _ in revisions])
+        self.assertEqual(2, self.unsound(slug))
+
+        # And the report names no row the rollback took back: the scope version
+        # this run projected went with it, so quoting one would tell an operator
+        # about a row the database does not hold.
+        self.assertIsNone(refused.facts.get("scope"))
 
     def test_the_gate_still_holds_over_the_programs_these_tests_opened(self):
         # The rows above are the first this module leaves committed, and the

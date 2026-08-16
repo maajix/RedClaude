@@ -27,6 +27,11 @@ from redkraken import capsule, integrity, packet, pg
 
 PROGRAM = "11111111-1111-4111-8111-111111111111"
 
+#: What that Program is called. The lifecycle section reports it and the standing
+#: checks are asked about it, and they are one constant because a capsule naming
+#: one Program in its rows and asking about another would be two documents.
+PROGRAM_SLUG = "matrix-web"
+
 
 def record(kind: str, label: str, **fields) -> dict:
     return {"kind": kind, "label": label, **fields}
@@ -85,7 +90,7 @@ class Recorder:
     ):
         self.calls: list[tuple[str, tuple]] = []
         self.revision = revision
-        self.program = [read_row("matrix-web", 12)] if program is None else program
+        self.program = [read_row(PROGRAM_SLUG, 12)] if program is None else program
         self.campaign = [read_row("OS4", 0)] if campaign is None else campaign
         self.capacity = [read_row("program", 0)] if capacity is None else capacity
         self.lanes = [read_row("recon", 0)] if lanes is None else lanes
@@ -143,7 +148,9 @@ class Recorder:
                 for position, element in enumerate(sent, start=1)
             ]
             return answered if self.digests is None else answered[: self.digests]
-        if sql == f"SELECT name, problems, detail FROM {integrity.STANDING}()":
+        if sql == capsule.SLUG:
+            return [(PROGRAM_SLUG,)]
+        if sql == integrity.STANDING_QUERY:
             return list(self.standing)
         raise AssertionError(f"the compile asked something unplanned: {sql}")
 
@@ -207,8 +214,16 @@ class CompileTest(unittest.TestCase):
         stated = built.section("integrity").rows[0].record
 
         self.assertEqual(
-            [f"SELECT name, problems, detail FROM {integrity.STANDING}()"],
+            [integrity.STANDING_QUERY],
             [sql for sql in connection.statements if integrity.STANDING in sql],
+        )
+        # And asked about this Program alone: a neighbour's contradictory
+        # configuration is not a fact about this session, and naming one here
+        # would spend the model's attention on somebody else's fault.
+        self.assertEqual([(PROGRAM,)], connection.sent(capsule.SLUG))
+        self.assertEqual(
+            [(pg.quote_array([PROGRAM_SLUG]), False)],
+            connection.sent(integrity.STANDING_QUERY),
         )
         self.assertEqual("standing:event_coverage", built.section("integrity").rows[0].label)
         self.assertEqual(False, stated["ok"])
@@ -315,8 +330,7 @@ class SlateSectionTest(unittest.TestCase):
         self.assertEqual(
             {capsule.REVISION, capsule.PROGRAM, capsule.CAMPAIGN, capsule.CAPACITY,
              capsule.LANES, capsule.WORK, capsule.WORK_COUNT, capsule.DIGESTS,
-             capsule.SLATE_REVISIONS,
-             f"SELECT name, problems, detail FROM {integrity.STANDING}()"},
+             capsule.SLATE_REVISIONS, capsule.SLUG, integrity.STANDING_QUERY},
             set(connection.statements),
         )
 

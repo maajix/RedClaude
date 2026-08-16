@@ -328,6 +328,49 @@ class ControlsTest(unittest.TestCase):
             ))),
         )
 
+    def test_run_ceilings_may_not_exceed_the_lane_or_the_campaign(self):
+        """A run promised more than its Lane or its campaign holds is refused here.
+
+        The runtime carries the same rule as a standing check, but that one reads
+        the Program row and so only fires once the row exists -- by which point
+        the configuration that produced it has been adopted, and every Program in
+        the database is refused until it is repaired.
+        """
+        self.assertEqual(
+            [
+                (
+                    INVALID_CONFIGURATION,
+                    "config:budgets.run_requests",
+                    "must not exceed budgets.lane_requests, which is 10",
+                ),
+                (
+                    INVALID_CONFIGURATION,
+                    "config:budgets.run_tokens",
+                    "must not exceed budgets.tokens, which is 20000",
+                ),
+            ],
+            sorted(violations(VALID.replace(
+                "requests = 5000\ntokens = 2000000\nrun_tokens = 40000\nrun_requests = 50\n"
+                "lane_tokens = 500000\nlane_requests = 1000\n",
+                "requests = 5000\ntokens = 20000\nrun_tokens = 40000\nrun_requests = 50\n"
+                "lane_tokens = 500000\nlane_requests = 10\n",
+            ))),
+        )
+
+    def test_a_lane_ceiling_above_the_campaign_is_slack_rather_than_a_refusal(self):
+        """Only the per-run ceiling is compared upwards.
+
+        A Lane allowed more than the campaign holds simply never binds, because
+        the campaign total is checked first and runs out sooner.
+        """
+        self.assertEqual(
+            [],
+            violations(VALID.replace(
+                "lane_tokens = 500000\nlane_requests = 1000\n",
+                "lane_tokens = 5000000\nlane_requests = 100000\n",
+            )),
+        )
+
     def test_identity_and_header_names_are_unique(self):
         self.assertEqual(
             [

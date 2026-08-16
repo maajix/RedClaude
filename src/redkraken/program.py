@@ -249,10 +249,20 @@ def run(
         # Two families, not three: the role catalogue is the runner's, and a
         # runtime command that asked for it would depend on the privilege
         # ticket 66 exists to take away.
+        #
+        # And no Program, because this gate runs before the configuration is
+        # adopted. A Program-scoped check read here would be read against the
+        # policy this file is about to replace, which makes the one command that
+        # can repair a contradictory Program refuse to start on account of the
+        # row it was going to repair -- and makes a neighbour's poisoned row
+        # everybody's refusal. Those checks run again below, once, against the
+        # Program this run is actually about. `rk db verify` still asks about
+        # all of them.
         gate = integrity.verify(
             connection,
             expected=[item.identity for item in migrations],
             families=integrity.RUNTIME_FAMILIES,
+            programs=(),
         )
         state.integrity = dict(gate.facts)
         if gate.violations:
@@ -480,62 +490,110 @@ def _open_program(
 
         connection.execute("SELECT set_actor('runtime', $1)", (ACTOR,))
 
+        # What this transaction writes is held in locals rather than published
+        # onto the report as it goes. The soundness check at the end can still
+        # roll the transaction back, and a refusal that answers with a
+        # program_id, a configuration revision and a scope version the database
+        # no longer holds is worse than one that answers with none of them. What
+        # `state` already carries is the existing row, read before this block,
+        # and that row survives a rollback.
+        program_id = state.program_id
+        lifecycle = state.lifecycle
+        revision = state.revision
+
         if answer == CREATE:
-            state.program_id = _create(connection, configuration, slug)
-            state.lifecycle = "open"
+            program_id = _create(connection, configuration, slug)
+            lifecycle = "open"
             reason = "program opened"
         elif answer == REVISE:
-            _revise(connection, configuration, str(state.program_id))
+            _revise(connection, configuration, str(program_id))
             reason = f"policy change accepted by {ACTOR}"
         else:
             reason = ""
 
         next_revision = 1 if current is None else current.revision + 1
         if answer in (CREATE, REVISE):
-            state.revision = _record(
+            revision = _record(
                 connection,
                 configuration,
-                str(state.program_id),
+                str(program_id),
                 revision=next_revision,
                 reason=reason,
             )
 
-        identity_revision = (
-            state.revision.revision if state.revision is not None else next_revision
-        )
+        identity_revision = revision.revision if revision is not None else next_revision
         _project_identities(
             connection,
             configuration,
-            str(state.program_id),
+            str(program_id),
             revision=identity_revision,
         )
 
         # Every answer that keeps the Program open leaves it running a compiled
         # policy, resume included: a Program opened before this path existed has
         # `scope_version` NULL, and NULL is a Program nothing may be sent to.
-        state.scope = _project_scope(
+        projected = _project_scope(
             connection,
             policy,
-            str(state.program_id),
-            revision=state.revision.revision if state.revision else next_revision,
-        )
-        ledger.hold(
-            "scope_version",
-            f"version {state.scope['version']} from configuration revision "
-            f"{state.scope['configuration_revision']}, {state.scope['rules']} rule(s), "
-            f"policy {_short(state.scope['policy_sha256'])}"
-            + ("" if state.scope["compiled"] else " (already live)"),
+            str(program_id),
+            revision=revision.revision if revision else next_revision,
         )
 
         if answer in (RESUME, REVISE):
-            counts = _resume(connection, str(state.program_id), state.revision)
+            counts = _resume(connection, str(program_id), revision)
             detail = ", ".join(f"{name} {value}" for name, value in sorted(counts.items()))
-            ledger.hold("program", f"resumed {slug}: {detail}")
+            summary = f"resumed {slug}: {detail}"
         else:
-            ledger.hold("program", f"created {slug}")
+            summary = f"created {slug}"
+
+        # Judged last and inside the transaction, so what is asked about is
+        # everything this run wrote and the answer can still undo it.
+        _refuse_unless_sound(ledger, connection, slug)
+
+        # Past here the rows will survive the commit, so they become the answer.
+        state.program_id = program_id
+        state.lifecycle = lifecycle
+        state.revision = revision
+        state.scope = projected
+        ledger.hold(
+            "scope_version",
+            f"version {projected['version']} from configuration revision "
+            f"{projected['configuration_revision']}, {projected['rules']} rule(s), "
+            f"policy {_short(projected['policy_sha256'])}"
+            + ("" if projected["compiled"] else " (already live)"),
+        )
+        ledger.hold("program", summary)
 
     if answer == REVISE:
         ledger.hold("configuration_revision", f"recorded revision {next_revision} for {slug}")
+
+
+def _refuse_unless_sound(ledger: Ledger, connection: pg.Connection, slug: str) -> None:
+    """Refuse unless this configuration leaves the Program passing its own checks.
+
+    Asked after the write rather than before it, because the question is about
+    the policy in this file and the only way to ask it is to adopt the policy and
+    look. Before the write, the same checks read the policy this run is replacing
+    -- which is how a Program with contradictory ceilings became unrepairable:
+    the one command that could correct it refused to start on account of the row
+    it was going to correct.
+
+    A refusal here leaves `connection.transaction()` by raising, so the Program
+    keeps the policy it had. Nothing is half-adopted and nothing is repaired by
+    accident.
+    """
+    failed = [check for check in integrity.program_checks(connection, slug) if not check.ok]
+    if not failed:
+        return
+    ledger.fail(
+        "program",
+        f"this configuration would leave {slug} failing "
+        f"{len(failed)} of its own check(s), and was not written: "
+        + "; ".join(f"{check.name}, {check.detail}" for check in failed),
+        code=INVALID_CONFIGURATION,
+        source="config",
+    )
+    raise _Refused
 
 
 def _existing(connection: pg.Connection, slug: str) -> Program | None:
