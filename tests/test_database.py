@@ -75,6 +75,7 @@ from redkraken import (
     operator,
     packet,
     pg,
+    playbook,
     program,
     proposal,
     proxy,
@@ -31728,6 +31729,911 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
         self.assertEqual(
             [], [tuple(str(field) for field in row) for row in self.export_problems]
         )
+
+
+PLAYBOOK_SLUG = "selftest-playbook"
+
+
+class PlaybookSelectionTest(DatabaseCase):
+    """PH2-45: one Playbook, chosen for one subject, frozen onto the Task.
+
+    032 built the selection machinery over an empty catalogue, so every question
+    it could be asked had the same answer. What ticket 45 adds is a row -- and a
+    catalogue with one row in it is the first moment any of this can be wrong:
+    the digests can disagree with the document, the derived specificity can
+    disagree with the trigger list, the metadata rules can exclude something for
+    a reason nobody can read back, and a selection can record a decision without
+    recording what the decision was made against.
+
+    Three things are held against the compiler rather than against a copy
+    written here. The catalogue row is compared to `playbook.PLAYBOOKS`, because
+    a registry is only worth having if something compares it to what it is a
+    copy of. The drop-reason vocabulary is compared to the cases below, because
+    a reason no test has seen emitted is a reason nobody knows the selection can
+    reach. And the reference material is looked for on the model's read surface,
+    because criterion 2 is a claim about where a file cannot arrive, which is
+    only checkable from the side that would receive it.
+
+    The catalogue is program-global, so every case that needs a second Playbook
+    makes one inside `scratch()` and rolls it back: a synthetic row left behind
+    is a row every later case's `check_playbook_integrity` would have to account
+    for. What commits is the Program, its Surface and two recorded selections --
+    one that kept the Playbook and one that dropped it -- because criterion 4 is
+    about what survives the transaction it was written in.
+
+    This case commits, and purges the Program at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: What the shipped document compiles to.
+    COMPILED = playbook.PLAYBOOKS["object-ownership"]
+
+    #: Every reason the vocabulary holds, and the case that produces it. A
+    #: registered reason nothing emits is 032's `dropped_because` problem in a
+    #: new form: the value exists, and what it describes never happens.
+    REASONS = {
+        "status_deprecated": "test_a_deprecated_playbook_is_dropped",
+        "expired": "test_a_playbook_past_its_review_date_is_dropped",
+        "risk_forbidden": "test_a_forbidden_playbook_is_dropped_under_every_ceiling",
+        "risk_above_ceiling": "test_a_ceiling_under_the_risk_floor_drops_it",
+        "class_mismatch": "test_a_class_the_playbook_does_not_produce_drops_it",
+        "role_lacks_skill": "test_a_role_that_cannot_load_the_skills_drops_it",
+        "exhausted": "test_a_playbook_already_exhausted_on_this_subject_is_dropped",
+        "conflicts_with": "test_a_conflicting_playbook_is_dropped_and_names_the_other",
+        "over_cap": "test_a_playbook_past_the_cap_is_reported_rather_than_vanishing",
+    }
+
+    #: What a second Playbook looks like when nothing about it is the point.
+    #: Each case below overrides the one column it is asking about.
+    OTHERWISE = {
+        "category": "authorization",
+        "status": "draft",
+        "stale_after": "2099-01-01T00:00:00Z",
+        "risk": "constrained",
+        "effects": "read_only",
+        "baseline": "none",
+        "specificity": 1,
+    }
+
+    SHIPPED = "playbooks/object-ownership/playbook.md"
+    SECOND = "playbooks/selftest-second/playbook.md"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        opened = program.run(
+            cls.harness.runtime,
+            write(SCOPED.replace('name = "matrix-web"', f'name = "{PLAYBOOK_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.runtime.execute(agent.BIND, (cls.program_id,))
+        cls.arrange()
+        cls.record()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (PLAYBOOK_SLUG,)
+            )
+        super().tearDownClass()
+
+    # -- the surface the selection is made over --------------------------------
+
+    @classmethod
+    def arrange(cls):
+        """One Application, three endpoints and the two Identities.
+
+        The subjects differ in one fact each, which is what makes them a matched
+        and an unmatched pair rather than two unrelated rows: `matching` and
+        `second` carry an object identifier in the path, `other` carries a text
+        parameter in the query string and nothing the Playbook asks for.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            application = cls.entity("application", f"application:{BASE_URL}")
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'api')",
+                (application, BASE_URL),
+            )
+            cls.subjects = {
+                "matching": cls.endpoint(application, "/notes/{id}", "id", "path", "integer_id"),
+                "second": cls.endpoint(application, "/orders/{id}", "id", "path", "uuid"),
+                "other": cls.endpoint(application, "/search", "q", "query", "text"),
+            }
+            # Two of them, and both `user`: `multiple_test_identities` is what
+            # makes an ownership question askable at all, and it is the trigger
+            # fact the Playbook's other conjunct is about. The slot names carry
+            # the Program because the index over them is proxy-global.
+            for slot in ("first", "second"):
+                cls.connection.execute(
+                    "INSERT INTO identities (entity_id, program_id, slot_name, class,"
+                    " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'user', $4)",
+                    (
+                        cls.entity("identity", f"identity:{slot}"),
+                        cls.program_id,
+                        f"{PLAYBOOK_SLUG}-{slot}",
+                        f"slot://identity/{PLAYBOOK_SLUG}-{slot}",
+                    ),
+                )
+            cls.tasks = {
+                name: cls.task(subject) for name, subject in cls.subjects.items()
+            }
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str) -> str:
+        """One in-scope Entity, through the one verb that projects scope.
+
+        `subject_facts` reads `in_scope`, so an Entity inserted by hand would
+        carry no fact, match no Playbook, and make every case below pass for the
+        wrong reason.
+        """
+        return str(
+            cls.connection.execute(
+                "SELECT add_entity($1::uuid, $2, '', 'host', $3, 80, $4)::text",
+                (cls.program_id, kind, HOST, dedup),
+            ).scalar()
+        )
+
+    @classmethod
+    def endpoint(
+        cls, application: str, template: str, name: str, location: str, value_class: str
+    ) -> str:
+        """One authenticated GET with one parameter on it."""
+        endpoint = cls.entity("endpoint", f"endpoint:GET {template}")
+        cls.connection.execute(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) VALUES ($1::uuid, $2::uuid, 'GET', $3, true)",
+            (endpoint, application, template),
+        )
+        cls.connection.execute(
+            "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
+            " VALUES ($1::uuid, $2::uuid, $3, $4, $5)",
+            (
+                cls.entity("parameter", f"parameter:{template}:{name}"),
+                endpoint,
+                name,
+                location,
+                value_class,
+            ),
+        )
+        return endpoint
+
+    @classmethod
+    def task(cls, subject: str) -> str:
+        """One `hunt` over the subject, which is the kind `web_hunter` executes."""
+        return str(
+            cls.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, 0.5, 0.5)"
+                " RETURNING id::text",
+                (cls.program_id, subject),
+            ).scalar()
+        )
+
+    @classmethod
+    def record(cls):
+        """The two recorded selections, through the role an operator points here.
+
+        Through `rk2_runtime` rather than the owner because the verb is granted
+        to exactly two logins, and a freeze recorded by the role that owns the
+        tables would prove nothing about the one that will do it in production.
+        """
+        cls.kept = int(cls.call(cls.tasks["matching"], "matching", "authorization"))
+        cls.dropped = int(cls.call(cls.tasks["second"], "second", "injection.sql"))
+
+    @classmethod
+    def call(cls, task: str, subject: str, property_class: str) -> object:
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return cls.runtime.execute(
+                "SELECT record_playbook_selection($1::uuid, $2::uuid, $3)",
+                (task, cls.subjects[subject], property_class),
+            ).scalar()
+
+    # -- asking the catalogue --------------------------------------------------
+
+    @contextlib.contextmanager
+    def scratch(self):
+        """A transaction as the owner that is never kept.
+
+        Every question below is asked inside one, because the ones that need a
+        second Playbook edit a program-global catalogue and the ones that do not
+        are asking the same function about the same rows. Rolled back through an
+        exception rather than a flag, so an assertion that fails inside it
+        surfaces as itself and still leaves nothing behind.
+        """
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                yield
+                raise Rollback
+        except Rollback:
+            pass
+
+    def row(self, path: str, **columns) -> str:
+        """One more `playbooks` row, defaulting to a Playbook nothing excludes."""
+        stated = self.OTHERWISE | columns
+        return str(
+            self.connection.execute(
+                "INSERT INTO playbooks (path, source_sha256, version, category, status,"
+                " stale_after, risk, effects, baseline, specificity, provenance)"
+                " VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9, $10, 'self test')"
+                " RETURNING id::text",
+                (
+                    path,
+                    "a" * 64,
+                    "b" * 64,
+                    stated["category"],
+                    stated["status"],
+                    stated["stale_after"],
+                    stated["risk"],
+                    stated["effects"],
+                    stated["baseline"],
+                    stated["specificity"],
+                ),
+            ).scalar()
+        )
+
+    def triggers(self, identifier: str, *facts: str) -> None:
+        """What the subject must carry. One fact, so it sorts after the shipped
+        Playbook's two and the greedy reaches it second."""
+        for fact in facts:
+            self.connection.execute(
+                "INSERT INTO playbook_triggers (playbook_id, mode, fact)"
+                " VALUES ($1::uuid, 'all', $2)",
+                (identifier, fact),
+            )
+
+    def needs(self, identifier: str, *names: str) -> None:
+        for name in names:
+            self.connection.execute(
+                "INSERT INTO playbook_skills (playbook_id, skill_name) VALUES ($1::uuid, $2)",
+                (identifier, name),
+            )
+
+    def proves(self, identifier: str) -> None:
+        """The one expectation a Playbook cannot be complete without."""
+        self.connection.execute(
+            "INSERT INTO playbook_evidence (playbook_id, to_status, role,"
+            " observation_kind, polarity, min_count)"
+            " VALUES ($1::uuid, 'supported', 'variant', 'response_differential',"
+            "         'supports', 1)",
+            (identifier,),
+        )
+
+    def synthetic(self, path: str, **columns) -> str:
+        """A second complete Playbook, matching the same subject.
+
+        The cases about an *incomplete* one build theirs out of `row`,
+        `triggers`, `needs` and `proves` instead, because what each of those is
+        asking is which part was left out.
+        """
+        identifier = self.row(path, **columns)
+        self.triggers(identifier, "object_identifier")
+        self.needs(identifier, "compare-responses")
+        self.proves(identifier)
+        return identifier
+
+    def candidates(
+        self,
+        subject: str = "matching",
+        property_class: str | None = None,
+        role: str = "web_hunter",
+        ceiling: str = "constrained",
+    ) -> dict[str, str | None]:
+        """The metadata stage, as a path to the reason it was excluded for."""
+        return {
+            str(path): None if reason is None else str(reason)
+            for path, reason in self.connection.execute(
+                "SELECT path, dropped_because FROM"
+                " playbook_candidates($1::uuid, $2::uuid, $3, $4, $5)",
+                (self.program_id, self.subjects[subject], property_class, role, ceiling),
+            ).rows
+        }
+
+    def selection(
+        self,
+        subject: str = "matching",
+        property_class: str | None = None,
+        role: str = "web_hunter",
+        ceiling: str = "constrained",
+        limit: int = 3,
+    ) -> list[tuple[str, str, str, str]]:
+        """The whole selection, as `(path, rank, reason, detail)` strings."""
+        return [
+            tuple("" if field is None else str(field) for field in row[1:])
+            for row in self.connection.execute(
+                "SELECT * FROM select_playbooks($1::uuid, $2::uuid, $3, $4, $5, $6)",
+                (
+                    self.program_id,
+                    self.subjects[subject],
+                    property_class,
+                    role,
+                    ceiling,
+                    limit,
+                ),
+            ).rows
+        ]
+
+    def integrity(self) -> list[tuple[str, str, str]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT severity, problem, detail FROM check_playbook_integrity()"
+                " ORDER BY severity, problem"
+            ).rows
+        ]
+
+    def refusal(self, sql: str, parameters: tuple = ()) -> str:
+        return refusal_message(self.connection, sql, parameters)
+
+    # -- criterion 1: what a Playbook declares ---------------------------------
+
+    def test_the_catalogue_holds_the_playbook_the_compiler_compiled(self):
+        # Every column the migration wrote by hand, against the value the
+        # compiler derives from the document. The two digests are the point: one
+        # is the file and one is what the model is handed, and a registry that
+        # got either from the other would answer both audit questions with one.
+        (
+            path, source_sha256, version, category, status, stale_after,
+            risk, effects, baseline, specificity, provenance,
+        ) = (
+            str(field)
+            for field in self.connection.execute(
+                "SELECT path, source_sha256, version, category, status, stale_after,"
+                " risk, effects, baseline, specificity, provenance FROM playbooks"
+            ).rows[0]
+        )
+        compiled = self.COMPILED
+
+        self.assertEqual(
+            (
+                compiled.path,
+                compiled.sha256,
+                compiled.version,
+                compiled.category,
+                compiled.status,
+                compiled.risk,
+                compiled.effects,
+                compiled.baseline,
+                str(compiled.specificity),
+                compiled.provenance,
+            ),
+            (
+                path,
+                source_sha256,
+                version,
+                category,
+                status,
+                risk,
+                effects,
+                baseline,
+                specificity,
+                provenance,
+            ),
+        )
+        # The review date is a date to the compiler and a timestamp in the
+        # column, so it is the only field the two do not spell the same way.
+        self.assertEqual(str(compiled.stale_after), stale_after[:10])
+
+    def test_the_catalogue_holds_the_triggers_outputs_skills_and_evidence(self):
+        identifier = self.playbook_id()
+
+        self.assertEqual(
+            sorted(self.COMPILED.triggers_all),
+            self.column("SELECT fact FROM playbook_triggers WHERE playbook_id = $1::uuid"
+                        " AND mode = 'all' ORDER BY fact", identifier),
+        )
+        self.assertEqual(
+            sorted(self.COMPILED.triggers_any),
+            self.column("SELECT fact FROM playbook_triggers WHERE playbook_id = $1::uuid"
+                        " AND mode = 'any' ORDER BY fact", identifier),
+        )
+        self.assertEqual(
+            sorted(self.COMPILED.property_classes),
+            self.column("SELECT property_class FROM playbook_outputs"
+                        " WHERE playbook_id = $1::uuid ORDER BY property_class", identifier),
+        )
+        self.assertEqual(
+            sorted(self.COMPILED.skills),
+            self.column("SELECT skill_name FROM playbook_skills WHERE playbook_id = $1::uuid"
+                        " ORDER BY skill_name", identifier),
+        )
+        self.assertEqual(
+            [
+                (item.to_status, item.role, item.kind, item.polarity, str(item.min_count))
+                for item in self.COMPILED.evidence
+            ],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT to_status, role, observation_kind, polarity, min_count"
+                    " FROM playbook_evidence WHERE playbook_id = $1::uuid"
+                    " ORDER BY to_status, role, observation_kind",
+                    (identifier,),
+                ).rows
+            ],
+        )
+
+    def playbook_id(self) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT id::text FROM playbooks WHERE path = $1", (self.SHIPPED,)
+            ).scalar()
+        )
+
+    def column(self, sql: str, parameter: str) -> list[str]:
+        return [str(row[0]) for row in self.connection.execute(sql, (parameter,)).rows]
+
+    # -- criterion 2: the material the model never gets ------------------------
+
+    def test_reference_material_is_linked_and_hashed_for_a_maintainer(self):
+        self.assertEqual(
+            [(item.name, item.path, item.sha256) for item in self.COMPILED.references],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT name, path, sha256 FROM playbook_references ORDER BY name"
+                ).rows
+            ],
+        )
+
+    def test_no_reference_column_is_published_to_the_role_the_model_reads_through(self):
+        # Criterion 2 from the side that would receive the file. The registry
+        # holds no column of this table, and the grant `apply_state_grants`
+        # issues is derived from the registry -- so the refusal below is what
+        # the empty registry means rather than a second rule beside it.
+        self.assertEqual(
+            [],
+            list(
+                self.connection.execute(
+                    "SELECT column_name FROM state_read_surface"
+                    " WHERE table_name = 'playbook_references'"
+                ).rows
+            ),
+        )
+        with pg.connect(self.harness.state) as session:
+            with self.assertRaises(pg.DatabaseError) as raised:
+                session.execute("SELECT path FROM playbook_references")
+
+        self.assertIn("permission denied", str(raised.exception).lower())
+
+    # -- criterion 6: a matching and a non-matching subject --------------------
+
+    def test_a_matching_subject_selects_the_playbook(self):
+        with self.scratch():
+            self.assertEqual(
+                [(self.SHIPPED, "1", "", "")],
+                self.selection(property_class="authorization.object_ownership"),
+            )
+
+    def test_a_non_matching_subject_selects_nothing_at_all(self):
+        # And nothing is not "dropped for a reason": a Playbook whose trigger
+        # facts the subject does not carry is about something else, and the
+        # funnel says so by counting it out at the trigger stage.
+        with self.scratch():
+            self.assertEqual([], self.selection(subject="other"))
+            self.assertEqual(
+                ["1", "0", "0", "0", "0"],
+                [
+                    str(field)
+                    for field in self.connection.execute(
+                        "SELECT * FROM playbook_funnel($1::uuid, $2::uuid, NULL,"
+                        " 'web_hunter', 'constrained', 3)",
+                        (self.program_id, self.subjects["other"]),
+                    ).rows[0]
+                ],
+            )
+
+    def test_the_funnel_counts_every_stage_of_a_matching_subject(self):
+        with self.scratch():
+            self.assertEqual(
+                ["1", "1", "1", "1", "0"],
+                [
+                    str(field)
+                    for field in self.connection.execute(
+                        "SELECT * FROM playbook_funnel($1::uuid, $2::uuid, $3,"
+                        " 'web_hunter', 'constrained', 3)",
+                        (
+                            self.program_id,
+                            self.subjects["matching"],
+                            "authorization.object_ownership",
+                        ),
+                    ).rows[0]
+                ],
+            )
+
+    # -- criterion 5: every exclusion, as a value ------------------------------
+
+    def test_every_registered_drop_reason_is_produced_by_a_case_here(self):
+        # The vocabulary is closed and the migration proves each id appears in
+        # one of the two functions. That is a claim about the text of a function
+        # body; this is the claim about the behaviour, and the two directions
+        # together are what make the reason a value rather than a comment.
+        self.assertEqual(
+            sorted(self.REASONS),
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT id FROM playbook_drop_reasons ORDER BY id"
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            [], [name for name in self.REASONS.values() if not hasattr(self, name)]
+        )
+
+    def test_a_class_the_playbook_does_not_produce_drops_it(self):
+        with self.scratch():
+            self.assertEqual(
+                {self.SHIPPED: "class_mismatch"}, self.candidates(property_class="injection.sql")
+            )
+
+    def test_a_family_is_asked_for_by_name_and_matches_its_leaf(self):
+        # `authorization` is the family of `authorization.object_ownership`, and
+        # a caller that has narrowed the hunt to a family should not have to
+        # enumerate the classes under it.
+        with self.scratch():
+            self.assertEqual({self.SHIPPED: None}, self.candidates(property_class="authorization"))
+
+    def test_a_role_that_cannot_load_the_skills_drops_it(self):
+        # `recon` holds neither `compare-responses` nor `use-identity`, so this
+        # is a load-time impossibility rather than a runtime escalation -- which
+        # is why it is a metadata exclusion and not an approval.
+        with self.scratch():
+            self.assertEqual({self.SHIPPED: "role_lacks_skill"}, self.candidates(role="recon"))
+
+    def test_a_ceiling_under_the_risk_floor_drops_it(self):
+        with self.scratch():
+            self.assertEqual(
+                {self.SHIPPED: "risk_above_ceiling"}, self.candidates(ceiling="autonomous")
+            )
+
+    def test_the_stage_refuses_a_ceiling_that_is_not_a_risk_class(self):
+        # `risk_rank` answers NULL for a string that is not one, and a
+        # comparison against NULL is unknown rather than false -- so a stage
+        # that took the argument on trust would drop nothing at all and read
+        # like a run with no ceiling. The stage is reachable on its own grant,
+        # so it refuses on its own rather than through its caller.
+        for ceiling in ("Constrained", "forbidden", ""):
+            with self.subTest(ceiling=ceiling):
+                self.assertIn(
+                    "is not a runtime risk class",
+                    self.refusal(
+                        "SELECT * FROM playbook_candidates($1::uuid, $2::uuid, NULL,"
+                        " 'web_hunter', $3)",
+                        (self.program_id, self.subjects["matching"], ceiling),
+                    ),
+                )
+
+    def test_a_forbidden_playbook_is_dropped_under_every_ceiling(self):
+        with self.scratch():
+            self.synthetic(self.SECOND, risk="forbidden")
+
+            for ceiling in ("autonomous", "constrained", "approval_required"):
+                with self.subTest(ceiling=ceiling):
+                    self.assertEqual(
+                        "risk_forbidden", self.candidates(ceiling=ceiling)[self.SECOND]
+                    )
+
+    def test_a_deprecated_playbook_is_dropped(self):
+        with self.scratch():
+            self.synthetic(self.SECOND, status="deprecated")
+
+            self.assertEqual("status_deprecated", self.candidates()[self.SECOND])
+
+    def test_a_playbook_past_its_review_date_is_dropped(self):
+        with self.scratch():
+            self.synthetic(self.SECOND, stale_after="2020-01-01T00:00:00Z")
+
+            self.assertEqual("expired", self.candidates()[self.SECOND])
+
+    def test_a_playbook_already_exhausted_on_this_subject_is_dropped(self):
+        # Against the row the fixture committed, whose outcome is what a run
+        # moves -- so this is also the half of the freeze that has to stay
+        # writable for the selection to mean anything.
+        with self.scratch():
+            self.connection.execute(
+                "UPDATE playbook_selections SET outcome = 'exhausted' WHERE task_id = $1::uuid",
+                (self.tasks["matching"],),
+            )
+
+            self.assertEqual({self.SHIPPED: "exhausted"}, self.candidates())
+
+    def test_a_conflicting_playbook_is_dropped_and_names_the_other(self):
+        # The shipped Playbook needs a stable session; this one moves it. The
+        # conflict is derived from the two declarations rather than declared, so
+        # neither document mentions the other -- and the row that reports it has
+        # to, which is what `dropped_detail` is.
+        with self.scratch():
+            self.synthetic(self.SECOND, effects="mutates_session")
+
+            self.assertEqual(
+                [
+                    (self.SHIPPED, "1", "", ""),
+                    (self.SECOND, "", "conflicts_with", self.SHIPPED),
+                ],
+                self.selection(),
+            )
+
+    def test_a_playbook_past_the_cap_is_reported_rather_than_vanishing(self):
+        # 032 left the loop at the cap, so everything past it disappeared with
+        # no row at all -- indistinguishable from a Playbook that never matched.
+        with self.scratch():
+            self.synthetic(self.SECOND)
+
+            self.assertEqual(
+                [(self.SHIPPED, "1", "", ""), (self.SECOND, "", "over_cap", "")],
+                self.selection(limit=1),
+            )
+
+    def test_a_cap_that_keeps_nothing_is_refused_rather_than_answered(self):
+        self.assertIn(
+            "a selection cap of 0 keeps nothing",
+            self.refusal(
+                "SELECT * FROM select_playbooks($1::uuid, $2::uuid, NULL,"
+                " 'web_hunter', 'constrained', 0)",
+                (self.program_id, self.subjects["matching"]),
+            ),
+        )
+
+    def test_a_ceiling_that_is_not_a_runtime_risk_class_is_refused(self):
+        self.assertIn(
+            "autonomy ceiling forbidden is not a runtime risk class",
+            self.refusal(
+                "SELECT * FROM select_playbooks($1::uuid, $2::uuid, NULL,"
+                " 'web_hunter', 'forbidden', 3)",
+                (self.program_id, self.subjects["matching"]),
+            ),
+        )
+
+    # -- criterion 5: a corpus that cannot be right ----------------------------
+
+    def test_a_playbook_naming_a_skill_nobody_has_cannot_be_written(self):
+        with self.scratch():
+            identifier = self.row(self.SECOND)
+
+            self.assertIn(
+                "playbook_skills_skill_name_fkey",
+                self.refusal_in_place(
+                    "INSERT INTO playbook_skills (playbook_id, skill_name)"
+                    " VALUES ($1::uuid, 'no-such-skill')",
+                    (identifier,),
+                ),
+            )
+
+    def test_a_playbook_with_no_trigger_at_all_is_an_integrity_error(self):
+        # It would match every subject in the Program, which is the one thing a
+        # trigger list exists to prevent.
+        with self.scratch():
+            identifier = self.row(self.SECOND)
+            self.needs(identifier, "compare-responses")
+            self.proves(identifier)
+
+            self.assertIn(("error", "playbook_without_trigger", self.SECOND), self.integrity())
+
+    def test_a_specificity_that_disagrees_with_the_triggers_is_an_integrity_error(self):
+        # The tie-break in `select_playbooks` is derived, so the database
+        # recomputes what the importer wrote down. A number that stopped
+        # matching would reorder the catalogue and say nothing.
+        with self.scratch():
+            identifier = self.row(self.SECOND, specificity=3)
+            self.triggers(identifier, "object_identifier")
+            self.needs(identifier, "compare-responses")
+            self.proves(identifier)
+
+            self.assertIn(
+                ("error", "specificity_disagrees", f"{self.SECOND} says 3, it requires 1 fact(s)"),
+                self.integrity(),
+            )
+
+    def test_a_playbook_that_declares_no_supported_evidence_is_an_integrity_error(self):
+        # `enforce_playbook_evidence` would have nothing to enforce, so the
+        # guard would pass by being empty.
+        with self.scratch():
+            identifier = self.row(self.SECOND)
+            self.triggers(identifier, "object_identifier")
+            self.needs(identifier, "compare-responses")
+
+            self.assertIn(("error", "evidence_missing", self.SECOND), self.integrity())
+
+    def test_a_skill_combination_no_role_can_load_is_reported(self):
+        # `recon` holds `enumerate-surface` and `web_hunter` holds
+        # `use-identity`; nothing holds both, so this Playbook can never be
+        # selected by anyone. 035 calls that an error rather than a warning --
+        # dead corpus, the same class as a Playbook with no trigger -- and the
+        # detail names the set so a roster gap reads differently from a typo.
+        with self.scratch():
+            identifier = self.row(self.SECOND)
+            self.triggers(identifier, "object_identifier")
+            self.needs(identifier, "enumerate-surface", "use-identity")
+            self.proves(identifier)
+
+            self.assertIn(
+                ("error", "playbook_unloadable",
+                 f"{self.SECOND} needs {{enumerate-surface,use-identity}}"),
+                self.integrity(),
+            )
+            self.assertEqual("role_lacks_skill", self.candidates()[self.SECOND])
+
+    def test_the_shipped_catalogue_passes_its_own_check(self):
+        self.assertEqual([], [row for row in self.integrity() if row[0] == "error"])
+
+    # -- criterion 4: frozen onto the Task -------------------------------------
+
+    def test_the_selection_recorded_what_it_kept_and_what_it_dropped(self):
+        self.assertEqual((1, 0), (self.kept, self.dropped))
+        self.assertEqual(
+            [
+                (self.tasks["matching"], "1", "", ""),
+                (self.tasks["second"], "", "class_mismatch", ""),
+            ],
+            [
+                tuple("" if field is None else str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT task_id::text, rank, dropped_because, dropped_detail"
+                    " FROM playbook_selections ORDER BY selected_at"
+                ).rows
+            ],
+        )
+
+    def test_the_selection_froze_the_digests_the_catalogue_holds(self):
+        self.assertEqual(
+            [(self.COMPILED.sha256, self.COMPILED.version)] * 2,
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT playbook_sha256, playbook_version FROM playbook_selections"
+                ).rows
+            ],
+        )
+
+    def test_the_selection_froze_the_skill_digests_the_registry_holds(self):
+        # The Playbook's Skills as they stood when this Agent loaded them, which
+        # is a different fact from `skill_sha256_at_promotion`: the two differ
+        # exactly when a Skill was edited between promotion and use.
+        self.assertEqual(
+            [
+                (item.name, item.sha256, item.version)
+                for item in sorted(
+                    (skill.SKILLS[name] for name in self.COMPILED.skills),
+                    key=lambda item: item.name,
+                )
+            ],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT skill_name, skill_sha256, skill_version"
+                    " FROM playbook_selection_skills ORDER BY skill_name"
+                ).rows
+            ],
+        )
+
+    def test_a_dropped_selection_freezes_no_skill_at_all(self):
+        # A Playbook that was not selected was never loaded, and recording the
+        # Skills it would have used would be recording a run that did not happen.
+        self.assertEqual(
+            [],
+            list(
+                self.connection.execute(
+                    "SELECT k.skill_name FROM playbook_selection_skills k"
+                    " JOIN playbook_selections s ON s.id = k.selection_id"
+                    " WHERE s.task_id = $1::uuid",
+                    (self.tasks["second"],),
+                ).rows
+            ),
+        )
+
+    def test_a_frozen_column_cannot_be_edited_afterwards(self):
+        for column, value in (
+            ("rank", "2"),
+            ("playbook_sha256", "'" + "c" * 64 + "'"),
+            ("playbook_version", "'" + "d" * 64 + "'"),
+            ("dropped_because", "'over_cap'"),
+            ("selected_at", "now()"),
+        ):
+            with self.subTest(column=column):
+                self.assertIn(
+                    "a selection records a decision that was already made",
+                    self.refusal(
+                        f"UPDATE playbook_selections SET {column} = {value}"
+                        " WHERE task_id = $1::uuid",
+                        (self.tasks["matching"],),
+                    ),
+                )
+
+    def test_the_outcome_and_the_stale_stamp_still_move(self):
+        with self.scratch():
+            self.connection.execute(
+                "UPDATE playbook_selections SET outcome = 'produced', went_stale_at = now()"
+                " WHERE task_id = $1::uuid",
+                (self.tasks["matching"],),
+            )
+
+            self.assertEqual(
+                "produced",
+                str(
+                    self.connection.execute(
+                        "SELECT outcome FROM playbook_selections WHERE task_id = $1::uuid",
+                        (self.tasks["matching"],),
+                    ).scalar()
+                ),
+            )
+
+    def test_a_selection_that_claims_a_digest_the_catalogue_does_not_hold_is_refused(self):
+        with self.scratch():
+            self.assertIn(
+                "the selection claims " + "e" * 64,
+                self.refusal_in_place(
+                    "INSERT INTO playbook_selections (program_id, task_id, subject_entity_id,"
+                    " playbook_id, playbook_sha256, rank)"
+                    " VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 1)",
+                    (
+                        self.program_id,
+                        self.tasks["other"],
+                        self.subjects["other"],
+                        self.playbook_id(),
+                        "e" * 64,
+                    ),
+                ),
+            )
+
+    def test_a_selection_of_a_playbook_the_catalogue_does_not_have_is_refused(self):
+        with self.scratch():
+            self.assertIn(
+                "is not in the catalogue",
+                self.refusal_in_place(
+                    "INSERT INTO playbook_selections (program_id, task_id, subject_entity_id,"
+                    " playbook_id, rank)"
+                    " VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 1)",
+                    (
+                        self.program_id,
+                        self.tasks["other"],
+                        self.subjects["other"],
+                        "00000000-0000-7000-8000-000000000000",
+                    ),
+                ),
+            )
+
+    def test_the_frozen_skill_rows_cannot_be_rewritten_or_removed(self):
+        for statement in (
+            "UPDATE playbook_selection_skills SET skill_sha256 = repeat('f', 64)",
+            "DELETE FROM playbook_selection_skills",
+        ):
+            with self.subTest(statement=statement.split()[0]):
+                self.assertIn("immutable", self.refusal(statement))
+
+    def test_recording_against_a_task_that_does_not_exist_is_refused(self):
+        self.assertIn(
+            "does not exist",
+            self.refusal(
+                "SELECT record_playbook_selection($1::uuid, $2::uuid, NULL, 'constrained', 3)",
+                ("00000000-0000-7000-8000-000000000000", self.subjects["matching"]),
+            ),
+        )
+
+    def refusal_in_place(self, sql: str, parameters: tuple) -> str:
+        """A refusal expected inside an open `scratch()` transaction.
+
+        `refusal_message` opens one of its own, which a case that has already
+        arranged rows cannot use: the arrangement would not be visible to it.
+        The transaction is aborted either way, and `scratch` rolls it back.
+        """
+        try:
+            self.connection.execute(sql, parameters)
+        except pg.DatabaseError as error:
+            return error.primary or str(error)
+        return ""
 
 
 if __name__ == "__main__":

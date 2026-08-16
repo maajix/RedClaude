@@ -51,7 +51,6 @@ depends on the run is a script whose evidence is not reproducible.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
@@ -63,6 +62,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from redkraken import document
+from redkraken.document import ENTRY, digest
+
 #: The corpus, inside the package rather than beside it. The reason is the one
 #: the migration corpus already has: `rk` runs what it was installed with, and a
 #: directory at the repository root ships in a checkout and not in a wheel.
@@ -71,7 +73,6 @@ CORPUS = Path(__file__).resolve().parent / "skills"
 INSTRUCTIONS = "SKILL.md"
 SCRIPT_DIR = "scripts"
 REFERENCE_DIR = "references"
-FENCE = "---"
 
 #: The name a skill answers to, which is its directory's. Narrower than the
 #: `skills.name` column allows on purpose: this is the pattern
@@ -85,11 +86,6 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 #: however the file came to be declared.
 FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
-#: What a list entry has to be before anything more specific is asked of it.
-#: `bb:references` uses it because the shape of a file name is `_resolved`'s
-#: question and this one is only about the list being a list of scalars.
-ENTRY = re.compile(r"^\S.*$")
-
 #: `evidence_profiles.id` and `offline_tools.tool`, restated where the corpus
 #: names them. Both are checked for real against the database by the standing
 #: check the migration installs; these only refuse a value that could not be
@@ -99,12 +95,6 @@ RUNTIME_TOOL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 #: `roles.role`, restated the same way and for the same reason.
 ROLE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-
-#: A frontmatter key. `bb:` is a namespace and not a special case -- the probe
-#: in `docs/prototype/skill-format/README.md` measured exactly this prefix
-#: surviving the CLI's own parse on 2.1.224, so it is the one extension point
-#: this corpus is allowed to have evidence for.
-KEY = re.compile(r"^[a-z][a-z0-9_]*(?:[-:][a-z0-9_]+)*$")
 
 #: `roster.TOOL_GROUPS`' keys and the tool names inside them, as spellings. Which
 #: groups exist and which role holds them is `roster._check_skills`' question;
@@ -149,24 +139,8 @@ REFERENCE_KIND = "reference"
 KINDS = (INSTRUCTION_KIND, SCRIPT_KIND, REFERENCE_KIND)
 
 
-class SkillError(Exception):
-    """One reason the corpus does not compile, in the words a test names it by.
-
-    `code` exists so a negative test asserts the rule that fired rather than the
-    sentence it fired with: the sentence is for the operator reading the refusal
-    and is free to improve, the code is what the suite pins.
-    """
-
-    def __init__(self, code: str, subject: str, detail: str) -> None:
-        super().__init__(f"{code}: {subject}: {detail}")
-        self.code = code
-        self.subject = subject
-        self.detail = detail
-
-
-def digest(data: bytes) -> str:
-    """SHA-256, hex, lower case -- the one spelling every hash in this system has."""
-    return hashlib.sha256(data).hexdigest()
+class SkillError(document.DocumentError):
+    """One reason the skill corpus does not compile, in the words a test names it by."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,91 +228,6 @@ class Skill:
         """
         manifest = "".join(f"{item.line()}\n" for item in self.dependencies)
         return digest(manifest.encode("utf-8"))
-
-
-def _scalar(name: str, key: str, raw: str) -> str:
-    """A plain value, restricted to what YAML and this parser must agree about.
-
-    The CLI reads these files as YAML and this module reads them line by line.
-    Two parsers over one document is a disagreement waiting for a value that
-    means different things to each, so the grammar here admits only values where
-    there is nothing to disagree about: no leading indicator character, no
-    `key: value` inside a value, no comment introducer. Anything richer is
-    written as JSON, which is a subset of YAML and so parses the same both ways.
-    """
-    if not raw:
-        raise SkillError("frontmatter_malformed", name, f"{key} has no value")
-    if raw[0] in "-?:,[]{}#&*!|>'\"%@`":
-        raise SkillError(
-            "frontmatter_malformed", name,
-            f"{key} starts with {raw[0]!r}, which YAML reads as structure; quote it as JSON",
-        )
-    if ": " in raw or raw.endswith(":"):
-        raise SkillError(
-            "frontmatter_malformed", name, f"{key} carries a colon YAML would read as a second key"
-        )
-    if " #" in raw:
-        raise SkillError(
-            "frontmatter_malformed", name, f"{key} carries a comment introducer"
-        )
-    return raw
-
-
-def _field(name: str, number: int, line: str) -> tuple[str, Any]:
-    if line != line.strip():
-        raise SkillError("frontmatter_malformed", name, f"line {number} is indented or padded")
-    key, colon, raw = line.partition(": ")
-    if not colon:
-        raise SkillError("frontmatter_malformed", name, f"line {number} is not `key: value`")
-    if not KEY.match(key):
-        raise SkillError("frontmatter_malformed", name, f"line {number}: {key!r} is not a key")
-    if raw.startswith(("[", "{", '"')):
-        try:
-            return key, json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise SkillError("frontmatter_malformed", name, f"{key}: {error}") from error
-    return key, _scalar(name, key, raw)
-
-
-def _frontmatter(name: str, text: str) -> dict[str, Any]:
-    """The fenced block at the top of `SKILL.md`, as a mapping."""
-    lines = text.split("\n")
-    if not lines or lines[0] != FENCE:
-        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} does not open with {FENCE}")
-    try:
-        end = lines.index(FENCE, 1)
-    except ValueError:
-        raise SkillError("frontmatter_malformed", name, "the frontmatter is never closed") from None
-    if end == 1:
-        raise SkillError("frontmatter_malformed", name, "the frontmatter is empty")
-    fields: dict[str, Any] = {}
-    for number, line in enumerate(lines[1:end], start=2):
-        key, value = _field(name, number, line)
-        if key in fields:
-            # A duplicate key is not a malformed line: every line parsed, and
-            # the file still says two things. Which one a parser keeps is a
-            # property of the parser, which is exactly why this refuses.
-            raise SkillError("duplicate_key", name, f"{key} is stated twice")
-        fields[key] = value
-    body = "\n".join(lines[end + 1:]).strip()
-    if not body:
-        raise SkillError("body_missing", name, "a skill whose body is empty teaches nothing")
-    return fields
-
-
-def _strings(name: str, key: str, value: Any, pattern: re.Pattern[str]) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise SkillError("value_malformed", name, f"{key} is a non-empty JSON array")
-    for item in value:
-        if not isinstance(item, str) or not pattern.match(item):
-            raise SkillError("value_malformed", name, f"{key} holds {item!r}, which is not a name")
-    if len(set(value)) != len(value):
-        raise SkillError("duplicate_entry", name, f"{key} names something twice")
-    if list(value) != sorted(value):
-        # Sorted, because the corpus is compared against database rows and
-        # against itself. An unordered list is a diff that moves for no reason.
-        raise SkillError("value_malformed", name, f"{key} is not in sorted order")
-    return tuple(value)
 
 
 def _case(name: str, script: str, entry: Any) -> Case:
@@ -439,7 +328,9 @@ def _skill(directory: Path) -> Skill:
     if "\r" in text:
         raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} carries a carriage return")
 
-    fields = _frontmatter(name, text)
+    fields, body = document.frontmatter(SkillError, name, INSTRUCTIONS, text)
+    if not body:
+        raise SkillError("body_missing", name, "a skill whose body is empty teaches nothing")
     for key, reason in FORBIDDEN_KEYS.items():
         if key in fields:
             raise SkillError("key_forbidden", name, f"{key}: {reason}")
@@ -477,7 +368,8 @@ def _skill(directory: Path) -> Skill:
     if len({script.name for script in scripts}) != len(scripts):
         raise SkillError("duplicate_entry", name, "two scripts share a name")
     references = (
-        _strings(name, "bb:references", fields["bb:references"], ENTRY)
+        document.strings(SkillError, name, "bb:references",
+                         fields["bb:references"], ENTRY)
         if "bb:references" in fields else ()
     )
     reference_paths = {
@@ -509,15 +401,18 @@ def _skill(directory: Path) -> Skill:
     return Skill(
         name=name,
         description=description,
-        roles=_strings(name, "bb:roles", fields["bb:roles"], ROLE),
-        tool_groups=_strings(name, "bb:tool_groups", fields["bb:tool_groups"], TOOL_GROUP),
+        roles=document.strings(SkillError, name, "bb:roles", fields["bb:roles"], ROLE),
+        tool_groups=document.strings(
+            SkillError, name, "bb:tool_groups", fields["bb:tool_groups"], TOOL_GROUP),
         evidence_profile=profile,
         allowed_tools=(
-            _strings(name, "allowed-tools", fields["allowed-tools"], TOOL)
+            document.strings(SkillError, name, "allowed-tools", fields["allowed-tools"], TOOL)
             if "allowed-tools" in fields else ()
         ),
         runtime_tools=(
-            _strings(name, "bb:runtime-tools", fields["bb:runtime-tools"], RUNTIME_TOOL)
+            document.strings(
+                SkillError, name, "bb:runtime-tools",
+                fields["bb:runtime-tools"], RUNTIME_TOOL)
             if "bb:runtime-tools" in fields else ()
         ),
         scripts=MappingProxyType({script.name: script for script in scripts}),

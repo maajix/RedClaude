@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import _launch, _startup, agent, isolation, tls
+from redkraken.document import FENCE
 
 
 VALID = """\
@@ -769,6 +770,26 @@ def write(text: str, name: str = "program.toml") -> Path:
     source = scratch() / name
     source.write_text(text, encoding="utf-8")
     return source
+
+
+def frontmatter(fields: dict) -> str:
+    """A frontmatter block, from a mapping, the way the parser reads one back.
+
+    Values go out as JSON when they are not plain strings, because that is the
+    one shape `document`'s line parser and a YAML parser are guaranteed to read
+    the same way -- and a test that wrote something else would be testing a
+    document neither corpus is allowed to contain.
+
+    It lives here rather than in either corpus test because `skill` and
+    `playbook` share one parser: two copies of this would let the Skill tests
+    and the Playbook tests disagree about what a document even looks like.
+    """
+    lines = [FENCE]
+    for key, value in fields.items():
+        rendered = value if isinstance(value, str) else json.dumps(value)
+        lines.append(f"{key}: {rendered}")
+    lines.append(FENCE)
+    return "\n".join(lines) + "\n"
 
 
 #: One root for everything the suite writes, so a run leaves nothing behind.

@@ -41,6 +41,25 @@ class PackagingTest(unittest.TestCase):
             self.pyproject["tool"]["setuptools"]["package-data"]["redkraken"],
         )
 
+    def test_every_file_the_package_carries_is_shipped_with_it(self):
+        # `packages.find` ships the modules; anything that is not a module is
+        # shipped only if a package-data glob names it. So a corpus added under
+        # `src/redkraken/` without a glob installs as an empty directory, and
+        # the failure is at the first `compile_corpus()` on an installed `rk`
+        # rather than in the checkout, where the files are always there. This
+        # asks the question the other way round: every file, is it covered.
+        patterns = self.pyproject["tool"]["setuptools"]["package-data"]["redkraken"]
+        package = ROOT / "src" / "redkraken"
+        unshipped = sorted(
+            str(path.relative_to(package))
+            for path in package.rglob("*")
+            if path.is_file()
+            and path.suffix != ".py"
+            and "__pycache__" not in path.parts
+            and not any(path.relative_to(package).match(one) for one in patterns)
+        )
+        self.assertEqual([], unshipped)
+
     def test_the_version_has_one_source(self):
         self.assertEqual(
             {"attr": "redkraken.__version__"},

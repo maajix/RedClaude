@@ -39,6 +39,7 @@ from importlib import resources
 from types import MappingProxyType
 from typing import Any
 
+from . import playbook as playbooks_module
 from . import skill as skills_module
 
 
@@ -1506,6 +1507,32 @@ def _check_skills(corpus: Mapping[str, skills_module.Skill]) -> None:
         ROLES[name] = replace(role, skills=tuple(sorted(granted[name])))
 
 
+def _check_playbooks(corpus: Mapping[str, playbooks_module.Playbook]) -> None:
+    """The Playbook corpus, against the Skills the roles can actually load.
+
+    Same split as `_check_skills` and for the same reason: `playbook` knows what
+    a `playbook.md` looks like and nothing about roles, which is what lets this
+    import it rather than the other way round.
+
+    Two rules. A Playbook names Skills that exist -- a name that is not in the
+    corpus is a technique nobody wrote, and the selection stage would hand a
+    model instructions referring to it. And some single role can load all of
+    them at once: a Playbook is executed inside one Agent run, so Skills
+    spread across two roles are not a Playbook that runs, they are two halves
+    that never meet. Both are refusals rather than warnings because the
+    alternative is dead corpus, and dead corpus is worse than an absent Playbook
+    -- it looks like the question is covered.
+
+    It runs after `_check_skills`, which is what filled `Role.skills`.
+    """
+    for name, one in sorted(corpus.items()):
+        unknown = sorted(set(one.skills) - set(skills_module.SKILLS))
+        if unknown:
+            raise RosterError(f"playbook {name}: {unknown} is not a skill")
+        if not any(set(one.skills) <= set(role.skills) for role in ROLES.values()):
+            raise RosterError(f"playbook {name}: no role loads {list(one.skills)} at once")
+
+
 def _check_task_kinds() -> None:
     """The role-to-kind mapping is the schema's: total on kinds, injective.
 
@@ -1635,6 +1662,8 @@ def _compile() -> Mapping[str, Any]:
     # `Skill` tool agree -- and the list it asks about is the one this fills.
     _check_skills(skills_module.SKILLS)
     _check_roles(measured)
+    # After `_check_skills`, which is what derived the `Role.skills` this reads.
+    _check_playbooks(playbooks_module.PLAYBOOKS)
     _check_task_kinds()
     _check_authority()
     return measured

@@ -755,5 +755,13 @@ never what a Skill teaches), module
 
 **Playbook**:
 An investigation strategy in the knowledge base, versioned with knowledge rather
-than code, carrying provenance and an expiry.
+than code, carrying provenance and an expiry. Chosen by its own metadata before a
+model reads a word of it -- the Property class it outputs, the Surface facts it
+needs, the role that can load its Skills, the risk ceiling of the run, its status
+and its review date -- and each one it fails is a typed reason on a row rather
+than a silent absence. What a model receives is the projection, never the
+document: provenance, review date and maintainer references have no field to
+occupy on it, so the reference text is absent by shape rather than by a filter
+that could be forgotten. Two digests, because two things move independently --
+the document, and the projection that is the version.
 _Avoid_: Strategy, recipe, methodology, technique

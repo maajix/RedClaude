@@ -39,8 +39,11 @@ include = ["redkraken*"]
 [tool.setuptools.package-data]
 redkraken = [
     "migrations/*.sql",
+    "migrations/README.md",
     "measurements/*.json",
     "skills/*/SKILL.md",
     "skills/*/scripts/*",
     "skills/*/references/*",
+    "playbooks/*/playbook.md",
+    "playbooks/*/references/*",
 ]

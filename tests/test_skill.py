@@ -17,7 +17,8 @@ import unittest
 from pathlib import Path
 
 from redkraken import roster, skill
-from tests.fixtures import scratch
+from redkraken.document import FENCE
+from tests.fixtures import frontmatter, scratch
 
 
 #: The smallest skill that compiles. Every negative below is this document with
@@ -60,19 +61,8 @@ json.dump({"count": random.random()}, sys.stdout, sort_keys=True)
 
 
 def document(fields: dict, body: str = BODY) -> str:
-    """One `SKILL.md`, from a mapping, the way the parser reads one back.
-
-    Values go out as JSON when they are not plain strings, because that is the
-    one shape the module's line parser and a YAML parser are guaranteed to read
-    the same way -- and a test that wrote something else would be testing a
-    document the corpus is not allowed to contain.
-    """
-    lines = [skill.FENCE]
-    for key, value in fields.items():
-        rendered = value if isinstance(value, str) else json.dumps(value)
-        lines.append(f"{key}: {rendered}")
-    lines.append(skill.FENCE)
-    return "\n".join(lines) + "\n" + body
+    """One `SKILL.md`, from a mapping, the way the parser reads one back."""
+    return frontmatter(fields) + body
 
 
 def corpus(**skills: str | None) -> Path:
@@ -117,11 +107,11 @@ class Refusals(unittest.TestCase):
 
     def test_frontmatter_must_open_and_close(self):
         self.refuses("frontmatter_malformed", corpus(a_technique="# no fence at all\n"))
-        unclosed = skill.FENCE + "\ndescription: a thing\n" + BODY
+        unclosed = FENCE + "\ndescription: a thing\n" + BODY
         self.refuses("frontmatter_malformed", corpus(a_technique=unclosed))
 
     def test_an_empty_frontmatter_is_refused_rather_than_defaulted(self):
-        empty = f"{skill.FENCE}\n{skill.FENCE}\n{BODY}"
+        empty = f"{FENCE}\n{FENCE}\n{BODY}"
         self.refuses("frontmatter_malformed", corpus(a_technique=empty))
 
     def test_a_line_that_is_not_a_key_and_a_value_is_refused(self):
