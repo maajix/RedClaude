@@ -364,49 +364,139 @@ class Corpus(unittest.TestCase):
         self.assertTrue(self.one.provenance)
         self.assertTrue(self.one.evidence)
 
-    def test_the_shipped_playbook_requires_a_control_before_it_may_claim_anything(self):
-        # The one rule the Playbook exists for. A refusal under the second
-        # Identity is only evidence of a boundary if that session was working.
+    def test_every_playbook_declares_everything_criterion_one_names(self):
+        # The same clause as above, over the whole catalogue rather than one
+        # Playbook, because 49's ledger rows cite this file as their proof and
+        # "the name is in PLAYBOOKS" is not what those rows claim. The values
+        # are not written down here -- a second copy of eight Playbooks' metadata
+        # is a second thing to edit, and the compiler already refuses a missing
+        # key. What is asserted is that nothing is declared empty, that the
+        # class it outputs sits under the category it announces, and that both
+        # projections carry text.
+        for name, one in self.corpus.items():
+            with self.subTest(playbook=name):
+                self.assertTrue(one.description)
+                self.assertTrue(one.property_classes)
+                self.assertTrue(one.triggers_all or one.triggers_any)
+                self.assertTrue(one.skills)
+                self.assertTrue(one.provenance)
+                self.assertTrue(one.evidence)
+                self.assertTrue(all(row.startswith(f"{one.category}.")
+                                    for row in one.property_classes))
+                self.assertTrue(one.projection.instructions.strip())
+                self.assertTrue(one.projection.canonical().strip())
+
+    def test_every_playbook_requires_a_control_before_it_may_claim_anything(self):
+        # The one rule these Playbooks exist for, and the reason it is asserted
+        # over the catalogue: a Playbook whose supported evidence is all
+        # `variant` is a Playbook that can claim from one reading, which is the
+        # v1 failure this corpus replaces. What the control observes differs by
+        # class -- a working session, an unchanged answer, a difference the
+        # limit did not make -- so the kind is not pinned, only the role.
+        for name, one in self.corpus.items():
+            with self.subTest(playbook=name):
+                supported = {(row.role, row.kind) for row in one.evidence
+                             if row.to_status == "supported"}
+                self.assertTrue(any(role == "control" for role, _ in supported))
+                self.assertTrue(any(role == "variant" for role, _ in supported))
+
+    def test_the_shipped_playbook_names_the_control_its_own_class_needs(self):
+        # `object-ownership` pins both kinds, where the catalogue-wide case
+        # above pins only the roles: a refusal under the second Identity is
+        # evidence of a boundary only if that session was working, and
+        # `credential_effect` is the observation that says it was.
         supported = {(row.role, row.kind) for row in self.one.evidence
                      if row.to_status == "supported"}
         self.assertIn(("control", "credential_effect"), supported)
         self.assertIn(("variant", "response_differential"), supported)
 
-    def test_the_shipped_playbook_says_what_would_refute_it(self):
-        self.assertTrue(any(row.to_status == "refuted" for row in self.one.evidence))
+    def test_every_playbook_says_what_would_refute_it(self):
+        for name, one in self.corpus.items():
+            with self.subTest(playbook=name):
+                self.assertTrue(any(row.to_status == "refuted" for row in one.evidence))
 
-    def test_the_shipped_playbook_is_draft_until_a_fixture_has_graded_it(self):
+    def test_every_playbook_is_draft_until_a_fixture_has_graded_it(self):
         # `playbooks_stable_is_promoted` plus 036's promotion guard make
-        # `stable` unreachable while the fixture catalogue is empty, and
-        # selection admits draft: only `deprecated` is excluded.
-        self.assertEqual("draft", self.one.status)
+        # `stable` unreachable until the evaluator has run the exact text, and
+        # no evaluation has: the door refuses to dial the loopback a fixture
+        # listens on, which is ticket 78. Selection admits draft -- only
+        # `deprecated` is excluded -- so this is the honest state and not a gap.
+        # When one of these promotes, this line is what says which.
+        self.assertEqual(
+            {name: "draft" for name in self.corpus},
+            {name: one.status for name, one in self.corpus.items()},
+        )
 
-    def test_the_review_date_has_not_passed(self):
+    def test_no_review_date_has_passed(self):
         # The only version of a review date that gets read is one that fails the
         # suite on the day. When this fires: re-read the body against what the
         # surface looks like now, then move the date or deprecate the Playbook.
-        self.assertGreater(
-            self.one.stale_after, dt.date.today(),
-            f"{self.one.path} was due for review on {self.one.stale_after}: "
-            "re-read it, then move bb:stale_after or deprecate it",
+        for name, one in self.corpus.items():
+            with self.subTest(playbook=name):
+                self.assertGreater(
+                    one.stale_after, dt.date.today(),
+                    f"{one.path} was due for review on {one.stale_after}: "
+                    "re-read it, then move bb:stale_after or deprecate it",
+                )
+
+    def test_the_catalogue_is_the_topics_that_have_been_migrated_so_far(self):
+        # The list the v1 disposition rows resolve against: each name here is a
+        # `rewritten -> playbook:<name>` row whose proof is this file, and a row
+        # naming something absent is what `check_dispositions` refuses. Adding a
+        # Playbook without a row, or a row without a Playbook, fails one of the
+        # two, which is the point of writing the set down in both places.
+        self.assertEqual(
+            [
+                "agentic-ai",
+                "api",
+                "attack-surface",
+                "graphql",
+                "grpc",
+                "object-ownership",
+                "realtime",
+                "webhooks",
+            ],
+            sorted(self.corpus),
+        )
+
+    def test_every_reference_is_attached_to_the_one_playbook_that_absorbed_it(self):
+        # The other half of the disposition rows: `absorbed -> reference:<path>`
+        # is a claim that a v1 page became material hanging off one Playbook
+        # rather than text every Agent loads. What makes that checkable is the
+        # attachment, so the pairing is bound rather than the count.
+        self.assertEqual(
+            {
+                "agentic-ai": ("llm.md",),
+                "api": ("api-soap.md", "api.md", "rate-limit-bypass.md"),
+                "attack-surface": ("auto-scanners.md", "cves.md", "ffuf.md"),
+                "graphql": ("api-graphql.md",),
+                "object-ownership": ("why-two-identities.md",),
+            },
+            {
+                name: tuple(reference.name for reference in one.references)
+                for name, one in self.corpus.items()
+                if one.references
+            },
         )
 
     def test_every_reference_is_material_a_maintainer_can_open(self):
-        for reference in self.one.references:
-            with self.subTest(reference=reference.name):
-                path = playbook.CORPUS.parent / reference.path
-                self.assertTrue(path.is_file())
-                self.assertEqual(playbook.digest(path.read_bytes()), reference.sha256)
+        for name, one in self.corpus.items():
+            for reference in one.references:
+                with self.subTest(playbook=name, reference=reference.name):
+                    path = playbook.CORPUS.parent / reference.path
+                    self.assertTrue(path.is_file())
+                    self.assertEqual(playbook.digest(path.read_bytes()), reference.sha256)
 
-    def test_no_reference_text_reaches_the_shipped_projection(self):
-        canonical = self.one.projection.canonical()
-        for reference in self.one.references:
-            body = (playbook.CORPUS.parent / reference.path).read_text(encoding="utf-8")
-            for line in body.splitlines():
-                stripped = line.strip()
-                if len(stripped) > 40:
-                    with self.subTest(line=stripped[:40]):
-                        self.assertNotIn(stripped, canonical)
+    def test_no_reference_text_reaches_a_shipped_projection(self):
+        for name, one in self.corpus.items():
+            canonical = one.projection.canonical()
+            for reference in one.references:
+                body = (playbook.CORPUS.parent / reference.path).read_text(encoding="utf-8")
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    if len(stripped) > 40:
+                        with self.subTest(playbook=name, line=stripped[:40]):
+                            self.assertNotIn(stripped, canonical)
 
 
 class AgainstTheRoster(unittest.TestCase):

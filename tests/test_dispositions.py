@@ -60,8 +60,9 @@ class DispositionLedgerTest(unittest.TestCase):
             "  reserved              3   superseded 3\n"
             # The per-kind lines are the census by disposition and do not move.
             # `built` and `promised` do, once per migration ticket: 48 built the
-            # ten references the analyst's Skill owed, so ten rows crossed.
-            "  total               223   built 49  promised 122  retired 52",
+            # ten references the analyst's Skill owed, so ten rows crossed, and
+            # 49 built seven Playbooks and the eight pages hanging off them.
+            "  total               223   built 64  promised 107  retired 52",
             self.report,
         )
 
@@ -148,7 +149,7 @@ class DispositionRowTest(unittest.TestCase):
         self.assertEqual(
             "promised",
             self.state(
-                broken(replacement="playbook:graphql", verification="ticket:49"),
+                broken(replacement="playbook:oauth", verification="ticket:50"),
                 kind="playbook_topic",
             ),
         )

@@ -31772,6 +31772,12 @@ class PlaybookSelectionTest(DatabaseCase):
     #: What the shipped document compiles to.
     COMPILED = playbook.PLAYBOOKS["object-ownership"]
 
+    #: The funnel's first stage is the size of the catalogue, which grows every
+    #: time a Playbook ships. Read from the compiler rather than written down,
+    #: so the count that matters -- how many of them this subject reached -- is
+    #: what a diff here is about.
+    CORPUS = str(len(playbook.PLAYBOOKS))
+
     #: Every reason the vocabulary holds, and the case that produces it. A
     #: registered reason nothing emits is 032's `dropped_because` problem in a
     #: new form: the value exists, and what it describes never happens.
@@ -31836,6 +31842,14 @@ class PlaybookSelectionTest(DatabaseCase):
         and an unmatched pair rather than two unrelated rows: `matching` and
         `second` carry an object identifier in the path, `other` carries a text
         parameter in the query string and nothing the Playbook asks for.
+
+        The Application is a `spa`, so that the shipped Playbook is the only one
+        in the catalogue whose triggers this Surface satisfies. Every case below
+        is about the machinery around one row -- which reason excluded it, what
+        the funnel counted, what the freeze wrote down -- and a second shipped
+        Playbook arriving in the answers would be measuring the corpus instead.
+        The corpus is measured by `PlaybookCorpusSelectionTest`, one Surface per
+        Playbook, which is the shape that question actually has.
         """
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
@@ -31843,7 +31857,7 @@ class PlaybookSelectionTest(DatabaseCase):
             application = cls.entity("application", f"application:{BASE_URL}")
             cls.connection.execute(
                 "INSERT INTO applications (entity_id, base_url, kind)"
-                " VALUES ($1::uuid, $2, 'api')",
+                " VALUES ($1::uuid, $2, 'spa')",
                 (application, BASE_URL),
             )
             cls.subjects = {
@@ -32095,6 +32109,8 @@ class PlaybookSelectionTest(DatabaseCase):
             for field in self.connection.execute(
                 "SELECT path, source_sha256, version, category, status, stale_after,"
                 " risk, effects, baseline, specificity, provenance FROM playbooks"
+                " WHERE path = $1",
+                (self.SHIPPED,),
             ).rows[0]
         )
         compiled = self.COMPILED
@@ -32186,7 +32202,9 @@ class PlaybookSelectionTest(DatabaseCase):
             [
                 tuple(str(field) for field in row)
                 for row in self.connection.execute(
-                    "SELECT name, path, sha256 FROM playbook_references ORDER BY name"
+                    "SELECT name, path, sha256 FROM playbook_references"
+                    " WHERE playbook_id = $1::uuid ORDER BY name",
+                    (self.playbook_id(),),
                 ).rows
             ],
         )
@@ -32227,7 +32245,7 @@ class PlaybookSelectionTest(DatabaseCase):
         with self.scratch():
             self.assertEqual([], self.selection(subject="other"))
             self.assertEqual(
-                ["1", "0", "0", "0", "0"],
+                [self.CORPUS, "0", "0", "0", "0"],
                 [
                     str(field)
                     for field in self.connection.execute(
@@ -32241,7 +32259,7 @@ class PlaybookSelectionTest(DatabaseCase):
     def test_the_funnel_counts_every_stage_of_a_matching_subject(self):
         with self.scratch():
             self.assertEqual(
-                ["1", "1", "1", "1", "0"],
+                [self.CORPUS, "1", "1", "1", "0"],
                 [
                     str(field)
                     for field in self.connection.execute(
@@ -32639,6 +32657,247 @@ class PlaybookSelectionTest(DatabaseCase):
         return ""
 
 
+CORPUS_SLUG = "selftest-corpus"
+
+
+class PlaybookCorpusSelectionTest(DatabaseCase):
+    """PH2-49 criterion 5: every shipped Playbook, on the Surface it describes.
+
+    The class above asks what the selection does with one Playbook. This one
+    asks what the catalogue does: "All seven are loadable by an allowed
+    production role, selectable on matching Surface and absent from non-matching
+    bounded context." Three claims, and the third is the one a corpus fails
+    quietly -- a Playbook whose trigger list is loose matches subjects it has
+    nothing to say about, and nothing in the selection can tell, because
+    matching is exactly what a trigger list is for.
+
+    So the arrangement is one Program with one Surface per Playbook, each built
+    to carry that Playbook's trigger facts and no other Playbook's. The
+    assertion is then total in both directions: for every subject, the set of
+    Playbooks whose triggers it satisfies is exactly one, and it is the one the
+    subject was built for. Adding a Playbook whose triggers overlap an existing
+    one fails here, in the pair it collides with, rather than at the point some
+    Program in production selects two Playbooks and an operator wonders why.
+
+    The surfaces are written out rather than derived from `playbook_triggers`.
+    A Surface built by reading the same rows the selection reads would match
+    whatever those rows say, including a trigger list that is wrong -- what is
+    written below is what each Playbook's document claims to be about, in the
+    vocabulary of the thing being pointed at, and the two agreeing is the test.
+
+    This case commits its Program and purges it at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: One Surface per Playbook, as `(application kind, technology, method,
+    #: path, auth_required, parameter)`, where the parameter is `(location,
+    #: value_class)`. `spa` is the neutral Application kind: three Playbooks key
+    #: on the kind and none of them keys on that one, so a Surface that is not
+    #: about the Application shape says so by being an `spa`.
+    SURFACES = {
+        "agentic-ai": ("spa", "llm", "POST", "/assistant", True, ("body", "text")),
+        "api": ("api", None, "GET", "/api/v1/documents", True, ("query", "text")),
+        # The one unauthenticated Surface, which is what this Playbook is for:
+        # what a reader can reach before presenting anything.
+        "attack-surface": ("spa", None, "GET", "/openapi.json", False, None),
+        "graphql": ("graphql", None, "POST", "/graphql", True, ("body", "text")),
+        "grpc": ("spa", "grpc", "POST", "/billing.Admin/ListAll", True, ("body", "text")),
+        "object-ownership": ("spa", None, "GET", "/notes/{id}", True, ("path", "integer_id")),
+        "realtime": ("websocket", None, "GET", "/socket", True, None),
+        "webhooks": ("spa", None, "POST", "/webhooks", True, ("body", "url")),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(SCOPED.replace('name = "matrix-web"', f'name = "{CORPUS_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.arrange()
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (CORPUS_SLUG,))
+        super().tearDownClass()
+
+    @classmethod
+    def arrange(cls):
+        """One Application and one endpoint per Playbook, and two Identities.
+
+        The Identities are the Program's rather than a subject's, so every
+        subject below carries `multiple_test_identities`. That is the honest
+        shape -- an operator who configured two accounts configured them for the
+        whole Program -- and it is also the harder one: four of the eight
+        Playbooks key on it, so the fact cannot be what tells them apart.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for slot in ("first", "second"):
+                cls.connection.execute(
+                    "INSERT INTO identities (entity_id, program_id, slot_name, class,"
+                    " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'user', $4)",
+                    (
+                        cls.entity("identity", f"identity:{slot}"),
+                        cls.program_id,
+                        f"{CORPUS_SLUG}-{slot}",
+                        f"slot://identity/{CORPUS_SLUG}-{slot}",
+                    ),
+                )
+            cls.subjects = {name: cls.surface(name) for name in cls.SURFACES}
+
+    @classmethod
+    def surface(cls, name: str) -> str:
+        """The Application, the technology it runs and the one endpoint on it."""
+        kind, technology, method, path, authenticated, parameter = cls.SURFACES[name]
+        base_url = f"http://{name}.{HOST}"
+        application = cls.entity("application", f"application:{base_url}")
+        cls.connection.execute(
+            "INSERT INTO applications (entity_id, base_url, kind) VALUES ($1::uuid, $2, $3)",
+            (application, base_url, kind),
+        )
+        if technology is not None:
+            running = cls.entity("technology", f"technology:{base_url}:{technology}")
+            cls.connection.execute(
+                "INSERT INTO technologies (entity_id, name) VALUES ($1::uuid, $2)",
+                (running, technology),
+            )
+            cls.connection.execute(
+                "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+                " VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
+                (cls.program_id, application, running),
+            )
+        endpoint = cls.entity("endpoint", f"endpoint:{method} {base_url}{path}")
+        cls.connection.execute(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) VALUES ($1::uuid, $2::uuid, $3, $4, $5)",
+            (endpoint, application, method, path, authenticated),
+        )
+        if parameter is not None:
+            location, value_class = parameter
+            cls.connection.execute(
+                "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
+                " VALUES ($1::uuid, $2::uuid, 'subject', $3, $4)",
+                (
+                    cls.entity("parameter", f"parameter:{base_url}{path}"),
+                    endpoint,
+                    location,
+                    value_class,
+                ),
+            )
+        return endpoint
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str) -> str:
+        """One in-scope Entity, through the one verb that projects scope."""
+        return str(
+            cls.connection.execute(
+                "SELECT add_entity($1::uuid, $2, '', 'host', $3, 80, $4)::text",
+                (cls.program_id, kind, HOST, dedup),
+            ).scalar()
+        )
+
+    # -- reading it back -------------------------------------------------------
+
+    def matched(self, name: str) -> list[str]:
+        """Every Playbook whose triggers this subject satisfies, by path."""
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT p.path FROM playbooks p"
+                " WHERE p.id IN (SELECT playbooks_by_trigger($1::uuid, $2::uuid))"
+                " ORDER BY p.path",
+                (self.program_id, self.subjects[name]),
+            ).rows
+        ]
+
+    def loadable(self, name: str) -> list[str]:
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT role FROM playbook_loadable_by("
+                "   (SELECT id FROM playbooks WHERE path = $1)) ORDER BY role",
+                (playbook.PLAYBOOKS[name].path,),
+            ).rows
+        ]
+
+    def selection(self, name: str, role: str) -> list[tuple[str, ...]]:
+        """The whole selection for one subject, at the Playbook's own ceiling."""
+        return [
+            tuple("" if field is None else str(field) for field in row[1:])
+            for row in self.connection.execute(
+                "SELECT * FROM select_playbooks($1::uuid, $2::uuid, NULL, $3, $4, 3)",
+                (
+                    self.program_id,
+                    self.subjects[name],
+                    role,
+                    playbook.PLAYBOOKS[name].risk,
+                ),
+            ).rows
+        ]
+
+    # -- the three claims ------------------------------------------------------
+
+    def test_every_playbook_is_loadable_by_exactly_one_production_role(self):
+        # The roles come out of `role_skills`, which is the roster the harness
+        # runs. A Playbook loadable by nothing is dead corpus -- 035 makes it an
+        # integrity error -- and one loadable only by a role no Agent runs is
+        # the same thing with a longer explanation.
+        #
+        # Exactly one, rather than at least one, because that is what the
+        # catalogue currently says and it is the more useful thing to be told
+        # when it stops being true: a Playbook that two roles can load is a
+        # Playbook whose Skill set no longer picks out who does this work, and a
+        # Playbook that none can is unreachable. `attack-surface` is the recon
+        # one; every other topic here is web_hunter's.
+        self.assertEqual(
+            {
+                "agentic-ai": ["web_hunter"],
+                "api": ["web_hunter"],
+                "attack-surface": ["recon"],
+                "graphql": ["web_hunter"],
+                "grpc": ["web_hunter"],
+                "object-ownership": ["web_hunter"],
+                "realtime": ["web_hunter"],
+                "webhooks": ["web_hunter"],
+            },
+            {name: sorted(self.loadable(name)) for name in sorted(self.SURFACES)},
+        )
+
+    def test_every_playbook_is_selected_on_the_surface_it_describes(self):
+        # Rank 1 and no drop reason, through the first role that can load it and
+        # at the ceiling its own risk asks for: a Playbook that needs approval
+        # is selected under an approving ceiling and this says nothing about
+        # whether one was given.
+        for name in sorted(self.SURFACES):
+            with self.subTest(playbook=name):
+                self.assertEqual(
+                    [(playbook.PLAYBOOKS[name].path, "1", "", "")],
+                    self.selection(name, self.loadable(name)[0]),
+                )
+
+    def test_no_playbook_reaches_a_subject_its_triggers_do_not_describe(self):
+        # Both halves of criterion 5's last clause, in one comparison per
+        # subject: the Playbook the Surface was built for matched, and nothing
+        # else in the catalogue did.
+        self.assertEqual(
+            {name: [playbook.PLAYBOOKS[name].path] for name in sorted(self.SURFACES)},
+            {name: self.matched(name) for name in sorted(self.SURFACES)},
+        )
+
+    def test_the_corpus_agrees_with_the_surfaces_this_case_states(self):
+        # The class is only as total as its own table. A Playbook that ships
+        # without a Surface here would be tested by nothing above and would
+        # leave the three claims true of everything they were asked about.
+        self.assertEqual(sorted(playbook.PLAYBOOKS), sorted(self.SURFACES))
+
+
 #: The four Programs an evaluation of one Playbook against two fixture pairs
 #: opens, by `(fixture, variant)`. Named here because `tearDownClass` purges them
 #: by prefix and a slug built in two places is a slug that can drift.
@@ -32693,6 +32952,14 @@ class PlaybookEvaluationTest(DatabaseCase):
     CLASS = "authorization.object_ownership"
     OTHER = "information_disclosure.error_detail"
 
+    #: The whole corpus, in the order `ORDER BY fixture_id` reads it back. The
+    #: binding is total, so a verdict is only reachable with the configured
+    #: repeats against every one of them: each gets both halves of its pair
+    #: opened, marked and arranged. Only the two named above are claimed in --
+    #: the rest are the specificity measurement, and a Playbook that fired in
+    #: one of them would be reporting its own class rather than reading a target.
+    GRADED = tuple(sorted(fixture.FIXTURES))
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -32703,7 +32970,7 @@ class PlaybookEvaluationTest(DatabaseCase):
             ).rows[0]
         )
         cls.programs = {}
-        for fixture_id in (cls.OWN, cls.OUT):
+        for fixture_id in cls.GRADED:
             for variant in evaluation.PAIR:
                 cls.programs[fixture_id, variant] = cls.open(fixture_id, variant)
         cls.surface = {key: cls.arrange(*key) for key in cls.programs}
@@ -32715,7 +32982,7 @@ class PlaybookEvaluationTest(DatabaseCase):
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
             cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
             for _ in range(3):
-                for fixture_id in (cls.OWN, cls.OUT):
+                for fixture_id in cls.GRADED:
                     cls.file(fixture_id)
 
     @classmethod
@@ -32761,6 +33028,13 @@ class PlaybookEvaluationTest(DatabaseCase):
         The marker is written first for the reason `evaluation._marking` writes
         it before the work: a Program that ran first and was marked second spent
         the interval contributing promotion evidence.
+
+        Every half of every pair is arranged the same way, including the fixtures
+        nothing below claims in. A run out of a Program with no selection would
+        record no instrument, which is a state this class reaches deliberately
+        one case at a time -- and an evaluation against an `out` fixture does
+        select the Playbook and run it. Not selecting it there would be measuring
+        a Playbook that was never pointed at the target.
         """
         identifier = cls.programs[fixture_id, variant]
         with cls.connection.transaction():
@@ -33051,15 +33325,35 @@ class PlaybookEvaluationTest(DatabaseCase):
         # Both sides come out of `fixture_classes x playbook_outputs`, so the
         # only way to change which fixtures grade this Playbook is to change what
         # it claims to produce -- which changes what it is graded FOR as well.
+        #
+        # Derived from the corpus rather than written down, because the binding
+        # is total: every fixture that ships is a positive or a negative for
+        # every Playbook, and a fixture that arrived on neither side would be one
+        # nothing is graded against. The two anchors are asserted by name
+        # underneath, so a corpus that drifted into all-out still fails here.
+        produces = set(playbook.PLAYBOOKS["object-ownership"].property_classes)
+        binding = sorted(
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT fixture_id, side, kind FROM playbook_fixture_binding($1::uuid)",
+                (self.playbook_id,),
+            ).rows
+        )
+
         self.assertEqual(
-            [(self.OUT, "out", "own_pair"), (self.OWN, "in", "own_pair")],
             sorted(
-                tuple(str(field) for field in row)
-                for row in self.connection.execute(
-                    "SELECT fixture_id, side, kind FROM playbook_fixture_binding($1::uuid)",
-                    (self.playbook_id,),
-                ).rows
+                (one.name, "in" if produces & set(one.classes) else "out", one.kind)
+                for one in fixture.FIXTURES.values()
             ),
+            binding,
+        )
+        self.assertEqual(
+            {self.OWN: "in", self.OUT: "out"},
+            {
+                fixture_id: side
+                for fixture_id, side, _ in binding
+                if fixture_id in (self.OWN, self.OUT)
+            },
         )
 
     def test_the_negative_fixture_holds_a_defect_of_a_class_nothing_here_declares(self):
@@ -33100,7 +33394,7 @@ class PlaybookEvaluationTest(DatabaseCase):
                     fixture.FIXTURES[fixture_id].source_sha256,
                     fixture.FIXTURES[fixture_id].ground_truth_sha256,
                 )
-                for fixture_id in (self.OUT, self.OWN)
+                for fixture_id in self.GRADED
                 for _ in range(3)
             ],
             [
@@ -33123,7 +33417,7 @@ class PlaybookEvaluationTest(DatabaseCase):
             for name in playbook.PLAYBOOKS["object-ownership"].skills
         )
         self.assertEqual(
-            [expected] * 6,
+            [expected] * (3 * len(self.GRADED)),
             [sorted(self.frozen(run_id)) for run_id in self.filed()],
         )
 
@@ -33248,11 +33542,20 @@ class PlaybookEvaluationTest(DatabaseCase):
         # is grounded, supported, inside the Playbook's declaration, inside the
         # fixture's ground truth and absent from the secure half -- which is the
         # only combination that counts as a discriminating true positive.
+        #
+        # Every other fixture counts zero of everything, on a Program arranged
+        # exactly like the one that counted something. That is the assertion the
+        # `out` half of the binding is for: the Playbook was selected there, ran
+        # there, and said nothing there.
+        in_pair = ("in", "1", "0", "1", "0", "0", "1", "0", "2")
+        out = ("out", "0", "0", "0", "0", "0", "0", "0", "2")
+
         self.assertEqual(
-            [(self.OUT, str(index), "out", "0", "0", "0", "0", "0", "0", "0", "2")
-             for index in range(3)]
-            + [(self.OWN, str(index), "in", "1", "0", "1", "0", "0", "1", "0", "2")
-               for index in range(3)],
+            [
+                (fixture_id, str(index)) + (in_pair if fixture_id == self.OWN else out)
+                for fixture_id in self.GRADED
+                for index in range(3)
+            ],
             self.counts(),
         )
 
@@ -33334,8 +33637,16 @@ class PlaybookEvaluationTest(DatabaseCase):
     # -- criterion 3: what promotion requires ----------------------------------
 
     def test_the_verdict_is_pass_at_the_configured_repeat(self):
+        # One positive and every other fixture in the corpus as the negative,
+        # which is what a total binding costs and what it buys: the out count
+        # rises with the catalogue, so a Playbook promoted today was measured
+        # against every target anybody has written since.
         self.assertEqual(
-            ("pass", "1 in-pair, 1 out fixture(s), 3 repeats each, all clean"), self.verdict()
+            (
+                "pass",
+                f"1 in-pair, {len(self.GRADED) - 1} out fixture(s), 3 repeats each, all clean",
+            ),
+            self.verdict(),
         )
 
     def test_one_repeat_short_of_the_policy_is_untested_rather_than_passing(self):
@@ -33596,7 +33907,7 @@ class PlaybookEvaluationTest(DatabaseCase):
                 [("edited", f"text changed from {self.playbook_sha[:12]} to cccccccccccc")],
                 self.demotions(),
             )
-            self.assertEqual(6, len(self.counts()))
+            self.assertEqual(3 * len(self.GRADED), len(self.counts()))
 
     def test_a_failing_verdict_demotes_the_playbook_and_says_why(self):
         with self.scratch():
@@ -33622,7 +33933,7 @@ class PlaybookEvaluationTest(DatabaseCase):
                 ],
             )
             self.assertEqual("draft", str(self.status()))
-            self.assertEqual(7, len(self.counts()))
+            self.assertEqual(3 * len(self.GRADED) + 1, len(self.counts()))
 
     def test_an_expired_playbook_is_demoted_and_reported_as_an_error(self):
         # 036 argued expiry should not demote, because `mark_stale_selections`
@@ -33700,11 +34011,26 @@ class PlaybookEvaluationTest(DatabaseCase):
             "SELECT status FROM playbooks WHERE id = $1::uuid", (self.playbook_id,)
         ).scalar()
 
-    def test_the_catalogue_and_the_corpus_have_no_standing_problem(self):
-        # Every arm of the check, over a catalogue that is fully tested at its
-        # current text. The baseline is what a green tree looks like here, so
-        # anything this reports is a regression rather than a known gap.
-        self.assertEqual([], self.problems())
+    def test_the_only_standing_problem_is_a_draft_nobody_has_evaluated(self):
+        # Every arm of the check, over a catalogue in which one Playbook is
+        # fully tested at its current text and the rest have never been run.
+        # That second half is a known gap and not a regression: a Playbook ships
+        # `draft`, an evaluation is a run against every fixture in the binding,
+        # and until somebody spends it the check says so once per Playbook. Any
+        # other row here is the regression.
+        self.assertEqual(
+            [
+                (
+                    "warning",
+                    "draft_playbook_untestable",
+                    f"{one.path} -> {len(fixture.FIXTURES)} fixture(s) in the binding"
+                    " have no run at this text",
+                )
+                for one in sorted(playbook.PLAYBOOKS.values(), key=lambda one: one.path)
+                if one.path != self.SHIPPED
+            ],
+            self.problems(),
+        )
 
 
 class PlaybookEvaluationCommandTest(DatabaseCase):
@@ -33731,10 +34057,18 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
     Two things this deliberately does not do. It does not go through the door,
     because the fixture is on loopback and the door refuses loopback: what an
     evaluation through the proxy needs is a fixture the door's network can
-    reach, which is ticket 31's container shape and not this ticket's. And
-    nothing it runs writes a hypothesis, so the verdict it earns is `fail` on
-    sensitivity -- which is the honest answer for a Playbook nothing exercised,
-    and the answer this asserts.
+    reach, which is ticket 31's container shape and not this ticket's. And it
+    grades two fixtures rather than the whole corpus, because what is under test
+    is the command rather than the catalogue: the binding is total and grows
+    with every ticket that ships a fixture, so a class that evaluated all of it
+    would re-measure the rule the class above already measures, at one Program
+    per repeat per half.
+
+    So the verdict it earns is `untested`, which is the honest answer after two
+    fixtures of nine, and it is asserted with the count derived from the corpus.
+    Nothing it runs writes a hypothesis either, so the measurement underneath --
+    the median discriminating finding on its own pair -- is zero, which is the
+    number that would fail it once the rest of the corpus is run.
 
     Every Program, run row and workspace document it makes is its own, and the
     Programs are purged at the end: the class above asserts exact counts over
@@ -33952,10 +34286,21 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
                 )
 
     def test_each_repeat_was_served_by_a_process_of_its_own(self):
-        # A port per Program, and every one of them released by the time this
-        # reads them: a listener that outlived its repeat would be answering for
-        # the next one, and the repeats would agree because they were the same run.
-        self.assertEqual(12, len(set(item["port"] for item in self.attempts)))
+        # A Program per repeat, and every port released by the time this reads
+        # them. Twelve distinct identifiers is a claim about `evaluate` and not
+        # about this bookkeeping: `work` is handed the `program_id` production
+        # opened, so a repeat that inherited the previous one's Program would
+        # arrive here as a duplicate while the attempt count stayed at twelve.
+        #
+        # The Program is the identity and the port is not. The repeats run one
+        # after another, so a port a closed server had is a port the kernel may
+        # hand to the next one -- a set of twelve distinct numbers is something
+        # this usually gets and can never require. What rules out a listener
+        # outliving its repeat is not the port count but
+        # `test_the_work_reached_the_fixture_through_the_program_s_own_scope`: a
+        # stale server answering for the next repeat would answer with the other
+        # variant's status, which that case reads per attempt.
+        self.assertEqual(12, len(set(item["program_id"] for item in self.attempts)))
         for item in self.attempts:
             with self.subTest(port=item["port"]):
                 with self.assertRaises(OSError):
@@ -34060,22 +34405,44 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
 
     def test_one_fixture_on_its_own_leaves_the_playbook_untested(self):
         # What a single `rk playbook evaluate` earns: the binding is total, so a
-        # Playbook graded on its positive alone has not been graded.
+        # Playbook graded on its positive alone has not been graded, and the
+        # count it is short by is every other fixture anybody has written.
         self.assertEqual(
             {
                 "verdict": "untested",
-                "reason": "1 fixture(s) in the binding have no run at this text",
+                "reason": f"{len(fixture.FIXTURES) - 1} fixture(s) in the binding"
+                " have no run at this text",
             },
             self.after_one,
         )
 
-    def test_a_playbook_that_found_nothing_fails_rather_than_passes(self):
+    def test_a_second_fixture_moves_the_count_and_not_the_verdict(self):
+        # `untested` is not a soft pass: two of nine is still an ungraded
+        # Playbook, and the operator is told how many are left rather than a
+        # verdict that reads like one.
         self.assertEqual(
             {
-                "verdict": "fail",
-                "reason": f"median discriminating finding < 1 on {self.OWN}",
+                "verdict": "untested",
+                "reason": f"{len(fixture.FIXTURES) - 2} fixture(s) in the binding"
+                " have no run at this text",
             },
             self.reports[self.OUT].facts["verdict"],
+        )
+
+    def test_a_playbook_that_found_nothing_records_a_median_that_cannot_pass(self):
+        # The clause the rest of the corpus would run into. Nothing the work
+        # callable did wrote a hypothesis, so the discriminating median on the
+        # Playbook's own pair is zero -- and `playbook_test_verdict` fails
+        # rather than passes on that number, which is what the class above
+        # asserts against a fully run catalogue.
+        self.assertEqual(
+            "0",
+            str(
+                self.connection.execute(
+                    "SELECT playbook_test_median_tp($1::uuid, $2, $3)",
+                    (self.playbook_id, self.playbook_sha, self.OWN),
+                ).scalar()
+            ),
         )
 
     def test_the_programs_it_opened_contribute_no_promotion_evidence(self):
