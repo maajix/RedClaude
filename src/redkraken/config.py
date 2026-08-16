@@ -89,7 +89,12 @@ SECRET_KEYS = (
 #: A configuration is policy, not data: anything larger is not one.
 MAXIMUM_BYTES = 1 << 20
 
-_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+#: What a Program may be named, and `programs.slug`'s own pattern. Public
+#: because a caller that generates a name rather than reading one -- the
+#: Playbook evaluator opens a Program per repeat per variant -- has to be able
+#: to check it against the same rule this reader will apply, and up front:
+#: a name refused halfway through a run is a measurement with a hole in it.
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
 
 #: A final label begins with a letter, so a dotted number is read as an address
@@ -387,10 +392,10 @@ def _program(reader: _Reader, root: dict) -> dict | None:
     name = None
     raw = reader.required(table, "program", "name")
     if raw is not None:
-        name = reader.text(raw, "program.name", _SLUG, _SLUG.pattern)
+        name = reader.text(raw, "program.name", SLUG, SLUG.pattern)
     platform = None
     if "platform" in table:
-        platform = reader.text(table["platform"], "program.platform", _SLUG, _SLUG.pattern)
+        platform = reader.text(table["platform"], "program.platform", SLUG, SLUG.pattern)
     return {"name": name, "platform": platform}
 
 
@@ -539,7 +544,7 @@ def _identity(reader: _Reader, table: dict, source: str) -> dict | None:
     that field is the one deciding whether a configuration carries credential
     material of its own.
     """
-    name = _name(reader, table, source, _SLUG, _SLUG.pattern)
+    name = _name(reader, table, source, SLUG, SLUG.pattern)
     reference = None
     if "slot_ref" in table:
         reference = reader.text(
@@ -562,7 +567,7 @@ def _header(reader: _Reader, table: dict, source: str) -> dict | None:
 
 
 def _callback(reader: _Reader, table: dict, source: str) -> dict | None:
-    name = _name(reader, table, source, _SLUG, _SLUG.pattern)
+    name = _name(reader, table, source, SLUG, SLUG.pattern)
     kind = None
     raw = reader.required(table, source, "kind")
     if raw is not None and raw not in CALLBACK_KINDS:

@@ -765,3 +765,38 @@ occupy on it, so the reference text is absent by shape rather than by a filter
 that could be forgotten. Two digests, because two things move independently --
 the document, and the projection that is the version.
 _Avoid_: Strategy, recipe, methodology, technique
+
+**Fixture**:
+A synthetic target a Playbook is graded against, authored without reference to
+any Playbook -- naming one is a refused key -- and carrying its own ground truth:
+the Property classes it contains, and nothing about who should find them. Which
+side of a Playbook's test it falls on is derived by intersecting that ground
+truth with what the Playbook declares it outputs, so under-declaring an output
+moves a fixture to the negative side and firing on it then fails. A pair ships
+both halves from one source, and the secure half is the control: a claim
+admitted there is a Playbook reciting its class rather than reading the target.
+Two digests, again for two things that move independently -- the application
+that was served, and the ground truth it was graded by.
+_Avoid_: Test case, sample, mock, lab
+
+**Evaluation Program**:
+A Program opened to grade a Playbook rather than to hunt a target, marked as one
+before its work runs and named with the Playbook it grades and the half of the
+fixture pair it points at. The mark is what keeps the loop from closing on
+itself: nothing an evaluation Program deposits counts as the runtime provenance
+promotion requires, so a Playbook cannot be promoted by the run that was
+supposed to be testing it. It selects one Playbook and no other, because a claim
+is attributed through (Program, subject, Property class) and two Playbooks in one
+Program make that attribution a guess. One per repeat and per half, since a
+repeat that inherited the previous one's Hypotheses is one measurement counted
+twice.
+_Avoid_: Test program, harness run, dry run, sandbox
+
+**Test verdict**:
+What a Playbook has earned at one exact text: `pass`, `fail`, or `untested`.
+Derived from the filed repeats rather than recorded, and `untested` is neither a
+soft pass nor a soft fail -- it blocks promotion to stable and does not demote,
+because a Playbook nobody has measured is not a Playbook that failed. A verdict
+belongs to a text: editing the document, letting it expire, or a later failing
+verdict demotes it, and no historical run is deleted to make that true.
+_Avoid_: Score, grade, result, rating

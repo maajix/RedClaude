@@ -48,14 +48,22 @@ class PackagingTest(unittest.TestCase):
         # the failure is at the first `compile_corpus()` on an installed `rk`
         # rather than in the checkout, where the files are always there. This
         # asks the question the other way round: every file, is it covered.
+        #
+        # A `.py` file is a module only where its directory is a package. The
+        # fixture corpus is the case that makes the distinction load-bearing:
+        # `fixtures/*/app.py` is Python that `find` will not ship, because the
+        # directory holding it has no `__init__.py` and a name no import
+        # statement could spell. Excluding every `.py` suffix would let it
+        # install as nothing at all, silently, which is the failure this test
+        # exists to catch.
         patterns = self.pyproject["tool"]["setuptools"]["package-data"]["redkraken"]
         package = ROOT / "src" / "redkraken"
         unshipped = sorted(
             str(path.relative_to(package))
             for path in package.rglob("*")
             if path.is_file()
-            and path.suffix != ".py"
             and "__pycache__" not in path.parts
+            and not (path.suffix == ".py" and (path.parent / "__init__.py").exists())
             and not any(path.relative_to(package).match(one) for one in patterns)
         )
         self.assertEqual([], unshipped)

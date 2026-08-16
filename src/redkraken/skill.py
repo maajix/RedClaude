@@ -487,8 +487,6 @@ def compile_corpus(root: Path = CORPUS) -> Mapping[str, Skill]:
     Parameterised on the root so a test can compile a corpus it wrote rather
     than the installed one. Nothing in the running system passes an argument.
     """
-    if not root.is_dir():
-        raise SkillError("corpus_missing", str(root), "the installed package carries no skills")
     # A skill's name is its directory's, so two skills cannot share one: the
     # filesystem already refuses that, and `NAME` admits only lower case, so
     # there is no pair of legal names a case-folding filesystem would merge
@@ -496,13 +494,9 @@ def compile_corpus(root: Path = CORPUS) -> Mapping[str, Skill]:
     # two scripts, two list entries, a key stated twice -- and each is refused
     # where it is written.
     compiled: dict[str, Skill] = {}
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.is_symlink():
-            raise SkillError("stray_file", entry.name, "the corpus holds skill directories only")
+    for entry in document.directories(SkillError, root, "skill"):
         skill = _skill(entry)
         compiled[skill.name] = skill
-    if not compiled:
-        raise SkillError("corpus_missing", str(root), "a corpus with no skill in it")
     return MappingProxyType(compiled)
 
 

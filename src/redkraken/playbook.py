@@ -306,29 +306,6 @@ class Playbook:
         return len(self.triggers_all)
 
 
-def _one_of(name: str, key: str, value: Any, allowed: tuple[str, ...]) -> str:
-    if not isinstance(value, str) or value not in allowed:
-        raise PlaybookError("value_malformed", name, f"{key} is one of {list(allowed)}, not {value!r}")
-    return value
-
-
-def _named(name: str, key: str, value: Any, pattern: re.Pattern[str]) -> str:
-    """One name, where the vocabulary it belongs to lives in the database."""
-    if not isinstance(value, str) or not pattern.match(value):
-        raise PlaybookError("value_malformed", name, f"{key} holds {value!r}, which is not a name")
-    return value
-
-
-def _line(name: str, key: str, value: Any, limit: int) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise PlaybookError("value_malformed", name, f"{key} is a non-empty line")
-    if len(value) > limit:
-        raise PlaybookError(
-            "value_unbounded", name, f"{key} is {len(value)} characters, which is not one line"
-        )
-    return value
-
-
 def _date(name: str, key: str, value: Any) -> dt.date:
     """A review date, as a date and not as a string that looks like one."""
     if not isinstance(value, str):
@@ -348,7 +325,7 @@ def _expectation(name: str, entry: Any) -> Expectation:
     for required in ("to_status", "role", "kind", "min_count"):
         if required not in entry:
             raise PlaybookError("value_malformed", name, f"an evidence row states {required}")
-    kind = _named(name, "kind", entry["kind"], OBSERVATION_KIND)
+    kind = document.named(PlaybookError, name, "kind", entry["kind"], OBSERVATION_KIND)
     count = entry["min_count"]
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         # No syntax for zero, deliberately: `playbook_evidence` is a conjunction
@@ -359,8 +336,8 @@ def _expectation(name: str, entry: Any) -> Expectation:
     if polarity is not None and (not isinstance(polarity, str) or polarity not in POLARITIES):
         raise PlaybookError("value_malformed", name, f"polarity is one of {list(POLARITIES)} or absent")
     return Expectation(
-        to_status=_one_of(name, "to_status", entry["to_status"], TO_STATUSES),
-        role=_one_of(name, "role", entry["role"], EVIDENCE_ROLES),
+        to_status=document.one_of(PlaybookError, name, "to_status", entry["to_status"], TO_STATUSES),
+        role=document.one_of(PlaybookError, name, "role", entry["role"], EVIDENCE_ROLES),
         kind=kind,
         polarity=polarity,
         min_count=count,
@@ -459,7 +436,7 @@ def _playbook(directory: Path) -> Playbook:
     if stray:
         raise PlaybookError("stray_file", name, f"nothing reads {stray}")
 
-    category = _named(name, "bb:category", fields["bb:category"], FAMILY)
+    category = document.named(PlaybookError, name, "bb:category", fields["bb:category"], FAMILY)
     outputs = document.strings(PlaybookError, name, "bb:outputs", fields["bb:outputs"], CLASS)
     outside = sorted(one for one in outputs if not one.startswith(f"{category}."))
     if outside:
@@ -483,8 +460,8 @@ def _playbook(directory: Path) -> Playbook:
         # `playbooks_by_trigger` unable to exclude anything.
         raise PlaybookError("duplicate_entry", name, f"{overlap} is required and also optional")
 
-    risk = _one_of(name, "bb:risk", fields["bb:risk"], RISKS)
-    effects = _one_of(name, "bb:effects", fields["bb:effects"], EFFECTS)
+    risk = document.one_of(PlaybookError, name, "bb:risk", fields["bb:risk"], RISKS)
+    effects = document.one_of(PlaybookError, name, "bb:effects", fields["bb:effects"], EFFECTS)
     if risk not in RISK_FLOOR[effects]:
         raise PlaybookError(
             "risk_understates_effects", name,
@@ -513,12 +490,14 @@ def _playbook(directory: Path) -> Playbook:
 
     projection = Projection(
         path=f"{PREFIX}/{name}/{DOCUMENT}",
-        description=_line(name, "description", fields["description"], DESCRIPTION_LIMIT),
+        description=document.line(
+            PlaybookError, name, "description", fields["description"], DESCRIPTION_LIMIT
+        ),
         property_classes=outputs,
         skills=document.strings(PlaybookError, name, "bb:skills", fields["bb:skills"], SKILL_NAME),
         risk=risk,
         effects=effects,
-        baseline=_one_of(name, "bb:baseline", fields["bb:baseline"], BASELINES),
+        baseline=document.one_of(PlaybookError, name, "bb:baseline", fields["bb:baseline"], BASELINES),
         evidence=_evidence(name, fields["bb:evidence"]),
         instructions=body,
     )
@@ -528,9 +507,11 @@ def _playbook(directory: Path) -> Playbook:
         category=category,
         triggers_all=triggers_all,
         triggers_any=triggers_any,
-        status=_one_of(name, "bb:status", fields["bb:status"], STATUSES),
+        status=document.one_of(PlaybookError, name, "bb:status", fields["bb:status"], STATUSES),
         stale_after=_date(name, "bb:stale_after", fields["bb:stale_after"]),
-        provenance=_line(name, "bb:provenance", fields["bb:provenance"], PROVENANCE_LIMIT),
+        provenance=document.line(
+            PlaybookError, name, "bb:provenance", fields["bb:provenance"], PROVENANCE_LIMIT
+        ),
         references=references,
         projection=projection,
         source=source,
@@ -544,16 +525,10 @@ def compile_corpus(root: Path = CORPUS) -> Mapping[str, Playbook]:
     Parameterised on the root so a test can compile a corpus it wrote rather
     than the installed one. Nothing in the running system passes an argument.
     """
-    if not root.is_dir():
-        raise PlaybookError("corpus_missing", str(root), "the installed package carries no Playbooks")
     compiled: dict[str, Playbook] = {}
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.is_symlink():
-            raise PlaybookError("stray_file", entry.name, "the corpus holds Playbook directories only")
+    for entry in document.directories(PlaybookError, root, "Playbook"):
         one = _playbook(entry)
         compiled[one.name] = one
-    if not compiled:
-        raise PlaybookError("corpus_missing", str(root), "a corpus with no Playbook in it")
     return MappingProxyType(compiled)
 
 

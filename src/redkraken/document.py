@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 #: The fence, which is the same three characters both parsers look for.
@@ -117,6 +118,53 @@ def frontmatter(
             raise fault("duplicate_key", name, f"{key} is stated twice")
         fields[key] = value
     return fields, "\n".join(lines[end + 1:]).strip()
+
+
+def directories(fault: type[DocumentError], root: Path, what: str) -> list[Path]:
+    """The corpus directories under `root`, in name order, or the reason there are none.
+
+    Every corpus here is one directory per item and nothing else at the top
+    level, so a stray file is refused rather than skipped: a corpus that ignores
+    what it does not recognise is a corpus where a misnamed document is missing
+    rather than wrong.
+    """
+    if not root.is_dir():
+        raise fault("corpus_missing", str(root), f"the installed package carries no {what}s")
+    found = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            raise fault("stray_file", entry.name, f"the corpus holds {what} directories only")
+        found.append(entry)
+    if not found:
+        raise fault("corpus_missing", str(root), f"a corpus with no {what} in it")
+    return found
+
+
+def line(fault: type[DocumentError], name: str, key: str, value: Any, limit: int) -> str:
+    """One bounded line of prose, which is what a description or a provenance is."""
+    if not isinstance(value, str) or not value.strip():
+        raise fault("value_malformed", name, f"{key} is a non-empty line")
+    if len(value) > limit:
+        raise fault(
+            "value_unbounded", name, f"{key} is {len(value)} characters, which is not one line"
+        )
+    return value
+
+
+def one_of(fault: type[DocumentError], name: str, key: str, value: Any,
+           allowed: tuple[str, ...]) -> str:
+    """One value from a closed vocabulary the corpus states, not the database."""
+    if not isinstance(value, str) or value not in allowed:
+        raise fault("value_malformed", name, f"{key} is one of {list(allowed)}, not {value!r}")
+    return value
+
+
+def named(fault: type[DocumentError], name: str, key: str, value: Any,
+          pattern: re.Pattern[str]) -> str:
+    """One name, where the vocabulary it belongs to lives in the database."""
+    if not isinstance(value, str) or not pattern.match(value):
+        raise fault("value_malformed", name, f"{key} holds {value!r}, which is not a name")
+    return value
 
 
 def strings(

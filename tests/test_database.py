@@ -49,7 +49,7 @@ import time
 import unittest
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote, urlsplit
@@ -65,8 +65,10 @@ from redkraken import (
     capsule,
     config,
     decisions,
+    evaluation,
     evidence,
     execution,
+    fixture,
     header,
     identity,
     integrity,
@@ -1310,8 +1312,9 @@ CONTROLS = (
         # one line, and then only a standing check still says the row is wrong.
         "standing:playbook_tests",
         "ALTER TABLE fixture_classes DROP CONSTRAINT fixture_classes_property_class_fkey;"
-        " INSERT INTO fixtures (id, kind, source_sha256)"
-        " VALUES ('selftest-fixture', 'own_pair', repeat('a', 64));"
+        " INSERT INTO fixtures (id, kind, path, source_sha256, ground_truth_sha256)"
+        " VALUES ('selftest-fixture', 'own_pair', 'fixtures/selftest-fixture/fixture.md',"
+        "         repeat('a', 64), repeat('b', 64));"
         " INSERT INTO fixture_classes (fixture_id, property_class)"
         " VALUES ('selftest-fixture', 'selftest.unknown_class')",
     ),
@@ -32634,6 +32637,1537 @@ class PlaybookSelectionTest(DatabaseCase):
         except pg.DatabaseError as error:
             return error.primary or str(error)
         return ""
+
+
+#: The four Programs an evaluation of one Playbook against two fixture pairs
+#: opens, by `(fixture, variant)`. Named here because `tearDownClass` purges them
+#: by prefix and a slug built in two places is a slug that can drift.
+EVALUATION_PREFIX = "selftest-eval"
+
+
+class PlaybookEvaluationTest(DatabaseCase):
+    """PH2-46: a Playbook earns `stable` against fixtures it did not pick.
+
+    036 built the shape of a Playbook test over an empty fixture catalogue, so
+    every clause of its verdict was unreachable: no fixture, no binding, and
+    `untested` for everything in the tree. Ticket 46 puts a corpus behind it and
+    closes the five places where the shape was not yet the rule. This class is
+    where each of those becomes a row somebody can be wrong about.
+
+    The baseline is four Programs -- both halves of both fixture pairs -- each
+    marked in `evaluation_programs`, each carrying the surface a claim needs, and
+    exactly one grounded supported claim, in the vulnerable half of the pair that
+    contains the Playbook's own class. Three repeats of each fixture are then
+    filed through `record_playbook_test_run`. That is the shape of a Playbook
+    that deserves to pass, and it is committed, because criterion 3 is about what
+    a promotion guard reads back out of the database rather than about what one
+    transaction could see.
+
+    Everything that would move the catalogue -- a promotion, an edit, an expiry,
+    a demotion, a claim that should not have been made -- happens inside
+    `scratch()` and is rolled back. The catalogue is program-global and the gate
+    reads it, so a synthetic promotion left behind would be a `stable` Playbook
+    every later case has to account for.
+
+    Two negative controls are worth naming, because they are what make the
+    corresponding assertions mean anything. The evidence exclusion is proven by
+    deleting the marker and watching the same chain become admissible, and the
+    sensitivity clause is proven by filing repeats from Programs that found
+    nothing and watching the median fall under one.
+
+    This case commits, and purges its Programs, runs and demotions at the end.
+    """
+
+    settings_for = "migrate"
+
+    SHIPPED = "playbooks/object-ownership/playbook.md"
+
+    #: The pair whose ground truth contains the Playbook's declared class, and
+    #: the pair whose ground truth contains a class no authorization Playbook
+    #: declares. The binding derives `in` and `out` from exactly that.
+    OWN = "object-ownership-pair"
+    OUT = "error-detail-pair"
+
+    #: What the Playbook says it produces, and a class the corpus knows about
+    #: that neither fixture the Playbook is graded on contains.
+    CLASS = "authorization.object_ownership"
+    OTHER = "information_disclosure.error_detail"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.playbook_id, cls.playbook_sha = (
+            str(field)
+            for field in cls.connection.execute(
+                "SELECT id::text, source_sha256 FROM playbooks WHERE path = $1", (cls.SHIPPED,)
+            ).rows[0]
+        )
+        cls.programs = {}
+        for fixture_id in (cls.OWN, cls.OUT):
+            for variant in evaluation.PAIR:
+                cls.programs[fixture_id, variant] = cls.open(fixture_id, variant)
+        cls.surface = {key: cls.arrange(*key) for key in cls.programs}
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.claim((cls.OWN, "vulnerable"), cls.CLASS)
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for _ in range(3):
+                for fixture_id in (cls.OWN, cls.OUT):
+                    cls.file(fixture_id)
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            # Before the Programs, because a run row outlives the Programs it
+            # counted on purpose -- criterion 5 is that nothing is deleted -- so
+            # nothing else would take these with it.
+            cls.connection.execute(
+                "DELETE FROM playbook_test_runs WHERE playbook_id = $1::uuid", (cls.playbook_id,)
+            )
+            cls.connection.execute(
+                "DELETE FROM playbook_demotions WHERE playbook_id = $1::uuid", (cls.playbook_id,)
+            )
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (EVALUATION_PREFIX + "-%",)
+            )
+        super().tearDownClass()
+
+    # -- the baseline ----------------------------------------------------------
+
+    @classmethod
+    def open(cls, fixture_id: str, variant: str) -> str:
+        """One Program per half of one fixture, opened the way `rk run` opens one.
+
+        Through `program.run` rather than an INSERT because everything below
+        depends on the Program carrying a scope version, and `add_entity`
+        projects scope: an Entity in a Program nobody opened properly is an
+        Entity no Playbook could have been selected on.
+        """
+        slug = f"{EVALUATION_PREFIX}-{fixture_id.split('-')[0]}-{variant}"
+        opened = program.run(
+            cls.harness.runtime, write(SCOPED.replace('name = "matrix-web"', f'name = "{slug}"'))
+        )
+        assert opened.ok, opened.violations
+        return str(opened.facts["program_id"])
+
+    @classmethod
+    def arrange(cls, fixture_id: str, variant: str) -> dict[str, str]:
+        """The marker, the subject, and the chain one claim has to hang from.
+
+        The marker is written first for the reason `evaluation._marking` writes
+        it before the work: a Program that ran first and was marked second spent
+        the interval contributing promotion evidence.
+        """
+        identifier = cls.programs[fixture_id, variant]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "INSERT INTO evaluation_programs (program_id, playbook_id, fixture_id, variant)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4)",
+                (identifier, cls.playbook_id, fixture_id, variant),
+            )
+            subject = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'endpoint', 'GET /notes/{id}', 'host',"
+                    " $2, 80, 'endpoint:GET /notes/{id}')::text",
+                    (identifier, HOST),
+                ).scalar()
+            )
+            task = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                    " expected_information_gain, potential_impact)"
+                    " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, 0.5, 0.5) RETURNING id::text",
+                    (identifier, subject),
+                ).scalar()
+            )
+            # `produced`, because `playbook_promotion_evidence` counts only kept
+            # selections that produced something: a selection left `pending`
+            # would make every evidence assertion below pass for the wrong reason.
+            selection = str(
+                cls.connection.execute(
+                    "INSERT INTO playbook_selections (program_id, task_id, subject_entity_id,"
+                    " playbook_id, rank) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 1)"
+                    " RETURNING id::text",
+                    (identifier, task, subject, cls.playbook_id),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "UPDATE playbook_selections SET outcome = 'produced' WHERE id = $1::uuid",
+                (selection,),
+            )
+            # What 045's `record_playbook_selection` freezes onto a kept
+            # selection, written out because this baseline inserts the selection
+            # by hand. `record_playbook_test_run` copies the run's Skill rows
+            # from here, so a selection without them is a repeat that recorded
+            # no instrument -- which is a state worth reaching deliberately
+            # (`test_a_repeat_whose_selection_froze_nothing_records_no_skill`)
+            # and not by forgetting.
+            cls.connection.execute(
+                "INSERT INTO playbook_selection_skills"
+                " (selection_id, program_id, skill_name, skill_sha256, skill_version)"
+                " SELECT $1::uuid, $2::uuid, ps.skill_name, sk.source_sha256, sk.version"
+                "   FROM playbook_skills ps JOIN skills sk ON sk.name = ps.skill_name"
+                "  WHERE ps.playbook_id = $3::uuid",
+                (selection, identifier, cls.playbook_id),
+            )
+            receipt = cls.capability(identifier)
+        return {"program": identifier, "subject": subject, "task": task} | receipt
+
+    @classmethod
+    def capability(cls, identifier: str) -> dict[str, str]:
+        """A Receipt, and the live authorised capability one is only valid under.
+
+        `enforce_allowed_receipt_capability` wants a Tool run holding an
+        unexpired egress token, so an observation grounded in a Receipt cannot be
+        written without one. That is the point of grounding it in a Receipt: a
+        claim below is only countable because bytes were authorised to leave.
+        """
+        run = str(
+            cls.connection.execute(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session', 'operator',"
+                " 'low', '{}'::jsonb) RETURNING id::text",
+                (identifier,),
+            ).scalar()
+        )
+        tool_run = str(
+            cls.connection.execute(
+                "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+                " decision, egress_token_sha256, egress_token_expires_at)"
+                " VALUES ($1::uuid, $2::uuid, 'mcp__rk2__net_request', '{}'::jsonb, 'running',"
+                " 'runtime', 'allow', $3, clock_timestamp() + interval '1 hour')"
+                " RETURNING id::text",
+                (identifier, run, "e" * 64),
+            ).scalar()
+        )
+        return {
+            "agent_run": run,
+            "tool_run": tool_run,
+            "receipt": str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version) VALUES ($1::uuid, $2::uuid,"
+                    " 'agent', 'allowed', 'evaluation', now(), 'target', (SELECT max(version)"
+                    " FROM program_scope_versions WHERE program_id = $1::uuid))"
+                    " RETURNING id::text",
+                    (identifier, tool_run),
+                ).scalar()
+            ),
+        }
+
+    @classmethod
+    def claim(cls, key: tuple[str, str], property_class: str, *, grounded: bool = True) -> str:
+        """One supported hypothesis, and the observation that grounds it.
+
+        Assumes an open transaction as the owner, so the same helper serves the
+        committed baseline and every rolled-back case. `response_differential` is
+        the kind the Playbook's own `bb:evidence` names, and 018 admits it under
+        `receipt` provenance only -- which is why the Receipt above exists.
+        """
+        surface = cls.surface[key]
+        hypothesis = str(
+            cls.connection.execute(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement, status) VALUES ($1::uuid, $2::uuid, $3, $4, 'supported')"
+                " RETURNING id::text",
+                (
+                    surface["program"],
+                    surface["subject"],
+                    property_class,
+                    f"the {key[1]} variant admits {property_class}",
+                ),
+            ).scalar()
+        )
+        if grounded:
+            observation = str(
+                cls.connection.execute(
+                    "INSERT INTO observations (program_id, subject_entity_id, kind, summary,"
+                    " provenance_kind, receipt_id) VALUES ($1::uuid, $2::uuid,"
+                    " 'response_differential', $3, 'receipt', $4::uuid) RETURNING id::text",
+                    (
+                        surface["program"],
+                        surface["subject"],
+                        f"the two identities were answered differently on {key[0]}",
+                        surface["receipt"],
+                    ),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)"
+                " VALUES ($1::uuid, $2::uuid, 'supports', 'variant')",
+                (hypothesis, observation),
+            )
+        return hypothesis
+
+    @classmethod
+    def file(cls, fixture_id: str, vulnerable: str | None = None, secure: str | None = "") -> str:
+        """One repeat, through the one function that may write a run row.
+
+        Assumes an open transaction. The default is the pair this fixture names;
+        a case that is asking about the wrong Program passes its own.
+        """
+        return str(
+            cls.connection.execute(
+                "SELECT record_playbook_test_run($1::uuid, $2, $3::uuid, $4::uuid)::text",
+                (
+                    cls.playbook_id,
+                    fixture_id,
+                    vulnerable or cls.programs[fixture_id, "vulnerable"],
+                    cls.programs[fixture_id, "secure"] if secure == "" else secure,
+                ),
+            ).scalar()
+        )
+
+    # -- reading it back -------------------------------------------------------
+
+    @contextlib.contextmanager
+    def scratch(self):
+        """A transaction as the owner that is never kept."""
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                yield
+                raise Rollback
+        except Rollback:
+            pass
+
+    def counts(self) -> list[tuple[str, ...]]:
+        """Every run row, as the counts the harness derived for it."""
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT fixture_id, repeat_index, side, claims, ungrounded, fired_in_scope,"
+                " out_of_scope, false_positives, discriminating_tp, admitted_secure, tool_runs"
+                " FROM playbook_test_runs WHERE playbook_id = $1::uuid"
+                " ORDER BY fixture_id, repeat_index",
+                (self.playbook_id,),
+            ).rows
+        ]
+
+    def verdict(self) -> tuple[str, str]:
+        return tuple(
+            str(field)
+            for field in self.connection.execute(
+                "SELECT verdict, reason FROM playbook_test_verdict($1::uuid, NULL)",
+                (self.playbook_id,),
+            ).rows[0]
+        )
+
+    def evidence(self) -> int:
+        return int(
+            str(
+                self.connection.execute(
+                    "SELECT count(*) FROM playbook_promotion_evidence($1::uuid, NULL)",
+                    (self.playbook_id,),
+                ).scalar()
+            )
+        )
+
+    def problems(self) -> list[tuple[str, str, str]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT severity, problem, detail FROM check_playbook_tests() ORDER BY 1, 2, 3"
+            ).rows
+        ]
+
+    def demotions(self) -> list[tuple[str, str]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT cause, detail FROM playbook_demotions WHERE playbook_id = $1::uuid"
+                " ORDER BY demoted_at",
+                (self.playbook_id,),
+            ).rows
+        ]
+
+    def promote(self) -> str:
+        """Take the Playbook to `stable`, assuming an open `scratch()`.
+
+        In place rather than through `refusal_message`, which opens a
+        transaction of its own: a promotion that succeeded in one would be a
+        promotion the rest of the case could not see.
+        """
+        return self.refusal_in_place(
+            "UPDATE playbooks SET status = 'stable', promoted_at = now() WHERE id = $1::uuid",
+            (self.playbook_id,),
+        )
+
+    def refusal(self, sql: str, parameters: tuple = ()) -> str:
+        return refusal_message(self.connection, sql, parameters)
+
+    def refusal_in_place(self, sql: str, parameters: tuple = ()) -> str:
+        """A refusal expected inside an already-open `scratch()` transaction."""
+        try:
+            self.connection.execute(sql, parameters)
+        except pg.DatabaseError as error:
+            return error.primary or str(error)
+        return ""
+
+    # -- criterion 1: fixtures the Playbook's author did not choose -------------
+
+    def test_the_catalogue_holds_the_corpus_that_is_on_disk(self):
+        # The row and the tree, at both digests. `source_sha256` is what was
+        # served and `ground_truth_sha256` is how it was graded, and an edit to
+        # either without an edit to the migration is what this catches.
+        self.assertEqual(
+            sorted(
+                (one.name, one.kind, one.path, one.source_sha256, one.ground_truth_sha256)
+                for one in fixture.FIXTURES.values()
+            ),
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT id, kind, path, source_sha256, ground_truth_sha256"
+                    " FROM fixtures ORDER BY id"
+                ).rows
+            ],
+        )
+
+    def test_a_fixture_declares_its_own_classes_and_the_playbook_reads_none_of_it(self):
+        self.assertEqual(
+            sorted(
+                (one.name, property_class)
+                for one in fixture.FIXTURES.values()
+                for property_class in one.classes
+            ),
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT fixture_id, property_class FROM fixture_classes"
+                    " ORDER BY fixture_id, property_class"
+                ).rows
+            ],
+        )
+
+    def test_the_binding_derives_a_positive_and_a_negative_the_author_cannot_move(self):
+        # Both sides come out of `fixture_classes x playbook_outputs`, so the
+        # only way to change which fixtures grade this Playbook is to change what
+        # it claims to produce -- which changes what it is graded FOR as well.
+        self.assertEqual(
+            [(self.OUT, "out", "own_pair"), (self.OWN, "in", "own_pair")],
+            sorted(
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT fixture_id, side, kind FROM playbook_fixture_binding($1::uuid)",
+                    (self.playbook_id,),
+                ).rows
+            ),
+        )
+
+    def test_the_negative_fixture_holds_a_defect_of_a_class_nothing_here_declares(self):
+        # Criterion 1 asks for a MEANINGFUL negative. An empty page is a negative
+        # nothing could fire on; this one contains a real defect in a family the
+        # Playbook does not declare, so firing on it is reporting its own class
+        # rather than reading the target.
+        self.assertEqual(
+            [self.OTHER],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT property_class FROM fixture_classes WHERE fixture_id = $1", (self.OUT,)
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            [],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT property_class FROM playbook_outputs WHERE playbook_id = $1::uuid"
+                    " AND property_class IN (SELECT property_class FROM fixture_classes"
+                    "                         WHERE fixture_id = $2)",
+                    (self.playbook_id, self.OUT),
+                ).rows
+            ],
+        )
+
+    # -- criterion 2: what one repeat records ----------------------------------
+
+    def test_a_repeat_freezes_the_text_it_ran_and_the_text_it_was_graded_by(self):
+        self.assertEqual(
+            [
+                (
+                    fixture_id,
+                    self.playbook_sha,
+                    fixture.FIXTURES[fixture_id].source_sha256,
+                    fixture.FIXTURES[fixture_id].ground_truth_sha256,
+                )
+                for fixture_id in (self.OUT, self.OWN)
+                for _ in range(3)
+            ],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT fixture_id, playbook_sha256, fixture_sha256, fixture_ground_truth"
+                    " FROM playbook_test_runs WHERE playbook_id = $1::uuid"
+                    " ORDER BY fixture_id, repeat_index",
+                    (self.playbook_id,),
+                ).rows
+            ],
+        )
+
+    def test_a_repeat_freezes_the_skill_texts_its_selection_recorded(self):
+        # The instrument, not just the result: a Playbook is a document that
+        # names Skills and the model reads all of them, so a pass recorded
+        # without them is a pass about an instrument that has since been rebuilt.
+        expected = sorted(
+            (skill.SKILLS[name].name, skill.SKILLS[name].sha256, skill.SKILLS[name].version)
+            for name in playbook.PLAYBOOKS["object-ownership"].skills
+        )
+        self.assertEqual(
+            [expected] * 6,
+            [sorted(self.frozen(run_id)) for run_id in self.filed()],
+        )
+
+    def test_a_registry_edited_after_the_selection_is_not_what_the_repeat_records(self):
+        # The distinction 045 exists for, and the reason the run reads
+        # `playbook_selection_skills` rather than `skills`: the registry says
+        # what a Skill is now, the selection says what this Program was handed.
+        # A Skill edited between the run and the filing must not silently
+        # rewrite the instrument a finished measurement was taken with.
+        edited = sorted(playbook.PLAYBOOKS["object-ownership"].skills)[0]
+        with self.scratch():
+            self.connection.execute(
+                "UPDATE skills SET source_sha256 = $1 WHERE name = $2", ("d" * 64, edited)
+            )
+
+            recorded = {name: sha for name, sha, _ in self.frozen(self.file(self.OWN))}
+
+            self.assertEqual(skill.SKILLS[edited].sha256, recorded[edited])
+
+    def test_a_repeat_whose_selection_froze_nothing_records_no_skill(self):
+        # Not a failure to record: nothing was selected in that Program, so
+        # nothing was loaded, and the standing check is what says so out loud
+        # rather than the registry filling the gap with today's digests.
+        with self.scratch():
+            self.connection.execute("SET LOCAL app.purging = 'on'")
+            self.connection.execute(
+                "DELETE FROM playbook_selection_skills k USING playbook_selections s"
+                " WHERE s.id = k.selection_id AND s.program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            self.assertEqual([], self.frozen(self.file(self.OWN)))
+            self.assertIn(
+                ("warning", "test_run_froze_no_skills", f"{self.SHIPPED} on {self.OWN}"),
+                self.problems(),
+            )
+
+    def test_a_program_that_froze_two_texts_of_one_skill_has_no_instrument(self):
+        # A Program that selected the Playbook twice across a corpus that moved
+        # in between holds two answers to "what was this Skill". Picking either
+        # would file a measurement against a text half of it was not taken with,
+        # and picking both would double the row -- so the repeat is refused and
+        # the corpus is what gets fixed.
+        name = sorted(playbook.PLAYBOOKS["object-ownership"].skills)[0]
+        with self.scratch():
+            self.disagree_about(name)
+
+            self.assertIn(
+                f"froze more than one text of Skill {name}",
+                self.refusal_in_place(
+                    "SELECT record_playbook_test_run($1::uuid, $2, $3::uuid, $4::uuid)",
+                    (
+                        self.playbook_id,
+                        self.OWN,
+                        self.programs[self.OWN, "vulnerable"],
+                        self.programs[self.OWN, "secure"],
+                    ),
+                ),
+            )
+
+    def disagree_about(self, name: str) -> None:
+        """A second kept selection whose freeze of one Skill says something else.
+
+        On a second subject, because `tasks_live_dedup_idx` allows one live task
+        per (program, kind, subject): a Program that selected this Playbook on
+        two endpoints is the ordinary shape, and disagreeing about what the
+        Skill said is what is not.
+        """
+        surface = self.surface[self.OWN, "vulnerable"]
+        subject = str(
+            self.connection.execute(
+                "SELECT add_entity($1::uuid, 'endpoint', 'GET /notes', 'host',"
+                " $2, 80, 'endpoint:GET /notes')::text",
+                (surface["program"], HOST),
+            ).scalar()
+        )
+        task = str(
+            self.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, 0.5, 0.5) RETURNING id::text",
+                (surface["program"], subject),
+            ).scalar()
+        )
+        selection = str(
+            self.connection.execute(
+                "INSERT INTO playbook_selections (program_id, task_id, subject_entity_id,"
+                " playbook_id, rank) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 1)"
+                " RETURNING id::text",
+                (surface["program"], task, subject, self.playbook_id),
+            ).scalar()
+        )
+        self.connection.execute(
+            "INSERT INTO playbook_selection_skills"
+            " (selection_id, program_id, skill_name, skill_sha256, skill_version)"
+            " VALUES ($1::uuid, $2::uuid, $3, $4, $5)",
+            (selection, surface["program"], name, "d" * 64, "e" * 64),
+        )
+
+    def frozen(self, run_id: str) -> list[tuple[str, ...]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT skill_name, skill_sha256, skill_version"
+                " FROM playbook_test_run_skills WHERE run_id = $1::uuid",
+                (run_id,),
+            ).rows
+        ]
+
+    def filed(self) -> list[str]:
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT id::text FROM playbook_test_runs WHERE playbook_id = $1::uuid"
+                " ORDER BY fixture_id, repeat_index",
+                (self.playbook_id,),
+            ).rows
+        ]
+
+    def test_every_count_is_derived_from_the_rows_the_run_left_behind(self):
+        # Nothing here was supplied by the caller. The one claim in the baseline
+        # is grounded, supported, inside the Playbook's declaration, inside the
+        # fixture's ground truth and absent from the secure half -- which is the
+        # only combination that counts as a discriminating true positive.
+        self.assertEqual(
+            [(self.OUT, str(index), "out", "0", "0", "0", "0", "0", "0", "0", "2")
+             for index in range(3)]
+            + [(self.OWN, str(index), "in", "1", "0", "1", "0", "0", "1", "0", "2")
+               for index in range(3)],
+            self.counts(),
+        )
+
+    def test_the_repeat_index_and_the_run_key_are_the_harness_s(self):
+        # A caller-supplied index is a caller that can overwrite the repeat it
+        # did not like. The key is equal across repeats of one measurement and
+        # different between the two fixtures, which is what makes "these three
+        # are the same measurement" a fact rather than a convention.
+        keys = {}
+        for fixture_id, index, key in (
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT fixture_id, repeat_index, run_key FROM playbook_test_runs"
+                " WHERE playbook_id = $1::uuid ORDER BY fixture_id, repeat_index",
+                (self.playbook_id,),
+            ).rows
+        ):
+            keys.setdefault(fixture_id, []).append((index, key))
+
+        self.assertEqual(["0", "1", "2"], [index for index, _ in keys[self.OWN]])
+        self.assertEqual(["0", "1", "2"], [index for index, _ in keys[self.OUT]])
+        self.assertEqual(1, len({key for _, key in keys[self.OWN]}))
+        self.assertNotEqual(keys[self.OWN][0][1], keys[self.OUT][0][1])
+
+    def test_a_run_filed_against_a_served_text_the_corpus_has_moved_past_is_refused(self):
+        with self.scratch():
+            self.assertIn(
+                f"test run filed against fixture {self.OWN} at source aaaaaaaaaaaa",
+                self.refusal_in_place(*self.handwritten(fixture_sha256="a" * 64)),
+            )
+
+    def test_a_run_graded_against_a_ground_truth_the_corpus_has_moved_past_is_refused(self):
+        # The grading text moves separately from the served text: rewriting the
+        # ground truth regrades every historical result without changing a byte
+        # the model ever saw.
+        with self.scratch():
+            self.assertIn(
+                "test run graded against ground truth bbbbbbbbbbbb",
+                self.refusal_in_place(*self.handwritten(fixture_ground_truth="b" * 64)),
+            )
+
+    def handwritten(self, **columns) -> tuple[str, tuple]:
+        """A run row written by hand, defaulting to one the guards would admit."""
+        stated = {
+            "fixture_sha256": fixture.FIXTURES[self.OWN].source_sha256,
+            "fixture_ground_truth": fixture.FIXTURES[self.OWN].ground_truth_sha256,
+            "claims": 0,
+            "ungrounded": 0,
+            "fired_in_scope": 0,
+            "out_of_scope": 0,
+            "false_positives": 0,
+            "discriminating_tp": 0,
+            "admitted_secure": 0,
+        } | columns
+        return (
+            "INSERT INTO playbook_test_runs (playbook_id, playbook_sha256, fixture_id,"
+            " fixture_sha256, fixture_ground_truth, side, repeat_index, run_key, claims,"
+            " ungrounded, fired_in_scope, out_of_scope, false_positives, discriminating_tp,"
+            " admitted_secure, tool_runs) VALUES ($1::uuid, $2, $3, $4, $5, 'in', 9,"
+            " '000000000000', $6, $7, $8, $9, $10, $11, $12, 0)",
+            (self.playbook_id, self.playbook_sha, self.OWN, *stated.values()),
+        )
+
+    def test_a_false_positive_cannot_exceed_the_claims_that_were_made(self):
+        with self.scratch():
+            self.assertIn(
+                "playbook_test_runs_false_positives_are_claims",
+                self.refusal_in_place(*self.handwritten(false_positives=1)),
+            )
+
+    def test_a_frozen_skill_row_cannot_be_rewritten_or_removed(self):
+        for statement in (
+            "UPDATE playbook_test_run_skills SET skill_sha256 = repeat('f', 64)",
+            "DELETE FROM playbook_test_run_skills",
+        ):
+            with self.subTest(statement=statement.split()[0]):
+                self.assertIn("immutable", self.refusal(statement))
+
+    # -- criterion 3: what promotion requires ----------------------------------
+
+    def test_the_verdict_is_pass_at_the_configured_repeat(self):
+        self.assertEqual(
+            ("pass", "1 in-pair, 1 out fixture(s), 3 repeats each, all clean"), self.verdict()
+        )
+
+    def test_one_repeat_short_of_the_policy_is_untested_rather_than_passing(self):
+        # The number is a row, so raising it is a deployment decision rather than
+        # a migration. One run of a stochastic model is a coin that came up heads,
+        # and this is the clause that says so.
+        with self.scratch():
+            self.connection.execute("UPDATE playbook_test_policy SET required_repeats = 4")
+            verdict, reason = self.verdict()
+
+        self.assertEqual("untested", verdict)
+        self.assertIn("fewer than 4 repeats at this text on ", reason)
+        self.assertIn(f"{self.OWN} (3)", reason)
+        self.assertIn(f"{self.OUT} (3)", reason)
+
+    def test_the_programs_that_graded_the_playbook_are_no_evidence_that_it_works(self):
+        # Criterion 4's last clause. The chain 035 counts is right there -- a kept
+        # selection that produced a supported hypothesis on a declared class,
+        # backed by an observation with a Receipt -- and it is all inside the
+        # evaluation, so none of it counts.
+        self.assertEqual(0, self.evidence())
+
+    def test_the_same_chain_counts_as_soon_as_it_is_not_an_evaluation(self):
+        # The negative control for the assertion above: without it, an evidence
+        # count of zero could equally mean the baseline never built a chain.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            self.assertEqual(1, self.evidence())
+
+    def test_a_promotion_on_the_evaluation_s_own_evidence_is_refused(self):
+        with self.scratch():
+            self.assertIn(
+                "no runtime provenance for this text",
+                self.promote(),
+            )
+
+    def test_a_playbook_with_hunting_evidence_and_a_passing_test_promotes(self):
+        # Both guards satisfied at once, which is the only path to `stable`: the
+        # test verdict is `pass` on fixtures nobody chose, and the evidence comes
+        # from a Program that was not grading it.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            self.assertEqual("", self.promote())
+            self.assertEqual(
+                ("stable", True),
+                tuple(
+                    self.connection.execute(
+                        "SELECT status, promoted_at IS NOT NULL FROM playbooks WHERE id = $1::uuid",
+                        (self.playbook_id,),
+                    ).rows[0]
+                ),
+            )
+
+    # -- criterion 4: what fails ----------------------------------------------
+
+    def test_a_playbook_that_fires_on_the_negative_fixture_fails(self):
+        # "Always fires", measured. The claim is grounded, supported and inside
+        # the Playbook's own declaration, on a fixture whose ground truth
+        # contains nothing of the kind.
+        with self.scratch():
+            self.claim((self.OUT, "vulnerable"), self.CLASS)
+            self.file(self.OUT)
+
+            self.assertEqual(
+                ("fail", f"fires inside its own declared classes on out-side fixture {self.OUT}"),
+                self.verdict(),
+            )
+
+    def test_a_playbook_that_claims_a_class_the_ground_truth_does_not_contain_fails(self):
+        # The other half of "always fires": reporting somebody else's class. 036
+        # read this as merely out of scope and never scored it, because out of
+        # scope is measured against the PLAYBOOK's declaration and this is
+        # measured against the FIXTURE's ground truth.
+        with self.scratch():
+            self.claim((self.OWN, "vulnerable"), self.OTHER)
+            self.file(self.OWN)
+
+            self.assertEqual(
+                ("fail", f"claims a class the ground truth does not contain on {self.OWN}"),
+                self.verdict(),
+            )
+
+    def test_a_claim_the_secure_variant_also_admits_is_not_evidence_of_anything(self):
+        # The control doing its job. The same claim on the half that enforces the
+        # boundary means the Playbook did not read the target, and this clause is
+        # never averaged away over repeats.
+        with self.scratch():
+            self.claim((self.OWN, "secure"), self.CLASS)
+            self.file(self.OWN)
+
+            self.assertEqual(
+                ("fail", f"admits a claim on the secure variant of {self.OWN}"), self.verdict()
+            )
+
+    def test_repeats_that_find_nothing_pull_the_median_under_one(self):
+        # Sensitivity, and the negative control for the passing baseline: three
+        # more repeats of the same fixture from Programs that produced no claim
+        # take the median discriminating finding to 0.5.
+        with self.scratch():
+            self.connection.execute(
+                "UPDATE evaluation_programs SET fixture_id = $1"
+                " WHERE program_id IN ($2::uuid, $3::uuid)",
+                (
+                    self.OWN,
+                    self.programs[self.OUT, "vulnerable"],
+                    self.programs[self.OUT, "secure"],
+                ),
+            )
+            for _ in range(3):
+                self.file(
+                    self.OWN,
+                    vulnerable=self.programs[self.OUT, "vulnerable"],
+                    secure=self.programs[self.OUT, "secure"],
+                )
+
+            self.assertEqual(("fail", f"median discriminating finding < 1 on {self.OWN}"),
+                             self.verdict())
+
+    def test_a_pair_filed_without_its_control_is_refused(self):
+        with self.scratch():
+            self.assertIn(
+                f"fixture {self.OWN} is a pair and its secure half was not run",
+                self.refusal_in_place(
+                    "SELECT record_playbook_test_run($1::uuid, $2, $3::uuid, NULL)",
+                    (self.playbook_id, self.OWN, self.programs[self.OWN, "vulnerable"]),
+                ),
+            )
+
+    def test_a_target_with_no_control_earns_no_discriminating_finding(self):
+        # 036: "third party = no secure twin, therefore no discriminating". The
+        # claim is still counted as fired in scope -- it was made, it was
+        # grounded, and it is in the ground truth -- but nothing held it against
+        # a variant that enforces the boundary, so it is not evidence the
+        # Playbook read the target rather than its own declaration. Left
+        # uncontrolled it would be the recall-only pass 036's asymmetry refuses.
+        with self.scratch():
+            self.connection.execute(
+                "INSERT INTO fixtures (id, kind, path, source_sha256, ground_truth_sha256,"
+                " upstream_list_size, converted) VALUES ('selftest-unpaired', 'third_party',"
+                " 'fixtures/selftest-unpaired/fixture.md', repeat('a', 64), repeat('b', 64),"
+                " 10, 4)"
+            )
+            self.connection.execute(
+                "INSERT INTO fixture_classes (fixture_id, property_class)"
+                " VALUES ('selftest-unpaired', $1)",
+                (self.CLASS,),
+            )
+            self.connection.execute(
+                "UPDATE evaluation_programs SET fixture_id = 'selftest-unpaired'"
+                " WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            run = self.file(
+                "selftest-unpaired",
+                vulnerable=self.programs[self.OWN, "vulnerable"],
+                secure=None,
+            )
+
+            self.assertEqual(
+                [("in", "1", "1", "0", None)],
+                [
+                    tuple(None if field is None else str(field) for field in row)
+                    for row in self.connection.execute(
+                        "SELECT side, claims, fired_in_scope, discriminating_tp, admitted_secure"
+                        " FROM playbook_test_runs WHERE id = $1::uuid",
+                        (run,),
+                    ).rows
+                ],
+            )
+
+    def test_a_program_nobody_marked_cannot_be_filed_as_the_evaluation(self):
+        # The marker is what makes the exclusion and the measurement read the
+        # same rows: a run counted out of an unmarked Program is a run whose
+        # evidence is still being admitted into promotions.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            self.assertIn(
+                f"is not marked as the vulnerable evaluation of {self.SHIPPED} against {self.OWN}",
+                self.refusal_in_place(
+                    "SELECT record_playbook_test_run($1::uuid, $2, $3::uuid, $4::uuid)",
+                    (
+                        self.playbook_id,
+                        self.OWN,
+                        self.programs[self.OWN, "vulnerable"],
+                        self.programs[self.OWN, "secure"],
+                    ),
+                ),
+            )
+
+    def test_an_evaluation_program_cannot_also_select_another_playbook(self):
+        # A claim is attributed to a Playbook through (program, subject, class),
+        # which is exact only while an evaluation Program runs one Playbook.
+        with self.scratch():
+            other = str(
+                self.connection.execute(
+                    "INSERT INTO playbooks (path, source_sha256, version, category, status,"
+                    " stale_after, risk, effects, baseline, specificity, provenance)"
+                    " VALUES ('playbooks/selftest-eval-other/playbook.md', $1, $2,"
+                    " 'authorization', 'draft', '2099-01-01T00:00:00Z', 'constrained',"
+                    " 'read_only', 'none', 1, 'self test') RETURNING id::text",
+                    ("a" * 64, "b" * 64),
+                ).scalar()
+            )
+            surface = self.surface[self.OWN, "vulnerable"]
+
+            self.assertIn(
+                f"evaluates {self.SHIPPED}, so it cannot also select"
+                " playbooks/selftest-eval-other/playbook.md",
+                self.refusal_in_place(
+                    "INSERT INTO playbook_selections (program_id, task_id, subject_entity_id,"
+                    " playbook_id, rank) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 2)",
+                    (surface["program"], surface["task"], surface["subject"], other),
+                ),
+            )
+
+    # -- criterion 5: demotion, and the runs that survive it -------------------
+
+    def test_editing_a_promoted_playbook_demotes_it_and_keeps_every_run(self):
+        # 035's guard would refuse the edit outright, which leaves a maintainer
+        # with an undocumented two-step and the ledger with no record of it. The
+        # demotion runs first, so the promotion guard sees a row that is no
+        # longer promoted.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+            self.assertEqual("", self.promote())
+
+            self.connection.execute(
+                "UPDATE playbooks SET source_sha256 = $1 WHERE id = $2::uuid",
+                ("c" * 64, self.playbook_id),
+            )
+
+            self.assertEqual(
+                ("draft", False),
+                tuple(
+                    self.connection.execute(
+                        "SELECT status, promoted_at IS NOT NULL FROM playbooks WHERE id = $1::uuid",
+                        (self.playbook_id,),
+                    ).rows[0]
+                ),
+            )
+            self.assertEqual(
+                [("edited", f"text changed from {self.playbook_sha[:12]} to cccccccccccc")],
+                self.demotions(),
+            )
+            self.assertEqual(6, len(self.counts()))
+
+    def test_a_failing_verdict_demotes_the_playbook_and_says_why(self):
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+            self.assertEqual("", self.promote())
+            self.claim((self.OUT, "vulnerable"), self.CLASS)
+            self.file(self.OUT)
+
+            self.assertEqual(
+                [
+                    (
+                        self.SHIPPED,
+                        "failed",
+                        f"fires inside its own declared classes on out-side fixture {self.OUT}",
+                    )
+                ],
+                [
+                    tuple(str(field) for field in row)
+                    for row in self.connection.execute("SELECT * FROM demote_playbooks()").rows
+                ],
+            )
+            self.assertEqual("draft", str(self.status()))
+            self.assertEqual(7, len(self.counts()))
+
+    def test_an_expired_playbook_is_demoted_and_reported_as_an_error(self):
+        # 036 argued expiry should not demote, because `mark_stale_selections`
+        # already excludes an expired Playbook from selection. Ticket 46 reverses
+        # it: `stable` is a claim about which Playbooks are trusted, and one
+        # nobody has reviewed since its date passed is merely one that is quietly
+        # never chosen.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+            self.assertEqual("", self.promote())
+            self.connection.execute(
+                "UPDATE playbooks SET stale_after = date '2020-03-01' WHERE id = $1::uuid",
+                (self.playbook_id,),
+            )
+
+            self.assertIn(
+                ("error", "stable_playbook_expired",
+                 f"{self.SHIPPED} -> stale_after passed on 2020-03-01"),
+                self.problems(),
+            )
+            self.assertEqual(
+                [(self.SHIPPED, "expired", "stale_after passed on 2020-03-01")],
+                [
+                    tuple(str(field) for field in row)
+                    for row in self.connection.execute("SELECT * FROM demote_playbooks()").rows
+                ],
+            )
+            self.assertEqual("draft", str(self.status()))
+
+    def test_a_playbook_whose_test_grew_a_fixture_is_not_demoted(self):
+        # `untested` is what ADDING a fixture looks like from here, and demoting
+        # the catalogue because somebody widened its test is a rule nobody would
+        # widen a test under.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+            self.assertEqual("", self.promote())
+            self.connection.execute(
+                "INSERT INTO fixtures (id, kind, path, source_sha256, ground_truth_sha256,"
+                " upstream_list_size, converted) VALUES ('selftest-later', 'third_party',"
+                " 'fixtures/selftest-later/fixture.md', $1, $2, 10, 1)",
+                ("d" * 64, "e" * 64),
+            )
+
+            self.assertEqual("untested", self.verdict()[0])
+            self.assertEqual(
+                [],
+                list(self.connection.execute("SELECT * FROM demote_playbooks()").rows),
+            )
+            self.assertEqual("stable", str(self.status()))
+
+    def test_a_demotion_cannot_be_rewritten_or_removed(self):
+        # A scratch each, because a refusal aborts the transaction it happened
+        # in and the row this asks about is arranged inside one.
+        for statement in (
+            "UPDATE playbook_demotions SET cause = 'expired'",
+            "DELETE FROM playbook_demotions",
+        ):
+            with self.subTest(statement=statement.split()[0]), self.scratch():
+                self.connection.execute(
+                    "INSERT INTO playbook_demotions (playbook_id, playbook_sha256, cause, detail)"
+                    " VALUES ($1::uuid, $2, 'failed', 'written by the self test')",
+                    (self.playbook_id, self.playbook_sha),
+                )
+
+                self.assertIn("immutable", self.refusal_in_place(statement))
+
+    def status(self) -> object:
+        return self.connection.execute(
+            "SELECT status FROM playbooks WHERE id = $1::uuid", (self.playbook_id,)
+        ).scalar()
+
+    def test_the_catalogue_and_the_corpus_have_no_standing_problem(self):
+        # Every arm of the check, over a catalogue that is fully tested at its
+        # current text. The baseline is what a green tree looks like here, so
+        # anything this reports is a regression rather than a known gap.
+        self.assertEqual([], self.problems())
+
+
+class PlaybookEvaluationCommandTest(DatabaseCase):
+    """PH2-46 criterion 6: `rk playbook evaluate` against this database.
+
+    The class above measures the rule; this one measures the command, and the
+    criterion is about which seams it goes through: "the end-to-end evaluator
+    uses the production Agent, proxy, Test and promotion seams against synthetic
+    fixtures." So nothing here inserts a Program, marks one, or counts anything.
+    `evaluation.evaluate` is called twice -- once per fixture, as an operator
+    would call it -- and everything asserted is read back out of the rows that
+    left behind.
+
+    The work callable is where the Agent seam is proven. `program.run` hands it
+    the ledger, the runtime connection and the Program it opened, which is the
+    same three things `execution.Slice.attempt` is handed on a real target, and
+    it does with them what a slice does at its first step: reads what it is
+    grading, and asks the target. That it can ask at all is the load-bearing
+    part -- the fixture is only listening while the Program is open, so a probe
+    that answers proves the Program was opened against the origin that was
+    serving, through the production configuration reader and the production
+    scope compiler.
+
+    Two things this deliberately does not do. It does not go through the door,
+    because the fixture is on loopback and the door refuses loopback: what an
+    evaluation through the proxy needs is a fixture the door's network can
+    reach, which is ticket 31's container shape and not this ticket's. And
+    nothing it runs writes a hypothesis, so the verdict it earns is `fail` on
+    sensitivity -- which is the honest answer for a Playbook nothing exercised,
+    and the answer this asserts.
+
+    Every Program, run row and workspace document it makes is its own, and the
+    Programs are purged at the end: the class above asserts exact counts over
+    the same Playbook.
+    """
+
+    settings_for = "migrate"
+
+    SHIPPED = "playbooks/object-ownership/playbook.md"
+    OWN = "object-ownership-pair"
+    OUT = "error-detail-pair"
+
+    #: One request per Program, chosen by the fixture the marker names: the
+    #: route, the headers a caller needs, and what each variant answers. The
+    #: statuses are written here rather than read from the application so that a
+    #: pair edited into agreeing with itself is a failure rather than a tautology.
+    PROBES = {
+        OWN: ("/notes/2", {"Cookie": "session=s-alice-4f2c"}, {"vulnerable": 200, "secure": 403}),
+        OUT: ("/search?q=quarterly&limit=none", {}, {"vulnerable": 500, "secure": 400}),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.playbook_id, cls.playbook_sha = (
+            str(field)
+            for field in cls.connection.execute(
+                "SELECT id::text, source_sha256 FROM playbooks WHERE path = $1", (cls.SHIPPED,)
+            ).rows[0]
+        )
+        cls.workspace = scratch()
+        #: What the work callable saw, in the order it ran. The evaluator does
+        #: not report this -- it reports what it filed -- so it is collected
+        #: where it happened.
+        cls.attempts = []
+        cls.reports = {}
+        for fixture_id in (cls.OWN, cls.OUT):
+            cls.reports[fixture_id] = cls.evaluate(fixture_id)
+        # Read from the first report rather than at the end: the verdict after
+        # one fixture is a different answer from the verdict after both, and it
+        # is the answer a single `rk playbook evaluate` gives an operator.
+        cls.after_one = cls.reports[cls.OWN].facts["verdict"]
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM playbook_test_runs WHERE playbook_id = $1::uuid", (cls.playbook_id,)
+            )
+            # `eval-` and not `selftest-eval-`: LIKE anchors at the start, so
+            # this cannot reach the class above's Programs.
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE 'eval-%'")
+        super().tearDownClass()
+
+    @classmethod
+    def slug(cls, fixture_id: str, variant: str, index: int) -> str:
+        """What one repeat's Program is called, restated rather than imported.
+
+        `Subject.slug` builds the same string, and a test that called it would
+        agree with any name the evaluator invented. Stated once here because
+        two places asking for it are asking about one fact: the Programs on
+        disk under `workspace` are the Programs in `programs`.
+        """
+        return f"eval-{cls.playbook_sha[:8]}-{fixture_id}-{variant}-{index}"
+
+    @classmethod
+    def evaluate(cls, fixture_id: str, **options) -> Report:
+        return evaluation.evaluate(
+            cls.harness.runtime,
+            cls.workspace,
+            playbook=options.pop("playbook", cls.SHIPPED),
+            fixture_name=fixture_id,
+            work=cls.work,
+            **options,
+        )
+
+    @classmethod
+    def work(cls, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
+        """What one open Program does here: read the marker, then ask the target.
+
+        Both halves matter. Reading the marker inside the work is what proves
+        `_marking` wrote it BEFORE the work rather than after -- there is no
+        other moment from which that ordering is observable. Asking the target
+        through the port in this Program's own compiled scope is what proves the
+        Program was opened against the fixture that is listening, rather than
+        against a document that merely parsed.
+        """
+        fixture_id, variant = (
+            str(field)
+            for field in connection.execute(
+                "SELECT fixture_id, variant FROM evaluation_programs WHERE program_id = $1::uuid",
+                (program_id,),
+            ).rows[0]
+        )
+        port = int(
+            str(
+                connection.execute(
+                    "SELECT port FROM program_scope_rules WHERE program_id = $1::uuid"
+                    " AND effect = 'target' ORDER BY version DESC, ord LIMIT 1",
+                    (program_id,),
+                ).scalar()
+            )
+        )
+        path, headers, _ = cls.PROBES[fixture_id]
+        asked = http.client.HTTPConnection(evaluation.HOST, port, timeout=10)
+        try:
+            asked.request(
+                "GET",
+                path,
+                headers={"Host": evaluation.origin(fixture.FIXTURES[fixture_id])} | headers,
+            )
+            answer = asked.getresponse()
+            status, body = answer.status, answer.read()
+        finally:
+            asked.close()
+        cls.attempts.append(
+            {
+                "program_id": program_id,
+                "fixture_id": fixture_id,
+                "variant": variant,
+                "port": port,
+                "status": status,
+                "body": body,
+            }
+        )
+        ledger.hold("task", f"{fixture_id} ({variant}) answered {status} at {port}")
+        return {}
+
+    # -- what the two runs reported --------------------------------------------
+
+    def test_both_evaluations_ran_the_configured_repeats_and_said_so(self):
+        for fixture_id, result in self.reports.items():
+            with self.subTest(fixture=fixture_id):
+                self.assertEqual([], list(result.violations))
+                self.assertEqual(3, result.facts["repeats"])
+                self.assertEqual([0, 1, 2], [item["index"] for item in result.facts["runs"]])
+                self.assertEqual(
+                    [["secure", "vulnerable"]] * 3,
+                    [sorted(item["programs"]) for item in result.facts["runs"]],
+                )
+
+    def test_the_command_answers_the_same_keys_on_both_paths(self):
+        # `FACTS` is the contract an operator scripts against, and a refusal
+        # answers it too -- so the refused path below is not a shorter document.
+        refused = self.evaluate("no-such-fixture")
+        for result in (*self.reports.values(), refused):
+            self.assertEqual(set(evaluation.FACTS), set(result.facts))
+
+    def test_every_repeat_opened_programs_of_its_own(self):
+        opened = [
+            item["programs"][variant]
+            for result in self.reports.values()
+            for item in result.facts["runs"]
+            for variant in evaluation.PAIR
+        ]
+        # 2 fixtures x 3 repeats x 2 variants, none shared. A repeat that reused
+        # the previous one's Program would be counting one measurement twice.
+        self.assertEqual(12, len(set(opened)))
+        self.assertEqual(
+            sorted(
+                self.slug(fixture_id, variant, index)
+                for fixture_id in (self.OWN, self.OUT)
+                for variant in evaluation.PAIR
+                for index in range(3)
+            ),
+            sorted(
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT slug FROM programs WHERE slug LIKE 'eval-%'"
+                ).rows
+            ),
+        )
+
+    def test_each_program_was_opened_under_a_document_on_disk(self):
+        # Through `config.load` rather than by reading the text: the claim is
+        # that what the evaluator wrote is what the production reader accepts,
+        # and re-parsing it here with anything else would not be that claim.
+        for one_run in self.reports[self.OWN].facts["runs"]:
+            for variant in evaluation.PAIR:
+                slug = self.slug(self.OWN, variant, one_run["index"])
+                loaded, refusals = config.load(self.workspace / f"{slug}.toml")
+                with self.subTest(slug=slug):
+                    self.assertEqual([], list(refusals))
+                    self.assertEqual(
+                        evaluation.origin(fixture.FIXTURES[self.OWN]),
+                        loaded.document["scope"]["include"][0]["host"],
+                    )
+
+    # -- what the work saw -----------------------------------------------------
+
+    def test_the_program_was_marked_as_an_evaluation_before_the_work_ran(self):
+        # Read from inside the work, so this is the ordering `_marking` promises
+        # and not the state afterwards. A Program worked before it was marked
+        # would spend that interval as ordinary promotion evidence.
+        self.assertEqual(12, len(self.attempts))
+        self.assertEqual(
+            sorted(
+                (fixture_id, variant)
+                for fixture_id in (self.OWN, self.OUT)
+                for variant in evaluation.PAIR
+                for _ in range(3)
+            ),
+            sorted((item["fixture_id"], item["variant"]) for item in self.attempts),
+        )
+
+    def test_the_work_reached_the_fixture_through_the_program_s_own_scope(self):
+        # The port came out of `program_scope_rules` and the fixture is only
+        # listening while the Program is open, so an answer here is the whole
+        # chain: document written, read, compiled, Program opened, target served.
+        for item in self.attempts:
+            with self.subTest(fixture=item["fixture_id"], variant=item["variant"]):
+                self.assertEqual(
+                    self.PROBES[item["fixture_id"]][2][item["variant"]], item["status"]
+                )
+
+    def test_each_repeat_was_served_by_a_process_of_its_own(self):
+        # A port per Program, and every one of them released by the time this
+        # reads them: a listener that outlived its repeat would be answering for
+        # the next one, and the repeats would agree because they were the same run.
+        self.assertEqual(12, len(set(item["port"] for item in self.attempts)))
+        for item in self.attempts:
+            with self.subTest(port=item["port"]):
+                with self.assertRaises(OSError):
+                    http.client.HTTPConnection(
+                        evaluation.HOST, item["port"], timeout=5
+                    ).request("GET", "/")
+
+    def test_the_two_halves_of_a_pair_answered_differently(self):
+        for fixture_id in (self.OWN, self.OUT):
+            answers = {
+                item["variant"]: item["body"]
+                for item in self.attempts
+                if item["fixture_id"] == fixture_id
+            }
+            with self.subTest(fixture=fixture_id):
+                self.assertNotEqual(answers["vulnerable"], answers["secure"])
+
+    # -- what was filed --------------------------------------------------------
+
+    def test_each_repeat_was_filed_against_the_texts_that_were_served(self):
+        self.assertEqual(
+            [
+                (
+                    fixture_id,
+                    str(index),
+                    side,
+                    self.playbook_sha,
+                    fixture.FIXTURES[fixture_id].source_sha256,
+                    fixture.FIXTURES[fixture_id].ground_truth_sha256,
+                )
+                for fixture_id, side in ((self.OUT, "out"), (self.OWN, "in"))
+                for index in range(3)
+            ],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT fixture_id, repeat_index, side, playbook_sha256, fixture_sha256,"
+                    " fixture_ground_truth FROM playbook_test_runs WHERE playbook_id = $1::uuid"
+                    " ORDER BY fixture_id, repeat_index",
+                    (self.playbook_id,),
+                ).rows
+            ],
+        )
+
+    def test_the_run_ids_it_reported_are_the_rows_that_were_filed(self):
+        # The command reports what `record_playbook_test_run` returned, so a
+        # repeat it claimed to file and did not would show up as a missing row
+        # rather than as a shorter list nobody compares to anything.
+        self.assertEqual(
+            sorted(
+                item["run_id"]
+                for result in self.reports.values()
+                for item in result.facts["runs"]
+            ),
+            sorted(
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT id::text FROM playbook_test_runs WHERE playbook_id = $1::uuid",
+                    (self.playbook_id,),
+                ).rows
+            ),
+        )
+
+    def test_every_program_it_reported_is_marked_against_the_half_it_graded(self):
+        # The run row carries no Program identifier -- it is a statement about a
+        # text, not about a Program -- so `evaluation_programs` is the only
+        # place the two meet, and this is what makes that join total.
+        self.assertEqual(
+            sorted(
+                (item["programs"][variant], fixture_id, variant)
+                for fixture_id, result in self.reports.items()
+                for item in result.facts["runs"]
+                for variant in evaluation.PAIR
+            ),
+            sorted(
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT e.program_id::text, e.fixture_id, e.variant FROM evaluation_programs e"
+                    " JOIN programs p ON p.id = e.program_id"
+                    " WHERE e.playbook_id = $1::uuid AND p.slug LIKE 'eval-%'",
+                    (self.playbook_id,),
+                ).rows
+            ),
+        )
+
+    def test_a_run_that_claimed_nothing_is_counted_as_nothing(self):
+        # The work asked the target and wrote no hypothesis, which is what a
+        # slice that finds nothing does. Every count derived from that is zero,
+        # including `tool_runs`: this evaluation went nowhere near the door.
+        self.assertEqual(
+            [("0",) * 7] * 6,
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT claims, ungrounded, fired_in_scope, out_of_scope, false_positives,"
+                    " discriminating_tp, tool_runs FROM playbook_test_runs"
+                    " WHERE playbook_id = $1::uuid",
+                    (self.playbook_id,),
+                ).rows
+            ],
+        )
+
+    def test_one_fixture_on_its_own_leaves_the_playbook_untested(self):
+        # What a single `rk playbook evaluate` earns: the binding is total, so a
+        # Playbook graded on its positive alone has not been graded.
+        self.assertEqual(
+            {
+                "verdict": "untested",
+                "reason": "1 fixture(s) in the binding have no run at this text",
+            },
+            self.after_one,
+        )
+
+    def test_a_playbook_that_found_nothing_fails_rather_than_passes(self):
+        self.assertEqual(
+            {
+                "verdict": "fail",
+                "reason": f"median discriminating finding < 1 on {self.OWN}",
+            },
+            self.reports[self.OUT].facts["verdict"],
+        )
+
+    def test_the_programs_it_opened_contribute_no_promotion_evidence(self):
+        # Twelve Programs, each with a produced selection's worth of surface if
+        # anything had been found, and none of them admissible: the marker is
+        # what keeps a graded run from being its own runtime provenance.
+        self.assertEqual(
+            0,
+            int(
+                str(
+                    self.connection.execute(
+                        "SELECT count(*) FROM playbook_promotion_evidence($1::uuid, NULL)",
+                        (self.playbook_id,),
+                    ).scalar()
+                )
+            ),
+        )
+
+    # -- what it refuses -------------------------------------------------------
+
+    def opened(self) -> int:
+        return int(
+            str(
+                self.connection.execute(
+                    "SELECT count(*) FROM programs WHERE slug LIKE 'eval-%'"
+                ).scalar()
+            )
+        )
+
+    def test_a_fixture_the_corpus_does_not_serve_is_refused_before_a_connection(self):
+        before = self.opened()
+        result = self.evaluate("object-ownership")
+        self.assertEqual(
+            [("invalid_configuration", "argument:--fixture")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        self.assertIn("is not in the fixture corpus", result.violations[0].detail)
+        self.assertEqual(before, self.opened())
+
+    def test_a_playbook_this_database_does_not_carry_is_refused(self):
+        before = self.opened()
+        result = self.evaluate(self.OWN, playbook="playbooks/invented/playbook.md")
+        self.assertEqual(
+            [("invalid_configuration", "argument:--playbook")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        self.assertEqual(before, self.opened())
+
+    def test_a_fixture_whose_programs_could_not_be_named_opens_none_of_them(self):
+        # Checked up front, so the refusal is all-or-nothing: a slug refused on
+        # the last repeat would leave a Playbook graded on the repeats that fit.
+        before = self.opened()
+        long_name = replace(fixture.FIXTURES[self.OWN], name="o" * 64)
+        result = self.evaluate(long_name.name, fixtures={long_name.name: long_name})
+        self.assertEqual(
+            [("invalid_configuration", "argument:--fixture")],
+            [(item.code, item.source) for item in result.violations],
+        )
+        self.assertIn("is not a Program name a configuration admits", result.violations[0].detail)
+        self.assertEqual(before, self.opened())
+
+    def test_a_program_that_already_grades_something_else_is_not_re_pointed(self):
+        # `_marking`'s other arm, which a resumed Program reaches: the marker is
+        # left alone and the work does not run, because the rows of a Program
+        # already counted as one fixture's evidence cannot also be another's.
+        attempted = []
+        subject = evaluation.Subject(
+            playbook=self.SHIPPED,
+            playbook_id=self.playbook_id,
+            playbook_sha256=self.playbook_sha,
+            fixture=fixture.FIXTURES[self.OUT],
+            work=lambda ledger, connection, program_id: attempted.append(program_id) or {},
+            corpus=migrate.CORPUS,
+        )
+        already = self.reports[self.OWN].facts["runs"][0]["programs"]["vulnerable"]
+        ledger = Ledger()
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                evaluation._marking(subject, "vulnerable")(ledger, self.connection, already)
+                raise Rollback
+        except Rollback:
+            pass
+        self.assertEqual([], attempted)
+        self.assertEqual(
+            [("invalid_configuration", "argument:--fixture")],
+            [(item.code, item.source) for item in ledger.violations],
+        )
+        self.assertIn(
+            f"already grades {self.OWN} (vulnerable)", ledger.violations[0].detail
+        )
 
 
 if __name__ == "__main__":

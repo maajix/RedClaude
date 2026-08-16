@@ -46,4 +46,6 @@ redkraken = [
     "skills/*/references/*",
     "playbooks/*/playbook.md",
     "playbooks/*/references/*",
+    "fixtures/*/fixture.md",
+    "fixtures/*/app.py",
 ]

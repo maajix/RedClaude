@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 import redkraken
-from redkraken import pg, verifier
+from redkraken import evaluation, pg, verifier
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -1680,6 +1680,106 @@ class EvidenceCommandTest(unittest.TestCase):
         self.assertEqual(
             EXIT_USAGE, run("evidence", "verify", str(self.bundle()), "--config", "x").returncode
         )
+
+
+class PlaybookCommandTest(unittest.TestCase):
+    """`rk playbook evaluate`, up to the point where a database is needed.
+
+    Three inputs and no configuration file, which is the shape of the thing: an
+    evaluation writes the Program documents it runs rather than being handed
+    one. An operator who could pass a configuration here could grade a Playbook
+    against a target of their own choosing and file the result as a test run.
+
+    The fixture is named and never described, for the same reason. Ground truth,
+    class binding and subject come out of the corpus the database digested, so
+    the only thing this command line can decide is which fixture -- not what it
+    is supposed to prove.
+    """
+
+    #: Both in the corpora the database digests -- `src/redkraken/playbooks/`
+    #: and `src/redkraken/fixtures/` -- so the refusals below are about the
+    #: connection and not about either name.
+    PLAYBOOK = "playbooks/object-ownership/playbook.md"
+    FIXTURE = "object-ownership-pair"
+
+    def arguments(self, *extra: str) -> tuple[str, ...]:
+        return (
+            "playbook", "evaluate",
+            "--playbook", self.PLAYBOOK,
+            "--fixture", self.FIXTURE,
+            "--workspace", str(scratch()),
+            *extra,
+        )
+
+    def test_the_store_is_the_only_thing_named_by_the_environment(self):
+        result = run(*self.arguments())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("playbook evaluate", report["command"])
+        self.assertEqual(
+            ["environment:RK_DATABASE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_an_evaluation_without_a_playbook_a_fixture_or_a_workspace_is_a_usage_error(self):
+        for missing, value in (
+            ("--playbook", self.PLAYBOOK),
+            ("--fixture", self.FIXTURE),
+            ("--workspace", None),
+        ):
+            with self.subTest(missing):
+                given = [
+                    item
+                    for item in self.arguments()
+                    if item != missing and item != value and not item.startswith("/")
+                ]
+
+                result = run(*given)
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn(missing, result.stderr)
+        self.assertEqual(EXIT_USAGE, run("playbook").returncode)
+
+    def test_a_fixture_outside_the_corpus_is_refused_before_a_connection_is_opened(self):
+        # The corpus is compiled into this process, so the name can be answered
+        # without the database -- and is, because an evaluation that connected
+        # first would hold a runtime connection open while deciding it had
+        # nothing to grade.
+        observed = observe(
+            *self.arguments(
+                "--fixture", "the-one-that-proves-my-playbook",
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+            )
+        )
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
+
+    def test_the_same_five_facts_are_answered_on_a_path_that_files_nothing(self):
+        result = run(*self.arguments("--url", "postgresql://rk2@127.0.0.1:1/rk2"))
+
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            ["fixture", "playbook", "repeats", "runs", "verdict"],
+            sorted(set(report) & set(evaluation.FACTS)),
+        )
+        self.assertEqual([], report["runs"])
+        self.assertIsNone(report["verdict"])
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(*self.arguments("--url", "postgresql://rk2@127.0.0.1:1/rk2"))
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("playbook evaluate", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            *self.arguments("--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2")
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
 
 
 class InterruptedCommandTest(unittest.TestCase):

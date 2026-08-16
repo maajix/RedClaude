@@ -22,6 +22,7 @@ from redkraken import (
     callback,
     decisions,
     doctor,
+    evaluation,
     evidence,
     execution,
     header,
@@ -954,6 +955,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     judging.set_defaults(run=_finding_validate)
 
+    playbooks = commands.add_parser(
+        "playbook", help="grade a Playbook against fixtures it did not choose"
+    )
+    grading = playbooks.add_subparsers(dest="operation", required=True, metavar="operation")
+
+    evaluating = grading.add_parser(
+        "evaluate",
+        help=(
+            "run one Playbook against one synthetic fixture for the configured "
+            "repeats and file each one, through the production Program, Agent "
+            f"and Test seams (${DATABASE_URL})"
+        ),
+    )
+    _add_url(evaluating, RUNTIME)
+    evaluating.add_argument(
+        "--playbook",
+        required=True,
+        metavar="path",
+        help="the Playbook to grade, by its corpus path",
+    )
+    evaluating.add_argument(
+        "--fixture",
+        required=True,
+        metavar="name",
+        help=(
+            "the fixture to grade it against, by directory name; the fixture's "
+            "own ground truth decides which side of the Playbook's test it is on"
+        ),
+    )
+    evaluating.add_argument(
+        "--workspace",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="an existing directory the per-repeat Program configurations are written into",
+    )
+    # The same second string `rk run` takes, for the same reason: each repeat is
+    # a Program `program.run` opens, and the work inside it is this machine's
+    # ordinary execution slice or nothing.
+    evaluating.add_argument(
+        AGENT.flag,
+        metavar="postgresql://...",
+        help=(
+            "the agent connection string each repeat's Mission packet is "
+            f"compiled on (default: ${AGENT.variable}); needed only when "
+            f"{execution.IMAGE} and the rest of the Agent boundary are set"
+        ),
+    )
+    evaluating.set_defaults(run=_playbook_evaluate)
+
     reports = commands.add_parser(
         "report", help="render what holds, for a Finding or for a kill chain"
     )
@@ -1506,6 +1557,50 @@ def _run(arguments: argparse.Namespace) -> int:
             execute=None if slice_ is None else slice_.attempt,
         ),
     )
+
+
+def _playbook_evaluate(arguments: argparse.Namespace) -> int:
+    """Grade one Playbook against one fixture, through the seams `rk run` uses.
+
+    The slice is built by the same helper and refused by the same rule, which is
+    criterion 6 in one line: an evaluation on a machine that describes no Agent
+    boundary opens its Programs and attempts nothing, exactly as a run against a
+    real target would. What it files then is zeroes, and the verdict follows from
+    them -- `untested` while a fixture in the binding has no run at this text,
+    and `fail` once they all do -- rather than from a result invented to fill the
+    repeats with.
+    """
+    ledger = Ledger()
+    slice_ = _slice(ledger, arguments)
+    if ledger.violations:
+        return _render(report(evaluation.RUN, ledger))
+    return _with_settings(
+        arguments,
+        evaluation.RUN,
+        lambda settings: evaluation.evaluate(
+            settings,
+            arguments.workspace,
+            playbook=arguments.playbook,
+            fixture_name=arguments.fixture,
+            work=_nothing if slice_ is None else slice_.attempt,
+        ),
+    )
+
+
+def _nothing(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
+    """The work a machine with no Agent boundary does inside an open Program.
+
+    `program.run` takes `execute=None` for this, but an evaluation cannot: the
+    marker that keeps this Program out of promotion evidence is written by the
+    wrapper around `execute`, and a Program opened with no callback at all would
+    be an unmarked one. So the callback is always passed and this is its floor --
+    the Program is opened and marked, and nothing is attempted in it.
+    """
+    ledger.hold(
+        "task",
+        f"nothing was attempted in {program_id}: this machine describes no Agent boundary",
+    )
+    return {}
 
 
 def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | None:
