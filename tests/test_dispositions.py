@@ -61,9 +61,10 @@ class DispositionLedgerTest(unittest.TestCase):
             # The per-kind lines are the census by disposition and do not move.
             # `built` and `promised` do, once per migration ticket: 48 built the
             # ten references the analyst's Skill owed, so ten rows crossed, 49
-            # built seven Playbooks and the eight pages hanging off them, and 50
-            # built eight more Playbooks and their eight pages.
-            "  total               223   built 80  promised 91  retired 52",
+            # built seven Playbooks and the eight pages hanging off them, 50
+            # built eight more Playbooks and their eight pages, and 51 built
+            # four Playbooks and the five pages hanging off them.
+            "  total               223   built 89  promised 82  retired 52",
             self.report,
         )
 
@@ -147,10 +148,14 @@ class DispositionRowTest(unittest.TestCase):
         self.assertEqual("built", self.state(BUILT))
 
     def test_a_row_that_names_an_open_migration_ticket_is_promised(self):
+        # The example moves on every migration ticket: once 51 shipped
+        # `api-authorization`, a row citing `ticket:51` for it stopped being a
+        # promise and became a row that should cite its proof. 52 is the next
+        # open one, and `browser-framing` is a topic it has not built yet.
         self.assertEqual(
             "promised",
             self.state(
-                broken(replacement="playbook:api-authorization", verification="ticket:51"),
+                broken(replacement="playbook:browser-framing", verification="ticket:52"),
                 kind="playbook_topic",
             ),
         )

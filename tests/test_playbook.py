@@ -451,6 +451,7 @@ class Corpus(unittest.TestCase):
             [
                 "agentic-ai",
                 "api",
+                "api-authorization",
                 "attack-surface",
                 "authentication",
                 "cookies",
@@ -461,7 +462,10 @@ class Corpus(unittest.TestCase):
                 "jwt-jose",
                 "oauth",
                 "object-ownership",
+                "payment-workflows",
+                "race-conditions",
                 "realtime",
+                "routing",
                 "webauthn",
                 "webhooks",
                 "workload-identities",
@@ -478,6 +482,7 @@ class Corpus(unittest.TestCase):
             {
                 "agentic-ai": ("llm.md",),
                 "api": ("api-soap.md", "api.md", "rate-limit-bypass.md"),
+                "api-authorization": ("idor.md", "uuids.md"),
                 "attack-surface": ("auto-scanners.md", "cves.md", "ffuf.md"),
                 "authentication": ("cloud-aws-cognito.md", "http-attacks-password-reset.md",
                                    "sign-up-login-register.md", "type-juggling.md"),
@@ -486,6 +491,8 @@ class Corpus(unittest.TestCase):
                 "jwt-jose": ("jwt.md",),
                 "oauth": ("oauth2-attack-via-google-oauth2-playground.md", "oauth2.md"),
                 "object-ownership": ("why-two-identities.md",),
+                "race-conditions": ("race-conditions-and-timing-attacks.md",),
+                "routing": ("http-attacks-verb-tampering.md", "status-code-bypass.md"),
             },
             {
                 name: tuple(reference.name for reference in one.references)

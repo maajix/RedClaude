@@ -32660,23 +32660,41 @@ class PlaybookSelectionTest(DatabaseCase):
 CORPUS_SLUG = "selftest-corpus"
 
 
+@dataclass(frozen=True)
+class Surface:
+    """Everything one Playbook's subject is built from, in the table below."""
+
+    kind: str
+    technology: str | None
+    method: str
+    path: str
+    authenticated: bool | None
+    #: `(location, value_class)`, or None for a route that carries nothing.
+    parameter: tuple[str, str] | None
+    #: Defaulted because only the one Playbook that triggers on `json_request`
+    #: needs it, and a recon pass records nothing here for a route it never saw
+    #: a typed body on.
+    request_content_type: str | None = None
+
+
 class PlaybookCorpusSelectionTest(DatabaseCase):
-    """PH2-49 criterion 5 and PH2-50 criterion 6: every shipped Playbook, on the
-    Surface it describes.
+    """PH2-49 criterion 5, PH2-50 criterion 6 and PH2-51 criterion 1: every
+    shipped Playbook, on the Surface it describes.
 
     The class above asks what the selection does with one Playbook. This one
     asks what the catalogue does: "All seven are loadable by an allowed
     production role, selectable on matching Surface and absent from non-matching
-    bounded context", and 050's "all eight exact hashes pass loadability,
-    selection ... gates" is the same three claims over its own eight topics, so
-    they are checked here together rather than in two tables that could
-    disagree. Three claims, and the third is the one a corpus fails
+    bounded context", 050's "all eight exact hashes pass loadability,
+    selection ... gates" is the same three claims over its own eight topics, and
+    051's "complete trigger ... metadata" is the third of them over its own
+    four, so they are checked here together rather than in three tables that
+    could disagree. Three claims, and the third is the one a corpus fails
     quietly -- a Playbook whose trigger list is loose matches subjects it has
     nothing to say about, and nothing in the selection can tell, because
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same sixteen subjects at a `constrained` ceiling, where
+    criterion 5: the same twenty subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -32699,39 +32717,53 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
 
     settings_for = "migrate"
 
-    #: One Surface per Playbook, as `(application kind, technology, method,
-    #: path, auth_required, parameter)`, where the parameter is `(location,
-    #: value_class)`. `spa` is the neutral Application kind: three Playbooks key
-    #: on the kind and none of them keys on that one, so a Surface that is not
-    #: about the Application shape says so by being an `spa`.
+    #: One Surface per Playbook. `spa` is the neutral Application kind: three
+    #: Playbooks key on the kind and none of them keys on that one, so a Surface
+    #: that is not about the Application shape says so by being an `spa`.
     SURFACES = {
-        "agentic-ai": ("spa", "llm", "POST", "/assistant", True, ("body", "text")),
-        "api": ("api", None, "GET", "/api/v1/documents", True, ("query", "text")),
+        "agentic-ai": Surface("spa", "llm", "POST", "/assistant", True, ("body", "text")),
+        "api": Surface("api", None, "GET", "/api/v1/documents", True, ("query", "text")),
+        # A path segment that names an object and a write against it, with the
+        # segment left untyped: an identifier a recon pass could classify would
+        # make this the object-ownership Surface as well.
+        "api-authorization": Surface("spa", None, "POST", "/orders/{reference}/cancel",
+                                     True, ("path", "text")),
         # The one unauthenticated Surface, which is what this Playbook is for:
         # what a reader can reach before presenting anything.
-        "attack-surface": ("spa", None, "GET", "/openapi.json", False, None),
-        "authentication": ("spa", None, "POST", "/session", False, ("body", "email")),
+        "attack-surface": Surface("spa", None, "GET", "/openapi.json", False, None),
+        "authentication": Surface("spa", None, "POST", "/session", False, ("body", "email")),
         # Two cookie-bearing Surfaces, told apart by method rather than by
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
-        "cookies": ("spa", None, "GET", "/account", True, ("cookie", "text")),
-        "graphql": ("graphql", None, "POST", "/graphql", True, ("body", "text")),
-        "grpc": ("spa", "grpc", "POST", "/billing.Admin/ListAll", True, ("body", "text")),
-        "identity-lifecycle": ("spa", None, "POST", "/session/logout", True,
-                               ("cookie", "text")),
-        "identity-parsing": ("spa", "saml", "POST", "/sso/acs", False, ("body", "text")),
-        "jwt-jose": ("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
+        "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", "text")),
+        "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", "text")),
+        "grpc": Surface("spa", "grpc", "POST", "/billing.Admin/ListAll", True,
+                        ("body", "text")),
+        "identity-lifecycle": Surface("spa", None, "POST", "/session/logout", True,
+                                      ("cookie", "text")),
+        "identity-parsing": Surface("spa", "saml", "POST", "/sso/acs", False,
+                                    ("body", "text")),
+        "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
         # The two Surfaces whose authentication nobody has established, which is
         # where a callback and a machine-to-machine route sit before an Identity
         # has been leased against them.
-        "oauth": ("spa", "oauth", "GET", "/oauth/callback", None, ("query", "text")),
-        "object-ownership": ("spa", None, "GET", "/notes/{id}", True, ("path", "integer_id")),
-        "realtime": ("websocket", None, "GET", "/socket", True, None),
-        "webauthn": ("spa", "webauthn", "POST", "/account/recovery-email", True,
-                     ("body", "text")),
-        "webhooks": ("spa", None, "POST", "/webhooks", True, ("body", "url")),
-        "workload-identities": ("spa", None, "GET", "/internal/metrics", None,
-                                ("header", "text")),
+        "oauth": Surface("spa", "oauth", "GET", "/oauth/callback", None, ("query", "text")),
+        "object-ownership": Surface("spa", None, "GET", "/notes/{id}", True,
+                                    ("path", "integer_id")),
+        # The three writes with a body, which nothing above tells apart. The
+        # value class does it for the first, the content type for the second,
+        # and the redirect arranged below for the third.
+        "payment-workflows": Surface("spa", None, "POST", "/cart/items", True,
+                                     ("body", "number")),
+        "race-conditions": Surface("spa", None, "POST", "/coupons/redeem", True,
+                                   ("body", "text"), "application/json"),
+        "realtime": Surface("websocket", None, "GET", "/socket", True, None),
+        "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
+        "webauthn": Surface("spa", "webauthn", "POST", "/account/recovery-email", True,
+                            ("body", "text")),
+        "webhooks": Surface("spa", None, "POST", "/webhooks", True, ("body", "url")),
+        "workload-identities": Surface("spa", None, "GET", "/internal/metrics", None,
+                                       ("header", "text")),
     }
 
     @classmethod
@@ -32760,7 +32792,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: four of the sixteen
+        whole Program -- and it is also the harder one: five of the twenty
         Playbooks key on it, so the fact cannot be what tells them apart.
 
         The tenants are the same argument one fact later. `tenant_boundary` is a
@@ -32806,47 +32838,91 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                     (cls.program_id, account, organisation),
                 )
             cls.subjects = {name: cls.surface(name) for name in cls.SURFACES}
+            cls.lead_into_the_routing_subject()
+
+    @classmethod
+    def base_url(cls, name: str) -> str:
+        """One Application per Playbook, so a Surface is reachable by name."""
+        return f"http://{name}.{HOST}"
 
     @classmethod
     def surface(cls, name: str) -> str:
         """The Application, the technology it runs and the one endpoint on it."""
-        kind, technology, method, path, authenticated, parameter = cls.SURFACES[name]
-        base_url = f"http://{name}.{HOST}"
+        one = cls.SURFACES[name]
+        base_url = cls.base_url(name)
         application = cls.entity("application", f"application:{base_url}")
         cls.connection.execute(
             "INSERT INTO applications (entity_id, base_url, kind) VALUES ($1::uuid, $2, $3)",
-            (application, base_url, kind),
+            (application, base_url, one.kind),
         )
-        if technology is not None:
-            running = cls.entity("technology", f"technology:{base_url}:{technology}")
+        if one.technology is not None:
+            running = cls.entity("technology", f"technology:{base_url}:{one.technology}")
             cls.connection.execute(
                 "INSERT INTO technologies (entity_id, name) VALUES ($1::uuid, $2)",
-                (running, technology),
+                (running, one.technology),
             )
             cls.connection.execute(
                 "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
                 " VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
                 (cls.program_id, application, running),
             )
-        endpoint = cls.entity("endpoint", f"endpoint:{method} {base_url}{path}")
+        endpoint = cls.entity("endpoint", f"endpoint:{one.method} {base_url}{one.path}")
         cls.connection.execute(
             "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
-            " auth_required) VALUES ($1::uuid, $2::uuid, $3, $4, $5)",
-            (endpoint, application, method, path, authenticated),
+            " auth_required, request_content_type)"
+            " VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
+            (
+                endpoint,
+                application,
+                one.method,
+                one.path,
+                one.authenticated,
+                one.request_content_type,
+            ),
         )
-        if parameter is not None:
-            location, value_class = parameter
+        if one.parameter is not None:
+            location, value_class = one.parameter
             cls.connection.execute(
                 "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
                 " VALUES ($1::uuid, $2::uuid, 'subject', $3, $4)",
                 (
-                    cls.entity("parameter", f"parameter:{base_url}{path}"),
+                    cls.entity("parameter", f"parameter:{base_url}{one.path}"),
                     endpoint,
                     location,
                     value_class,
                 ),
             )
         return endpoint
+
+    @classmethod
+    def lead_into_the_routing_subject(cls):
+        """The step before the routing subject, which is what makes it a step.
+
+        `flow_step` is read at the far end of a `redirects_to`, so it is the
+        one trigger fact in this table that a Surface cannot carry by itself:
+        something else has to point at it. This is the payment step of the same
+        checkout, on the same Application, which is where the fixture that
+        grades this Playbook puts it.
+
+        It is a second endpoint rather than a second Surface because nothing
+        asserts about it: it carries `redirect_target`, which no Playbook in
+        the catalogue triggers on, and the assertions below walk `SURFACES`.
+        """
+        method, path = "POST", "/checkout/pay"
+        payment = cls.entity(
+            "endpoint", f"endpoint:{method} {cls.base_url('routing')}{path}"
+        )
+        cls.connection.execute(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) SELECT $1::uuid, application_id, $2, $3, true"
+            "   FROM endpoints WHERE entity_id = $4::uuid",
+            (payment, method, path, cls.subjects["routing"]),
+        )
+        cls.connection.execute(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'redirects_to')",
+            (cls.program_id, payment, cls.subjects["routing"]),
+        )
 
     @classmethod
     def entity(cls, kind: str, dedup: str) -> str:
@@ -32915,6 +32991,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
             {
                 "agentic-ai": ["web_hunter"],
                 "api": ["web_hunter"],
+                "api-authorization": ["web_hunter"],
                 "attack-surface": ["recon"],
                 "authentication": ["web_hunter"],
                 "cookies": ["web_hunter"],
@@ -32925,7 +33002,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "jwt-jose": ["web_hunter"],
                 "oauth": ["web_hunter"],
                 "object-ownership": ["web_hunter"],
+                "payment-workflows": ["web_hunter"],
+                "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
+                "routing": ["web_hunter"],
                 "webauthn": ["web_hunter"],
                 "webhooks": ["web_hunter"],
                 "workload-identities": ["web_hunter"],
