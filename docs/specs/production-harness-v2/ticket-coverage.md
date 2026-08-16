@@ -51,6 +51,15 @@ refuses a validate or a report that adds none. Neither names a blocker, because
 nothing blocks them -- no test had reached either until a fixture claimed one
 Task of every kind in one Program and then purged it.
 
+Tickets 76 through 80 were raised after this re-measurement and are in none of the
+counts above: the table says 75 files because that is what was measured on the
+date it names. They are research and follow-up work rather than plan coverage --
+76 through 78 from implementation reviews, 79 to mine public disclosures for
+techniques the corpus lacks, 80 to measure the documented multiagent failure
+modes against this roster. Like 67 through 75, nothing downstream names them, so
+they are sinks beside 65 and not work the release depends on. The next
+re-measurement is what moves the table, not this paragraph.
+
 ## Implementation progress
 
 | Measure | Value |
