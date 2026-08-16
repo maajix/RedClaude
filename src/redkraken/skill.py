@@ -1,0 +1,616 @@
+"""The Skill corpus: instructions that steer, compiled against authority they cannot widen.
+
+A Skill is text a model loads mid-run. That is the whole of what it is, and the
+whole of the risk: loading it changes what the model knows and must not change
+what the model may do. The SDK offers no containment here -- `AgentDefinition.skills`
+is a selection list, the `Skill` tool takes a name, and the instructions that
+come back are just tokens. So containment is built on this side, in three
+places that are deliberately not one:
+
+* **This module** decides whether the corpus is well-formed. It parses each
+  `SKILL.md`, refuses metadata it cannot read, refuses a key that would give
+  instructions authority over the frame they load into, hashes every file the
+  skill owns, and publishes `SKILLS`. It knows nothing about roles or tools
+  beyond their spelling, which is why `roster` can import it.
+* **`roster._check_skills`** decides whether the corpus fits the authority the
+  roles hold: that every role a skill names exists and can execute a skill at
+  all, that every tool group it needs is a group that role already holds, and
+  that an `allowed-tools` line only ever narrows. It fills `Role.skills` from
+  the corpus, so which role may load which Skill is stated once -- in the
+  corpus -- rather than twice with a hope that the two agree.
+* **`roster.Gate`** decides, at the call, whether the name in a `Skill` call is
+  one the running role holds. That is the only one of the three that runs while
+  a model is running, and it is the one that cannot be argued with.
+
+What a skill is *named* is part of the design and not a convention. A skill is a
+technique -- enumerating a surface, pairing identities, comparing responses,
+taking browser evidence, reading source, handling untrusted content -- and never
+a vulnerability family or a workflow. (Not "capability": `CONTEXT.md` reserves
+that word for what a run obtains against a target, and a Skill obtains nothing.)
+A skill called `injection` is a bucket a
+model fills with whatever it already believed; a skill called `compare-responses`
+is a thing that either happened or did not, and its output is checkable. The
+corpus is the enumeration, so the rule is enforced by there being no such
+directory rather than by a check that would have to recognise a family name.
+
+**Version is computed, never declared.** A skill's version is the digest of its
+own dependency manifest: every file it owns, its kind, its path and its SHA-256,
+in one order. A hand-written `version:` line is a second statement of identity
+that drifts from the first the moment somebody edits a script and forgets, and
+the thing a Task needs to record is not what the author believed the version was
+but what actually ran. `docs/prototype/skill-format/SKILL-FORMAT.md` settled
+this in the same words: content hash, no semver, no pinning.
+
+**Determinism lives in scripts, and a script carries its own checks.** A script
+takes stored Artifacts and nothing else -- that is the whole of what
+`mcp__rk2__run_skill_script` can hand it -- and each one declares cases: the
+Artifact text in, the exact JSON out. `check` runs a case twice under a bare
+environment and refuses if the two runs disagree, because a script whose output
+depends on the run is a script whose evidence is not reproducible.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+#: The corpus, inside the package rather than beside it. The reason is the one
+#: the migration corpus already has: `rk` runs what it was installed with, and a
+#: directory at the repository root ships in a checkout and not in a wheel.
+CORPUS = Path(__file__).resolve().parent / "skills"
+
+INSTRUCTIONS = "SKILL.md"
+SCRIPT_DIR = "scripts"
+REFERENCE_DIR = "references"
+FENCE = "---"
+
+#: The name a skill answers to, which is its directory's. Narrower than the
+#: `skills.name` column allows on purpose: this is the pattern
+#: `mcp__rk2__run_skill_script.skill_name` accepts, and a skill the tool cannot
+#: name is a skill whose scripts cannot be run.
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+#: A file inside a skill. It is a name and never a path: no separator, no
+#: parent, no leading dot. Checked in `_resolved` and nowhere else, so that
+#: "is this a file inside the skill" has one answer with one refusal code
+#: however the file came to be declared.
+FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
+#: What a list entry has to be before anything more specific is asked of it.
+#: `bb:references` uses it because the shape of a file name is `_resolved`'s
+#: question and this one is only about the list being a list of scalars.
+ENTRY = re.compile(r"^\S.*$")
+
+#: `evidence_profiles.id` and `offline_tools.tool`, restated where the corpus
+#: names them. Both are checked for real against the database by the standing
+#: check the migration installs; these only refuse a value that could not be
+#: either.
+PROFILE = re.compile(r"^[a-z0-9_]+$")
+RUNTIME_TOOL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+#: `roles.role`, restated the same way and for the same reason.
+ROLE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+#: A frontmatter key. `bb:` is a namespace and not a special case -- the probe
+#: in `docs/prototype/skill-format/README.md` measured exactly this prefix
+#: surviving the CLI's own parse on 2.1.224, so it is the one extension point
+#: this corpus is allowed to have evidence for.
+KEY = re.compile(r"^[a-z][a-z0-9_]*(?:[-:][a-z0-9_]+)*$")
+
+#: `roster.TOOL_GROUPS`' keys and the tool names inside them, as spellings. Which
+#: groups exist and which role holds them is `roster._check_skills`' question;
+#: this only refuses a string that is not a group name or a tool name at all.
+TOOL_GROUP = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
+TOOL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+#: A description is one line and it is a selection criterion, so it has a
+#: ceiling. What is above the ceiling is not a description, it is the skill.
+DESCRIPTION_LIMIT = 1024
+
+#: How long one synthetic check may take. A script that needs longer than this
+#: over a synthetic input is not a deterministic transform.
+CHECK_TIMEOUT = 30
+
+#: Keys a skill may state. `description` is the SDK's and required; the rest of
+#: the SDK's own vocabulary is either forbidden below or absent from this corpus
+#: on purpose.
+REQUIRED_KEYS = ("description", "bb:roles", "bb:tool_groups", "bb:evidence_profile")
+OPTIONAL_KEYS = ("allowed-tools", "bb:scripts", "bb:references", "bb:runtime-tools")
+
+#: Keys no skill may state, each with the reason it may not. The shape is
+#: `roster.FORBIDDEN_BUILTINS`' and so is the point: a prohibition that does not
+#: say what it is protecting is one nobody can argue with later.
+#:
+#: All four are ways a loaded instruction would reach past the text it is. The
+#: frame -- which model, which agent type, which turn -- is opened by the runtime
+#: from the roster before the model has read anything, and a skill that could
+#: edit it would be instructions granting themselves authority.
+FORBIDDEN_KEYS: dict[str, str] = {
+    "name": "identity is the directory name; a second one is a name that can drift from it",
+    "model": "which model a role runs is the roster's, decided before any instruction is read",
+    "agent": "loading instructions may not introduce an Agent type the roster never compiled",
+    "agents": "same",
+    "context": "`context: fork` runs the text in a frame the gate did not open",
+}
+
+#: What a dependency is, for the manifest the version is taken over.
+INSTRUCTION_KIND = "instruction"
+SCRIPT_KIND = "script"
+REFERENCE_KIND = "reference"
+KINDS = (INSTRUCTION_KIND, SCRIPT_KIND, REFERENCE_KIND)
+
+
+class SkillError(Exception):
+    """One reason the corpus does not compile, in the words a test names it by.
+
+    `code` exists so a negative test asserts the rule that fired rather than the
+    sentence it fired with: the sentence is for the operator reading the refusal
+    and is free to improve, the code is what the suite pins.
+    """
+
+    def __init__(self, code: str, subject: str, detail: str) -> None:
+        super().__init__(f"{code}: {subject}: {detail}")
+        self.code = code
+        self.subject = subject
+        self.detail = detail
+
+
+def digest(data: bytes) -> str:
+    """SHA-256, hex, lower case -- the one spelling every hash in this system has."""
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Dependency:
+    """One file a skill owns, as the version manifest records it."""
+
+    kind: str
+    path: str
+    sha256: str
+
+    def line(self) -> str:
+        return f"{self.kind} {self.path} {self.sha256}"
+
+
+@dataclass(frozen=True, slots=True)
+class Case:
+    """One synthetic check: these Artifacts in, exactly this JSON out.
+
+    `artifacts` is the text of each input; the runner hashes it rather than
+    letting the author state a digest, because a digest an author writes is a
+    digest that can be wrong about the bytes beside it.
+    """
+
+    artifacts: tuple[str, ...]
+    stdout: Any
+
+    def payload(self) -> str:
+        """The stdin envelope a checked script reads, defined here and nowhere else.
+
+        `mcp__rk2__run_skill_script` has a contract in `roster` and no handler
+        yet, so this is the only executable statement of the shape -- which is
+        why the checks run against it: whatever serves that tool later has to
+        produce this, and a script that reads something else fails here first.
+        """
+        return json.dumps(
+            {
+                "artifacts": [
+                    {"sha256": digest(text.encode("utf-8")), "text": text}
+                    for text in self.artifacts
+                ]
+            },
+            sort_keys=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Script:
+    """One checked script, and the cases that say what it does."""
+
+    name: str
+    description: str
+    cases: tuple[Case, ...]
+    path: Path
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class Skill:
+    """One compiled skill: the exact text, what it needs, and what it is."""
+
+    name: str
+    description: str
+    roles: tuple[str, ...]
+    tool_groups: tuple[str, ...]
+    evidence_profile: str
+    allowed_tools: tuple[str, ...]
+    runtime_tools: tuple[str, ...]
+    scripts: Mapping[str, Script]
+    references: tuple[str, ...]
+    #: The exact bytes of `SKILL.md`, which is what the PreToolUse hook hashes
+    #: and what a Task records. Kept as bytes rather than text so the digest and
+    #: the thing digested are one object.
+    source: bytes
+    sha256: str
+    dependencies: tuple[Dependency, ...]
+
+    @property
+    def version(self) -> str:
+        """The digest of the dependency manifest, which is this skill's identity.
+
+        Every file the skill owns, its kind, its path and its hash, one per
+        line in a fixed order. Editing a script moves this and leaves `sha256`
+        alone, which is the difference a Task needs to be able to record: the
+        instructions a model read, and everything that ran underneath them.
+        """
+        manifest = "".join(f"{item.line()}\n" for item in self.dependencies)
+        return digest(manifest.encode("utf-8"))
+
+
+def _scalar(name: str, key: str, raw: str) -> str:
+    """A plain value, restricted to what YAML and this parser must agree about.
+
+    The CLI reads these files as YAML and this module reads them line by line.
+    Two parsers over one document is a disagreement waiting for a value that
+    means different things to each, so the grammar here admits only values where
+    there is nothing to disagree about: no leading indicator character, no
+    `key: value` inside a value, no comment introducer. Anything richer is
+    written as JSON, which is a subset of YAML and so parses the same both ways.
+    """
+    if not raw:
+        raise SkillError("frontmatter_malformed", name, f"{key} has no value")
+    if raw[0] in "-?:,[]{}#&*!|>'\"%@`":
+        raise SkillError(
+            "frontmatter_malformed", name,
+            f"{key} starts with {raw[0]!r}, which YAML reads as structure; quote it as JSON",
+        )
+    if ": " in raw or raw.endswith(":"):
+        raise SkillError(
+            "frontmatter_malformed", name, f"{key} carries a colon YAML would read as a second key"
+        )
+    if " #" in raw:
+        raise SkillError(
+            "frontmatter_malformed", name, f"{key} carries a comment introducer"
+        )
+    return raw
+
+
+def _field(name: str, number: int, line: str) -> tuple[str, Any]:
+    if line != line.strip():
+        raise SkillError("frontmatter_malformed", name, f"line {number} is indented or padded")
+    key, colon, raw = line.partition(": ")
+    if not colon:
+        raise SkillError("frontmatter_malformed", name, f"line {number} is not `key: value`")
+    if not KEY.match(key):
+        raise SkillError("frontmatter_malformed", name, f"line {number}: {key!r} is not a key")
+    if raw.startswith(("[", "{", '"')):
+        try:
+            return key, json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise SkillError("frontmatter_malformed", name, f"{key}: {error}") from error
+    return key, _scalar(name, key, raw)
+
+
+def _frontmatter(name: str, text: str) -> dict[str, Any]:
+    """The fenced block at the top of `SKILL.md`, as a mapping."""
+    lines = text.split("\n")
+    if not lines or lines[0] != FENCE:
+        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} does not open with {FENCE}")
+    try:
+        end = lines.index(FENCE, 1)
+    except ValueError:
+        raise SkillError("frontmatter_malformed", name, "the frontmatter is never closed") from None
+    if end == 1:
+        raise SkillError("frontmatter_malformed", name, "the frontmatter is empty")
+    fields: dict[str, Any] = {}
+    for number, line in enumerate(lines[1:end], start=2):
+        key, value = _field(name, number, line)
+        if key in fields:
+            # A duplicate key is not a malformed line: every line parsed, and
+            # the file still says two things. Which one a parser keeps is a
+            # property of the parser, which is exactly why this refuses.
+            raise SkillError("duplicate_key", name, f"{key} is stated twice")
+        fields[key] = value
+    body = "\n".join(lines[end + 1:]).strip()
+    if not body:
+        raise SkillError("body_missing", name, "a skill whose body is empty teaches nothing")
+    return fields
+
+
+def _strings(name: str, key: str, value: Any, pattern: re.Pattern[str]) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise SkillError("value_malformed", name, f"{key} is a non-empty JSON array")
+    for item in value:
+        if not isinstance(item, str) or not pattern.match(item):
+            raise SkillError("value_malformed", name, f"{key} holds {item!r}, which is not a name")
+    if len(set(value)) != len(value):
+        raise SkillError("duplicate_entry", name, f"{key} names something twice")
+    if list(value) != sorted(value):
+        # Sorted, because the corpus is compared against database rows and
+        # against itself. An unordered list is a diff that moves for no reason.
+        raise SkillError("value_malformed", name, f"{key} is not in sorted order")
+    return tuple(value)
+
+
+def _case(name: str, script: str, entry: Any) -> Case:
+    if not isinstance(entry, dict):
+        raise SkillError("value_malformed", name, f"{script}: a check case is an object")
+    unknown = sorted(set(entry) - {"artifacts", "stdout"})
+    if unknown:
+        raise SkillError("value_malformed", name, f"{script}: a case does not take {unknown}")
+    if "artifacts" not in entry or "stdout" not in entry:
+        raise SkillError("value_malformed", name, f"{script}: a case states artifacts and stdout")
+    artifacts = entry["artifacts"]
+    if not isinstance(artifacts, list) or not all(isinstance(one, str) for one in artifacts):
+        raise SkillError("value_malformed", name, f"{script}: a case's artifacts are text")
+    return Case(tuple(artifacts), entry["stdout"])
+
+
+def _script(name: str, directory: Path, entry: Any) -> Script:
+    if not isinstance(entry, dict):
+        raise SkillError("value_malformed", name, "bb:scripts holds objects")
+    unknown = sorted(set(entry) - {"name", "description", "checks"})
+    if unknown:
+        raise SkillError("value_malformed", name, f"a script does not take {unknown}")
+    for required in ("name", "description", "checks"):
+        if required not in entry:
+            raise SkillError("value_malformed", name, f"a script states {required}")
+    script_name = entry["name"]
+    if not isinstance(script_name, str):
+        raise SkillError("value_malformed", name, f"{script_name!r} is not a script name")
+    description = entry["description"]
+    if not isinstance(description, str) or not description.strip():
+        raise SkillError("value_malformed", name, f"{script_name} has no description")
+    checks = entry["checks"]
+    if not isinstance(checks, list) or not checks:
+        # Criterion 3. A script with no case is deterministic behaviour nobody
+        # has run, which is the state this key exists to make impossible.
+        raise SkillError("check_missing", name, f"{script_name} declares no check")
+    path = _resolved(name, directory / SCRIPT_DIR, script_name)
+    return Script(
+        name=script_name,
+        description=description,
+        cases=tuple(_case(name, script_name, case) for case in checks),
+        path=path,
+        sha256=digest(path.read_bytes()),
+    )
+
+
+def _resolved(name: str, parent: Path, file_name: str) -> Path:
+    """One file inside a skill, or the reason it is not one.
+
+    Two rules rather than one, because they fail differently. The pattern
+    refuses a name that is a path -- `../`, an absolute path, a separator --
+    before anything touches the filesystem. Resolution refuses a name that is
+    not a path and reaches outside anyway, which on a filesystem means a
+    symbolic link: a corpus file that is a link into the container's own
+    credentials would pass every text rule in this module.
+    """
+    if not FILE_NAME.match(file_name):
+        raise SkillError("path_escape", name, f"{file_name!r} is not a file name")
+    candidate = parent / file_name
+    if candidate.is_symlink():
+        raise SkillError("path_escape", name, f"{file_name} is a symbolic link")
+    if not candidate.is_file():
+        raise SkillError("file_missing", name, f"{parent.name}/{file_name} is declared and absent")
+    resolved = candidate.resolve()
+    root = parent.resolve()
+    if not resolved.is_relative_to(root):
+        raise SkillError("path_escape", name, f"{file_name} resolves outside {parent.name}/")
+    return resolved
+
+
+def _listing(name: str, directory: Path) -> tuple[str, ...]:
+    """What is actually in `scripts/` or `references/`, refusing anything odd."""
+    if not directory.is_dir():
+        return ()
+    found = []
+    for entry in sorted(directory.iterdir()):
+        if not entry.is_file() or entry.is_symlink():
+            raise SkillError("stray_file", name, f"{directory.name}/{entry.name} is not a file")
+        if not FILE_NAME.match(entry.name):
+            raise SkillError("path_escape", name, f"{directory.name}/{entry.name} is not a file name")
+        found.append(entry.name)
+    return tuple(found)
+
+
+def _skill(directory: Path) -> Skill:
+    name = directory.name
+    if not NAME.match(name):
+        raise SkillError("name_invalid", name, "a skill is named the way run_skill_script names it")
+
+    source_path = directory / INSTRUCTIONS
+    if not source_path.is_file() or source_path.is_symlink():
+        raise SkillError("file_missing", name, f"there is no {INSTRUCTIONS}")
+    source = source_path.read_bytes()
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} is not UTF-8") from error
+    if "\r" in text:
+        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} carries a carriage return")
+
+    fields = _frontmatter(name, text)
+    for key, reason in FORBIDDEN_KEYS.items():
+        if key in fields:
+            raise SkillError("key_forbidden", name, f"{key}: {reason}")
+    unknown = sorted(set(fields) - set(REQUIRED_KEYS) - set(OPTIONAL_KEYS))
+    if unknown:
+        raise SkillError("key_unknown", name, f"nothing reads {unknown}")
+    missing = sorted(set(REQUIRED_KEYS) - set(fields))
+    if missing:
+        raise SkillError("key_missing", name, f"a skill states {missing}")
+
+    description = fields["description"]
+    if not isinstance(description, str) or not description.strip():
+        raise SkillError("description_missing", name, "a skill states what it is for")
+    if len(description) > DESCRIPTION_LIMIT:
+        raise SkillError(
+            "description_unbounded", name,
+            f"{len(description)} characters is the skill, not a criterion for loading it",
+        )
+
+    profile = fields["bb:evidence_profile"]
+    if not isinstance(profile, str) or not PROFILE.match(profile):
+        raise SkillError("value_malformed", name, f"{profile!r} is not an evidence profile id")
+
+    stray = sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.name not in (INSTRUCTIONS, SCRIPT_DIR, REFERENCE_DIR)
+    )
+    if stray:
+        raise SkillError("stray_file", name, f"nothing reads {stray}")
+
+    declared_scripts = fields.get("bb:scripts", [])
+    if not isinstance(declared_scripts, list):
+        raise SkillError("value_malformed", name, "bb:scripts is a JSON array")
+    scripts = tuple(_script(name, directory, entry) for entry in declared_scripts)
+    if len({script.name for script in scripts}) != len(scripts):
+        raise SkillError("duplicate_entry", name, "two scripts share a name")
+    references = (
+        _strings(name, "bb:references", fields["bb:references"], ENTRY)
+        if "bb:references" in fields else ()
+    )
+    reference_paths = {
+        reference: _resolved(name, directory / REFERENCE_DIR, reference)
+        for reference in references
+    }
+
+    # Both directions. A declared file that is absent is a skill that breaks
+    # when it is used; a present file nothing declares is material inside the
+    # mounted corpus that no rule here has looked at, and the version manifest
+    # would not cover it.
+    for directory_name, declared in (
+        (SCRIPT_DIR, {script.name for script in scripts}),
+        (REFERENCE_DIR, set(references)),
+    ):
+        undeclared = sorted(set(_listing(name, directory / directory_name)) - declared)
+        if undeclared:
+            raise SkillError("stray_file", name, f"{directory_name}/ carries undeclared {undeclared}")
+
+    dependencies = [Dependency(INSTRUCTION_KIND, INSTRUCTIONS, digest(source))]
+    dependencies += [
+        Dependency(SCRIPT_KIND, f"{SCRIPT_DIR}/{script.name}", script.sha256) for script in scripts
+    ]
+    dependencies += [
+        Dependency(REFERENCE_KIND, f"{REFERENCE_DIR}/{reference}", digest(path.read_bytes()))
+        for reference, path in reference_paths.items()
+    ]
+
+    return Skill(
+        name=name,
+        description=description,
+        roles=_strings(name, "bb:roles", fields["bb:roles"], ROLE),
+        tool_groups=_strings(name, "bb:tool_groups", fields["bb:tool_groups"], TOOL_GROUP),
+        evidence_profile=profile,
+        allowed_tools=(
+            _strings(name, "allowed-tools", fields["allowed-tools"], TOOL)
+            if "allowed-tools" in fields else ()
+        ),
+        runtime_tools=(
+            _strings(name, "bb:runtime-tools", fields["bb:runtime-tools"], RUNTIME_TOOL)
+            if "bb:runtime-tools" in fields else ()
+        ),
+        scripts=MappingProxyType({script.name: script for script in scripts}),
+        references=references,
+        source=source,
+        sha256=digest(source),
+        dependencies=tuple(sorted(dependencies, key=lambda one: (one.kind, one.path))),
+    )
+
+
+def check(skill: Skill, script: Script, case: Case) -> None:
+    """Run one synthetic case, twice, and refuse anything but the declared answer.
+
+    Twice because the word in the criterion is *deterministic*, and one run
+    cannot tell a transform from a coin. Under a bare environment and in an
+    empty directory, because a script that reads the ambient environment or a
+    file beside it is a script whose output is not a function of its input --
+    and `mcp__rk2__run_skill_script` gives it neither.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        answers = []
+        for _ in range(2):
+            try:
+                completed = subprocess.run(
+                    [sys.executable, str(script.path)],
+                    input=case.payload(),
+                    capture_output=True,
+                    text=True,
+                    timeout=CHECK_TIMEOUT,
+                    cwd=empty,
+                    env={"PATH": "/usr/bin:/bin", "PYTHONHASHSEED": "0"},
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise SkillError(
+                    "check_failed", skill.name, f"{script.name} did not finish in {CHECK_TIMEOUT}s"
+                ) from error
+            if completed.returncode != 0:
+                raise SkillError(
+                    "check_failed", skill.name,
+                    f"{script.name} exited {completed.returncode}: {completed.stderr.strip()}",
+                )
+            try:
+                answers.append(json.loads(completed.stdout))
+            except json.JSONDecodeError as error:
+                raise SkillError(
+                    "check_failed", skill.name, f"{script.name} did not write JSON: {error}"
+                ) from error
+    if answers[0] != answers[1]:
+        raise SkillError("check_failed", skill.name, f"{script.name} answered twice and differed")
+    if answers[0] != case.stdout:
+        raise SkillError(
+            "check_failed", skill.name,
+            f"{script.name} answered {json.dumps(answers[0], sort_keys=True)}",
+        )
+
+
+def check_all(skills: Mapping[str, Skill] | None = None) -> tuple[str, ...]:
+    """Every declared case in the corpus, and what was run, so a caller can count."""
+    ran = []
+    for skill in (skills if skills is not None else SKILLS).values():
+        for script in skill.scripts.values():
+            for ordinal, case in enumerate(script.cases, start=1):
+                check(skill, script, case)
+                ran.append(f"{skill.name}/{script.name}#{ordinal}")
+    return tuple(ran)
+
+
+def compile_corpus(root: Path = CORPUS) -> Mapping[str, Skill]:
+    """Parse and check every skill under `root`, or refuse.
+
+    Parameterised on the root so a test can compile a corpus it wrote rather
+    than the installed one. Nothing in the running system passes an argument.
+    """
+    if not root.is_dir():
+        raise SkillError("corpus_missing", str(root), "the installed package carries no skills")
+    # A skill's name is its directory's, so two skills cannot share one: the
+    # filesystem already refuses that, and `NAME` admits only lower case, so
+    # there is no pair of legal names a case-folding filesystem would merge
+    # either. The duplicates this corpus can express are inside a document --
+    # two scripts, two list entries, a key stated twice -- and each is refused
+    # where it is written.
+    compiled: dict[str, Skill] = {}
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            raise SkillError("stray_file", entry.name, "the corpus holds skill directories only")
+        skill = _skill(entry)
+        compiled[skill.name] = skill
+    if not compiled:
+        raise SkillError("corpus_missing", str(root), "a corpus with no skill in it")
+    return MappingProxyType(compiled)
+
+
+#: The compiled corpus, read-only, built at import so a bad corpus is never a
+#: running one. `roster` imports it and derives `Role.skills` from it.
+SKILLS: Mapping[str, Skill] = compile_corpus()

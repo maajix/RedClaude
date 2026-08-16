@@ -5,7 +5,7 @@ import re
 import unittest
 from unittest import mock
 
-from redkraken import roster
+from redkraken import roster, skill
 from tests import ROOT
 
 
@@ -179,14 +179,18 @@ class CompileTest(unittest.TestCase):
     def test_the_skill_tool_and_the_skill_grants_travel_together(self):
         # An empty grant list is read as every skill, so the tool with nothing
         # granted is the widest surface in the roster rather than the narrowest.
-        with mock.patch.dict(roster.ROLES, altered("recon", skills=())):
+        # Broken through the corpus, because the corpus is where the grants are
+        # stated: a role's `skills` is filled from it and cannot be set here.
+        thinned = {
+            name: one for name, one in skill.SKILLS.items() if "recon" not in one.roles
+        }
+        # `patch.dict` with nothing to change, because `_check_skills` writes
+        # the grants onto `ROLES` and the compile below fails after it: without
+        # a snapshot the roster would stay thinned for every test after this.
+        with mock.patch.dict(roster.ROLES), mock.patch.object(skill, "SKILLS", thinned):
             with self.compiling() as raised:
                 roster._compile()
         self.assertIn("no skill granted", str(raised.exception))
-
-        with mock.patch.dict(roster.ROLES, altered("orchestrator", skills=("injection",))):
-            with self.compiling():
-                roster._compile()
 
     def test_only_a_session_holds_the_delegation_tool(self):
         delegating = altered("recon", builtin_tools=(roster.SKILL, roster.DELEGATION))

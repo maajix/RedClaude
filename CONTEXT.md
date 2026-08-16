@@ -743,9 +743,13 @@ _Avoid_: Guard, preflight, health check, validation
 ## Knowledge
 
 **Skill**:
-An executable capability that lives in the repo, is versioned with the code, and
+An executable technique that lives in the repo, is versioned with the code, and
 is testable in CI. A playbook references skills; a skill never references a
-playbook.
+playbook. Named for what it does -- enumerating a surface, comparing responses,
+taking browser evidence -- and never for a vulnerability family or a workflow,
+because a family name is a bucket and a technique either ran or did not. Its
+version is the digest of its own dependency manifest, computed rather than
+declared, so what a Task records is what actually ran.
 _Avoid_: Tool, capability (a Capability is what a run obtains against a target,
 never what a Skill teaches), module
 

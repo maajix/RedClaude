@@ -1,5 +1,8 @@
 ---
 description: Authenticated target requests through a named RedKraken Identity. Use when testing logged-in reachability, comparing two leased Identities, or following redirects and subresources within an authenticated session.
+bb:roles: ["web_hunter"]
+bb:tool_groups: ["net.request", "state.propose", "state.read"]
+bb:evidence_profile: identity_differential
 ---
 
 # Use an Identity
@@ -18,7 +21,7 @@ the request.
 
 ## 2. Spend the lease
 
-Call `mcp__rk2__net_request` with `identity_slot` set to the chosen label. Send
+Call `mcp__rk2__http_request` with `identity_slot` set to the chosen label. Send
 only target semantics in the request headers and body; authentication fields
 belong to the proxy.
 

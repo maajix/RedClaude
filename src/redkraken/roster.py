@@ -34,10 +34,12 @@ import hashlib
 import json
 import re
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from types import MappingProxyType
 from typing import Any
+
+from . import skill as skills_module
 
 
 #: The observed inventory this roster is closed against, and the digest that
@@ -369,7 +371,6 @@ class Role:
     max_turns: int
     builtin_tools: tuple[str, ...]
     tool_groups: tuple[str, ...]
-    skills: tuple[str, ...]
     max_concurrent: int
     #: Migration 0019's column of the same name. True where the role's real
     #: ceiling is the number of free Identity leases rather than the number
@@ -377,6 +378,15 @@ class Role:
     #: Identity model exists to prevent. The clamp itself is the scheduler's,
     #: which is the only party that knows how many leases are free.
     clamp_to_identity_leases: bool = False
+    #: Derived, not written: `_check_skills` fills this from the Skill corpus at
+    #: import, and the table below states no skill at all. Which role may load
+    #: which Skill is a property of the Skill -- it is the `bb:roles` line in its
+    #: own frontmatter -- and stating it here as well would be a second list that
+    #: agrees with the first until somebody adds a skill and forgets. A field
+    #: with a default rather than a property, because the value is a fact about
+    #: the corpus that one walk establishes and every later reader shares; a
+    #: property would recompute it per read from a corpus this class cannot see.
+    skills: tuple[str, ...] = ()
 
     @property
     def executes_tasks(self) -> bool:
@@ -733,6 +743,14 @@ CONTRACTS: dict[str, Contract] = {
     ),
 }
 
+#: The one tool that starts a registered binary, and the closed set of binaries
+#: it starts, read off its contract rather than restated. A skill's
+#: `bb:runtime-tools` line is checked against exactly this, so the corpus and
+#: the gate cannot come to hold different opinions about which tools exist.
+RUN_TOOL = "mcp__rk2__run_tool"
+RUN_TOOL_GROUP = CONTRACTS[RUN_TOOL].group
+RUN_TOOL_NAMES: tuple[str, ...] = CONTRACTS[RUN_TOOL].arguments["tool"].enum
+
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
 #: that is neither granted nor refused here is a tool this roster has not
@@ -781,7 +799,6 @@ ROLES: dict[str, Role] = {
         # task, and the SDK reads an empty skill list as every skill, so the
         # tool is absent rather than granted with a bound that does not bind.
         tool_groups=("state.read", "sched.pick"),
-        skills=(),
         max_concurrent=1,
     ),
     "recon": Role(
@@ -794,7 +811,6 @@ ROLES: dict[str, Role] = {
         max_turns=60,
         builtin_tools=(SKILL,),
         tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
-        skills=("recon-surface", "recon-endpoints"),
         # Two recons on one surface collide on the same deduplication cell.
         max_concurrent=1,
     ),
@@ -808,7 +824,6 @@ ROLES: dict[str, Role] = {
         max_turns=120,
         builtin_tools=(SKILL,),
         tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
-        skills=("access-control", "injection", "business-logic", "auth-session"),
         max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:
         # two hunters sharing one upstream slot is the session mixing that the
@@ -830,7 +845,6 @@ ROLES: dict[str, Role] = {
         # through state.read and are analysed through exec.tool_run, so the
         # record of what it looked at is a row rather than a claim.
         tool_groups=("state.read", "state.propose", "exec.tool_run"),
-        skills=("js-bundle-analysis", "source-map-recovery"),
         max_concurrent=2,
     ),
     "validator": Role(
@@ -845,9 +859,9 @@ ROLES: dict[str, Role] = {
         # Not one built-in, and not one state read either: the packet is its
         # whole world, and a second tool is a second thing in it.
         builtin_tools=(),
+        # A Skill is technique. The validator judges, so it holds no Skill tool
+        # and the corpus names it in no `bb:roles` line.
         tool_groups=("validate.judge",),
-        # A Skill is technique. The validator judges.
-        skills=(),
         max_concurrent=1,
     ),
     "reporter": Role(
@@ -861,7 +875,6 @@ ROLES: dict[str, Role] = {
         max_turns=0,
         builtin_tools=(),
         tool_groups=(),
-        skills=(),
         max_concurrent=1,
     ),
 }
@@ -1405,12 +1418,92 @@ def _check_roles(measured: Mapping[str, Any]) -> None:
             raise RosterError(f"{name}: a model session takes at least one turn")
         if SKILL in role.builtin_tools and not role.skills:
             # An empty grant list is read as every skill, so a role holding the
-            # tool with nothing granted has the widest surface of all.
+            # tool with nothing granted has the widest surface of all. Only this
+            # direction is asked here: the other one -- a grant on a role with no
+            # tool to load it -- is `_check_skills`' `has no tool to load a skill
+            # with`, which runs first and is where the grant comes from, so a
+            # second refusal here could never fire.
             raise RosterError(f"{name}: holds Skill with no skill granted")
-        if role.skills and SKILL not in role.builtin_tools:
-            raise RosterError(f"{name}: was granted skills it has no tool to execute")
         if DELEGATION in role.builtin_tools and role.runs_as != SESSION:
             raise RosterError(f"{name}: only a session delegates")
+
+
+def _check_skills(corpus: Mapping[str, skills_module.Skill]) -> None:
+    """The Skill corpus, against the authority the roles already hold.
+
+    `skill` decides whether a `SKILL.md` is well-formed; this decides whether a
+    well-formed one fits. The split is deliberate: the corpus module knows what
+    a skill looks like and nothing about roles, which is what lets this one
+    import it rather than the other way round.
+
+    Five rules, and they are criterion 4 of the ticket in order. A skill names
+    only roles that exist and can execute one at all. A skill needs only tool
+    groups its every role already holds -- so instructions never reach for
+    authority the compile did not grant, and there is no "the skill requested
+    it" path that could grant it. A runtime tool it names is one `run_tool`
+    accepts, reached through the group that serves `run_tool`. An
+    `allowed-tools` line is a *narrowing* of what the skill itself declared, so
+    it can subtract and has nothing to add with. And nothing on that line is a
+    forbidden built-in, which is the one rule that would still matter if the
+    others were somehow satisfied: a skill that could put `Bash` in front of a
+    model has widened the runtime whatever its groups say.
+
+    It rewrites each `Role` with the tuple it derived, for `_check_task_kinds`'
+    reason: it is this walk that makes the mapping a mapping, and building it
+    anywhere else would be a second place for the corpus and the roster to
+    disagree.
+    """
+    granted: dict[str, list[str]] = {name: [] for name in ROLES}
+    for name, one in sorted(corpus.items()):
+        # What the skill says about itself first, so a skill naming a group
+        # that does not exist is reported as that rather than as every role
+        # failing to hold it.
+        unknown = sorted(set(one.tool_groups) - set(TOOL_GROUPS))
+        if unknown:
+            raise RosterError(f"skill {name}: {unknown} is not a tool group")
+        forbidden = sorted(set(one.allowed_tools) & set(FORBIDDEN_BUILTINS))
+        if forbidden:
+            raise RosterError(f"skill {name}: allowed-tools exposes {forbidden}")
+        if one.runtime_tools:
+            # A runtime tool is run through `run_tool`, whose `tool` argument is
+            # a closed enum. A skill naming something outside it is instructing
+            # a model to make a call the gate will refuse, which is a corpus
+            # that compiles and cannot be followed.
+            stranger = sorted(set(one.runtime_tools) - set(RUN_TOOL_NAMES))
+            if stranger:
+                raise RosterError(f"skill {name}: {stranger} is not a tool run_tool runs")
+            if RUN_TOOL_GROUP not in one.tool_groups:
+                raise RosterError(f"skill {name}: names runtime tools without {RUN_TOOL_GROUP}")
+
+        # The tools this skill's own declaration reaches, which is what an
+        # `allowed-tools` line has to be a subset of. Built from the groups
+        # rather than from what the roles hold: a role's other groups are
+        # authority this skill did not ask for, and a line that reached into
+        # them would be widening in every sense but the arithmetic one.
+        declared = {member for group in one.tool_groups for member in TOOL_GROUPS[group]}
+        for role_name in one.roles:
+            role = ROLES.get(role_name)
+            if role is None:
+                raise RosterError(f"skill {name}: {role_name} is not a roster role")
+            if role.rendered:
+                raise RosterError(f"skill {name}: {role_name} runs no model to read it")
+            if SKILL not in role.builtin_tools:
+                raise RosterError(f"skill {name}: {role_name} has no tool to load a skill with")
+            missing = sorted(set(one.tool_groups) - set(role.tool_groups))
+            if missing:
+                raise RosterError(f"skill {name}: {role_name} does not hold {missing}")
+            declared |= set(role.builtin_tools)
+            granted[role_name].append(name)
+
+        widening = sorted(set(one.allowed_tools) - declared)
+        if widening:
+            raise RosterError(f"skill {name}: allowed-tools widens to {widening}")
+
+    # Published only once every rule has held. A partial write would leave the
+    # roster describing a corpus that was refused, and `_compile` runs at import
+    # where there is nobody to catch the exception and put it back.
+    for name, role in ROLES.items():
+        ROLES[name] = replace(role, skills=tuple(sorted(granted[name])))
 
 
 def _check_task_kinds() -> None:
@@ -1532,9 +1625,17 @@ def _compile() -> Mapping[str, Any]:
     """Run every check once, at import, so a bad roster is not a running one."""
     measured = _load_inventory()
     _check_inventory(measured)
+    # Contracts first: they are what makes `TOOL_GROUPS` a partition of tools
+    # that exist, and the two checks after them measure the corpus and the
+    # roles against it. Asked in the other order, a group holding a tool
+    # nothing serves would be reported as a skill reaching for a tool nobody
+    # holds, which is a true sentence about the wrong table.
+    _check_contracts()
+    # Before `_check_roles`, which asks whether each role's skill list and its
+    # `Skill` tool agree -- and the list it asks about is the one this fills.
+    _check_skills(skills_module.SKILLS)
     _check_roles(measured)
     _check_task_kinds()
-    _check_contracts()
     _check_authority()
     return measured
 

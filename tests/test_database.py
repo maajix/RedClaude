@@ -83,6 +83,7 @@ from redkraken import (
     roster,
     scope,
     seal,
+    skill,
     state,
     tls,
     tool,
@@ -404,17 +405,76 @@ class CleanCreationTest(DatabaseCase):
             {item.identity: item.checksum for item in self.harness.migrations}, recorded
         )
 
-    def test_the_identity_skill_is_registered_for_the_web_hunter(self):
-        source = Path(__file__).parents[1] / "skills" / "use-identity" / "SKILL.md"
-        row = self.connection.execute(
-            "SELECT s.enabled, s.source_sha256, rs.role"
-            "  FROM skills s JOIN role_skills rs ON rs.skill_name = s.name"
-            " WHERE s.name = 'use-identity'"
+    def test_the_registry_holds_the_corpus_the_compiler_holds(self):
+        # The registry is a copy of the corpus, and a copy is only worth having
+        # if something compares it. Every column the migration writes by hand is
+        # here against the value the compiler derives from the files.
+        registered = {
+            name: (enabled, description, digest, version, profile)
+            for name, enabled, description, digest, version, profile in self.connection.execute(
+                "SELECT name, enabled, description, source_sha256, version,"
+                " evidence_profile_id FROM skills"
+            ).rows
+        }
+
+        self.assertEqual(
+            {
+                item.name: (
+                    True, item.description, item.sha256, item.version, item.evidence_profile
+                )
+                for item in skill.SKILLS.values()
+            },
+            registered,
+        )
+
+    def test_the_registry_holds_every_grant_dependency_and_runtime_tool(self):
+        grants = self.connection.execute(
+            "SELECT role, skill_name FROM role_skills ORDER BY role, skill_name"
+        ).rows
+        dependencies = self.connection.execute(
+            "SELECT skill_name, kind, path, sha256 FROM skill_dependencies"
+            " ORDER BY skill_name, kind, path"
+        ).rows
+        tools = self.connection.execute(
+            "SELECT skill_name, tool FROM skill_runtime_tools ORDER BY skill_name, tool"
         ).rows
 
         self.assertEqual(
-            ((True, artifact.digest(source.read_bytes()), "web_hunter"),), row
+            tuple(
+                (role, name)
+                for role, names in sorted(
+                    (name, one.skills) for name, one in roster.ROLES.items()
+                )
+                for name in names
+            ),
+            tuple(sorted(grants, key=lambda row: (row[0], row[1]))),
         )
+        self.assertEqual(
+            tuple(
+                (item.name, dependency.kind, dependency.path, dependency.sha256)
+                for item in skill.SKILLS.values()
+                for dependency in item.dependencies
+            ),
+            dependencies,
+        )
+        self.assertEqual(
+            tuple(
+                (item.name, name)
+                for item in skill.SKILLS.values()
+                for name in item.runtime_tools
+            ),
+            tools,
+        )
+
+    def test_the_server_recomputes_every_skill_version_for_itself(self):
+        # The migration wrote the versions Python computed. This asks the server
+        # to derive them from its own dependency rows, so the number in the
+        # column is checked arithmetic rather than a transcription.
+        drift = self.connection.execute(
+            "SELECT code, subject, detail FROM check_skill_registry()"
+        ).rows
+
+        self.assertEqual((), drift)
 
     def test_the_shipped_settings_reach_the_connection_the_gate_runs_on(self):
         # `apply_server_settings` is `ALTER DATABASE ... SET`, which only reaches
@@ -1507,6 +1567,30 @@ CONTROLS = (
         " FOR EACH ROW EXECUTE FUNCTION selftest_block_delete()",
     ),
     Control("standing:role_catalogue", "GRANT TRUNCATE ON entities TO rk2_runtime"),
+    # --- the Skill registry ---------------------------------------------------
+    Control(
+        # One file edited without the registry being told. This is the whole
+        # point of storing the manifest rather than the number: the version
+        # column still says what Python wrote, and the rows it is a digest of
+        # no longer hash to it.
+        "standing:skill_registry",
+        "UPDATE skill_dependencies SET sha256 = repeat('e', 64)"
+        " WHERE skill_name = 'compare-responses' AND path = 'scripts/compare.py'",
+    ),
+    Control(
+        # A skill in the image that no role can reach. Not dangerous, and not a
+        # skill either -- and the way a grant gets dropped is a role being
+        # edited, which leaves the instructions behind.
+        "standing:skill_registry",
+        "DELETE FROM role_skills WHERE skill_name = 'analyse-source'",
+    ),
+    Control(
+        # The predicate a registered profile names, dropped after the trigger
+        # that demanded it had already run. The profile stays legal to declare
+        # and raises at the one moment it is consulted.
+        "standing:skill_registry",
+        "DROP FUNCTION evidence_profile_browser_run_evidence(uuid)",
+    ),
     # --- artifacts a Program can reach ---------------------------------------
     Control(
         # Rule 1: the bytes go and the label that cites them stays. This is the
