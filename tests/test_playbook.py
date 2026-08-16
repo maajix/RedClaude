@@ -12,12 +12,14 @@ violation is to write the violation somewhere the corpus is not.
 """
 
 import datetime as dt
+import re
 import unittest
 from pathlib import Path
 
 from redkraken import playbook, roster, skill
 from redkraken.document import FENCE
 from tests.fixtures import frontmatter, scratch
+from tools import check_dispositions
 
 
 #: The smallest Playbook that compiles. Every negative below is this document
@@ -450,11 +452,19 @@ class Corpus(unittest.TestCase):
                 "agentic-ai",
                 "api",
                 "attack-surface",
+                "authentication",
+                "cookies",
                 "graphql",
                 "grpc",
+                "identity-lifecycle",
+                "identity-parsing",
+                "jwt-jose",
+                "oauth",
                 "object-ownership",
                 "realtime",
+                "webauthn",
                 "webhooks",
+                "workload-identities",
             ],
             sorted(self.corpus),
         )
@@ -469,7 +479,12 @@ class Corpus(unittest.TestCase):
                 "agentic-ai": ("llm.md",),
                 "api": ("api-soap.md", "api.md", "rate-limit-bypass.md"),
                 "attack-surface": ("auto-scanners.md", "cves.md", "ffuf.md"),
+                "authentication": ("cloud-aws-cognito.md", "http-attacks-password-reset.md",
+                                   "sign-up-login-register.md", "type-juggling.md"),
                 "graphql": ("api-graphql.md",),
+                "identity-parsing": ("saml.md",),
+                "jwt-jose": ("jwt.md",),
+                "oauth": ("oauth2-attack-via-google-oauth2-playground.md", "oauth2.md"),
                 "object-ownership": ("why-two-identities.md",),
             },
             {
@@ -486,6 +501,28 @@ class Corpus(unittest.TestCase):
                     path = playbook.CORPUS.parent / reference.path
                     self.assertTrue(path.is_file())
                     self.assertEqual(playbook.digest(path.read_bytes()), reference.sha256)
+
+    def test_no_shipped_document_names_a_property_class_the_vocabulary_lacks(self):
+        # A Playbook's `bb:outputs` is checked against `property_classes` by a
+        # foreign key at apply time. Its *prose* is not, and neither is a
+        # fixture's ground truth or a maintainer reference -- and those are
+        # where a Playbook says which neighbouring class a reading belongs to
+        # instead. A plausible name that no leaf carries sends the next reader
+        # to a class that does not exist, and nothing in the schema notices.
+        #
+        # Backticked `family.leaf` only, and only where the family is real: the
+        # corpus writes class names in backticks throughout, and the family
+        # filter is what keeps `app.py` and `fixture.md` out of the scan.
+        schema = check_dispositions.schema_text(Path(playbook.__file__).parents[2])
+        classes = check_dispositions.inserted_ids(schema, "property_classes")
+        families = check_dispositions.inserted_ids(schema, "property_class_families")
+        named = re.compile(r"`([a-z_]+\.[a-z_]+)`")
+        for tree in ("playbooks", "fixtures", "skills"):
+            for path in sorted((Path(playbook.__file__).parent / tree).rglob("*.md")):
+                for found in named.findall(path.read_text(encoding="utf-8")):
+                    if found.split(".")[0] in families:
+                        with self.subTest(document=path.name, named=found):
+                            self.assertIn(found, classes)
 
     def test_no_reference_text_reaches_a_shipped_projection(self):
         for name, one in self.corpus.items():

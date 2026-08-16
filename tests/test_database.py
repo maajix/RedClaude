@@ -32661,15 +32661,24 @@ CORPUS_SLUG = "selftest-corpus"
 
 
 class PlaybookCorpusSelectionTest(DatabaseCase):
-    """PH2-49 criterion 5: every shipped Playbook, on the Surface it describes.
+    """PH2-49 criterion 5 and PH2-50 criterion 6: every shipped Playbook, on the
+    Surface it describes.
 
     The class above asks what the selection does with one Playbook. This one
     asks what the catalogue does: "All seven are loadable by an allowed
     production role, selectable on matching Surface and absent from non-matching
-    bounded context." Three claims, and the third is the one a corpus fails
+    bounded context", and 050's "all eight exact hashes pass loadability,
+    selection ... gates" is the same three claims over its own eight topics, so
+    they are checked here together rather than in two tables that could
+    disagree. Three claims, and the third is the one a corpus fails
     quietly -- a Playbook whose trigger list is loose matches subjects it has
     nothing to say about, and nothing in the selection can tell, because
     matching is exactly what a trigger list is for.
+
+    A fourth reading comes off the same arrangement for free, and it is 050's
+    criterion 5: the same sixteen subjects at a `constrained` ceiling, where
+    every Playbook that asks for approval has to come back parked rather than
+    selected or missing.
 
     So the arrangement is one Program with one Surface per Playbook, each built
     to carry that Playbook's trigger facts and no other Playbook's. The
@@ -32701,11 +32710,28 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # The one unauthenticated Surface, which is what this Playbook is for:
         # what a reader can reach before presenting anything.
         "attack-surface": ("spa", None, "GET", "/openapi.json", False, None),
+        "authentication": ("spa", None, "POST", "/session", False, ("body", "email")),
+        # Two cookie-bearing Surfaces, told apart by method rather than by
+        # anything else: reading an account is where a scope claim can be made
+        # and logging out is where a lifetime claim can be.
+        "cookies": ("spa", None, "GET", "/account", True, ("cookie", "text")),
         "graphql": ("graphql", None, "POST", "/graphql", True, ("body", "text")),
         "grpc": ("spa", "grpc", "POST", "/billing.Admin/ListAll", True, ("body", "text")),
+        "identity-lifecycle": ("spa", None, "POST", "/session/logout", True,
+                               ("cookie", "text")),
+        "identity-parsing": ("spa", "saml", "POST", "/sso/acs", False, ("body", "text")),
+        "jwt-jose": ("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
+        # The two Surfaces whose authentication nobody has established, which is
+        # where a callback and a machine-to-machine route sit before an Identity
+        # has been leased against them.
+        "oauth": ("spa", "oauth", "GET", "/oauth/callback", None, ("query", "text")),
         "object-ownership": ("spa", None, "GET", "/notes/{id}", True, ("path", "integer_id")),
         "realtime": ("websocket", None, "GET", "/socket", True, None),
+        "webauthn": ("spa", "webauthn", "POST", "/account/recovery-email", True,
+                     ("body", "text")),
         "webhooks": ("spa", None, "POST", "/webhooks", True, ("body", "url")),
+        "workload-identities": ("spa", None, "GET", "/internal/metrics", None,
+                                ("header", "text")),
     }
 
     @classmethod
@@ -32728,27 +32754,56 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
 
     @classmethod
     def arrange(cls):
-        """One Application and one endpoint per Playbook, and two Identities.
+        """One Application and one endpoint per Playbook, two Identities, two
+        tenants.
 
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: four of the eight
+        whole Program -- and it is also the harder one: four of the sixteen
         Playbooks key on it, so the fact cannot be what tells them apart.
+
+        The tenants are the same argument one fact later. `tenant_boundary` is a
+        property of the Program, so putting the two accounts in two
+        organisations makes it true of every subject here at once and leaves
+        `workload-identities` to be picked out by the two facts that are about
+        the route. A tenant arranged only under that subject would let a loose
+        trigger list pass.
         """
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
             cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            for slot in ("first", "second"):
+            for slot, tenant in (("first", "alpha"), ("second", "beta")):
+                account = cls.entity("identity", f"identity:{slot}")
                 cls.connection.execute(
                     "INSERT INTO identities (entity_id, program_id, slot_name, class,"
                     " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'user', $4)",
                     (
-                        cls.entity("identity", f"identity:{slot}"),
+                        account,
                         cls.program_id,
                         f"{CORPUS_SLUG}-{slot}",
                         f"slot://identity/{CORPUS_SLUG}-{slot}",
                     ),
+                )
+                # The organisation an account belongs to is an Identity of class
+                # `service`, which is how the rest of the corpus spells a tenant.
+                # It is not a test account, so it does not count towards
+                # `multiple_test_identities`.
+                organisation = cls.entity("identity", f"identity:{tenant}")
+                cls.connection.execute(
+                    "INSERT INTO identities (entity_id, program_id, slot_name, class,"
+                    " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'service', $4)",
+                    (
+                        organisation,
+                        cls.program_id,
+                        f"{CORPUS_SLUG}-{tenant}",
+                        f"slot://identity/{CORPUS_SLUG}-{tenant}",
+                    ),
+                )
+                cls.connection.execute(
+                    "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id,"
+                    " type) VALUES ($1::uuid, $2::uuid, $3::uuid, 'member_of')",
+                    (cls.program_id, account, organisation),
                 )
             cls.subjects = {name: cls.surface(name) for name in cls.SURFACES}
 
@@ -32827,7 +32882,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
             ).rows
         ]
 
-    def selection(self, name: str, role: str) -> list[tuple[str, ...]]:
+    def selection(self, name: str, role: str, ceiling: str | None = None) -> list[tuple[str, ...]]:
         """The whole selection for one subject, at the Playbook's own ceiling."""
         return [
             tuple("" if field is None else str(field) for field in row[1:])
@@ -32837,7 +32892,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                     self.program_id,
                     self.subjects[name],
                     role,
-                    playbook.PLAYBOOKS[name].risk,
+                    ceiling or playbook.PLAYBOOKS[name].risk,
                 ),
             ).rows
         ]
@@ -32861,11 +32916,19 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "agentic-ai": ["web_hunter"],
                 "api": ["web_hunter"],
                 "attack-surface": ["recon"],
+                "authentication": ["web_hunter"],
+                "cookies": ["web_hunter"],
                 "graphql": ["web_hunter"],
                 "grpc": ["web_hunter"],
+                "identity-lifecycle": ["web_hunter"],
+                "identity-parsing": ["web_hunter"],
+                "jwt-jose": ["web_hunter"],
+                "oauth": ["web_hunter"],
                 "object-ownership": ["web_hunter"],
                 "realtime": ["web_hunter"],
+                "webauthn": ["web_hunter"],
                 "webhooks": ["web_hunter"],
+                "workload-identities": ["web_hunter"],
             },
             {name: sorted(self.loadable(name)) for name in sorted(self.SURFACES)},
         )
@@ -32881,6 +32944,36 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                     [(playbook.PLAYBOOKS[name].path, "1", "", "")],
                     self.selection(name, self.loadable(name)[0]),
                 )
+
+    def test_a_playbook_that_needs_approval_is_parked_under_a_constrained_ceiling(self):
+        # PH2-50 criterion 5: "risk effects correctly park credential-changing,
+        # session-mutating or third-party-impact actions when grants are
+        # absent." The test above selects each Playbook at its own ceiling,
+        # which is deliberately silent about the parking; this one holds the
+        # ceiling at `constrained` for the whole catalogue and reads the drop
+        # reason back.
+        #
+        # Parked rather than absent is the point. The row still comes back,
+        # carrying `risk_above_ceiling`, so an operator can see what a grant
+        # would buy instead of wondering why a subject matched nothing.
+        self.assertEqual(
+            {
+                name: [
+                    (
+                        playbook.PLAYBOOKS[name].path,
+                        "risk_above_ceiling"
+                        if playbook.PLAYBOOKS[name].risk == "approval_required"
+                        else "",
+                    )
+                ]
+                for name in sorted(self.SURFACES)
+            },
+            {
+                name: [(path, because) for path, _, because, _ in
+                       self.selection(name, self.loadable(name)[0], "constrained")]
+                for name in sorted(self.SURFACES)
+            },
+        )
 
     def test_no_playbook_reaches_a_subject_its_triggers_do_not_describe(self):
         # Both halves of criterion 5's last clause, in one comparison per
