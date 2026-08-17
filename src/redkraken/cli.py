@@ -31,6 +31,7 @@ from redkraken import (
     legacy,
     migrate,
     operator,
+    panels,
     pg,
     program,
     proxy,
@@ -39,6 +40,7 @@ from redkraken import (
     scope,
     state,
     tool,
+    ui,
     validation,
 )
 from redkraken.outcome import (
@@ -107,6 +109,12 @@ RUNTIME = _Source("connection_string", "--url", DATABASE_URL)
 AGENT = _Source("state_connection_string", "--state-url", STATE_URL)
 FENCE = _Source("connection_string", "--url", PROXY_DATABASE_URL)
 CONSOLE = _Source("connection_string", "--url", HUMAN_URL)
+
+#: The operator's connection where it is a command's second string rather than
+#: its only one. `rk ui serve` reads on the runtime's and acts on this one, so
+#: it needs both spellings at once -- and a console that took the operator's
+#: role under `--url` would be a console whose reads ran as the operator.
+OPERATOR = _Source("console_connection_string", "--console-url", HUMAN_URL)
 
 #: Where the door listens, which is neither a role nor a store. The capability
 #: is sent to this address and to nothing else, and `proxy.endpoint` refuses any
@@ -329,6 +337,128 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     inspect.set_defaults(run=_state)
+
+    console = commands.add_parser(
+        "ui",
+        help="the local operator console, and the reads behind it",
+    )
+    console_operations = console.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+
+    serving = console_operations.add_parser(
+        "serve",
+        help=(
+            "serve the local console over the reads and verbs of this surface "
+            f"(${DATABASE_URL}, ${STATE_URL} and ${HUMAN_URL})"
+        ),
+        description=(
+            "Open a console on this machine over the same operations `rk` "
+            "already exposes. It holds no query of its own: every view is one "
+            "of the reads below and every button is one of the operator verbs, "
+            "so a page and a command cannot come to mean different things. "
+            "Loopback only, and every form on it carries a token this process "
+            "alone holds."
+        ),
+    )
+    _add_url(serving, RUNTIME)
+    # Two further strings, for the two roles the console is not. The reads run
+    # as the runtime, the record index runs as the agent because that is whose
+    # isolation it is describing, and the verbs run as the operator.
+    serving.add_argument(
+        AGENT.flag,
+        metavar="postgresql://...",
+        help=f"the agent connection string the record index is read on (default: ${STATE_URL})",
+    )
+    serving.add_argument(
+        OPERATOR.flag,
+        metavar="postgresql://...",
+        help=f"the operator connection string the verbs run on (default: ${HUMAN_URL})",
+    )
+    serving.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the one Program this console is about",
+    )
+    serving.add_argument(
+        "--host",
+        default=ui.DEFAULT_HOST,
+        metavar="address",
+        help=f"the address to listen on (default: {ui.DEFAULT_HOST})",
+    )
+    serving.add_argument(
+        "--port",
+        type=int,
+        default=ui.DEFAULT_PORT,
+        metavar="port",
+        help=f"the port to listen on (default: {ui.DEFAULT_PORT})",
+    )
+    serving.add_argument(
+        "--limit",
+        type=int,
+        default=panels.DEFAULT_ROWS,
+        metavar="n",
+        help=f"rows per panel on the overview (default: {panels.DEFAULT_ROWS})",
+    )
+    serving.set_defaults(run=_ui_serve)
+
+    reading = console_operations.add_parser(
+        "read",
+        help=f"print the console's panels as a report (${DATABASE_URL})",
+        description=(
+            "The operational reads the console is built on, in the shape every "
+            "other command answers in. `rk state` is the model's read of its "
+            "own records; this is the operator's read of everything that is not "
+            "a record -- the Program's lifecycle and integrity, the slates, the "
+            "runs, the leases, the budgets, the chains and the documents on "
+            "file. Each panel is bounded and says how much it did not return."
+        ),
+    )
+    _add_url(reading, RUNTIME)
+    reading.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program to read",
+    )
+    reading.add_argument(
+        "--panel",
+        action="append",
+        default=[],
+        dest="panels",
+        choices=panels.NAMES,
+        metavar="name",
+        help=(
+            f"read one panel; repeatable, and all of {', '.join(panels.NAMES)} "
+            "are read when none is named"
+        ),
+    )
+    reading.add_argument(
+        "--limit",
+        type=int,
+        default=panels.DEFAULT_ROWS,
+        metavar="n",
+        help=f"rows per panel (default: {panels.DEFAULT_ROWS})",
+    )
+    reading.set_defaults(run=_ui_read)
+
+    listing = console_operations.add_parser(
+        "forms",
+        help=f"print the report forms a report may be asked for (${DATABASE_URL})",
+        description=(
+            "The report forms this installation carries, in the shape every "
+            "other command answers in. The console's report page offers these as "
+            "a chooser, and it is a read of the CLI's rather than a query of the "
+            "page's own: a form belongs to the installation and not to a "
+            "Program, so it takes no configuration and names nothing a Program "
+            "holds."
+        ),
+    )
+    _add_url(listing, RUNTIME)
+    listing.set_defaults(run=_ui_forms)
 
     identities = commands.add_parser(
         "identity",
@@ -1836,6 +1966,74 @@ def _state(arguments: argparse.Namespace) -> int:
                 label=arguments.label,
                 per_kind=arguments.limit,
                 byte_limit=arguments.byte_limit,
+            ),
+        )
+    )
+
+
+def _ui_read(arguments: argparse.Namespace) -> int:
+    """The console's own reads, printed instead of rendered.
+
+    One connection, because these are the runtime's reads. The console adds two
+    more to them -- the agent's, to show the record index as a model gets it,
+    and the operator's, to run a verb -- and neither is needed to print a panel.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, panels.COMMAND)
+    if runtime is None:
+        return _render(report(panels.COMMAND, ledger))
+    return _render(
+        _guarded(
+            panels.COMMAND,
+            lambda: panels.read(
+                runtime,
+                arguments.config,
+                names=tuple(arguments.panels) or panels.NAMES,
+                limit=arguments.limit,
+            ),
+        )
+    )
+
+
+def _ui_forms(arguments: argparse.Namespace) -> int:
+    """The report forms the console's chooser offers, as a read of the CLI's.
+
+    One connection, the runtime's, because the console asks this as the runtime:
+    the chooser is a read like the panels and not a verb, so it must have a CLI
+    read behind it or it would be the one query the console holds of its own.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, panels.FORMS_COMMAND)
+    if runtime is None:
+        return _render(report(panels.FORMS_COMMAND, ledger))
+    return _render(_guarded(panels.FORMS_COMMAND, lambda: panels.forms(runtime)))
+
+
+def _ui_serve(arguments: argparse.Namespace) -> int:
+    """Three connection strings, because the console is three roles at once.
+
+    Which is the reason they are three arguments and not one. A console given a
+    single URL would run its reads as whatever role could also lift a Halt, and
+    the isolation every page on it describes would be a description of an
+    arrangement that was not in force while it rendered.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, ui.COMMAND)
+    agent = _url(ledger, AGENT, arguments.state_url, ui.COMMAND)
+    human = _url(ledger, OPERATOR, arguments.console_url, ui.COMMAND)
+    if runtime is None or agent is None or human is None:
+        return _render(report(ui.COMMAND, ledger))
+    return _render(
+        _guarded(
+            ui.COMMAND,
+            lambda: ui.serve(
+                runtime,
+                agent,
+                human,
+                arguments.config,
+                host=arguments.host,
+                port=arguments.port,
+                limit=arguments.limit,
             ),
         )
     )

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import html
 import http.client
 import json
 import os
@@ -78,6 +79,7 @@ from redkraken import (
     migrate,
     operator,
     packet,
+    panels,
     pg,
     playbook,
     program,
@@ -93,6 +95,7 @@ from redkraken import (
     store,
     tls,
     tool,
+    ui,
     validation,
     verifier,
 )
@@ -37785,6 +37788,622 @@ class V1ImportRefusalTest(DatabaseCase):
         self.assertEqual(0, answered["records"])
         self.assertFalse(answered["repeated"])
         self.assertEqual(1, self.imports())
+
+
+CONSOLE_SLUG = "selftest-console"
+
+
+class OperatorConsoleTest(ReportFixture, DatabaseCase):
+    """Ticket 60: the local console, against the rows a campaign actually holds.
+
+    `tests/test_ui.py` asks what a page says, which is answerable with no
+    database at all. What is only answerable here is whether the reads behind
+    those pages run: nine statements and one function over a schema of a hundred
+    and forty tables, each naming columns that were added by different migrations
+    for different reasons, and none of which the renderer can be wrong about
+    because the renderer never sees a column name it did not get from the row.
+
+    So the arrangement is 42's, which carries a claim the whole way -- proposed,
+    attempted, observed, supported, validated, exploited and rendered -- and the
+    console is opened over it. Criterion 4's ladder is then a question about
+    rows rather than about a mock: each rung is asked of the table that would
+    carry it, and a rung that showed because a status column said so rather than
+    because the thing happened would show here on a Finding that never did it.
+
+    The six verbs are submitted as forms, through `respond`, on the operator's
+    own connection. Three of them write and are asked for their durable Event;
+    two are asked about a decision nobody opened, because what criterion 3 wants
+    proved is that the form reaches the typed operation, and a refusal that came
+    back from `operator` is that proof as much as an approval is. The seventh
+    control is a console built with the runtime's connection where the
+    operator's belongs: it renders every page and cannot lift a Halt.
+
+    A second Program is opened and left empty. Criterion 6's isolation is not a
+    filter to be checked on this surface -- there is no Program argument on it --
+    so what is asked is the thing that could still be wrong: that a console
+    opened over one configuration reads that Program's rows and not the other's.
+    """
+
+    slug = CONSOLE_SLUG
+
+    #: The Program this console is not about, opened and left with nothing in
+    #: it. Under the same prefix so the fixture's own purge takes it.
+    NEIGHBOUR = f"{CONSOLE_SLUG}-other"
+
+    #: The operator's sentences. Each goes onto an Event or a clearance, and
+    #: none is ever handed to a model.
+    WHY_STOPPED = "the target started answering slowly and I want to look at it myself"
+    WHY_RESUMED = "the target is answering normally again"
+    WHY_REPORTED = "the write stayed written on a neighbour's order and the program pays for it"
+    WHY_NOT_KNOWN = "their list means the public catalogue, and this is the orders API"
+    WHY_ANSWERED = "scoped, expected, and the same request they already approved once"
+
+    KNOWN = "we do not take reports about this catalogue"
+
+    #: A decision label nobody opened. The two queue verbs are asked about it
+    #: because opening a real question means walking a tool call into the gate,
+    #: which is 29's subject and is asserted there; what is asked here is that
+    #: the form reaches `operator` and that what `operator` says comes back onto
+    #: the page.
+    ABSENT = "D-nobody"
+
+    HARD = (
+        "SELECT code FROM report_blockers($1::uuid) WHERE severity = 'hard' ORDER BY code"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.rendering = cls.filed["rendering"]
+        cls.digest = cls.filed["content_sha256"]
+        cls.twin_label = str(
+            cls.connection.execute(
+                "SELECT label FROM findings WHERE id = $1::uuid",
+                (cls.member["second"]["finding"],),
+            ).scalar()
+        )
+
+        cls.console = cls.opened_console(cls.slug)
+        cls.impostor = cls.opened_console(cls.slug, human=cls.harness.runtime)
+        # The Program this console is not about, opened over a configuration of
+        # its own so that isolation is a question about two Programs rather than
+        # about one Program and an absence.
+        cls.neighbour = cls.opened_console(cls.NEIGHBOUR)
+        opened = program.run(cls.harness.runtime, cls.neighbour.configuration_path)
+        assert opened.ok, opened.violations
+
+        # Every page, before any verb has moved anything. The report page is
+        # here for a reason of the domain rather than of the fixture: a rendering
+        # is a projection of a validated Finding, and the Finding is reported
+        # three lines below.
+        cls.pages = {
+            path: ui.respond(cls.console, "GET", path)
+            for path in (
+                "/",
+                "/records",
+                "/decisions",
+                "/control",
+                "/panel/findings",
+                f"/reports?subject=finding&label={cls.label}&template={cls.FORM}",
+            )
+        }
+        cls.record_label = cls.first_record()
+        cls.pages[f"/record/{cls.record_label}"] = ui.respond(
+            cls.console, "GET", f"/record/{cls.record_label}"
+        )
+        cls.before = cls.panels_of(cls.console)
+        cls.empty = cls.panels_of(cls.neighbour)
+
+        cls.answers = {}
+        cls.answers["halt"] = cls.acted(verb=operator.HALT, reason=cls.WHY_STOPPED)
+        cls.stopped = cls.facts_of(cls.panels_of(cls.console, names=("program",)))
+        cls.answers["resume"] = cls.acted(verb=operator.RESUME, reason=cls.WHY_RESUMED)
+        cls.answers["report"] = cls.acted(
+            verb=operator.REPORT,
+            label=cls.label,
+            rendering=cls.rendering,
+            content_sha256=cls.digest,
+            reason=cls.WHY_REPORTED,
+        )
+        cls.after = cls.panels_of(cls.console)
+
+        cls.raise_the_gate()
+        cls.blocked = cls.hard_blockers(cls.member["second"]["finding"])
+        cls.gated = cls.panels_of(cls.console)
+        cls.answers["clear"] = cls.acted(
+            verb=operator.CLEAR,
+            label=cls.twin_label,
+            gate="known_issue",
+            reason=cls.WHY_NOT_KNOWN,
+        )
+        cls.lifted = cls.hard_blockers(cls.member["second"]["finding"])
+
+        cls.answers["answer"] = cls.acted(
+            verb=operator.ANSWER,
+            label=cls.ABSENT,
+            verdict="approve",
+            reason=cls.WHY_ANSWERED,
+        )
+        cls.answers["supersede"] = cls.acted(
+            verb=operator.SUPERSEDE, label=cls.ABSENT, reason=cls.WHY_ANSWERED
+        )
+        cls.refused_halt = cls.acted(
+            console=cls.impostor, verb=operator.HALT, reason=cls.WHY_STOPPED
+        )
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def opened_console(cls, slug: str, **overrides) -> ui.Console:
+        """One console over one configuration, opened the way `rk ui serve` does."""
+        ledger = Ledger()
+        settings = {
+            "runtime": cls.harness.runtime,
+            "agent": cls.harness.state,
+            "human": cls.harness.human,
+        } | overrides
+        console = ui.build(
+            ledger,
+            settings["runtime"],
+            settings["agent"],
+            settings["human"],
+            write(VALID.replace('name = "acme-web"', f'name = "{slug}"')),
+        )
+        assert console is not None, ledger.violations
+        return console
+
+    @classmethod
+    def panels_of(cls, console: ui.Console, **options) -> dict:
+        """Every panel of one console, by name, asserted to have been read."""
+        answer = panels.read(console.runtime, console.configuration_path, **options)
+        assert answer.ok, answer.violations
+        return {item["panel"]: item for item in answer.facts["panels"]}
+
+    @classmethod
+    def facts_of(cls, shown: dict) -> dict:
+        """The Program panel's pairs as a mapping, which is what it is."""
+        return {name: value for name, value in shown["program"]["rows"]}
+
+    @classmethod
+    def row_for(cls, shown: dict, name: str, label: str) -> dict:
+        """One panel row as a mapping of its own columns, found by its first cell."""
+        found = [row for row in shown[name]["rows"] if row[0] == label]
+        assert len(found) == 1, (name, label, shown[name]["rows"])
+        return dict(zip(shown[name]["columns"], found[0]))
+
+    @classmethod
+    def acted(cls, console: ui.Console | None = None, **form) -> ui.Response:
+        """One verb, submitted as the form this console printed it as."""
+        console = console or cls.console
+        return ui.respond(console, "POST", "/act", {"token": console.token} | form)
+
+    @classmethod
+    def first_record(cls) -> str:
+        """A label the model's own read carries, for the record pages below."""
+        answer = state.read(cls.harness.runtime, cls.harness.state, cls.console.configuration_path)
+        assert answer.ok, answer.violations
+        records = answer.facts["state"]["records"]
+        assert records, answer.facts["state"]
+        return str(records[0]["label"])
+
+    @classmethod
+    def hard_blockers(cls, finding: str) -> set:
+        return {str(code) for (code,) in cls.rows_of(cls.HARD, (finding,))}
+
+    @staticmethod
+    def said(key: str, value: object) -> str:
+        """One pair of a verb's Event, spelled the way the page spells it.
+
+        Escaped, because the console escapes everything it prints including the
+        database's own answer: a quote in a reason an operator typed is text on
+        that page and not markup, and a test that read the unescaped form would
+        pass against a console that had stopped escaping.
+        """
+        return html.escape(f'"{key}": {json.dumps(value)}', quote=True)
+
+    @classmethod
+    def raise_the_gate(cls):
+        """The one gate an operator may lift, raised the way 59 raises it.
+
+        As the owner, because there is no verb: 019 declared
+        `program_known_issues` entered through a control surface no ticket has
+        built. On the second Finding rather than the first, because the first is
+        reported by then and a blocker on it would be a blocker on something
+        that has already gone.
+        """
+        cls.as_owner(
+            "INSERT INTO program_known_issues (program_id, class_id, entity_like, source, note)"
+            " SELECT $1::uuid, f.class_id, e.dedup_key, 'program_policy', $3"
+            "   FROM findings f JOIN entities e ON e.id = f.subject_entity_id"
+            "  WHERE f.id = $2::uuid",
+            (cls.program_id, cls.member["second"]["finding"], cls.KNOWN),
+        )
+
+    # -- criterion 1: the panels are the campaign, and they run -----------------
+
+    def test_every_panel_this_console_shows_runs_against_the_live_schema(self):
+        # The one thing `tests/test_ui.py` cannot ask. Nine statements over
+        # columns from a dozen migrations, and a renderer that would show a
+        # panel that failed exactly as convincingly as one that worked.
+        self.assertEqual(list(panels.NAMES), list(self.before))
+        for name, shown in self.before.items():
+            with self.subTest(panel=name):
+                self.assertIn(shown["state"], (panels.READY, panels.EMPTY))
+                self.assertEqual("", shown["detail"])
+
+    def test_the_areas_this_ticket_names_are_the_panels_and_the_two_other_reads(self):
+        # Lifecycle, integrity, Slates, Agent runs, Tool runs, Leases, budgets,
+        # Findings, chains and reports are panels; Tasks, Surface, Hypotheses and
+        # Tests are the model's own compact read; pending decisions are the
+        # operator's queue. Nothing in the criterion is unreachable from here.
+        self.assertEqual(
+            {"program", "checks", "slates", "agent_runs", "tool_runs", "leases",
+             "budgets", "findings", "chains", "reports"},
+            set(self.before),
+        )
+        self.assertIn("records", dict(ui.NAVIGATION).values())
+        self.assertIn("decisions", dict(ui.NAVIGATION).values())
+
+    def test_the_program_panel_carries_the_lifecycle_and_the_configuration(self):
+        facts = self.facts_of(self.before)
+
+        self.assertEqual(self.slug, facts["slug"])
+        self.assertEqual("open", facts["lifecycle"])
+        self.assertEqual("running", facts["halt"])
+        self.assertEqual("1", facts["configuration revision"])
+        self.assertRegex(facts["configuration digest"], "^[0-9a-f]{64}$")
+
+    def test_a_program_that_was_never_closed_is_open_and_not_retired(self):
+        # `program.lifecycle` reads two absences, and a null spelled as the
+        # empty string on the way through the panel would read as a date.
+        facts = self.facts_of(self.before)
+
+        self.assertEqual("", facts["closed"])
+        self.assertEqual("", facts["purge after"])
+
+    def test_the_checks_panel_asks_the_same_function_a_run_asks(self):
+        asked = {
+            check.name: "yes" if check.ok else "no"
+            for check in integrity.program_checks(self.connection, self.slug)
+        }
+
+        self.assertEqual(
+            asked, {name: held for name, held, _ in self.before["checks"]["rows"]}
+        )
+        self.assertTrue(asked)
+
+    def test_the_runs_the_leases_and_the_budgets_are_this_campaigns_own(self):
+        self.assertEqual(panels.READY, self.before["agent_runs"]["state"])
+        self.assertEqual(panels.READY, self.before["leases"]["state"])
+        self.assertEqual(panels.READY, self.before["budgets"]["state"])
+        self.assertEqual(
+            "program", self.before["budgets"]["rows"][0][0], self.before["budgets"]["rows"]
+        )
+
+    def test_a_lease_names_the_identity_and_the_run_that_holds_it(self):
+        held = dict(
+            zip(self.before["leases"]["columns"], self.before["leases"]["rows"][0])
+        )
+
+        self.assertTrue(held["identity"])
+        # The slot's name, which is what an operator can act on. The material
+        # behind it is never on this surface, which is why the panel joins
+        # `identities` for a name and never for a value.
+        self.assertTrue(held["slot"])
+        self.assertTrue(held["held by"])
+
+    # -- criterion 4: the ladder is asked of the rows ---------------------------
+
+    def test_a_claim_carried_the_whole_way_shows_every_rung_it_reached(self):
+        row = self.row_for(self.before, "findings", self.label)
+
+        for rung in ("proposed", "attempted", "observed", "supported", "validated",
+                     "exploited"):
+            with self.subTest(rung=rung):
+                self.assertEqual("true", row[rung], row)
+        self.assertEqual("false", row["reported"])
+        self.assertEqual("false", row["blocked"])
+
+    def test_a_finding_nobody_reported_says_so_until_an_operator_reports_it(self):
+        self.assertEqual("false", self.row_for(self.before, "findings", self.label)["reported"])
+        self.assertEqual("true", self.row_for(self.after, "findings", self.label)["reported"])
+
+    def test_a_finding_a_gate_stands_against_is_marked_as_blocked(self):
+        # `cls.gated` is the read taken while the gate stood, which is why it is
+        # a read of its own. The cell is the blocker set and not a summary of
+        # it: a Finding the database still refuses reads as blocked whether the
+        # refusal is the raised gate or one of the eight facts beside it, so the
+        # column is asked against `report_blockers` at the moment it was read.
+        self.assertIn("known_issue", self.blocked)
+        self.assertNotIn("known_issue", self.lifted)
+        self.assertEqual("true", self.row_for(self.gated, "findings", self.twin_label)["blocked"])
+        self.assertEqual(
+            str(bool(self.hard_blockers(self.member["second"]["finding"]))).lower(),
+            self.row_for(self.panels_of(self.console), "findings", self.twin_label)["blocked"],
+        )
+
+    def test_a_rendering_that_still_describes_its_finding_is_current(self):
+        row = self.row_for(self.before, "reports", self.label)
+
+        self.assertEqual(self.FORM, row["template"])
+        self.assertEqual(self.digest, row["digest"])
+        self.assertEqual("current", row["freshness"])
+        self.assertEqual("false", row["approved"])
+
+    def test_a_rendering_of_a_finding_that_has_moved_since_is_stale(self):
+        # The Finding was reported after the bytes were taken, so the bytes are
+        # a projection of a state that is over -- which is the one thing an
+        # operator about to approve a document has to be told first.
+        row = self.row_for(self.after, "reports", self.label)
+
+        self.assertEqual("stale", row["freshness"])
+        self.assertEqual("true", row["approved"])
+
+    def test_the_reports_panel_carries_the_rendering_the_report_verb_asks_for(self):
+        # Criterion 3's report form names three things: the Finding, the id of
+        # the rendering and the digest of its bytes. All three have to be
+        # readable off the console or the verb is reachable and not completable
+        # -- so the panel that shows a filed rendering shows its id beside it.
+        row = self.row_for(self.before, "reports", self.label)
+
+        self.assertEqual(str(self.rendering), row["rendering"])
+        self.assertEqual(self.digest, row["digest"])
+
+    def test_a_chain_carries_what_it_starts_from_and_how_many_steps_it_took(self):
+        [row] = self.before["chains"]["rows"]
+        held = dict(zip(self.before["chains"]["columns"], row))
+
+        self.assertEqual("2", held["steps"])
+        self.assertTrue(held["entry"])
+
+    # -- criterion 6: isolation, bounds, loading and failure --------------------
+
+    def test_a_console_over_one_configuration_reads_that_programs_rows(self):
+        for name in ("findings", "chains", "reports", "agent_runs", "leases"):
+            with self.subTest(panel=name):
+                self.assertEqual(panels.EMPTY, self.empty[name]["state"])
+                self.assertEqual(0, self.empty[name]["total"])
+                self.assertEqual(panels.READY, self.before[name]["state"])
+
+    def test_the_other_programs_own_facts_are_the_ones_its_console_shows(self):
+        self.assertEqual(self.NEIGHBOUR, self.facts_of(self.empty)["slug"])
+        self.assertEqual(self.slug, self.facts_of(self.before)["slug"])
+
+    def test_the_operators_reason_is_recorded_but_never_read_back_as_the_runtime(self):
+        # Criterion 6's redaction, on the material this surface actually holds. A
+        # Halt carries a person's sentence about a target; the column is NOT NULL
+        # so a reason was stored, and 29 puts it on the durable Event. What it is
+        # not on is anything the console reads as the runtime -- the program
+        # panel selects who moved the Halt and when, and not why -- and it is not
+        # echoed back onto the result page of the form that carried it either.
+        [(recorded,)] = self.rows_of(
+            "SELECT reason FROM program_halts WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )
+        self.assertTrue(recorded)
+        for reason in (self.WHY_STOPPED, self.WHY_RESUMED):
+            with self.subTest(reason=reason):
+                self.assertNotIn(reason, "".join(self.stopped.values()))
+                self.assertNotIn(reason, "".join(self.facts_of(self.after).values()))
+        self.assertNotIn(self.WHY_STOPPED, self.answers["halt"].body)
+        self.assertNotIn(self.WHY_RESUMED, self.answers["resume"].body)
+
+    def test_a_panel_says_how_much_of_a_large_campaign_it_did_not_return(self):
+        shown = self.panels_of(self.console, names=("findings",), limit=1)["findings"]
+
+        # The count is the Program's and the rows are the page's, so the marker
+        # is the difference. `tests/test_ui.py` asks how it renders; what is only
+        # answerable here is that the two numbers come from two statements over
+        # the same Program and that the second one is not the first one bounded.
+        self.assertEqual(1, len(shown["rows"]))
+        self.assertGreaterEqual(shown["total"], 2)
+        self.assertEqual(shown["total"] - 1, shown["omitted"])
+        self.assertEqual(self.before["findings"]["total"], shown["total"])
+
+    def test_a_page_that_ran_out_of_time_reports_the_rest_as_pending(self):
+        answer = panels.read(
+            self.harness.runtime, self.console.configuration_path,
+            deadline=time.monotonic() - 1,
+        )
+
+        self.assertTrue(answer.ok)
+        self.assertTrue(
+            all(item["state"] == panels.PENDING for item in answer.facts["panels"])
+        )
+        self.assertIn("ran out of time", answer.facts["panels"][0]["detail"])
+
+    def test_a_panel_whose_statement_is_refused_is_one_panel_and_not_the_page(self):
+        # And the panels after it still read, which is only true because each
+        # runs in a transaction of its own: without that, the first refusal
+        # would leave every later statement reporting an aborted transaction.
+        broken = replace(panels.LEASES, rows="SELECT no_such_column FROM identity_leases")
+
+        with mock.patch.dict(panels.BY_NAME, {"leases": broken}):
+            answer = panels.read(self.harness.runtime, self.console.configuration_path)
+
+        shown = {item["panel"]: item for item in answer.facts["panels"]}
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, answer.exit_code)
+        self.assertEqual(panels.ERROR, shown["leases"]["state"])
+        self.assertIn("no_such_column", shown["leases"]["detail"])
+        self.assertEqual(panels.READY, shown["budgets"]["state"])
+
+    def test_a_panel_read_cannot_write_whatever_it_is_handed(self):
+        broken = replace(
+            panels.LEASES, rows="DELETE FROM identity_leases WHERE program_id = $1 AND $2 > 0"
+        )
+
+        with mock.patch.dict(panels.BY_NAME, {"leases": broken}):
+            answer = panels.read(
+                self.harness.runtime, self.console.configuration_path, names=("leases",)
+            )
+
+        [shown] = answer.facts["panels"]
+        self.assertEqual(panels.ERROR, shown["state"])
+        self.assertIn("read-only", shown["detail"])
+        self.assertEqual(
+            self.before["leases"]["total"], self.panels_of(self.console)["leases"]["total"]
+        )
+
+    # -- criterion 2: every view is one of the calls the CLI makes --------------
+
+    def test_every_page_renders_and_says_what_it_was_reading(self):
+        for path, answer in self.pages.items():
+            with self.subTest(path=path):
+                self.assertEqual(200, answer.status)
+                self.assertIn(f"<title>", answer.body)
+                self.assertIn(self.slug, answer.body)
+
+    def test_the_overview_carries_every_panel_and_the_reads_own_outcome(self):
+        body = self.pages["/"].body
+
+        for name in panels.NAMES:
+            with self.subTest(panel=name):
+                self.assertIn(f'<a href="/panel/{name}">{name}</a>', body)
+        self.assertIn("ui read: held", body)
+
+    def test_the_records_page_is_the_model_own_compact_read(self):
+        body = self.pages["/records"].body
+
+        self.assertIn(f"{state.COMMAND}: held", body)
+        self.assertIn(self.record_label, body)
+        self.assertIn("as the agent connection sees them", body)
+
+    def test_a_record_page_shows_the_record_whole_beside_its_projection(self):
+        body = self.pages[f"/record/{self.record_label}"].body
+
+        self.assertIn("no summary was held for this label", body)
+        self.assertIn("<pre>", body)
+        self.assertIn("digest <code>", body)
+
+    def test_a_projection_read_a_second_time_is_the_bytes_it_was_taken_from(self):
+        again = ui.respond(self.console, "GET", f"/record/{self.record_label}")
+
+        self.assertEqual(200, again.status)
+        self.assertNotIn("no summary was held", again.body)
+        self.assertIn('<p class="summary">', again.body)
+
+    def test_a_label_no_record_carries_is_a_page_that_says_so(self):
+        answer = ui.respond(self.console, "GET", "/record/R-nobody")
+
+        self.assertEqual(404, answer.status)
+        self.assertIn("no record of this Program carries that label", answer.body)
+
+    def test_the_decisions_page_reads_the_queue_on_the_operators_connection(self):
+        body = self.pages["/decisions"].body
+
+        self.assertIn("decision list: held", body)
+        self.assertIn("nothing is waiting on an operator", body)
+        self.assertIn(operator.ANSWER, body)
+
+    def test_the_reports_page_renders_the_document_the_cli_renders(self):
+        body = self.pages[
+            f"/reports?subject=finding&label={self.label}&template={self.FORM}"
+        ].body
+
+        self.assertIn(f"{reporting.COMMAND}: held", body)
+        self.assertIn("bytes an approval may name", body)
+        # The digest and the renderer, which is what `rk report` prints without
+        # `--out`: this page is that call and not a second one, so it names the
+        # bytes an approval can name and does not put a copy of them on a page
+        # nobody can approve from.
+        self.assertIn(reporting.VERSION, body)
+        self.assertIn(str(self.bundle["digest"]), body)
+
+    def test_the_form_chooser_offers_the_forms_this_installation_carries(self):
+        registry = panels.forms(self.harness.runtime)
+
+        self.assertTrue(registry.ok)
+        self.assertIn("rk2.default", [identity for identity, _, _ in registry.facts["forms"]])
+        self.assertIn(
+            f'<option value="{self.FORM}"',
+            self.pages[
+                f"/reports?subject=finding&label={self.label}&template={self.FORM}"
+            ].body,
+        )
+
+    def test_a_report_subject_the_chooser_never_offered_is_refused_not_coerced(self):
+        # The chooser offers the two `reporting.SUBJECTS`, so a third can only be
+        # hand-typed. It is refused rather than quietly rendered as a `finding`:
+        # a document under the wrong heading is the one thing an operator about
+        # to name bytes for an approval must not be handed.
+        answer = ui.respond(
+            self.console,
+            "GET",
+            f"/reports?subject=banana&label={self.label}&template={self.FORM}",
+        )
+
+        self.assertEqual(400, answer.status)
+        self.assertIn("is not a subject this console reports", answer.body)
+        self.assertNotIn("bytes an approval may name", answer.body)
+
+    # -- criterion 3: the verbs are the operator's own, with their Events -------
+
+    def test_a_halt_submitted_as_a_form_writes_the_event_the_cli_writes(self):
+        answer = self.answers["halt"]
+
+        self.assertEqual(200, answer.status)
+        self.assertIn("the Event this wrote", answer.body)
+        self.assertIn(self.said("status", "halted"), answer.body)
+        self.assertIn(self.said("program_id", self.program_id), answer.body)
+        self.assertEqual("halted", self.stopped["halt"])
+        self.assertEqual("rk2_human", self.stopped["halt changed by"])
+
+    def test_a_resume_lifts_it_and_says_so_in_the_same_shape(self):
+        self.assertEqual(200, self.answers["resume"].status)
+        self.assertIn("the Event this wrote", self.answers["resume"].body)
+        self.assertIn(self.said("status", "cleared"), self.answers["resume"].body)
+        self.assertEqual("cleared", self.facts_of(self.after)["halt"])
+
+    def test_reporting_a_finding_from_a_form_is_the_operators_own_transition(self):
+        answer = self.answers["report"]
+
+        self.assertEqual(200, answer.status)
+        self.assertIn("the Event this wrote", answer.body)
+        self.assertIn(self.said("status", "reported"), answer.body)
+        self.assertIn(self.said("reported_by", "rk2_human"), answer.body)
+        self.assertIn(self.said("content_sha256", self.digest), answer.body)
+        self.assertEqual(
+            ("reported", True),
+            tuple(
+                self.rows_of(
+                    "SELECT status, reported_at IS NOT NULL FROM findings"
+                    " WHERE label = $1 AND program_id = $2::uuid",
+                    (self.label, self.program_id),
+                )[0]
+            ),
+        )
+
+    def test_clearing_a_gate_from_a_form_lifts_that_gate_and_nothing_else(self):
+        answer = self.answers["clear"]
+
+        self.assertEqual(200, answer.status)
+        self.assertIn("the Event this wrote", answer.body)
+        self.assertIn(self.said("cleared_by", "rk2_human"), answer.body)
+        self.assertIn(self.said("was_saying", self.KNOWN), answer.body)
+        self.assertEqual({"known_issue"}, self.blocked - self.lifted)
+
+    def test_the_two_queue_verbs_reach_the_typed_operation_and_report_what_it_said(self):
+        for verb in ("answer", "supersede"):
+            with self.subTest(verb=verb):
+                answer = self.answers[verb]
+                self.assertEqual(400, answer.status)
+                self.assertIn(self.ABSENT, answer.body)
+                self.assertIn("this verb wrote no Event", answer.body)
+                self.assertIn("invalid_configuration", answer.body)
+
+    def test_a_console_holding_the_runtime_where_the_operator_belongs_cannot_act(self):
+        # The console reads as the runtime and writes as the operator, which is
+        # why `rk ui serve` takes two connection strings. One doing both would
+        # be a console whose panels ran as the only role that may lift a Halt.
+        self.assertEqual(400, self.refused_halt.status)
+        self.assertIn("rk2_human", self.refused_halt.body)
+        self.assertEqual(200, ui.respond(self.impostor, "GET", "/").status)
+
+    def test_no_page_this_console_renders_carries_the_connection_it_holds(self):
+        for path, answer in self.pages.items():
+            with self.subTest(path=path):
+                self.assertNotIn(self.harness.runtime.password, answer.body)
+                self.assertNotIn(self.harness.human.password, answer.body)
 
 
 if __name__ == "__main__":

@@ -2107,16 +2107,17 @@ class OperatorSurfaceTest(unittest.TestCase):
     SURFACE = (
         "--accept-change", "--action", "--agent-run", "--approve", "--argument",
         "--artifacts", "--authority", "--authorize", "--bytes", "--ca",
-        "--callback", "--channel", "--closed", "--config", "--content-sha256",
-        "--content-type", "--database", "--deny", "--discovery", "--egress",
-        "--every", "--finding", "--fixture", "--for", "--from", "--gate",
-        "--grant-hours", "--header", "--help", "--host", "--identity", "--image",
-        "--impact", "--into", "--key", "--kind", "--label", "--limit", "--method",
-        "--narrative", "--offset", "--out", "--peer", "--plan", "--playbook",
-        "--port", "--program", "--proxy", "--reason", "--record", "--redacted",
-        "--rendering", "--state-url", "--subject", "--subtree", "--template",
-        "--test", "--test-run", "--timeout", "--to", "--tool", "--tool-run",
-        "--url", "--wire", "--workspace",
+        "--callback", "--channel", "--closed", "--config", "--console-url",
+        "--content-sha256", "--content-type", "--database", "--deny",
+        "--discovery", "--egress", "--every", "--finding", "--fixture", "--for",
+        "--from", "--gate", "--grant-hours", "--header", "--help", "--host",
+        "--identity", "--image", "--impact", "--into", "--key", "--kind",
+        "--label", "--limit", "--method", "--narrative", "--offset", "--out",
+        "--panel", "--peer", "--plan", "--playbook", "--port", "--program",
+        "--proxy", "--reason", "--record", "--redacted", "--rendering",
+        "--state-url", "--subject", "--subtree", "--template", "--test",
+        "--test-run", "--timeout", "--to", "--tool", "--tool-run", "--url",
+        "--wire", "--workspace",
     )
 
     @classmethod
@@ -2146,6 +2147,21 @@ class OperatorSurfaceTest(unittest.TestCase):
                 name
                 for name, parser in self.commands.items()
                 if parser.get_default("url_source") is cli.CONSOLE
+            },
+        )
+
+        # And the one command that holds the operator's connection without
+        # being one of the verbs. 60's console renders those same seven as
+        # forms and calls the same functions, so it is given the connection they
+        # run on -- under a flag of its own, because its reads are the
+        # runtime's and a single URL doing both would run them as the operator.
+        # A second name here would be a second process that can lift a Halt.
+        self.assertEqual(
+            {"ui serve"},
+            {
+                name
+                for name, parser in self.commands.items()
+                if cli.OPERATOR.flag in flags(parser)
             },
         )
 

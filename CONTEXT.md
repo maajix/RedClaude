@@ -738,6 +738,26 @@ force then. Distinct from a denial, which ends the task on the operator's
 authority.
 _Avoid_: Cancel, dismiss, close, ignore
 
+**Console**:
+The local operator surface over one Program: every view is one of the reads the
+CLI already makes and every button is one of the operator verbs, so it holds no
+query and no judgement of its own. It reads on the runtime's connection, reads
+the record index on the agent's because that is whose isolation the index
+describes, and acts on the operator's, which is why a console built with one
+string in all three places renders every page and can lift nothing. Loopback
+only, one origin, and a token this process alone holds on every form.
+_Avoid_: Dashboard, web UI, admin panel, portal
+
+**Panel**:
+One bounded read on the console, named, captioned and counted: what came back,
+what the Program holds, and the difference between them stated rather than
+implied. A panel is ready, empty, still pending or refused, and each state is
+its own answer -- a panel whose statement was refused says so and does not take
+the page with it, and one the page ran out of time for says the read has not
+happened rather than that there is nothing there. What it shows is rows the
+database computed; it never computes a claim about a campaign.
+_Avoid_: Widget, card, tile, section
+
 **Credential vector**:
 An environment variable, settings key or provider switch that replaces,
 prevents, reroutes or redirects the CLI's subscription-authenticated request

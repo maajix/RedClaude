@@ -274,6 +274,39 @@ over the file as written and `canonical_sha256` over its normalised content, so
 reformatting does not change the policy's identity — and never a reference or a
 header value.
 
+## The operator console
+
+```sh
+rk ui serve --config program.toml
+```
+
+The console is the same operations this CLI already exposes, rendered as pages.
+Every view is one of the reads — `rk ui read` for the Program's lifecycle and
+integrity, its slates, runs, leases, budgets, findings, chains and the documents
+on file; `rk state` for the model's own records; `rk decision list` for what is
+waiting on a person; `rk report` for one rendering by label — and every button
+is one of the operator verbs, so a page and a command cannot come to mean
+different things. It holds no query of its own.
+
+Three connection strings, because the console is three roles and not one. The
+panels read as the runtime, the record index reads as the agent because that is
+whose isolation it is describing, and halt, resume, the two queue verbs, the
+report and the gate clearance run as the operator. A console given one string in
+all three places renders every page and can lift nothing.
+
+It listens on loopback, refuses a `Host` or `Origin` header that is not the
+address it was given, and puts a token this process alone holds on every form,
+so a page in another tab cannot submit a verb to it. There is no login, because
+there is no remote: the authority is the operator connection string, and anyone
+who can reach the socket already has the machine.
+
+```sh
+rk ui read --config program.toml
+```
+
+The same panels without a browser, in the shape every other command answers in.
+Each one is bounded and says how many rows it did not return.
+
 ## Outcomes
 
 `rk doctor` aggregates: it reports every violation it found, not the first, and
