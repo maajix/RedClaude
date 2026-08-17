@@ -9,7 +9,7 @@ import tomllib
 import unittest
 
 import redkraken
-from redkraken import doctor
+from redkraken import doctor, migrate
 from tests import ROOT
 from tests.fixtures import VALID, scratch, write
 
@@ -181,6 +181,26 @@ class InstallationTest(unittest.TestCase):
             [rk, "--version"], env=environment(), text=True, capture_output=True, check=False
         )
         self.assertEqual(f"rk {redkraken.__version__}\n", version.stdout)
+
+        # Ticket 59 criterion 6, and the one command that can only be asked
+        # here. `rk version` reads the migration corpus off the installed
+        # package, so a wheel that shipped the Python and not the `.sql` files
+        # answers this with a refusal -- and the checkout the rest of the suite
+        # runs from has the files either way. The digest is compared against
+        # this tree's own corpus because that is the claim being made: the
+        # installation an operator got is the migrations this checkout has.
+        corpus = subprocess.run(
+            [rk, "version"], env=environment(), text=True, capture_output=True, check=False
+        )
+        self.assertEqual(0, corpus.returncode, corpus.stderr)
+        installed = json.loads(corpus.stdout)
+        migrations, refused = migrate.load()
+        self.assertEqual((), refused)
+        self.assertTrue(installed["ok"], installed["violations"])
+        self.assertEqual(redkraken.__version__, installed["version"])
+        self.assertEqual(len(migrations), installed["corpus"])
+        self.assertEqual(migrate.revision(migrations), installed["corpus_sha256"])
+        self.assertEqual(migrations[-1].identity, installed["schema"])
 
         report = subprocess.run(
             [rk, "doctor", "--config", str(write(VALID))],

@@ -33,6 +33,8 @@ ANSWER = "decision answer"
 SUPERSEDE = "decision supersede"
 HALT = "halt"
 RESUME = "resume"
+REPORT = "finding report"
+CLEAR = "finding clear-gate"
 
 #: Membership of `rk2_human` is the whole authorisation: every operator verb asks
 #: `human_actor_session()` for it and refuses without it. Named here so a wrong
@@ -66,6 +68,8 @@ ANSWER_DECISION = "SELECT answer_decision($1, $2, $3, $4::interval)"
 SUPERSEDE_DECISION = "SELECT supersede_decision($1, $2)"
 HALT_PROGRAM = "SELECT halt_program($1::uuid, $2)"
 CLEAR_HALT = "SELECT clear_program_halt($1::uuid, $2)"
+REPORT_FINDING = "SELECT report_finding($1, $2::uuid, $3, $4)"
+CLEAR_REVIEW_GATE = "SELECT clear_review_gate($1, $2, $3)"
 
 #: How long an approval is good for when the operator does not say. The database
 #: defaults to the same 24 hours; it is spelled again here because the flag has
@@ -182,6 +186,74 @@ def resume(human: pg.Settings | None, slug: str, *, reason: str) -> Report:
     )
 
 
+def report_finding(
+    human: pg.Settings | None,
+    slug: str,
+    label: str,
+    rendering: str,
+    digest: str,
+    *,
+    reason: str,
+) -> Report:
+    """Report one validated Finding, naming the rendering the operator read.
+
+    The last step of the harness, and the one the corpus had no caller for:
+    `transition_rules` has reserved `validated -> reported` for a human actor
+    since ticket 06 and nothing in the runtime may write that row. What makes
+    this an operator verb rather than a convenience is the rendering: the
+    approval names exact bytes, so "I approved this report" cannot later mean a
+    document the Finding has since been re-rendered into.
+
+    The digest is the confirmation, and it is the one this verb can ask for
+    honestly. There is no step after this one -- `reported` is terminal in
+    `transition_rules` and a clearance cannot be withdrawn -- so the guard is not
+    "are you sure" but "which bytes", and an id pasted out of a script that filed
+    a rendering nobody opened does not answer it.
+
+    Every gate stays the database's. This adds none and lifts none -- a Finding
+    still blocked by anything `report_blockers` raises is refused here, and the
+    sentence it is refused with is the blocker's own.
+    """
+    return _verb(
+        REPORT,
+        human,
+        slug,
+        lambda connection, _: connection.execute(
+            REPORT_FINDING, (label, rendering, digest, reason)
+        ),
+        held=f"{label} was reported",
+        refused=f"{label} was not reported",
+        label=label,
+        rendering=rendering,
+    )
+
+
+def clear_gate(human: pg.Settings | None, slug: str, label: str, gate: str, *, reason: str) -> Report:
+    """Lift one review gate on one Finding, and do nothing else.
+
+    Separate from `report_finding` because it answers a different question.
+    Reporting asks "send this one"; clearing asks "the program's do-not-send
+    list does not mean this instance", which is a reading of somebody else's
+    words that outlives the Finding it was made on. Two verbs mean the operator
+    says both things out loud, and the record carries what each of them was told
+    at the time.
+
+    Only the two judgement blockers can be reached this way. The other seven are
+    facts the database computed, and the refusal for those names the whole set
+    rather than the one that was asked for.
+    """
+    return _verb(
+        CLEAR,
+        human,
+        slug,
+        lambda connection, _: connection.execute(CLEAR_REVIEW_GATE, (label, gate, reason)),
+        held=f"the {gate} gate on {label} is lifted",
+        refused=f"the {gate} gate on {label} was not lifted",
+        label=label,
+        gate=gate,
+    )
+
+
 def assert_operator_connection(ledger: Ledger, connection: pg.Connection) -> bool:
     """Refuse anything but the operator's connection, before the verb.
 
@@ -205,7 +277,7 @@ def assert_operator_connection(ledger: Ledger, connection: pg.Connection) -> boo
         ledger.fail(
             "operator_connection",
             f"connected as {user}, which is not a member of rk2_human: only the "
-            "operator connection may answer a question or lift a Halt",
+            "operator connection may answer a question, lift a Halt or report a Finding",
             code=INVALID_CONFIGURATION,
             source="database",
         )

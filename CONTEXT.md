@@ -168,8 +168,11 @@ _Avoid_: Rerun, reproduction, playback
 A claimed vulnerability resting on one or more hypotheses, moving through
 `candidate -> validating -> validated | rejected -> reported`. It cannot be
 validated without the test run that reproduced it, and only a human moves it to
-reported. It is born a candidate and nothing else: at `info`, on no severity
-basis, naming the Property class it rests on, the exact holding Test run that
+reported -- on their own connection, with their reason on the transition, naming
+the exact rendering they read, so what was approved stays the bytes that were
+approved after the Finding is rendered again. It is born a candidate and nothing
+else: at `info`, on no severity basis, naming the Property class it rests on, the
+exact holding Test run that
 settled the claim, and what that run demonstrated. The later states are reached
 by transition, never by birth, so a Finding that is validated is one something
 validated. The cell it occupies is the claim's cell -- Program, Property class,
@@ -687,7 +690,19 @@ question about one call)
 
 **Review gate**:
 A registered blocker code holding a finding or a chain unrenderable until an
-operator clears it. It blocks rendering only; scheduling never waits on a
+operator clears it, and the only kind of blocker anybody may lift. Two are
+registered, and both are a judgement rather than a fact: `duplicate`, where the
+report signature is deliberately coarser than a dedup key and two real reports
+can collide on it, and `known_issue`, where the program published a do-not-send
+list and whether this instance is what they meant is a reading of their words.
+Every other blocker is computed from rows and is answered by changing the rows.
+Lifting one is a verb of its own rather than a flag on reporting, because a
+blocked record may not be rendered at all, and what an operator reports is a
+rendering they have read. A clearance is one person's act on one gate on one
+record: it carries their reason, records what the gate was saying at the time,
+answers with what is still blocking, and cannot afterwards be edited or
+withdrawn. Its reason is the operator's own words and stays off every surface a
+model reads. It blocks rendering and reporting only; scheduling never waits on a
 reviewer.
 _Avoid_: Sign-off, hold, lock, approval
 

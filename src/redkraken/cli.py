@@ -70,6 +70,11 @@ PROXY_DATABASE_URL = proxy.DATABASE_VARIABLE
 
 DEFAULT_DATABASE = "rk2"
 
+#: What `rk version` files under. A constant because the test that holds the
+#: verb's answer against `--version` names it, and a command whose report is
+#: filed under one string in one place and another in the other is two commands.
+VERSION = "version"
+
 #: Where the door listens when nobody says otherwise. Loopback because a
 #: capability is bearer material and the runtime is on this machine; a fixed port
 #: because the operator has to be able to name it in `RK_PROXY_URL` before the
@@ -144,6 +149,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"rk {__version__}")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    stated = commands.add_parser(
+        "version",
+        help="report this installation's version and the corpus revision behind it",
+        description=(
+            "What is installed here, as a report rather than a line of text. "
+            "`--version` answers the same question for a person reading a "
+            "terminal; this answers it in the shape every other command answers "
+            "in, for the script that has to decide whether two machines are "
+            "running the same harness. Reaches no database and no network."
+        ),
+    )
+    stated.set_defaults(run=_version)
 
     diagnose = commands.add_parser(
         "doctor",
@@ -955,6 +973,99 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     judging.set_defaults(run=_finding_validate)
+
+    sending = judgements.add_parser(
+        "report",
+        help=f"report one validated Finding, naming the rendering read (${HUMAN_URL})",
+        description=(
+            "The last step, and the only one no part of the runtime may take: "
+            "`validated -> reported` is reserved for a human actor. The approval "
+            "names the exact rendering the operator read, so what was approved "
+            "stays the bytes that were approved even after the Finding is "
+            "rendered again. Every emission gate stays where it is -- this lifts "
+            "none of them, and a Finding any of them still blocks is refused "
+            "with what the blocker said. `rk report finding` renders a document; "
+            "this reports the Finding."
+        ),
+    )
+    _add_url(sending, CONSOLE)
+    _add_program(sending)
+    sending.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help="the Finding to report, by its label",
+    )
+    sending.add_argument(
+        "--rendering",
+        required=True,
+        metavar="uuid",
+        help=(
+            "the rendering being approved, as `rk report finding --record` "
+            "printed it; a rendering of another Finding, or one the Finding has "
+            "since moved out from under, is refused"
+        ),
+    )
+    sending.add_argument(
+        "--content-sha256",
+        required=True,
+        metavar="digest",
+        help=(
+            "the digest of the bytes being approved, as `rk report finding "
+            "--record` printed it beside the rendering id. This is the "
+            "confirmation: nothing follows a report, so the question is not "
+            "whether the operator is sure but which document they read"
+        ),
+    )
+    sending.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help="why this is worth sending, in the operator's own words; recorded on the transition",
+    )
+    sending.set_defaults(run=_finding_report)
+
+    clearing = judgements.add_parser(
+        "clear-gate",
+        help=f"lift one review gate on one Finding, and nothing else (${HUMAN_URL})",
+        description=(
+            "Two of the emission gates are a judgement rather than a fact: "
+            "`known_issue`, where the program published a do-not-send list and "
+            "whether this instance is what they meant is a reading of their "
+            "words, and `duplicate`, where the report signature is coarser than "
+            "a dedup key and two real reports can collide on it. An operator may "
+            "overrule those two, one Finding at a time, while the gate is "
+            "actually raised, and the sentence it was raising goes on the record "
+            "beside their reason. The other seven blockers are things the "
+            "database computed and are cleared by fixing what they were computed "
+            "from. This reports nothing and approves nothing."
+        ),
+    )
+    _add_url(clearing, CONSOLE)
+    _add_program(clearing)
+    clearing.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help="the Finding the gate is raised on, by its label",
+    )
+    # No `choices`: `review_gates` is the vocabulary, and a copy of it here would
+    # be a second spelling of a closed set that a migration could move out from
+    # under. A wrong code is refused by the database, which names the whole set
+    # it read rather than the one this file was built believing in.
+    clearing.add_argument(
+        "--gate",
+        required=True,
+        metavar="code",
+        help="the gate to lift, by the code `report_blockers` raises it under",
+    )
+    clearing.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help="why this Finding is not the thing the gate is about",
+    )
+    clearing.set_defaults(run=_finding_clear_gate)
 
     playbooks = commands.add_parser(
         "playbook", help="grade a Playbook against fixtures it did not choose"
@@ -2303,6 +2414,32 @@ def _proxy_request(arguments: argparse.Namespace) -> int:
     )
 
 
+def _version(arguments: argparse.Namespace) -> int:
+    """What is installed, without asking anything else what it thinks.
+
+    A corpus that will not load is a violation rather than a silence: an
+    installation whose migrations are unreadable is one an operator has to be
+    told about, and `rk version` is the first command they run.
+    """
+    del arguments
+    ledger = Ledger()
+    migrations, refusals = migrate.load()
+    if refusals:
+        ledger.refuse("corpus", f"{len(refusals)} refused migration file(s)", refusals)
+        return _render(report(VERSION, ledger, version=__version__))
+    ledger.hold("corpus", f"{len(migrations)} migration(s) readable")
+    return _render(
+        report(
+            VERSION,
+            ledger,
+            version=__version__,
+            schema=migrations[-1].identity if migrations else None,
+            corpus=len(migrations),
+            corpus_sha256=migrate.revision(migrations),
+        )
+    )
+
+
 def _decision_sweep(arguments: argparse.Namespace) -> int:
     """The one command whose useful run is usually the one that did nothing.
 
@@ -2354,6 +2491,31 @@ def _decision_supersede(arguments: argparse.Namespace) -> int:
         operator.SUPERSEDE,
         lambda console: operator.supersede(
             console, arguments.program, arguments.label, reason=arguments.reason
+        ),
+    )
+
+
+def _finding_report(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.REPORT,
+        lambda console: operator.report_finding(
+            console,
+            arguments.program,
+            arguments.label,
+            arguments.rendering,
+            arguments.content_sha256,
+            reason=arguments.reason,
+        ),
+    )
+
+
+def _finding_clear_gate(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.CLEAR,
+        lambda console: operator.clear_gate(
+            console, arguments.program, arguments.label, arguments.gate, reason=arguments.reason
         ),
     )
 

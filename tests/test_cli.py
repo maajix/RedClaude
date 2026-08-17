@@ -1,3 +1,4 @@
+import argparse
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import unittest
 from pathlib import Path
 
 import redkraken
-from redkraken import evaluation, pg, verifier
+from redkraken import cli, evaluation, migrate, operator, pg, verifier
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -92,6 +93,48 @@ def run(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess
     )
 
 
+def leaves(parser: argparse.ArgumentParser | None = None, path: str = "") -> dict:
+    """Every command the surface offers, by the words that reach it.
+
+    Read off the parser rather than listed here, because a list written by hand
+    is a list that agrees with the surface on the day it was written. That means
+    argparse's internals: `_actions` and `_SubParsersAction` are the only way to
+    walk a parser tree, and a test that audits a surface has to walk it.
+    """
+    parser = parser if parser is not None else cli.build_parser()
+    subcommands = [
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ]
+    if not subcommands:
+        return {path: parser}
+    found = {}
+    for action in subcommands:
+        for name, child in action.choices.items():
+            found.update(leaves(child, f"{path} {name}".strip()))
+    return found
+
+
+def flags(parser: argparse.ArgumentParser) -> set[str]:
+    """Every long option one command accepts."""
+    return {
+        string
+        for action in parser._actions
+        for string in action.option_strings
+        if string.startswith("--")
+    }
+
+
+def required(parser: argparse.ArgumentParser) -> set[str]:
+    """Every long option one command refuses to run without."""
+    return {
+        string
+        for action in parser._actions
+        if action.required
+        for string in action.option_strings
+        if string.startswith("--")
+    }
+
+
 def observe(*arguments: str) -> dict:
     result = subprocess.run(
         [sys.executable, "-c", DRIVER, *arguments],
@@ -111,6 +154,39 @@ class VersionTest(unittest.TestCase):
 
         self.assertEqual(EXIT_OK, result.returncode, result.stderr)
         self.assertEqual(f"rk {redkraken.__version__}\n", result.stdout)
+
+    def test_the_verb_answers_with_the_corpus_revision_behind_the_installation(self):
+        """Ticket 59 criterion 2: a read that carries a revision and a digest.
+
+        Two machines running the same version of the package can be running
+        different databases, so the number that decides whether they agree is
+        the corpus digest and not the version string.
+        """
+        result = run("version")
+        migrations, refused = migrate.load()
+
+        self.assertEqual(EXIT_OK, result.returncode, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual((), refused)
+        self.assertEqual(redkraken.__version__, document["version"])
+        self.assertEqual(migrate.revision(migrations), document["corpus_sha256"])
+        self.assertEqual(len(migrations), document["corpus"])
+        self.assertEqual(migrations[-1].identity, document["schema"])
+        self.assertTrue(document["ok"])
+
+    def test_both_spellings_of_the_question_report_one_version(self):
+        """`--version` is for a person and `version` is for a script, and a
+        machine that answered them differently would be two installations."""
+        document = json.loads(run("version").stdout)
+
+        self.assertEqual(run("--version").stdout.strip(), f"rk {document['version']}")
+        self.assertEqual(cli.VERSION, document["command"])
+
+    def test_the_first_command_an_operator_runs_touches_nothing(self):
+        observed = observe("version")
+
+        self.assertEqual([], observed["events"])
+        self.assertEqual(EXIT_OK, observed["exit"])
 
 
 class DoctorCommandTest(unittest.TestCase):
@@ -1974,6 +2050,182 @@ class ContainmentTest(unittest.TestCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
         self.assertNotIn("s3cr3t-sentinel", result.stdout)
         self.assertNotIn("s3cr3t-sentinel", result.stderr)
+
+
+class OperatorSurfaceTest(unittest.TestCase):
+    """Ticket 59: the command surface, audited as a surface.
+
+    Every other case in this file asks one command whether it does its job. This
+    asks the whole set the questions that are only answerable about the set: that
+    each area the ticket names has a verb, that the shapes an operation must not
+    have are absent everywhere rather than in the commands somebody remembered,
+    and that the two connections stay two -- the operator's verbs are exactly the
+    ones held as a person, and nothing a model reaches names a Program.
+
+    Read off `build_parser` rather than from a list, so a verb added later is
+    audited by being added.
+    """
+
+    #: Each area the ticket's first criterion names, and the verbs that cover it.
+    #: Spelled out because the criterion is a list of areas and an area with no
+    #: verb is the failure it is written to catch.
+    AREAS = {
+        "version": ("version",),
+        "doctor": ("doctor",),
+        "migrate": ("db migrate",),
+        "run/resume": ("run", "resume"),
+        "Program lifecycle": ("run", "scope", "halt", "resume"),
+        "compact/full reads": ("state",),
+        "Halt/clear": ("halt", "resume"),
+        "pending decisions": (
+            "decision sweep", "decision list", "decision answer", "decision supersede",
+        ),
+        "integrity": ("db verify", "artifact audit", "evidence verify"),
+        "import": ("import",),
+        "validation": ("finding validate",),
+        "report": ("report finding", "report chain", "finding report", "finding clear-gate"),
+        "evidence export": ("evidence export",),
+    }
+
+    #: The shapes criterion 4 forbids, as the flags they would arrive as. A
+    #: generic operation is generic in its argument: `--sql` and `--query` are
+    #: raw SQL, `--patch` and `--set` are an arbitrary edit, the credential three
+    #: are a secret by value rather than by `slot://` reference, and `--receipt`
+    #: is a hand-written record of an exchange that never happened.
+    FORBIDDEN = (
+        "--sql", "--query", "--patch", "--set", "--where",
+        "--password", "--secret", "--token", "--credential",
+        "--receipt", "--exec", "--eval",
+    )
+
+    #: Every flag the surface takes, as it stands. A list of names to avoid can
+    #: only catch the shapes somebody thought of, and criterion 4 is a claim
+    #: about all of them -- so the set itself is pinned, and a flag added later
+    #: fails this until it is written down. What the failure asks for is a
+    #: reading: is the new argument a value this command needs, or a way to say
+    #: something the database was supposed to decide.
+    SURFACE = (
+        "--accept-change", "--action", "--agent-run", "--approve", "--argument",
+        "--artifacts", "--authority", "--authorize", "--bytes", "--ca",
+        "--callback", "--channel", "--closed", "--config", "--content-sha256",
+        "--content-type", "--database", "--deny", "--discovery", "--egress",
+        "--every", "--finding", "--fixture", "--for", "--from", "--gate",
+        "--grant-hours", "--header", "--help", "--host", "--identity", "--image",
+        "--impact", "--into", "--key", "--kind", "--label", "--limit", "--method",
+        "--narrative", "--offset", "--out", "--peer", "--plan", "--playbook",
+        "--port", "--program", "--proxy", "--reason", "--record", "--redacted",
+        "--rendering", "--state-url", "--subject", "--subtree", "--template",
+        "--test", "--test-run", "--timeout", "--to", "--tool", "--tool-run",
+        "--url", "--wire", "--workspace",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.commands = leaves()
+        cls.operator_verbs = {
+            operator.LIST, operator.ANSWER, operator.SUPERSEDE,
+            operator.HALT, operator.RESUME, operator.REPORT, operator.CLEAR,
+        }
+
+    def test_every_area_the_ticket_names_has_a_verb_that_covers_it(self):
+        for area, verbs in self.AREAS.items():
+            with self.subTest(area):
+                self.assertEqual([], [verb for verb in verbs if verb not in self.commands])
+
+    def test_the_operator_verbs_are_exactly_the_ones_held_as_a_person(self):
+        """Criterion 5's "human-only", asked of the surface instead of the database.
+
+        `rk2_human` is the only role the control verbs are granted to, so a verb
+        wired to any other connection string is a verb that cannot work -- and a
+        verb on that connection that is not one of the seven would be a route to
+        the operator's role from something that is not the operator's console.
+        """
+        self.assertEqual(
+            self.operator_verbs,
+            {
+                name
+                for name, parser in self.commands.items()
+                if parser.get_default("url_source") is cli.CONSOLE
+            },
+        )
+
+    def test_a_program_is_named_only_where_a_person_names_it(self):
+        """Criterion 4's last clause. Everything a model reaches is bound to one
+        Program by `rk2.program_id` and by the configuration it was started
+        under; a selector argument would let a compromised run pick another."""
+        self.assertEqual(
+            self.operator_verbs,
+            {name for name, parser in self.commands.items() if "--program" in flags(parser)},
+        )
+
+    def test_no_command_takes_sql_a_patch_or_a_credential_by_value(self):
+        for name, parser in self.commands.items():
+            with self.subTest(name):
+                self.assertEqual(
+                    [], sorted(flags(parser) & set(self.FORBIDDEN))
+                )
+
+    def test_the_surface_takes_the_arguments_it_is_written_down_as_taking(self):
+        """The same criterion as a closed question rather than an open one.
+
+        The list above says which shapes are forbidden, which is only ever the
+        ones somebody thought to forbid: `--filter` and `--json` and `--expr`
+        are all a query language arriving under a name nobody wrote down. So
+        this asks the other way round -- these are the arguments the surface
+        takes -- and the next flag is a line in this test before it is a flag.
+        """
+        taken = set()
+        for parser in self.commands.values():
+            taken |= flags(parser)
+
+        self.assertEqual(sorted(self.SURFACE), sorted(taken))
+
+    def test_every_operator_mutation_carries_the_sentence_behind_it(self):
+        """Criterion 3 where the risk is a decision rather than a resource.
+
+        The reason is required and not defaulted, because these six are the
+        writes an audit reads afterwards, and a reason argparse supplied would be
+        a record of nobody's judgement.
+        """
+        for name in sorted(self.operator_verbs - {operator.LIST}):
+            with self.subTest(name):
+                self.assertIn("--reason", required(self.commands[name]))
+                self.assertIn("--program", required(self.commands[name]))
+
+    def test_the_mutations_that_can_undo_a_guarantee_ask_before_they_do(self):
+        """Criterion 3 where the risk is a resource. Each of these is a rule of
+        the harness suspended on purpose, so each says so in its own word rather
+        than happening because a command was run twice."""
+        for name, word in (
+            ("run", "--accept-change"),
+            ("artifact open", "--authorize"),
+            ("decision answer", "--grant-hours"),
+            (operator.REPORT, "--content-sha256"),
+        ):
+            with self.subTest(name):
+                self.assertIn(word, flags(self.commands[name]))
+
+        # And the one of the four that is not optional. `reported` is terminal in
+        # `transition_rules` and a clearance cannot be withdrawn, so there is no
+        # step after this one to notice at -- which makes an unasked-for
+        # confirmation the wrong shape. The digest is required, and it is the
+        # digest rather than a word because "are you sure" can be answered
+        # without having read anything.
+        self.assertIn("--content-sha256", required(self.commands[operator.REPORT]))
+
+    def test_every_command_has_a_handler_and_help_that_names_it(self):
+        """Criterion 6, over the whole surface: a command whose help does not
+        print is a command an operator cannot learn from the terminal."""
+        for name, parser in self.commands.items():
+            with self.subTest(name):
+                self.assertTrue(callable(parser.get_default("run")))
+                self.assertTrue(parser.format_help().startswith(f"usage: rk {name}"))
+
+    def test_a_command_missing_what_it_needs_is_a_usage_error(self):
+        result = run("finding", "report")
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("usage: rk finding report", result.stderr)
 
 
 if __name__ == "__main__":

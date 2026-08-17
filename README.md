@@ -45,6 +45,17 @@ the identical command line from a source checkout, with `src` on `PYTHONPATH`.
 ## Check the machine
 
 ```sh
+rk version
+```
+
+`rk version` reports what is installed: the package version, the last migration
+in the corpus, how many there are, and a digest over all of them. Two machines
+running the same package version can be running different schemas, so the digest
+is the number that decides whether they agree. `rk --version` answers the same
+question as one line for a person; this answers it in the shape every other
+command answers in. It reaches no database and no network.
+
+```sh
 rk doctor
 ```
 

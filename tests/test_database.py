@@ -2241,6 +2241,40 @@ CONTROLS = (
         "                repeat('b', 64));"
         " END $ctl$",
     ),
+    Control(
+        # PH2-59 criterion 5, as the one-row migration that would undo it. Which
+        # blockers an operator may lift is a table, and the whole design rests on
+        # the seven that are not in it: `not_validated` says a Finding was never
+        # reproduced, and a row registering it as a review gate would turn the
+        # emission gate into something a person can talk their way past. Nothing
+        # ships that row -- the failure this arm is for is a later migration
+        # adding one, and a check reading the registry is what notices.
+        "standing:finding_reporting",
+        "INSERT INTO review_gates (code, description)"
+        " VALUES ('not_validated', 'forged')",
+    ),
+    Control(
+        # PH2-59, the same three routes 29 found, on the sentence an operator
+        # writes to overrule a gate. The column first.
+        "standing:finding_reporting",
+        "GRANT SELECT (reason) ON finding_gate_clearances TO rk2_runtime",
+    ),
+    Control(
+        # Then a view over it, which is the route a column grant does not close.
+        # No GRANT is written because none is needed: 029's default privileges
+        # hand rk2_runtime SELECT on anything rk2_owner creates, so the CREATE
+        # is the whole fault -- which is why the arm reads the dependency graph
+        # rather than trusting that a view over free text would be noticed.
+        "standing:finding_reporting",
+        "CREATE VIEW v_selftest_clearances AS"
+        " SELECT finding_id, reason FROM finding_gate_clearances",
+    ),
+    Control(
+        # And the log, which republishes the row to a table the runtime sweeps.
+        "standing:finding_reporting",
+        "UPDATE event_table_config SET redacted_columns = array_remove(redacted_columns, 'reason')"
+        " WHERE table_name = 'finding_gate_clearances'",
+    ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
@@ -24346,13 +24380,25 @@ class ReplayFixture:
         make each arm an assertion about whichever walk got there first. A
         caller that passes a subject is one that wants two claims about the same
         thing, which is a different arrangement and never the default.
+
+        Such a caller gets the next Property class rather than the first. 018's
+        dedup index is the subject and the Property class together, so a second
+        claim about one subject has to be about a different property of it --
+        which is what a second investigation of one thing is, and is exactly the
+        gap 019 means when it says a report signature is coarser than a
+        Hypothesis dedup key.
         """
         subject = subject or offline_entity(cls.connection, cls.program_id)
         hypothesis = committed(
             cls.connection,
             "INSERT INTO hypotheses (program_id, subject_entity_id, property_class, statement)"
             " VALUES ($1::uuid, $2::uuid,"
-            "         (SELECT id FROM property_classes ORDER BY id LIMIT 1), $3)"
+            "         (SELECT pc.id FROM property_classes pc"
+            "           WHERE NOT EXISTS (SELECT 1 FROM hypotheses h"
+            "                              WHERE h.subject_entity_id = $2::uuid"
+            "                                AND h.superseded_by IS NULL"
+            "                                AND h.property_class = pc.id)"
+            "           ORDER BY pc.id LIMIT 1), $3)"
             " RETURNING id",
             (cls.program_id, subject, statement),
         )
@@ -26688,9 +26734,16 @@ class ValidatedFindingFixture(ReplayFixture):
         )
 
     @classmethod
-    def candidate(cls, statement: str) -> dict:
-        """One candidate Finding, by 36's route and no other."""
-        walk = cls.walked(statement, specification(cls.HELD), answers=cls.ANSWERS)
+    def candidate(cls, statement: str, subject: str | None = None) -> dict:
+        """One candidate Finding, by 36's route and no other.
+
+        A caller that names a subject is one that wants two Findings about the
+        same thing, which is how a `duplicate` gate is raised: 019's report
+        signature is the class and the subject's dedup key, so a twin has to be a
+        real second claim about the one subject rather than a row edited to look
+        like one.
+        """
+        walk = cls.walked(statement, specification(cls.HELD), answers=cls.ANSWERS, subject=subject)
         opened = cls.called(
             cls.OPEN_FINDING,
             (walk["hypothesis"], walk["closed"]["test_run_id"], cls.klass, cls.TITLE),
@@ -26718,9 +26771,9 @@ class ValidatedFindingFixture(ReplayFixture):
                 "replay": again["closed"]["test_run_id"]}
 
     @classmethod
-    def served(cls, statement: str) -> dict:
+    def served(cls, statement: str, subject: str | None = None) -> dict:
         """A candidate, reproduced, and the session the packet went to."""
-        made = cls.reproduced(cls.candidate(statement))
+        made = cls.reproduced(cls.candidate(statement, subject))
         opened = cls.called(cls.SESSION, (cls.program_id, made["finding"], made["replay"]))
         assert opened["outcome"] == "opened", opened
         return {**made, "opened": opened}
@@ -26741,9 +26794,9 @@ class ValidatedFindingFixture(ReplayFixture):
         return session
 
     @classmethod
-    def validated(cls, statement: str) -> dict:
+    def validated(cls, statement: str, subject: str | None = None) -> dict:
         """One Finding all the way to `validated`, which is where 38 starts."""
-        made = cls.answer(cls.served(statement), "confirmed")
+        made = cls.answer(cls.served(statement, subject), "confirmed")
         assert made["verdict"]["status"] == "validated", made["verdict"]
         return made
 
@@ -32910,6 +32963,765 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
     def test_the_check_holds_over_everything_this_case_exported(self):
         self.assertEqual(
             [], [tuple(str(field) for field in row) for row in self.export_problems]
+        )
+
+
+REPORTING_SLUG = "selftest-reporting"
+
+
+class FindingReportTest(ReportFixture, DatabaseCase):
+    """Ticket 59 criterion 5: a person reports a Finding, and lifts a gate to do it.
+
+    019 built every part of this and left the last step with no caller.
+    `transition_rules` has reserved `validated -> reported` for a human actor
+    since 06, `report_renderings` holds the exact bytes an approval may name and
+    `enforce_report_approval` refuses a transition that names none -- and nothing
+    in the corpus inserted the row, so an operator's only route to the end of the
+    harness was `psql`. `findings.reported_at` had been ranked on by 023 since the
+    day it was added and had never been written by anything.
+
+    42's arrangement carried one step further, and then twice more. A Finding is
+    validated, composed, rendered and filed; the operator reports it; a second
+    real claim about the same subject is validated, which raises the `duplicate`
+    gate against it because the report signature is deliberately coarser than a
+    dedup key; the program's do-not-send list is written, which raises
+    `known_issue` beside it; the operator lifts both and reports the twin.
+
+    Everything commits and the order is load-bearing throughout. 42 refuses to
+    keep bytes for a blocked Finding, so the twin cannot be rendered until its
+    gates are lifted -- which is the whole reason clearing is a verb of its own
+    and not a flag on reporting.
+
+    Both verbs are asked on the operator's own connection, because that is the
+    only connection they are granted to. Asking them as the runtime is the path
+    criterion 5's "human-only" exists to close, so it is asked here as a refusal
+    rather than assumed.
+    """
+
+    slug = REPORTING_SLUG
+
+    REPORT = "SELECT report_finding($1, $2::uuid, $3, $4)"
+    CLEAR = "SELECT clear_review_gate($1, $2, $3)"
+    BLOCKERS = (
+        "SELECT code, detail FROM report_blockers($1::uuid)"
+        " WHERE severity = 'hard' ORDER BY code"
+    )
+    LABEL = "SELECT label FROM findings WHERE id = $1::uuid"
+
+    #: The operator's own sentences, which go on the transition and on the two
+    #: clearances and are never handed to a model.
+    WHY = "the write stayed written on a neighbour's order and the program pays for it"
+    WHY_NOT_A_DUPLICATE = "the other report is about the read; this one is about the write"
+    WHY_NOT_KNOWN = "their list means the public catalogue, and this is the orders API"
+
+    #: A second real claim about the first Finding's own subject. One class and
+    #: one subject is one report signature, which is what `duplicate` is about; a
+    #: different statement is what makes it a second investigation rather than a
+    #: row edited to look like a collision.
+    TWIN = "the orders API lets a stranger write on a neighbour's order twice over"
+
+    #: What the program wrote on its own do-not-send list, and so what the
+    #: `known_issue` gate says back to the operator who has to read it.
+    KNOWN = "we do not take reports about this catalogue"
+
+    #: The name the standing check is registered and asked under.
+    CHECK = "check_finding_reporting"
+
+    #: The twin's basis. Not 38's `demonstrated_impact`, which is refused until
+    #: there is an `impact_demonstrations` row: the pivots this fixture stamps
+    #: are on the two Findings it opens itself, and the twin is a third.
+    BASIS = "constrained_inference"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.subject = cls.member["first"]["subject"]
+        cls.rendering = cls.filed["rendering"]
+        cls.digest = cls.filed["content_sha256"]
+        cls.other = cls.label_of(cls.member["second"]["finding"])
+
+        cls.unblocked = cls.hard_blockers(cls.finding)
+        cls.refuse_before_anything_is_reported()
+        cls.report_it()
+        cls.refuse_the_second_time()
+        cls.raise_the_two_review_gates()
+        cls.refuse_what_no_operator_may_lift()
+        cls.lift_them_and_report_the_twin()
+        cls.refuse_to_edit_a_clearance()
+        cls.keep_the_operators_words_off_the_model_surface()
+
+        cls.transitions_announced = int(
+            cls.connection.execute(
+                "SELECT count(*) FROM events"
+                " WHERE program_id = $1::uuid AND type = 'finding.transitioned'"
+                "   AND payload -> 'after' ->> 'to_status' = 'reported'",
+                (cls.program_id,),
+            ).scalar()
+        )
+        cls.problems = cls.rows_of(f"SELECT * FROM {cls.CHECK}()")
+        cls.forged = cls.forge_each_way_reporting_can_be_wrong()
+
+    # -- the moves -------------------------------------------------------------
+
+    @classmethod
+    def label_of(cls, finding: str) -> str:
+        return str(cls.connection.execute(cls.LABEL, (finding,)).scalar())
+
+    @classmethod
+    def hard_blockers(cls, finding: str) -> dict:
+        """What still stands between one Finding and a report, as a mapping."""
+        return {
+            str(code): str(detail) for code, detail in cls.rows_of(cls.BLOCKERS, (finding,))
+        }
+
+    @classmethod
+    def operator_says(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One operator verb, on the one connection it is granted to."""
+        return json.loads(str(cls.as_operator(sql, parameters)))
+
+    @classmethod
+    def refused_operator(cls, sql: str, parameters: tuple = ()) -> str:
+        """One operator verb that must refuse, in the words it refused in."""
+        connection = pg.connect(cls.harness.human)
+        try:
+            connection.execute(operator.BIND, (cls.program_id,))
+            return refusal_message(connection, sql, parameters)
+        finally:
+            connection.close()
+
+    @classmethod
+    def operator_rows(cls, sql: str, parameters: tuple = ()) -> list:
+        """Rows only a person may read, on the connection a person reads them on.
+
+        A clearance's reason is granted to `rk2_human` and to nothing else, so
+        the runtime connection every other read in this class uses cannot see the
+        row an audit is about.
+        """
+        connection = pg.connect(cls.harness.human)
+        try:
+            connection.execute(operator.BIND, (cls.program_id,))
+            return [
+                tuple(str(field) for field in row)
+                for row in connection.execute(sql, parameters).rows
+            ]
+        finally:
+            connection.close()
+
+    @classmethod
+    def snapshot(cls, finding: str) -> tuple:
+        """The two columns a report moves, read together.
+
+        Together because 023 ranks on `reported_at` and 06's machine reads
+        `status`, and a report that moved one without the other would be a
+        Finding that is reported for one half of the harness and not for the
+        other.
+        """
+        [row] = cls.rows_of(
+            "SELECT status, reported_at IS NOT NULL FROM findings WHERE id = $1::uuid",
+            (finding,),
+        )
+        return (str(row[0]), bool(row[1]))
+
+    @classmethod
+    def refuse_before_anything_is_reported(cls):
+        """Every way the verb is asked wrong, while nothing has been reported yet.
+
+        Asked here rather than afterwards because most of them stop meaning what
+        they say once the Finding has moved: on a Finding that is already
+        `reported`, "no such Finding" and "only a validated Finding can be
+        reported" are different sentences. The already-reported one is asked on
+        its own below.
+
+        The runtime arm is the one criterion 5 is most about. `rk2_runtime` is
+        the connection every model's tool call reaches through, and 033's default
+        privileges grant EXECUTE on a new function to it as the function is
+        created -- so "human-only" is a claim about a revoke, and a revoke is
+        only ever proved by asking.
+        """
+        cls.refusals_before = {
+            "the runtime may not report": cls.refuse(
+                cls.REPORT, (cls.label, cls.rendering, cls.digest, cls.WHY)
+            ),
+            "the runtime may not lift a gate": cls.refuse(
+                cls.CLEAR, (cls.label, "duplicate", cls.WHY_NOT_A_DUPLICATE)
+            ),
+            "no such Finding": cls.refused_operator(
+                cls.REPORT, ("F-nobody", cls.rendering, cls.digest, cls.WHY)
+            ),
+            "no reason": cls.refused_operator(
+                cls.REPORT, (cls.label, cls.rendering, cls.digest, "   ")
+            ),
+            "no such rendering": cls.refused_operator(
+                cls.REPORT, (cls.label, str(uuid.uuid4()), cls.digest, cls.WHY)
+            ),
+            "a rendering of another Finding": cls.refused_operator(
+                cls.REPORT, (cls.other, cls.rendering, cls.digest, cls.WHY)
+            ),
+            # The confirmation, asked as the failure it exists for: an id
+            # pasted out of a script that filed a rendering nobody opened.
+            "the digest of other bytes": cls.refused_operator(
+                cls.REPORT, (cls.label, cls.rendering, "0" * 64, cls.WHY)
+            ),
+            "no digest at all": cls.refused_operator(
+                cls.REPORT, (cls.label, cls.rendering, "", cls.WHY)
+            ),
+        }
+
+    @classmethod
+    def report_it(cls):
+        """The step 019 left with no caller, and everything it moved."""
+        cls.before = cls.snapshot(cls.finding)
+        cls.reported = cls.operator_says(
+            cls.REPORT, (cls.label, cls.rendering, cls.digest, cls.WHY)
+        )
+        cls.after = cls.snapshot(cls.finding)
+        [cls.transition] = cls.rows_of(
+            "SELECT from_status, to_status, actor_kind, rationale,"
+            "       approved_rendering_id::text, agent_run_id IS NULL"
+            "  FROM finding_transitions"
+            " WHERE finding_id = $1::uuid AND to_status = 'reported'",
+            (cls.finding,),
+        )
+
+    @classmethod
+    def refuse_the_second_time(cls):
+        """An operator who reported this one an hour ago, told so in those words.
+
+        019's trigger would refuse it too -- a `validated -> reported` row whose
+        Finding is `reported` is a stale transition -- but "stale transition" is
+        the right sentence for a caller that raced and the wrong one for a person
+        who has forgotten what they did this morning.
+        """
+        cls.said_twice = cls.refused_operator(
+            cls.REPORT, (cls.label, cls.rendering, cls.digest, cls.WHY)
+        )
+
+    @classmethod
+    def raise_the_two_review_gates(cls):
+        """A second real claim about one subject, and the do-not-send list.
+
+        The twin is validated by 36's and 37's route in full, so `duplicate` is
+        raised by two Findings that both exist. The known issue is written as the
+        owner and not through a verb because there is none: 019 declared
+        `program_known_issues` entered by the operator through the control
+        surface and no ticket has built that surface, which is said here rather
+        than quietly invented.
+
+        The twin is carried up to the two gates and no further, so that what is
+        read back is the gates and only the gates. A Finding that had merely been
+        validated would also be missing its effects, its chain and its severity,
+        and a clearance that lifted one code out of four would prove nothing
+        about what the other three cost.
+        """
+        cls.twin = cls.validated(cls.TWIN, cls.subject)
+        cls.twin_label = cls.label_of(cls.twin["finding"])
+        cls.compose_the_twin()
+        cls.duplicate_only = cls.hard_blockers(cls.twin["finding"])
+
+        cls.as_owner(
+            "INSERT INTO program_known_issues (program_id, class_id, entity_like, source, note)"
+            " SELECT $1::uuid, f.class_id, e.dedup_key, 'program_policy', $3"
+            "   FROM findings f JOIN entities e ON e.id = f.subject_entity_id"
+            "  WHERE f.id = $2::uuid",
+            (cls.program_id, cls.twin["finding"], cls.KNOWN),
+        )
+        cls.both_gates = cls.hard_blockers(cls.twin["finding"])
+        # What 42 refuses to keep bytes for, asked before either gate is lifted
+        # because it is the reason clearing has to be able to happen first.
+        cls.blocked_rendering = cls.called(
+            cls.FILE, (cls.twin["finding"], cls.FORM, "bytes nobody may keep", reporting.VERSION)
+        )
+
+    @classmethod
+    def refuse_what_no_operator_may_lift(cls):
+        """The refusals that keep a clearance an answer rather than a licence."""
+        cls.refusals_lifting = {
+            "a blocker the database computed": cls.refused_operator(
+                cls.CLEAR, (cls.twin_label, "not_validated", cls.WHY_NOT_A_DUPLICATE)
+            ),
+            "a code that is nothing at all": cls.refused_operator(
+                cls.CLEAR, (cls.twin_label, "inconvenient", cls.WHY_NOT_A_DUPLICATE)
+            ),
+            "a gate that is not raised": cls.refused_operator(
+                cls.CLEAR, (cls.other, "duplicate", cls.WHY_NOT_A_DUPLICATE)
+            ),
+            "no reason": cls.refused_operator(cls.CLEAR, (cls.twin_label, "duplicate", " ")),
+            "no such Finding": cls.refused_operator(
+                cls.CLEAR, ("F-nobody", "duplicate", cls.WHY_NOT_A_DUPLICATE)
+            ),
+        }
+
+    @classmethod
+    def lift_them_and_report_the_twin(cls):
+        """Both gates lifted one at a time, and then the report they were blocking.
+
+        One at a time because they are two judgements, and the middle reading is
+        the evidence of it: after the first clearance the other gate is still
+        standing, and the verb's own answer says so.
+        """
+        cls.lifted_known = cls.operator_says(
+            cls.CLEAR, (cls.twin_label, "known_issue", cls.WHY_NOT_KNOWN)
+        )
+        cls.after_the_first = cls.hard_blockers(cls.twin["finding"])
+        cls.lifted_duplicate = cls.operator_says(
+            cls.CLEAR, (cls.twin_label, "duplicate", cls.WHY_NOT_A_DUPLICATE)
+        )
+        cls.after_both = cls.hard_blockers(cls.twin["finding"])
+        cls.lifted_twice = cls.refused_operator(
+            cls.CLEAR, (cls.twin_label, "duplicate", cls.WHY_NOT_A_DUPLICATE)
+        )
+        # On the operator's connection, because the reason is granted to nobody
+        # else -- which is to say the audit is read the way an audit reads it.
+        cls.clearances = cls.operator_rows(
+            "SELECT code, detail, reason, actor_kind, cleared_by"
+            "  FROM finding_gate_clearances WHERE finding_id = $1::uuid ORDER BY code",
+            (cls.twin["finding"],),
+        )
+        cls.clearance_events = [
+            (str(kind), str(entity))
+            for kind, entity in cls.rows_of(
+                "SELECT actor_kind, payload -> 'after' ->> 'code' FROM events"
+                " WHERE program_id = $1::uuid AND type = 'finding.gate_cleared'"
+                " ORDER BY seq",
+                (cls.program_id,),
+            )
+        ]
+        cls.report_the_twin()
+
+    @classmethod
+    def compose_the_twin(cls):
+        """Everything a report needs that is not a judgement, done before the gates.
+
+        Composed exactly as 42 composes the first one, out of the twin's own
+        rows: 034's no-new-facts rule says a mechanism sentence may only print a
+        value that appears in a row the Finding cites, and every observation and
+        Receipt the first Finding cites belongs to the first Finding.
+
+        42 grades a composition against `report_blockers` and returns what still
+        stands, but it does not refuse on it, so this runs with `duplicate`
+        already up. Only the rendering is refused for a blocked Finding, and the
+        rendering is the one step left below.
+        """
+        witness = [
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT observation_id::text FROM finding_evidence"
+                " WHERE finding_id = $1::uuid ORDER BY ordinal",
+                (cls.twin["finding"],),
+            )
+        ]
+        cited = [
+            (str(path), str(status))
+            for path, status in cls.rows_of(
+                "SELECT DISTINCT r.path, r.status_code::text"
+                "  FROM finding_cited_receipts fcr JOIN receipts r ON r.id = fcr.receipt_id"
+                " WHERE fcr.finding_id = $1::uuid ORDER BY 1",
+                (cls.twin["finding"],),
+            )
+        ]
+        cls.twin_composed = cls.called(cls.COMPOSE, (cls.twin["finding"], json.dumps({
+            "effects": [{"effect": effect, "witness": seen}
+                        for effect, seen in zip(cls.EFFECTS, witness)],
+            "steps": [{
+                "mechanism": "generic.control",
+                "params": {"control_path": cited[2][0], "control_status": cited[2][1],
+                           "path": cited[1][0]},
+                "citations": [{"observation": witness[0]}, {"observation": witness[1]}],
+            }],
+        })))
+        committed(cls.connection, cls.CVSS, (cls.twin["finding"],))
+        cls.twin_stated = cls.called(
+            cls.SEVERITY, (cls.twin["finding"], cls.BAND, cls.BASIS, cls.RATIONALE)
+        )
+
+    @classmethod
+    def report_the_twin(cls):
+        """The bytes the two clearances were for, and the report of them."""
+        cls.twin_filed = cls.called(cls.FILE, (
+            cls.twin["finding"], cls.FORM,
+            reporting.render(cls.bundle_of(cls.FINDING_SOURCE, (cls.twin["finding"], cls.FORM))),
+            reporting.VERSION,
+        ))
+        cls.twin_reported = cls.operator_says(
+            cls.REPORT,
+            (cls.twin_label, cls.twin_filed["rendering"],
+             cls.twin_filed["content_sha256"], cls.WHY),
+        )
+
+    @classmethod
+    def refuse_to_edit_a_clearance(cls):
+        """A decision that can be rewritten is not a record of one.
+
+        Both sessions are asked, because "cannot be rewritten" is a claim about
+        every session there is and the two are refused by different things. The
+        operator's connection is granted SELECT and nothing else. The owner's
+        gets as far as 026's guard, which refuses first: the row says a person
+        cleared this gate, and a session that is not one cannot re-assert that
+        even to leave it exactly as it was.
+        """
+        cls.edits = {
+            "the operator's own connection": cls.refused_operator(
+                "UPDATE finding_gate_clearances SET reason = 'something else'"
+                " WHERE finding_id = $1::uuid",
+                (cls.twin["finding"],),
+            ),
+            "update": refusal_message(
+                cls.owner_connection,
+                "UPDATE finding_gate_clearances SET reason = 'something else'"
+                " WHERE finding_id = $1::uuid",
+                (cls.twin["finding"],),
+            ),
+            "delete": refusal_message(
+                cls.owner_connection,
+                "DELETE FROM finding_gate_clearances WHERE finding_id = $1::uuid",
+                (cls.twin["finding"],),
+            ),
+            "another Program's Finding": cls.refuse_a_clearance_under_another_program(),
+        }
+
+    @classmethod
+    def refuse_a_clearance_under_another_program(cls) -> str:
+        """The keys that tie a clearance to one Program, reached the only way possible.
+
+        Every row on this table says a person cleared the gate, by CHECK, and
+        026's guard is BEFORE INSERT and ALWAYS -- so a session that is not a
+        person is stopped by the guard and the key never rules on anything. The
+        claim is dropped for one transaction and the row offered as the
+        runtime's, which is the only shape of it the key gets to see. The
+        transaction is thrown away whichever answer comes back.
+        """
+        try:
+            with cls.owner_connection.transaction():
+                cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+                cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+                cls.owner_connection.execute(
+                    "ALTER TABLE finding_gate_clearances DROP CONSTRAINT"
+                    " finding_gate_clearances_actor_kind_check"
+                )
+                cls.owner_connection.execute(
+                    "INSERT INTO finding_gate_clearances (program_id, finding_id, code,"
+                    " detail, reason, actor_kind, cleared_by)"
+                    " VALUES ($1::uuid, $2::uuid, 'duplicate', 'forged', 'forged',"
+                    " 'llm', 'nobody')",
+                    (str(uuid.uuid4()), cls.finding),
+                )
+                raise Rollback
+        except pg.DatabaseError as error:
+            return error.primary or str(error)
+        except Rollback:
+            return ""
+
+    @classmethod
+    def keep_the_operators_words_off_the_model_surface(cls):
+        """29's three routes to an operator's free text, asked about this one.
+
+        A clearance's reason is an argument for sending a report a program said
+        it did not want, written for the person who reads the audit. The column,
+        a view over it and the event that republishes the row are the three ways
+        it could arrive back in what a model is handed, and two of them are
+        opened by doing nothing: 029's default privileges grant the runtime
+        SELECT on every table and view rk2_owner creates.
+
+        The narrow half is asked beside the wide one, because the wide claim
+        would be a runtime that cannot see that a gate was lifted at all -- which
+        it has to see, since a lifted gate is what lets 42 keep the bytes.
+        """
+        cls.runtime_reading_the_reason = cls.refuse(
+            "SELECT reason FROM finding_gate_clearances WHERE finding_id = $1::uuid",
+            (cls.twin["finding"],),
+        )
+        cls.runtime_reading_the_rest = [
+            (str(code), str(detail))
+            for code, detail in cls.rows_of(
+                "SELECT code, detail FROM finding_gate_clearances"
+                " WHERE finding_id = $1::uuid ORDER BY code",
+                (cls.twin["finding"],),
+            )
+        ]
+        # Read as the runtime, which is the connection that sweeps `events` and
+        # quotes what it finds into a mission packet.
+        cls.clearance_payloads = [
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT payload::text FROM events"
+                " WHERE program_id = $1::uuid AND type = 'finding.gate_cleared'"
+                " ORDER BY seq",
+                (cls.program_id,),
+            )
+        ]
+
+    # -- the negative controls -------------------------------------------------
+
+    @classmethod
+    def forge_each_way_reporting_can_be_wrong(cls) -> dict:
+        """A state for every arm of `check_finding_reporting` that can be forged.
+
+        One transaction each, so each arm is read against its own forgery and
+        nothing carries into the next: the check answers about the whole
+        database, and two breakages at once would be one arm asserted by
+        another's rows.
+
+        Four of the eight. A clearance filed under a Program that is not the
+        Finding's is refused by the composite foreign key on the table and cannot
+        be produced at all, which is asserted directly above instead. The three
+        that ask where the operator's own sentence can be read are forged in
+        `CONTROLS`, because each of them is a grant or a registry row rather than
+        a Finding, and this class's Program is not what they are about.
+        """
+        return {
+            "a review gate the blocker function does not consult": cls.while_broken(
+                [("INSERT INTO review_gates (code, description)"
+                  " VALUES ('not_validated', 'forged')", ())],
+            ),
+            "a review gate was lifted by something other than a person": cls.while_broken(
+                [("ALTER TABLE finding_gate_clearances DROP CONSTRAINT"
+                  " finding_gate_clearances_actor_kind_check", ()),
+                 ("INSERT INTO finding_gate_clearances (program_id, finding_id, code,"
+                  " detail, reason, actor_kind, cleared_by)"
+                  " VALUES ($1::uuid, $2::uuid, 'known_issue', 'forged', 'forged',"
+                  " 'llm', 'nobody')", (cls.program_id, cls.finding))],
+            ),
+            "a Finding is reported with no operator transition behind it": cls.while_broken(
+                [("DELETE FROM finding_transitions WHERE finding_id = $1::uuid"
+                  "   AND to_status = 'reported'", (cls.finding,))],
+            ),
+            "a Finding's reported status and its reported_at disagree": cls.while_broken(
+                [("UPDATE findings SET reported_at = NULL WHERE id = $1::uuid",
+                  (cls.finding,))],
+            ),
+        }
+
+    @classmethod
+    def while_broken(cls, statements: list) -> list:
+        """What the check says about a state, on a transaction that never commits.
+
+        42's `while_forged` breaks it, asks and puts it back. This asks inside
+        the transaction that broke it and rolls the whole thing away, because
+        the third arm cannot be put back: `findings_status_guard` and 019's
+        approval trigger are both ENABLE ALWAYS, so a deleted `reported`
+        transition can be re-inserted by nobody at all -- the Finding it belonged
+        to is `reported`, and a `reported` Finding carries the `not_validated`
+        blocker the approval gate refuses on.
+
+        `app.purging` is the same third arm's other half. It is the one flag that
+        lets an immutable row be deleted, and what it is for is a Program going
+        away whole; a delete of one transition out from under a Finding that
+        stays is the cascade half-run, which is the state the arm is about and
+        the only route to it there is.
+        """
+        broken: list = []
+        with contextlib.suppress(Rollback), cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SET LOCAL app.purging = 'on'")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            for sql, parameters in statements:
+                cls.owner_connection.execute(sql, parameters)
+            broken = [
+                tuple(str(field) for field in row)
+                for row in cls.owner_connection.execute(f"SELECT * FROM {cls.CHECK}()").rows
+            ]
+            raise Rollback
+        return broken
+
+    # -- criterion 5: the report ------------------------------------------------
+
+    def test_a_validated_finding_starts_with_nothing_blocking_it(self):
+        """The premise of everything below, said rather than assumed."""
+        self.assertEqual({}, self.unblocked)
+        self.assertEqual(("validated", False), self.before)
+
+    def test_reporting_moves_the_status_and_writes_the_timestamp_023_ranks_on(self):
+        self.assertEqual(("reported", True), self.after)
+        self.assertEqual("reported", self.reported["status"])
+        self.assertEqual(self.label, self.reported["finding"])
+        self.assertIsNotNone(self.reported["reported_at"])
+
+    def test_the_transition_is_the_operators_and_names_the_bytes_they_read(self):
+        """Criterion 5's word is "transitions", and this is what one carries.
+
+        The actor kind is `human` and no Agent run is on it, which together are
+        what say a person did this: 026's guard refuses `human` from a session
+        that is not one, and an Agent run on the row would be a claim that a
+        model was involved in the decision.
+        """
+        from_status, to_status, actor_kind, rationale, rendering, no_run = self.transition
+        self.assertEqual(
+            ("validated", "reported", "human", self.WHY, self.rendering, True),
+            (str(from_status), str(to_status), str(actor_kind), str(rationale),
+             str(rendering), bool(no_run)),
+        )
+
+    def test_the_report_answers_with_the_hash_of_the_bytes_that_were_approved(self):
+        """What makes an approval checkable afterwards by somebody else."""
+        [kept] = self.rows(
+            "SELECT content_sha256, template_id FROM report_renderings WHERE id = $1::uuid",
+            (self.rendering,),
+        )
+        self.assertEqual(
+            (str(kept[0]), str(kept[1])),
+            (self.reported["content_sha256"], self.reported["template"]),
+        )
+        self.assertEqual([], self.reported["gates_lifted"])
+
+    def test_each_report_is_the_event_006_files_a_transition_under(self):
+        """Two reports were made by the end of this case, and two were announced."""
+        self.assertEqual(2, self.transitions_announced)
+
+    def test_reporting_the_same_finding_again_says_so_in_those_words(self):
+        self.assertIn("was already reported", self.said_twice)
+
+    def test_neither_verb_is_reachable_from_the_runtime_connection(self):
+        """Criterion 5's "human-only", asked of the role a model can reach.
+
+        Both, because a revoke that covered one of them would leave the other as
+        the way a compromised runtime decides what leaves for a bounty program.
+        """
+        for name in ("the runtime may not report", "the runtime may not lift a gate"):
+            with self.subTest(name):
+                self.assertIn("permission denied", self.refusals_before[name])
+
+    def test_every_way_the_report_verb_is_asked_wrong_is_its_own_sentence(self):
+        for name, said in (
+            ("no such Finding", "no Finding of this Program is labelled F-nobody"),
+            ("no reason", "there is no reason on it"),
+            ("no such rendering", "no rendering of this Program is recorded under"),
+            ("a rendering of another Finding", "not of"),
+            ("the digest of other bytes", "this approval names " + "0" * 64),
+            ("no digest at all", "this approval names <nothing>"),
+        ):
+            with self.subTest(name):
+                self.assertIn(said, self.refusals_before[name])
+
+    # -- criterion 5: the gates -------------------------------------------------
+
+    def test_a_second_claim_about_one_subject_raises_the_duplicate_gate(self):
+        """And raises it naming the Finding it collides with, in its own words."""
+        self.assertEqual(["duplicate"], sorted(self.duplicate_only))
+        self.assertIn(self.label, self.duplicate_only["duplicate"])
+        self.assertIn("reported", self.duplicate_only["duplicate"])
+
+    def test_the_programs_own_list_raises_the_known_issue_gate_beside_it(self):
+        self.assertEqual(["duplicate", "known_issue"], sorted(self.both_gates))
+        self.assertEqual(self.KNOWN, self.both_gates["known_issue"])
+
+    def test_a_blocked_finding_cannot_have_its_bytes_filed_at_all(self):
+        """42's refusal, which is why clearing has to be a verb of its own.
+
+        A rendering cannot be recorded while a gate stands, so an operator who
+        could only clear a gate as part of approving a rendering would have
+        nothing to approve.
+        """
+        self.assertEqual("blocked", self.blocked_rendering["outcome"])
+        self.assertIn("duplicate", self.blocked_rendering["refusal"])
+        self.assertIn("known_issue", self.blocked_rendering["refusal"])
+
+    def test_lifting_one_gate_leaves_the_other_standing(self):
+        self.assertEqual(["duplicate"], sorted(self.after_the_first))
+        self.assertEqual({}, self.after_both)
+
+    def test_the_verb_says_what_is_still_blocking_and_not_only_what_it_lifted(self):
+        """So that lifting a gate never reads as permission to send."""
+        self.assertEqual(["duplicate"], self.lifted_known["still_blocked_by"])
+        self.assertEqual([], self.lifted_duplicate["still_blocked_by"])
+
+    def test_a_clearance_records_what_the_gate_was_saying_at_the_time(self):
+        """The half of the row an audit reads: not only what was decided, but
+        what the person was told before they decided it."""
+        self.assertEqual(
+            [("duplicate", self.duplicate_only["duplicate"], self.WHY_NOT_A_DUPLICATE,
+              "human", self.lifted_duplicate["cleared_by"]),
+             ("known_issue", self.KNOWN, self.WHY_NOT_KNOWN,
+              "human", self.lifted_known["cleared_by"])],
+            self.clearances,
+        )
+
+    def test_each_clearance_is_a_human_event_of_its_own(self):
+        """Criterion 5 asks for two distinct operator transitions "with Events",
+        and a clearance is not a Finding transition: it moves no status, so 006's
+        `finding.transitioned` would say something untrue about it."""
+        self.assertEqual(
+            [("human", "known_issue"), ("human", "duplicate")], self.clearance_events
+        )
+
+    def test_lifting_a_gate_twice_is_refused(self):
+        self.assertIn("was already lifted", self.lifted_twice)
+
+    def test_no_operator_may_lift_a_blocker_the_database_computed(self):
+        """The refusal names the whole set rather than only the code that was
+        asked for, because an operator who reached for `not_validated` is an
+        operator who does not yet know which two are theirs."""
+        said = self.refusals_lifting["a blocker the database computed"]
+        self.assertIn("not_validated is not a review gate", said)
+        self.assertIn("duplicate or known_issue", said)
+
+    def test_a_gate_that_is_not_raised_cannot_be_lifted_in_advance(self):
+        """What keeps a clearance an answer rather than a standing permission."""
+        self.assertIn("is not raised", self.refusals_lifting["a gate that is not raised"])
+
+    def test_every_other_way_the_clearing_verb_is_asked_wrong(self):
+        for name, said in (
+            ("a code that is nothing at all", "inconvenient is not a review gate"),
+            ("no reason", "there is none"),
+            ("no such Finding", "no Finding of this Program is labelled F-nobody"),
+        ):
+            with self.subTest(name):
+                self.assertIn(said, self.refusals_lifting[name])
+
+    def test_the_cleared_twin_renders_reports_and_says_which_gates_were_lifted(self):
+        """The end of the story: two judgements, then the bytes, then the report."""
+        self.assertEqual("recorded", self.twin_filed["outcome"])
+        self.assertEqual("reported", self.twin_reported["status"])
+        self.assertEqual(["duplicate", "known_issue"], self.twin_reported["gates_lifted"])
+        self.assertEqual(("reported", True), self.snapshot(self.twin["finding"]))
+
+    def test_the_runtime_cannot_read_the_reason_a_person_gave_for_overruling(self):
+        """A model that can read this can read an argument for sending a report
+        a program refused, and learn to make it."""
+        self.assertIn("permission denied", self.runtime_reading_the_reason)
+        # And the rest of the row, which it has to have: `record_rendering` asks
+        # `report_blockers` as the runtime, and what a gate was saying is the
+        # runtime's own sentence.
+        self.assertEqual(
+            [("duplicate", self.duplicate_only["duplicate"]), ("known_issue", self.KNOWN)],
+            self.runtime_reading_the_rest,
+        )
+
+    def test_the_reason_is_redacted_out_of_the_event_that_records_it(self):
+        """The route the column grant does not close, because the event is a
+        copy of the row on a table the runtime reads."""
+        for code, payload in zip(("known_issue", "duplicate"), self.clearance_payloads):
+            with self.subTest(code):
+                self.assertIn("[redacted]", payload)
+        published = " ".join(self.clearance_payloads)
+        self.assertNotIn(self.WHY_NOT_A_DUPLICATE, published)
+        self.assertNotIn(self.WHY_NOT_KNOWN, published)
+        # And what the gate itself was saying stays, because the runtime wrote
+        # that sentence and redacting it would hide the machine from the machine.
+        self.assertIn(self.KNOWN, published)
+
+    def test_a_clearance_cannot_be_edited_or_filed_under_another_program(self):
+        self.assertIn("permission denied", self.edits["the operator's own connection"])
+        self.assertIn("is not a member of rk2_human", self.edits["update"])
+        self.assertIn("immutable", self.edits["delete"])
+        self.assertIn("foreign key", self.edits["another Program's Finding"].lower())
+
+    # -- the standing check -----------------------------------------------------
+
+    def test_the_check_holds_over_everything_this_case_reported(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+    def test_each_arm_of_the_check_answers_the_state_it_is_for(self):
+        for problem, rows in self.forged.items():
+            with self.subTest(problem):
+                self.assertEqual([problem], [row[0] for row in rows])
+
+    def test_the_check_is_registered_where_rk_db_verify_will_find_it(self):
+        self.assertEqual(
+            [(f"SELECT * FROM {self.CHECK}()", "59")],
+            [(str(query), str(ticket)) for query, ticket in self.rows(
+                "SELECT query, owner_ticket FROM standing_checks"
+                " WHERE name = 'finding_reporting'"
+            )],
         )
 
 

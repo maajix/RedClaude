@@ -786,11 +786,18 @@ def _recorded(
             source="report_renderings",
         )
         return
+    # Both, because an approval names both: `rk finding report` takes the id and
+    # the digest of the bytes, so that what is approved is a document somebody
+    # opened rather than a row somebody's script filed. Printed here because this
+    # is where they are true together -- the digest is over the content this call
+    # just wrote, and reading it back out of the table later is reading whatever
+    # is there now.
     answers.document["rendering"] = filed["rendering"]
+    answers.document["content_sha256"] = filed["content_sha256"]
     ledger.hold(
         "record",
-        f"the bytes are filed as {filed['rendering']}, "
-        f"which an approval of {answers.label} may name",
+        f"the bytes are filed as {filed['rendering']} "
+        f"({filed['content_sha256']}), which an approval of {answers.label} may name",
     )
 
 

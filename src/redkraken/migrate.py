@@ -273,6 +273,24 @@ def load(corpus: Path = CORPUS) -> tuple[tuple[Migration, ...], tuple[Violation,
     return tuple(sorted(migrations, key=lambda item: item.identity)), ()
 
 
+def revision(migrations: tuple[Migration, ...]) -> str:
+    """The one name for a whole corpus: what it says, hashed in order.
+
+    `rk version` reports this beside the package version because the package
+    version is half the answer. Two installations at `0.1.0` with different
+    corpora are two different databases, and an operator comparing a report from
+    one machine with a report from another has nothing else to compare.
+
+    The identity is hashed alongside the checksum so that renaming a file is a
+    different revision. A digest over bytes alone would call two corpora equal
+    when one applies its migrations in an order the other does not.
+    """
+    digest = hashlib.sha256()
+    for migration in migrations:
+        digest.update(f"{migration.identity}\n{migration.checksum}\n".encode())
+    return digest.hexdigest()
+
+
 def provision(
     settings: pg.Settings,
     database: str,
