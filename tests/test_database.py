@@ -33840,7 +33840,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same forty-two subjects at a `constrained` ceiling, where
+    criterion 5: the same forty-seven subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -33896,6 +33896,13 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "browser-storage": Surface("web", None, "GET", "/profile", True, None),
         "client-side-path-traversal": Surface("web", None, "GET", "/view/{ref}", None,
                                               ("path", "text")),
+        # The two authenticated reads with no parameter at all that only the
+        # technology behind the Application tells apart, and
+        # `information-disclosure` is the third. A content platform is one
+        # question, a telemetry backend is another, and a published contract is
+        # the third: nothing about the route itself distinguishes them, which is
+        # what ticket 55's two technology facts are for.
+        "cms": Surface("spa", "wordpress", "GET", "/api/articles", True, None),
         # The one Surface with a file in a multipart body, which is where a
         # converter is reached. Nothing else in this table is a multipart write,
         # and nothing else carries a `file` value class.
@@ -33906,6 +33913,11 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
         "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", "text")),
+        # The second Surface running a technology in front of the Application
+        # rather than inside it, and `web-cache` is the first. A caching front
+        # end and a terminating proxy are different readings -- what is stored
+        # for whom, against what a rule matched -- so they are two facts.
+        "deployment": Surface("web", "nginx", "GET", "/admin/config", None, None),
         # The four authenticated routes that only one parameter's value class
         # tells apart, which is what ticket 54's two new facts are for. A
         # serialised body on a write is the first; a number, a path and a URL on
@@ -33935,6 +33947,12 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "information-disclosure": Surface("spa", "openapi", "GET", "/api/v2/orders", True,
                                           None),
         "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
+        # The second read whose authentication nobody has established and which
+        # carries no parameter, and `supply-chain` is the third. Both are told
+        # apart from everything above by the technology alone: an orchestrator
+        # underneath the Application, and a bundler beside its output.
+        "kubernetes": Surface("spa", "kubernetes", "GET", "/healthz", None, None),
+        "logging": Surface("spa", "sentry", "GET", "/api/activity", True, None),
         # Auth left unknown, and that is what separates this JSON write from
         # `race-conditions`: both are a typed JSON body on a POST, and only the
         # store behind the route and the caller's standing tell them apart.
@@ -33987,6 +34005,11 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # parser exists to be reached.
         "structured-injection": Surface("spa", None, "POST", "/services/orders", True,
                                         ("body", "text"), "text/xml"),
+        # The third served document in this table. `secrets` is a bundle a shell
+        # embeds and `browser-messaging` is a widget a page frames; this one is
+        # the map the build wrote beside the bundle, and what picks it out is the
+        # bundler rather than anything pointing at it.
+        "supply-chain": Surface("spa", "webpack", "GET", "/static/app.js.map", None, None),
         # The one Surface that runs a technology in front of the Application
         # rather than inside it, which is what `tech_cdn` is.
         "web-cache": Surface("web", "cloudflare", "GET", "/dashboard", None, None),
@@ -34023,7 +34046,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: six of the forty-two
+        whole Program -- and it is also the harder one: seven of the forty-seven
         Playbooks key on it, so the fact cannot be what tells them apart.
 
         The tenants are the same argument one fact later. `tenant_boundary` is a
@@ -34301,8 +34324,9 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # when it stops being true: a Playbook that two roles can load is a
         # Playbook whose Skill set no longer picks out who does this work, and a
         # Playbook that none can is unreachable. `attack-surface` is the recon
-        # one and `external-resources` is the js_analyst one -- it reads a
-        # served document for what it points at, which is that role's whole job;
+        # one, and `external-resources` and `supply-chain` are the js_analyst
+        # ones -- both read a served document for what it names rather than
+        # sending anything at the application, which is that role's whole job;
         # every other topic here is web_hunter's.
         self.assertEqual(
             {
@@ -34317,8 +34341,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "browser-script": ["web_hunter"],
                 "browser-storage": ["web_hunter"],
                 "client-side-path-traversal": ["web_hunter"],
+                "cms": ["web_hunter"],
                 "command-directory-injection": ["web_hunter"],
                 "cookies": ["web_hunter"],
+                "deployment": ["web_hunter"],
                 "deserialization": ["web_hunter"],
                 "exceptional-conditions": ["web_hunter"],
                 "external-resources": ["js_analyst"],
@@ -34330,6 +34356,8 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "identity-parsing": ["web_hunter"],
                 "information-disclosure": ["web_hunter"],
                 "jwt-jose": ["web_hunter"],
+                "kubernetes": ["web_hunter"],
+                "logging": ["web_hunter"],
                 "nosql-injection": ["web_hunter"],
                 "oauth": ["web_hunter"],
                 "object-ownership": ["web_hunter"],
@@ -34344,6 +34372,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "ssrf-url-routing": ["web_hunter"],
                 "ssti": ["web_hunter"],
                 "structured-injection": ["web_hunter"],
+                "supply-chain": ["js_analyst"],
                 "web-cache": ["web_hunter"],
                 "webauthn": ["web_hunter"],
                 "webhooks": ["web_hunter"],

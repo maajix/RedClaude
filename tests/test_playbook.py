@@ -460,8 +460,10 @@ class Corpus(unittest.TestCase):
                 "browser-script",
                 "browser-storage",
                 "client-side-path-traversal",
+                "cms",
                 "command-directory-injection",
                 "cookies",
+                "deployment",
                 "deserialization",
                 "exceptional-conditions",
                 "external-resources",
@@ -473,6 +475,8 @@ class Corpus(unittest.TestCase):
                 "identity-parsing",
                 "information-disclosure",
                 "jwt-jose",
+                "kubernetes",
+                "logging",
                 "nosql-injection",
                 "oauth",
                 "object-ownership",
@@ -487,6 +491,7 @@ class Corpus(unittest.TestCase):
                 "ssrf-url-routing",
                 "ssti",
                 "structured-injection",
+                "supply-chain",
                 "web-cache",
                 "webauthn",
                 "webhooks",
@@ -512,6 +517,7 @@ class Corpus(unittest.TestCase):
                 "browser-messaging": ("dom-vulnerabilities.md", "prototype-pollution.md"),
                 "browser-realtime": ("websocket-attacks.md",),
                 "browser-script": ("dangling-markup.md", "xss.md"),
+                "cms": ("cms-drupal.md", "cms-joomla.md", "cms-wordpress.md"),
                 # Two of these five describe classes `command-directory-injection`
                 # does not grade. They are attached here because that is where
                 # v1's pack put them, and this mapping records where each v1 page
@@ -519,6 +525,11 @@ class Corpus(unittest.TestCase):
                 "command-directory-injection": ("command-injection-filter-bypass.md",
                                                 "ldap-injections.md", "os-command-injection.md",
                                                 "shells.md", "xxe.md"),
+                # One of these two describes work `deployment` refuses outright:
+                # `http-attacks-tls-attacks.md` is a transport audit the scope
+                # proxy makes unobservable, and it is attached here because that
+                # is where v1's pack put it.
+                "deployment": ("apache-tomcat.md", "http-attacks-tls-attacks.md"),
                 "deserialization": ("deserialization-attacks.md",),
                 "external-resources": ("broken-link-hijacking.md",),
                 "file-resolution": ("lfi.md", "path-traversal-encoding-variants.md",
