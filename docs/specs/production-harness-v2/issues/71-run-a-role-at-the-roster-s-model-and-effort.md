@@ -157,7 +157,9 @@ of it would start -- so a validate, whose validator holds a session, is refused
 for three subagents it does not add to. The closing returns the Task to
 `pending` with the attempt spent, which frees both the lane and the count. The
 cap refusing claims that spend no subagent is a defect of its own and is
-PH2-75.
+PH2-75. That ticket has since made the cap ask what the claim in front of it
+would start, so the fixture closes nothing between claims and all five runs are
+open at once.
 
 ### A purge that cannot travel its own edge, found here and left open
 

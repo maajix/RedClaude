@@ -49,7 +49,8 @@ it. 75: `global_subagent_cap` counts the Tasks already claimed and never asks
 what the claim in front of it would start, so a Program running three subagents
 refuses a validate or a report that adds none. Neither names a blocker, because
 nothing blocks them -- no test had reached either until a fixture claimed one
-Task of every kind in one Program and then purged it.
+Task of every kind in one Program and then purged it. 75 is resolved: the cap is
+asked only of a claim whose own lane role runs as a subagent.
 
 Tickets 76 through 83 were raised after this re-measurement and are in none of the
 counts above: the table says 75 files because that is what was measured on the

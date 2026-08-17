@@ -1436,6 +1436,25 @@ CONTROLS = (
         "            AND r.runs_as = 'subagent') >= 3 $ctl$",
     ),
     Control(
+        # The same count, bounded by the row this time, and asked of every claim
+        # rather than of the claims that add to it -- which is the defect PH2-75
+        # closed, written back in. Structural for the same reason the two above
+        # are: with three subagent lanes open this function answers what the
+        # scheduler answered before the fix, and what it gets wrong is not a row
+        # but who it is asked about.
+        "standing:subagent_cap_guard",
+        "CREATE FUNCTION selftest_cap_refuses_every_claim() RETURNS boolean"
+        " LANGUAGE sql STABLE AS $ctl$"
+        " SELECT (SELECT count(*) FROM tasks c"
+        "           JOIN effective_lane_capacity lc"
+        "             ON lc.program_id = c.program_id AND lc.kind = c.kind"
+        "           JOIN roles r ON r.role = lc.role"
+        "          WHERE c.status IN ('claimed','running')"
+        "            AND r.runs_as = 'subagent')"
+        "        >= (SELECT w.max_concurrent_subagents FROM scheduler_weights w"
+        "             WHERE w.active) $ctl$",
+    ),
+    Control(
         # Capacity held out of the pool for a run that has already ended. Written
         # by hand because no call reaches it: the trigger on `finished_at`
         # settles the reservation in the same statement that closes the run, so
@@ -15258,16 +15277,19 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         here, which is also the first time `claimable_for` is asked about all
         five in one Program.
 
-        Each run is closed before the next Task is claimed, and that is not
-        tidiness. `global_subagent_cap` counts every claimed or running Task in
-        the Program whose lane role runs as a subagent and then refuses the
-        claim in front of it, whatever that claim would start: three of the
-        five kinds are subagent ones (recon, web_hunter, js_analyst -- the
-        validator holds a session and the reporter is a renderer), so with all
-        three left open the validate claim is refused for somebody else's
-        concurrency. Closing hands the Task back to `pending` with the attempt
-        spent, which frees both the lane and the count. That the cap also
-        refuses claims which start no subagent at all is real and is PH2-75.
+        Nothing is closed between the claims, which is PH2-75's criterion and
+        used to be impossible. `global_subagent_cap` counted the Program's
+        claimed and running subagent Tasks and then refused whatever claim was
+        in front of it, and three of the five kinds are subagent ones (recon,
+        web_hunter, js_analyst -- the validator holds a session and the reporter
+        is a renderer). So by the fourth claim the Program was at a cap of 3 by
+        doing what the roster calls full, and the validate was refused for
+        concurrency it does not spend; the fixture closed each run to get past
+        it, and that workaround was the symptom the ticket was written from. The
+        cap is asked only of a claim that would start a subagent now, so all
+        five runs are open at once. Each claim is made off a pass of its own,
+        and `offered_before` and `subagents_open` record what the offer held and
+        what the count stood at the moment before it.
         """
         program_id = cls.identifiers["roster"]
         labels = cls.seed("roster", 5)
@@ -15368,19 +15390,38 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
 
         cls.bind("roster")
         cls.offer()
+        cls.roster_cap = cls.cap()
         cls.claimed_runs = {}
+        cls.subagents_open = {}
+        cls.offered_before = {}
         for kind in SLATE_KINDS:
+            # A pass of its own before every claim, so the offer is asked the
+            # same question at the same moment the claim is: PH2-75's criterion
+            # 2 is that the two agree, and one slate taken before any of this
+            # was claimed could agree with all five claims by being stale.
+            cls.offered_before[kind] = tuple(
+                str(row["kind"]) for row in cls.offer()
+            )
+            # The shipped predicate rather than a second spelling of its join:
+            # a fixture that counted the population itself could not disagree
+            # with the rule, which is the whole thing being asserted.
+            cls.subagents_open[kind] = int(
+                cls.scalar(
+                    "SELECT count(*) FROM tasks c"
+                    " WHERE c.program_id = $1::uuid"
+                    "   AND c.status IN ('claimed','running')"
+                    "   AND subagent_started_for(c)",
+                    (program_id,),
+                )
+            )
             run = cls.call("SELECT claim_task($1)", (by_kind[kind],))
-            claimed = cls.as_owner(
+            cls.claimed_runs[kind] = cls.as_owner(
                 "SELECT a.id::text AS id, a.role, a.model, a.effort,"
                 "       r.model AS roster_model, r.effort AS roster_effort"
                 "  FROM agent_runs a JOIN roles r ON r.role = a.role"
                 " WHERE a.program_id = $1::uuid AND a.label = $2",
                 (program_id, str(run)),
             ).dicts()[0]
-            cls.claimed_runs[kind] = claimed
-            cls.call("SELECT finish_task_attempt($1::uuid, 'completed')",
-                     (claimed["id"],))
 
     @classmethod
     def arrange_subagent_cap(cls):
@@ -15883,6 +15924,43 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         self.assertEqual(
             [], [kind for kind, row in self.claimed_runs.items()
                  if str(row["model"]).startswith("claude-")]
+        )
+
+    # -- the cap is spent by the claims that start one (PH2-75) ----------------
+
+    def test_a_claim_that_starts_no_subagent_is_taken_at_the_cap(self):
+        # Criteria 1 and 3. The three subagent kinds are claimed and left open,
+        # which puts the Program at the cap, and the validate and the report are
+        # then claimed anyway -- a session and a renderer, neither of which adds
+        # a child. The counts are what each claim was standing at, so this fails
+        # loudly if a later edit starts closing runs between claims and quietly
+        # takes the cap out of the picture.
+        self.assertEqual(
+            {"recon": 0, "hunt": 1, "analyze": 2, "validate": 3, "report": 3},
+            self.subagents_open,
+        )
+        self.assertGreaterEqual(self.subagents_open["validate"], self.roster_cap)
+        self.assertEqual(
+            ("validator", "reporter"),
+            (self.claimed_runs["validate"]["role"], self.claimed_runs["report"]["role"]),
+        )
+
+    def test_every_claim_was_on_the_slate_offered_the_moment_before_it(self):
+        # Criterion 2. `claimable_for` is what the offer filters on and what the
+        # claim re-asks, so a cap that refused the last two refused them twice
+        # and the slate went empty rather than disagreeing -- which is why the
+        # defect never failed anything. Each pass is asked with the claims
+        # before it still open, so the two at the cap are the ones that matter:
+        # the offer holds them, and the claim then takes them. As sets, because
+        # which of the pending kinds the ranker puts first is its own question
+        # and not this ticket's.
+        self.assertEqual(
+            {"recon": {"recon", "hunt", "analyze", "validate", "report"},
+             "hunt": {"hunt", "analyze", "validate", "report"},
+             "analyze": {"analyze", "validate", "report"},
+             "validate": {"validate", "report"},
+             "report": {"report"}},
+            {kind: set(offered) for kind, offered in self.offered_before.items()},
         )
 
     # -- the one cross-role subagent cap (PH2-73) -------------------------------
