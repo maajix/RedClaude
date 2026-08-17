@@ -1507,6 +1507,18 @@ def _check_skills(corpus: Mapping[str, skills_module.Skill]) -> None:
         ROLES[name] = replace(role, skills=tuple(sorted(granted[name])))
 
 
+def loadable(one: playbooks_module.Playbook) -> bool:
+    """Whether some single role can load every Skill this Playbook names.
+
+    Published rather than left inline in the check below, because the corpus
+    gates outside ask the same question by name and two spellings of one rule
+    are two rules the day somebody edits one of them. It reads `ROLES` as it
+    stands, so it answers about the roster that is loaded rather than about the
+    one on disk.
+    """
+    return any(set(one.skills) <= set(role.skills) for role in ROLES.values())
+
+
 def _check_playbooks(corpus: Mapping[str, playbooks_module.Playbook]) -> None:
     """The Playbook corpus, against the Skills the roles can actually load.
 
@@ -1529,7 +1541,7 @@ def _check_playbooks(corpus: Mapping[str, playbooks_module.Playbook]) -> None:
         unknown = sorted(set(one.skills) - set(skills_module.SKILLS))
         if unknown:
             raise RosterError(f"playbook {name}: {unknown} is not a skill")
-        if not any(set(one.skills) <= set(role.skills) for role in ROLES.values()):
+        if not loadable(one):
             raise RosterError(f"playbook {name}: no role loads {list(one.skills)} at once")
 
 

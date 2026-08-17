@@ -287,10 +287,18 @@ The suite is standard library only and runs offline:
 python3 -m unittest discover -q
 python3 tools/check_baseline.py
 python3 -m tools.check_dispositions
+python3 -m tools.check_coverage
 ```
 
-The last of these is the migration ledger: for each of the 223 artifacts the
-census froze, what became of it. A row either names something this checkout has
-and cites the file that proves it works, or names the open migration ticket
+The third is the migration ledger: for each of the 223 artifacts the census
+froze, what became of it. A row either names something this checkout has and
+cites the file that proves it works, or names the open migration ticket
 committed to building it -- and fails the moment that ticket is marked resolved
 with the thing still missing.
+
+The fourth runs the third and then measures the shape of the answer, which no
+single row can show: the 49 in-scope Playbooks are all present, loadable by one
+role and registered in the schema at the exact text this checkout ships; the 73
+operator references and 9 sink packs are each attached to one Skill or Playbook
+that declares them and nothing sits loose in a `references/` directory; and the
+52 retirements split by kind under a scope whose reversal is on record.

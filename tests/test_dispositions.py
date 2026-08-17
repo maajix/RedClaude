@@ -1,4 +1,3 @@
-import csv
 import json
 import subprocess
 import sys
@@ -6,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.ledger import ledger_rows, written
 from tools import check_baseline, check_dispositions
 
 
@@ -27,19 +27,6 @@ BUILT = {
 
 def broken(**changes: str) -> dict[str, str]:
     return {**BUILT, **changes}
-
-
-def ledger_rows(without: str | None = None) -> list[list[str]]:
-    """The shipped ledger as raw rows, optionally missing the row for one source."""
-    with (ROOT / "baseline" / "v1-dispositions.tsv").open(encoding="utf-8", newline="") as handle:
-        return [row for row in csv.reader(handle, delimiter="\t") if row[0] != without]
-
-
-def written(rows: list[list[str]], directory: str) -> Path:
-    path = Path(directory) / "v1-dispositions.tsv"
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        csv.writer(handle, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_NONE).writerows(rows)
-    return path
 
 
 class DispositionLedgerTest(unittest.TestCase):
@@ -156,15 +143,16 @@ class DispositionRowTest(unittest.TestCase):
         self.assertEqual("built", self.state(BUILT))
 
     def test_a_row_that_names_an_open_migration_ticket_is_promised(self):
-        # The example moved on every migration ticket, and 56 was the last of
-        # them: with every registered ticket resolved and every replacement on
-        # disk, no row of the shipped ledger can be promised any more, which is
-        # what `promised 0` above says. So the open ticket is supplied rather
-        # than borrowed -- 57 is real and unresolved, and registering it here is
-        # what a later migration ticket would do in the policy file.
-        policy = {**self.policy, "migration_tickets": [*self.policy["migration_tickets"], "57"]}
+        # With every registered ticket resolved and every replacement on disk, no
+        # row of the shipped ledger can be promised any more, which is what
+        # `promised 0` above says. So the open ticket is supplied rather than
+        # borrowed, and it is read out of the tracker rather than written down
+        # here: a literal was 56, then 57, and each time the ticket it named was
+        # resolved this test failed on the day the ledger was most correct.
+        number = self.open_ticket()
+        policy = {**self.policy, "migration_tickets": [*self.policy["migration_tickets"], number]}
         found, state = check_dispositions.row_error(
-            broken(replacement="playbook:nothing-built-it", verification="ticket:57"),
+            broken(replacement="playbook:nothing-built-it", verification=f"ticket:{number}"),
             "playbook_topic",
             self.names,
             ROOT,
@@ -172,6 +160,21 @@ class DispositionRowTest(unittest.TestCase):
         )
 
         self.assertEqual(("", "promised"), (found, state))
+
+    def open_ticket(self) -> str:
+        """The lowest-numbered ticket the tracker still holds open.
+
+        Lowest rather than highest so the example is the next thing somebody
+        would pick up, and a skip rather than a failure if there is none: a
+        tracker with nothing open is a finished project, not a broken checker.
+        """
+        root = ROOT / self.policy["issue_root"]
+        for path in sorted(root.glob("[0-9][0-9]*-*.md")):
+            number = path.name.split("-", 1)[0]
+            status = check_dispositions.ticket_status(ROOT, self.policy["issue_root"], number)
+            if status is not None and status != "resolved":
+                return number
+        self.skipTest("the tracker holds no open ticket to borrow")
 
     def test_a_replacement_that_is_nowhere_is_a_missing_replacement(self):
         self.assertEqual(

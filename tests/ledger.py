@@ -1,0 +1,37 @@
+"""The shipped v1 ledger, and a way to write a broken copy of it somewhere else.
+
+Shared by the row gate's tests and the closing gate's, because both of them ask
+the same kind of question: what does the checker say when one row of the real
+ledger is missing, changed or duplicated? Reading the real file rather than
+building a small one is the point -- a fixture ledger would agree with whatever
+the fixture author believed, and these gates exist to catch the day the ledger
+and the tree stop agreeing.
+
+Neither function writes anything the caller did not name, and `written` writes
+only into a directory it is handed, so the shipped ledger is never the copy
+under test.
+"""
+
+import csv
+from pathlib import Path
+
+from tests import ROOT
+
+
+LEDGER = ROOT / "baseline" / "v1-dispositions.tsv"
+
+
+def ledger_rows(without: str | None = None) -> list[list[str]]:
+    """The shipped ledger as raw rows, optionally missing the row for one source."""
+    with LEDGER.open(encoding="utf-8", newline="") as handle:
+        return [row for row in csv.reader(handle, delimiter="\t") if row[0] != without]
+
+
+def written(rows: list[list[str]], directory: str) -> Path:
+    """Those rows as a ledger inside `directory`, in the format the gates read."""
+    path = Path(directory) / "v1-dispositions.tsv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(
+            handle, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_NONE
+        ).writerows(rows)
+    return path
