@@ -33840,7 +33840,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same thirty-five subjects at a `constrained` ceiling, where
+    criterion 5: the same forty-two subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -33906,7 +33906,22 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
         "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", "text")),
+        # The four authenticated routes that only one parameter's value class
+        # tells apart, which is what ticket 54's two new facts are for. A
+        # serialised body on a write is the first; a number, a path and a URL on
+        # a read are the other three.
+        "deserialization": Surface("spa", None, "POST", "/preferences/restore", True,
+                                   ("body", "serialized")),
+        "exceptional-conditions": Surface("spa", None, "GET", "/reports/summary", True,
+                                          ("query", "number")),
         "external-resources": Surface("web", None, "GET", "/embed", None, ("query", "url")),
+        "file-resolution": Surface("spa", None, "GET", "/documents/export", True,
+                                   ("query", "path")),
+        # The one route in this table with two parameters, added below by
+        # `name_the_uploaded_file`: a file to store and a name to store it
+        # under. A write carrying the file alone is the converter route above.
+        "file-upload": Surface("spa", None, "POST", "/uploads", True, ("body", "file"),
+                               "application/octet-stream"),
         "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", "text")),
         "grpc": Surface("spa", "grpc", "POST", "/billing.Admin/ListAll", True,
                         ("body", "text")),
@@ -33914,6 +33929,11 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                       ("cookie", "text")),
         "identity-parsing": Surface("spa", "saml", "POST", "/sso/acs", False,
                                     ("body", "text")),
+        # The one Application that publishes a contract, and the one subject in
+        # this table with no parameter at all: what this reading compares is the
+        # response against the document the application published about it.
+        "information-disclosure": Surface("spa", "openapi", "GET", "/api/v2/orders", True,
+                                          None),
         "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
         # Auth left unknown, and that is what separates this JSON write from
         # `race-conditions`: both are a typed JSON body on a POST, and only the
@@ -33939,6 +33959,11 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                    ("body", "text"), "application/json"),
         "realtime": Surface("websocket", None, "GET", "/socket", True, None),
         "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
+        # The second document something else loads, and `browser-messaging` is
+        # the first. The Application kind is the whole difference: a widget in a
+        # page a browser renders is a messaging question, and a bundle an
+        # application shell pulls in is a question about what is inside it.
+        "secrets": Surface("spa", None, "GET", "/static/app.js", None, None),
         # The second form post in this table, and `browser-framing` is the first.
         # What separates them is the Application kind and the reflection: a form
         # that comes back is where a stored value reaches an export.
@@ -33947,6 +33972,12 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                          "application/x-www-form-urlencoded", True),
         "sql-injection": Surface("spa", "postgresql", "GET", "/reports", True,
                                  ("query", "text")),
+        # The one route that takes a URL and authenticates. `external-resources`
+        # is the other URL parameter in this table and it is a `web` page nobody
+        # has logged into, which is the difference between reading what a
+        # document points at and asking what a server fetched.
+        "ssrf-url-routing": Surface("spa", None, "GET", "/render/preview", True,
+                                    ("query", "url")),
         # The one authenticated write whose parameter comes back, which is what a
         # template engine renders.
         "ssti": Surface("spa", "jinja", "POST", "/preview", True, ("body", "text"),
@@ -33992,7 +34023,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: six of the thirty-five
+        whole Program -- and it is also the harder one: six of the forty-two
         Playbooks key on it, so the fact cannot be what tells them apart.
 
         The tenants are the same argument one fact later. `tenant_boundary` is a
@@ -34040,6 +34071,8 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
             cls.subjects = {name: cls.surface(name) for name in cls.SURFACES}
             cls.lead_into_the_routing_subject()
             cls.embed_the_messaging_subject()
+            cls.embed_the_secrets_subject()
+            cls.name_the_uploaded_file()
 
     @classmethod
     def base_url(cls, name: str) -> str:
@@ -34157,6 +34190,56 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         )
 
     @classmethod
+    def embed_the_secrets_subject(cls):
+        """The shell that pulls the bundle in.
+
+        The same arrangement the messaging subject needs, one Application over:
+        `embedded_document` is read at the far end of an `embeds`, so a served
+        bundle cannot carry it alone. This is the application's own index, which
+        is where the fixture that grades this Playbook puts the script tag.
+
+        A second endpoint rather than a second Surface, for the reason the two
+        above are: nothing asserts about it, and it carries no fact any Playbook
+        in the catalogue triggers on.
+        """
+        method, path = "GET", "/"
+        shell = cls.entity("endpoint", f"endpoint:{method} {cls.base_url('secrets')}{path}")
+        cls.connection.execute(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) SELECT $1::uuid, application_id, $2, $3, NULL"
+            "   FROM endpoints WHERE entity_id = $4::uuid",
+            (shell, method, path, cls.subjects["secrets"]),
+        )
+        cls.connection.execute(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'embeds')",
+            (cls.program_id, shell, cls.subjects["secrets"]),
+        )
+
+    @classmethod
+    def name_the_uploaded_file(cls):
+        """The second parameter on the upload subject.
+
+        `surface()` writes at most one parameter, which was enough for
+        thirty-five Playbooks and is not enough for this one: `file-upload`
+        triggers on a file AND a path, because the question it asks is whether
+        the name the caller chose decided what the stored bytes became. A route
+        that takes the file and names it itself has nothing to compare.
+
+        A parameter rather than a Surface field, so that the table above stays
+        one line per Playbook and this stays the one exception a reader is told
+        about.
+        """
+        cls.connection.execute(
+            "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
+            " VALUES ($1::uuid, $2::uuid, 'destination', 'query', 'path')",
+            (
+                cls.entity("parameter", f"parameter:{cls.base_url('file-upload')}/uploads:name"),
+                cls.subjects["file-upload"],
+            ),
+        )
+
+    @classmethod
     def entity(cls, kind: str, dedup: str) -> str:
         """One in-scope Entity, through the one verb that projects scope."""
         return str(
@@ -34236,11 +34319,16 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "client-side-path-traversal": ["web_hunter"],
                 "command-directory-injection": ["web_hunter"],
                 "cookies": ["web_hunter"],
+                "deserialization": ["web_hunter"],
+                "exceptional-conditions": ["web_hunter"],
                 "external-resources": ["js_analyst"],
+                "file-resolution": ["web_hunter"],
+                "file-upload": ["web_hunter"],
                 "graphql": ["web_hunter"],
                 "grpc": ["web_hunter"],
                 "identity-lifecycle": ["web_hunter"],
                 "identity-parsing": ["web_hunter"],
+                "information-disclosure": ["web_hunter"],
                 "jwt-jose": ["web_hunter"],
                 "nosql-injection": ["web_hunter"],
                 "oauth": ["web_hunter"],
@@ -34250,8 +34338,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
                 "routing": ["web_hunter"],
+                "secrets": ["web_hunter"],
                 "spreadsheet-injection": ["web_hunter"],
                 "sql-injection": ["web_hunter"],
+                "ssrf-url-routing": ["web_hunter"],
                 "ssti": ["web_hunter"],
                 "structured-injection": ["web_hunter"],
                 "web-cache": ["web_hunter"],
