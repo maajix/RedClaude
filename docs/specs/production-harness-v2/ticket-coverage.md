@@ -50,7 +50,13 @@ what the claim in front of it would start, so a Program running three subagents
 refuses a validate or a report that adds none. Neither names a blocker, because
 nothing blocks them -- no test had reached either until a fixture claimed one
 Task of every kind in one Program and then purged it. 75 is resolved: the cap is
-asked only of a claim whose own lane role runs as a subagent.
+asked only of a claim whose own lane role runs as a subagent. 74 is resolved, and
+its headline case turned out to be the one instance already fixed: the rollup
+edge's hypothesis side had been given a cascade in passing by the migration that
+made a supported claim a candidate, while four other NO ACTION keys still had
+their check drained ahead of the cascade that answers it, and `interception_cas`
+was not reached by the purge at all, so a Program that had minted a CA could not
+be purged by any statement the schema permits.
 
 Tickets 76 through 83 were raised after this re-measurement and are in none of the
 counts above: the table says 75 files because that is what was measured on the

@@ -1454,6 +1454,56 @@ CONTROLS = (
         "        >= (SELECT w.max_concurrent_subagents FROM scheduler_weights w"
         "             WHERE w.active) $ctl$",
     ),
+    # PH2-74 has four arms and gets four controls, one per arm, each written so
+    # that the arm it names is the only one it trips. The gate only asserts the
+    # check goes red, so nothing here would notice a control that went red for a
+    # neighbour's reason -- which is the whole failure mode, since three of these
+    # four arms are about the register and the catalogue disagreeing and a
+    # careless break makes them disagree twice.
+    Control(
+        # (a): the register claiming an edge no key travels. `receipts.artifact_id`
+        # is 012's content-addressed store, deliberately NO ACTION into a table
+        # the purge does not travel, so a row here is the CA's lie in the one
+        # place it cannot be true.
+        "standing:purge_travel",
+        "INSERT INTO purge_cascade_edges (table_name, column_name, rationale)"
+        " VALUES ('receipts', 'artifact_id', 'a control: this column travels nothing')",
+    ),
+    Control(
+        # (b): a cascade the register does not know about, which is 016's rewrite
+        # loop asked as a standing question. Taking the register row away rather
+        # than adding a cascade, because the row is the reviewable half.
+        "standing:purge_travel",
+        "DELETE FROM purge_cascade_edges"
+        " WHERE table_name = 'hypothesis_evidence' AND column_name = 'program_id'",
+    ),
+    Control(
+        # (c): PH2-74 written back in, by taking one of the three keys it added
+        # away again. `finding_effects` then reaches the purge root only through
+        # the Finding, one generation later than the Observation it cites with a
+        # NO ACTION key -- so the check is drained before the delete that answers
+        # it, and whether the purge succeeds goes back to being decided by which
+        # of two sibling keys the catalogue holds first. The register row goes
+        # with the key, or arm (a) fires as well and this stops being a control
+        # for the ordering rule at all.
+        "standing:purge_travel",
+        "ALTER TABLE finding_effects DROP CONSTRAINT finding_effects_program_id_fkey;"
+        " DELETE FROM purge_cascade_edges"
+        "  WHERE table_name = 'finding_effects' AND column_name = 'program_id';",
+    ),
+    Control(
+        # (d): the CA's own defect, put back. NO ACTION into `programs` from a
+        # table no cascade reaches refuses the purge in every catalogue order
+        # there is, which is why it needs an arm of its own -- arm (c) compares
+        # two generations and `programs` has no generation to compare.
+        "standing:purge_travel",
+        "ALTER TABLE interception_cas"
+        "    DROP CONSTRAINT interception_cas_program_id_fkey,"
+        "    ADD  CONSTRAINT interception_cas_program_id_fkey"
+        "         FOREIGN KEY (program_id) REFERENCES programs (id);"
+        " DELETE FROM purge_cascade_edges"
+        "  WHERE table_name = 'interception_cas' AND column_name = 'program_id';",
+    ),
     Control(
         # Capacity held out of the pool for a run that has already ended. Written
         # by hand because no call reaches it: the trigger on `finished_at`
@@ -4449,16 +4499,6 @@ class MissionPacketTest(DatabaseCase):
     def tearDownClass(cls):
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
-            # `hypothesis_evidence` first, and only because of how its two keys
-            # differ: the hypothesis side cascades and the observation side does
-            # not, so dropping the Program takes the Observation out from under
-            # an edge that still cites it. Deliberate in the schema -- an
-            # Observation may not be deleted while something rests on it -- and
-            # therefore an ordering a purge has to supply.
-            cls.connection.execute(
-                "DELETE FROM hypothesis_evidence WHERE program_id = ANY($1::uuid[])",
-                (pg.quote_array([cls.identifiers[name] for name in ("a", "b")]),),
-            )
             cls.connection.execute(
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{PACKET_SLUG}-%",)
             )
@@ -15018,20 +15058,6 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.runtime.close()
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
-            # The rollup edge goes first, and this is a workaround rather than
-            # tidiness: `finding_hypotheses` cascades from the finding side only
-            # (016's `purge_cascade_edges`), while `hypotheses_program_id_fkey`
-            # is older than `findings_program_id_fkey` and so cascades first --
-            # so the NO ACTION check on the edge fires before the delete that
-            # would have removed it, and `DELETE FROM programs` raises. It is a
-            # purge that cannot travel its own edge in the order the catalogue
-            # happens to hold, which is 031's failure in a place 031 does not
-            # repair. Filed as PH2-74; this delete comes out with that ticket.
-            cls.connection.execute(
-                "DELETE FROM finding_hypotheses WHERE program_id IN"
-                " (SELECT id FROM programs WHERE slug LIKE $1)",
-                (f"{SLATE_SLUG}-%",),
-            )
             cls.connection.execute(
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{SLATE_SLUG}-%",)
             )
@@ -19548,11 +19574,6 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         cls.runtime.close()
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
-            cls.connection.execute(
-                "DELETE FROM finding_hypotheses WHERE program_id IN"
-                " (SELECT id FROM programs WHERE slug LIKE $1)",
-                (f"{OPERATOR_SLUG}-%",),
-            )
             cls.connection.execute(
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{OPERATOR_SLUG}-%",)
             )
@@ -31588,25 +31609,6 @@ class ReportFixture(ChainFixture):
         cls.problems = cls.rows_of("SELECT * FROM check_report_projection()")
         cls.grounding = cls.rows_of("SELECT * FROM check_report_grounding()")
 
-    @classmethod
-    def tearDownClass(cls):
-        """The two rows 034 left with no way out of a dropped Program.
-
-        `finding_effects` names its witness observation and
-        `finding_chain_step_citations` names its cited one, both with no
-        `ON DELETE`. Dropping the Program cascades into `observations` and into
-        those two in an order PostgreSQL picks, and when it picks the
-        observation first the teardown fails on a constraint neither table is
-        wrong about. Cleared here because this is the only case in the file that
-        has such a row, and a schema change to a numbered migration for the
-        benefit of a teardown would be the harness editing the product.
-        """
-        cls.as_the_owner_says([
-            ("DELETE FROM finding_chain_steps WHERE program_id = $1::uuid", (cls.program_id,)),
-            ("DELETE FROM finding_effects WHERE program_id = $1::uuid", (cls.program_id,)),
-        ])
-        super().tearDownClass()
-
     # -- the arrangement -------------------------------------------------------
 
     @classmethod
@@ -38482,6 +38484,205 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
             with self.subTest(path=path):
                 self.assertNotIn(self.harness.runtime.password, answer.body)
                 self.assertNotIn(self.harness.human.password, answer.body)
+
+
+PURGE_SLUG = "selftest-purge"
+
+
+class ProgramPurgeTest(ReportFixture, DatabaseCase):
+    """PH2-74: one statement empties a Program, whatever order its keys are in.
+
+    The deepest Program the suite builds, purged on purpose rather than on the
+    way out. `ReportFixture` is inherited for the rows: by the time it has
+    composed a report its Program holds fifty-odd tables, among them every one
+    the ticket is about -- the `finding_hypotheses` edge whose NO ACTION check
+    ran before the cascade that answers it, the `hypothesis_evidence` that was
+    passing on the luck of two constraint OIDs, and the two rows `ReportFixture`
+    used to delete by hand in its own teardown because "an order PostgreSQL
+    picks" was the honest description of what happened otherwise.
+
+    A teardown that purges is not this test. Every fixture in the file ends by
+    dropping its Program, which has meant "the purge worked, or something in a
+    teardown said 23503 and the case that failed was whichever ran next". Here
+    the delete is the assertion, and what it is asserted against is every
+    program-scoped table in the catalogue rather than the five that are known to
+    have been wrong.
+    """
+
+    slug = PURGE_SLUG
+
+    #: The five tables the ticket is about, each of which the purge could not
+    #: reach in time or, in the CA's case, at all. Used for two things, and both
+    #: want the same five: they are asserted to hold rows before the purge, so a
+    #: Program that stopped carrying them cannot make the purge below pass by
+    #: having nothing to do, and they are the tables whose cascade keys the third
+    #: test rebuilds into the order that broke them.
+    SUBJECTS = (
+        "finding_hypotheses",
+        "hypothesis_evidence",
+        "finding_effects",
+        "finding_chain_step_citations",
+        "interception_cas",
+    )
+
+    #: Every cascade key on `SUBJECTS`, as the one statement that drops it and
+    #: adds it back. Read out of the catalogue rather than written down: a
+    #: constraint named here by hand is one a later migration renames without
+    #: this test noticing it has stopped rebuilding anything.
+    REBUILT = (
+        "SELECT format('ALTER TABLE %s DROP CONSTRAINT %I, ADD CONSTRAINT %I %s',"
+        "              con.conrelid::regclass, con.conname, con.conname,"
+        "              pg_get_constraintdef(con.oid))"
+        "  FROM pg_constraint con"
+        " WHERE con.contype = 'f' AND con.confdeltype = 'c'"
+        "   AND con.conrelid::regclass::text = ANY($1::text[])"
+    )
+
+    #: Every program-scoped table, counted for one Program in one round trip.
+    #: `query_to_xml` because the table list is a query result: a hundred and
+    #: eight counts written out by hand is a list that stops being every table
+    #: the first time a migration adds one.
+    COUNTS = (
+        "SELECT c.relname::text,"
+        "       (xpath('/row/c/text()',"
+        "              query_to_xml(format('SELECT count(*) AS c FROM public.%I"
+        "                                   WHERE program_id = %L', c.relname, $1::uuid),"
+        "                           false, true, '')))[1]::text::bigint"
+        "  FROM pg_class c"
+        " WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r'"
+        "   AND is_program_scoped(c.oid::regclass)"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.mint_the_ca_no_other_case_mints()
+        cls.held = cls.holdings()
+
+    @classmethod
+    def mint_the_ca_no_other_case_mints(cls):
+        """A retired CA superseded by a current one, which nothing else writes.
+
+        `interception_cas` is the table the whole-program purge could not reach
+        at all before this ticket -- its key to `programs` was NO ACTION while
+        its own `purge_cascade_edges` row said the purge destroys the record --
+        and no case in this file had ever written a row to it, which is why a
+        Program that had minted a CA being unpurgeable was a state nothing here
+        could enter.
+
+        Two rows and not one, because the pair is the case arm (c) of
+        `check_purge_travel` excludes by hand: `superseded_by` is a NO ACTION key
+        from the table to itself, and a self key answers itself, since all of a
+        table's rows go in the one delete that queues its check. An exclusion
+        with no row under it is a claim, so here is the row.
+        """
+        retired = cls.mint("ca-retired", "a1", "-2 days", retired_at="-1 minute")
+        current = cls.mint("ca-current", "b2", "-1 hour")
+        cls.as_owner(
+            "UPDATE interception_cas SET superseded_by = $2::uuid WHERE id = $1::uuid",
+            (retired, current),
+        )
+
+    @classmethod
+    def mint(cls, label: str, key: str, since: str, retired_at: str | None = None) -> str:
+        """One CA row, inside the 90-day lifetime 025 caps a program's CA at.
+
+        `since` and `retired_at` are ages, read backwards from now, and
+        `retired_at` is left out for the current CA: `interception_cas_one_current`
+        allows exactly one row per Program with `retired_at` unset, so the two
+        rows differ in that column and nothing else. Not written through
+        `as_owner`, which returns nothing and is asked for the id here.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(
+                cls.owner_connection.execute(
+                    "INSERT INTO interception_cas (program_id, label, subject,"
+                    " spki_sha256, not_before, not_after, secret_ref, retired_at)"
+                    " VALUES ($1::uuid, $2, 'CN=redkraken selftest',"
+                    "         repeat($3, 32), now() + $4::interval,"
+                    "         now() + interval '30 days', 'kek:selftest',"
+                    "         now() + $5::interval)"
+                    " RETURNING id::text",
+                    (cls.program_id, label, key, since, retired_at),
+                ).scalar()
+            )
+
+    @classmethod
+    def holdings(cls) -> dict[str, int]:
+        """What this Program still has rows in, by table."""
+        return {
+            str(name): int(count)
+            for name, count in cls.owner_connection.execute(
+                cls.COUNTS, (cls.program_id,)
+            ).rows
+            if count
+        }
+
+    def purged(self, before: tuple[str, ...] = ()) -> dict[str, int]:
+        """One `DELETE FROM programs`, and what it left, rolled back.
+
+        Rolled back rather than committed: the fixture's own teardown purges
+        this Program for real afterwards, so leaving the delete in place would
+        replace a second, independent execution of the same statement with
+        nothing. What is read is read inside the transaction, which is where the
+        end-of-statement checks have already run or raised. `before` is run
+        first, on the same connection and in the same transaction, for the test
+        that wants the keys in a particular order when the delete arrives.
+        """
+        left: dict[str, int] = {}
+        try:
+            with self.owner_connection.transaction():
+                self.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+                self.owner_connection.execute("SET LOCAL app.purging = 'on'")
+                for statement in before:
+                    self.owner_connection.execute(statement)
+                self.owner_connection.execute(
+                    "DELETE FROM programs WHERE id = $1::uuid", (self.program_id,)
+                )
+                left = self.holdings()
+                raise Rollback
+        except Rollback:
+            pass
+        return left
+
+    def test_one_statement_reaches_every_row_the_program_holds(self):
+        for table in self.SUBJECTS:
+            with self.subTest(table):
+                self.assertIn(table, self.held)
+
+        self.assertEqual({}, self.purged())
+
+    def test_the_register_and_the_catalogue_say_the_same_thing_about_the_purge(self):
+        # The standing check, asked here as well as by the gate, because this is
+        # the case that has the rows: `check_purge_travel` is a question about
+        # the catalogue and passes on an empty database, and what made the
+        # ticket was a Program with a Finding in it.
+        self.assertEqual(
+            (), self.owner_connection.execute("SELECT * FROM check_purge_travel()").rows
+        )
+
+    def test_the_purge_holds_with_the_keys_rebuilt_in_the_order_that_broke_it(self):
+        # Criterion 2, made rather than hoped for. A dropped and re-added key is
+        # the newest constraint in the database, so its RI trigger sorts last
+        # among its parent's and fires after every sibling -- which is the state
+        # a `pg_restore` leaves at random and the state this ticket's four keys
+        # were failing in. Rebuilt here for the five tables the ticket is about,
+        # so their cascades drain last within their generation, and the purge is
+        # asked again. It holds because the generation is what carries it: the
+        # NO ACTION checks queued while the Observations, Receipts and Proposals
+        # go are drained one generation later, by which time last-within-the-
+        # generation has still been.
+        rebuilds = tuple(
+            str(row[0])
+            for row in self.owner_connection.execute(
+                self.REBUILT, (pg.quote_array(self.SUBJECTS),)
+            ).rows
+        )
+
+        self.assertNotEqual((), rebuilds, "nothing was rebuilt, so nothing was reordered")
+        self.assertEqual({}, self.purged(before=rebuilds))
 
 
 if __name__ == "__main__":
