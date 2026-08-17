@@ -167,6 +167,7 @@ FINALIZERS = (
     "enforce_always_triggers",
     "apply_state_rls",
     "apply_state_grants",
+    "apply_runtime_grants",
     "enforce_fk_fire_order",
 )
 
@@ -663,9 +664,10 @@ def _apply(connection: pg.Connection, migration: Migration) -> int:
     """
     with connection.transaction():
         # Every object a migration creates is owned by rk2_owner, whichever login
-        # applied it: ALTER DEFAULT PRIVILEGES is keyed to the creating role, so
-        # without this a second admin account would create tables the runtime
-        # silently cannot read. LOCAL, so the role does not outlive the file.
+        # applied it: `check_runtime_connection` asserts that ownership, and
+        # ALTER DEFAULT PRIVILEGES is keyed to the creating role, so without this
+        # a second admin account would create tables whose sequences the runtime
+        # silently cannot use. LOCAL, so the role does not outlive the file.
         connection.execute(f"SET LOCAL ROLE {pg.quote_identifier(OWNER_ROLE)}")
         _declare_actor(connection, f"migrate:{migration.identity}")
         started = time.monotonic()

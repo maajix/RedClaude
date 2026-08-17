@@ -2386,14 +2386,18 @@ CONTROLS = (
         "GRANT SELECT (reason) ON finding_gate_clearances TO rk2_runtime",
     ),
     Control(
-        # Then a view over it, which is the route a column grant does not close.
-        # No GRANT is written because none is needed: 029's default privileges
-        # hand rk2_runtime SELECT on anything rk2_owner creates, so the CREATE
-        # is the whole fault -- which is why the arm reads the dependency graph
-        # rather than trusting that a view over free text would be noticed.
+        # Then a view over it, which is the route a column grant does not close --
+        # which is why the arm reads the dependency graph rather than trusting
+        # that a view over free text would be noticed.
+        #
+        # The GRANT used to be unnecessary: 029's default privileges handed
+        # rk2_runtime SELECT on anything rk2_owner created, so the CREATE was the
+        # whole fault. Ticket 66 took that default away, so the fault is now two
+        # statements, and a view nobody can read is no longer one.
         "standing:finding_reporting",
         "CREATE VIEW v_selftest_clearances AS"
-        " SELECT finding_id, reason FROM finding_gate_clearances",
+        " SELECT finding_id, reason FROM finding_gate_clearances;"
+        " GRANT SELECT ON v_selftest_clearances TO rk2_runtime",
     ),
     Control(
         # And the log, which republishes the row to a table the runtime sweeps.
@@ -2404,8 +2408,42 @@ CONTROLS = (
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
     Control(
-        "roles:runtime_readwrite_on_every_managed_table",
+        # PH2-66 renamed the arm with the question: it used to ask about every
+        # managed table and now asks about what `runtime_table_surface` declares,
+        # because nine tables are deliberately no longer writable. `entities` is
+        # declared SELECT, INSERT, UPDATE, DELETE, so the falsification is the
+        # same statement it always was.
+        "roles:runtime_holds_the_declared_table_surface",
         "REVOKE INSERT ON entities FROM rk2_runtime",
+    ),
+    # --- the runtime's privilege surface, PH2-66 -----------------------------
+    Control(
+        # Criterion 5, the table half: a privilege granted back that no registry
+        # row declares. `secret_kek` is read-only to the runtime, and this is the
+        # grant that would put the key rows back within its reach.
+        "standing:runtime_privileges",
+        "GRANT UPDATE ON secret_kek TO rk2_runtime",
+    ),
+    Control(
+        # Criterion 5, the verb half: one of the six proxy verbs the default
+        # privileges used to hand over at creation.
+        "standing:runtime_privileges",
+        "GRANT EXECUTE ON FUNCTION write_blocked_receipt(uuid, jsonb, text) TO rk2_runtime",
+    ),
+    Control(
+        # And the mechanism itself, which is the fault the other two are
+        # symptoms of: restoring the default grant reopens every object the
+        # corpus creates from here on, one at a time, and each of those would
+        # read as an ordinary missing row.
+        "standing:runtime_privileges",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE rk2_owner IN SCHEMA public"
+        " GRANT SELECT ON TABLES TO rk2_runtime",
+    ),
+    Control(
+        # The registry pointing at nothing, which is what a rename leaves behind.
+        "standing:runtime_privileges",
+        "INSERT INTO runtime_table_surface (table_name, privilege, added_by)"
+        " VALUES ('entities_renamed_away', 'SELECT', 'selftest')",
     ),
     Control(
         # As the login role, not as the owner: rk2_owner is a member of nothing,
@@ -6249,7 +6287,14 @@ class SealedWireArtifactTest(DatabaseCase):
                 ("{" + ",".join((artifact.digest(WIRE), artifact.digest(REDACTED))) + "}",),
             )
             cls.connection.execute("DELETE FROM secret_access_log")
-            cls.connection.execute("DELETE FROM secret_kek")
+        # PH2-66 made `secret_kek` read-only to the runtime, so the generation
+        # this case established -- committed by the definer `sealing` reaches --
+        # is cleared as the owner. On its own connection because the runtime is
+        # not a member of rk2_owner and so cannot become it.
+        with pg.connect(cls.harness.migrate) as owner:
+            with owner.transaction():
+                owner.execute("SET LOCAL ROLE rk2_owner")
+                owner.execute("DELETE FROM secret_kek")
         super().tearDownClass()
 
     @classmethod
@@ -12769,6 +12814,35 @@ class ArchiveTest(DatabaseCase):
             self.assertEqual(
                 [("row_last_write_unaccounted",)],
                 [tuple(row) for row in connection.execute(integrity.EVENT_LOG_PROBLEMS).rows],
+            )
+
+    def test_the_narrowed_runtime_surface_survives_the_restore(self):
+        # Criterion 6. `pg_restore` replays every grant the dump carries, so a
+        # narrowing that lived only in `apply_runtime_grants` -- a finalizer the
+        # dump never calls -- would come back open on the far side. The revoked
+        # default privilege and the closed per-object grants are ordinary
+        # catalogue state, so they ride the dump; this is what proves the runtime
+        # lands closed on a restored database and not only on a migrated one.
+        with pg.connect(self.target) as connection:
+            self.assertEqual(
+                (), connection.execute("SELECT * FROM check_runtime_privileges()").rows
+            )
+            self.assertFalse(
+                connection.execute(
+                    "SELECT has_function_privilege("
+                    "'rk2_runtime', 'write_blocked_receipt(uuid, jsonb, text)', 'EXECUTE')"
+                ).scalar()
+            )
+            # No default privilege grants tables or functions back to the runtime
+            # -- the sequence default ('S') is the kept exception and is excluded.
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT count(*) FROM pg_default_acl d,"
+                    " LATERAL aclexplode(d.defaclacl) a"
+                    " WHERE a.grantee = 'rk2_runtime'::regrole"
+                    "   AND d.defaclobjtype IN ('r', 'f')"
+                ).scalar(),
             )
 
     def test_a_populated_archive_restores_into_a_database_the_gate_accepts(self):
@@ -39281,6 +39355,203 @@ class ProgramPurgeTest(ReportFixture, DatabaseCase):
 
         self.assertNotEqual((), rebuilds, "nothing was rebuilt, so nothing was reordered")
         self.assertEqual({}, self.purged(before=rebuilds))
+
+
+#: The registries that decide what the checks check, and the two tables that
+#: hold key bookkeeping. Written out rather than read from
+#: `runtime_table_surface`, because a test that asks the registry what the
+#: registry declares proves nothing about what the database grants.
+READ_ONLY_TO_THE_RUNTIME = (
+    "standing_checks",
+    "event_table_config",
+    "event_table_exempt",
+    "program_global_tables",
+    "cross_program_exempt_fks",
+    "state_read_surface",
+    "purge_cascade_edges",
+    "secret_kek",
+    "secret_dek",
+)
+
+#: The verbs the corpus gates to `rk2_proxy`, every one of them called from
+#: `proxy.py` and nowhere else. These are what 029's default privileges actually
+#: left open to the runtime -- not `answer_decision`, which PH2-59 had already
+#: closed by the time PH2-66 was written.
+PROXY_VERBS = (
+    "authorize_identity_egress_address(text, text, text, integer, text)",
+    "authorize_identity_egress_request(text, text, text, text, integer, text, text)",
+    "confirm_required_headers_open(text, uuid, text)",
+    "ensure_proxy_wire_keying(text, bytea, bytea)",
+    "open_required_headers(text)",
+    "write_blocked_receipt(uuid, jsonb, text)",
+)
+
+#: Who holds EXECUTE on one function, by name, from the function's own ACL.
+#: `has_function_privilege` answers about reachability and would say false for a
+#: role that lost a direct grant while PUBLIC kept one -- which is the difference
+#: this ticket is about, so the ACL is read rather than the reachability.
+EXECUTE_GRANTEES = (
+    "SELECT CASE WHEN a.grantee = 0 THEN 'public' ELSE a.grantee::regrole::text END"
+    "  FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) a"
+    " WHERE p.oid = $1::regprocedure AND a.privilege_type = 'EXECUTE'"
+)
+
+
+class RuntimePrivilegeSurfaceTest(DatabaseCase):
+    """PH2-66: the runtime holds what the two registries declare and no more.
+
+    Every case here asks the catalogue or the runtime connection itself, never
+    the registry alone. The registry is the intent; the grants are the fact; the
+    whole ticket exists because the two had been allowed to disagree.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        super().tearDownClass()
+
+    def privilege(self, table: str, privilege: str) -> bool:
+        return bool(
+            self.connection.execute(
+                "SELECT has_table_privilege('rk2_runtime', $1, $2)", (table, privilege)
+            ).scalar()
+        )
+
+    def grantees(self, verb: str) -> set[str]:
+        return {str(row[0]) for row in self.connection.execute(EXECUTE_GRANTEES, (verb,)).rows}
+
+    def refused(self, connection: pg.Connection, sql: str, parameters: tuple = ()) -> None:
+        with self.assertRaises(pg.DatabaseError) as refusal:
+            connection.execute(sql, parameters)
+        self.assertEqual("42501", refusal.exception.sqlstate)
+
+    def test_a_verb_the_corpus_gates_to_the_proxy_is_closed_to_the_runtime(self):
+        # Criterion 1, and its "revoked from the role rather than from PUBLIC".
+        # All six were already revoked from PUBLIC and all six were still
+        # callable by the runtime, because 029's default privileges had written
+        # it into the ACL by name at creation. What closes them is that entry
+        # being gone, which is what the ACL is read for.
+        for verb in PROXY_VERBS:
+            with self.subTest(verb):
+                held = self.grantees(verb)
+
+                self.assertNotIn("rk2_runtime", held)
+                self.assertNotIn("public", held)
+                self.assertIn("rk2_proxy", held)
+
+    def test_the_runtime_connection_is_refused_the_verb_it_used_to_hold(self):
+        # The same fact from the other side, because an ACL is a claim about
+        # what a connection would be told and this is the connection.
+        self.refused(self.runtime, "SELECT open_required_headers('selftest')")
+
+    def test_a_new_object_arrives_closed_to_the_runtime(self):
+        # Criterion 2, asked the only way a rule about creation can be asked:
+        # create something and look. Before this ticket the table was readable
+        # and writable the instant it existed and the function was executable
+        # despite its own migration revoking it from PUBLIC.
+        #
+        # The sequence is the deliberate exception. Its default grant stays,
+        # because a sequence is reachable only through the column that defaults
+        # from it and the alternative is a third registry that would never say
+        # anything the second one did not already say.
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("CREATE TABLE t66_selftest (id bigserial PRIMARY KEY)")
+                self.connection.execute(
+                    "CREATE FUNCTION f66_selftest() RETURNS integer LANGUAGE sql AS 'SELECT 1'"
+                )
+                self.connection.execute("REVOKE ALL ON FUNCTION f66_selftest() FROM PUBLIC")
+                born = tuple(
+                    self.connection.execute(
+                        "SELECT has_table_privilege('rk2_runtime', 't66_selftest', 'SELECT'),"
+                        "       has_function_privilege('rk2_runtime', 'f66_selftest()', 'EXECUTE'),"
+                        "       has_sequence_privilege('rk2_runtime', 't66_selftest_id_seq', 'USAGE')"
+                    ).rows[0]
+                )
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual((False, False, True), born)
+
+    def test_the_control_registries_and_the_key_tables_are_read_only(self):
+        # Criterion 3. Every one of these is written by a migration and by
+        # nothing else, so read-only costs the runtime nothing and takes away
+        # the move where a role edits the rule it is about to be judged by.
+        for table in READ_ONLY_TO_THE_RUNTIME:
+            with self.subTest(table):
+                self.assertTrue(self.privilege(table, "SELECT"))
+                for privilege in ("INSERT", "UPDATE", "DELETE"):
+                    self.assertFalse(self.privilege(table, privilege), privilege)
+
+    def test_the_event_log_is_append_only_to_the_runtime(self):
+        # Criterion 4. The log is what everything else is checked against, so a
+        # role that can rewrite it can make any other check pass.
+        self.assertTrue(self.privilege("events", "SELECT"))
+        self.assertTrue(self.privilege("events", "INSERT"))
+        self.assertFalse(self.privilege("events", "UPDATE"))
+        self.assertFalse(self.privilege("events", "DELETE"))
+
+        self.refused(self.runtime, "UPDATE events SET trace_id = 'selftest'")
+        self.refused(self.runtime, "DELETE FROM events")
+
+    def test_the_runtime_establishes_a_key_generation_without_writing_the_table(self):
+        # `secret_kek` is read-only, and the one write the runtime has to make --
+        # generation 1 on an installation that has none -- goes through the
+        # definer the proxy already reached the same table through. Rolled back,
+        # because a committed generation is a fixture later cases arrange for
+        # themselves.
+        self.refused(
+            self.runtime,
+            "INSERT INTO secret_kek (gen, salt, root_check)"
+            " VALUES (9, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))",
+        )
+
+        try:
+            with self.runtime.transaction():
+                established = self.runtime.execute(
+                    "SELECT generation FROM ensure_active_secret_kek($1::bytea, $2::bytea)",
+                    (bytes(32), bytes(16)),
+                ).scalar()
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual(1, int(established))
+
+    def test_the_declared_surface_is_the_surface_the_database_grants(self):
+        # Criterion 5's positive half. The negative half is three rows in
+        # `CONTROLS` -- a table privilege granted back, a proxy verb granted
+        # back, and the default privilege restored -- which `NegativeControlTest`
+        # proves this check fails on.
+        self.assertEqual(
+            (), self.connection.execute("SELECT * FROM check_runtime_privileges()").rows
+        )
+
+    def test_the_runtime_still_runs_every_family_it_is_gated_to(self):
+        # The narrowing has to leave the runtime able to check itself.
+        # `run_standing_checks` is SECURITY INVOKER, so each registered query
+        # runs as whoever asked: `check_role_catalogue` stays granted to the
+        # runtime for that reason -- revoking it would not narrow the role, it
+        # would make the standing family unrunnable -- and the check this ticket
+        # adds had to be granted for the same reason.
+        failed = [
+            check.source
+            for check in integrity.run(
+                self.runtime, self.harness.expected, families=integrity.RUNTIME_FAMILIES
+            )
+            if not check.ok
+        ]
+
+        self.assertEqual([], failed)
 
 
 if __name__ == "__main__":

@@ -253,13 +253,16 @@ GENERATION_BY = (
     "SELECT encode(salt, 'hex'), encode(root_check, 'hex') FROM secret_kek"
     " WHERE gen = $1::integer"
 )
-#: `DO NOTHING` because two processes can reach a database with no generation at
-#: the same instant. Both read no row, both insert generation 1, and one of them
-#: has to lose without raising: the loser derives from what the winner stored,
-#: which is why the caller reads the row back rather than trusting its own salt.
-FIRST_GENERATION = (
-    "INSERT INTO secret_kek (gen, salt, root_check) VALUES (1, $1::bytea, $2::bytea)"
-    " ON CONFLICT (gen) DO NOTHING"
+#: Through the function rather than into the table: ticket 66 makes `secret_kek`
+#: read-only to `rk2_runtime`, and this is the one write the runtime has to make.
+#: The definer runs `ON CONFLICT DO NOTHING` because two processes can reach a
+#: database with no generation at the same instant -- both read no row, both
+#: insert generation 1, and one of them has to lose without raising -- and then
+#: returns the row that is actually there, which is the winner's salt and not
+#: necessarily this process's.
+ESTABLISH_GENERATION = (
+    "SELECT generation, salt_hex, root_check_hex"
+    " FROM ensure_active_secret_kek($1::bytea, $2::bytea)"
 )
 
 #: The audit row, written on every attempt including the refused ones. `peer_pid`,
@@ -1066,16 +1069,14 @@ def _keying(
                 )
                 return None
             salt = seal.new_salt()
-            connection.execute(FIRST_GENERATION, (salt, root.check(salt, generation=1)))
-            # Read back rather than assume. Two `rk artifact seal` runs starting
-            # against a database with no generation both find none and both
-            # insert; `ON CONFLICT DO NOTHING` makes the loser's insert a no-op
-            # instead of an unhandled unique violation, and the row that is
-            # actually there -- the winner's salt, not this process's -- is what
-            # the key has to be derived from. Same shape as
-            # `ensure_active_secret_kek`, which the proxy reaches this table
-            # through and which handles the collision the same way.
-            rows = connection.execute(GENERATION).rows
+            # What comes back is the established generation rather than the
+            # proposal: two `rk artifact seal` runs starting against a database
+            # with no generation both find none and both call this, and the key
+            # has to be derived from the row that is actually there. The proxy
+            # reaches the same table through the same function, which is why
+            # ticket 66 could take the table's INSERT away without taking the
+            # first generation of an installation away with it.
+            rows = connection.execute(ESTABLISH_GENERATION, (salt, root.check(salt, generation=1))).rows
             if not rows:
                 ledger.fail(
                     "key",

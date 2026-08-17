@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — Run production migrations and the integrity gate.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 **Triaged 2026-08-11:** kept as its own ticket rather than folded into 03, because
 it changes promoted schema and decides a security surface. Ticket 62 now lists it
@@ -36,9 +36,9 @@ The table side is the same shape and wider: `rk2_runtime` holds `INSERT`, `UPDAT
 
 Ticket 03 deliberately left this alone. It is a decision about what the runtime is allowed to do, spanning 05 (program isolation), 07 (wire-artifact encryption), 13 (egress budget) and 29 (pending decisions), and it changes promoted schema. Closing it under a ticket about running migrations would have been a silent change to the security surface.
 
-- [ ] `rk2_runtime` cannot execute any function the corpus gates to `rk2_human` or `rk2_proxy`, revoked from the role rather than from `PUBLIC`.
-- [ ] A single declared mechanism decides which role holds which verb, so a new gated function is closed when it is created rather than when someone remembers to revoke it.
-- [ ] The runtime's table privileges are stated per table against what the runtime writes, with the control registries (`standing_checks`, `event_table_config`, `event_table_exempt`, `program_global_tables`, `state_read_surface`, `purge_cascade_edges`) and the key tables (`secret_kek`, `secret_dek`) read-only or unreachable to it.
-- [ ] `events` is append-only to `rk2_runtime`: no `UPDATE`, no `DELETE`.
-- [ ] A standing check fails when `rk2_runtime` holds a privilege outside the declared surface, and a negative control in `tests/test_database.py` proves that check fails when the privilege is granted back.
-- [ ] The gate is run against a database restored from an archive as well as a migrated one, because `pg_restore` replays grants and a fix that only lives in a finalizer would not survive the round trip.
+- [x] `rk2_runtime` cannot execute any function the corpus gates to `rk2_human` or `rk2_proxy`, revoked from the role rather than from `PUBLIC`. The six `rk2_proxy` write verbs are revoked from the role and swept (migration §4-§5); `answer_decision` and the three operator verbs are `rk2_human`'s alone (closed by `20260814T020000Z`, asserted by `OperatorDecisionTest.test_no_connection_a_model_reaches_may_execute_an_operator_verb`). Arm 4 of `check_runtime_privileges()` keeps any newly-leaked verb failing; the keyholder side is a recorded measurement rather than a mirror arm, because 28 declared verbs are legitimately co-held with a keyholder (26 read-only reporting verbs + `state_severity` with `rk2_human`, `run_contacts` with `rk2_proxy`) — documented at migration §3.
+- [x] A single declared mechanism decides which role holds which verb, so a new gated function is closed when it is created rather than when someone remembers to revoke it. Migration §1 drops the `rk2_owner` default privileges so a new object arrives with no runtime grant; `runtime_table_surface`/`runtime_verb_surface` are the surface, `apply_runtime_grants()` the finalizer, arms 1/4/7 the enforcement. `RuntimePrivilegeSurfaceTest.test_a_new_object_arrives_closed_to_the_runtime`.
+- [x] The runtime's table privileges are stated per table against what the runtime writes, with the control registries (`standing_checks`, `event_table_config`, `event_table_exempt`, `program_global_tables`, `state_read_surface`, `purge_cascade_edges`) and the key tables (`secret_kek`, `secret_dek`) read-only or unreachable to it. Migration §4; `RuntimePrivilegeSurfaceTest.test_the_control_registries_and_the_key_tables_are_read_only`.
+- [x] `events` is append-only to `rk2_runtime`: no `UPDATE`, no `DELETE`. Migration §4; `RuntimePrivilegeSurfaceTest.test_the_event_log_is_append_only_to_the_runtime`.
+- [x] A standing check fails when `rk2_runtime` holds a privilege outside the declared surface, and a negative control in `tests/test_database.py` proves that check fails when the privilege is granted back. `check_runtime_privileges()` registered in `standing_checks`; four `standing:runtime_privileges` controls in `NegativeControlTest`; positive `test_the_declared_surface_is_the_surface_the_database_grants`.
+- [x] The gate is run against a database restored from an archive as well as a migrated one, because `pg_restore` replays grants and a fix that only lives in a finalizer would not survive the round trip. `ArchiveTest.test_the_narrowed_runtime_surface_survives_the_restore`.

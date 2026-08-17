@@ -76,11 +76,19 @@ STANDING = "run_standing_checks"
 STANDING_QUERY = f"SELECT name, problems, detail FROM {STANDING}($1::text[], $2::boolean)"
 
 #: The families by name, and the subset a runtime connection asks for. The role
-#: catalogue is the runner's: `0029_roles_and_grants.sql` revokes it from PUBLIC
-#: for that reason, and ticket 66 closes the default-privilege grant that
-#: currently leaves it executable by `rk2_runtime` regardless. A command that
-#: runs as the runtime therefore asks for the other two, so closing 66 narrows
-#: the role rather than breaking the command.
+#: catalogue is the runner's, and `0029_roles_and_grants.sql` revokes it from
+#: PUBLIC for that reason, so a command that runs as the runtime asks for the
+#: other two.
+#:
+#: It stays executable by `rk2_runtime` all the same, and ticket 66 -- which was
+#: expected to close it -- established why it must: `standing_checks` carries a
+#: `role_catalogue` row, `run_standing_checks()` is SECURITY INVOKER, and the
+#: runtime is what runs the standing family. Revoking the verb would not narrow
+#: the role, it would make the whole standing family unrunnable on a runtime
+#: connection. What 66 closed instead is the reason a *new* gated verb arrived
+#: open: the default privilege that granted the runtime everything at creation.
+#: `runtime_verb_surface` now records this one as a declared exception rather
+#: than as an accident.
 BASELINE_FAMILY = "baseline"
 ROLES_FAMILY = "roles"
 STANDING_FAMILY = "standing"
