@@ -65,7 +65,7 @@ class DispositionLedgerTest(unittest.TestCase):
             # built eight more Playbooks and their eight pages, 51 built four
             # Playbooks and the five pages hanging off them, and 52 built eight
             # Playbooks and the nine pages hanging off them.
-            "  total               223   built 106  promised 65  retired 52",
+            "  total               223   built 133  promised 38  retired 52",
             self.report,
         )
 
@@ -149,17 +149,16 @@ class DispositionRowTest(unittest.TestCase):
         self.assertEqual("built", self.state(BUILT))
 
     def test_a_row_that_names_an_open_migration_ticket_is_promised(self):
-        # The example moves on every migration ticket: once 52 shipped
-        # `browser-framing`, a row citing `ticket:52` for it stopped being a
-        # promise and became a row that should cite its proof. 53 is the next
-        # open one, and `command-directory-injection` is a topic it has not
-        # built yet.
+        # The example moves on every migration ticket: once 53 shipped
+        # `command-directory-injection`, a row citing `ticket:53` for it stopped
+        # being a promise and became a row that should cite its proof. 54 is the
+        # next open one, and `deserialization` is a topic it has not built yet.
         self.assertEqual(
             "promised",
             self.state(
                 broken(
-                    replacement="playbook:command-directory-injection",
-                    verification="ticket:53",
+                    replacement="playbook:deserialization",
+                    verification="ticket:54",
                 ),
                 kind="playbook_topic",
             ),

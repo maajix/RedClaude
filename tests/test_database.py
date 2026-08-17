@@ -33840,7 +33840,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same twenty subjects at a `constrained` ceiling, where
+    criterion 5: the same thirty-five subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -33896,6 +33896,12 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "browser-storage": Surface("web", None, "GET", "/profile", True, None),
         "client-side-path-traversal": Surface("web", None, "GET", "/view/{ref}", None,
                                               ("path", "text")),
+        # The one Surface with a file in a multipart body, which is where a
+        # converter is reached. Nothing else in this table is a multipart write,
+        # and nothing else carries a `file` value class.
+        "command-directory-injection": Surface("spa", None, "POST", "/documents/convert",
+                                               True, ("body", "file"),
+                                               "multipart/form-data"),
         # Two cookie-bearing Surfaces, told apart by method rather than by
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
@@ -33909,12 +33915,21 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "identity-parsing": Surface("spa", "saml", "POST", "/sso/acs", False,
                                     ("body", "text")),
         "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
+        # Auth left unknown, and that is what separates this JSON write from
+        # `race-conditions`: both are a typed JSON body on a POST, and only the
+        # store behind the route and the caller's standing tell them apart.
+        "nosql-injection": Surface("spa", "mongodb", "POST", "/search", None,
+                                   ("body", "text"), "application/json"),
         # The two Surfaces whose authentication nobody has established, which is
         # where a callback and a machine-to-machine route sit before an Identity
         # has been leased against them.
         "oauth": Surface("spa", "oauth", "GET", "/oauth/callback", None, ("query", "text")),
         "object-ownership": Surface("spa", None, "GET", "/notes/{id}", True,
                                     ("path", "integer_id")),
+        # The second of the three authenticated query reads that only the store
+        # behind them tells apart. `jwt-jose` is the first, and the third is
+        # below.
+        "orm": Surface("spa", "django", "GET", "/accounts", True, ("query", "text")),
         # The three writes with a body, which nothing above tells apart. The
         # value class does it for the first, the content type for the second,
         # and the redirect arranged below for the third.
@@ -33924,6 +33939,23 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                    ("body", "text"), "application/json"),
         "realtime": Surface("websocket", None, "GET", "/socket", True, None),
         "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
+        # The second form post in this table, and `browser-framing` is the first.
+        # What separates them is the Application kind and the reflection: a form
+        # that comes back is where a stored value reaches an export.
+        "spreadsheet-injection": Surface("spa", None, "POST", "/contacts", True,
+                                         ("body", "text"),
+                                         "application/x-www-form-urlencoded", True),
+        "sql-injection": Surface("spa", "postgresql", "GET", "/reports", True,
+                                 ("query", "text")),
+        # The one authenticated write whose parameter comes back, which is what a
+        # template engine renders.
+        "ssti": Surface("spa", "jinja", "POST", "/preview", True, ("body", "text"),
+                        None, True),
+        # The one XML body in this table. Nothing else states a content type a
+        # document parser reads, which is what makes this route the one where a
+        # parser exists to be reached.
+        "structured-injection": Surface("spa", None, "POST", "/services/orders", True,
+                                        ("body", "text"), "text/xml"),
         # The one Surface that runs a technology in front of the Application
         # rather than inside it, which is what `tech_cdn` is.
         "web-cache": Surface("web", "cloudflare", "GET", "/dashboard", None, None),
@@ -33960,7 +33992,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: five of the twenty
+        whole Program -- and it is also the harder one: six of the thirty-five
         Playbooks key on it, so the fact cannot be what tells them apart.
 
         The tenants are the same argument one fact later. `tenant_boundary` is a
@@ -34202,6 +34234,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "browser-script": ["web_hunter"],
                 "browser-storage": ["web_hunter"],
                 "client-side-path-traversal": ["web_hunter"],
+                "command-directory-injection": ["web_hunter"],
                 "cookies": ["web_hunter"],
                 "external-resources": ["js_analyst"],
                 "graphql": ["web_hunter"],
@@ -34209,12 +34242,18 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "identity-lifecycle": ["web_hunter"],
                 "identity-parsing": ["web_hunter"],
                 "jwt-jose": ["web_hunter"],
+                "nosql-injection": ["web_hunter"],
                 "oauth": ["web_hunter"],
                 "object-ownership": ["web_hunter"],
+                "orm": ["web_hunter"],
                 "payment-workflows": ["web_hunter"],
                 "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
                 "routing": ["web_hunter"],
+                "spreadsheet-injection": ["web_hunter"],
+                "sql-injection": ["web_hunter"],
+                "ssti": ["web_hunter"],
+                "structured-injection": ["web_hunter"],
                 "web-cache": ["web_hunter"],
                 "webauthn": ["web_hunter"],
                 "webhooks": ["web_hunter"],
