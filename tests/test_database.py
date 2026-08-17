@@ -33840,7 +33840,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same forty-seven subjects at a `constrained` ceiling, where
+    criterion 5: the same fifty subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -33937,6 +33937,12 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", "text")),
         "grpc": Surface("spa", "grpc", "POST", "/billing.Admin/ListAll", True,
                         ("body", "text")),
+        # The second Surface running a proxy in front of the Application, and
+        # `deployment` is the first. The Application kind is the whole
+        # difference: what a front end and an application disagree about when
+        # they resolve a path is a `web` question, and what protocol a
+        # connection negotiated is asked of the shell an application serves.
+        "http-desync": Surface("spa", "nginx", "GET", "/", None, None),
         "identity-lifecycle": Surface("spa", None, "POST", "/session/logout", True,
                                       ("cookie", "text")),
         "identity-parsing": Surface("spa", "saml", "POST", "/sso/acs", False,
@@ -33976,6 +33982,18 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         "race-conditions": Surface("spa", None, "POST", "/coupons/redeem", True,
                                    ("body", "text"), "application/json"),
         "realtime": Surface("websocket", None, "GET", "/socket", True, None),
+        # The one authenticated read carrying a header parameter.
+        # `workload-identities` is the other header in this table and its
+        # authentication is what nobody has established, which is the difference
+        # between asking who a machine route answers for and asking who may read
+        # what a caller's own route answered.
+        "request-integrity": Surface("spa", None, "GET", "/api/account", True,
+                                     ("header", "text")),
+        # The second route in this table with two parameters, added below by
+        # `repeat_the_export_format`: one name in the query string and the same
+        # name in the body, which is the only shape 020's uniqueness admits.
+        "request-parsing": Surface("web", None, "POST", "/orders/export", None,
+                                   ("body", "text")),
         "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
         # The second document something else loads, and `browser-messaging` is
         # the first. The Application kind is the whole difference: a widget in a
@@ -34046,7 +34064,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         The Identities are the Program's rather than a subject's, so every
         subject below carries `multiple_test_identities`. That is the honest
         shape -- an operator who configured two accounts configured them for the
-        whole Program -- and it is also the harder one: seven of the forty-seven
+        whole Program -- and it is also the harder one: seven of the fifty
         Playbooks key on it, so the fact cannot be what tells them apart.
 
         The tenants are the same argument one fact later. `tenant_boundary` is a
@@ -34096,6 +34114,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
             cls.embed_the_messaging_subject()
             cls.embed_the_secrets_subject()
             cls.name_the_uploaded_file()
+            cls.repeat_the_export_format()
 
     @classmethod
     def base_url(cls, name: str) -> str:
@@ -34263,6 +34282,28 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         )
 
     @classmethod
+    def repeat_the_export_format(cls):
+        """The same parameter name again, in the other carrier.
+
+        The second exception to `surface()`'s one parameter, and the only one
+        that has to reuse a name: `repeated_parameter_name` is a self-join over
+        `parameters` on an equal name and differing locations, so the fact is
+        false until one name is written twice. `surface()` wrote `subject` in
+        the body; this writes `subject` in the query string, which is the shape
+        the fixture that grades this Playbook serves.
+        """
+        cls.connection.execute(
+            "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
+            " VALUES ($1::uuid, $2::uuid, 'subject', 'query', 'text')",
+            (
+                cls.entity(
+                    "parameter", f"parameter:{cls.base_url('request-parsing')}/orders/export:query"
+                ),
+                cls.subjects["request-parsing"],
+            ),
+        )
+
+    @classmethod
     def entity(cls, kind: str, dedup: str) -> str:
         """One in-scope Entity, through the one verb that projects scope."""
         return str(
@@ -34352,6 +34393,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "file-upload": ["web_hunter"],
                 "graphql": ["web_hunter"],
                 "grpc": ["web_hunter"],
+                "http-desync": ["web_hunter"],
                 "identity-lifecycle": ["web_hunter"],
                 "identity-parsing": ["web_hunter"],
                 "information-disclosure": ["web_hunter"],
@@ -34365,6 +34407,8 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "payment-workflows": ["web_hunter"],
                 "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
+                "request-integrity": ["web_hunter"],
+                "request-parsing": ["web_hunter"],
                 "routing": ["web_hunter"],
                 "secrets": ["web_hunter"],
                 "spreadsheet-injection": ["web_hunter"],
@@ -34481,6 +34525,14 @@ class PlaybookEvaluationTest(DatabaseCase):
     settings_for = "migrate"
 
     SHIPPED = "playbooks/object-ownership/playbook.md"
+
+    #: The one Playbook in the catalogue whose output class no own-pair fixture
+    #: declares, so its verdict stops at the first `untested` clause rather than
+    #: the last. 056 shipped it that way deliberately:
+    #: `transport.tls_configuration` is settled by a measurement the proxy takes
+    #: on a lane it does not intercept, so grading it needs a target serving two
+    #: TLS configurations to that lane rather than a handler a fixture can write.
+    UNGRADED = "playbooks/http-desync/playbook.md"
 
     #: The pair whose ground truth contains the Playbook's declared class, and
     #: the pair whose ground truth contains a class no authorization Playbook
@@ -35573,15 +35625,23 @@ class PlaybookEvaluationTest(DatabaseCase):
         # fully tested at its current text and the rest have never been run.
         # That second half is a known gap and not a regression: a Playbook ships
         # `draft`, an evaluation is a run against every fixture in the binding,
-        # and until somebody spends it the check says so once per Playbook. Any
-        # other row here is the regression.
+        # and until somebody spends it the check says so once per Playbook. One
+        # of them says it differently -- `UNGRADED` has no own pair to be run
+        # against at all, so it never reaches the clause about runs. Any other
+        # row here is the regression.
         self.assertEqual(
             [
                 (
                     "warning",
                     "draft_playbook_untestable",
-                    f"{one.path} -> {len(fixture.FIXTURES)} fixture(s) in the binding"
-                    " have no run at this text",
+                    f"{one.path} -> "
+                    + (
+                        "no own-pair fixture declares a class this playbook"
+                        " declares as an output"
+                        if one.path == self.UNGRADED
+                        else f"{len(fixture.FIXTURES)} fixture(s) in the binding"
+                        " have no run at this text"
+                    ),
                 )
                 for one in sorted(playbook.PLAYBOOKS.values(), key=lambda one: one.path)
                 if one.path != self.SHIPPED

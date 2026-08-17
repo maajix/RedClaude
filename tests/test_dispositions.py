@@ -66,9 +66,13 @@ class DispositionLedgerTest(unittest.TestCase):
             # Playbooks and the five pages hanging off them, 52 built eight
             # Playbooks and the nine pages hanging off them, 53 built seven
             # Playbooks and the six pages hanging off them, 54 built seven
-            # Playbooks and the nine pages hanging off them, and 55 built five
-            # Playbooks and the five pages hanging off them.
-            "  total               223   built 159  promised 12  retired 52",
+            # Playbooks and the nine pages hanging off them, 55 built five
+            # Playbooks and the five pages hanging off them, and 56 built the
+            # last three Playbooks and the nine pages hanging off them. Nothing
+            # is promised now, which is the ledger's own end state: every row
+            # either cites where its replacement is proved or cites the register
+            # that recorded its retirement.
+            "  total               223   built 171  promised 0  retired 52",
             self.report,
         )
 
@@ -152,20 +156,22 @@ class DispositionRowTest(unittest.TestCase):
         self.assertEqual("built", self.state(BUILT))
 
     def test_a_row_that_names_an_open_migration_ticket_is_promised(self):
-        # The example moves on every migration ticket: once 55 shipped
-        # `kubernetes`, a row citing `ticket:55` for it stopped being a
-        # promise and became a row that should cite its proof. 56 is the next
-        # open one, and `http-desync` is a topic it has not built yet.
-        self.assertEqual(
-            "promised",
-            self.state(
-                broken(
-                    replacement="playbook:http-desync",
-                    verification="ticket:56",
-                ),
-                kind="playbook_topic",
-            ),
+        # The example moved on every migration ticket, and 56 was the last of
+        # them: with every registered ticket resolved and every replacement on
+        # disk, no row of the shipped ledger can be promised any more, which is
+        # what `promised 0` above says. So the open ticket is supplied rather
+        # than borrowed -- 57 is real and unresolved, and registering it here is
+        # what a later migration ticket would do in the policy file.
+        policy = {**self.policy, "migration_tickets": [*self.policy["migration_tickets"], "57"]}
+        found, state = check_dispositions.row_error(
+            broken(replacement="playbook:nothing-built-it", verification="ticket:57"),
+            "playbook_topic",
+            self.names,
+            ROOT,
+            policy,
         )
+
+        self.assertEqual(("", "promised"), (found, state))
 
     def test_a_replacement_that_is_nowhere_is_a_missing_replacement(self):
         self.assertEqual(
