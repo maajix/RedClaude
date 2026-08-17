@@ -22,6 +22,7 @@ from tests.fixtures import (
     SCOPE_REQUESTS,
     SCOPED,
     VALID,
+    export,
     scratch,
     write,
 )
@@ -1680,6 +1681,120 @@ class EvidenceCommandTest(unittest.TestCase):
         self.assertEqual(
             EXIT_USAGE, run("evidence", "verify", str(self.bundle()), "--config", "x").returncode
         )
+
+
+class ImportCommandTest(unittest.TestCase):
+    """`rk import`, up to the point where a database is needed.
+
+    Criterion 1 is a property of this command line and of nothing else: "import
+    accepts only an explicit operator-selected export ... and never crawls live
+    engagement directories implicitly". There is no default for `--from`, no
+    environment variable behind it and no configuration key that supplies one,
+    so the cases below are what an operator who did not name a directory gets.
+    """
+
+    def importing(self, *extra: str, source: Path | None = None) -> tuple[str, ...]:
+        return (
+            "import",
+            "--config", str(write(VALID)),
+            "--from", str(source or export()),
+            *extra,
+        )
+
+    def test_the_store_is_named_alongside_the_connection_when_neither_is_set(self):
+        result = run(*self.importing())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("import", report["command"])
+        self.assertEqual(
+            ["environment:RK_ARTIFACT_ROOT", "environment:RK_DATABASE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_an_export_is_named_or_there_is_no_import(self):
+        for missing in ("--config", "--from"):
+            with self.subTest(missing):
+                given = list(self.importing())
+                at = given.index(missing)
+
+                result = run(*given[:at], *given[at + 2:])
+
+                self.assertEqual(EXIT_USAGE, result.returncode)
+                self.assertIn(missing, result.stderr)
+
+    def test_nothing_supplies_an_export_directory_that_was_not_typed(self):
+        """The other half of the same criterion. `--from` having no default is
+        only a refusal if no environment variable stands in for it either."""
+        result = subprocess.run(
+            [sys.executable, "-m", "redkraken", "import", "--config", str(write(VALID))],
+            cwd=str(ROOT),
+            env=environment()
+            | {
+                "RK_IMPORT_FROM": str(export()),
+                "RK_EXPORT": str(export()),
+                "RK_ARTIFACT_ROOT": str(scratch()),
+                "RK_DATABASE_URL": "postgresql://rk2@127.0.0.1:1/rk2",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(EXIT_USAGE, result.returncode)
+        self.assertIn("--from", result.stderr)
+
+    def test_a_directory_that_is_not_an_export_is_refused_before_a_connection(self):
+        result = run(
+            *self.importing(
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                "--artifacts", str(scratch()),
+                source=scratch(),
+            )
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        violations = json.loads(result.stdout)["violations"]
+        self.assertEqual(["argument:--from"], [item["source"] for item in violations])
+        self.assertIn("manifest.json", violations[0]["detail"])
+
+    def test_an_export_taken_from_another_program_is_refused_before_a_connection(self):
+        """Criterion 5's isolation at the coarse end, and the cheapest place to
+        see it: the manifest names the engagement, the configuration names the
+        Program, and an import across the two is the whole cross-Program
+        failure. It is asked before the connection because a refusal that needed
+        a database would not be available to an operator checking a file."""
+        result = run(
+            *self.importing(
+                "--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                "--artifacts", str(scratch()),
+                source=export(program="another-engagement"),
+            )
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        violations = json.loads(result.stdout)["violations"]
+        self.assertEqual(["argument:--from"], [item["source"] for item in violations])
+        self.assertIn("another-engagement", violations[0]["detail"])
+        self.assertIn("acme-web", violations[0]["detail"])
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run(*self.importing("--url", "postgresql://rk2@127.0.0.1:1/rk2",
+                                     "--artifacts", str(scratch())))
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("import", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            *self.importing(
+                "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2",
+                "--artifacts", str(scratch()),
+            )
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
 
 
 class PlaybookCommandTest(unittest.TestCase):

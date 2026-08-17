@@ -74,6 +74,7 @@ from redkraken import (
     identity,
     integrity,
     isolation,
+    legacy,
     migrate,
     operator,
     packet,
@@ -130,6 +131,7 @@ from tests.fixtures import (
     contained_url,
     counterparty,
     docker,
+    export,
     latched,
     role_url,
     scratch,
@@ -2203,6 +2205,41 @@ CONTROLS = (
         "    AND h.superseded_by IS NULL AND e.in_scope"
         "    AND NOT EXISTS (SELECT 1 FROM chain_steps cs"
         "                     WHERE cs.chain_id = c.id AND cs.stamp_id = z.id) $ctl$",
+    ),
+    Control(
+        # PH2-58 criterion 4, as the migration that would quietly undo it. A
+        # hint carries a count and a ceiling and no leaf class, status, title or
+        # Finding, because those are the columns a claim could be rebuilt from
+        # and v1 kept nothing behind the words it wrote in them. Nothing this
+        # ticket ships can add one, which is the point: the failure this arm
+        # exists for is a later migration doing it, and a check reading the
+        # catalogue is the only thing that would notice.
+        "standing:v1_import",
+        "ALTER TABLE v1_finding_hints ADD COLUMN status text",
+    ),
+    Control(
+        # PH2-58 criterion 6, in the direction that matters. A record naming a
+        # hash this Program does not hold as imported is the audit claiming a
+        # filing that did not happen -- the shape a caller reaches by writing
+        # the record and skipping the store, or by a restore that carried the
+        # rows and not the bytes. `record_v1_import` refuses it on the way in,
+        # so what this builds is what is left when nothing went through it.
+        "standing:v1_import",
+        "DO $ctl$ DECLARE p uuid; i uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('import-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO v1_imports (program_id, source_sha256, schema_version, exported_at,"
+        "                           scope_version, report)"
+        "        VALUES (p, repeat('a', 64), 'rk2-v1-export/1', now(), 1, '{}'::jsonb)"
+        "     RETURNING id INTO i;"
+        "   INSERT INTO v1_import_records (import_id, program_id, ordinal, kind, ref,"
+        "                                  disposition, detail, sha256)"
+        "        VALUES (i, p, 0, 'artifact', 'A1', 'accepted',"
+        "                'the bytes hash to the name the export filed them under',"
+        "                repeat('b', 64));"
+        " END $ctl$",
     ),
     # --- the role split ------------------------------------------------------
     Control("roles:runtime_no_truncate_anywhere", "GRANT TRUNCATE ON entities TO rk2_runtime"),
@@ -36152,6 +36189,790 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         self.assertIn(
             f"already grades {self.OWN} (vulnerable)", ledger.violations[0].detail
         )
+
+
+IMPORT_SLUG = "selftest-import"
+
+#: The bytes behind each artifact the export offers, and what is true of them.
+#: `keep` is filed and survives, `secret` matches the shipped `bearer` rule and
+#: must not be, `moved` is v1's own claim about bytes that are no longer those
+#: bytes, and the fourth is named by a record and carried by nothing.
+KEEP_BYTES = b'{"host":"shop.example.com","seen":"2025-11-02"}'
+SECRET_BYTES = b'{"authorization":"Bearer aaaaaaaaaaaaaaaaaaaaaaaa"}'
+MOVED_BYTES = b'{"host":"app.example.com","seen":"2025-11-03"}'
+
+
+def v1_export() -> Path:
+    """One v1 export carrying every shape criterion 6 asks for fixtures of.
+
+    Read it as six columns at once: what v1 called each thing, what the export
+    kept behind the claim, and what this Program is allowed to conclude. The
+    misleading labels are `confirmed`, `exploited` and `completed`; the worker
+    and the time are on `V-worker` and on nothing else, so the fixture carries
+    both the record that names them and the six that do not; the stale Artifact
+    is `A-moved`; the secret is `A-secret`; and the cross-Program identifiers are
+    the two records naming `neighbour-engagement`.
+    """
+    lists = {
+        "artifacts": [
+            {"ref": "A-keep", "path": "artifacts/keep.json", "sha256": store.digest(KEEP_BYTES),
+             "content_type": "application/json"},
+            # Repacked around a modified body: the manifest agrees with what is
+            # on disk and v1's own row does not.
+            {"ref": "A-moved", "path": "artifacts/moved.json", "sha256": store.digest(b"gone")},
+            {"ref": "A-secret", "path": "artifacts/secret.json",
+             "sha256": store.digest(SECRET_BYTES)},
+            # v1 pruned its store and kept the row, which is most of a real one.
+            {"ref": "A-absent", "path": "artifacts/absent.json", "sha256": store.digest(b"never")},
+        ],
+        "scope": [
+            {"ref": "SC-in", "host": "app.example.com", "port": 443},
+            {"ref": "SC-excluded", "host": "admin.example.com", "port": 443},
+            {"ref": "SC-junk", "host": "not a host at all"},
+        ],
+        "surface": [
+            {"ref": "S-app", "type": "domain", "fqdn": "APP.example.com.",
+             "evidence": "A-moved"},
+            {"ref": "S-shop", "type": "domain", "fqdn": "shop.example.com",
+             "evidence": "A-keep"},
+            # The same address again, in v1's other spelling of it.
+            {"ref": "S-shop-again", "type": "domain", "fqdn": "shop.example.com"},
+            {"ref": "S-box", "type": "host", "hostname": "box.example.com",
+             "address": "93.184.216.34"},
+            {"ref": "S-site", "type": "application", "base_url": "https://shop.example.com/",
+             "kind": "web", "evidence": "A-secret"},
+            {"ref": "S-route", "type": "endpoint", "method": "GET", "path": "/admin"},
+            {"ref": "S-admin", "type": "domain", "fqdn": "admin.example.com"},
+            {"ref": "S-elsewhere", "type": "domain", "fqdn": "app.neighbour.example",
+             "program": "neighbour-engagement"},
+            {"ref": "S-junk", "type": "domain", "fqdn": "not..a..domain"},
+            # One address twice with the bytes on the second one, which is the
+            # order `S-shop` does not test: v1 wrote rows in whatever order it
+            # found them and the Entity may not depend on that.
+            {"ref": "S-blog", "type": "domain", "fqdn": "blog.example.com"},
+            {"ref": "S-blog-again", "type": "domain", "fqdn": "blog.example.com",
+             "evidence": "A-keep"},
+        ],
+        "findings": [
+            {"ref": "V-confirmed", "subject_ref": "S-shop", "family": "authorization",
+             "severity": "high", "status": "confirmed", "evidence": "A-keep"},
+            {"ref": "V-exploited", "subject_ref": "S-shop", "family": "authorization",
+             "severity": "critical", "status": "exploited"},
+            {"ref": "V-completed", "subject_ref": "S-app", "family": "injection",
+             "severity": "medium", "status": "completed"},
+            {"ref": "V-orphan", "subject_ref": "S-route", "family": "injection",
+             "severity": "low", "status": "tested"},
+            {"ref": "V-unfamily", "subject_ref": "S-app", "family": "vibes",
+             "severity": "high", "status": "confirmed"},
+            {"ref": "V-unrankable", "subject_ref": "S-app", "family": "transport",
+             "severity": "catastrophic", "status": "exhausted"},
+            {"ref": "V-elsewhere", "subject_ref": "S-shop", "family": "transport",
+             "severity": "low", "status": "confirmed", "program": "neighbour-engagement"},
+            # Criterion 6's worker and time, present rather than absent. v1
+            # wrote neither for most of what it held, and the shape that would
+            # let a label buy something is the one where it wrote both: a name,
+            # an hour and the word `confirmed` read as an attempt somebody made.
+            {"ref": "V-worker", "subject_ref": "S-shop", "family": "transport",
+             "severity": "low", "status": "confirmed",
+             "tested_by": "alice", "tested_at": "2025-11-04T14:20:00Z",
+             "worker": "worker-07"},
+        ],
+    }
+    return export(
+        program=IMPORT_SLUG,
+        lists=lists,
+        blobs={
+            "artifacts/keep.json": KEEP_BYTES,
+            "artifacts/moved.json": MOVED_BYTES,
+            "artifacts/secret.json": SECRET_BYTES,
+        },
+    )
+
+
+class V1ImportTest(DatabaseCase):
+    """PH2-58: one v1 export read into one Program, and what it may conclude.
+
+    The whole ticket is an argument about absence, so the fixture is one export
+    carrying every way v1 lied by omission -- terminal labels with nothing
+    behind them, an Artifact that is no longer the Artifact it claims, a body
+    with a credential in it, records belonging to another engagement -- and the
+    cases below are what this schema does with each. `legacy.run` is called
+    rather than `record_v1_import`, because the artifact filing and the
+    recording are one claim held together by one transaction, and a case that
+    called the writer directly would be arranging the agreement it is checking.
+
+    Everything runs as `rk2_runtime`: the import is the runtime's, and a case
+    that asked the owner would prove the SQL parses rather than that the role
+    which calls it in production may.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.configuration = write(
+            UNSEEDED.replace('name = "matrix-web"', f'name = "{IMPORT_SLUG}"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.root = scratch()
+        cls.keep = Store(cls.root)
+
+        cls.source = v1_export()
+        cls.report = cls.imported(cls.source)
+        assert cls.report.ok, cls.report.violations
+        cls.connection.execute(reporting.BIND, (cls.program_id,))
+        cls.records = {
+            row["ref"]: row
+            for row in cls.connection.execute(
+                "SELECT ref, kind, disposition, detail, entity_id::text, hint_id::text, sha256"
+                "  FROM v1_import_records WHERE program_id = $1::uuid ORDER BY ordinal",
+                (cls.program_id,),
+            ).dicts()
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (IMPORT_SLUG,))
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def imported(cls, source: Path, *, root: Path | None = None) -> Report:
+        return legacy.run(
+            cls.harness.runtime, cls.configuration, source, root=root or cls.root
+        )
+
+    def counted(self, sql: str, parameters: tuple = ()) -> int:
+        return int(self.connection.execute(sql, parameters).scalar())
+
+    def entity(self, ref: str) -> dict:
+        return self.connection.execute(
+            "SELECT e.type, e.dedup_key, e.origin, e.scope_selector, e.scope_selector_kind"
+            "  FROM entities e WHERE e.id = $1::uuid",
+            (self.records[ref]["entity_id"],),
+        ).dicts()[0]
+
+    def origins(self, ref: str) -> list[str]:
+        """Every voice recorded about the Entity this record wrote, in order."""
+        return [
+            row["origin"]
+            for row in self.connection.execute(
+                "SELECT origin FROM entity_provenance WHERE entity_id = $1::uuid"
+                " ORDER BY origin",
+                (self.records[ref]["entity_id"],),
+            ).dicts()
+        ]
+
+    # -- criterion 2: attributed to one source hash --------------------------
+
+    def test_the_import_is_recorded_under_the_hash_of_the_export_it_read(self):
+        digest = legacy.read(self.source).digest
+        row = self.connection.execute(
+            "SELECT source_sha256, schema_version, scope_version, exported_at::text"
+            "  FROM v1_imports WHERE program_id = $1::uuid",
+            (self.program_id,),
+        ).dicts()[0]
+
+        self.assertEqual(digest, row["source_sha256"])
+        self.assertEqual(legacy.SCHEMA, row["schema_version"])
+        self.assertEqual(1, row["scope_version"])
+        self.assertEqual(digest, self.report.facts["imported"]["source_sha256"])
+
+    def test_every_row_an_import_wrote_leads_back_to_the_export_and_the_record(self):
+        """Criterion 2's attribution, end to end. The provenance carries the
+        source hash and the export's own handle for the record, so an operator
+        asked where a row came from opens one directory at one line."""
+        digest = legacy.read(self.source).digest[:12]
+
+        paths = [
+            row["element_path"]
+            for row in self.connection.execute(
+                "SELECT element_path FROM entity_provenance"
+                " WHERE program_id = $1::uuid ORDER BY element_path",
+                (self.program_id,),
+            ).dicts()
+        ]
+
+        self.assertEqual(
+            sorted(f"v1:{digest}:{ref}" for ref in ("S-app", "S-blog", "S-blog-again", "S-box",
+                                                    "S-shop", "S-shop-again", "S-site")),
+            paths,
+        )
+
+    def test_an_address_v1_spelt_loosely_converges_on_the_key_the_runtime_uses(self):
+        """`APP.example.com.` is the same domain as `app.example.com`, and an
+        import that filed it as written would stand a second row up beside the
+        Surface the runtime already keys on."""
+        self.assertEqual("domain:app.example.com", self.entity("S-app")["dedup_key"])
+        self.assertEqual("app.example.com", self.entity("S-app")["scope_selector"])
+
+    # -- criterion 3: what may keep its provenance ---------------------------
+
+    def test_a_row_the_export_retained_bytes_for_is_imported_surface(self):
+        self.assertEqual("accepted", self.records["S-shop"]["disposition"])
+        self.assertEqual("imported", self.entity("S-shop")["origin"])
+        self.assertIn("imported", self.origins("S-shop"))
+
+    def test_a_row_with_nothing_behind_it_is_demoted_to_an_unverified_proposal(self):
+        """Criterion 3's second half. Three ways to have nothing behind a claim
+        -- naming no evidence, naming an Artifact whose bytes moved, and naming
+        one whose bytes were redacted -- and all three are the same row."""
+        for ref in ("S-box", "S-app", "S-site"):
+            with self.subTest(ref):
+                self.assertEqual("demoted", self.records[ref]["disposition"])
+                self.assertEqual("proposed", self.entity(ref)["origin"])
+
+    def test_a_second_voice_for_surface_this_program_holds_is_merged(self):
+        self.assertEqual("merged", self.records["S-shop-again"]["disposition"])
+        self.assertEqual(
+            self.records["S-shop"]["entity_id"], self.records["S-shop-again"]["entity_id"]
+        )
+        self.assertEqual(
+            1,
+            self.counted(
+                "SELECT count(*) FROM entities"
+                " WHERE program_id = $1::uuid AND dedup_key = 'domain:shop.example.com'",
+                (self.program_id,),
+            ),
+        )
+        # The uncorroborated voice does not downgrade the row it joined, and it
+        # survives as its own line of provenance -- which is the difference
+        # between merging two accounts and averaging them.
+        self.assertEqual("imported", self.entity("S-shop")["origin"])
+        self.assertEqual(["imported", "proposed"], self.origins("S-shop"))
+
+    def test_which_of_two_voices_the_export_listed_first_decides_nothing(self):
+        """The same pair as `S-shop`, the other way round. v1 wrote its rows in
+        whatever order it found them, so an Entity whose origin depended on
+        which one the export lists first would make the report a fact about the
+        file rather than about what is behind it. The lift is one way and only
+        out of `proposed`: anything the runtime established outranks both."""
+        self.assertEqual("demoted", self.records["S-blog"]["disposition"])
+        self.assertEqual("merged", self.records["S-blog-again"]["disposition"])
+        self.assertEqual(
+            self.records["S-blog"]["entity_id"], self.records["S-blog-again"]["entity_id"]
+        )
+        self.assertEqual("imported", self.entity("S-blog")["origin"])
+        self.assertEqual(["imported", "proposed"], self.origins("S-blog"))
+
+    def test_a_route_v1_recorded_is_not_surface_this_import_writes(self):
+        """Criterion 3 read strictly: an Endpoint recovered from a v1 database
+        is a claim about a request nothing in the export witnessed."""
+        self.assertEqual("skipped", self.records["S-route"]["disposition"])
+        self.assertIn("domains, hosts and applications", self.records["S-route"]["detail"])
+        self.assertEqual(
+            0,
+            self.counted(
+                "SELECT count(*) FROM entities"
+                " WHERE program_id = $1::uuid AND type IN ('endpoint','parameter')",
+                (self.program_id,),
+            ),
+        )
+
+    def test_an_address_this_program_denies_is_not_written_by_an_import(self):
+        self.assertEqual("skipped", self.records["S-admin"]["disposition"])
+        self.assertIn("out of this Program's scope", self.records["S-admin"]["detail"])
+        self.assertEqual("skipped", self.records["S-junk"]["disposition"])
+        self.assertEqual(
+            0,
+            self.counted(
+                "SELECT count(*) FROM entities"
+                " WHERE program_id = $1::uuid AND scope_selector = 'admin.example.com'",
+                (self.program_id,),
+            ),
+        )
+
+    # -- criterion 4: a label alone buys nothing -----------------------------
+
+    def test_no_terminal_label_creates_anything_that_could_be_reported(self):
+        """The ticket's own sentence: `confirmed`, `exploited`, `tested`,
+        completed or exhausted labels alone cannot create supported Hypotheses,
+        validated Findings, attempts, Receipts or pivot stamps. Asked of every
+        table any of them would live in, because the failure this guards is a
+        later migration routing an import through one of them."""
+        for table in ("hypotheses", "tests", "findings", "receipts", "tool_runs", "agent_runs",
+                      "pivot_stamps", "pivot_proposals", "proposals", "tasks"):
+            with self.subTest(table):
+                self.assertEqual(
+                    0,
+                    self.counted(
+                        f"SELECT count(*) FROM {table} WHERE program_id = $1::uuid",
+                        (self.program_id,),
+                    ),
+                )
+        # A Test run is the Program's through the Test it executes, so this one
+        # is asked the way the row itself is reached.
+        self.assertEqual(
+            0,
+            self.counted(
+                "SELECT count(*) FROM test_runs r JOIN tests t ON t.id = r.test_id"
+                " WHERE t.program_id = $1::uuid",
+                (self.program_id,),
+            ),
+        )
+
+    def test_what_v1_called_it_survives_as_a_sentence_and_as_no_column(self):
+        self.assertIn("v1 called it confirmed", self.records["V-confirmed"]["detail"])
+        self.assertIn("v1 called it exploited", self.records["V-exploited"]["detail"])
+
+        columns = [
+            row["column_name"]
+            for row in self.connection.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = 'v1_finding_hints' ORDER BY column_name"
+            ).dicts()
+        ]
+
+        self.assertEqual(
+            ["correlated", "family_id", "id", "import_id", "program_id", "reported",
+             "severity_ceiling", "subject_entity_id"],
+            columns,
+        )
+
+    def test_a_worker_and_an_hour_v1_wrote_down_buy_nothing_either(self):
+        """Criterion 6's worker and time. `V-worker` says who tested it and
+        when, which is the one shape in which a terminal label looks like an
+        account of an attempt: a name, an hour and the word `confirmed`. It
+        becomes the same hint as the six records that say none of those things,
+        because there is no Receipt behind the hour and no Agent run behind the
+        name, and a schema that read them would be inventing both."""
+        record = self.records["V-worker"]
+
+        self.assertEqual("demoted", record["disposition"])
+        self.assertIn("v1 called it confirmed", record["detail"])
+        for claim in ("alice", "2025-11-04", "worker-07"):
+            with self.subTest(claim):
+                self.assertNotIn(claim, record["detail"])
+        self.assertEqual(
+            0,
+            self.counted(
+                "SELECT count(*) FROM v1_import_records"
+                " WHERE program_id = $1::uuid AND detail LIKE '%alice%'",
+                (self.program_id,),
+            ),
+        )
+
+    def test_a_finding_becomes_a_count_against_a_family_and_a_ceiling(self):
+        hints = self.connection.execute(
+            "SELECT h.family_id, h.reported, h.severity_ceiling, h.correlated, e.dedup_key"
+            "  FROM v1_finding_hints h JOIN entities e ON e.id = h.subject_entity_id"
+            " WHERE h.program_id = $1::uuid ORDER BY e.dedup_key, h.family_id",
+            (self.program_id,),
+        ).dicts()
+
+        self.assertEqual(
+            [
+                # `confirmed` at high and `exploited` at critical about one
+                # subject are two reports and one hint, ceilinged at the higher
+                # of the two and correlated because one of them had bytes.
+                {"dedup_key": "domain:app.example.com", "family_id": "injection",
+                 "reported": 1, "severity_ceiling": "medium", "correlated": False},
+                {"dedup_key": "domain:shop.example.com", "family_id": "authorization",
+                 "reported": 2, "severity_ceiling": "critical", "correlated": True},
+                {"dedup_key": "domain:shop.example.com", "family_id": "transport",
+                 "reported": 1, "severity_ceiling": "low", "correlated": False},
+            ],
+            [dict(row) for row in hints],
+        )
+
+    def test_a_hint_about_surface_the_import_did_not_write_is_skipped(self):
+        """`S-route` was skipped as an Endpoint, so the hint filed against it has
+        no subject in this schema and there is nothing to attach a count to."""
+        self.assertEqual("skipped", self.records["V-orphan"]["disposition"])
+        self.assertIn("is not Surface this import wrote", self.records["V-orphan"]["detail"])
+
+    def test_a_hint_against_a_family_this_schema_does_not_have_is_skipped(self):
+        self.assertEqual("skipped", self.records["V-unfamily"]["disposition"])
+        self.assertIn("is not one", self.records["V-unfamily"]["detail"])
+
+    def test_a_hint_at_a_severity_that_does_not_rank_is_skipped(self):
+        """A ceiling computed over a word that is not one of the five would
+        silently be whichever operand did rank, so the record does not join."""
+        self.assertEqual("skipped", self.records["V-unrankable"]["disposition"])
+        self.assertIn("severity is not one of", self.records["V-unrankable"]["detail"])
+
+    # -- criterion 5: idempotent, isolated, and reported ---------------------
+
+    def test_every_record_is_reported_under_one_of_the_five_words(self):
+        counts = self.report.facts["imported"]["by_disposition"]
+
+        self.assertEqual(
+            {"accepted": 4, "merged": 3, "demoted": 6, "skipped": 12, "redacted": 1}, counts
+        )
+        self.assertEqual(sum(counts.values()), self.report.facts["imported"]["records"])
+        self.assertEqual(
+            {"artifact": 4, "scope": 3, "surface": 11, "finding": 8},
+            self.report.facts["imported"]["by_kind"],
+        )
+        self.assertEqual(len(self.records), sum(counts.values()))
+
+    def test_importing_the_same_export_again_reports_the_first_answer(self):
+        before = self.counted(
+            "SELECT count(*) FROM v1_import_records WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )
+
+        again = self.imported(v1_export())
+
+        self.assertTrue(again.ok, again.violations)
+        self.assertTrue(again.facts["imported"]["repeated"])
+        self.assertEqual(
+            self.report.facts["imported"]["by_disposition"],
+            again.facts["imported"]["by_disposition"],
+        )
+        self.assertEqual(
+            1,
+            self.counted(
+                "SELECT count(*) FROM v1_imports WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ),
+        )
+        self.assertEqual(
+            before,
+            self.counted(
+                "SELECT count(*) FROM v1_import_records WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ),
+        )
+
+    def test_a_record_belonging_to_another_engagement_is_skipped(self):
+        """Criterion 5's isolation at the record level. The manifest agreeing
+        with the configuration is the coarse half and is the caller's; this is
+        the row that survives it."""
+        for ref in ("S-elsewhere", "V-elsewhere"):
+            with self.subTest(ref):
+                self.assertEqual("skipped", self.records[ref]["disposition"])
+                self.assertIn("neighbour-engagement", self.records[ref]["detail"])
+        self.assertEqual(
+            0,
+            self.counted(
+                "SELECT count(*) FROM entities"
+                " WHERE program_id = $1::uuid AND dedup_key LIKE '%neighbour%'",
+                (self.program_id,),
+            ),
+        )
+
+    def test_the_v1_scope_is_classified_and_applied_to_nothing(self):
+        before = self.counted(
+            "SELECT count(*) FROM program_scope_rules WHERE program_id = $1::uuid",
+            (self.program_id,),
+        )
+
+        self.assertEqual("accepted", self.records["SC-in"]["disposition"])
+        self.assertIn("classifies target", self.records["SC-in"]["detail"])
+        self.assertEqual("skipped", self.records["SC-excluded"]["disposition"])
+        self.assertIn("classifies denied", self.records["SC-excluded"]["detail"])
+        self.assertEqual("skipped", self.records["SC-junk"]["disposition"])
+        # The accepted entry changed no rule, which is the point of reading it.
+        self.assertEqual(
+            before,
+            self.counted(
+                "SELECT count(*) FROM program_scope_rules WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.counted(
+                "SELECT count(*) FROM program_scope_versions WHERE program_id = $1::uuid",
+                (self.program_id,),
+            ),
+        )
+
+    # -- criterion 6: the bytes, and what is never filed ---------------------
+
+    def test_bytes_the_export_kept_are_filed_under_their_own_hash(self):
+        self.assertEqual("accepted", self.records["A-keep"]["disposition"])
+        self.assertEqual(store.digest(KEEP_BYTES), self.records["A-keep"]["sha256"])
+        self.assertTrue(self.keep.holds(store.digest(KEEP_BYTES)))
+        self.assertEqual(KEEP_BYTES, self.keep.load(store.digest(KEEP_BYTES)))
+        self.assertEqual(
+            [
+                {
+                    "kind": "imported",
+                    "byte_size": len(KEEP_BYTES),
+                    "content_type": "application/json",
+                    "visibility": "agent_visible",
+                }
+            ],
+            [
+                dict(row)
+                for row in self.connection.execute(
+                    "SELECT r.kind, a.byte_size, a.content_type, a.visibility"
+                    "  FROM artifact_references r JOIN artifacts a ON a.sha256 = r.sha256"
+                    " WHERE r.program_id = $1::uuid AND r.sha256 = $2",
+                    (self.program_id, store.digest(KEEP_BYTES)),
+                ).dicts()
+            ],
+        )
+
+    def test_a_body_a_redaction_rule_matches_is_not_filed_anywhere(self):
+        """The one direction that matters. `redacted` is reported as a count, so
+        an operator sees that something was withheld; the bytes are not in the
+        store, not under a hash and not behind a reference, because an import is
+        the one path by which material this harness never chose to collect
+        arrives."""
+        self.assertEqual("redacted", self.records["A-secret"]["disposition"])
+        self.assertIsNone(self.records["A-secret"]["sha256"])
+        self.assertFalse(self.keep.holds(store.digest(SECRET_BYTES)))
+        for table in ("artifacts", "artifact_references"):
+            with self.subTest(table):
+                self.assertEqual(
+                    0,
+                    self.counted(
+                        f"SELECT count(*) FROM {table} WHERE sha256 = $1",
+                        (store.digest(SECRET_BYTES),),
+                    ),
+                )
+
+    def test_bytes_that_are_no_longer_what_v1_said_they_are_are_not_filed(self):
+        """The manifest cannot see this: it is a claim about the file in the
+        directory, and this is v1's claim about what it stored. An export
+        repacked around a modified artifact passes one and fails the other,
+        which is the whole reason both are checked."""
+        self.assertEqual("skipped", self.records["A-moved"]["disposition"])
+        self.assertIn("do not hash to the name", self.records["A-moved"]["detail"])
+        self.assertFalse(self.keep.holds(store.digest(MOVED_BYTES)))
+
+    def test_bytes_the_export_names_and_does_not_carry_are_skipped(self):
+        """v1 pruned its store and kept the row, which is most of what a real
+        export looks like."""
+        self.assertEqual("skipped", self.records["A-absent"]["disposition"])
+        self.assertIn("does not carry them", self.records["A-absent"]["detail"])
+
+    def test_every_artifact_the_export_offered_is_counted_under_one_state(self):
+        self.assertEqual(
+            {"retained": 1, "redacted": 1, "stale": 1, "absent": 1},
+            self.report.facts["imported"]["artifacts"],
+        )
+
+    def test_the_check_this_ticket_registered_holds_over_what_was_written(self):
+        self.assertEqual(
+            [], list(self.connection.execute("SELECT * FROM check_v1_import()").rows)
+        )
+
+
+class V1ImportRefusalTest(DatabaseCase):
+    """PH2-58 criterion 6's other half: the shapes that must fail closed.
+
+    Each case calls `record_v1_import` directly, because what is under test is
+    an account of an import that disagrees with what the database holds -- and
+    `legacy.run` is the thing that keeps the two in step, so a caller going
+    through it cannot produce any of them. A compromised or simply wrong caller
+    can, which is why the writer checks rather than trusting.
+    """
+
+    settings_for = "runtime"
+
+    SLUG = f"{IMPORT_SLUG}-refusal"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(UNSEEDED.replace('name = "matrix-web"', f'name = "{cls.SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.connection.execute(reporting.BIND, (cls.program_id,))
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (cls.SLUG,))
+        super().tearDownClass()
+
+    def setUp(self):
+        # A hash of its own per case, because the second import of one export is
+        # the idempotent early return rather than a refusal, and a shared
+        # identity would make every case after the first assert about that.
+        self.sha = secrets.token_hex(32)
+        self.source = {
+            "schema": legacy.SCHEMA,
+            "source_sha256": self.sha,
+            "exported_at": "2026-03-01T09:15:00Z",
+        }
+
+    def refused(self, payload: dict, source: dict | None = None) -> str:
+        return refusal_message(
+            self.connection,
+            "SELECT record_v1_import($1::jsonb, $2::jsonb)",
+            (json.dumps(source or self.source), json.dumps(payload)),
+        )
+
+    def file(self, data: bytes) -> None:
+        """File bytes at kind `imported` the way `legacy.run` would have."""
+        with self.connection.transaction():
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            artifact.filed(
+                self.connection, Store(scratch()), self.program_id, data, kind=legacy.KIND
+            )
+
+    def imports(self) -> int:
+        """How many imports this Program holds under the hash this case used."""
+        return int(
+            self.connection.execute(
+                "SELECT count(*) FROM v1_imports"
+                " WHERE program_id = $1::uuid AND source_sha256 = $2",
+                (self.program_id, self.sha),
+            ).scalar()
+        )
+
+    def test_an_import_states_the_export_it_read_and_when_it_was_taken(self):
+        for source, expected in (
+            ({**self.source, "source_sha256": "not a hash"}, "identified by the sha256"),
+            ({**self.source, "schema": ""}, "states the schema version"),
+            ({**self.source, "exported_at": "whenever"}, "states when the export"),
+        ):
+            with self.subTest(expected):
+                self.assertIn(expected, self.refused({}, source))
+        self.assertEqual(0, self.imports())
+
+    def test_a_caller_claiming_it_filed_bytes_it_did_not_file_is_refused(self):
+        """The check a caller cannot talk its way past. `retained` is the word
+        that turns a demoted row into imported Surface, so a caller able to
+        assert it without the reference could promote anything."""
+        message = self.refused(
+            {"artifacts": [{"ref": "A1", "state": "retained", "sha256": "c" * 64}]}
+        )
+
+        self.assertIn("claimed as retained", message)
+        self.assertEqual(0, self.imports())
+
+    def test_a_caller_calling_bytes_it_did_file_anything_but_retained_is_refused(self):
+        """The same check inverted, and the worse of the two: an audit saying a
+        secret was withheld while the store holds it. Three words say it and all
+        three are the same lie about the same bytes."""
+        data = b'{"authorization":"Bearer bbbbbbbbbbbbbbbbbbbbbbbb"}'
+        self.file(data)
+
+        for state in ("redacted", "stale", "absent"):
+            with self.subTest(state):
+                message = self.refused(
+                    {"artifacts": [{"ref": "A1", "state": state,
+                                    "sha256": store.digest(data)}]}
+                )
+
+                self.assertIn(f"claimed as {state}", message)
+        self.assertEqual(0, self.imports())
+
+    def test_a_second_export_may_disagree_with_what_the_first_one_retained(self):
+        """The same shape, and not the same claim. v1 pruning an artifact between
+        two exports, or a redaction rule shipping between them, leaves the second
+        export saying `stale` about bytes an earlier import of this Program
+        legitimately holds -- and refusing that would leave the second import
+        unrunnable with no way to withdraw the first."""
+        data = b'{"host":"first.example.com"}'
+        self.file(data)
+        first = {**self.source, "source_sha256": secrets.token_hex(32)}
+        committed(
+            self.connection,
+            "SELECT record_v1_import($1::jsonb, $2::jsonb)",
+            (
+                json.dumps(first),
+                json.dumps({"artifacts": [{"ref": "A1", "state": "retained",
+                                           "sha256": store.digest(data)}]}),
+            ),
+        )
+
+        answered = json.loads(
+            committed(
+                self.connection,
+                "SELECT record_v1_import($1::jsonb, $2::jsonb)",
+                (
+                    json.dumps(self.source),
+                    json.dumps({"artifacts": [{"ref": "A1", "state": "stale",
+                                               "sha256": store.digest(data)}]}),
+                ),
+            )
+        )
+
+        self.assertEqual({"skipped": 1}, answered["by_disposition"])
+        self.assertEqual(1, self.imports())
+        self.assertIn(
+            "an earlier import of this Program retained them",
+            str(
+                self.connection.execute(
+                    "SELECT detail FROM v1_import_records"
+                    " WHERE import_id = $1::uuid AND ref = 'A1'",
+                    (answered["import"],),
+                ).scalar()
+            ),
+        )
+
+    def test_an_export_naming_one_record_twice_is_refused_by_name(self):
+        """`v1_import_records` is unique on (import, kind, ref) and would refuse
+        the second one halfway through with a constraint name, which tells an
+        operator holding a bad export nothing about which record to look at."""
+        message = self.refused(
+            {"surface": [{"ref": "S1", "type": "domain", "fqdn": "a.example.com"},
+                         {"ref": "S1", "type": "domain", "fqdn": "b.example.com"}]}
+        )
+
+        self.assertIn("names the same surface record S1 twice", message)
+        self.assertEqual(0, self.imports())
+
+    def test_an_import_into_a_program_with_no_compiled_scope_is_refused(self):
+        """Fail closed rather than import wide. Every record is admitted on the
+        strength of a scope class, and a Program whose policy has not been
+        compiled has none to give."""
+        slug = f"{IMPORT_SLUG}-scopeless"
+        # Written by the owner rather than by `rk run`, because a Program with
+        # no compiled scope version is precisely what `rk run` will not leave
+        # behind: it compiles the policy and promotes it in the same call.
+        with pg.connect(self.harness.migrate) as owner:
+            with owner.transaction():
+                owner.execute("SET LOCAL ROLE rk2_owner")
+                owner.execute("SELECT set_actor('runtime', 'selftest')")
+                unscoped = str(
+                    owner.execute(
+                        "INSERT INTO programs (slug, name, platform)"
+                        " VALUES ($1, 'Self test', 'hackerone') RETURNING id::text",
+                        (slug,),
+                    ).scalar()
+                )
+            try:
+                self.connection.execute(reporting.BIND, (unscoped,))
+
+                message = self.refused({"surface": []})
+
+                self.assertIn("no compiled scope version", message)
+            finally:
+                self.connection.execute(reporting.BIND, (self.program_id,))
+                with owner.transaction():
+                    owner.execute("SET LOCAL ROLE rk2_owner")
+                    owner.execute("SET LOCAL app.purging = 'on'")
+                    owner.execute("DELETE FROM programs WHERE slug = $1", (slug,))
+
+    def test_a_record_the_export_gave_no_handle_for_is_refused(self):
+        for kind in ("artifacts", "scope", "surface", "findings"):
+            with self.subTest(kind):
+                self.assertIn("carries a ref", self.refused({kind: [{"ref": "  "}]}))
+        self.assertEqual(0, self.imports())
+
+    def test_a_payload_that_is_not_four_lists_imports_nothing_and_refuses_nothing(self):
+        """An import of nothing is a valid import, and it still gets a row: an
+        export that turned out to be empty is a fact about the export, and the
+        idempotence key has to exist for the operator not to run it again."""
+        answered = json.loads(
+            committed(
+                self.connection,
+                "SELECT record_v1_import($1::jsonb, $2::jsonb)",
+                (json.dumps(self.source), json.dumps({"surface": "not a list"})),
+            )
+        )
+
+        self.assertEqual(0, answered["records"])
+        self.assertFalse(answered["repeated"])
+        self.assertEqual(1, self.imports())
 
 
 if __name__ == "__main__":

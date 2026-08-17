@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
-from redkraken import _launch, _startup, agent, door, isolation, tls
+from redkraken import _launch, _startup, agent, door, isolation, legacy, store, tls, verifier
 from redkraken.document import FENCE
 
 
@@ -807,6 +807,70 @@ def write(text: str, name: str = "program.toml") -> Path:
     source = scratch() / name
     source.write_text(text, encoding="utf-8")
     return source
+
+
+#: One v1 export's four lists, in the shape `rk import` reads them. Small and
+#: dull on purpose: what varies between the cases that use it is the one claim
+#: under test, and everything else has to stay valid for that claim to be the
+#: reason a refusal happened.
+EXPORT_BODY = b'{"seen":"a body v1 kept"}'
+EXPORT_BLOB = "artifacts/a1.json"
+EXPORT_LISTS = {
+    "scope": [{"ref": "in-1", "host": "app.example.com", "port": 443}],
+    "surface": [{"ref": "S1", "type": "domain", "fqdn": "app.example.com"}],
+    "findings": [
+        {
+            "ref": "V-1",
+            "subject_ref": "S1",
+            "family": "authorization",
+            "severity": "high",
+            "status": "confirmed",
+        }
+    ],
+    "artifacts": [{"ref": "A1", "path": EXPORT_BLOB, "sha256": store.digest(EXPORT_BODY)}],
+}
+
+
+def export(
+    *,
+    lists: dict | None = None,
+    blobs: dict[str, bytes] | None = None,
+    program: str = "acme-web",
+    schema: str = legacy.SCHEMA,
+    exported_at: str = "2026-03-01T09:15:00Z",
+    drop: str | None = None,
+) -> Path:
+    """One v1 export directory, written the way a v1 exporter is expected to.
+
+    Valid unless an argument makes it otherwise, so a case changes one thing and
+    the refusal it gets names that thing. Shared rather than each test module's
+    own, because `test_legacy` asks what the reader refuses and `test_cli` asks
+    what the command does with an export it accepts -- and two builders would
+    let those two disagree about what an export is.
+    """
+    where = scratch() / "export"
+    where.mkdir()
+    files: list[dict] = []
+    payload = {**EXPORT_LISTS, **(lists or {})}
+    written = {legacy.PAYLOAD[key]: json.dumps(payload[key]).encode("utf-8") for key in payload}
+    written.update({EXPORT_BLOB: EXPORT_BODY} if blobs is None else blobs)
+    for path, data in written.items():
+        target = where / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        if path != drop:
+            files.append({"path": path, "bytes": len(data), "sha256": store.digest(data)})
+    document = {
+        "schema": schema,
+        "program": program,
+        "exported_at": exported_at,
+        "files": files,
+    }
+    (where / legacy.MANIFEST).write_text(
+        json.dumps(document | {"digest": verifier.manifest_digest(document)}, sort_keys=True),
+        encoding="utf-8",
+    )
+    return where
 
 
 def frontmatter(fields: dict) -> str:

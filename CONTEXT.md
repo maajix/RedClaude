@@ -356,6 +356,32 @@ the manifest excludes from its own digest.
 _Avoid_: Export (the command is `rk evidence export`; the noun is the bundle),
 archive, package, attachment, dump
 
+**Import**:
+One v1 export, read into one Program without inheriting its conclusions. The
+directory is one an operator names and nothing searches, defaults or globs for
+it, so an import cannot happen without somebody deciding it should. What it is
+held against is its own manifest, in both directions, and what identifies it is
+the hash of that manifest rather than any field the export states about itself,
+because every row an import writes hangs off that identity. Four things cross
+and nothing else does: the v1 configuration, classified against this Program's
+compiled scope and applied to nothing; domains, hosts and applications,
+converged on the dedup keys the runtime already uses; one finding hint per
+subject and Property class family, carrying a count and a severity ceiling and
+no leaf class, status or title; and bytes the export retained, filed under their
+own hash at a reference kind no operator command offers. What decides whether a
+row keeps the provenance it claims is whether the export carried bytes that hash
+to what it said they were: one that did is imported Surface, one that did not is
+an unverified proposal, whatever v1 called it. A v1 status survives as a
+sentence in the record and as no column anything joins on, so no label alone
+reaches a Hypothesis, a Finding, a Receipt, a Test run or a pivot stamp. Bytes a
+redaction rule matches are counted and not filed anywhere, and a caller whose
+account of what it filed disagrees with what this Program holds is refused in
+both directions. An import into a Program with no compiled scope version is
+refused rather than admitted wide. Every record is reported under exactly one of
+accepted, merged, demoted, skipped and redacted, and importing the same export
+again reports the first answer rather than a second one.
+_Avoid_: Migration (that is the schema corpus), restore, ingest, sync
+
 **Negative knowledge**:
 Refuted hypotheses kept as first-class records with the conditions under which
 they were refuted and the surface deltas that would make them worth retesting.

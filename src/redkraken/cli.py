@@ -28,6 +28,7 @@ from redkraken import (
     execution,
     header,
     identity,
+    legacy,
     migrate,
     operator,
     pg,
@@ -1118,6 +1119,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     packing_verify.set_defaults(run=_evidence_verify)
 
+    legacy_import = commands.add_parser(
+        legacy.COMMAND,
+        help=f"read one redacted v1 export into this Program (${DATABASE_URL})",
+        description=(
+            "Read one v1 export an operator names: its configuration validated "
+            "against this Program's scope and applied to nothing, its domains, "
+            "hosts and applications converged onto the Surface, its findings "
+            "rolled up to one hint per Property class family, and the artifacts "
+            "it retained filed under their own hashes. v1 kept no Receipt, Tool "
+            "Run or Agent run behind any of it, so no attempt, Hypothesis, "
+            "Finding, Test run or pivot stamp is created and a `confirmed` or "
+            "`exploited` label buys nothing: a record the export retained bytes "
+            "for is accepted, and one without is an unverified proposal. Every "
+            "record is reported as accepted, merged, demoted, skipped or "
+            "redacted, and importing the same export twice reports the first "
+            "import's answer."
+        ),
+    )
+    _add_url(legacy_import, RUNTIME)
+    legacy_import.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program the export is being read into",
+    )
+    # Required, with no default and nothing that derives one. An import that
+    # could find its own input is an import that happens without anybody
+    # deciding it should, which is what criterion 1 refuses.
+    legacy_import.add_argument(
+        "--from",
+        dest="source",
+        type=Path,
+        required=True,
+        metavar="dir",
+        help="the export directory to read; it is never searched for or inferred",
+    )
+    _add_root(
+        legacy_import,
+        help=(
+            "where the artifacts the export retained are filed "
+            f"(default: ${ARTIFACTS.variable})"
+        ),
+    )
+    legacy_import.set_defaults(run=_legacy_import)
+
     # Not `door`: the module by that name is what the subcommand two blocks down
     # calls, and a local shadowing it here is a parser being asked for a default.
     doors = commands.add_parser(
@@ -2035,6 +2082,26 @@ def _evidence_export(arguments: argparse.Namespace) -> int:
 def _evidence_verify(arguments: argparse.Namespace) -> int:
     """One directory and nothing else, which is the point of the verifier."""
     return _render(_guarded(evidence.VERIFY, lambda: evidence.verify(arguments.bundle)))
+
+
+def _legacy_import(arguments: argparse.Namespace) -> int:
+    """A connection and a store, because an export carries bytes as well as rows.
+
+    No key: an import files what the export retained as itself, and bytes that
+    arrived from another harness are not sealed wire material this one could
+    have a key for.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, legacy.COMMAND)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(legacy.COMMAND, ledger))
+    return _render(
+        _guarded(
+            legacy.COMMAND,
+            lambda: legacy.run(runtime, arguments.config, arguments.source, root=root),
+        )
+    )
 
 
 def _plan(ledger: Ledger, path: Path) -> list | None:
