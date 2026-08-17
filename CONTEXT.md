@@ -44,7 +44,10 @@ lane
 **Identity**:
 An entity representing a way of being someone against the target — a proxy
 upstream slot the agent names, never credential material the agent holds. Also a
-graph node, because identities own resources.
+graph node, because identities own resources. Being nobody in particular is one
+of them: an unauthenticated hunt acts as its program's anonymous identity, made
+the first time a hunt needs one, because two anonymous hunters share an upstream
+slot exactly as two authenticated ones would.
 _Avoid_: User, account, credential, session
 
 **Lease**:
@@ -52,6 +55,8 @@ An exclusive, expiring hold taken by one agent run — on an identity, and on th
 task it is executing. At most one unreleased lease per identity, so two hunters
 cannot mix sessions. Both leases of one run share a single clock and a single
 heartbeat: a run whose task lease is alive always holds live identity leases.
+A role the roster clamps holds one identity lease per identity its task acts as,
+and a claim that could hold none is refused rather than started.
 _Avoid_: Lock, reservation, checkout
 
 **Surface fingerprint**:

@@ -1504,6 +1504,60 @@ CONTROLS = (
         " DELETE FROM purge_cascade_edges"
         "  WHERE table_name = 'interception_cas' AND column_name = 'program_id';",
     ),
+    # PH2-72 has three arms and gets three controls for 074's reason: the gate
+    # asserts the check goes red and not which arm went red, and two of these
+    # three are about a clamped Task and its Leases disagreeing. Each is written
+    # so that only the arm it names can see it, which is why the rows differ in
+    # what they leave out rather than in how much they build.
+    Control(
+        # (a): the roster gains a clamp over a lane whose Task is already in
+        # flight. The Task is opened before the flip, so the projection does not
+        # run for it and the run is executing as nothing. Arm (b) needs a live
+        # Task Lease and this one has none.
+        "standing:identity_clamp",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('clamped-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO tasks (program_id, kind, status) VALUES (p, 'recon', 'claimed');"
+        "   UPDATE roles SET clamp_to_identity_leases = true WHERE role = 'recon';"
+        " END $ctl$",
+    ),
+    Control(
+        # (b): a clamped run holding its Task Lease and none of the Identity
+        # Leases its Task names. What `claim_task` writes in one statement, a
+        # restore or a hand-written row can leave half of -- and 024's arm (i)
+        # is satisfied by one Lease however many the Task acts as, so this is
+        # the half of criterion 1 that only this check asks.
+        "standing:identity_clamp",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('unheld-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO tasks (program_id, kind, status, lease_expires_at)"
+        "        VALUES (p, 'hunt', 'running', now() + interval '5 minutes');"
+        " END $ctl$",
+    ),
+    Control(
+        # (c): criterion 3 undone -- the lane view as it was before this ticket,
+        # which is `max_slots` minus what is running and nothing about who is
+        # holding what. Every row in the database stays exactly as it is, and a
+        # Program with one session goes back to reporting room for two hunts.
+        "standing:identity_clamp",
+        "CREATE OR REPLACE VIEW scheduler_lane_state AS"
+        " SELECT c.program_id, c.kind, c.role, c.min_slots, c.max_slots, c.overridden,"
+        "        coalesce(live.n, 0)                            AS live_slots,"
+        "        greatest(c.max_slots - coalesce(live.n, 0), 0) AS headroom,"
+        "        greatest(c.min_slots - coalesce(live.n, 0), 0) AS deficit"
+        "   FROM effective_lane_capacity c"
+        "   LEFT JOIN LATERAL ("
+        "       SELECT count(*) AS n FROM tasks t"
+        "        WHERE t.program_id = c.program_id AND t.kind = c.kind"
+        "          AND t.status IN ('claimed','running')"
+        "   ) live ON true",
+    ),
     Control(
         # Capacity held out of the pool for a run that has already ended. Written
         # by hand because no call reaches it: the trigger on `finished_at`
@@ -19488,6 +19542,515 @@ class LeaseTest(DatabaseCase):
         self.assertEqual((0, ""), (int(problems), str(detail)))
 
 
+#: PH2-72's Programs: one per shape a clamped Task's Identities can take.
+CLAMP_SLUG = "selftest-clamp"
+
+
+class IdentityClampTest(SchedulerFixture, DatabaseCase):
+    """PH2-72: a clamped run holds an Identity Lease for everything it acts as.
+
+    `web_hunter` is the one role the roster clamps, and both halves of the
+    enforcement used to read the Task's Hypothesis: a Hypothesis naming no
+    Identity meant no Lease was written and none was checked for, which is the
+    ordinary unauthenticated hunt. What a clamped Task acts as is now its own
+    rows, so the scenarios here are the shapes those rows can take.
+
+    `anonymous` is that ordinary hunt, twice over: two Tasks whose Hypotheses
+    name nobody both act as the Program's one anonymous Identity, so the second
+    cannot start while the first holds it. `paired` is a Hypothesis naming two
+    Identities, which is criterion 1's "every". `hypothesisless` is criterion
+    1's "including on a Task that names no hypothesis". `legacy` is the Task
+    that predates the clamp, which is the one way to be clamped and name
+    nothing. `reprojected` moves a Task's Hypothesis under it and then tries to
+    move it under its own Lease.
+
+    Everything runs in `setUpClass` because the claims commit and the refusals
+    are refusals of the state the claims left.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in ("anonymous", "paired", "hypothesisless", "legacy", "reprojected"):
+            # `UNSEEDED` for SlateClaimTest's reason, and for one more: this
+            # case counts a Program's Identities, and 083's recon Task would
+            # bring a lane of its own into the headroom being read.
+            path = write(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{CLAMP_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_anonymous()
+        cls.arrange_paired()
+        cls.arrange_hypothesisless()
+        cls.arrange_legacy()
+        cls.arrange_reprojected()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{CLAMP_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_anonymous(cls):
+        """Two unauthenticated hunts, one anonymous Identity between them.
+
+        The whole defect in one Program. Before this ticket both Tasks were
+        claimable at once through `web_hunter`'s two slots, which is the
+        session mixing the roster's clamp exists to prevent; now the first
+        holds the Identity and the second waits for it.
+        """
+        labels = cls.seed("anonymous", 2, kind="hunt")
+        program_id = cls.identifiers["anonymous"]
+        # The derivation at INSERT, before anything is pointed at a Hypothesis:
+        # a hunt Task acts as the anonymous Identity from the moment it exists.
+        cls.anonymous_at_insert = cls.acts_as("anonymous", labels[0])
+        for label in labels:
+            cls.attach("anonymous", label, cls.hypothesis_for("anonymous", label))
+        cls.anonymous_after_hypothesis = cls.acts_as("anonymous", labels[0])
+        cls.anonymous_shared = cls.acts_as("anonymous", labels[1])
+        # One row, not one per Task: `rk2_anonymous_identity` finds the
+        # Program's by `dedup_key` and only mints it where there is none.
+        cls.anonymous_identities = int(
+            cls.scalar(
+                "SELECT count(*) FROM identities i JOIN entities e ON e.id = i.entity_id"
+                " WHERE e.program_id = $1::uuid",
+                (program_id,),
+            )
+        )
+        cls.anonymous_class = str(
+            cls.scalar(
+                "SELECT i.class || ' ' || i.slot_name FROM identities i"
+                " JOIN entities e ON e.id = i.entity_id WHERE e.program_id = $1::uuid",
+                (program_id,),
+            )
+        )
+
+        cls.bind("anonymous")
+        offered = cls.offer()
+        cls.anonymous_offered = tuple(str(entry["task_label"]) for entry in offered)
+        # Criterion 3, measured where it is decidable: two free slots, one free
+        # Identity. Without the clamp in the view this reads 2, and both hunts
+        # start.
+        cls.headroom_before = cls.headroom("anonymous")
+        cls.anonymous_claimed = str(cls.call("SELECT claim_task($1)", (cls.anonymous_offered[0],)))
+        cls.headroom_after = cls.headroom("anonymous")
+        cls.anonymous_leases = cls.leases_of("anonymous", cls.anonymous_claimed)
+        # Criterion 4. The refusal is `identity_held` and not `lane_full`
+        # because the two Tasks want the same Identity, which is the thing the
+        # clamp is about; the lane arm would have said the same thing about a
+        # Program that had simply run out of slots.
+        cls.anonymous_refusal = cls.refusal(
+            "SELECT claim_task($1)", (cls.anonymous_offered[1],)
+        )
+        cls.anonymous_second = cls.claimable("anonymous", cls.anonymous_offered[1])
+        cls.anonymous_runs = cls.counted("anonymous")[1]
+
+    @classmethod
+    def arrange_paired(cls):
+        """A Hypothesis about two Identities is two Leases, not one.
+
+        Criterion 1's "every". 024's arm (i) asks only whether the run holds
+        something, so a run holding one of the two it acts as reads as clean
+        there; arm (b) of this ticket's check is what asks per Identity.
+        """
+        [label] = cls.seed("paired", 1, kind="hunt")
+        first = cls.identity("paired", "tenant-a")
+        second = cls.identity("paired", "tenant-b")
+        cls.attach(
+            "paired", label, cls.hypothesis_for("paired", label, identities=(first, second))
+        )
+        cls.paired_acts_as = cls.acts_as("paired", label)
+
+        cls.bind("paired")
+        cls.paired_headroom = cls.headroom("paired")
+        offered = cls.offer()
+        cls.paired_claimed = str(cls.call("SELECT claim_task($1)", (str(offered[0]["task_label"]),)))
+        cls.paired_leases = cls.leases_of("paired", cls.paired_claimed)
+        # One clock across both halves is 024's, and it is asked again here
+        # because this ticket is what writes more than one Identity Lease per
+        # claim: two rows written from `now()` in one statement expire together
+        # or arm (a) of `check_lease_liveness` has something to say.
+        cls.paired_expiries = int(
+            cls.scalar(
+                "SELECT count(DISTINCT l.expires_at) FROM identity_leases l"
+                " JOIN agent_runs a ON a.id = l.holder_agent_run_id"
+                " WHERE a.program_id = $1::uuid AND l.released_at IS NULL",
+                (cls.identifiers["paired"],),
+            )
+        )
+
+    @classmethod
+    def arrange_hypothesisless(cls):
+        """Criterion 1's last clause, and what actually happens to such a Task.
+
+        The ticket's Why has this Task taking no Lease and passing no gate. It
+        does carry Identities -- the derivation does not read the Hypothesis to
+        decide whether there is one -- and it is refused before the Lease
+        question is reached at all, by 023's `hunt.no_hypothesis`. Both halves
+        are recorded because the second is the correction.
+        """
+        [label] = cls.seed("hypothesisless", 1, kind="hunt")
+        cls.hypothesisless_acts_as = cls.acts_as("hypothesisless", label)
+        cls.bind("hypothesisless")
+        cls.hypothesisless_offered = cls.offer()
+        cls.hypothesisless_refusal = cls.claimable("hypothesisless", label)
+
+    @classmethod
+    def arrange_legacy(cls):
+        """Criterion 2: the Task the roster's clamp arrived after.
+
+        The flip and the reading are one transaction that is thrown away, for
+        two reasons. `roles` is the corpus's roster and not a per-Program row,
+        so a committed edit here would be an edit to every other case in this
+        file; and the state being described is a database mid-change, which is
+        not a state anything should be left in.
+
+        What that measures is the predicate and not the raise. The step between
+        them is `claim_task`'s own, which raises `check_violation` on any
+        non-NULL `claimable_for` result without reading which one it is, and
+        `SlateClaimTest` already reads that raise back for `unaffordable` and
+        for `identity_held`. So criterion 2's "refused rather than granted
+        leaseless" is this arm being a reason at all.
+        """
+        [label] = cls.seed("legacy", 1, kind="recon")
+        cls.bind("legacy")
+        cls.offer()
+        cls.legacy_before = cls.claimable("legacy", label)
+        try:
+            with cls.connection.transaction():
+                cls.connection.execute("SET LOCAL ROLE rk2_owner")
+                cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                cls.connection.execute(
+                    "UPDATE roles SET clamp_to_identity_leases = true WHERE role = 'recon'"
+                )
+                cls.legacy_acts_as = cls.rows_of(
+                    cls.connection, cls.identifiers["legacy"], label
+                )
+                cls.legacy_refusal = str(
+                    cls.connection.execute(
+                        "SELECT claimable_for(t, w) FROM tasks t"
+                        " CROSS JOIN scheduler_weights w"
+                        " WHERE w.active AND t.program_id = $1::uuid AND t.label = $2",
+                        (cls.identifiers["legacy"], label),
+                    ).scalar()
+                )
+                # What the check says while the database is in that state, read
+                # off the same arrangement rather than a second one. Arm (a) is
+                # about a clamped run in flight, and the refusal above is what
+                # keeps this Task out of flight -- so a roster that gains a
+                # clamp is not by itself a violation, and the arm's own control
+                # is what shows it firing.
+                cls.legacy_clamp_problems = tuple(
+                    str(row[0])
+                    for row in cls.connection.execute(
+                        "SELECT problem FROM check_identity_clamp()"
+                    ).rows
+                )
+                raise Rollback
+        except Rollback:
+            pass
+        cls.legacy_after = cls.claimable("legacy", label)
+
+    @classmethod
+    def arrange_reprojected(cls):
+        """The Task's Hypothesis moves, and then tries to move under a Lease.
+
+        Five sites in this file point a Task at a Hypothesis after opening it,
+        so the projection follows the UPDATE as well as the INSERT. What it may
+        not follow is a re-point under a live hold: the run is already acting as
+        what it leased, and rewriting the answer beneath it would leave a hold
+        on an Identity the Task no longer names and arm (b) asking for a Lease
+        the run never took.
+        """
+        [label] = cls.seed("reprojected", 1, kind="hunt")
+        cls.reprojected_at_insert = cls.acts_as("reprojected", label)
+        rotated = cls.identity("reprojected", "rotated")
+        cls.attach(
+            "reprojected", label,
+            cls.hypothesis_for("reprojected", label, identities=(rotated,)),
+        )
+        cls.reprojected_after = cls.acts_as("reprojected", label)
+
+        cls.bind("reprojected")
+        offered = cls.offer()
+        cls.reprojected_claimed = str(
+            cls.call("SELECT claim_task($1)", (str(offered[0]["task_label"]),))
+        )
+        cls.reprojected_leases = cls.leases_of("reprojected", cls.reprojected_claimed)
+        replacement = cls.hypothesis_for(
+            "reprojected", label, property_class="authorization.tenant_isolation"
+        )
+        cls.reprojected_refusal = cls.owner_refusal(
+            "UPDATE tasks SET hypothesis_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers["reprojected"], label, replacement),
+        )
+        cls.reprojected_still = cls.acts_as("reprojected", label)
+
+    # -- what the scenarios are built out of -----------------------------------
+
+    @classmethod
+    def identity(cls, name: str, slot: str) -> str:
+        """One named Identity in a Program, the way recon records one."""
+        program_id = cls.identifiers[name]
+        entity = str(
+            cls.as_owner(
+                "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
+                (program_id, HOST, f"identity:{slot}"),
+            ).scalar()
+        )
+        cls.as_owner(
+            "INSERT INTO identities (entity_id, program_id, slot_name, class)"
+            " VALUES ($1::uuid, $2::uuid, $3, 'anonymous')",
+            (entity, program_id, slot),
+        )
+        return entity
+
+    @classmethod
+    def hypothesis_for(
+        cls,
+        name: str,
+        label: str,
+        identities: tuple[str, ...] = (),
+        property_class: str = "authorization.object_ownership",
+    ) -> str:
+        """One testable Hypothesis about a Task's own subject.
+
+        `identities` is what distinguishes the scenarios: none is the
+        unauthenticated hunt this ticket is about, one is what 024's fixtures
+        write, and two is criterion 1's "every".
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " identity_a_entity_id, identity_b_entity_id, property_class,"
+                " statement, status)"
+                " SELECT $1::uuid, t.subject_entity_id, $3::uuid, $4::uuid, $5,"
+                " 'a clamped hypothesis', 'testable'"
+                "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2"
+                " RETURNING id::text",
+                (
+                    cls.identifiers[name],
+                    label,
+                    identities[0] if len(identities) > 0 else None,
+                    identities[1] if len(identities) > 1 else None,
+                    property_class,
+                ),
+            )
+        )
+
+    @classmethod
+    def attach(cls, name: str, label: str, hypothesis: str):
+        """Point an already-opened Task at a Hypothesis, which re-projects."""
+        cls.as_owner(
+            "UPDATE tasks SET hypothesis_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers[name], label, hypothesis),
+        )
+
+    @classmethod
+    def owner_refusal(cls, sql: str, parameters: tuple = ()) -> str:
+        """What one statement raised at the role that owns the table.
+
+        `SchedulerFixture.refusal` asks the runtime, and the runtime cannot
+        reach `task_identities` with an UPDATE at all -- so a refusal read there
+        would be 029's grant answering rather than the projection guard.
+        """
+        try:
+            cls.as_owner(sql, parameters)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError(f"not refused: {sql} {parameters}")
+
+    @classmethod
+    def acts_as(cls, name: str, label: str) -> tuple[str, ...]:
+        """The Identities one Task acts as, by slot name."""
+        return cls.rows_of(cls.connection, cls.identifiers[name], label)
+
+    @staticmethod
+    def rows_of(connection: pg.Connection, program_id: str, label: str) -> tuple[str, ...]:
+        """The same reading, on whichever connection is asking.
+
+        A classmethod would open a transaction of its own, and `legacy` reads
+        this from inside one it is going to throw away.
+        """
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT i.slot_name FROM task_identities ti"
+                "  JOIN identities i ON i.entity_id = ti.identity_entity_id"
+                "  JOIN tasks t ON t.id = ti.task_id"
+                " WHERE t.program_id = $1::uuid AND t.label = $2"
+                " ORDER BY i.slot_name",
+                (program_id, label),
+            ).rows
+        )
+
+    @classmethod
+    def leases_of(cls, name: str, run: str) -> tuple[str, ...]:
+        """The Identities one Agent run holds, by slot name."""
+        return tuple(
+            str(row[0])
+            for row in cls.as_owner(
+                "SELECT i.slot_name FROM identity_leases l"
+                "  JOIN agent_runs a ON a.id = l.holder_agent_run_id"
+                "  JOIN identities i ON i.entity_id = l.identity_entity_id"
+                " WHERE a.program_id = $1::uuid AND a.label = $2"
+                "   AND l.released_at IS NULL"
+                " ORDER BY i.slot_name",
+                (cls.identifiers[name], run),
+            ).rows
+        )
+
+    @classmethod
+    def headroom(cls, name: str) -> int:
+        return int(
+            cls.scalar(
+                "SELECT headroom FROM scheduler_lane_state"
+                " WHERE program_id = $1::uuid AND kind = 'hunt'",
+                (cls.identifiers[name],),
+            )
+        )
+
+    # -- the ordinary hunt -----------------------------------------------------
+
+    def test_a_hunt_acts_as_the_anonymous_identity_from_the_moment_it_is_opened(self):
+        self.assertEqual(("_anonymous",), self.anonymous_at_insert)
+        self.assertEqual(("_anonymous",), self.anonymous_after_hypothesis)
+        self.assertEqual(("_anonymous",), self.anonymous_shared)
+
+    def test_the_anonymous_identity_is_one_row_per_program(self):
+        self.assertEqual(1, self.anonymous_identities)
+        # The leading underscore is what `config.SLUG` cannot produce, so no
+        # configured `identity.name` can collide with the reserved slot.
+        self.assertEqual("anonymous _anonymous", self.anonymous_class)
+
+    def test_a_hypothesisless_hunt_still_names_what_it_would_act_as(self):
+        self.assertEqual(("_anonymous",), self.hypothesisless_acts_as)
+
+    def test_a_hypothesisless_hunt_is_refused_before_the_lease_question(self):
+        # The correction to the ticket's Why: such a Task does not start
+        # leaseless, because it does not start.
+        self.assertEqual("hunt.no_hypothesis", self.hypothesisless_refusal)
+        self.assertEqual((), self.hypothesisless_offered)
+
+    # -- criterion 1 -----------------------------------------------------------
+
+    def test_the_claim_holds_a_lease_for_the_identity_it_acts_as(self):
+        self.assertEqual(("_anonymous",), self.anonymous_leases)
+
+    def test_a_task_that_acts_as_two_identities_holds_two_leases(self):
+        self.assertEqual(("tenant-a", "tenant-b"), self.paired_acts_as)
+        self.assertEqual(("tenant-a", "tenant-b"), self.paired_leases)
+
+    def test_the_leases_one_claim_writes_expire_together(self):
+        self.assertEqual(1, self.paired_expiries)
+
+    # -- criterion 2 -----------------------------------------------------------
+
+    def test_a_task_clamped_after_it_was_opened_names_nothing(self):
+        self.assertEqual((), self.legacy_acts_as)
+
+    def test_a_clamped_task_that_names_nothing_is_refused_rather_than_started(self):
+        self.assertIsNone(self.legacy_before)
+        self.assertEqual("clamped_without_identity", self.legacy_refusal)
+        self.assertIsNone(self.legacy_after)
+
+    # -- criterion 3 -----------------------------------------------------------
+
+    def test_the_clamp_bounds_the_lane_by_the_identities_it_can_hold(self):
+        # Two slots, one Identity: the lane reports what it can actually
+        # start, which is the whole of `clamp_to_identity_leases` being an
+        # input.
+        self.assertEqual(1, self.headroom_before)
+        self.assertEqual(0, self.headroom_after)
+        # And is not a second subtraction: two free Identities against two free
+        # slots is two.
+        self.assertEqual(2, self.paired_headroom)
+
+    # -- criterion 4 -----------------------------------------------------------
+
+    def test_the_second_hunt_for_one_identity_does_not_start(self):
+        self.assertEqual(2, len(self.anonymous_offered))
+        self.assertIn("identity_held", self.anonymous_refusal)
+        self.assertEqual("identity_held", self.anonymous_second)
+        # One run, not two: the refusal left nothing behind that a heartbeat
+        # would keep alive.
+        self.assertEqual(1, self.anonymous_runs)
+
+    # -- the projection --------------------------------------------------------
+
+    def test_pointing_a_task_at_a_hypothesis_moves_what_it_acts_as(self):
+        self.assertEqual(("_anonymous",), self.reprojected_at_insert)
+        self.assertEqual(("rotated",), self.reprojected_after)
+        self.assertEqual(("rotated",), self.reprojected_leases)
+
+    def test_a_task_under_a_live_lease_cannot_be_re_pointed(self):
+        self.assertIn("holds an Identity Lease", self.reprojected_refusal)
+        self.assertEqual(("rotated",), self.reprojected_still)
+
+    def test_the_rows_are_projected_and_not_written_by_hand(self):
+        for statement, parameters in (
+            (
+                # The value it already has, which is the weakest UPDATE there
+                # is: the guard refuses the verb and not the change, because a
+                # row here is derived or it is gone.
+                "UPDATE task_identities SET identity_entity_id = identity_entity_id"
+                " WHERE task_id = (SELECT id FROM tasks WHERE program_id = $1::uuid"
+                "                   LIMIT 1)",
+                (self.identifiers["paired"],),
+            ),
+            (
+                "DELETE FROM task_identities"
+                " WHERE task_id IN (SELECT id FROM tasks WHERE program_id = $1::uuid)",
+                (self.identifiers["paired"],),
+            ),
+        ):
+            with self.subTest(statement.split()[0]):
+                self.assertIn(
+                    "projected from the Task", self.owner_refusal(statement, parameters)
+                )
+
+    # -- the invariant ---------------------------------------------------------
+
+    def test_the_standing_check_is_registered_and_holds(self):
+        [registered] = self.connection.execute(
+            "SELECT count(*) FROM standing_checks WHERE name = 'identity_clamp'"
+        ).rows
+        [[problems, detail]] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'identity_clamp'"
+        ).rows
+
+        self.assertEqual(1, int(registered[0]))
+        self.assertEqual((0, ""), (int(problems), str(detail)))
+
+    def test_a_roster_that_gains_a_clamp_is_not_itself_a_violation(self):
+        # The refusal is what keeps the Task out of flight, and arm (a) asks
+        # about runs in flight -- so the mid-change state is quiet, and what
+        # would make it loud is a claim that got through anyway.
+        self.assertEqual((), self.legacy_clamp_problems)
+
+
 #: PH2-29's Programs: one per thing that can happen to a question between the
 #: moment the gate files it and the moment somebody answers it.
 OPERATOR_SLUG = "selftest-operator"
@@ -28174,6 +28737,19 @@ class ImpactRunFixture(ValidatedFindingFixture):
         The ending is cleared with the claim, because a Task that ended and is
         claimed again is claimed: 012 makes the abandonment reason a property of
         the status, and a row carrying both is one the constraint refuses.
+
+        The Identities the Task acts as are leased with it, which is the rest of
+        what `claim_task` does in the same statement: 072 makes a hunt Task act
+        as its Program's anonymous session where its Hypothesis names nobody, so
+        a claim arranged without them is a clamped run in flight holding no
+        session -- the state `check_identity_clamp()` exists to find.
+
+        A second run over a Task the first still holds is one of the shapes
+        below, and it changes both halves of that. The session is already leased
+        and exclusively so, which is the point of it, so the second run takes
+        what is left rather than the lot; and the Task Lease it just pushed out
+        is the clock 023 reads every Identity Lease against, so the Leases the
+        first run took move with it.
         """
         cls.as_owner(
             "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
@@ -28182,7 +28758,14 @@ class ImpactRunFixture(ValidatedFindingFixture):
             " WHERE program_id = $1::uuid AND label = $2",
             (cls.program_id, task),
         )
-        return committed(
+        cls.as_owner(
+            "UPDATE identity_leases l SET expires_at = t.lease_expires_at"
+            "  FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            " WHERE l.holder_agent_run_id = a.id AND l.released_at IS NULL"
+            "   AND t.program_id = $1::uuid AND t.label = $2",
+            (cls.program_id, task),
+        )
+        run = committed(
             cls.connection,
             "INSERT INTO agent_runs (program_id, task_id, role, model, effort, mission_packet)"
             " SELECT $1::uuid, t.id, 'web_hunter', 'operator', 'low', '{}'::jsonb"
@@ -28190,6 +28773,16 @@ class ImpactRunFixture(ValidatedFindingFixture):
             " RETURNING id",
             (cls.program_id, task),
         )
+        cls.as_owner(
+            "INSERT INTO identity_leases (program_id, identity_entity_id,"
+            "                             holder_agent_run_id, expires_at)"
+            " SELECT $1::uuid, ti.identity_entity_id, $2::uuid, t.lease_expires_at"
+            "   FROM task_identities ti JOIN tasks t ON t.id = ti.task_id"
+            "  WHERE t.program_id = $1::uuid AND t.label = $3"
+            " ON CONFLICT DO NOTHING",
+            (cls.program_id, run, task),
+        )
+        return run
 
     @classmethod
     def as_operator(cls, sql: str, parameters: tuple = ()):
@@ -28292,11 +28885,16 @@ class ImpactRunFixture(ValidatedFindingFixture):
             # problem of its own. What a run that ends really does is
             # `finish_task_attempt`, and settling the Task is the scheduler's
             # move rather than the walk's.
+            #
+            # The slot's Lease and not the run's, for the same reason: what the
+            # run took with its claim is what the Task acts as, and 072 reads a
+            # clamped run holding a live Task Lease and none of those as a
+            # problem of its own.
             cls.as_owner(
                 "UPDATE identity_leases SET released_at = now()"
                 " WHERE program_id = $1::uuid AND holder_agent_run_id = $2::uuid"
-                "   AND released_at IS NULL",
-                (cls.program_id, run),
+                "   AND identity_entity_id = $3::uuid AND released_at IS NULL",
+                (cls.program_id, run, identity),
             )
         return {"run": run, "plan": plan, "identity": identity, "closed": closed}
 

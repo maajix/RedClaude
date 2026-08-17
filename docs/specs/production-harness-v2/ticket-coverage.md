@@ -27,8 +27,8 @@ review, all triaged into the graph.
 
 Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
 the plan's reachability property. Ticket 62 now lists it as a blocker, which
-restored it. Tickets 67–75 are in the same position and not yet resolved the
-same way: each except 74 and 75 names a blocker, so none of them is a way to
+restored it. Tickets 67–75 are in the same position and not resolved the same
+way: each except 74 and 75 names a blocker, so none of them is a way to
 start work early, but nothing downstream names them, so today they are nine sinks
 beside 65 rather than work the release depends on. Whichever later ticket owns
 their outcome has to list them before that claim reads "every ticket" again.
@@ -38,8 +38,16 @@ and the scheduler that will read it: the model and effort a claimed run records,
 the Identity a clamped role must hold, and the cross-role subagent cap that is
 written once in `roster.py` and once as a `scheduler_weights` column. Each is
 blocked by the scheduler ticket that owns the code it changes (23 and 24), which
-is also why none of them was fixed under 18. Two of the three, 71 and 73, are
-resolved.
+is also why none of them was fixed under 18. All three are resolved. 72 was the
+last and the largest: both halves of the clamp read the Hypothesis's two
+nullable Identity columns, so an unauthenticated hunt took no Lease and blocked
+nobody. 18's measurement of the corpus this schema came from counts 49
+investigations in 55 with at least one NULL Identity slot, which is the bucket
+this case falls in rather than its size -- a single-identity Hypothesis did take
+its one Lease. A clamped Task now carries what it acts as in rows of its own --
+the Program's anonymous Identity where its Hypothesis names nobody -- and the
+lane view's headroom is bounded by the Identities that are free, which is what
+`clamp_to_identity_leases` had been sitting in a capacity view without doing.
 
 Tickets 74 and 75 are what 71 found that was not 71's, and both are defects the
 corpus has held since the migration that wrote them. 74: the whole-program purge

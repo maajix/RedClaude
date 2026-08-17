@@ -11,7 +11,14 @@ Because this repo tracks issues as local markdown, a "label" is the value of the
 | `ready-for-agent`          | `ready-for-agent`    | Fully specified, ready for an AFK agent  |
 | `ready-for-human`          | `ready-for-human`    | Requires human implementation            |
 | `wontfix`                  | `wontfix`            | Will not be actioned                     |
+| _(none)_                   | `resolved`           | Built, tested, reviewed and committed    |
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
+
+`resolved` has no counterpart in the five canonical roles, because the roles are
+about triage and this one is about the work being finished. It is the terminal
+state of `ready-for-agent` in this tracker and the commonest `Status:` value in
+`docs/specs/production-harness-v2/issues/`, so a skill reading only the five
+would call two thirds of the corpus unlabelled.
 
 Edit the right-hand column to match whatever vocabulary you actually use.
