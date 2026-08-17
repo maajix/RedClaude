@@ -122,6 +122,7 @@ from tests.fixtures import (
     SCOPE_ENTITIES,
     SCOPE_REQUESTS,
     SCOPED,
+    UNSEEDED,
     VALID,
     WITHDRAWN,
     Target,
@@ -1284,6 +1285,24 @@ CONTROLS = (
     ),
     Control("standing:role_kind_mapping", "INSERT INTO task_kinds (kind) VALUES ('selftest_kind')"),
     Control("standing:scheduler_closure", "INSERT INTO task_kinds (kind) VALUES ('selftest_kind')"),
+    Control(
+        # The account of why a Task was opened, written with no Task under it.
+        # `open_task` writes the pair in one transaction, so this is what a
+        # caller reaching for the event by hand leaves behind -- and it is the
+        # shape a lost causal link leaves too, which is why the check reads the
+        # citation rather than the two rows' timestamps.
+        "standing:opened_tasks",
+        "DO $ctl$ DECLARE p uuid;"
+        " BEGIN"
+        "   PERFORM set_actor('runtime', 'selftest');"
+        "   INSERT INTO programs (slug, name) VALUES ('unopened-selftest', 'Self test')"
+        "     RETURNING id INTO p;"
+        "   INSERT INTO events (program_id, type, actor_kind, payload)"
+        "        VALUES (p, 'task.opened', 'runtime',"
+        "                jsonb_build_object('kind', 'recon', 'subject', 'AP1',"
+        "                                   'reason', 'a reason no Task cites'));"
+        " END $ctl$",
+    ),
     Control(
         "standing:report_grounding",
         "INSERT INTO report_blocks (id, name, description)"
@@ -2798,9 +2817,11 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(first.facts["program_id"])])
 
     def test_opening_projects_the_identity_and_resuming_emits_one_more_event(self):
-        # The configured Identity is durable Program state now, so opening emits
-        # its creation and initial scope projection beside program.configured.
-        # Resuming adds only run.resumed because neither projection moved.
+        # The configured Identity and the configured Surface are both durable
+        # Program state now, so opening emits a creation and a scope projection
+        # for each beside program.configured, and then the first Task and the
+        # sentence that licensed it. Resuming adds only run.resumed because
+        # nothing moved: the subject is already recorded and already has a Task.
         slug = f"{RUN_SLUG}-events"
 
         opened = self.run_for(slug)
@@ -2814,13 +2835,20 @@ class ProgramRunTest(DatabaseCase):
                 ("program.configured", "program_configurations", "runtime"),
                 ("entity.created", "entities", "runtime"),
                 ("entity.updated", "entities", "runtime"),
+                ("entity.created", "entities", "runtime"),
+                ("entity.updated", "entities", "runtime"),
+                ("task.opened", None, "runtime"),
+                ("task.created", "tasks", "runtime"),
             ],
             [event[:3] for event in after_open],
         )
-        self.assertEqual(4, len(after_resume))
-        self.assertEqual(("run.resumed", None, "runtime"), after_resume[3][:3])
-        payload = json.loads(after_resume[3][3])
+        self.assertEqual(8, len(after_resume))
+        self.assertEqual(("run.resumed", None, "runtime"), after_resume[7][:3])
+        payload = json.loads(after_resume[7][3])
         self.assertEqual(1, payload["configuration_revision"])
+        # Zero because `tasks_unclaimed` counts Tasks taken back off a dead
+        # lease, not Tasks waiting: the recon Task this open wrote was never
+        # claimed, so there was nothing to take back.
         self.assertEqual(0, payload["counts"]["tasks_unclaimed"])
 
     def test_the_event_a_revision_writes_carries_no_value_out_of_the_policy(self):
@@ -2858,7 +2886,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(program.STOPPED_REFUSED, changed.facts["stop_reason"])
         self.assertEqual(1, changed.facts["configuration"]["revision"])
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
-        self.assertEqual(3, len(self.events(program_id)))
+        self.assertEqual(7, len(self.events(program_id)))
 
     def test_a_change_the_operator_accepts_becomes_the_next_revision(self):
         # The other side of criterion 3: an explicit revision, never a silent
@@ -2890,7 +2918,12 @@ class ProgramRunTest(DatabaseCase):
                 "program.configured",
                 "entity.created",
                 "entity.updated",
+                "entity.created",
+                "entity.updated",
+                "task.opened",
+                "task.created",
                 "program.configured",
+                "entity.updated",
                 "entity.updated",
                 "run.resumed",
             ],
@@ -2922,7 +2955,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
         self.assertEqual("retired", result.facts["lifecycle"])
         self.assertEqual(program_id, result.facts["program_id"])
-        self.assertEqual(3, len(self.events(program_id)))
+        self.assertEqual(7, len(self.events(program_id)))
 
     def test_a_database_that_is_not_ready_is_refused_before_anything_is_written(self):
         # Criterion 5, the first half, at the last point it can still be true:
@@ -3079,6 +3112,458 @@ class ProgramRunTest(DatabaseCase):
             result = integrity.verify(connection, self.harness.expected)
 
         self.assertTrue(result.ok, result.violations)
+
+
+#: The Programs ticket 83's case opens. Named apart for the reason below: the
+#: purge at the end of each class finds only its own rows.
+FIRST_SLUG = "selftest-first"
+
+
+class FirstTaskTest(DatabaseCase):
+    """PH2-83: a Program with a compiled scope and no history has work to do.
+
+    The arrangement is one campaign carried from a file to a claim, in the order
+    an operator meets it. `rk run` opens the Program; opening records the
+    Surface the configuration already declares and opens one recon Task against
+    it; a scheduler pass ranks that Task, offers it and claims it. Nothing here
+    writes a `tasks` row by hand, which is the whole of criterion 1 -- a case
+    that inserted one would prove the scheduler works on Tasks somebody else
+    already made, which was never in doubt.
+
+    A second Program is opened beside it and left alone. It is the control for
+    the Program predicate: its subject is a perfectly good target of its own
+    scope, and opening a Task against it from over here is still refused.
+
+    Everything commits, because what survives the transaction is the subject,
+    and everything runs as `rk2_runtime`: the seeding is the runtime's, and a
+    case that asked the owner would prove the SQL parses rather than that the
+    role which calls it in production may.
+    """
+
+    settings_for = "runtime"
+
+    #: The one subject `VALID` declares. Its inclusion names a protocol, a host,
+    #: a port and a path prefix, and those four are an address: the base URL
+    #: below is that address in the spelling `promote_proposal` keys an
+    #: Application on, so the recon Agent this sends out converges on the row it
+    #: was sent to map instead of standing up a second one beside it.
+    #:
+    #: Which is why the URL has no trailing slash and the rule does. The scope
+    #: columns keep the prefix the rule states, because a prefix is a subtree
+    #: and `/api` is not under `/api/`; the URL is cleaned, because that is what
+    #: `rk2_parse_base_url` hands `promote_proposal` for the same address.
+    SUBJECT = ("app.example.com", 443, "/api/")
+    BASE_URL = "https://app.example.com/api"
+
+    #: The same configuration with its one inclusion made a wildcard. It is the
+    #: control for what has no address: `*.example.net` names a set of hosts,
+    #: nothing here enumerates one, and a Task against it would reach the target
+    #: step and stop.
+    WIDE = 'host = "*.example.net"'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.identifiers = {}
+        cls.reported = {}
+        for name in ("main", "other", "wide"):
+            slug = f"{FIRST_SLUG}-{name}"
+            source = VALID.replace('name = "acme-web"', f'name = "{slug}"')
+            if name == "wide":
+                source = source.replace('host = "app.example.com"', cls.WIDE)
+            opened = program.run(cls.harness.runtime, write(source))
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+            cls.reported[name] = opened.facts["first_tasks"]
+
+        cls.subject = cls.entity_of("main")
+        cls.elsewhere = cls.entity_of("other")
+        cls.pass_ledger, cls.offered, cls.claimed = cls.run_one_pass()
+        cls.refusals = {}
+        cls.refuse_what_is_not_a_subject()
+        cls.repeat = cls.reopen()
+        cls.problems = cls.connection.execute("SELECT * FROM check_opened_tasks()").rows
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{FIRST_SLUG}-%",))
+        super().tearDownClass()
+
+    @classmethod
+    def subjects_of(cls, name: str) -> list[dict]:
+        """Every configured subject of a Program, as its row.
+
+        Selected on where it came from rather than on its type: the Identity is
+        `configured` too, and telling them apart by type would be this case
+        knowing which type a scope rule projects to.
+        """
+        return cls.connection.execute(
+            "SELECT e.id::text, e.label, e.type, e.origin, e.scope_class,"
+            "       e.scope_selector_kind, e.scope_selector, e.scope_port,"
+            "       e.scope_path_raw, e.scope_path_norm, e.metadata::text,"
+            "       e.dedup_key, a.base_url, a.kind"
+            "  FROM entities e LEFT JOIN applications a ON a.entity_id = e.id"
+            " WHERE e.program_id = $1::uuid"
+            "   AND e.metadata ->> 'source' = 'program_scope'"
+            " ORDER BY e.label",
+            (cls.identifiers[name],),
+        ).dicts()
+
+    @classmethod
+    def entity_of(cls, name: str) -> dict:
+        """The one configured subject of a Program."""
+        rows = cls.subjects_of(name)
+        assert len(rows) == 1, rows
+        return rows[0]
+
+    @classmethod
+    def run_one_pass(cls) -> tuple[Ledger, list, execution.Claimed]:
+        """The queue half of one scheduler pass, run by the code that runs it.
+
+        `execution.Slice`'s own `_reconcile`, `_offer` and `_claim`, not the
+        statements they issue: the sentence this ticket was opened over --
+        "no Task is ready; nothing was claimed" -- is written by `_pass` on the
+        list `_offer` returns, so a case that reissued `OFFER` itself would
+        still pass on the day that guard or the order of the three statements
+        inside it broke. The half after the claim is where a child runs, and it
+        belongs to PH2-20's case, which has a door and a launcher.
+
+        The boundary is described and never dialled -- nothing here starts a
+        child -- and the Slice runs on its own connection, because a pass is
+        bound to a Program and the connection every other method here uses is
+        not.
+        """
+        slice_ = execution.Slice(
+            boundary=boundary(proxy_url="http://127.0.0.1:1"), state=cls.harness.state
+        )
+        ledger = Ledger()
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            connection.execute(proxy.BIND, (cls.identifiers["main"],))
+            slice_._reconcile(ledger, connection)
+            offered = slice_._offer(ledger, connection)
+            assert offered is not None, list(ledger.violations)
+            claimed = slice_._claim(ledger, connection, cls.identifiers["main"], len(offered))
+            assert claimed is not None, list(ledger.violations)
+            return ledger, offered, claimed
+        finally:
+            connection.close()
+
+    @classmethod
+    def refuse_what_is_not_a_subject(cls):
+        """Criterion 2: the five things `open_task` is not.
+
+        Not a row with no reason, not a subject of somebody else's Program, not
+        an Entity the live scope refuses, not a second live Task of a kind this
+        subject already carries one of, and not a call from a session that has
+        not said who is making it.
+        """
+        open_task = "SELECT open_task($1::uuid, 'recon', $2::uuid, $3)"
+        main = cls.identifiers["main"]
+        cls.refusals["no_actor"] = cls.refuse_anonymously(
+            open_task, (main, cls.subject["id"], "a session that never said who it is")
+        )
+        cls.refusals["no_reason"] = cls.refuse(open_task, (main, cls.subject["id"], "  "))
+        cls.refusals["another_program"] = cls.refuse(
+            open_task, (main, cls.elsewhere["id"], "a subject of a Program this is not")
+        )
+        cls.refusals["not_a_target"] = cls.refuse(
+            open_task, (main, cls.identity_of(main), "an Entity the scope never admitted")
+        )
+        cls.refusals["already_live"] = cls.refuse(
+            open_task, (main, cls.subject["id"], "a subject already being mapped")
+        )
+
+    @classmethod
+    def identity_of(cls, program_id: str) -> str:
+        """The Entity the configured Identity projects, which is nothing to map."""
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM entities"
+                " WHERE program_id = $1::uuid AND type = 'identity'",
+                (program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def reopen(cls) -> dict:
+        """The seeding asked again against the same configuration.
+
+        Inside a transaction with an actor set, because `refresh_scope_projection`
+        refuses a session that has not said who it is -- which is the same thing
+        `program.run` does around the call this repeats.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            answer = cls.connection.execute(
+                "SELECT open_configured_recon($1::uuid)", (cls.identifiers["main"],)
+            ).scalar()
+        return json.loads(str(answer))
+
+    @classmethod
+    def refuse(cls, sql: str, parameters: tuple = ()) -> str:
+        return refusal_message(cls.connection, sql, parameters)
+
+    @classmethod
+    def refuse_anonymously(cls, sql: str, parameters: tuple = ()) -> str:
+        """The same statement, from a session that has not called `set_actor`.
+
+        On a connection of its own: `set_actor` is session-wide until the next
+        one, and borrowing the shared connection would leave every later
+        arrangement here running as whoever this method last was.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        try:
+            with connection.transaction():
+                connection.execute(sql, parameters)
+        except pg.DatabaseError as error:
+            return error.primary or str(error)
+        finally:
+            connection.close()
+        return ""
+
+    def tasks_of(self, name: str) -> list[dict]:
+        return self.connection.execute(
+            "SELECT label, kind, status, subject_entity_id::text AS subject,"
+            "       hypothesis_id, finding_id, estimated_cost"
+            "  FROM tasks WHERE program_id = $1::uuid ORDER BY label",
+            (self.identifiers[name],),
+        ).dicts()
+
+    def events_of(self, name: str, type_: str) -> list[dict]:
+        return self.connection.execute(
+            "SELECT id::text, type, actor_kind, subject_table,"
+            "       subject_id::text, caused_by_event_id::text, payload::text"
+            "  FROM events WHERE program_id = $1::uuid AND type = $2 ORDER BY seq",
+            (self.identifiers[name], type_),
+        ).dicts()
+
+    # -- what opening records ---------------------------------------------------
+
+    def test_opening_records_the_surface_the_configuration_declares(self):
+        # The seed is addressed in the rule's own terms, which is what makes the
+        # projection agree with it: an Entity carrying the default `/` would be
+        # denied by a rule whose prefix is `/api/`, and the Task against it would
+        # never be ready for a reason nothing in the configuration explains.
+        selector, port, path = self.SUBJECT
+        self.assertEqual(
+            ("application", "host", selector, port, path, path, "target"),
+            (
+                self.subject["type"],
+                self.subject["scope_selector_kind"],
+                self.subject["scope_selector"],
+                self.subject["scope_port"],
+                self.subject["scope_path_raw"],
+                self.subject["scope_path_norm"],
+                self.subject["scope_class"],
+            ),
+        )
+        # The address, and the key a proposal of the same address converges on.
+        # `kind` is left alone: web, api, spa, graphql or websocket is a
+        # judgement about what answered, and nothing has asked yet.
+        self.assertEqual(self.BASE_URL, self.subject["base_url"])
+        self.assertIsNone(self.subject["kind"])
+        self.assertEqual(f"application:{self.BASE_URL}", self.subject["dedup_key"])
+        self.assertEqual("program_scope", json.loads(self.subject["metadata"])["source"])
+        # Recorded on the rule as it was written, so a reader can tell which
+        # version of which document put this subject in Surface.
+        self.assertEqual("configured", self.subject["origin"])
+        # And the report says what it did, so an operator reading `rk run`'s
+        # output learns the campaign has a Surface without querying for one.
+        self.assertEqual({"subjects_recorded": 1, "tasks_opened": 1}, self.reported["main"])
+
+    def test_the_url_it_recorded_is_the_one_a_proposal_of_it_would_key_on(self):
+        # The claim the whole projection rests on, asked as a fixed point rather
+        # than by rebuilding `promote_proposal`'s expression here -- a second
+        # copy of it would agree with itself and prove nothing.
+        #
+        # 020 keys a promoted Application on the URL it builds from
+        # `rk2_parse_base_url`'s four parts. So if parsing the URL this recorded
+        # and spelling those parts again returns the same string, the Agent sent
+        # to map this subject converges on this row. It is exactly the assertion
+        # that failed before the port, the trailing slash and an IPv6 host's
+        # brackets were all handled the way the parse handles them.
+        for base_url in (
+            self.subject["base_url"],
+            "http://app.example.com:8080/api",
+            "https://[2001:db8::1]/v1",
+            "http://127.0.0.1",
+        ):
+            with self.subTest(base_url=base_url):
+                self.assertEqual(
+                    base_url,
+                    self.connection.execute(
+                        "SELECT rk2_base_url(u.scheme, u.host, u.port, u.path)"
+                        "  FROM rk2_parse_base_url($1) u",
+                        (base_url,),
+                    ).scalar(),
+                )
+
+    def test_a_path_with_no_canonical_spelling_records_no_subject(self):
+        # The other half of the same rule. A path `rk2_clean_path` refuses has
+        # no spelling `promote_proposal` could converge on, so there is no
+        # address to record -- the same answer a wildcard gets, and for the same
+        # reason.
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT rk2_base_url('https', 'app.example.com', 443, $1)", ("/a/../b",)
+            ).scalar()
+        )
+
+    def test_an_inclusion_naming_no_address_records_nothing_and_says_so(self):
+        # A wildcard names a set of hosts, and this build enumerates none of
+        # them. Recording one anyway would put a subject in Surface that no verb
+        # reaches: the Task would be ranked, offered, claimed and paid for, and
+        # then refused at the target step for carrying no address. The count is
+        # the honest answer instead.
+        self.assertEqual(0, len(self.subjects_of("wide")))
+        self.assertEqual(0, len(self.tasks_of("wide")))
+        self.assertEqual({"subjects_recorded": 0, "tasks_opened": 0}, self.reported["wide"])
+
+    def test_the_first_task_is_a_recon_task_against_that_subject(self):
+        # The narrow shape criterion 2 asks for: one kind, one subject the scope
+        # already admits, and neither of the two rows every other writer of
+        # `tasks` is downstream of.
+        tasks = self.tasks_of("main")
+        self.assertEqual(1, len(tasks))
+        self.assertEqual("recon", tasks[0]["kind"])
+        self.assertEqual(self.subject["id"], tasks[0]["subject"])
+        self.assertIsNone(tasks[0]["hypothesis_id"])
+        self.assertIsNone(tasks[0]["finding_id"])
+
+    # -- criteria 1 and 4: the slate is not empty -------------------------------
+
+    def test_a_pass_over_a_program_with_no_history_offers_that_task(self):
+        # Criterion 4. What this asserts is that the list has something in it:
+        # before this ticket `Slice._offer` over a freshly opened Program
+        # returned an empty one, `_pass` held "no Task is ready; nothing was
+        # claimed", and an operator's first run ended there with no way to say
+        # why.
+        #
+        # Its `priority` is NULL, and that is 026's answer rather than a gap
+        # here: nothing has stated what this subject is worth yet, and a Task
+        # scored 0 would be a different claim from one never scored. It sorts
+        # last among ranked Tasks, which on a Program that has none is first.
+        self.assertEqual(1, len(self.offered))
+        self.assertEqual(
+            ("recon", self.subject["label"], True),
+            (self.offered[0]["kind"], self.offered[0]["subject"], self.offered[0]["entitled"]),
+        )
+        # And the pass said nothing was wrong on the way there. `_offer` reports
+        # a failed pass as a violation and answers `None`, so an empty slate and
+        # a broken one are different outcomes and this is the first.
+        self.assertEqual([], list(self.pass_ledger.violations))
+
+    def test_the_claim_takes_it_and_the_task_it_takes_was_never_inserted_here(self):
+        # Criterion 1, and the reason the pass above runs the shipped methods
+        # rather than a query of this case's own: a Task reached through
+        # `Slice._offer` and `Slice._claim` is a Task production would have
+        # reached. The claim answers with the Agent run it opened, so the join
+        # is what says which Task that run was opened against.
+        tasks = self.tasks_of("main")
+        self.assertEqual("claimed", tasks[0]["status"])
+        self.assertIsNotNone(tasks[0]["estimated_cost"])
+        self.assertEqual(
+            [(tasks[0]["label"], "recon")],
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    "SELECT t.label, a.role FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+                    " WHERE a.program_id = $1::uuid AND a.label = $2",
+                    (self.identifiers["main"], self.claimed.agent_run_label),
+                ).rows
+            ],
+        )
+
+    def test_the_claim_derived_an_address_to_send_the_child_to(self):
+        # Which is why the subject recorded is an Application and not a host.
+        # `claim_task` resolves the target from `applications.base_url` or from
+        # an Endpoint's template under one, and answers NULL for anything else
+        # -- so a `host` Entity would have satisfied "a subject the scope
+        # admits" and produced a Task the pass claims, pays for and then refuses
+        # at the target step for carrying nowhere to send a request.
+        self.assertEqual(
+            ("application", "GET", self.BASE_URL),
+            (self.claimed.subject_type, self.claimed.method, self.claimed.url),
+        )
+
+    # -- criterion 3: who opened it, and why ------------------------------------
+
+    def test_the_event_says_who_opened_the_task_and_why(self):
+        opened = self.events_of("main", "task.opened")
+        self.assertEqual(1, len(opened))
+        self.assertEqual("runtime", opened[0]["actor_kind"])
+        payload = json.loads(opened[0]["payload"])
+        self.assertEqual("recon", payload["kind"])
+        self.assertEqual(self.subject["id"], payload["subject_entity_id"])
+        self.assertEqual(self.subject["label"], payload["subject"])
+        self.assertIn("configured scope admits this subject", payload["reason"])
+        # An occurrence carries no subject row, because the row it would name is
+        # the one it is the reason for and does not exist when it is written.
+        self.assertIsNone(opened[0]["subject_table"])
+        self.assertIsNone(opened[0]["subject_id"])
+
+    def test_the_task_names_that_event_as_its_cause(self):
+        # Which is what makes the reason reachable from the Task rather than
+        # merely present in the same log: the campaign's first Task is as
+        # attributable as every Task derived from a Finding or a Hypothesis.
+        opened = self.events_of("main", "task.opened")
+        created = self.events_of("main", "task.created")
+        self.assertEqual(1, len(created))
+        self.assertEqual(opened[0]["id"], created[0]["caused_by_event_id"])
+        self.assertEqual("tasks", created[0]["subject_table"])
+
+    # -- opening again ----------------------------------------------------------
+
+    def test_seeding_the_same_configuration_again_records_and_opens_nothing(self):
+        # Which is why a resume is not a second campaign: the dedup key is the
+        # address the rule states, so the same rule finds the same Entity, and
+        # the Entity already carries a recon Task.
+        self.assertEqual({"subjects_recorded": 0, "tasks_opened": 0}, self.repeat)
+        self.assertEqual(1, len(self.tasks_of("main")))
+        self.assertEqual(1, len(self.events_of("main", "task.opened")))
+
+    # -- criterion 2: what is not a subject -------------------------------------
+
+    def test_a_task_is_refused_without_the_sentence_that_licensed_it(self):
+        self.assertIn(
+            "a Task is opened with the sentence that licensed it", self.refusals["no_reason"]
+        )
+
+    def test_a_task_is_refused_by_a_session_that_has_not_said_who_it_is(self):
+        # The event is the whole of criterion 3, and an actor this function
+        # defaulted would be the answer to "who opened it" invented by the thing
+        # being asked. `refresh_scope_projection` refuses the same session for
+        # the same reason.
+        self.assertIn("app.actor_kind unset", self.refusals["no_actor"])
+
+    def test_a_task_is_refused_against_a_subject_of_another_program(self):
+        self.assertIn("is not an Entity of program", self.refusals["another_program"])
+
+    def test_a_task_is_refused_against_an_entity_the_scope_does_not_admit(self):
+        # The Identity's Entity is the sharp case: it is real, it is this
+        # Program's, and it is not somewhere to send a recon Agent.
+        self.assertIn("not a target of the live scope", self.refusals["not_a_target"])
+
+    def test_a_second_live_task_of_the_same_kind_is_refused_by_name(self):
+        # The live-dedup index would refuse this on its own. The pre-check is
+        # what makes the refusal say which Task already holds the subject.
+        self.assertIn("already carries a live recon Task", self.refusals["already_live"])
+
+    def test_the_other_program_was_left_with_its_own_first_task(self):
+        # And the refusals above cost it nothing: a Program is a boundary, not a
+        # queue, so the one nobody ran a pass over still has work waiting.
+        tasks = self.tasks_of("other")
+        self.assertEqual(1, len(tasks))
+        self.assertEqual(("recon", "pending"), (tasks[0]["kind"], tasks[0]["status"]))
+        self.assertEqual(self.elsewhere["id"], tasks[0]["subject"])
+
+    # -- the standing check -----------------------------------------------------
+
+    def test_the_standing_check_holds_over_what_this_case_opened(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
 #: The Program the scope tests open. Named apart from `RUN_SLUG` so the purge at
@@ -3295,7 +3780,24 @@ class ScopeEvaluatorTest(DatabaseCase):
             ).rows
         ]
 
-        self.assertEqual(["program.configured"], [name for name, _ in events])
+        # Everything opening a Program writes, in the order it wrote it. The
+        # four after `program.configured` are 083's seeding: one Application
+        # recorded for the one exact inclusion, classified against the scope it
+        # was recorded from, and one `recon` Task opened against it under the
+        # reason that licensed it. They are listed rather than filtered out
+        # because they are events this criterion has to hold over too -- a
+        # subject built out of a configuration is the likeliest place for a
+        # reference in that configuration to be copied into a payload.
+        self.assertEqual(
+            [
+                "program.configured",
+                "entity.created",
+                "entity.updated",
+                "task.opened",
+                "task.created",
+            ],
+            [name for name, _ in events],
+        )
         for name, payload in events:
             with self.subTest(name):
                 self.assertNotIn("slot://", payload)
@@ -3515,11 +4017,13 @@ class StateReadTest(DatabaseCase):
         self.assertNotEqual(
             first.facts["record"]["digest"], second.facts["record"]["digest"]
         )
-        # The second Program holds its configured Identity beside the technology,
-        # and the first holds everything else this case wrote. Neither count
-        # includes the other Program's colliding labels.
+        # The second Program holds its configured Identity beside the technology
+        # and the Application 083 recorded from its one exact inclusion, and the
+        # `recon` Task opened against that Application. The first holds
+        # everything else this case wrote. Neither count includes the other
+        # Program's colliding labels.
         self.assertEqual(
-            [("entity", 2)],
+            [("entity", 3), ("task", 1)],
             [
                 (item["kind"], item["count"])
                 for item in second.facts["state"]["kinds"]
@@ -9441,8 +9945,12 @@ class ExecutionSliceTest(DatabaseCase):
         cls.identifiers = {}
         cls.configurations = {}
         for name in ("grounded", "prose", "twin-a", "twin-b"):
+            # `UNSEEDED` rather than `SCOPED`, because `seed` below writes the
+            # one Task this case is about: a configuration that recorded a
+            # subject of its own would put a second Task on the slate, and what
+            # the slice claimed would then be a fact about ranking.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
                     'name = "matrix-web"', f'name = "{EXECUTION_SLUG}-{name}"'
                 )
             )
@@ -10012,7 +10520,12 @@ class SurfacePromotionTest(DatabaseCase):
         cls.identifiers = {}
         for name in ("recon", "other"):
             slug = f"{SURFACE_SLUG}-{name}"
-            path = write(SCOPED.replace('name = "matrix-web"', f'name = "{slug}"') + DECLARED)
+            # `UNSEEDED` rather than `SCOPED`, because what this case counts is
+            # the Surface one promotion produced. An exact inclusion records an
+            # Application of its own when the Program opens, and that row would
+            # be a second Application in a fixture whose whole method is "one
+            # subject per type, so a type naming two of them is the failure".
+            path = write(UNSEEDED.replace('name = "matrix-web"', f'name = "{slug}"') + DECLARED)
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, (name, opened.violations)
             cls.configurations[name] = path
@@ -10246,7 +10759,8 @@ class SurfacePromotionTest(DatabaseCase):
 
     @classmethod
     def held(cls, name: str) -> dict:
-        """This Program's Entities, by type, for the types it holds one of.
+        """The Entities this fixture promoted, by type, for the types it holds
+        one of.
 
         A type this Program holds twice is left out rather than resolved by
         order: two Domains are two subjects, and a test that named one of them
@@ -10810,8 +11324,12 @@ class HypothesisPromotionTest(DatabaseCase):
         super().setUpClass()
         cls.identifiers = {}
         for name in ("main", "other"):
+            # `UNSEEDED` rather than `SCOPED`: `labels` below reads the Entities
+            # this Program holds one of per type, and an Application the
+            # configuration recorded when it opened would hide the one this
+            # result promoted by making the type a type there are two of.
             path = write(
-                SCOPED.replace('name = "matrix-web"', f'name = "{CLAIM_SLUG}-{name}"')
+                UNSEEDED.replace('name = "matrix-web"', f'name = "{CLAIM_SLUG}-{name}"')
                 + DECLARED
             )
             opened = program.run(cls.harness.runtime, path)
@@ -12214,7 +12732,12 @@ class SurfaceFingerprintTest(DatabaseCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        path = write(SCOPED.replace('name = "matrix-web"', f'name = "{FINGERPRINT_SLUG}"'))
+        # `UNSEEDED` rather than `SCOPED`: `build` below stands up the two
+        # Applications this case fingerprints, and the program-wide verb sweeps
+        # every Application there is. One recorded by 083 from an exact
+        # inclusion would be a third, with no Endpoint under it and so no
+        # fingerprint to compare.
+        path = write(UNSEEDED.replace('name = "matrix-web"', f'name = "{FINGERPRINT_SLUG}"'))
         opened = program.run(cls.harness.runtime, path)
         assert opened.ok, opened.violations
         cls.program_id = opened.facts["program_id"]
@@ -14371,8 +14894,14 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             ("roster", AFFORDABLE),
             ("capped", AFFORDABLE),
         ):
+            # `UNSEEDED` rather than `SCOPED`: `seed` below writes the Tasks
+            # every scenario here is about, and 083 opens a `recon` Task of its
+            # own against every exact inclusion. A Task this case did not write
+            # would rank, be offered and be claimable beside the ones it did,
+            # so "the slate is what was seeded" would stop being a statement
+            # about the scheduler.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, budgets).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, budgets).replace(
                     'name = "matrix-web"', f'name = "{SLATE_SLUG}-{name}"'
                 )
             )
@@ -16124,8 +16653,13 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
 
         cls.identifiers = {}
         for name in SCENARIOS:
+            # `UNSEEDED` rather than `SCOPED`: every case here asserts the whole
+            # order the ranking reached, and 083's `recon` Task on the exact
+            # inclusion would be an unranked row in it -- unscored, so its
+            # components are NULL and its place in the order is 026's tie-break
+            # rather than anything this case set up.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
                     'name = "matrix-web"', f'name = "{RANK_SLUG}-{name}"'
                 )
             )
@@ -16898,8 +17432,13 @@ class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
 
         cls.identifiers = {}
         for name in DISPATCH_SCENARIOS:
+            # `UNSEEDED` rather than `SCOPED`, for the reason 023's case takes
+            # it: what is asserted here is which of the seeded Tasks the offer
+            # held and which the walk passed over, and 083's `recon` Task would
+            # be a third answer neither this case nor its expectation knows
+            # about.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
                     'name = "matrix-web"', f'name = "{DISPATCH_SLUG}-{name}"'
                 )
             )
@@ -17469,8 +18008,12 @@ class OrchestratorRotationTest(SchedulerFixture, DatabaseCase):
 
         cls.identifiers = {}
         for name in ROTATION_SCENARIOS:
+            # `UNSEEDED` rather than `SCOPED`: the capsule carries the live
+            # slate, and the case names the Tasks it expects to find in it. A
+            # `recon` Task 083 opened would be a fifth entry in a section
+            # counted to four.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
                     'name = "matrix-web"', f'name = "{ROTATION_SLUG}-{name}"'
                 )
             )
@@ -18085,8 +18628,12 @@ class LeaseTest(DatabaseCase):
         cls.identifiers = {}
         cls.runs: dict[str, tuple[str, str]] = {}
         for name in ("beating", "lapsed", "released", "crashed", "retired", "alive"):
+            # `UNSEEDED` rather than `SCOPED`: every scenario claims and then
+            # asks what the claim took, and 083's `recon` Task is unscored --
+            # so it outranks the scored one this case seeded, and the lease
+            # under test would be a lease over the wrong Task.
             path = write(
-                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
                     'name = "matrix-web"', f'name = "{LEASE_SLUG}-{name}"'
                 )
             )

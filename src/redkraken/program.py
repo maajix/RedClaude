@@ -86,6 +86,7 @@ FACTS = (
     "program_slug",
     "configuration",
     "scope",
+    "first_tasks",
     "lifecycle",
     "stop_reason",
     "pending_decisions",
@@ -331,6 +332,7 @@ class _State:
     program_id: str | None = None
     revision: Revision | None = None
     scope: dict | None = None
+    first_tasks: dict | None = None
     lifecycle: str | None = None
     pending: list[dict] | None = None
     integrity: dict | None = None
@@ -355,6 +357,7 @@ def _report(ledger: Ledger, state: _State) -> Report:
         program_slug=state.slug,
         configuration=state.revision.summary() if state.revision else None,
         scope=state.scope,
+        first_tasks=state.first_tasks,
         lifecycle=state.lifecycle,
         stop_reason=stop_reason,
         pending_decisions=pending,
@@ -539,6 +542,25 @@ def _open_program(
             revision=revision.revision if revision else next_revision,
         )
 
+        # A Program with a compiled scope and no history has nothing to rank:
+        # every other writer of `tasks` is downstream of a Finding or a
+        # Hypothesis it does not have yet, and no model runs while the slate is
+        # empty to propose one. Here rather than in the scheduler because this
+        # is when the configuration is read -- a seeding that ran every pass
+        # would be the runtime re-deciding the Surface on a timer -- and after
+        # the scope is projected, because what it opens a Task against is a
+        # subject the live version admits.
+        #
+        # `open_configured_recon` does the deciding, and does it in SQL because
+        # what it reads is the compiled policy rather than the document: a
+        # subject addressed in the same terms `scope_class_of_entity` will judge
+        # it by is a subject whose Task becomes ready, and one re-derived out
+        # here from `policy.rules` would be a second reading free to disagree
+        # with the first. Idempotent, and so is calling it: a resume against an
+        # unchanged configuration records no subject and opens no Task, because
+        # every subject already has its dedup key and its recon Task.
+        seeded = _decoded(connection, "SELECT open_configured_recon($1::uuid)", str(program_id))
+
         if answer in (RESUME, REVISE):
             counts = _resume(connection, str(program_id), revision)
             detail = ", ".join(f"{name} {value}" for name, value in sorted(counts.items()))
@@ -555,12 +577,18 @@ def _open_program(
         state.lifecycle = lifecycle
         state.revision = revision
         state.scope = projected
+        state.first_tasks = seeded
         ledger.hold(
             "scope_version",
             f"version {projected['version']} from configuration revision "
             f"{projected['configuration_revision']}, {projected['rules']} rule(s), "
             f"policy {_short(projected['policy_sha256'])}"
             + ("" if projected["compiled"] else " (already live)"),
+        )
+        ledger.hold(
+            "first_tasks",
+            f"{seeded['subjects_recorded']} configured subject(s) recorded, "
+            f"{seeded['tasks_opened']} recon Task(s) opened",
         )
         ledger.hold("program", summary)
 
@@ -1047,6 +1075,16 @@ def _encode(rows: list[dict]) -> str:
     return json.dumps(rows, sort_keys=True, separators=(",", ":"))
 
 
+def _decoded(connection: pg.Connection, sql: str, program_id: str) -> dict:
+    """What a jsonb-returning function answered about one Program, as a mapping.
+
+    `pg` hands jsonb back as text, so every caller of one of these decodes it;
+    one spelling here rather than one per caller, so a second reader cannot pick
+    a different one.
+    """
+    return json.loads(str(connection.execute(sql, (program_id,)).scalar()))
+
+
 def _resume(connection: pg.Connection, program_id: str, revision: Revision | None) -> dict:
     """The reconciliation sweep, and the one event that records it happened.
 
@@ -1056,9 +1094,7 @@ def _resume(connection: pg.Connection, program_id: str, revision: Revision | Non
     changed nothing is still a fact about the Program: it is how a reader tells
     an idle restart from one that unclaimed twelve tasks.
     """
-    counts = json.loads(str(connection.execute(
-        "SELECT resume_program($1::uuid)", (program_id,)
-    ).scalar()))
+    counts = _decoded(connection, "SELECT resume_program($1::uuid)", program_id)
     payload = {
         "schema_version": EVENT_SCHEMA_VERSION,
         "configuration_revision": revision.revision if revision else None,

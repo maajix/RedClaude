@@ -241,6 +241,16 @@ forward slash, so the protocol-relative `//elsewhere.example/admin` is refused;
 it holds no `..` segment and no unprintable character, so what is printed is
 what was matched.
 
+Opening a Program records one Application per inclusion and opens one `recon`
+Task against each, so a campaign has something to rank on its first pass. A
+protocol, a host, a port and a path prefix are an address, and an address is
+what a Task can be sent to — which is why an inclusion naming two protocols is
+two Applications, and why an inclusion naming a wildcard records nothing:
+`*.example.com` names a set of hosts and no address. Both counts are reported
+as `first_tasks`, and rerunning an unchanged configuration records nothing and
+opens nothing, because the Task each subject already carries is the one being
+resumed.
+
 Secret material is never written into a configuration. An identity carries a
 `slot_ref` and a required header carries a `value_ref`. Both name a
 runtime-owned slot — the `slot://` scheme and nothing else, so a configuration

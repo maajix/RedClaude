@@ -143,6 +143,15 @@ kind = "dns"
 host = "dns.example.org"
 """
 
+#: `SCOPED` with its one exact inclusion widened to a wildcard, for the cases
+#: that build a Surface of their own. Opening a Program records one Application
+#: per exact inclusion and opens a `recon` Task against each, so a case that
+#: seeds its own Task and then asserts what the scheduler offered would
+#: otherwise be asserting about which of two Tasks ranked higher. A wildcard
+#: names a set of hosts and no address, so a Program opened from this one
+#: records nothing and the seeded Task is the only Task there is.
+UNSEEDED = SCOPED.replace('host = "api.example.net"', 'host = "*.example.net"')
+
 #: What every name in the egress suites resolves to, and the one address the
 #: configuration above withdraws. Here rather than in either suite, because the
 #: second of them has to be the address the `[[scope.exclude]]` rule names: a
