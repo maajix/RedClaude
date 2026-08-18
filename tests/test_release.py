@@ -300,15 +300,21 @@ class DeclarationTest(unittest.TestCase):
         A directory added at the root is either part of the application or part
         of the work around it. If it is the second and nobody wrote it down, the
         install stage stops being able to see it arrive in a wheel.
+
+        Tracked directories rather than whatever is lying in the tree: a build
+        leaves `build/` next to the sources, gitignored, and a checkout is what
+        a clone carries. `src` is the application and `baseline` is the registry
+        the repository gates read; everything else has to be accounted for.
         """
-        unaccounted = [
-            entry.name
-            for entry in ROOT.iterdir()
-            if entry.is_dir()
-            and not entry.name.startswith((".", "__"))
-            and entry.name not in NOT_INSTALLABLE
-            and entry.name not in {"src", "baseline"}
-        ]
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        carried = {name.split("/")[0] for name in tracked.stdout.split("\0") if "/" in name}
+        unaccounted = sorted(carried - set(NOT_INSTALLABLE) - {"src", "baseline"})
         self.assertEqual(unaccounted, [])
 
     def test_the_application_is_the_only_thing_that_may_be_installed(self):
