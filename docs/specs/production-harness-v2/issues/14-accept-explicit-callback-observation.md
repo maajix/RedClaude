@@ -12,6 +12,11 @@
 - [x] Missing, expired, fabricated and cross-Program correlation tokens cannot confirm a Hypothesis.
 - [x] Unconfigured hosts, wildcard channels and adjacent infrastructure remain refused.
 - [x] The acceptance test is entirely synthetic and does not contact an external callback provider.
+- [x] One recorded arrival is one Interaction and one Observation however many times it is
+      handed to `rk callback accept`, and the second call says so. Added by 67 after a live
+      installation produced `CB1`/`O1` and then `CB3`/`O3` from the same file; the identity of
+      an arrival is `callback_interactions_arrival_key` and the moment in it is the listener's,
+      stated with `--at`.
 
 ## Comments
 
@@ -115,6 +120,7 @@ the limit in the same words.
 | 4 | `CallbackAdmissionTest.test_no_correlator_but_a_live_one_of_this_program_confirms_anything`, `...test_an_arrival_cannot_backdate_itself_into_a_dead_correlator` |
 | 5 | `CallbackAdmissionTest.test_a_name_no_channel_admits_is_refused_wherever_it_is_asked`, `...test_a_wildcard_is_not_a_channel_and_never_becomes_a_program`, `CompilationTest.test_two_channels_at_one_endpoint_are_refused_rather_than_ranked`, `AcceptTest.test_a_name_no_channel_admits_never_opens_a_connection` |
 | 6 | The whole of `CallbackAdmissionTest`: the listener is a file this test writes, and nothing in it opens a socket |
+| 7 | `CallbackAdmissionTest.test_one_recording_is_one_arrival_however_often_it_is_handed_over`, `...test_the_arrival_is_filed_under_the_moment_the_listener_recorded`, `...test_two_arrivals_that_agree_but_for_the_moment_stay_two_arrivals`, `...test_the_identity_of_an_arrival_is_a_constraint_and_not_a_writer_rule`, `...test_a_moment_outside_the_correlator_s_life_is_refused_through_the_verb`, `MomentTest` |
 
 Criterion 4 is the one the ticket rests on. Four arrivals at a name the policy
 does admit — so none of them is refused for being off-channel — each carrying a

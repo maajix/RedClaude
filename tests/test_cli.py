@@ -2106,7 +2106,7 @@ class OperatorSurfaceTest(unittest.TestCase):
     #: something the database was supposed to decide.
     SURFACE = (
         "--accept-change", "--action", "--agent-run", "--approve", "--argument",
-        "--artifacts", "--authority", "--authorize", "--bytes", "--ca",
+        "--artifacts", "--at", "--authority", "--authorize", "--bytes", "--ca",
         "--callback", "--channel", "--closed", "--config", "--console-url",
         "--content-sha256", "--content-type", "--database", "--deny",
         "--discovery", "--egress", "--every", "--finding", "--fixture", "--for",

@@ -51,6 +51,7 @@ import unittest
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -5681,6 +5682,22 @@ class CallbackAdmissionTest(DatabaseCase):
             **options,
         )
 
+    def now(self) -> datetime:
+        """The server's clock, which is the one every fence here reads.
+
+        Not this process's. `enforce_callback_attribution` compares an arrival's
+        moment against `now()`, so a timestamp taken from a clock even
+        microseconds ahead of the server's is one it reads as being in the
+        future -- a flake that would only ever fire on somebody else's machine.
+        """
+        return datetime.fromisoformat(
+            str(self.connection.execute("SELECT clock_timestamp()::text").scalar())
+        )
+
+    def moment(self) -> str:
+        """One moment a listener could have recorded, in the spelling `--at` takes."""
+        return self.now().isoformat()
+
     def refuse(self, name: str, sql: str, parameters: tuple) -> pg.DatabaseError:
         """One statement, in a transaction of its own, expected to be refused.
 
@@ -6186,6 +6203,144 @@ class CallbackAdmissionTest(DatabaseCase):
 
         self.assertEqual("23514", arriving.sqlstate)
         self.assertEqual("23514", minting.sqlstate)
+
+    def test_one_recording_is_one_arrival_however_often_it_is_handed_over(self):
+        # PH2-67 criterion 1. Measured on a live installation, 2026-08-12: the
+        # same recorded interactsh arrival accepted twice answered CB1/O1 and
+        # then CB3/O3, so two Observations claimed two arrivals where the
+        # listener recorded one. A callback Observation is the confirming half
+        # of a Hypothesis, and "the canary fired twice" is a stronger claim
+        # about the target than "the canary fired".
+        #
+        # Program `b` and not `c`, here and in the four tests below: `c` is the
+        # one whose channel `test_a_channel_the_live_policy_withdrew...` takes
+        # away, and it runs before these do. Minting under `c` afterwards is
+        # answered `channel oob-dns is not declared by the live scope policy`,
+        # which is that test's result rather than this one's.
+        correlator = self.mint("b")
+        host = f"{correlator}.dns.example.org"
+        moment = self.moment()
+        before = self.counts()
+
+        first = self.arrive("b", host, at=moment)
+        again = self.arrive("b", host, at=moment)
+
+        self.assertTrue(first.ok, first.violations)
+        self.assertTrue(again.ok, again.violations)
+        self.assertFalse(first.facts["callback"]["duplicate"])
+        self.assertTrue(again.facts["callback"]["duplicate"])
+        self.assertEqual(
+            (first.facts["callback"]["interaction"], first.facts["callback"]["observation"]),
+            (again.facts["callback"]["interaction"], again.facts["callback"]["observation"]),
+        )
+        self.assertEqual((before[0] + 1, before[1] + 1), self.counts())
+        # And the second call says which arrival it resolved to, because that is
+        # the question an operator re-running the command after a crash has.
+        self.assertIn(
+            str(first.facts["callback"]["interaction"]),
+            "".join(one.detail for one in again.assertions if one.name == "callback"),
+        )
+
+    def test_the_arrival_is_filed_under_the_moment_the_listener_recorded(self):
+        # Criterion 2, and what makes criterion 1 possible: with the default the
+        # row is filed under the acceptance moment, which is precisely what a
+        # replay changes. The Observation carries it too -- an Observation whose
+        # timestamp says when somebody got round to filing it cannot be read
+        # against the Receipt whose payload carried the canary.
+        correlator = self.mint("b")
+        moment = self.moment()
+
+        accepted = self.arrive("b", f"{correlator}.dns.example.org", at=moment)
+
+        self.assertTrue(accepted.ok, accepted.violations)
+        # Compared in SQL: `timestamptz` renders per the session's `DateStyle`,
+        # and an assertion over that text would be a claim about the setting.
+        filed, together = self.connection.execute(
+            "SELECT ci.received_at = $3::timestamptz, o.observed_at = ci.received_at"
+            "  FROM callback_interactions ci"
+            "  JOIN observations o ON o.callback_interaction_id = ci.id"
+            " WHERE ci.label = $1 AND ci.program_id = $2::uuid",
+            (accepted.facts["callback"]["interaction"], self.identifiers["b"], moment),
+        ).rows[0]
+
+        self.assertTrue(filed)
+        self.assertTrue(together)
+        self.assertEqual(
+            datetime.fromisoformat(moment),
+            datetime.fromisoformat(str(accepted.facts["callback"]["received_at"])),
+        )
+
+    def test_two_arrivals_that_agree_but_for_the_moment_stay_two_arrivals(self):
+        # Criterion 3. The canary really did fire twice here, and a schema that
+        # could not say so would be trading one wrong claim for the other.
+        correlator = self.mint("b")
+        host = f"{correlator}.dns.example.org"
+        first_at = self.moment()
+        second_at = (
+            datetime.fromisoformat(first_at) + timedelta(microseconds=1)
+        ).isoformat()
+        before = self.counts()
+
+        first = self.arrive("b", host, at=first_at)
+        second = self.arrive("b", host, at=second_at)
+
+        self.assertTrue(first.ok, first.violations)
+        self.assertTrue(second.ok, second.violations)
+        self.assertFalse(second.facts["callback"]["duplicate"])
+        self.assertNotEqual(
+            first.facts["callback"]["interaction"],
+            second.facts["callback"]["interaction"],
+        )
+        self.assertEqual((before[0] + 2, before[1] + 2), self.counts())
+
+    def test_the_identity_of_an_arrival_is_a_constraint_and_not_a_writer_rule(self):
+        # Criterion 4. The writer is a convenience; this is what a restore, a
+        # fixture loaded by the owner and a future caller that reaches past
+        # `record_callback_interaction` meet.
+        correlator = self.mint("b")
+        moment = self.moment()
+        accepted = self.arrive("b", f"{correlator}.dns.example.org", at=moment)
+        self.assertTrue(accepted.ok, accepted.violations)
+        before = self.counts()
+
+        refused = self.refuse(
+            "b",
+            "INSERT INTO callback_interactions"
+            "     (program_id, correlator_id, channel_name, arrival_kind,"
+            "      observed_host, received_at, body_sha256, byte_size)"
+            " SELECT $1::uuid, t.id, 'oob-dns', 'dns', $2, $3::timestamptz,"
+            "        $4, $5::bigint"
+            "  FROM callback_correlators t WHERE t.correlator_sha256 = $6",
+            (
+                self.identifiers["b"],
+                f"{correlator}.dns.example.org",
+                moment,
+                artifact.digest(ARRIVAL),
+                str(len(ARRIVAL)),
+                artifact.digest(correlator.encode()),
+            ),
+        )
+
+        self.assertEqual("23505", refused.sqlstate)
+        self.assertIn("callback_interactions_arrival_key", str(refused))
+        self.assertEqual(before, self.counts())
+
+    def test_a_moment_outside_the_correlator_s_life_is_refused_through_the_verb(self):
+        # The `--at` an operator states is fenced by the same trigger a
+        # hand-written INSERT meets, so the flag does not become a way to file an
+        # arrival at a time no canary was listening.
+        correlator = self.mint("b")
+        before = self.counts()
+
+        early = self.arrive(
+            "b",
+            f"{correlator}.dns.example.org",
+            at=(self.now() - timedelta(days=1)).isoformat(),
+        )
+
+        self.assertFalse(early.ok)
+        self.assertIn("outside its correlator", str(early.violations[0].detail))
+        self.assertEqual(before, self.counts())
 
     def test_the_gate_still_holds_over_the_rows_these_writes_made(self):
         with pg.connect(self.harness.migrate) as connection:

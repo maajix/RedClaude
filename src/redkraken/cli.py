@@ -657,6 +657,16 @@ def build_parser() -> argparse.ArgumentParser:
             "from a resolver that may be nowhere near the target (default: unknown)"
         ),
     )
+    callback_accept.add_argument(
+        "--at",
+        metavar="timestamp",
+        help=(
+            "when the listener recorded the arrival, ISO 8601 with an offset; "
+            "the interactsh and tunnel record formats both carry one. Accepting "
+            "the same recording again resolves to the arrival it already wrote "
+            "rather than claiming the canary fired twice (default: now)"
+        ),
+    )
     callback_accept.set_defaults(run=_callback_accept)
 
     artifacts = commands.add_parser(
@@ -2116,6 +2126,7 @@ def _callback_accept(arguments: argparse.Namespace) -> int:
                 arguments.source,
                 root=root,
                 peer=arguments.peer,
+                at=arguments.at,
             ),
         )
     )

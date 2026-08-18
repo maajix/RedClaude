@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from datetime import datetime
 from pathlib import Path
 
 from redkraken import config, migrate, pg, program, scope
@@ -188,6 +189,7 @@ def accept(
     *,
     root: Path,
     peer: str = "unknown",
+    at: str | None = None,
 ) -> Report:
     """Admit one arrival the operator's listener recorded, or refuse it.
 
@@ -196,6 +198,12 @@ def accept(
     rule, and the same one direction of skew an audit cannot repair. A refused
     arrival leaves its bytes filed under their own hash and nothing pointing at
     them, which no reader can reach.
+
+    `at` is the moment the listener recorded, and it is what makes handing the
+    same recording over twice one arrival rather than two: the database keys an
+    arrival on the Program, the correlator, the name, the bytes and that moment,
+    so a replay resolves to the row it already wrote. Without it the arrival is
+    filed under the acceptance moment, which is different every time.
     """
     ledger = Ledger()
     facts: dict[str, object] = {"program_id": None, "callback": None}
@@ -211,6 +219,10 @@ def accept(
             code=INVALID_CONFIGURATION,
             source="argument:--peer",
         )
+        return report(ACCEPT, ledger, **facts)
+
+    received = _moment(ledger, at)
+    if ledger.violations:
         return report(ACCEPT, ledger, **facts)
 
     observed = _name(ledger, host)
@@ -257,6 +269,9 @@ def accept(
                 "host": observed,
                 "arrival_kind": endpoint.kind,
                 "peer_class": peer,
+                # Null when the caller stated no moment, which is how the writer
+                # is told to file the arrival under the moment it accepted it.
+                "received_at": received,
             }
             registration = {
                 "sha256": sha256,
@@ -278,22 +293,37 @@ def accept(
                 return report(ACCEPT, ledger, **facts)
 
     answer = _decode(str(accepted))
+    interaction = answer.get("interaction")
+    observation = answer.get("observation")
+    duplicate = bool(answer.get("duplicate"))
     facts["callback"] = {
-        "interaction": answer.get("interaction"),
-        "observation": answer.get("observation"),
+        "interaction": interaction,
+        "observation": observation,
         "artifact": answer.get("artifact"),
         "channel": answer.get("channel"),
         "kind": endpoint.kind,
         "sha256": sha256,
         "byte_size": len(data),
+        "received_at": answer.get("received_at"),
         "stored": written,
+        "duplicate": duplicate,
     }
-    ledger.hold(
-        "callback",
-        f"{answer.get('interaction')} arrived on channel {answer.get('channel')} "
-        f"({endpoint.kind}): {len(data)} byte(s) stored as {answer.get('artifact')}, "
-        f"recorded as {answer.get('observation')}",
-    )
+    # Both sentences name the arrival the call resolved to, because that is the
+    # question an operator re-running the command after a crash is asking. The
+    # duplicate one holds rather than refuses: what they asked for -- this
+    # arrival on the record -- is true, and it was true before they asked.
+    if duplicate:
+        said = (
+            f"{interaction} is already on the record: this arrival resolved to "
+            f"it and to {observation}, and nothing was written"
+        )
+    else:
+        said = (
+            f"{interaction} arrived on channel {answer.get('channel')} "
+            f"({endpoint.kind}): {len(data)} byte(s) stored as "
+            f"{answer.get('artifact')}, recorded as {observation}"
+        )
+    ledger.hold("callback", said)
     return report(ACCEPT, ledger, **facts)
 
 
@@ -345,6 +375,45 @@ def _name(ledger: Ledger, host: str) -> str | None:
             source="argument:--host",
         )
         return None
+
+
+def _moment(ledger: Ledger, at: str | None) -> str | None:
+    """The moment the listener recorded, or a refusal saying why it is not one.
+
+    Parsed here rather than left to the database so that a mistyped timestamp is
+    an argument the operator can see named, and refused when it carries no
+    offset: a wall clock with no zone is not a moment, and the database would
+    resolve it against whatever `TimeZone` the session happened to hold. What is
+    passed on is the parsed value re-rendered, so the string the database reads
+    is one this process understood.
+
+    Truncated to microseconds, because that is the resolution `timestamptz` has.
+    A listener recording nanoseconds -- interactsh does -- therefore has two
+    arrivals in the same microsecond collapse into one, which is the same trade
+    the identity of an arrival makes everywhere else.
+    """
+    if at is None:
+        return None
+    try:
+        moment = datetime.fromisoformat(at)
+    except ValueError as error:
+        ledger.fail(
+            "callback_arrival",
+            f"{at} is not a moment a listener could have recorded: {error}",
+            code=INVALID_CONFIGURATION,
+            source="argument:--at",
+        )
+        return None
+    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+        ledger.fail(
+            "callback_arrival",
+            f"{at} names no offset from UTC; an arrival is a moment rather than "
+            "a reading of somebody's clock",
+            code=INVALID_CONFIGURATION,
+            source="argument:--at",
+        )
+        return None
+    return moment.isoformat()
 
 
 def _correlator(ledger: Ledger, observed: str, endpoint: scope.Channel) -> str | None:

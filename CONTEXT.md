@@ -670,6 +670,20 @@ holding one authorises no read, no write and no request. Canonical state keeps
 only its digest, and it binds nothing once it expires.
 _Avoid_: Token, secret, canary token, callback id
 
+**Arrival**:
+One recorded inbound interaction at a callback channel, and the row a callback
+Observation cites. Its identity is five facts -- one Program, one correlator,
+the name it arrived at, the exact bytes, and the moment the listener recorded it
+-- held by a constraint rather than by whoever writes it, so a recording handed
+over twice resolves to the rows it already produced instead of becoming a second
+fact about the target. The moment is the listener's; a recording whose format
+carries no clock is filed under the moment it was accepted and gives up being
+recognisable as a replay. Two real arrivals a resolver made in the same second,
+at the same name, with byte-identical requests are one arrival by this rule,
+which is the price of no replay being indistinguishable from a fact.
+_Avoid_: Hit, ping, callback (the callback is the channel, not what came in),
+event (an Event is the redacted audit record, and an arrival raises one)
+
 **Lane**:
 Which party caused a request: `agent` (a subagent acted), `replay` (the runtime
 re-executed a test), or `proxy_internal` (the proxy acted as a client of the

@@ -134,6 +134,49 @@ class CorrelatorTest(unittest.TestCase):
         self.assertLessEqual(callback.CORRELATOR_BYTES * 2, 63)
 
 
+class MomentTest(unittest.TestCase):
+    """The moment an arrival is filed under, which is what a replay shares.
+
+    Ticket 67: the identity of an arrival is one Program, one correlator, one
+    name, one set of bytes and one moment, so the moment is the only part of it
+    this side of the wire decides. What it must not do is hand the database a
+    string that means one thing here and another there.
+    """
+
+    def moment(self, at):
+        ledger = Ledger()
+        return callback._moment(ledger, at), ledger
+
+    def test_a_caller_with_no_moment_states_none_rather_than_a_default(self):
+        # The fallback is `now()` in the database, which is the moment the
+        # accepting transaction began. Choosing one here would be a second
+        # clock, and the fence the arrival is held against reads the server's.
+        rendered, ledger = self.moment(None)
+
+        self.assertIsNone(rendered)
+        self.assertEqual([], list(ledger.violations))
+
+    def test_an_offset_is_kept_as_the_offset_it_was_written_in(self):
+        rendered, ledger = self.moment("2026-08-12T10:11:12+02:00")
+
+        self.assertEqual("2026-08-12T10:11:12+02:00", rendered)
+        self.assertEqual([], list(ledger.violations))
+
+    def test_zulu_is_an_offset(self):
+        rendered, _ = self.moment("2026-08-12T10:11:12Z")
+
+        self.assertEqual("2026-08-12T10:11:12+00:00", rendered)
+
+    def test_a_listener_that_records_nanoseconds_is_read_to_the_microsecond(self):
+        # interactsh writes RFC 3339 with nanoseconds and `timestamptz` holds
+        # microseconds, so the truncation happens either here or in the server.
+        # Doing it here is what makes the string the database reads one this
+        # process understood.
+        rendered, _ = self.moment("2026-08-12T10:11:12.123456789Z")
+
+        self.assertEqual("2026-08-12T10:11:12.123456+00:00", rendered)
+
+
 class AcceptTest(unittest.TestCase):
     """What `accept` refuses before it has anything to record."""
 
@@ -232,7 +275,27 @@ class AcceptTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual({"program_id", "callback"}, set(call().facts))
 
-    def refused(self, *, host=None, source=None, peer="unknown", source_text=SCOPED):
+    def test_a_moment_no_listener_could_have_recorded_is_refused(self):
+        for name, at in (
+            ("nonsense", "yesterday"),
+            ("a date with no time", "2026-08-12T"),
+            # A wall clock with no zone. The database would resolve it against
+            # whatever `TimeZone` the session held, which makes the identity of
+            # an arrival depend on the connection that filed it.
+            ("no offset", "2026-08-12T10:11:12"),
+            ("no offset, with a space", "2026-08-12 10:11:12"),
+        ):
+            with self.subTest(name):
+                opened, result = self.refused(at=at)
+
+                opened.assert_not_called()
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+                self.assertEqual(
+                    ["argument:--at"], [one.source for one in result.violations]
+                )
+
+    def refused(self, *, host=None, source=None, peer="unknown", at=None,
+                source_text=SCOPED):
         with mock.patch.object(
             pg, "connect", side_effect=AssertionError("connected")
         ) as opened:
@@ -243,6 +306,7 @@ class AcceptTest(unittest.TestCase):
                 source if source is not None else arrival(),
                 root=scratch(),
                 peer=peer,
+                at=at,
             )
         return opened, result
 
