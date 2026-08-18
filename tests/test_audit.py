@@ -70,7 +70,7 @@ class AuditGateTest(unittest.TestCase):
             "  stories                230   decisions 19  testing 24  scope 9"
             "  notes 6  regressions 7\n"
             "  verification           213   tests 208  gates 5  owed 2\n"
-            "  tickets                 83   resolved 77  audited 63  deferred criteria 11\n"
+            "  tickets                 83   resolved 78  audited 63  deferred criteria 11\n"
             "  area: runtime          144   anchors 1\n"
             "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
@@ -331,6 +331,13 @@ class AuditCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.audit = check_audit.gather()
+        #: The lowest-numbered ticket the tracker still has open. The readings
+        #: that are about unfinished work have to name work that is actually
+        #: unfinished, and a number written into the test the day it passed
+        #: stops being that the moment the ticket resolves.
+        cls.unfinished = min(
+            number for number, ticket in cls.audit.tickets.items() if not ticket.resolved
+        )
 
     def altered(self, **changes) -> check_audit.Audit:
         return dataclasses.replace(self.audit, **changes)
@@ -417,8 +424,11 @@ class AuditCitationTest(AuditCase):
         # Criterion 1's other half: a story is not delivered because a ticket
         # says it will be.
         self.assertEqual(
-            [f"{STORY}: ticket 77 is ready-for-agent, not resolved"],
-            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="77"))),
+            [f"{STORY}: ticket {self.unfinished:02d} is {self.audit.tickets[self.unfinished].status},"
+             " not resolved"],
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(STORY, tickets=str(self.unfinished)))
+            ),
         )
 
     def test_a_requirement_implemented_by_a_ticket_nobody_wrote_is_refused(self):
@@ -566,7 +576,7 @@ class AuditTicketTest(AuditCase):
             check_audit.ticket_errors(
                 self.altered(
                     tickets=self.tickets_with(
-                        20, criteria=((False, "**Partial:** Ticket 78 closes it."),)
+                        20, criteria=((False, f"**Partial:** Ticket {self.unfinished} closes it."),)
                     )
                 ),
             ),
@@ -574,9 +584,10 @@ class AuditTicketTest(AuditCase):
 
     def test_a_ticket_resolved_over_an_unresolved_blocker_is_refused(self):
         self.assertEqual(
-            ["ticket 20: blocked by 77, which is ready-for-agent"],
+            [f"ticket 20: blocked by {self.unfinished:02d},"
+             f" which is {self.audit.tickets[self.unfinished].status}"],
             check_audit.ticket_errors(
-                self.altered(tickets=self.tickets_with(20, blockers=(77,)))
+                self.altered(tickets=self.tickets_with(20, blockers=(self.unfinished,)))
             ),
         )
 
