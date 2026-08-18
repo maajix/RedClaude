@@ -41,6 +41,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -49,6 +50,7 @@ import threading
 import time
 import unittest
 import uuid
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -78,6 +80,7 @@ from redkraken import (
     isolation,
     legacy,
     migrate,
+    oob,
     operator,
     packet,
     panels,
@@ -122,6 +125,7 @@ from tests.fixtures import (
     GATEWAY,
     PINNED,
     PROBE,
+    PUBLISHED,
     ROLE,
     SLATE_COLUMNS,
     SCOPE_ENTITIES,
@@ -142,6 +146,7 @@ from tests.fixtures import (
     startup_refusal,
     tls_counterparty,
     unlatched,
+    unused_pid,
     write,
 )
 
@@ -6480,6 +6485,464 @@ class CallbackAdmissionTest(DatabaseCase):
             result = integrity.verify(connection, self.harness.expected)
 
         self.assertTrue(result.ok, result.violations)
+
+
+PUBLISHER_SLUG = "selftest-publisher"
+
+#: The channel `PUBLISHED` declares with no host: its name is bound at run time
+#: and lives in `callback_channel_bindings`, which is the whole subject below.
+PUBLISHED_CHANNEL = "oob-files"
+
+#: The one file the publisher serves. An external entity is the payload this
+#: channel exists for -- a target that fetches this is a target that resolved
+#: something we planted -- and its bytes are what a fetch has to return.
+PUBLISHED_FILE = "exploit.dtd"
+PUBLISHED_BYTES = b'<!ENTITY % send SYSTEM "http://nothing.invalid/">\n'
+
+#: A `cloudflared` that is not one: it prints the single line a quick tunnel
+#: prints its hostname in and then stays alive, because a binding whose process
+#: is gone is one `rk oob up` releases. The name is derived from the shell's own
+#: pid, so a second tunnel is a second name -- which is what tomorrow looks like.
+TUNNEL_SCRIPT = """#!/bin/sh
+echo "starting tunnel"
+echo "|  https://selftest-$$.trycloudflare.com  |"
+sleep 600
+"""
+
+#: A name nothing is serving, bound by hand to a pid nobody is on. What an
+#: overnight pause leaves behind, and the one state that cannot be arranged by
+#: starting a real tunnel: a process this test killed would still answer
+#: `kill(pid, 0)` until something reaped it.
+STALE_ENDPOINT = "selftest-stale.trycloudflare.com"
+
+
+class CallbackPublisherTest(DatabaseCase):
+    """PH2-69: an out-of-band host whose name is a record rather than a string.
+
+    One publisher over loopback, one tunnel that names it, one canary minted
+    against that name and one real fetch of a real file over a real socket. The
+    isolation rules that decide what may be published at all are decidable
+    without a server and are held in `tests/test_oob.py`; what needs one is
+    everything downstream: that the fetch becomes an Interaction and an
+    Observation attributed to a subject, that the public name is readable only
+    from the binding, and that releasing the binding ends every correlator
+    minted against it.
+
+    The lifecycle runs once in `setUpClass`, in the order an operator runs it,
+    because each step is the setup of the next: nothing can be minted before a
+    name is bound, and nothing is stale before something has been. Each test
+    then asserts about what one step left behind. This case commits, and purges
+    what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.configuration = write(
+            PUBLISHED.replace('name = "matrix-web"', f'name = "{PUBLISHER_SLUG}"')
+        )
+        opened = program.run(cls.harness.runtime, cls.configuration)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "INSERT INTO entities (program_id, type, dedup_key)"
+                " VALUES ($1::uuid, 'technology', $2)",
+                (cls.program_id, f"tech:{PUBLISHER_SLUG}"),
+            )
+
+        cls.store = scratch() / "store"
+        cls.base = scratch() / "published"
+        (cls.base / PUBLISHER_SLUG).mkdir(parents=True)
+        (cls.base / PUBLISHER_SLUG / PUBLISHED_FILE).write_bytes(PUBLISHED_BYTES)
+        cls.binary = scratch() / "cloudflared"
+        cls.binary.write_text(TUNNEL_SCRIPT)
+        cls.binary.chmod(0o755)
+
+        cls.log: list[str] = []
+        cls.announced: list[str] = []
+        cls.listeners: list[oob.Listener] = []
+        cls.tunnels: list[int] = []
+        cls.start_publisher()
+
+        # Before a name is bound there is nothing to embed, and this is the
+        # answer an agent asking for a canary gets.
+        cls.early = cls.provision()
+
+        cls.bound = cls.bind()
+        assert cls.bound.ok, cls.bound.violations
+        cls.endpoint = str(cls.bound.facts["oob"]["endpoint"])
+        cls.shown = oob.status(cls.harness.runtime, cls.configuration, PUBLISHED_CHANNEL)
+
+        cls.minted = cls.provision()
+        assert cls.minted.ok, cls.minted.violations
+        cls.address = str(cls.minted.facts["callback"]["address"])
+        cls.correlator = cls.address.split("/")[3]
+        cls.before = cls.counts()
+        cls.fetched = cls.fetch(f"/{cls.correlator}/{PUBLISHED_FILE}", records=True)
+        cls.after_fetch = cls.counts()
+        # The exact address the provision printed, which names the canary and no
+        # file at all -- the target most likely to be fetched, because it is the
+        # one an operator embeds.
+        cls.bare = cls.fetch(f"/{cls.correlator}/", records=True)
+        cls.after_bare = cls.counts()
+        # And with a query on it, which a quick tunnel forwards verbatim and
+        # every reader of a path here cuts before reading the segment.
+        cls.queried = cls.fetch(f"/{cls.correlator}/{PUBLISHED_FILE}?q=1", records=True)
+        cls.after_query = cls.counts()
+        # A first segment nobody minted: answered, and attributed to nothing.
+        cls.unattributed = cls.fetch(
+            f"/{secrets.token_hex(16)}/{PUBLISHED_FILE}", records=False
+        )
+        cls.after_stranger = cls.counts()
+
+        cls.ended = oob.down(cls.harness.runtime, cls.configuration, PUBLISHED_CHANNEL)
+        assert cls.ended.ok, cls.ended.violations
+        # The same canary, at the same name, with its binding released.
+        cls.orphaned = cls.fetch(f"/{cls.correlator}/{PUBLISHED_FILE}", records=False)
+        cls.after_release = cls.counts()
+        cls.late = cls.provision()
+
+        cls.stale = cls.bind_stale()
+        cls.rebound = cls.bind()
+        assert cls.rebound.ok, cls.rebound.violations
+        cls.released = oob.down(cls.harness.runtime, cls.configuration, PUBLISHED_CHANNEL)
+
+    @classmethod
+    def tearDownClass(cls):
+        for pid in cls.tunnels:
+            # The process group, because the fake tunnel is a shell with a sleep
+            # under it and `_tunnel` starts it in a session of its own.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        if cls.listeners:
+            cls.listeners[0].shutdown()
+        cls.patched.stop()
+        cls.serving.join(timeout=10)
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (PUBLISHER_SLUG,))
+        super().tearDownClass()
+
+    @classmethod
+    def start_publisher(cls):
+        """`rk oob serve` in a thread, with the handle to stop it kept.
+
+        The publisher is a command that runs until it is interrupted, so a test
+        needs the listener to interrupt it with. Taken by patching
+        `serve_forever` rather than by threading a stop flag through shipped
+        code, which is what `tests/test_ui.py` does for the same reason.
+        """
+        forever = oob.Listener.serve_forever
+
+        def capture(listener, *arguments, **options):
+            cls.listeners.append(listener)
+            return forever(listener, *arguments, **options)
+
+        cls.patched = mock.patch.object(oob.Listener, "serve_forever", capture)
+        cls.patched.start()
+        cls.serving = threading.Thread(target=cls.publish, daemon=True)
+        cls.serving.start()
+        deadline = time.monotonic() + 30
+        while not cls.announced and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cls.announced, "the publisher never bound a socket"
+        cls.port = int(cls.announced[0].rsplit(":", 1)[1])
+        assert oob._listening(cls.port), "the publisher bound a socket and never answered"
+
+    @classmethod
+    def publish(cls):
+        cls.served = oob.serve(
+            cls.harness.runtime,
+            cls.configuration,
+            PUBLISHED_CHANNEL,
+            store=cls.store,
+            port=0,
+            root=cls.base,
+            announce=cls.announced.append,
+            note=cls.log.append,
+        )
+
+    @classmethod
+    def bind(cls) -> Report:
+        """`rk oob up` against the fake tunnel, with the pid kept to kill later.
+
+        The warning is filtered because the tunnel outliving the command is the
+        design: `_tunnel` starts a process in a session of its own and hands
+        back its pid, so the `Popen` it dropped is a child still running when
+        the interpreter collects it. In production that process is `cloudflared`
+        and `rk oob down` is what ends it.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = oob.up(
+                cls.harness.runtime,
+                cls.configuration,
+                PUBLISHED_CHANNEL,
+                store=cls.store,
+                port=cls.port,
+                binary=str(cls.binary),
+                timeout=30,
+            )
+        pid = (result.facts["oob"] or {}).get("tunnel_pid")
+        if pid is not None:
+            cls.tunnels.append(int(pid))
+        return result
+
+    @classmethod
+    def provision(cls) -> Report:
+        return callback.provision(
+            cls.harness.runtime, cls.configuration, PUBLISHED_CHANNEL, "TEC1"
+        )
+
+    @classmethod
+    def bind_stale(cls) -> str:
+        """One binding to a name nothing is serving, on a pid nobody is on.
+
+        Written through the verb `rk oob up` writes through, because a row put
+        straight to the table is one the append-only trigger and the definer's
+        checks never saw. The bytes are stored first for the same reason the
+        command stores them: the binding cites evidence, and evidence that is
+        not in the store is a hash pointing at nothing.
+        """
+        sha256, _ = Store(cls.store).put(TUNNEL_SCRIPT.encode())
+        evidence = json.dumps(
+            {
+                "sha256": sha256,
+                "byte_size": len(TUNNEL_SCRIPT.encode()),
+                "content_type": "text/plain; charset=utf-8",
+            }
+        )
+        with cls.connection.transaction():
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            return str(
+                cls.connection.execute(
+                    "SELECT bind_callback_channel($1, $2, $3, $4, $5::jsonb) ->> 'binding_id'",
+                    (
+                        PUBLISHED_CHANNEL,
+                        "cloudflare-quick",
+                        STALE_ENDPOINT,
+                        str(unused_pid()),
+                        evidence,
+                    ),
+                ).scalar()
+            )
+
+    @classmethod
+    def fetch(cls, target: str, *, records: bool) -> tuple[int, bytes]:
+        """One request as it arrives from the edge: the tunnel's own `Host`.
+
+        And the client address in the header a quick tunnel adds, which is the
+        peer as far as anything on this side can tell. It is evidence rather
+        than a column: what the arrival states is a peer class, and the address
+        is in the stored transcript.
+
+        The answer is sent before the arrival is filed, which is the right order
+        for a target and one a caller has to wait out: a count taken the moment
+        the body arrives is a count taken while the publisher is still writing.
+        `records` says which of its two counters this request moves, so waiting
+        for the wrong one fails here rather than passing an assertion early.
+        """
+        counter = "recorded" if records else "refused"
+        listener = cls.listeners[0]
+        before = getattr(listener, counter)
+        session = http.client.HTTPConnection(oob.LISTEN_HOST, cls.port, timeout=10)
+        try:
+            session.request(
+                "GET",
+                target,
+                headers={"Host": cls.endpoint, "Cf-Connecting-Ip": "198.51.100.7"},
+            )
+            answer = session.getresponse()
+            status, body = answer.status, answer.read()
+        finally:
+            session.close()
+        deadline = time.monotonic() + 30
+        while getattr(listener, counter) == before and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert getattr(listener, counter) > before, f"the publisher never {counter} {target}"
+        return status, body
+
+    @classmethod
+    def counts(cls) -> tuple[int, int]:
+        """How many arrivals and callback Observations this Program has."""
+        return tuple(
+            int(value)
+            for value in cls.connection.execute(
+                "SELECT (SELECT count(*) FROM callback_interactions WHERE program_id = $1::uuid),"
+                "       (SELECT count(*) FROM observations"
+                "         WHERE program_id = $1::uuid AND provenance_kind = 'callback')",
+                (cls.program_id,),
+            ).rows[0]
+        )
+
+    def test_a_target_fetches_the_published_file_over_the_bound_name(self):
+        # Criterion 1. The bytes are the operator's file, unchanged, and the
+        # name they came back at is the tunnel's rather than anything declared.
+        self.assertEqual((200, PUBLISHED_BYTES), self.fetched)
+        self.assertTrue(self.endpoint.endswith(".trycloudflare.com"), self.endpoint)
+        self.assertEqual(f"https://{self.endpoint}/{self.correlator}/", self.address)
+
+    def test_the_fetch_is_an_interaction_and_an_observation_about_a_subject(self):
+        # Criterion 2, and the whole of what a file host is for: the request the
+        # payload caused is on the record, attributed to the entity the canary
+        # was minted for, with the request bytes stored as the artifact.
+        self.assertEqual((self.before[0] + 1, self.before[1] + 1), self.after_fetch)
+        rows = self.connection.execute(
+            "SELECT i.channel_name, i.arrival_kind, i.observed_host, i.observed_path,"
+            "       i.peer_class, o.subject_entity_id = e.id, a.byte_size > 0"
+            "  FROM callback_interactions i"
+            "  JOIN observations o ON o.callback_interaction_id = i.id"
+            "                     AND o.provenance_kind = 'callback'"
+            "  JOIN artifacts a ON a.sha256 = i.body_sha256"
+            "  JOIN entities e ON e.program_id = i.program_id AND e.label = 'TEC1'"
+            " WHERE i.program_id = $1::uuid AND i.observed_path = $2",
+            (self.program_id, f"/{self.correlator}/{PUBLISHED_FILE}"),
+        ).rows
+
+        self.assertEqual(
+            [
+                (
+                    PUBLISHED_CHANNEL,
+                    "http",
+                    self.endpoint,
+                    f"/{self.correlator}/{PUBLISHED_FILE}",
+                    "client",
+                    True,
+                    True,
+                )
+            ],
+            [tuple(row) for row in rows],
+        )
+
+    def test_the_address_that_was_printed_is_an_arrival_with_no_file_to_serve(self):
+        # The address ends at the correlator's directory and there is no
+        # listing, so the body is the same 404 a stranger gets. The difference
+        # is the record: this one names a canary, so the payload having fired
+        # is on the record whether or not it asked for something we publish.
+        self.assertEqual((404, b"not found"), self.bare)
+        self.assertEqual(
+            (self.after_fetch[0] + 1, self.after_fetch[1] + 1), self.after_bare
+        )
+
+    def test_a_query_is_the_payloads_business_and_not_the_correlators(self):
+        # Both readers of a path have to agree about this: the publisher cuts
+        # the query to find the file, and `callback_correlator_from_path` cuts
+        # it to find the correlator. A disagreement here is a fetch that is
+        # answered and then attributed to nothing.
+        self.assertEqual((200, PUBLISHED_BYTES), self.queried)
+        self.assertEqual(
+            (self.after_bare[0] + 1, self.after_bare[1] + 1), self.after_query
+        )
+
+    def test_the_public_name_is_a_record_and_the_configuration_states_none(self):
+        # Criterion 3. The channel compiled with no host, the live name is the
+        # binding's, and `rk oob status` is what reads it: an agent that went
+        # looking in the configuration would find a provider and nothing else.
+        self.assertNotIn("trycloudflare", self.configuration.read_text())
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT host FROM program_callback_channels c"
+                "  JOIN programs p ON p.id = c.program_id AND p.scope_version = c.version"
+                " WHERE c.program_id = $1::uuid AND c.name = $2",
+                (self.program_id, PUBLISHED_CHANNEL),
+            ).scalar()
+        )
+        self.assertEqual(
+            {
+                "declared": True,
+                "bound": True,
+                "endpoint": self.endpoint,
+                "placement": "path",
+                "provider": "cloudflare-quick",
+            },
+            {
+                key: self.shown.facts["oob"][key]
+                for key in ("declared", "bound", "endpoint", "placement", "provider")
+            },
+        )
+
+    def test_nothing_hands_out_a_name_that_is_not_bound(self):
+        # Criterion 3's second half and criterion 4's last clause, which are the
+        # same rule asked before and after: a correlator is minted against a
+        # live binding or not at all, so there is no address composed from a
+        # name that has gone.
+        for name, result in (("before anything bound", self.early), ("after down", self.late)):
+            with self.subTest(name):
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+                self.assertIsNone(result.facts["callback"])
+                self.assertEqual(
+                    ["argument:--channel"], [one.source for one in result.violations]
+                )
+
+    def test_an_arrival_that_resolves_no_correlator_is_answered_and_not_recorded(self):
+        # A row naming no correlator would be an unattributable claim about a
+        # target, so the publisher answers and writes its log line and nothing
+        # else. 404 rather than a refusal to answer: what the target learns is
+        # the same either way, and closing the connection would be a signal.
+        self.assertEqual((404, b"not found"), self.unattributed)
+        self.assertEqual(self.after_query, self.after_stranger)
+
+    def test_releasing_the_binding_ends_every_correlator_minted_against_it(self):
+        # Criterion 4. Nothing is cleaned up: the correlator names a binding
+        # that is released, so it resolves to nothing and the canary that was
+        # live a moment ago is a 404 at the name it was embedded at.
+        self.assertEqual(
+            {"released": True, "known": True, "endpoint": self.endpoint, "correlators": 1},
+            {
+                key: self.ended.facts["oob"][key]
+                for key in ("released", "known", "endpoint", "correlators")
+            },
+        )
+        self.assertEqual((404, b"not found"), self.orphaned)
+        self.assertEqual(self.after_stranger, self.after_release)
+
+    def test_a_binding_whose_tunnel_is_gone_is_released_before_the_next_one(self):
+        # Criterion 4's first clause. The morning after: a name bound to a
+        # process nobody is running is released by the next `up` before it binds
+        # anything, and what it binds is a different name.
+        self.assertIn(
+            self.stale,
+            " ".join(one.detail for one in self.rebound.assertions),
+        )
+        self.assertNotEqual(self.endpoint, self.rebound.facts["oob"]["endpoint"])
+        # Reported beside the binding rather than inside it, because reaping
+        # happens before anything is bound and a run that refuses afterwards
+        # still took those names away from this machine.
+        self.assertEqual(
+            [(self.stale, STALE_ENDPOINT)],
+            [
+                (one["binding_id"], one["endpoint"])
+                for one in self.rebound.facts["released"]
+            ],
+        )
+        self.assertEqual(
+            [(self.endpoint, False), (STALE_ENDPOINT, False),
+             (str(self.rebound.facts["oob"]["endpoint"]), False)],
+            [
+                (str(row[0]), row[1] is None)
+                for row in self.connection.execute(
+                    "SELECT endpoint_host, released_at FROM callback_channel_bindings"
+                    " WHERE program_id = $1::uuid ORDER BY bound_at",
+                    (self.program_id,),
+                ).rows
+            ],
+        )
+
+    def test_the_live_name_is_not_on_the_agent_read_surface(self):
+        # The reason `rk oob status` is the only supported way to learn it. A
+        # binding the model could select is a name it could embed without the
+        # verb that checks whether it is still bound.
+        with pg.connect(self.harness.state) as reader:
+            with self.assertRaises(pg.DatabaseError) as refused:
+                reader.execute("SELECT endpoint_host FROM callback_channel_bindings")
+
+        self.assertIn("permission denied", str(refused.exception))
 
 
 SEAL_SLUG = "selftest-sealed"

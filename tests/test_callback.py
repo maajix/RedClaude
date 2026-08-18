@@ -37,7 +37,7 @@ from redkraken.outcome import (
     EXIT_INVALID_CONFIGURATION,
     Ledger,
 )
-from tests.fixtures import SCOPED, VALID, scratch, write
+from tests.fixtures import PUBLISHED, SCOPED, VALID, scratch, write
 
 
 UNREACHABLE = "postgresql://rk2_runtime@127.0.0.1:1/rk2"
@@ -51,6 +51,12 @@ CORRELATOR = "0123456789abcdef0123456789abcdef"
 CORRELATOR_ID = "3f2a1c88-5d41-4e2b-9a76-0c1b8e4d7f30"
 BODY = b"\x00\x01\x81\x80 query for a canary\n"
 
+#: The HTTP channel `PUBLISHED` declares, and the name a tunnel bound to it.
+#: Nothing in the configuration says this string: it is what `rk oob up` put in
+#: `callback_channel_bindings`, which is why every call below passes it in.
+PUBLISHED_CHANNEL = "oob-files"
+TUNNEL = "bright-fox-1234.trycloudflare.com"
+
 
 def settings() -> pg.Settings:
     return pg.settings_from_url(UNREACHABLE, application_name="rk callback")
@@ -58,6 +64,17 @@ def settings() -> pg.Settings:
 
 def channel(host: str = ENDPOINT, kind: str = "dns") -> scope.Channel:
     return scope.Channel(name="oob", kind=kind, host=host)
+
+
+def published() -> scope.Channel:
+    """The channel whose name is bound at run time and whose canary is a path."""
+    return scope.Channel(
+        name=PUBLISHED_CHANNEL, kind="http", placement="path", provider="cloudflare-quick"
+    )
+
+
+def bound(host: str = TUNNEL) -> dict[str, str]:
+    return {PUBLISHED_CHANNEL: host}
 
 
 def arrival(data: bytes = BODY) -> Path:
@@ -109,7 +126,7 @@ class CorrelatorTest(unittest.TestCase):
     def test_the_correlator_is_the_label_beneath_the_endpoint(self):
         self.assertEqual(
             CORRELATOR,
-            callback._correlator(Ledger(), f"{CORRELATOR}.{ENDPOINT}", channel()),
+            callback._correlator(Ledger(), f"{CORRELATOR}.{ENDPOINT}", channel(), {}, None),
         )
 
     def test_labels_the_target_put_above_it_do_not_change_it(self):
@@ -122,20 +139,103 @@ class CorrelatorTest(unittest.TestCase):
             with self.subTest(observed):
                 self.assertEqual(
                     CORRELATOR,
-                    callback._correlator(Ledger(), observed, channel()),
+                    callback._correlator(Ledger(), observed, channel(), {}, None),
                 )
 
     def test_the_endpoint_itself_carries_no_correlator_and_is_refused(self):
         ledger = Ledger()
 
-        self.assertIsNone(callback._correlator(ledger, ENDPOINT, channel()))
+        self.assertIsNone(callback._correlator(ledger, ENDPOINT, channel(), {}, None))
 
         self.assertTrue(ledger.violations)
+
+    def test_on_a_path_channel_the_correlator_is_the_first_segment(self):
+        # And the name it arrived at is the same for every canary of the
+        # channel, because one bound host serves all of them -- so nothing is
+        # read from it, and "the endpoint itself" is not a refusal here.
+        for path in (
+            f"/{CORRELATOR}/",
+            f"/{CORRELATOR}",
+            f"/{CORRELATOR}/payload.xml",
+            f"/{CORRELATOR}/a/b/c",
+            # A query is the target's, not the canary's.
+            f"/{CORRELATOR}/?x=1",
+            f"/{CORRELATOR}?x=1",
+        ):
+            with self.subTest(path):
+                self.assertEqual(
+                    CORRELATOR,
+                    callback._correlator(Ledger(), TUNNEL, published(), bound(), path),
+                )
+
+    def test_the_root_of_a_path_channel_carries_no_correlator(self):
+        for path in ("/", "//", "/?q=1"):
+            with self.subTest(path):
+                ledger = Ledger()
+
+                self.assertIsNone(
+                    callback._correlator(ledger, TUNNEL, published(), bound(), path)
+                )
+
+                self.assertTrue(ledger.violations)
+
+    def test_an_arrival_and_a_placement_that_disagree_are_refused(self):
+        # The placement says where the correlator is. Reading one from anywhere
+        # else would be attributing an arrival by a rule nobody declared.
+        for name, endpoint, path in (
+            ("a target on a label channel", channel(), f"/{CORRELATOR}/"),
+            ("no target on a path channel", published(), None),
+        ):
+            with self.subTest(name):
+                ledger = Ledger()
+
+                self.assertIsNone(
+                    callback._correlator(ledger, TUNNEL, endpoint, bound(), path)
+                )
+
+                self.assertTrue(ledger.violations)
 
     def test_a_correlator_is_one_dns_label_with_room_to_spare(self):
         # 63 is the label ceiling. A correlator that did not fit would be an
         # address no canary could be embedded at.
         self.assertLessEqual(callback.CORRELATOR_BYTES * 2, 63)
+
+
+class AddressTest(unittest.TestCase):
+    """The one string an operator embeds, for each placement."""
+
+    def test_a_label_channel_is_addressed_by_name_alone(self):
+        self.assertEqual(
+            f"{CORRELATOR}.{ENDPOINT}", callback._address("label", ENDPOINT, CORRELATOR)
+        )
+
+    def test_a_path_channel_is_addressed_as_a_directory_beneath_the_bound_host(self):
+        self.assertEqual(
+            f"https://{TUNNEL}/{CORRELATOR}/",
+            callback._address("path", TUNNEL, CORRELATOR),
+        )
+
+    def test_what_is_addressed_is_what_is_attributed(self):
+        # The two halves of one canary: `provision` composes the address and
+        # `accept` reads the correlator back out of the arrival it produced. If
+        # they disagreed, every interaction on the channel would be unattributed.
+        address = callback._address("path", TUNNEL, CORRELATOR)
+        self.assertEqual(
+            CORRELATOR,
+            callback._correlator(
+                Ledger(),
+                TUNNEL,
+                published(),
+                bound(),
+                address.removeprefix(f"https://{TUNNEL}"),
+            ),
+        )
+        self.assertEqual(
+            CORRELATOR,
+            callback._correlator(
+                Ledger(), callback._address("label", ENDPOINT, CORRELATOR), channel(), {}, None
+            ),
+        )
 
 
 class MomentTest(unittest.TestCase):
@@ -206,6 +306,35 @@ class AcceptTest(unittest.TestCase):
 
         opened.assert_not_called()
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+
+    def test_a_declared_endpoint_is_refused_offline_even_beside_a_bound_channel(self):
+        # `PUBLISHED` declares a channel whose name only the database knows, and
+        # that is the one thing worth a connection. An arrival a declared
+        # channel already answers for is still settled before one exists.
+        opened, result = self.refused(host=ENDPOINT, source_text=PUBLISHED)
+
+        opened.assert_not_called()
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+
+    def test_a_name_only_a_bound_channel_could_admit_is_asked_of_the_database(self):
+        # Which is the one case the configuration cannot settle: whether this
+        # name is bound is written in `callback_channel_bindings` and nowhere
+        # else. A Program declaring no such channel refuses it offline instead.
+        for name, source_text, expected in (
+            ("bound channel declared", PUBLISHED, EXIT_DATABASE_UNREACHABLE),
+            ("none declared", SCOPED, EXIT_INVALID_CONFIGURATION),
+        ):
+            with self.subTest(name):
+                result = callback.accept(
+                    settings(),
+                    write(source_text),
+                    TUNNEL,
+                    arrival(),
+                    root=scratch(),
+                    path=f"/{CORRELATOR}/",
+                )
+
+                self.assertEqual(expected, result.exit_code)
 
     def test_something_a_listener_cannot_say_about_a_peer_is_refused(self):
         opened, result = self.refused(peer="target")
@@ -474,8 +603,10 @@ class ChannelProjectionTest(unittest.TestCase):
 
         self.assertEqual(
             [
-                {"name": "oob-dns", "kind": "dns", "host": ENDPOINT},
-                {"name": "oob-http", "kind": "http", "host": "callback.example.org"},
+                {"name": "oob-dns", "kind": "dns", "host": ENDPOINT,
+                 "placement": "label", "provider": "static"},
+                {"name": "oob-http", "kind": "http", "host": "callback.example.org",
+                 "placement": "label", "provider": "static"},
             ],
             [entry.summary() for entry in compiled.channels],
         )
@@ -499,7 +630,7 @@ class ChannelProjectionTest(unittest.TestCase):
         self.assertEqual("oob-near", verdict.channel)
         self.assertEqual(f"a.{ENDPOINT}", endpoint.host)
         self.assertEqual(
-            CORRELATOR, callback._correlator(Ledger(), observed, endpoint)
+            CORRELATOR, callback._correlator(Ledger(), observed, endpoint, {}, None)
         )
 
     def test_an_arrival_on_the_only_channel_that_admits_it_picks_that_one(self):

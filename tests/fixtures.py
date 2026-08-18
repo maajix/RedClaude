@@ -143,6 +143,18 @@ kind = "dns"
 host = "dns.example.org"
 """
 
+#: `SCOPED` with a channel whose name is bound at run time rather than declared.
+#: A quick tunnel is one hostname with no wildcard beneath it, so the correlator
+#: goes in the first path segment and the endpoint is whatever the tunnel was
+#: called this morning -- which is why there is no `host` here to write down.
+PUBLISHED = SCOPED + """
+[[callback]]
+name = "oob-files"
+kind = "http"
+provider = "cloudflare-quick"
+placement = "path"
+"""
+
 #: `SCOPED` with its one exact inclusion widened to a wildcard, for the cases
 #: that build a Surface of their own. Opening a Program records one Application
 #: per exact inclusion and opens a `recon` Task against each, so a case that
@@ -800,6 +812,23 @@ def latched(slate, picks: object = FIRST) -> _launch.Choice:
 def scratch() -> Path:
     """A directory of this run's own, removed when the run ends."""
     return Path(tempfile.mkdtemp(dir=_ROOT))
+
+
+def unused_pid() -> int:
+    """A process id nothing on this machine holds.
+
+    High enough to be above what a fresh boot has handed out, and asked rather
+    than assumed: `kill(pid, 0)` is the same question the reaper asks, so a
+    candidate this rejects is one the reaper would have called alive.
+    """
+    for candidate in range(4_000_000, 4_001_000):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:
+            continue
+    raise AssertionError("every candidate pid is running")
 
 
 def write(text: str, name: str = "program.toml") -> Path:

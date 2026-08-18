@@ -4,7 +4,7 @@ from unittest import mock
 
 from redkraken import config
 from redkraken.outcome import INVALID_CONFIGURATION, MISSING_DEPENDENCY, UNSUPPORTED_VERSION
-from tests.fixtures import VALID, scratch, write
+from tests.fixtures import PUBLISHED, VALID, scratch, write
 
 
 #: The operator-visible wording of a refused path, written out here so that
@@ -394,6 +394,48 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(
             [(INVALID_CONFIGURATION, "config:callback[0].kind", "must be one of: dns, http")],
             violations(VALID.replace('kind = "dns"', 'kind = "smtp"')),
+        )
+
+    def test_callback_placement_is_closed(self):
+        self.assertEqual(
+            [(INVALID_CONFIGURATION, "config:callback[0].placement", "must be one of: label, path")],
+            violations(VALID + 'placement = "query"\n'),
+        )
+
+    def test_callback_provider_is_closed(self):
+        self.assertEqual(
+            [(
+                INVALID_CONFIGURATION,
+                "config:callback[0].provider",
+                "must be one of: cloudflare-quick, static",
+            )],
+            violations(VALID + 'provider = "ngrok"\n'),
+        )
+
+    def test_a_channel_that_says_neither_is_the_one_every_v1_program_wrote(self):
+        # `placement` and `provider` are what ticket 69 added, and every
+        # configuration written before it says neither. Reading those as
+        # `label` and `static` is what makes them still mean what they meant.
+        configuration, refusals = config.load(write(VALID))
+
+        self.assertIsNotNone(configuration, refusals)
+        channel = configuration.document["callback"][0]
+        self.assertEqual(("label", "static"), (channel["placement"], channel["provider"]))
+
+    def test_a_channel_that_binds_its_name_declares_no_host(self):
+        configuration, refusals = config.load(write(PUBLISHED))
+
+        self.assertIsNotNone(configuration, refusals)
+        bound = [
+            entry for entry in configuration.document["callback"] if entry["name"] == "oob-files"
+        ]
+        # `host` is present and null rather than absent: the channel list is
+        # projected through `jsonb_to_recordset`, which needs every row to name
+        # the same columns, and a name nobody declared is the NULL that says so.
+        self.assertEqual(
+            [{"name": "oob-files", "kind": "http", "host": None,
+              "placement": "path", "provider": "cloudflare-quick"}],
+            bound,
         )
 
 

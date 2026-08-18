@@ -965,10 +965,12 @@ def _project_channels(
     if not policy.channels:
         return
     connection.execute(
-        "INSERT INTO program_callback_channels (program_id, version, ord, name, kind, host)"
-        " SELECT $1::uuid, $2, c.ord, c.name, c.kind, c.host"
+        "INSERT INTO program_callback_channels"
+        "       (program_id, version, ord, name, kind, host, placement, provider)"
+        " SELECT $1::uuid, $2, c.ord, c.name, c.kind, c.host, c.placement, c.provider"
         "   FROM jsonb_to_recordset($3::jsonb) AS c("
-        "        ord integer, name text, kind text, host text)"
+        "        ord integer, name text, kind text, host text,"
+        "        placement text, provider text)"
         " ON CONFLICT DO NOTHING",
         (
             program_id,

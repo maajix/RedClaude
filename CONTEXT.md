@@ -655,17 +655,34 @@ _Avoid_: Log entry, trace, request record
 
 **Callback channel**:
 One out-of-band endpoint the harness operates, declared by a Program under a
-name, a kind and a host. Never a target and never evidence about one: an arrival
-at it is evidence that something reached out. Declared per scope version, so a
-withdrawn channel stops admitting the moment the next version is live. One
-endpoint is one channel: a second name for the same host would make which
-channel admitted an arrival a question about declaration order.
+name, a kind, a placement and a provider. Never a target and never evidence
+about one: an arrival at it is evidence that something reached out. Declared per
+scope version, so a withdrawn channel stops admitting the moment the next
+version is live. One endpoint is one channel: a second name for the same host
+would make which channel admitted an arrival a question about declaration order.
+The placement says where in an arrival the correlator sits and the provider says
+who decides the endpoint -- a `static` channel names its host in the
+configuration, and any other provider names none, because that name is a fact
+about today rather than a declaration.
 _Avoid_: Canary domain, collaborator, listener, OOB server
 
+**Channel binding**:
+The name a channel is answering at right now, and the only place it is written.
+Append-only and released rather than deleted, with the tunnel's own startup
+output stored as the evidence the name was read from. A correlator minted while
+one is live names it, which is what makes yesterday's canary dead this morning:
+the binding is released, so the correlator resolves to nothing and nothing had
+to be swept up. A binding whose process is gone is released by the next `rk oob
+up` before it binds anything, and no verb hands out a name that is not bound.
+_Avoid_: Tunnel, hostname, endpoint (an endpoint is what a channel answers at,
+which is a declaration for a static channel and this for every other one)
+
 **Correlator**:
-The runtime-minted label a canary is addressed by, and the whole of what makes
+The runtime-minted name a canary is addressed by, and the whole of what makes
 an inbound arrival attributable to one Program and one subject. One lower-case
-DNS label, because that is the only shape it can arrive in. Not a credential:
+DNS label beneath the endpoint, or the first segment of the request path when
+the channel's placement says so -- a host with no wildcard has no labels to
+vary, and a path is what a tunnel forwards verbatim. Not a credential:
 holding one authorises no read, no write and no request. Canonical state keeps
 only its digest, and it binds nothing once it expires or once an operator ends
 it early by row id -- which is the identifier minting one printed, never the

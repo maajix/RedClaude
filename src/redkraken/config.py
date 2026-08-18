@@ -82,9 +82,16 @@ SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
 IDENTITY_KEYS = ("name", "slot_ref")
 HEADER_KEYS = ("name", "value_ref")
-CALLBACK_KEYS = ("host", "kind", "name")
+CALLBACK_KEYS = ("host", "kind", "name", "placement", "provider")
 PROTOCOLS = ("http", "https")
 CALLBACK_KINDS = ("dns", "http")
+
+#: Where in an arrival the correlator sits, and who says what name the
+#: channel answers at. `static` is the endpoint the operator wrote down;
+#: anything else is a name bound at run time, which is why `host` is
+#: absent for those and `scope.Channel` refuses one that states it anyway.
+CALLBACK_PLACEMENTS = ("label", "path")
+CALLBACK_PROVIDERS = ("cloudflare-quick", "static")
 
 #: Key names that would carry a secret inline. Naming them separately turns a
 #: leaked credential into a precise refusal rather than an unknown key.
@@ -591,20 +598,57 @@ def _header(reader: _Reader, table: dict, source: str) -> dict | None:
 
 
 def _callback(reader: _Reader, table: dict, source: str) -> dict | None:
+    """One declared channel, read as far as this file can read it.
+
+    `host` is optional here and required by `scope.Channel`, because whether an
+    endpoint must be written down is a fact about the provider rather than about
+    the key: a channel bound at run time has no host to state, and a static one
+    that omits it is refused where the pairing is decided. Reading it as
+    required in both places would be the same rule in two voices.
+    """
     name = _name(reader, table, source, SLUG, SLUG.pattern)
-    kind = None
-    raw = reader.required(table, source, "kind")
-    if raw is not None and raw not in CALLBACK_KINDS:
-        reader.fail(f"{source}.kind", "must be one of: " + ", ".join(CALLBACK_KINDS))
-    elif raw is not None:
-        kind = raw
+    kind = _vocabulary(reader, table, source, "kind", CALLBACK_KINDS)
+    placement = _vocabulary(reader, table, source, "placement", CALLBACK_PLACEMENTS, "label")
+    provider = _vocabulary(reader, table, source, "provider", CALLBACK_PROVIDERS, "static")
     host = None
-    raw = reader.required(table, source, "host")
-    if raw is not None:
-        host = reader.host(raw, f"{source}.host")
-    if name is None or kind is None or host is None:
+    if "host" in table:
+        host = reader.host(table["host"], f"{source}.host")
+        if host is None:
+            return None
+    if name is None or kind is None or placement is None or provider is None:
         return None
-    return {"host": host, "kind": kind, "name": name}
+    return {
+        "host": host,
+        "kind": kind,
+        "name": name,
+        "placement": placement,
+        "provider": provider,
+    }
+
+
+def _vocabulary(
+    reader: _Reader,
+    table: dict,
+    source: str,
+    key: str,
+    allowed: tuple[str, ...],
+    default: str | None = None,
+) -> str | None:
+    """One key whose value must be a word from a closed list.
+
+    A default makes the key optional, which is how a configuration written
+    before this vocabulary existed still reads: absent means the behaviour that
+    was the only one at the time.
+    """
+    if default is not None and key not in table:
+        return default
+    raw = reader.required(table, source, key)
+    if raw is None:
+        return None
+    if raw not in allowed:
+        reader.fail(f"{source}.{key}", "must be one of: " + ", ".join(allowed))
+        return None
+    return raw
 
 
 def _name(reader: _Reader, table: dict, source: str, pattern: re.Pattern[str], shape: str) -> str | None:

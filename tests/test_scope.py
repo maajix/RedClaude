@@ -22,6 +22,7 @@ import unittest
 from redkraken import config, scope
 from redkraken.outcome import INVALID_CONFIGURATION
 from tests.fixtures import (
+    PUBLISHED,
     SCOPE_ENTITIES,
     SCOPE_REFUSALS,
     SCOPE_REQUESTS,
@@ -162,6 +163,67 @@ class CompilationTest(unittest.TestCase):
         )
 
         self.assertEqual(("scope:callback[2].host",), refused(text))
+
+    def test_a_channel_whose_name_is_bound_at_run_time_compiles_to_no_egress(self):
+        # Our own file host is inbound only, and an egress rule whose host
+        # changes daily is a hole with a schedule.
+        policy = compiled(PUBLISHED)
+
+        self.assertEqual(
+            {"callback.example.org"},
+            {rule.pattern.text for rule in policy.rules if rule.effect == scope.EGRESS_SUPPORT},
+        )
+        self.assertEqual("oob-files", policy.channel("oob-files").name)
+
+    def test_a_channel_declares_a_host_exactly_when_its_provider_is_static(self):
+        for text, detail in (
+            (PUBLISHED.replace(
+                'name = "oob-files"\nkind = "http"\nprovider = "cloudflare-quick"',
+                'name = "oob-files"\nkind = "http"\nhost = "files.example.org"\n'
+                'provider = "cloudflare-quick"',
+            ), "declares a host and a provider that binds one"),
+            (SCOPED.replace('kind = "dns"\nhost = "dns.example.org"', 'kind = "dns"'),
+             "declares no host and provider static"),
+        ):
+            with self.subTest(detail):
+                self.assertTrue(refused(text))
+
+    def test_only_an_http_channel_may_carry_its_correlator_in_a_path(self):
+        # A DNS query has no path to put one in, so this is a declaration that
+        # could never admit anything rather than one that admits the wrong thing.
+        text = PUBLISHED.replace('name = "oob-files"\nkind = "http"', 'name = "oob-files"\nkind = "dns"')
+
+        self.assertTrue(refused(text))
+
+    def test_a_bound_channel_admits_the_name_it_is_bound_to_and_nothing_else(self):
+        channel = compiled(PUBLISHED).channel("oob-files")
+        bindings = {"oob-files": "dull-tunnel.trycloudflare.com"}
+
+        self.assertEqual("dull-tunnel.trycloudflare.com", channel.endpoint(bindings))
+        self.assertTrue(channel.admits("dull-tunnel.trycloudflare.com", bindings))
+        self.assertFalse(channel.admits("other-tunnel.trycloudflare.com", bindings))
+
+    def test_a_channel_with_nothing_bound_admits_nothing_at_all(self):
+        # Not "admits everything" and not "admits the last name it had": a
+        # channel with no live binding has no endpoint, and an arrival at a name
+        # nobody bound is an arrival nobody may attribute.
+        channel = compiled(PUBLISHED).channel("oob-files")
+
+        self.assertIsNone(channel.endpoint({}))
+        self.assertFalse(channel.admits("dull-tunnel.trycloudflare.com", {}))
+        self.assertFalse(channel.admits("dull-tunnel.trycloudflare.com"))
+
+    def test_a_bound_name_is_decided_by_the_one_verdict_every_arrival_gets(self):
+        policy = compiled(PUBLISHED)
+        bindings = {"oob-files": "dull-tunnel.trycloudflare.com"}
+
+        verdict = scope.decide_callback(policy, "dull-tunnel.trycloudflare.com", bindings)
+        self.assertEqual("oob-files", verdict.channel)
+        self.assertEqual("matched_callback", verdict.reason)
+
+        unbound = scope.decide_callback(policy, "dull-tunnel.trycloudflare.com")
+        self.assertEqual("", unbound.channel)
+        self.assertEqual("unlisted", unbound.reason)
 
     def test_a_pattern_is_a_suffix_test_and_never_a_glob(self):
         for pattern in ("ap*.example.com", "*.*.example.com", "app.*"):

@@ -7,12 +7,20 @@ tying it to a Program is a correlator that travelled out in a payload and came
 back in a query.
 
 So the module has three verbs and one idea between them. `provision` mints a
-correlator for one subject and hands back the address to embed --
-`<correlator>.<channel host>`, because a canary is addressed by its label.
-`accept` takes an arrival the operator's own listener recorded, recovers the
-correlator from the name it came in at, and asks the database to admit it.
-`clear` ends one early, by the id `provision` printed, and says what it caught
-before it ended.
+correlator for one subject and hands back the address to embed. `accept` takes
+an arrival the operator's own listener recorded, recovers the correlator from
+wherever the channel keeps it, and asks the database to admit it. `clear` ends
+one early, by the id `provision` printed, and says what it caught before it
+ended.
+
+Where the correlator sits is the channel's placement, and it is the one thing
+about a channel this module keeps asking. A `label` channel is addressed as
+`<correlator>.<endpoint>`, which is how a DNS canary has to work; a `path`
+channel is addressed as `https://<endpoint>/<correlator>/`, which is how one
+bound hostname with no wildcard serves every canary of a Program. And on a
+channel whose provider binds its name at run time the endpoint is not in the
+configuration at all: it is read from the live binding, and a channel with
+nothing bound has no address to hand out.
 
 The decision is not made here. `record_callback_interaction` re-asks every
 question -- is the channel still declared, is the correlator live, is this the
@@ -78,6 +86,7 @@ RECORD = "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)"
 SUBJECT = "SELECT id::text, type FROM entities WHERE program_id = $1::uuid AND label = $2"
 EXPIRY = "SELECT expires_at::text FROM callback_correlators WHERE id = $1::uuid"
 END_CORRELATOR = "SELECT clear_callback_correlator($1::uuid)"
+BINDING = "SELECT callback_channel_binding($1)"
 
 
 def provision(
@@ -103,7 +112,7 @@ def provision(
     ledger = Ledger()
     facts: dict[str, object] = {"program_id": None, "callback": None}
 
-    policy, slug = _policy(ledger, configuration_path)
+    policy, slug = policy_for(ledger, configuration_path)
     if policy is None or slug is None:
         return report(PROVISION, ledger, **facts)
     endpoint = policy.channel(channel)
@@ -131,7 +140,7 @@ def provision(
     if connection is None:
         return report(PROVISION, ledger, **facts)
     with connection:
-        program_id = _open(ledger, connection, slug)
+        program_id = open_program(ledger, connection, slug)
         if program_id is None:
             return report(PROVISION, ledger, **facts)
         facts["program_id"] = program_id
@@ -147,6 +156,24 @@ def provision(
             )
             return report(PROVISION, ledger, **facts)
         entity_id, entity_type = str(rows[0][0]), str(rows[0][1])
+
+        # Where the channel is answering, asked of the database rather than of
+        # the configuration: a static channel answers with the host the operator
+        # wrote down, and a bound one with whatever `rk oob up` last bound. The
+        # configuration cannot know the second, and a name this process composed
+        # from a stale binding would be a canary nothing can reach.
+        binding = _decode(str(connection.execute(BINDING, (channel,)).scalar()))
+        if not binding.get("bound"):
+            ledger.fail(
+                "callback_channel",
+                f"channel {channel} is declared with provider "
+                f"{binding.get('provider', endpoint.provider)} and has no live "
+                "binding, so there is no name to embed; `rk oob up` binds one",
+                code=INVALID_CONFIGURATION,
+                source="argument:--channel",
+            )
+            return report(PROVISION, ledger, **facts)
+        host = str(binding["endpoint"])
 
         correlator = secrets.token_hex(CORRELATOR_BYTES)
         with connection.transaction():
@@ -168,11 +195,15 @@ def provision(
                 return report(PROVISION, ledger, **facts)
         expires = str(connection.execute(EXPIRY, (correlator_id,)).scalar())
 
+    address = _address(endpoint.placement, host, correlator)
     facts["callback"] = {
         "channel": channel,
         "kind": endpoint.kind,
         "correlator_id": correlator_id,
-        "address": f"{correlator}.{endpoint.host}",
+        "address": address,
+        "endpoint": host,
+        "placement": endpoint.placement,
+        "provider": endpoint.provider,
         "subject": subject,
         "subject_type": entity_type,
         "expires_at": expires,
@@ -181,9 +212,23 @@ def provision(
     ledger.hold(
         "callback",
         f"channel {channel} ({endpoint.kind}) is listening for {subject}: "
-        f"embed {correlator}.{endpoint.host}, live until {expires}",
+        f"embed {address}, live until {expires}",
     )
     return report(PROVISION, ledger, **facts)
+
+
+def _address(placement: str, host: str, correlator: str) -> str:
+    """The one string an operator embeds, for wherever this channel keeps its name.
+
+    A label channel is addressed by name alone, because a DNS query carries no
+    path and an HTTP request to `<correlator>.<endpoint>` carries the correlator
+    in the name it resolved. A path channel is a URL: the endpoint is one host
+    serving every canary, so the correlator is the first segment, and the
+    trailing slash is there because the directory is what gets published.
+    """
+    if placement == "path":
+        return f"https://{host}/{correlator}/"
+    return f"{correlator}.{host}"
 
 
 def accept(
@@ -195,6 +240,7 @@ def accept(
     root: Path,
     peer: str = "unknown",
     at: str | None = None,
+    path: str | None = None,
 ) -> Report:
     """Admit one arrival the operator's listener recorded, or refuse it.
 
@@ -209,11 +255,16 @@ def accept(
     arrival on the Program, the correlator, the name, the bytes and that moment,
     so a replay resolves to the row it already wrote. Without it the arrival is
     filed under the acceptance moment, which is different every time.
+
+    `path` is the request target the listener saw, for a channel that carries
+    its correlator there rather than in a label. It is passed on exactly as
+    received -- not lowercased, not decoded -- because it is part of what
+    arrived, and the correlator is read from its first segment.
     """
     ledger = Ledger()
     facts: dict[str, object] = {"program_id": None, "callback": None}
 
-    policy, slug = _policy(ledger, configuration_path)
+    policy, slug = policy_for(ledger, configuration_path)
     if policy is None or slug is None:
         return report(ACCEPT, ledger, **facts)
     if peer not in PEERS:
@@ -233,28 +284,50 @@ def accept(
     observed = _name(ledger, host)
     if observed is None:
         return report(ACCEPT, ledger, **facts)
-    verdict = scope.decide_callback(policy, observed)
-    if not verdict.allowed:
-        # The same function the proxy asks, so a name admitted here is a name
-        # admitted there. Refused here as well as at the door, and this is the
-        # cheaper half: nothing about an undeclared name reaches the database,
-        # and the bytes of an arrival at somebody else's host are never stored.
+    if path is not None and not path.startswith("/"):
         ledger.fail(
-            "callback_channel",
-            f"{observed} is not a name any channel {slug} declares admits "
-            f"({verdict.reason})",
+            "callback_path",
+            f"{path} is not a request target a listener saw; one begins at /",
             code=INVALID_CONFIGURATION,
-            source="argument:--host",
+            source="argument:--path",
         )
-        return report(ACCEPT, ledger, **facts)
-    endpoint = policy.channel(verdict.channel)
-    assert endpoint is not None  # `decide_callback` names a channel of this policy
-    correlator = _correlator(ledger, observed, endpoint)
-    if correlator is None:
         return report(ACCEPT, ledger, **facts)
 
     data = _arrival(ledger, Path(source))
     if data is None:
+        return report(ACCEPT, ledger, **facts)
+
+    def unadmitted(reason: str) -> None:
+        # Refused rather than filed. A declared channel compiles to an egress
+        # rule as well, so for those this is the same answer the proxy gives;
+        # a channel bound at run time compiles to no rule at all, and its name
+        # is read from the bindings instead -- which is why this is written
+        # once here and reached from both of the asks below.
+        ledger.fail(
+            "callback_channel",
+            f"{observed} is not a name any channel {slug} declares admits ({reason})",
+            code=INVALID_CONFIGURATION,
+            source="argument:--host",
+        )
+
+    # Attribution is asked of the configuration first, and for every Program
+    # whose channels are all declared it is answered here: an arrival at
+    # somebody else's host, or at an endpoint carrying no correlator, is refused
+    # before a connection exists, which is ticket 14's rule and the reason its
+    # bytes are never stored. A channel whose name is bound at run time is the
+    # one thing the configuration cannot settle -- the name is in the database
+    # and nowhere else -- so only an arrival no declared channel admits, at a
+    # Program that has such a channel, pays a connection to find out.
+    verdict = scope.decide_callback(policy, observed)
+    dynamic = any(entry.dynamic for entry in policy.channels)
+    endpoint = policy.channel(verdict.channel) if verdict.allowed else None
+    correlator = None
+    if endpoint is not None:
+        correlator = _correlator(ledger, observed, endpoint, {}, path)
+        if correlator is None:
+            return report(ACCEPT, ledger, **facts)
+    elif not dynamic:
+        unadmitted(verdict.reason)
         return report(ACCEPT, ledger, **facts)
 
     connection = migrate.open_connection(ledger, runtime)
@@ -262,42 +335,49 @@ def accept(
         return report(ACCEPT, ledger, **facts)
     keep = Store(Path(root))
     with connection:
-        program_id = _open(ledger, connection, slug)
+        program_id = open_program(ledger, connection, slug)
         if program_id is None:
             return report(ACCEPT, ledger, **facts)
         facts["program_id"] = program_id
 
-        with connection.transaction():
-            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {ACCEPT}",))
-            sha256, written = keep.put(data)
-            arrival = {
-                "host": observed,
-                "arrival_kind": endpoint.kind,
-                "peer_class": peer,
-                # Null when the caller stated no moment, which is how the writer
-                # is told to file the arrival under the moment it accepted it.
-                "received_at": received,
-            }
-            registration = {
-                "sha256": sha256,
-                "byte_size": len(data),
-                "content_type": _content_type(endpoint.kind),
-            }
-            try:
-                accepted = connection.execute(
-                    RECORD,
-                    (correlator, _encode(arrival), _encode(registration)),
-                ).scalar()
-            except pg.DatabaseError as error:
-                ledger.fail(
-                    "callback",
-                    f"the interaction was refused: {error}",
-                    code=INVALID_CONFIGURATION,
-                    source="database",
-                )
+        if endpoint is None:
+            # And re-asked with the live names. Still before a byte is stored,
+            # so an arrival at a name nobody bound leaves nothing behind either.
+            bindings = _bindings(connection, policy)
+            verdict = scope.decide_callback(policy, observed, bindings)
+            if not verdict.allowed:
+                unadmitted(verdict.reason)
+                return report(ACCEPT, ledger, **facts)
+            endpoint = policy.channel(verdict.channel)
+            assert endpoint is not None  # named by the verdict just returned
+            correlator = _correlator(ledger, observed, endpoint, bindings, path)
+            if correlator is None:
                 return report(ACCEPT, ledger, **facts)
 
-    answer = _decode(str(accepted))
+        arrival = {
+            "host": observed,
+            "arrival_kind": endpoint.kind,
+            "peer_class": peer,
+            # Null when the caller stated no moment, which is how the writer is
+            # told to file the arrival under the moment it accepted it.
+            "received_at": received,
+            # And null when the listener saw no request target, which is every
+            # DNS query and every HTTP arrival on a label channel.
+            "path": path,
+        }
+        try:
+            answer, sha256, written = record(
+                connection, keep, correlator, arrival, data, actor=f"rk {ACCEPT}"
+            )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "callback",
+                f"the interaction was refused: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return report(ACCEPT, ledger, **facts)
+
     interaction = answer.get("interaction")
     observation = answer.get("observation")
     duplicate = bool(answer.get("duplicate"))
@@ -332,6 +412,44 @@ def accept(
     return report(ACCEPT, ledger, **facts)
 
 
+def record(
+    connection: pg.Connection,
+    keep: Store,
+    correlator: str,
+    arrival: dict,
+    data: bytes,
+    *,
+    actor: str,
+) -> tuple[dict, str, bool]:
+    """File one arrival: the bytes into the store, then the row through the writer.
+
+    One transaction, and the bytes first, so no committed row names a file that
+    was never stored -- `artifact put`'s rule, and the same one direction of skew
+    an audit cannot repair. A refused arrival leaves its bytes filed under their
+    own hash with nothing pointing at them, which no reader can reach.
+
+    Shared by `accept` and by the publisher in `oob`, because they differ only in
+    where the arrival came from: one is a recording an operator hands over, the
+    other is a request this machine answered a moment ago. What is written, and
+    the order it is written in, is the same question and gets one answer.
+
+    Raises `pg.DatabaseError` when the writer refuses, because the reason is the
+    database's sentence and the caller is the one with a ledger to put it in.
+    """
+    with connection.transaction():
+        connection.execute("SELECT set_actor('runtime', $1)", (actor,))
+        sha256, written = keep.put(data)
+        registration = {
+            "sha256": sha256,
+            "byte_size": len(data),
+            "content_type": _content_type(str(arrival["arrival_kind"])),
+        }
+        answer = connection.execute(
+            RECORD, (correlator, _encode(arrival), _encode(registration))
+        ).scalar()
+    return _decode(str(answer)), sha256, written
+
+
 def clear(
     runtime: pg.Settings | None,
     configuration_path: Path,
@@ -353,7 +471,7 @@ def clear(
     if identifier is None:
         return report(CLEAR, ledger, **facts)
 
-    policy, slug = _policy(ledger, configuration_path)
+    policy, slug = policy_for(ledger, configuration_path)
     if policy is None or slug is None:
         return report(CLEAR, ledger, **facts)
 
@@ -361,7 +479,7 @@ def clear(
     if connection is None:
         return report(CLEAR, ledger, **facts)
     with connection:
-        program_id = _open(ledger, connection, slug)
+        program_id = open_program(ledger, connection, slug)
         if program_id is None:
             return report(CLEAR, ledger, **facts)
         facts["program_id"] = program_id
@@ -417,10 +535,15 @@ def clear(
     return report(CLEAR, ledger, **facts)
 
 
-def _policy(
+def policy_for(
     ledger: Ledger, configuration_path: Path
 ) -> tuple[scope.Policy | None, str | None]:
-    """The compiled policy and the Program it names, or a refusal saying why not."""
+    """The compiled policy and the Program it names, or a refusal saying why not.
+
+    Public because `oob` asks it too: a publisher and a canary read the same
+    configuration to learn the same two things, and a second copy of this would
+    be a second answer to "which Program is this" waiting to disagree.
+    """
     configuration, refusals = config.load(Path(configuration_path))
     if configuration is None:
         ledger.refuse("configuration", f"refused by {len(refusals)} violation(s)", refusals)
@@ -436,8 +559,14 @@ def _policy(
     return policy, str(configuration.document["program"]["name"])
 
 
-def _open(ledger: Ledger, connection: pg.Connection, slug: str) -> str | None:
-    """The open Program this slug names, with the session bound to it."""
+def open_program(ledger: Ledger, connection: pg.Connection, slug: str) -> str | None:
+    """The open Program this slug names, with the session bound to it.
+
+    Public for the same reason `policy_for` is: every verb that writes on a
+    runtime connection has to bind `rk2.program_id` before it writes, because
+    the row-level policies and the callback verbs all read `rk2_program()`, and
+    a verb that forgot would be answered as though the Program had nothing.
+    """
     program.assert_runtime_connection(ledger, connection)
     if ledger.violations:
         return None
@@ -506,15 +635,77 @@ def _moment(ledger: Ledger, at: str | None) -> str | None:
     return moment.isoformat()
 
 
-def _correlator(ledger: Ledger, observed: str, endpoint: scope.Channel) -> str | None:
-    """The label the canary was addressed by, recovered from the name.
+def _bindings(connection: pg.Connection, policy: scope.Policy) -> dict[str, str]:
+    """What each bound channel of this Program is answering at right now.
 
-    The correlator is the label immediately beneath the channel endpoint, not
-    the whole prefix: a resolver that queried `www.<correlator>.<endpoint>` is
-    reporting one arrival on one canary, and the extra label is the target's
-    business rather than ours.
+    Only the bound ones are asked about: a static channel answers with the host
+    already in the policy, so asking would be one round trip to be told what the
+    configuration said. A channel with nothing bound is simply absent, which is
+    what makes it admit nothing.
     """
-    if observed == endpoint.host:
+    live: dict[str, str] = {}
+    for channel in policy.channels:
+        if not channel.dynamic:
+            continue
+        answer = _decode(str(connection.execute(BINDING, (channel.name,)).scalar()))
+        if answer.get("bound"):
+            live[channel.name] = str(answer["endpoint"])
+    return live
+
+
+def _correlator(
+    ledger: Ledger,
+    observed: str,
+    endpoint: scope.Channel,
+    bindings: dict[str, str],
+    path: str | None,
+) -> str | None:
+    """The correlator the arrival carries, from wherever this channel keeps it.
+
+    Two placements and one rule between them: the correlator is the part of the
+    arrival the canary was addressed by, and everything around it is the
+    target's business. Beneath a label endpoint that is the label immediately
+    below it -- a resolver that queried `www.<correlator>.<endpoint>` reported
+    one arrival on one canary, not a longer one. On a path endpoint it is the
+    first segment, because one bound host serves every canary of the channel and
+    the segment is what tells them apart.
+
+    An arrival that carries a path on a label channel, or none on a path
+    channel, is refused rather than read: the placement says where the
+    correlator is, and reading one from somewhere else would be attributing an
+    arrival by a rule nobody declared.
+    """
+    if (endpoint.placement == "path") != (path is not None):
+        ledger.fail(
+            "callback_correlator",
+            f"channel {endpoint.name} carries its correlator in the "
+            f"{endpoint.placement}, and this arrival "
+            + ("states a request target" if path is not None else "states none"),
+            code=INVALID_CONFIGURATION,
+            source="argument:--path",
+        )
+        return None
+    if endpoint.placement == "path":
+        assert path is not None  # the agreement above
+        # A target begins at `/`, so the split always has a second element and
+        # it is empty exactly when the request named the root. The query is cut
+        # first for the same reason the publisher cuts it: `/<correlator>?x=1`
+        # is a request for that canary, and a correlator read with the query
+        # still attached would match nothing that was ever minted.
+        correlator = path.split("?", 1)[0].split("/")[1]
+        if not correlator:
+            ledger.fail(
+                "callback_correlator",
+                f"{path} names no first segment beneath {endpoint.endpoint(bindings)}, "
+                "so it carries no correlator",
+                code=INVALID_CONFIGURATION,
+                source="argument:--path",
+            )
+            return None
+        return correlator
+
+    host = endpoint.endpoint(bindings)
+    if observed == host:
         ledger.fail(
             "callback_correlator",
             f"{observed} is the channel endpoint itself and carries no correlator; "
@@ -523,12 +714,13 @@ def _correlator(ledger: Ledger, observed: str, endpoint: scope.Channel) -> str |
             source="argument:--host",
         )
         return None
-    prefix = observed[: -(len(endpoint.host) + 1)]
+    assert host is not None  # `decide_callback` admitted this name on this channel
+    prefix = observed[: -(len(host) + 1)]
     correlator = prefix.rsplit(".", 1)[-1]
     if not correlator:
         ledger.fail(
             "callback_correlator",
-            f"{observed} carries no label beneath {endpoint.host}",
+            f"{observed} carries no label beneath {host}",
             code=INVALID_CONFIGURATION,
             source="argument:--host",
         )

@@ -178,10 +178,14 @@ class PolicyError(Exception):
     it into a verdict does not have to classify the message text.
     """
 
-    def __init__(self, reason: str, detail: str) -> None:
+    def __init__(self, reason: str, detail: str, key: str = "") -> None:
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+        #: The one key of the entry that is wrong, when there is one. A caller
+        #: turning this into a refusal can point the operator at the line they
+        #: have to edit instead of at the table it sits in.
+        self.key = key
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +666,19 @@ class Rule:
         }
 
 
+def host_admitted(observed: str, endpoint: str | None) -> bool:
+    """Whether an observed name is a channel endpoint or a label beneath it.
+
+    The rule written once, because three places ask it: the compiled channel,
+    the verb that admits an arrival, and `callback_host_admitted` in SQL, which
+    is this function in the one place Python cannot reach. None is not an
+    endpoint, so a channel with nothing bound admits nothing.
+    """
+    if endpoint is None:
+        return False
+    return observed == endpoint or observed.endswith("." + endpoint)
+
+
 @dataclass(frozen=True)
 class Channel:
     """One out-of-band callback endpoint the harness operates.
@@ -671,23 +688,98 @@ class Channel:
     `egress_support` and why a host that is both a channel and an inclusion
     resolves to the channel: the lower effect rank wins, and a callback endpoint
     the Program also happens to own is still not a finding.
+
+    Two things about a channel are not the endpoint. `placement` says where in
+    an arrival its correlator sits -- a label beneath the endpoint, or the first
+    segment of the request path, which is the difference between a canary that
+    can only be pinged and one that can serve a file per correlator.
+    `provider` says who decides the endpoint: `static` is the name the operator
+    wrote down, and anything else is a name bound at run time, for which `host`
+    is None here and the live value lives in `callback_channel_bindings`.
     """
 
     name: str
     kind: str
-    host: str
+    host: str | None = None
+    placement: str = "label"
+    provider: str = "static"
 
-    def admits(self, host: str) -> bool:
+    def __post_init__(self) -> None:
+        """The three ways a channel can be self-contradictory, refused here.
+
+        Written once, in the type, because a channel is built from a
+        configuration and read back from a projection, and a rule enforced at
+        one of those doors is a rule the other one lets through.
+        """
+        if self.placement not in config.CALLBACK_PLACEMENTS:
+            raise PolicyError(
+                "unsupported", f"unknown callback placement {self.placement}", "placement"
+            )
+        if self.provider not in config.CALLBACK_PROVIDERS:
+            raise PolicyError(
+                "unsupported", f"unknown callback provider {self.provider}", "provider"
+            )
+        if (self.provider == "static") != (self.host is not None):
+            # An endpoint is either written down or bound at run time. Both is a
+            # host that would go stale the moment something bound a name, and
+            # neither is a channel nothing can arrive at.
+            raise PolicyError(
+                "unsupported",
+                "a static callback names its endpoint and a bound one does not: "
+                f"provider {self.provider} with "
+                + ("a host" if self.host is not None else "no host"),
+                "host",
+            )
+        if self.kind != "http" and (self.placement != "label" or self.provider != "static"):
+            # A resolver sends a name and nothing else: there is no path to put
+            # a correlator in, and no way to publish a file at a bound name over
+            # DNS. Both are the HTTP channel's business.
+            raise PolicyError(
+                "unsupported",
+                f"a {self.kind} callback carries its correlator in a label of an "
+                "endpoint written down in advance",
+            )
+
+    @property
+    def dynamic(self) -> bool:
+        """Whether this channel's name is bound at run time rather than declared.
+
+        Asked of `host` rather than of `provider` because `__post_init__` has
+        already made them the same question, and this is the half every caller
+        means: a channel with no name in the configuration is one whose name has
+        to be read from somewhere else.
+        """
+        return self.host is None
+
+    def endpoint(self, bindings: dict[str, str] | None = None) -> str | None:
+        """The name this channel is answering at, or nothing when none is.
+
+        A static channel answers at what the operator wrote down, whatever is
+        bound; a bound one answers at what `bindings` says and at nothing when
+        that says nothing. None is a real answer for the second, and it is the
+        answer that makes a channel with nothing bound admit nothing.
+        """
+        if self.host is not None:
+            return self.host
+        return (bindings or {}).get(self.name)
+
+    def admits(self, host: str, bindings: dict[str, str] | None = None) -> bool:
         """Whether an interaction at `host` arrived on this channel.
 
         Labels beneath the endpoint count, because that is how an out-of-band
         canary is addressed: the token is the label. The endpoint itself counts
         too, and nothing above it does.
         """
-        return host == self.host or host.endswith("." + self.host)
+        return host_admitted(host, self.endpoint(bindings))
 
     def summary(self) -> dict:
-        return {"name": self.name, "kind": self.kind, "host": self.host}
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "host": self.host,
+            "placement": self.placement,
+            "provider": self.provider,
+        }
 
 
 @dataclass(frozen=True)
@@ -888,45 +980,67 @@ def compile_policy(
     endpoints: dict[str, str] = {}
     for index, entry in enumerate(document["callback"]):
         source = f"callback[{index}]"
-        if entry["host"].startswith("*."):
-            # A channel already admits everything beneath its endpoint, so a
-            # wildcard here is a second way to say one thing -- and the two
-            # spellings would not agree about the endpoint itself.
-            refusals.append(
-                _refusal(
-                    f"{source}.host",
-                    "a callback names its own endpoint; interactions beneath it are "
-                    "admitted by the channel, so a wildcard is refused",
+        host = entry["host"]
+        if host is not None:
+            if host.startswith("*."):
+                # A channel already admits everything beneath its endpoint, so a
+                # wildcard here is a second way to say one thing -- and the two
+                # spellings would not agree about the endpoint itself.
+                refusals.append(
+                    _refusal(
+                        f"{source}.host",
+                        "a callback names its own endpoint; interactions beneath it are "
+                        "admitted by the channel, so a wildcard is refused",
+                    )
                 )
-            )
-            continue
+                continue
+            try:
+                host = normalize_host(host)
+            except PolicyError as error:
+                refusals.append(_refusal(f"{source}.host", error.detail))
+                continue
+            if host in endpoints:
+                # One endpoint, one channel, which is what `program_callback_channels`
+                # keys on as well. Two names for one host would make "which channel
+                # admitted this arrival" a question about declaration order, and the
+                # projection would silently keep one row while the compiler reported
+                # two channels.
+                refusals.append(
+                    _refusal(
+                        f"{source}.host",
+                        f"{host} is already the endpoint of callback {endpoints[host]}; "
+                        "one endpoint is one channel",
+                    )
+                )
+                continue
+            endpoints[host] = entry["name"]
+        # An absent key is the dataclass default, so a configuration written
+        # before there was a placement or a provider reads as the one behaviour
+        # there was; the contradictions between the four are `Channel`'s to
+        # refuse, which is why this only turns them into a refusal.
+        declared = {key: entry[key] for key in ("placement", "provider") if key in entry}
         try:
-            host = normalize_host(entry["host"])
+            channel = Channel(name=entry["name"], kind=entry["kind"], host=host, **declared)
         except PolicyError as error:
-            refusals.append(_refusal(f"{source}.host", error.detail))
-            continue
-        if host in endpoints:
-            # One endpoint, one channel, which is what `program_callback_channels`
-            # keys on as well. Two names for one host would make "which channel
-            # admitted this arrival" a question about declaration order, and the
-            # projection would silently keep one row while the compiler reported
-            # two channels.
+            # Pointed at the key when the contradiction has one, because
+            # `callback[0]` sends an operator to read four keys to find the one
+            # they can fix. The kind rule names no single key and stays here.
             refusals.append(
-                _refusal(
-                    f"{source}.host",
-                    f"{host} is already the endpoint of callback {endpoints[host]}; "
-                    "one endpoint is one channel",
-                )
+                _refusal(f"{source}.{error.key}" if error.key else source, error.detail)
             )
             continue
-        endpoints[host] = entry["name"]
-        channels.append(Channel(name=entry["name"], kind=entry["kind"], host=host))
-        if entry["kind"] == "http":
+        channels.append(channel)
+        if channel.kind == "http" and channel.host is not None:
             # A DNS channel is not an HTTP destination, so only this kind
             # becomes a request rule. Both kinds stay channels.
+            #
+            # A bound channel gets no rule at all: there is no name to write one
+            # about until something binds it, and the harness never requests its
+            # own endpoint anyway -- the target does. `rk oob` reaches the
+            # publisher on the loopback address, which no policy governs.
             add(
                 EGRESS_SUPPORT,
-                {"host": host},
+                {"host": channel.host},
                 source,
                 PROTOCOLS,
                 CALLBACK_PORTS,
@@ -1103,7 +1217,9 @@ def decide_entity(
     )
 
 
-def decide_callback(policy: Policy, host: object) -> Verdict:
+def decide_callback(
+    policy: Policy, host: object, bindings: dict[str, str] | None = None
+) -> Verdict:
     """Whether an observed interaction arrived on a channel this Program declared.
 
     Never `target`, whatever else the policy says about the host: an interaction
@@ -1115,15 +1231,20 @@ def decide_callback(policy: Policy, host: object) -> Verdict:
     and for the same reason. It also decides where the correlator ends: the
     label beneath `a.oob.example.net` is a label of that channel and not a
     longer canary on its parent.
+
+    `bindings` is what each bound channel is answering at right now, which is
+    not in the policy because it is not in the configuration: a channel whose
+    provider hands it a name has no endpoint until something binds one, and a
+    channel missing from this mapping admits nothing.
     """
     try:
         observed = normalize_host(host)
     except PolicyError as error:
         return Verdict(scope_class=DENIED, reason=error.reason, detail=error.detail)
-    admitting = [channel for channel in policy.channels if channel.admits(observed)]
+    admitting = [channel for channel in policy.channels if channel.admits(observed, bindings)]
     if not admitting:
         return Verdict(scope_class=DENIED, reason="unlisted", detail=observed)
-    channel = max(admitting, key=lambda entry: len(entry.host))
+    channel = max(admitting, key=lambda entry: len(entry.endpoint(bindings) or ""))
     return Verdict(
         scope_class=EGRESS_SUPPORT,
         reason="matched_callback",
@@ -1256,6 +1377,19 @@ def diagnose(
         facts["entities"].append(_entity(policy, SELECTOR_HOST, authority))
     for authority in subtrees:
         facts["entities"].append(_entity(policy, SELECTOR_WILDCARD, authority))
+    # This command reaches no database, so a channel whose endpoint is bound at
+    # run time has no name here to compare an arrival against, and every answer
+    # below is about the declared endpoints only. Said out loud rather than left
+    # for a reader to infer from an `unlisted` about a name that is answering
+    # right now: `rk oob status` is where the live ones are.
+    bound = [entry.name for entry in policy.channels if entry.dynamic]
+    if callbacks and bound:
+        ledger.hold(
+            "callback_bindings",
+            f"{', '.join(bound)} bind an endpoint at run time, which is in the "
+            "database and not in this configuration; these verdicts read the "
+            "declared endpoints only",
+        )
     for host in callbacks:
         verdict = decide_callback(policy, host)
         facts["callbacks"].append({"host": host, **verdict.summary()})

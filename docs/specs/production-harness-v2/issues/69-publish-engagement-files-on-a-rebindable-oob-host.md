@@ -4,13 +4,13 @@
 
 **Blocked by:** 14 — Accept one explicitly configured callback Observation; 67 — Give an inbound arrival its own identity.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A target can fetch a file the operator put in one directory, over a public name, and nothing else on the machine is reachable.
-- [ ] That fetch becomes an Interaction and an Observation attributed to a subject, without an external OOB provider being involved.
-- [ ] The public name is a record in the database, not a string in a configuration file, and an agent reads the live one or gets nothing.
-- [ ] Restarting the tunnel the next day releases the old name and every correlator minted against it, and no verb hands out a name that is no longer bound.
-- [ ] Starting the publisher over a directory that fails any isolation rule refuses to start.
+- [x] A target can fetch a file the operator put in one directory, over a public name, and nothing else on the machine is reachable.
+- [x] That fetch becomes an Interaction and an Observation attributed to a subject, without an external OOB provider being involved.
+- [x] The public name is a record in the database, not a string in a configuration file, and an agent reads the live one or gets nothing.
+- [x] Restarting the tunnel the next day releases the old name and every correlator minted against it, and no verb hands out a name that is no longer bound.
+- [x] Starting the publisher over a directory that fails any isolation rule refuses to start.
 
 ## Why
 
@@ -145,6 +145,70 @@ usable across subjects without an operator maintaining a copy per correlator.
 - On start, a binding whose tunnel process is gone is released before anything
   else happens. A pause overnight and a restart in the morning is the ordinary
   path, and the old name must not survive it.
+
+## What was built
+
+**Placement and provider are two questions, and the schema asks each once.**
+`callback_correlator_claimed(placement, host, path, endpoint)` is the one place
+"which correlator does this arrival claim" is answered, and it dispatches to
+`callback_correlator_label` or to `callback_correlator_from_path`. Both readers
+cut the query before reading anything, because a quick tunnel forwards
+`/<correlator>/x.dtd?q=1` verbatim and a correlator read with `?q=1` still on it
+matches nothing that was ever minted. The Python publisher and `rk callback
+accept` cut it in the same place, and `test_a_query_is_the_payloads_business_and_not_the_correlators`
+holds the two readers against each other over a real socket.
+
+**A request that names a canary and no file is still an arrival.**
+`rk callback provision` prints `https://<endpoint>/<correlator>/`, which is the
+address an operator embeds in a payload and therefore the target most likely to
+be fetched. It names no file, and there is no listing, so the body is the same
+404 a stranger gets -- but the record is not: the correlator is the first
+segment and everything after it is the payload's business, so anything whose
+first segment resolves a live correlator becomes an Interaction and an
+Observation. `_requested` returns a correlator and a file name that may be
+absent, which is the split that makes those two decisions independent.
+
+**A first segment that no correlator could be minted in is not one.** `oob.CORRELATOR`
+mirrors the SQL readers' regex, so `/../etc/passwd` and `/C0FFEE/x.dtd` are
+refused before the database is asked, and nothing here is ever opened by name:
+the file is looked up in the mapping read at startup, so traversal is a shape
+with nowhere to go rather than a check that has to be got right.
+
+**Two counters, because they are two different things to explain.**
+`listener.refused` is an arrival nobody could attribute; `listener.lost` is one
+that was attributable and whose write the database refused. The report says
+`unattributed` and `unrecorded`. Conflating them would make a broken writer read
+as a quiet morning.
+
+**The publish root has no flag.** It is `$RK_OOB_ROOT/<program-slug>/` and
+refuses to be anything else, so a `--root` flag would have been a second way to
+say the one thing the isolation rules exist to fix. `serve(root=...)` stays as
+the seam the tests need, which is a temporary directory rather than an
+environment variable the whole test process shares.
+
+**A ceiling over the directory and a refusal for an empty one.** Neither is in
+the ticket. The directory is read once and held in memory for the life of the
+publisher, so its size is a startup fact an operator should be told rather than
+a memory footprint discovered later; and a publisher with nothing to publish is
+a name in front of nothing, which is the state `rk oob up` already refuses to
+bind in front of.
+
+**The peer address is evidence, not a column.** `callback_interactions` records
+a peer *class*, and the only address this process can see is the tunnel's own
+end of the loopback socket. `Cf-Connecting-Ip` is a header the tunnel wrote, so
+it is stored verbatim inside the transcript artifact, where a reader can weigh
+it, rather than promoted to a field the schema would present as a fact.
+
+**`released` sits beside `oob` in the facts rather than inside it.** Reaping
+happens before anything is bound, so a run that refuses afterwards -- no
+publisher answering, no tunnel name -- still has to report the names it took
+away from this machine.
+
+**`rk scope check --callback` says what it cannot know.** The command reaches no
+database by design, so a channel bound at run time has no name there to compare
+an arrival against. It now holds that out loud when the Program has such a
+channel, instead of answering `unlisted` about a name that is answering right
+now.
 
 ## The upgrade path, stated once
 

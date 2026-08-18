@@ -30,6 +30,7 @@ from redkraken import (
     identity,
     legacy,
     migrate,
+    oob,
     operator,
     panels,
     pg,
@@ -658,6 +659,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     callback_accept.add_argument(
+        "--path",
+        metavar="target",
+        help=(
+            "the request target the listener saw, for a channel that carries "
+            "its correlator in the path rather than in a label; passed on "
+            "exactly as received, and the correlator is its first segment"
+        ),
+    )
+    callback_accept.add_argument(
         "--at",
         metavar="timestamp",
         help=(
@@ -698,6 +708,158 @@ def build_parser() -> argparse.ArgumentParser:
         help="the correlator id to end; the address it was embedded in is not stored",
     )
     callback_clear.set_defaults(run=_callback_clear)
+
+    out_of_band = commands.add_parser(
+        "oob",
+        help="publish engagement files on a bound out-of-band host, and bind its name",
+    )
+    oob_operations = out_of_band.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+
+    oob_serve = oob_operations.add_parser(
+        "serve",
+        help=(
+            "publish one directory of engagement files on loopback, recording "
+            f"every request (${DATABASE_URL})"
+        ),
+        description=(
+            "Serves the files in $" + oob.ROOT_VARIABLE + "/<program-slug>/ over "
+            "loopback until interrupted. The directory is read and checked "
+            "before the socket is bound, so a root that fails any isolation "
+            "rule is a refusal to start rather than a file quietly skipped. A "
+            "request whose first path segment resolves a live correlator becomes "
+            "an Interaction and an Observation; one that resolves nothing is "
+            "answered 404 and logged, because there is nothing to attribute it to."
+        ),
+    )
+    _add_url(oob_serve, RUNTIME)
+    _add_root(oob_serve)
+    oob_serve.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and its callback channels",
+    )
+    oob_serve.add_argument(
+        "--channel",
+        required=True,
+        metavar="name",
+        help="the declared channel this directory is published for; its placement must be path",
+    )
+    oob_serve.add_argument(
+        "--port",
+        type=int,
+        default=oob.DEFAULT_PORT,
+        metavar="port",
+        help=(
+            "the loopback port to listen on; the tunnel on this machine is the "
+            f"only thing that reaches it (default: {oob.DEFAULT_PORT})"
+        ),
+    )
+    oob_serve.set_defaults(run=_oob_serve)
+
+    oob_up = oob_operations.add_parser(
+        "up",
+        help=f"start a tunnel and bind the name it is given to a channel (${DATABASE_URL})",
+        description=(
+            "Runs `" + oob.TUNNEL_BINARY + " tunnel --url http://127.0.0.1:<port>`, "
+            "reads the hostname out of its own output, stores that output as the "
+            "binding's evidence and writes the binding. A binding whose tunnel "
+            "process is gone is released first, because the name it held belongs "
+            "to somebody else now. It refuses when the publisher is not running: "
+            "a bound name in front of nothing is a name an agent will embed in a "
+            "payload."
+        ),
+    )
+    _add_url(oob_up, RUNTIME)
+    _add_root(oob_up)
+    oob_up.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and its callback channels",
+    )
+    oob_up.add_argument(
+        "--channel",
+        required=True,
+        metavar="name",
+        help=(
+            "the declared channel to bind the name to; its provider must be "
+            + oob.QUICK_PROVIDER
+        ),
+    )
+    oob_up.add_argument(
+        "--port",
+        type=int,
+        default=oob.DEFAULT_PORT,
+        metavar="port",
+        help=f"the loopback port the publisher is on (default: {oob.DEFAULT_PORT})",
+    )
+    oob_up.add_argument(
+        "--tunnel",
+        default=oob.TUNNEL_BINARY,
+        metavar="binary",
+        help=(
+            "the tunnel program to run, found the way the operator installed it "
+            f"(default: {oob.TUNNEL_BINARY})"
+        ),
+    )
+    oob_up.set_defaults(run=_oob_up)
+
+    oob_status = oob_operations.add_parser(
+        "status",
+        help=f"print the name a channel is answering at, and what hangs off it (${DATABASE_URL})",
+        description=(
+            "The only supported way to learn the live name. Nothing in a "
+            "configuration file holds it and no agent composes it: this reads "
+            "the binding, so a name released this morning is absent here rather "
+            "than embedded in a payload this afternoon."
+        ),
+    )
+    _add_url(oob_status, RUNTIME)
+    oob_status.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and its callback channels",
+    )
+    oob_status.add_argument(
+        "--channel",
+        required=True,
+        metavar="name",
+        help="the declared channel to read the binding of",
+    )
+    oob_status.set_defaults(run=_oob_status)
+
+    oob_down = oob_operations.add_parser(
+        "down",
+        help=f"release the name a channel is bound to (${DATABASE_URL})",
+        description=(
+            "Releases the binding. Every correlator minted against it is "
+            "unreachable from that moment -- not by a sweep, but because it "
+            "names a released binding -- and the verb says how many that was. "
+            "The tunnel process is the operator's to stop."
+        ),
+    )
+    _add_url(oob_down, RUNTIME)
+    oob_down.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program and its callback channels",
+    )
+    oob_down.add_argument(
+        "--channel",
+        required=True,
+        metavar="name",
+        help="the declared channel to release the binding of",
+    )
+    oob_down.set_defaults(run=_oob_down)
 
     artifacts = commands.add_parser(
         "artifact", help="store, read and verify this Program's content-addressed artifacts"
@@ -2157,6 +2319,7 @@ def _callback_accept(arguments: argparse.Namespace) -> int:
                 root=root,
                 peer=arguments.peer,
                 at=arguments.at,
+                path=arguments.path,
             ),
         )
     )
@@ -2171,6 +2334,73 @@ def _callback_clear(arguments: argparse.Namespace) -> int:
         _guarded(
             callback.CLEAR,
             lambda: callback.clear(runtime, arguments.config, arguments.correlator),
+        )
+    )
+
+
+def _oob_serve(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, oob.SERVE)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(oob.SERVE, ledger))
+    return _render(
+        _guarded(
+            oob.SERVE,
+            lambda: oob.serve(
+                runtime,
+                arguments.config,
+                arguments.channel,
+                store=root,
+                port=arguments.port,
+            ),
+        )
+    )
+
+
+def _oob_up(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, oob.UP)
+    root = _root(ledger, arguments.artifacts)
+    if runtime is None or root is None:
+        return _render(report(oob.UP, ledger))
+    return _render(
+        _guarded(
+            oob.UP,
+            lambda: oob.up(
+                runtime,
+                arguments.config,
+                arguments.channel,
+                store=root,
+                port=arguments.port,
+                binary=arguments.tunnel,
+            ),
+        )
+    )
+
+
+def _oob_status(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, oob.STATUS)
+    if runtime is None:
+        return _render(report(oob.STATUS, ledger))
+    return _render(
+        _guarded(
+            oob.STATUS,
+            lambda: oob.status(runtime, arguments.config, arguments.channel),
+        )
+    )
+
+
+def _oob_down(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, oob.DOWN)
+    if runtime is None:
+        return _render(report(oob.DOWN, ledger))
+    return _render(
+        _guarded(
+            oob.DOWN,
+            lambda: oob.down(runtime, arguments.config, arguments.channel),
         )
     )
 
