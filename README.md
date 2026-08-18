@@ -346,3 +346,74 @@ role and registered in the schema at the exact text this checkout ships; the 73
 operator references and 9 sink packs are each attached to one Skill or Playbook
 that declares them and nothing sits loose in a `references/` directory; and the
 52 retirements split by kind under a scope whose reversal is on record.
+
+The composed suite is the same modules with a server and a container engine
+behind them. It needs a PostgreSQL 18 superuser URL and, for the container
+cases, the two images:
+
+```sh
+RK_TEST_SUPERUSER_URL=postgres://postgres:...@127.0.0.1:5432/postgres \
+RK_TEST_CONTAINERS=1 \
+python3 -m unittest discover -q
+```
+
+Without `RK_TEST_SUPERUSER_URL` the database cases skip; without
+`RK_TEST_CONTAINERS=1` the boundary cases skip. `RK_TEST_AGENT_IMAGE` and
+`RK_TEST_BROWSER_IMAGE` name the images those cases run in.
+
+## The release gate
+
+The suites measure a checkout. The release gate measures the artifact:
+
+```sh
+python3 -m tools.release_gate --superuser-url postgres://postgres:...@127.0.0.1:5432/postgres
+```
+
+It exports `HEAD` with `git archive` into a scratch directory, installs it
+there through the documented offline path, and then does everything else with
+that installation rather than with this checkout. Six stages, in order, each
+using what the one before it built:
+
+* `export` — the commit and nothing lying next to it.
+* `install` — the offline install, then what it left behind: only `redkraken`
+  and `pip` in the environment, a distribution that declares no requirement of
+  its own, none of the checkout-only directories inside the installed package or
+  beside it (`docs`, `prototype`, `scratch`, `tmp`, `tests`, `tools`, `.git`,
+  `.venv`), and `rk --version`, `rk version` and `rk doctor` all answering from
+  a build the application recognises as its own.
+* `database` — provision, migrate, status, verify, migrate again, run, read,
+  dump, restore into a second database, verify that, and open the same Program
+  on the restored copy to prove it resumes rather than starts over. The second
+  migrate is the upgrade reading and it is judged on what it applied, not on
+  whether it succeeded: an installation that reapplied the corpus over a current
+  database reports the same `ok`.
+* `topology` — the internal Agent network, a routable egress network and the
+  door joined to both by `rk proxy door`, with the Agent network holding the
+  door and nothing else.
+* `privileges` — ticket 66's standing check on both databases, the migrated one
+  and the restored one.
+* `suites` — the offline suite and the composed suite, each twice, run from the
+  export against the installed application. Twice because the second run is what
+  proves the first left the server as it found it. A suite exits zero when it
+  skips everything, so the counts are read too: both runs of a suite must select
+  the same tests, and the composed run must skip fewer of them than the offline
+  run did.
+
+`--stage NAME` selects a stage (repeat it for several), `--keep` leaves the
+build directory and the databases behind, and the two together are how a single
+stage gets iterated on. A selection that names a stage whose input nothing built
+is refused at once, naming the stage that builds it: `--root` then has to point
+at a directory a kept run already left behind. `--keep` also leaves the
+generated role passwords in `roles.json` under that directory, readable only by
+the user that ran the gate; a kept root is a credential and should be removed
+with the databases it belongs to.
+
+Nothing the gate runs inherits the calling environment; every child gets `PATH`,
+`HOME`, `TMPDIR` and `LANG` written from scratch, so neither a provider key nor
+a database URL exported in the shell that starts it can reach the installation
+being measured. The `topology` stage needs a container engine and the Agent
+image, and fails rather than skipping when either is missing.
+
+The superuser URL must point at a server that can be dropped: the gate creates,
+drops and recreates `rk2_release_gate`, `rk2_release_gate_restored` and
+`rk2_gate_suite`.
