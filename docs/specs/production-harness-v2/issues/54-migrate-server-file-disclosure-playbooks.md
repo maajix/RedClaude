@@ -36,7 +36,7 @@ upload interpretation, document parsing and server-side request behaviour -- lan
 - [x] SSRF and URL-routing evidence uses configured callback or controlled local targets and cannot authorize adjacent-host discovery or third-party contact.
 - [x] File and deserialization tests declare mutation, cleanup and execution ceilings before any higher-risk action.
 - [x] Fixtures include secure normalization, harmless error, decoy secret and non-fetching URL controls.
-- [ ] All seven exact hashes pass loadability, relevant positive recall and adversarial precision gates before stable promotion.
+- [ ] All seven exact hashes pass loadability, relevant positive recall and adversarial precision gates before stable promotion. **Partial:** loadability holds and the fixtures grade offline; the production gates wait on the route above. Ticket 78 closes it.
 
 ## Comments
 

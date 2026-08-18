@@ -1,0 +1,716 @@
+"""The release audit: every requirement in the Spec, delivered and checked by something that can fail.
+
+The other three gates each read one artifact. `check_baseline` reads the tree,
+`check_dispositions` reads the ledger row by row and `check_coverage` reads the
+shape of the migration those rows describe. None of them has ever read the Spec,
+so the one claim nobody could make from inside this repository is the claim the
+release turns on: that the two hundred and thirty numbered stories, the nineteen
+Implementation Decisions, the twenty-four Testing Decisions, the nine
+Out-of-Scope constraints and the seven registered prototype regressions were each
+built by somebody and are each checked by something that would go red.
+
+Coverage of a *plan* is what the ticket-coverage audit measures, and it is a
+different and much weaker statement: a plan can cover a Spec perfectly and be
+built not at all. The two are kept apart on purpose, and this file is the one
+that is allowed to say "delivered". What makes that sayable is one table --
+`baseline/spec-evidence.tsv` -- with one row per requirement, and four readings
+over it:
+
+* every requirement in the Spec has exactly one row, and the row is frozen at
+  the digest of the requirement's own text, so a story reworded after somebody
+  mapped it stops matching and the release stops;
+* every row names tickets that exist and are resolved, and evidence that is a
+  test this checkout can run or a gate this checkout ships -- there is no third
+  kind, which is how "prose-only" is refused rather than warned about;
+* every ticket from 01 to 62 is resolved, has no unresolved blocker, and names a
+  revision git can resolve: the commit that turned its status into `resolved`;
+  and every acceptance box it left unticked says which open ticket closes it, so
+  a deferral is a tracked piece of work rather than a box somebody stopped
+  looking at;
+* and the dependency graph is acyclic, every blocker exists, and every resolved
+  ticket lies on a path to the release outcome -- a ticket nothing downstream
+  names is work the release does not depend on, however green it is.
+
+The last reading is the one with a history. Tickets 66 through 83 were raised
+after the original plan froze, and each of them arrived as a sink beside ticket
+65 rather than as something the release needs; that is the exact shape this
+reading refuses, and the graph is now written so it holds.
+
+Two things this gate deliberately does not do. It does not measure whether the
+cited evidence is *good* -- a test that asserts nothing would satisfy it, and
+only the code review the next ticket runs can catch that. And by default it does
+not run anything: the static pass proves the map resolves, and `--run` is what
+proves the map passes, because a citation that is skipped for want of a database
+or a container is not evidence of anything either and is reported as such.
+
+Run it as a module -- `python3 -m tools.check_audit` -- like the other three, and
+for the same reason: it reads the registry through the checker that owns it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import re
+import subprocess
+import sys
+import unittest
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+from tools.check_baseline import BASELINE, CHECKOUT, BaselineError, read_status, read_table
+
+
+#: The evidence map. In `baseline/` with the census and the ledger because it is
+#: the same kind of file: a frozen table a repository check reads and no part of
+#: the application ever opens.
+MAP = BASELINE / "spec-evidence.tsv"
+FIELDS = ("source", "sha256", "area", "tickets", "evidence")
+
+#: The classified tree this Spec lives in. Named by slug and resolved through the
+#: status registry rather than spelled as a path, because the registry is what
+#: already declares where this specification is and refuses to describe a tree
+#: that is not there -- and because production code may not name that root at all.
+SPEC_SLUG = "production-harness-v2"
+DOCUMENTATION = "documentation"
+SPEC_FILE = "spec.md"
+ISSUES = "issues"
+
+#: What the Spec is required to hold. Constants rather than counts taken from the
+#: file, for the reason the migration's numbers are constants: a total derived
+#: from the document it is checking agrees with it however the document changes,
+#: and "two hundred and thirty stories" is a decision somebody took.
+STORIES = 230
+DECISIONS = 19
+TESTING = 24
+OUT_OF_SCOPE = 9
+
+#: Criterion 3's range, and the ticket every resolved ticket must reach.
+AUDITED = range(1, 63)
+RELEASE_OUTCOME = 65
+
+#: Criterion 6, spelled as the eight subsystems the ticket names. An area is a
+#: column in the map, and each of these must hold at least one requirement whose
+#: evidence reaches every anchor beside it. Anchors are what stop the column from
+#: being a label: "the audit verifies Playbooks" is a sentence anybody can type,
+#: and "some row in the playbooks area cites the catalogue gate" is not.
+AREAS = {
+    "runtime": ("tests.test_database",),
+    "agents": ("tests.test_agent", "tests.test_roster"),
+    "skills": ("tests.test_skill",),
+    "playbooks": ("tests.test_playbook", "gate:tools.check_coverage"),
+    "operator": ("tests.test_cli", "tests.test_ui"),
+    "v1_import": ("tests.test_legacy", "gate:tools.check_dispositions"),
+    "long_session": ("tests.test_capsule", "tests.test_database.CampaignRecoveryTest"),
+    "first_hunt": ("gate:tools.release_gate",),
+}
+
+#: The one prefix an evidence citation may carry instead of being a test name.
+GATE = "gate:"
+TESTS = "tests"
+
+#: How a ticket file states the two things this gate reads off it.
+STATUS = re.compile(r"^\*\*Status:\*\*\s*(.+?)\s*$", re.MULTILINE)
+BLOCKED = re.compile(r"^\*\*Blocked by:\*\*\s*(.+?)\s*$", re.MULTILINE)
+CRITERION = re.compile(r"^- \[( |x)\] (.+)$", re.MULTILINE)
+RESOLVED = "resolved"
+
+#: How a resolved ticket points an unticked criterion at the work that closes it.
+#: Read as a marker rather than as any number in the line, because acceptance
+#: criteria count things -- eight hashes, 223 rows, 49 Playbooks -- and a count is
+#: not a ticket.
+DEFERRAL = re.compile(r"[Tt]icket (\d+)")
+
+#: The line whose appearance in a ticket's history is the revision that resolved
+#: it. Searched for as a string rather than reconstructed from a message, because
+#: a commit subject is prose and this is the fact the tracker actually records.
+RESOLUTION = f"**Status:** {RESOLVED}"
+
+
+class AuditError(Exception):
+    """A Spec that is not delivered, as opposed to a tree that does not close."""
+
+
+@dataclass(frozen=True)
+class Ticket:
+    """One issue file, read for the four things the graph and the audit ask of it."""
+
+    number: int
+    name: str
+    status: str
+    blockers: tuple[int, ...]
+    criteria: tuple[tuple[bool, str], ...]
+
+    @property
+    def resolved(self) -> bool:
+        return self.status == RESOLVED
+
+    @property
+    def deferred(self) -> tuple[str, ...]:
+        """The criteria this ticket was resolved without ticking."""
+        return tuple(text for ticked, text in self.criteria if not ticked)
+
+
+@dataclass(frozen=True)
+class Audit:
+    """The Spec, the tracker and the map, gathered once and read together."""
+
+    #: Every requirement the Spec and the registry state, by key, at its own text.
+    requirements: dict[str, str]
+    #: Every ticket in the tracker, by number.
+    tickets: dict[int, Ticket]
+    #: The map's rows, in file order.
+    rows: list[dict[str, str]]
+    #: Every name this checkout can run, and every gate it ships.
+    runnable: frozenset[str]
+    gates: frozenset[str]
+
+    def cited(self, source: str) -> tuple[int, ...]:
+        """The tickets one row names, in row order."""
+        for row in self.rows:
+            if row["source"] == source:
+                return ticket_numbers(row["tickets"])
+        return ()
+
+
+def spec_root(status: dict) -> Path:
+    """The tree the status registry classifies as this Spec's documentation.
+
+    Asked of the registry because the registry is already required to be honest
+    about it: `read_status` refuses a classification whose path is not there, so
+    a Spec that moved without the registry moving with it fails before this gate
+    reads a word of it.
+    """
+    named = [
+        entry["path"]
+        for entry in status["classifications"]
+        if entry["classification"] == DOCUMENTATION and Path(entry["path"]).name == SPEC_SLUG
+    ]
+    if len(named) != 1:
+        raise AuditError(f"the status registry classifies {len(named)} trees as {SPEC_SLUG}")
+    return CHECKOUT / named[0]
+
+
+def paragraphs(lines: list[str]) -> list[str]:
+    """The top-level bullets of one section, each with its continuation lines joined.
+
+    A bullet is the unit the Spec writes a Testing Decision and an Out-of-Scope
+    constraint in, and half of one is not a requirement: the digest has to be
+    taken over everything the bullet says, or a constraint could lose its second
+    sentence without the map noticing.
+    """
+    bullets: list[str] = []
+    for line in lines:
+        if line.startswith("- "):
+            bullets.append(line[2:].strip())
+        elif bullets and line.startswith("  ") and line.strip():
+            bullets[-1] += " " + line.strip()
+    return bullets
+
+
+def sections(text: str) -> dict[str, list[str]]:
+    """The Spec's top-level headings, each with the lines under it."""
+    found: dict[str, list[str]] = {}
+    current = ""
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            found[current] = []
+        elif current:
+            found[current].append(line)
+    return found
+
+
+def read_spec(root: Path, status: dict) -> dict[str, str]:
+    """Every requirement this release is measured against, by key, at its own text.
+
+    Four of the five kinds are read out of the Spec. The fifth is not in the Spec
+    at all: the known prototype regressions are frozen in the status registry,
+    with the tickets each one requires, and reading them from there is what makes
+    the two files one statement rather than two lists that happen to agree.
+    """
+    spec = (root / SPEC_FILE).read_text(encoding="utf-8")
+    found = sections(spec)
+    missing = {"User Stories", "Implementation Decisions", "Testing Decisions", "Out of Scope"}
+    missing -= set(found)
+    if missing:
+        raise AuditError("the spec has no " + ", ".join(sorted(missing)) + " section")
+
+    requirements: dict[str, str] = {}
+
+    numbered = [
+        (int(match.group(1)), match.group(2).strip())
+        for line in found["User Stories"]
+        for match in [re.match(r"^(\d+)\.\s+(.*)$", line)]
+        if match
+    ]
+    if [number for number, _ in numbered] != list(range(1, STORIES + 1)):
+        raise AuditError(f"the spec must hold user stories 1 through {STORIES}, numbered in order")
+    requirements.update({f"story:{number:03d}": text for number, text in numbered})
+
+    decisions: dict[str, list[str]] = {}
+    for line in found["Implementation Decisions"]:
+        heading = re.match(r"^###\s+(\d+)\.\s+(.*)$", line)
+        if heading:
+            decisions[f"decision:{int(heading.group(1)):02d}"] = [heading.group(2).strip()]
+        elif decisions and line.strip():
+            decisions[next(reversed(decisions))].append(line.strip())
+    if len(decisions) != DECISIONS:
+        raise AuditError(f"the spec must hold {DECISIONS} implementation decisions")
+    requirements.update({key: " ".join(body) for key, body in decisions.items()})
+
+    for section, prefix, expected in (
+        ("Testing Decisions", "testing", TESTING),
+        ("Out of Scope", "scope", OUT_OF_SCOPE),
+    ):
+        bullets = paragraphs(found[section])
+        if len(bullets) != expected:
+            raise AuditError(f"the spec must hold {expected} entries under {section}")
+        requirements.update({
+            f"{prefix}:{number:02d}": text for number, text in enumerate(bullets, 1)
+        })
+
+    requirements.update({
+        f"regression:{entry['id']}": entry["description"] for entry in status["regressions"]
+    })
+    return requirements
+
+
+def ticket_numbers(value: str) -> tuple[int, ...]:
+    """The ticket numbers one line names, in the order it names them.
+
+    Leading numbers only, and per clause: a blocker line spells each edge as
+    "NN -- title", and a title is free to hold a number of its own that means
+    something else entirely.
+    """
+    numbers = []
+    for clause in value.replace(";", ",").split(","):
+        match = re.match(r"^\s*(\d+)\b", clause)
+        if match:
+            numbers.append(int(match.group(1)))
+    return tuple(numbers)
+
+
+def read_tickets(root: Path) -> dict[int, Ticket]:
+    """Every issue file in the tracker, by number."""
+    tickets: dict[int, Ticket] = {}
+    for path in sorted((root / ISSUES).glob("*.md")):
+        match = re.match(r"^(\d+)-", path.name)
+        if not match:
+            raise AuditError(f"a ticket file must start with its number: {path.name}")
+        number = int(match.group(1))
+        if number in tickets:
+            raise AuditError(f"two ticket files are numbered {number:02d}")
+        text = path.read_text(encoding="utf-8")
+        status = STATUS.search(text)
+        blocked = BLOCKED.search(text)
+        if not status or not blocked:
+            raise AuditError(f"ticket {number:02d} states no status or no blockers")
+        tickets[number] = Ticket(
+            number=number,
+            name=path.stem,
+            status=status.group(1).strip(),
+            blockers=ticket_numbers(blocked.group(1)),
+            criteria=tuple(
+                (match.group(1) == "x", match.group(2).strip())
+                for match in CRITERION.finditer(text)
+            ),
+        )
+    return tickets
+
+
+def runnable_names(root: Path) -> frozenset[str]:
+    """Every module, case and method under `tests/` that a citation may name.
+
+    Read with `ast` rather than by importing, because a citation has to be
+    resolvable without a database, a container or a network: importing the suite
+    to find out whether a name exists would make the static half of this gate
+    need the world the run half is careful to ask for explicitly.
+    """
+    names: set[str] = set()
+    for path in sorted(root.glob("test_*.py")):
+        module = f"{TESTS}.{path.stem}"
+        names.add(module)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (SyntaxError, UnicodeError) as error:
+            raise AuditError(f"cannot inspect the suite: {path.name}: {error}") from error
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            names.add(f"{module}.{node.name}")
+            names.update(
+                f"{module}.{node.name}.{item.name}"
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name.startswith("test")
+            )
+    return frozenset(names)
+
+
+def gate_names(root: Path) -> frozenset[str]:
+    """Every repository check a citation may name, by module."""
+    return frozenset(
+        f"{root.name}.{path.stem}"
+        for path in sorted(root.glob("*.py"))
+        if "def main(" in path.read_text(encoding="utf-8")
+    )
+
+
+def resolution(root: Path, ticket: Ticket) -> str:
+    """The revision that resolved one ticket, or the empty string if none did.
+
+    The commit that added the resolved status line to that file, which is the
+    thing the tracker actually records; a commit subject naming a ticket is prose
+    and two of them can name the same one. `-S` reports every commit where the
+    count of that string changed, and the first line of the log is the newest,
+    which is the revision the current status came from.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(CHECKOUT),
+            "log",
+            "--format=%H",
+            f"-S{RESOLUTION}",
+            "--",
+            str((root / ISSUES / f"{ticket.name}.md").relative_to(CHECKOUT)),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AuditError(f"the tracker is not a readable git worktree: {result.stderr.strip()}")
+    revisions = result.stdout.split()
+    return revisions[0] if revisions else ""
+
+
+def map_errors(audit: Audit) -> list[str]:
+    """Criteria 1, 2 and 5: one row per requirement, and nothing in it that is prose."""
+    keys = [row["source"] for row in audit.rows]
+    errors = [
+        f"{key}: the spec states it and the map does not"
+        for key in sorted(set(audit.requirements) - set(keys))
+    ]
+    errors.extend(
+        f"{key}: the map claims a requirement the spec does not state"
+        for key in sorted(set(keys) - set(audit.requirements))
+    )
+
+    for row in audit.rows:
+        source = row["source"]
+        text = audit.requirements.get(source)
+        if text is None:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if row["sha256"] != digest:
+            # The requirement was edited after somebody mapped it. Whatever the
+            # evidence proves, it was chosen against different words.
+            errors.append(
+                f"{source}: mapped at {row['sha256'][:12]} and the spec now states {digest[:12]}"
+            )
+        if row["area"] not in AREAS:
+            errors.append(f"{source}: {row['area']} is not one of the audited areas")
+
+        cited = ticket_numbers(row["tickets"])
+        if not cited:
+            errors.append(f"{source}: no ticket implements it")
+        errors.extend(
+            f"{source}: names ticket {number:02d}, which the tracker does not hold"
+            for number in cited
+            if number not in audit.tickets
+        )
+        errors.extend(
+            f"{source}: ticket {number:02d} is {audit.tickets[number].status}, not {RESOLVED}"
+            for number in cited
+            if number in audit.tickets and not audit.tickets[number].resolved
+        )
+
+        evidence = [token for token in row["evidence"].split(";") if token.strip()]
+        if not evidence:
+            # Criterion 5's testless requirement: something somebody believes is
+            # built, with nothing that could report otherwise.
+            errors.append(f"{source}: no test or gate checks it")
+        for token in evidence:
+            token = token.strip()
+            if token.startswith(GATE):
+                if token[len(GATE):] not in audit.gates:
+                    errors.append(f"{source}: {token} is not a gate this checkout ships")
+            elif token.startswith(f"{TESTS}."):
+                if token not in audit.runnable:
+                    errors.append(f"{source}: {token} is not a test this checkout can run")
+            else:
+                # Criterion 5's prose-only requirement. A document, a heading or a
+                # sentence cannot fail, so it cannot be evidence.
+                errors.append(f"{source}: {token} is neither a test nor a gate")
+    return errors
+
+
+def ticket_errors(audit: Audit, root: Path) -> list[str]:
+    """Criterion 3: every ticket in the audited range is done, and the revision says when."""
+    errors = []
+    for number in AUDITED:
+        ticket = audit.tickets.get(number)
+        if ticket is None:
+            errors.append(f"ticket {number:02d}: the tracker holds no such ticket")
+            continue
+        if not ticket.resolved:
+            errors.append(f"ticket {number:02d}: {ticket.status}, not {RESOLVED}")
+            continue
+        if not ticket.criteria:
+            errors.append(f"ticket {number:02d}: resolved with no acceptance criteria")
+        for criterion in ticket.deferred:
+            # An unticked box on a resolved ticket is either an honest deferral or
+            # an abandoned one, and the difference is whether somebody still owes
+            # the work. A ticket that has itself been resolved cannot owe it.
+            owed = [
+                other
+                for other in (int(found) for found in DEFERRAL.findall(criterion))
+                if other in audit.tickets and not audit.tickets[other].resolved
+            ]
+            if not owed:
+                errors.append(
+                    f"ticket {number:02d}: unticked criterion names no open ticket:"
+                    f" {criterion[:72]}"
+                )
+        errors.extend(
+            f"ticket {number:02d}: blocked by {blocker:02d}, which is"
+            f" {audit.tickets[blocker].status}"
+            for blocker in ticket.blockers
+            if blocker in audit.tickets and not audit.tickets[blocker].resolved
+        )
+        if not resolution(root, ticket):
+            errors.append(f"ticket {number:02d}: no revision resolved it")
+    return errors
+
+
+def graph_errors(audit: Audit) -> list[str]:
+    """Criterion 4: the blockers exist, the graph is acyclic, and the work ends somewhere."""
+    errors = [
+        f"ticket {ticket.number:02d}: blocked by {blocker:02d}, which does not exist"
+        for ticket in audit.tickets.values()
+        for blocker in ticket.blockers
+        if blocker not in audit.tickets
+    ]
+
+    #: Depth-first, three-coloured, so the cycle is named rather than counted.
+    state: dict[int, int] = {}
+    cycles: list[str] = []
+
+    def walk(number: int, path: list[int]) -> None:
+        state[number] = 1
+        for blocker in audit.tickets[number].blockers:
+            if blocker not in audit.tickets:
+                continue
+            if state.get(blocker) == 1:
+                cycle = path[path.index(blocker):] if blocker in path else [number]
+                cycles.append(" -> ".join(f"{step:02d}" for step in [*cycle, blocker]))
+            elif blocker not in state:
+                walk(blocker, [*path, blocker])
+        state[number] = 2
+
+    for number in sorted(audit.tickets):
+        if number not in state:
+            walk(number, [number])
+    errors.extend(f"the dependency graph holds a cycle: {cycle}" for cycle in sorted(set(cycles)))
+
+    if RELEASE_OUTCOME not in audit.tickets:
+        errors.append(f"the tracker holds no release outcome: ticket {RELEASE_OUTCOME}")
+        return errors
+
+    # Everything the release outcome rests on, transitively. Anything resolved
+    # and outside it is finished work nothing downstream asks for, which is the
+    # one way a green ticket can still not be part of a release.
+    needed = {RELEASE_OUTCOME}
+    frontier = [RELEASE_OUTCOME]
+    while frontier:
+        for blocker in audit.tickets[frontier.pop()].blockers:
+            if blocker in audit.tickets and blocker not in needed:
+                needed.add(blocker)
+                frontier.append(blocker)
+    errors.extend(
+        f"ticket {ticket.number:02d}: resolved, and no path reaches"
+        f" ticket {RELEASE_OUTCOME} from it"
+        for ticket in sorted(audit.tickets.values(), key=lambda one: one.number)
+        if ticket.resolved and ticket.number not in needed
+    )
+    return errors
+
+
+def area_errors(audit: Audit) -> list[str]:
+    """Criterion 6: each named subsystem holds requirements, and its anchors are cited."""
+    errors = []
+    by_area: dict[str, list[str]] = {area: [] for area in AREAS}
+    for row in audit.rows:
+        if row["area"] in by_area:
+            by_area[row["area"]].extend(
+                token.strip() for token in row["evidence"].split(";") if token.strip()
+            )
+    for area, anchors in AREAS.items():
+        if not by_area[area]:
+            errors.append(f"{area}: the map covers no requirement in this area")
+            continue
+        errors.extend(
+            f"{area}: no requirement in this area is checked by {anchor}"
+            for anchor in anchors
+            if not any(
+                token == anchor or token.startswith(f"{anchor}.") for token in by_area[area]
+            )
+        )
+    return errors
+
+
+def regression_errors(audit: Audit, status: dict) -> list[str]:
+    """Criterion 2's registered half: each regression is mapped to the tickets it requires."""
+    errors = []
+    for entry in status["regressions"]:
+        cited = set(audit.cited(f"regression:{entry['id']}"))
+        absent = sorted(set(entry["required_tickets"]) - cited)
+        errors.extend(
+            f"regression:{entry['id']}: the registry requires ticket {number:02d}"
+            f" and the map does not name it"
+            for number in absent
+        )
+    return errors
+
+
+def selected(rows: list[dict[str, str]]) -> list[str]:
+    """The cited tests, deduplicated and shortened to the broadest citation of each.
+
+    A method cited beside its own case is the case, twice: `unittest` would load
+    and run it under both names, and a suite that reports a test twice cannot be
+    compared with the count of what was asked for.
+    """
+    names = {
+        token.strip()
+        for row in rows
+        for token in row["evidence"].split(";")
+        if token.strip() and not token.strip().startswith(GATE)
+    }
+    return sorted(
+        name
+        for name in names
+        if not any(other != name and name.startswith(f"{other}.") for other in names)
+    )
+
+
+def run_errors(names: list[str], stream=sys.stderr) -> tuple[list[str], str]:
+    """Criterion 1's other half: the cited evidence is run, and it holds.
+
+    A skip is a refusal here rather than a pass. Most of this suite's live arms
+    stand down without a database or a container, and a citation that stood down
+    proves exactly nothing about the requirement that cites it -- which is the
+    difference between this and running the suite for a green exit code.
+    """
+    suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+    result = unittest.TextTestRunner(verbosity=0, stream=stream).run(suite)
+    errors = [f"{case}: failed" for case, _ in result.failures]
+    errors.extend(f"{case}: errored" for case, _ in result.errors)
+    errors.extend(f"{case}: skipped, so it proves nothing" for case, _ in result.skipped)
+    report = (
+        f"  {'cited evidence':<22}{len(names):>4}"
+        f"   tests {result.testsRun}  failed {len(result.failures) + len(result.errors)}"
+        f"  skipped {len(result.skipped)}"
+    )
+    return errors, report
+
+
+def report(audit: Audit) -> str:
+    """The counts, measured and in one fixed order, so two runs of it diff to nothing."""
+    kinds = Counter(row["source"].split(":")[0] for row in audit.rows)
+    areas = Counter(row["area"] for row in audit.rows)
+    tests = {
+        token.strip()
+        for row in audit.rows
+        for token in row["evidence"].split(";")
+        if token.strip() and not token.strip().startswith(GATE)
+    }
+    gates = {
+        token.strip()
+        for row in audit.rows
+        for token in row["evidence"].split(";")
+        if token.strip().startswith(GATE)
+    }
+    resolved = sum(1 for ticket in audit.tickets.values() if ticket.resolved)
+    deferred = sum(
+        len(audit.tickets[number].deferred) for number in AUDITED if number in audit.tickets
+    )
+    lines = [
+        "spec coverage",
+        f"  {'stories':<22}{kinds['story']:>4}   decisions {kinds['decision']}"
+        f"  testing {kinds['testing']}  scope {kinds['scope']}"
+        f"  regressions {kinds['regression']}",
+        f"  {'evidence':<22}{len(tests) + len(gates):>4}"
+        f"   tests {len(tests)}  gates {len(gates)}",
+        f"  {'tickets':<22}{len(audit.tickets):>4}"
+        f"   resolved {resolved}  audited {len(AUDITED)}  deferred criteria {deferred}",
+    ]
+    lines.extend(
+        f"  {'area: ' + area:<22}{areas[area]:>4}   anchors {len(AREAS[area])}"
+        for area in AREAS
+    )
+    return "\n".join(lines)
+
+
+def gather(map_path: Path | None = None) -> tuple[Audit, Path, dict]:
+    """Read the registry, the Spec, the tracker and the map once."""
+    status = read_status()
+    root = spec_root(status)
+    return (
+        Audit(
+            requirements=read_spec(root, status),
+            tickets=read_tickets(root),
+            rows=read_table(map_path or MAP, FIELDS, "evidence map"),
+            runnable=runnable_names(CHECKOUT / TESTS),
+            gates=gate_names(CHECKOUT / "tools"),
+        ),
+        root,
+        status,
+    )
+
+
+def check(map_path: Path | None = None, run: bool = False) -> str:
+    """The release audit. Returns the report, or raises with every reason it failed."""
+    audit, root, status = gather(map_path)
+    errors = [
+        *map_errors(audit),
+        *ticket_errors(audit, root),
+        *graph_errors(audit),
+        *area_errors(audit),
+        *regression_errors(audit, status),
+    ]
+    lines = [report(audit)]
+    if run and not errors:
+        # After the static pass and only after it: names that do not resolve are
+        # names `unittest` refuses to load, and the refusal it raises would be
+        # this gate reporting an import error where it has a list of them.
+        failures, measured = run_errors(selected(audit.rows))
+        errors.extend(failures)
+        lines.append(measured)
+    if errors:
+        raise AuditError("\n".join(errors))
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="run every cited test and refuse a failure, an error or a skip",
+    )
+    arguments = parser.parse_args(argv)
+    try:
+        print(check(run=arguments.run))
+    except (AuditError, BaselineError, OSError) as error:
+        print(f"audit failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

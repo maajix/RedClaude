@@ -32,7 +32,7 @@ five is loadable by exactly one production role.
 - [x] Kubernetes and deployment checks remain limited to explicitly scoped web/API ingress and do not expand into infrastructure discovery.
 - [x] Logging and supply-chain fixtures distinguish public metadata from credential/artifact exposure and runtime reachability.
 - [x] Stale upstream knowledge or expired verification prevents stable selection until reevaluated.
-- [ ] All five exact hashes pass role loadability, matching selection and positive/adversarial fixture promotion gates.
+- [ ] All five exact hashes pass role loadability, matching selection and positive/adversarial fixture promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 closes it.
 
 ## Comments
 

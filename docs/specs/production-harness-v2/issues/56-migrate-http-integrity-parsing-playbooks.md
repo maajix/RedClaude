@@ -45,7 +45,7 @@ role.
 - [x] Smuggling, coalescing, host/header, parameter and integrity variants use controlled local fixtures and explicit negative baselines.
 - [x] Availability-impacting request patterns are absent unless separately granted and bounded.
 - [x] Protocol claims cite exact request/response bytes and transport path rather than banner, generic error or race-only behavior.
-- [ ] All three exact hashes pass relevant positive and adversarial evaluation before stable promotion.
+- [ ] All three exact hashes pass relevant positive and adversarial evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 closes it.
 
 ## Comments
 

@@ -1,37 +1,45 @@
 # Production harness v2 — ticket coverage audit
 
-Status: ticket-plan coverage complete; implementation in progress
+Status: ticket-plan coverage complete; implementation complete except the final
+review, the release outcome and four open research tickets
 
 This audit answers whether the approved ticket plan covers the production Spec
 and ends in a runnable first-hunt release candidate. Coverage is a property of
 the plan; the progress section below is the separate, smaller claim about what
-has been built, and neither section is evidence for the other. Ticket 63 remains
-the only thing that proves per-story implementation.
+has been built, and neither section is evidence for the other. Per-story
+implementation is no longer this file's claim to make: ticket 63 built
+`baseline/spec-evidence.tsv` and `tools/check_audit.py`, which hold a digest of
+every requirement's own text against the tickets that built it and the tests or
+gates that check it, and refuse the release when one of them is unmapped.
 
 ## Structural validation
 
-Re-measured 2026-08-13, after tickets 67–70 were raised by the ticket-14 review,
-71–73 by the ticket-18 review and 74–75 by the ticket-71 implementation and its
-review, all triaged into the graph.
+Re-measured 2026-08-18, after tickets 76–80 were raised by implementation reviews
+and research, and 81–83 by authorised live validation, all triaged into the graph.
+The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
+the audit gate parses, so this table and that gate cannot disagree.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 75, numbered continuously 01–75 |
-| Ticket status | 26 `resolved`, 49 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 430 total, 150 ticked |
-| Blocking edges | 134 exact title-and-number references |
+| Ticket files | 83, numbered continuously 01–83 |
+| Ticket status | 77 `resolved`, 6 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 475 total, 425 ticked |
+| Blocking edges | 154 exact title-and-number references |
 | Dependency graph | Acyclic |
-| Initial frontier | Ticket 01 only |
-| Release reachability | Every ticket except 67–75 has a dependency path to ticket 65 |
-| Absolute, scratch or issue-file paths in tickets | 0 |
+| Open frontier | 64, 77, 78, 79, 80 -- everything blocking them is resolved |
+| Release reachability | Every ticket except the open 77–80 has a dependency path to ticket 65 |
+| Unticked criteria on resolved tickets | 11, each naming ticket 78 as what closes it |
+| Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
 Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
 the plan's reachability property. Ticket 62 now lists it as a blocker, which
-restored it. Tickets 67–75 are in the same position and not resolved the same
-way: each except 74 and 75 names a blocker, so none of them is a way to
-start work early, but nothing downstream names them, so today they are nine sinks
-beside 65 rather than work the release depends on. Whichever later ticket owns
-their outcome has to list them before that claim reads "every ticket" again.
+restored it. Tickets 67–76 and 81–83 spent longer in that position: raised beside
+the plan while it ran, resolved green, and named by nothing downstream, so they
+were finished work the release did not rest on. Ticket 63's fourth reading is
+what made that visible and refuses it, and ticket 64 now lists all thirteen,
+which is also what its own first criterion asks for. The four that remain outside
+the graph -- 77, 78, 79 and 80 -- are outside it because they are open: the
+reading is about work that is finished and attached to nothing.
 
 Tickets 71–73 are drift the ticket-18 review found between the compiled roster
 and the scheduler that will read it: the model and effort a claimed run records,
@@ -66,26 +74,26 @@ their check drained ahead of the cascade that answers it, and `interception_cas`
 was not reached by the purge at all, so a Program that had minted a CA could not
 be purged by any statement the schema permits.
 
-Tickets 76 through 83 were raised after this re-measurement and are in none of the
-counts above: the table says 75 files because that is what was measured on the
-date it names. They are research and follow-up work rather than plan coverage --
+Tickets 76 through 83 are research and follow-up work rather than plan coverage:
 76 through 78 from implementation reviews, 79 to mine public disclosures for
 techniques the corpus lacks, 80 to measure the documented multiagent failure
 modes against this roster, and 81 through 83 from authorised live validation
-against a real target: a Program whose stored ceilings contradict each other and
-could not be repaired, the door having no shipped way to run as the Agent
-network's one peer, and no way to reach a claimed Task through that surface.
-Like 67 through 75, nothing downstream names them, so
-they are sinks beside 65 and not work the release depends on. The next
-re-measurement is what moves the table, not this paragraph.
+against a real target -- a Program whose stored ceilings contradict each other
+and could not be repaired, the door having no shipped way to run as the Agent
+network's one peer, and no way to reach a claimed Task through that surface. 76
+and 81 through 83 are resolved and now hang off ticket 64. 77 through 80 are
+open, and 78 is the one the rest of the plan is waiting on: eleven criteria
+across tickets 46 and 49 through 57 are ticked nowhere because the production
+evaluator's proxy route to a loopback fixture is 78's decision to make.
 
 ## Implementation progress
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–24, 71, 73 |
-| Unblocked and open | 25, 26, 30, 31, 33, 66, 67, 68, 70, 72, 74, 75 |
-| Criteria ticked | 150 of 430 |
+| Resolved | 01–63, 66–76, 81–83 |
+| Unblocked and open | 64, 77, 78, 79, 80 |
+| Blocked and open | 65, by the final review in 64 |
+| Criteria ticked | 425 of 475 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -146,7 +154,12 @@ Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with
 `RK_TEST_CONTAINERS=1`, and the repository has no CI, so a clean checkout
 enforces neither. And a ticked box records the implementer's judgement, not an
-audit: ticket 63 is where per-story evidence is actually demanded.
+audit. What answers the second one now is `tools/check_audit.py`: 289 mapped
+requirements, 211 distinct citations, and `--run` executes the cited tests and
+counts a skip as a refusal, because a citation that stood down for a missing
+database proves nothing about the requirement citing it. What it still does not
+answer is whether the cited evidence is any good -- a test that asserts nothing
+satisfies every reading it takes -- and that is ticket 64's.
 
 ## User-story coverage
 
@@ -166,9 +179,10 @@ later release verification slice.
 | 195–210 — Validation, reporting and visibility | 37, 40, 42, 43, 59, 60 |
 | 211–230 — Installation, security and release | 01–03, 07, 10, 11, 15–18, 30, 31, 44–48, 57, 61–65 |
 
-The implementation-time per-story evidence matrix is itself release-blocking in
-ticket 63; range coverage here prevents a planning omission, while ticket 63
-prevents a prose-only completion claim.
+The implementation-time per-story evidence matrix is itself release-blocking and
+now exists: `baseline/spec-evidence.tsv` carries one row per story with the
+tickets that built it and the tests that check it. Range coverage here prevents a
+planning omission; that table prevents a prose-only completion claim.
 
 ## Implementation-decision coverage
 
@@ -284,9 +298,10 @@ schema work or catalogue files.
 
 ## Verdict
 
-**PASS at ticket-plan level**, re-confirmed at 66 tickets. The approved
+**PASS at ticket-plan level**, re-confirmed at 83 tickets. The approved
 dependency graph covers the complete production Spec, the complete planned v1
-knowledge migration and an end-to-end first-hunt release outcome. Thirteen
-tickets are resolved and the remaining fifty-three carry the runtime
-functionality; ticket 63 is still what proves implementation evidence for every
-story, and nothing in this file substitutes for it.
+knowledge migration and an end-to-end first-hunt release outcome. Seventy-seven
+tickets are resolved; what is left is the final review in 64, the first-hunt
+release outcome in 65 it blocks, and four open research tickets. Implementation
+evidence for every story is no longer a promise in this file -- it is a table the
+release gate's neighbour reads, and nothing in this file substitutes for it.

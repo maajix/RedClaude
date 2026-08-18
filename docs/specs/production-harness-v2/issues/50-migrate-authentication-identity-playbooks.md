@@ -55,7 +55,7 @@ it.
 - [x] Identity-pairing, response-comparison and flow-mapping capabilities use proxy-side Identity labels without exposing target credentials.
 - [x] Fixtures include positive, secure-control and out-of-class cases for enumeration, session handling, redirect trust and token/identity confusion.
 - [x] Risk effects correctly park credential-changing, session-mutating or third-party-impact actions when grants are absent.
-- [ ] All eight exact hashes pass loadability, selection, grounded positive and adversarial precision gates before stable promotion.
+- [ ] All eight exact hashes pass loadability, selection, grounded positive and adversarial precision gates before stable promotion. **Partial:** loadability and selection hold at the shipped text; the graded halves wait on the route above. Ticket 78 closes it.
 
 ## Comments
 

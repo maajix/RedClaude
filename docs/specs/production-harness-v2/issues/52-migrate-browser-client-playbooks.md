@@ -33,10 +33,10 @@ loopback route 78 decides.
 
 - [x] Browser Framing, Browser Messaging, Browser Realtime, Browser Script, Browser Storage, Client-Side Path Traversal, External Resources and Web Cache each exist as authored v2 Playbooks.
 - [x] Each Playbook declares whether evidence requires browser, HTTP differential, DOM, storage, origin, framing or cache capabilities and is loadable by an appropriate role.
-- [ ] Browser fixtures run through production containment and bind DOM, screenshot and network evidence to Receipts and Tool runs.
+- [ ] Browser fixtures run through production containment and bind DOM, screenshot and network evidence to Receipts and Tool runs. **Partial:** `BrowserCommandTest` proves that binding through the real container; the loopback fixture route is the missing half. Ticket 78 closes it.
 - [x] Controls distinguish executable impact from reflection, browser policy from server policy and target behavior from proxy-induced protocol behavior.
 - [x] Cache, realtime and external-resource tests remain scope- and budget-bound and refuse uncontrolled third-party effects.
-- [ ] All eight exact hashes pass positive and out-of-class adversarial evaluation with no human-only reference leakage into model projections.
+- [ ] All eight exact hashes pass positive and out-of-class adversarial evaluation with no human-only reference leakage into model projections. **Partial:** the projections hold and the fixtures grade; the production evaluation waits on the same route. Ticket 78 closes it.
 
 ## Comments
 

@@ -2,7 +2,7 @@
 
 **What to build:** Review the complete production diff independently against repository Standards and the production Spec, fix every actionable release blocker and prove the review is clean enough to hunt.
 
-**Blocked by:** 63 — Audit Spec, ticket and implementation coverage.
+**Blocked by:** 63 — Audit Spec, ticket and implementation coverage; 67 — Give an inbound arrival its own identity; 68 — Make an installed harness be the code it claims; 69 — Publish engagement files on an out-of-band host whose name changes; 70 — End a canary from the command line; 71 — Run a role at the roster's model and effort; 72 — Hold an Identity for every run that uses one; 73 — State the cross-role subagent cap once; 74 — Purge a Program whose Finding cites a Hypothesis; 75 — Refuse a claim for the concurrency it would actually spend; 76 — Read engagement secrets from 1Password; 81 — Repair a Program whose stored ceilings disagree; 82 — Run the door as the Agent network's one peer; 83 — Open the first Task of a Program.
 
 **Status:** ready-for-agent
 

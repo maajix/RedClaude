@@ -56,7 +56,7 @@ different people, and no schema can make it.
 - [x] Recon-oriented content proposes Surface or Hypotheses through production Mission results and never owns campaign workflow or direct promotion.
 - [x] Each topic has an independently authored relevant positive fixture and participates in meaningful out-of-class adversarial coverage.
 - [x] All seven are loadable by an allowed production role, selectable on matching Surface and absent from non-matching bounded context.
-- [ ] Stable promotion passes the production evaluator for each exact Playbook hash with no ungrounded or off-class claims.
+- [ ] Stable promotion passes the production evaluator for each exact Playbook hash with no ungrounded or off-class claims. **Partial:** all seven are registered, loadable and selected at the text they ship, and their fixtures grade; the graded run needs the real-agent route. Ticket 78 closes it.
 
 ## Comments
 

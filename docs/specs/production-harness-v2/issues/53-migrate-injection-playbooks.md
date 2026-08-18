@@ -27,7 +27,7 @@ model receives.
 - [x] Detection defaults to the least mutating action and requires explicit risk/grant metadata before any write or execution effect.
 - [x] Timing, boolean, error and content differentials each include a neutralized control and configured repeat policy.
 - [x] Fixtures include secure twins, noisy endpoints and decoy reflections so a Playbook that always fires fails precision evaluation.
-- [ ] All seven exact hashes are role-loadable, selected only on matching facts and pass grounded positive/adversarial promotion gates.
+- [ ] All seven exact hashes are role-loadable, selected only on matching facts and pass grounded positive/adversarial promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 closes it.
 
 ## Comments
 

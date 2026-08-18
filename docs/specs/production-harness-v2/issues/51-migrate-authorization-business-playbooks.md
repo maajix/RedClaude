@@ -34,7 +34,7 @@ other two are the ticket's own words: `payment-workflows` outputs
 - [x] Business-logic and payment tests state their invariant, pristine baseline, allowed mutation and cleanup before execution.
 - [x] Race-condition fixtures require a sequential control and prove the broken invariant rather than treating timing alone as the Finding.
 - [x] Routing and verb behavior remains within configured scope and cannot expand to arbitrary host or availability testing.
-- [ ] All four exact hashes pass relevant positive and adversarial false-positive evaluation before stable promotion.
+- [ ] All four exact hashes pass relevant positive and adversarial false-positive evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 closes it.
 
 ## Comments
 

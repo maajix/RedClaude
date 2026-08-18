@@ -417,3 +417,48 @@ image, and fails rather than skipping when either is missing.
 The superuser URL must point at a server that can be dropped: the gate creates,
 drops and recreates `rk2_release_gate`, `rk2_release_gate_restored` and
 `rk2_gate_suite`.
+
+## The release audit
+
+The gate measures the artifact. The audit measures the Spec:
+
+```sh
+python3 -m tools.check_audit
+python3 -m tools.check_audit --run
+```
+
+`baseline/spec-evidence.tsv` holds one row per requirement -- 230 user stories,
+19 Implementation Decisions, 24 Testing Decisions, 9 Out-of-Scope constraints and
+the 7 registered prototype regressions -- and each row names the tickets that
+built it and the tests or gates that check it. The audit reads the Spec, the
+tracker and that table together and refuses:
+
+* a requirement with no row, or a row for a requirement the Spec does not state;
+* a row whose digest no longer matches the requirement's own text, so a story
+  reworded after somebody mapped it stops matching;
+* a row naming a ticket that does not exist or is not resolved, or evidence that
+  is neither a test this checkout can run nor a gate it ships -- there is no
+  third kind, which is how a citation to a document is refused rather than
+  counted;
+* a ticket in 01 through 62 that is unresolved, blocked by unfinished work, or
+  has no revision resolving it -- the commit that wrote its resolved status --
+  and any acceptance box it left unticked without naming an open ticket that
+  closes it;
+* a dependency graph with a cycle, a blocker nobody wrote, or a resolved ticket
+  with no path to the release outcome, which is what tickets raised beside the
+  plan look like until whichever ticket owns their outcome names them;
+* a named area of the release -- the runtime, the agents, the Skills, the 49
+  Playbooks, the operator surface, the v1 import, long-session recovery and the
+  first hunt -- holding no requirement at all, or holding requirements none of
+  which is checked by that area's anchor;
+* a registered prototype regression whose map does not name the tickets the
+  registry says it requires.
+
+`--run` then executes every cited test. A failure, an error *and a skip* are all
+refusals: most of the live arms stand down without a database or a container, and
+a citation that stood down proves nothing about the requirement citing it. So the
+run mode is a composed-suite command -- it wants `RK_TEST_SUPERUSER_URL`,
+`RK_TEST_CONTAINERS=1` and the two images, exactly like the composed suite.
+
+What it does not measure is whether the cited evidence is any good; a test that
+asserts nothing would satisfy it. That is the final code review's job.
