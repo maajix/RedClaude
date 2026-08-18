@@ -667,7 +667,9 @@ The runtime-minted label a canary is addressed by, and the whole of what makes
 an inbound arrival attributable to one Program and one subject. One lower-case
 DNS label, because that is the only shape it can arrive in. Not a credential:
 holding one authorises no read, no write and no request. Canonical state keeps
-only its digest, and it binds nothing once it expires.
+only its digest, and it binds nothing once it expires or once an operator ends
+it early by row id -- which is the identifier minting one printed, never the
+label itself.
 _Avoid_: Token, secret, canary token, callback id
 
 **Arrival**:

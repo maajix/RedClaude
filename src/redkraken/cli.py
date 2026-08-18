@@ -669,6 +669,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     callback_accept.set_defaults(run=_callback_accept)
 
+    callback_clear = callback_operations.add_parser(
+        "clear",
+        help=f"end one correlator early, by id (${DATABASE_URL})",
+        description=(
+            "Ends a canary before it expires -- when the test that carried it "
+            "is over, or when the payload turns out to have gone somewhere it "
+            "should not have. Takes the correlator id `callback provision` "
+            "printed, never the address that was embedded, and reports the "
+            "channel and how many arrivals it had already admitted. Clearing "
+            "one twice changes nothing the second time and says so, and an id "
+            "this Program did not mint is answered as unknown rather than "
+            "refused."
+        ),
+    )
+    _add_url(callback_clear, RUNTIME)
+    callback_clear.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration declaring the Program that minted the correlator",
+    )
+    callback_clear.add_argument(
+        "--correlator",
+        required=True,
+        metavar="uuid",
+        help="the correlator id to end; the address it was embedded in is not stored",
+    )
+    callback_clear.set_defaults(run=_callback_clear)
+
     artifacts = commands.add_parser(
         "artifact", help="store, read and verify this Program's content-addressed artifacts"
     )
@@ -2128,6 +2158,19 @@ def _callback_accept(arguments: argparse.Namespace) -> int:
                 peer=arguments.peer,
                 at=arguments.at,
             ),
+        )
+    )
+
+
+def _callback_clear(arguments: argparse.Namespace) -> int:
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, callback.CLEAR)
+    if runtime is None:
+        return _render(report(callback.CLEAR, ledger))
+    return _render(
+        _guarded(
+            callback.CLEAR,
+            lambda: callback.clear(runtime, arguments.config, arguments.correlator),
         )
     )
 

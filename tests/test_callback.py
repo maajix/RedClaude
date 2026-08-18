@@ -45,6 +45,10 @@ UNREACHABLE = "postgresql://rk2_runtime@127.0.0.1:1/rk2"
 #: The DNS channel `SCOPED` declares, and one arrival at it.
 ENDPOINT = "dns.example.org"
 CORRELATOR = "0123456789abcdef0123456789abcdef"
+
+#: A correlator's row id, which is what `clear` takes and what `provision`
+#: prints. Not derived from the plaintext above, and not derivable from it.
+CORRELATOR_ID = "3f2a1c88-5d41-4e2b-9a76-0c1b8e4d7f30"
 BODY = b"\x00\x01\x81\x80 query for a canary\n"
 
 
@@ -374,6 +378,87 @@ class ProvisionTest(unittest.TestCase):
         ) as opened:
             result = callback.provision(
                 settings(), write(source_text), channel, "TEC1", lifetime=lifetime
+            )
+        return opened, result
+
+
+class ClearTest(unittest.TestCase):
+    """What `clear` refuses before it ends anything.
+
+    Only one thing, and it is a shape: the verb takes the correlator's row id,
+    and a value that is not one is named as the argument it came in as rather
+    than reaching the database and coming back as a `22P02`. Everything else
+    -- whose correlator it is, whether it was still live, what it caught -- is
+    the database's to answer, and is held in `tests/test_database.py`.
+    """
+
+    def test_something_that_is_not_a_correlator_id_never_opens_a_connection(self):
+        for name, value in (
+            ("empty", ""),
+            ("a word", "not-a-correlator"),
+            # The address the canary was embedded in, which is the thing an
+            # operator has most of and the one thing this verb does not take.
+            ("the address", f"{CORRELATOR}.{ENDPOINT}"),
+            ("one hex digit short", CORRELATOR[:-1]),
+        ):
+            with self.subTest(name):
+                opened, result = self.refused(correlator=value)
+
+                opened.assert_not_called()
+                self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+                self.assertEqual(
+                    ["argument:--correlator"], [one.source for one in result.violations]
+                )
+
+    def test_the_correlator_plaintext_is_a_shape_this_verb_cannot_refuse(self):
+        """So it is let through to the database rather than named as a bad argument.
+
+        A correlator is 16 bytes of hex and so is a UUID with its dashes taken
+        out, so `uuid.UUID` reads the plaintext of a canary as an identifier.
+        Nothing this side of the wire can tell the two apart, and pretending
+        otherwise would mean refusing ids that are real. What is held here is
+        only that: it gets past the shape gate, which is why the exit class is
+        the connection's rather than the argument's. That it then matches no row
+        and comes back as the answer an id nobody minted gets is the database's
+        half, in `CallbackAdmissionTest`.
+        """
+        result = callback.clear(settings(), write(SCOPED), CORRELATOR)
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.exit_code)
+        self.assertEqual([], [one.source for one in result.violations if "--" in one.source])
+
+    def test_a_configuration_that_does_not_validate_never_opens_a_connection(self):
+        opened, result = self.refused(
+            source_text=SCOPED.replace("requests = 100", "requests = -1")
+        )
+
+        opened.assert_not_called()
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = callback.clear(settings(), write(SCOPED), CORRELATOR_ID)
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.exit_code)
+
+    def test_every_refusal_reports_the_keys_an_ended_canary_reports(self):
+        for name, call in (
+            ("refused", lambda: self.refused(correlator="not-a-correlator")[1]),
+            (
+                "unreachable",
+                lambda: callback.clear(settings(), write(SCOPED), CORRELATOR_ID),
+            ),
+        ):
+            with self.subTest(name):
+                self.assertEqual({"program_id", "callback"}, set(call().facts))
+
+    def refused(self, *, correlator=None, source_text=SCOPED):
+        with mock.patch.object(
+            pg, "connect", side_effect=AssertionError("connected")
+        ) as opened:
+            result = callback.clear(
+                settings(),
+                write(source_text),
+                CORRELATOR_ID if correlator is None else correlator,
             )
         return opened, result
 

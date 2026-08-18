@@ -6342,6 +6342,139 @@ class CallbackAdmissionTest(DatabaseCase):
         self.assertIn("outside its correlator", str(early.violations[0].detail))
         self.assertEqual(before, self.counts())
 
+    def test_a_canary_ends_by_verb_and_the_verb_says_what_it_caught(self):
+        """PH2-70 criteria 1 and 3: ending one is a verb, and it reports.
+
+        Two correlators under one Program, each with one arrival, because the
+        count the report carries is the correlator's and not the Program's --
+        one canary firing does not make another one look like it did.
+        """
+        first, first_address = self.canary("b")
+        second, second_address = self.canary("b")
+        for address in (first_address, second_address):
+            admitted = self.arrive("b", address)
+            self.assertTrue(admitted.ok, admitted.violations)
+
+        ended = callback.clear(self.harness.runtime, self.configurations["b"], first)
+
+        self.assertTrue(ended.ok, ended.violations)
+        self.assertEqual(
+            {
+                "correlator_id": first,
+                "cleared": True,
+                "known": True,
+                "channel": "oob-dns",
+                "interactions": 1,
+            },
+            ended.facts["callback"],
+        )
+
+        # And "ended" means what the word means: the canary admits nothing more.
+        # A different moment, so that what refuses this is the correlator being
+        # over rather than 67's identity refusing a replay.
+        after = self.arrive("b", first_address, at=self.moment())
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, after.exit_code)
+        self.assertIn("refused", after.violations[0].detail)
+
+        # The second canary is untouched, which is the other half of "one".
+        still_live = self.arrive("b", second_address, at=self.moment())
+
+        self.assertTrue(still_live.ok, still_live.violations)
+
+    def test_ending_a_canary_that_is_already_over_changes_nothing_and_says_so(self):
+        """PH2-70 criterion 1's second half. Idempotent, and honest about it.
+
+        `cleared` is what this call did and `known` is what it found, which is
+        the distinction an operator re-running the command after a crash needs:
+        the canary being over is what they asked for, and it is not the same
+        news as having named an id nobody minted.
+        """
+        identifier, address = self.canary("b")
+        admitted = self.arrive("b", address)
+        self.assertTrue(admitted.ok, admitted.violations)
+        first = callback.clear(self.harness.runtime, self.configurations["b"], identifier)
+        self.assertTrue(first.ok, first.violations)
+
+        again = callback.clear(self.harness.runtime, self.configurations["b"], identifier)
+
+        self.assertTrue(again.ok, again.violations)
+        self.assertEqual(
+            {
+                "correlator_id": identifier,
+                "cleared": False,
+                "known": True,
+                "channel": "oob-dns",
+                "interactions": 1,
+            },
+            again.facts["callback"],
+        )
+
+    def test_another_programs_canary_is_answered_as_one_that_never_existed(self):
+        """PH2-70 criterion 2. Three questions, one answer.
+
+        Not merely all unsuccessful: identical but for the id echoed back. A
+        verb that said `not yours` for one and `no such thing` for another would
+        be a way for one Program to enumerate a second's canaries, and the
+        Program doing the asking is the one a compromised run is bound to.
+
+        The third question is the correlator's plaintext, asked by the Program
+        that minted it, because 16 bytes of hex is a UUID with its dashes taken
+        out and so gets past the shape gate `ClearTest` holds. It is the answer
+        for an id nobody minted that it comes back with, which is what "cleared
+        by row id, never by plaintext" has to mean at the far end.
+        """
+        identifier, address = self.canary("b")
+        plaintext = address.partition(".")[0]
+
+        answers = {
+            # `a` asking about `b`'s canary, `a` asking about nothing at all,
+            # and `b` asking about its own canary the one way it may not.
+            "another Program's": callback.clear(
+                self.harness.runtime, self.configurations["a"], identifier
+            ),
+            "no such id": callback.clear(
+                self.harness.runtime, self.configurations["a"], str(uuid.uuid4())
+            ),
+            "its own plaintext": callback.clear(
+                self.harness.runtime, self.configurations["b"], plaintext
+            ),
+        }
+
+        for reason, answer in answers.items():
+            with self.subTest(reason):
+                self.assertTrue(answer.ok, answer.violations)
+                self.assertEqual(
+                    {"cleared": False, "known": False, "channel": None, "interactions": 0},
+                    {
+                        key: value
+                        for key, value in dict(answer.facts["callback"]).items()
+                        if key != "correlator_id"
+                    },
+                )
+
+        # And the answers were true rather than merely uninformative: `b`'s
+        # canary is still live, which is what all three failing to end it means.
+        still_live = self.arrive("b", address)
+
+        self.assertTrue(still_live.ok, still_live.violations)
+
+    def canary(self, name: str) -> tuple[str, str]:
+        """One correlator minted through the verb: its row id and its address.
+
+        Through `provision` rather than through `mint`, because the id is what
+        `clear` takes and `provision` is the only thing that prints it -- an
+        operator ending a canary has what the command that made it said.
+        """
+        minted = callback.provision(
+            self.harness.runtime, self.configurations[name], "oob-dns", "TEC1"
+        )
+        assert minted.ok, minted.violations
+        return (
+            str(minted.facts["callback"]["correlator_id"]),
+            str(minted.facts["callback"]["address"]),
+        )
+
     def test_the_gate_still_holds_over_the_rows_these_writes_made(self):
         with pg.connect(self.harness.migrate) as connection:
             result = integrity.verify(connection, self.harness.expected)

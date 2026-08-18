@@ -6,11 +6,13 @@ request somebody else made, arriving at a name we published, and the only thing
 tying it to a Program is a correlator that travelled out in a payload and came
 back in a query.
 
-So the module has two verbs and one idea between them. `provision` mints a
+So the module has three verbs and one idea between them. `provision` mints a
 correlator for one subject and hands back the address to embed --
 `<correlator>.<channel host>`, because a canary is addressed by its label.
 `accept` takes an arrival the operator's own listener recorded, recovers the
 correlator from the name it came in at, and asks the database to admit it.
+`clear` ends one early, by the id `provision` printed, and says what it caught
+before it ended.
 
 The decision is not made here. `record_callback_interaction` re-asks every
 question -- is the channel still declared, is the correlator live, is this the
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +44,7 @@ from redkraken.store import Store
 COMMAND = "callback"
 PROVISION = f"{COMMAND} provision"
 ACCEPT = f"{COMMAND} accept"
+CLEAR = f"{COMMAND} clear"
 
 #: 128 bits, hex. Long enough that guessing one is not a strategy, short enough
 #: to be a single DNS label with room to spare.
@@ -73,6 +77,7 @@ MINT = (
 RECORD = "SELECT record_callback_interaction($1, $2::jsonb, $3::jsonb)"
 SUBJECT = "SELECT id::text, type FROM entities WHERE program_id = $1::uuid AND label = $2"
 EXPIRY = "SELECT expires_at::text FROM callback_correlators WHERE id = $1::uuid"
+END_CORRELATOR = "SELECT clear_callback_correlator($1::uuid)"
 
 
 def provision(
@@ -327,6 +332,91 @@ def accept(
     return report(ACCEPT, ledger, **facts)
 
 
+def clear(
+    runtime: pg.Settings | None,
+    configuration_path: Path,
+    correlator_id: str,
+) -> Report:
+    """End one correlator early, and say what it had already caught.
+
+    By row id rather than by the address it was embedded in: the plaintext is
+    not stored, and an operator ending a canary because a payload went somewhere
+    it should not have is holding what `provision` printed. Ending one is
+    idempotent -- a second call changes nothing and says so -- and a correlator
+    this Program does not have is answered exactly as an id nobody minted,
+    because the two must not be tellable apart.
+    """
+    ledger = Ledger()
+    facts: dict[str, object] = {"program_id": None, "callback": None}
+
+    identifier = _identifier(ledger, correlator_id)
+    if identifier is None:
+        return report(CLEAR, ledger, **facts)
+
+    policy, slug = _policy(ledger, configuration_path)
+    if policy is None or slug is None:
+        return report(CLEAR, ledger, **facts)
+
+    connection = migrate.open_connection(ledger, runtime)
+    if connection is None:
+        return report(CLEAR, ledger, **facts)
+    with connection:
+        program_id = _open(ledger, connection, slug)
+        if program_id is None:
+            return report(CLEAR, ledger, **facts)
+        facts["program_id"] = program_id
+
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {CLEAR}",))
+            try:
+                ended = connection.execute(END_CORRELATOR, (identifier,)).scalar()
+            except pg.DatabaseError as error:
+                # The same shape `accept` uses, for the same reason: a database
+                # that refused is a refusal an operator can read, and letting it
+                # out of here would be reported as the command having stopped
+                # part-way -- the sentence reserved for what nobody enumerated.
+                ledger.fail(
+                    "callback",
+                    f"the correlator was not ended: {error}",
+                    code=INVALID_CONFIGURATION,
+                    source="database",
+                )
+                return report(CLEAR, ledger, **facts)
+
+    answer = _decode(str(ended))
+    cleared = bool(answer.get("cleared"))
+    known = bool(answer.get("known"))
+    arrivals = int(answer.get("interactions", 0))
+    facts["callback"] = {
+        "correlator_id": identifier,
+        "cleared": cleared,
+        "known": known,
+        "channel": answer.get("channel"),
+        "interactions": arrivals,
+    }
+    # An operator ending a canary in a hurry is asking two things: is it over,
+    # and did it already fire. The count is in every sentence that has one to
+    # give, including the one for the second call, which is the call made after
+    # a crash.
+    if cleared:
+        said = (
+            f"{identifier} is ended on channel {answer.get('channel')}: it "
+            f"admitted {arrivals} arrival(s) and will admit no more"
+        )
+    elif known:
+        said = (
+            f"{identifier} was already over on channel {answer.get('channel')}: "
+            f"it admitted {arrivals} arrival(s) and this call changed nothing"
+        )
+    else:
+        said = (
+            f"{identifier} is not a correlator this Program minted: nothing was "
+            "changed, and nothing is claimed about whose it is"
+        )
+    ledger.hold("callback", said)
+    return report(CLEAR, ledger, **facts)
+
+
 def _policy(
     ledger: Ledger, configuration_path: Path
 ) -> tuple[scope.Policy | None, str | None]:
@@ -487,6 +577,38 @@ def _arrival(ledger: Ledger, source: Path) -> bytes | None:
 def _content_type(kind: str) -> str:
     """What the stored bytes are, said rather than sniffed."""
     return "application/dns-message" if kind == "dns" else "message/http"
+
+
+def _identifier(ledger: Ledger, value: str) -> str | None:
+    """The correlator row id, or a refusal that what was given is not one.
+
+    Checked here so a mistyped id is an argument the operator can see named
+    rather than a `22P02` from the cast. It is the id `provision` printed; the
+    address the canary was embedded in is not stored and is not what this verb
+    takes.
+
+    Only the shape is checked, and a correlator's plaintext has that shape: it
+    is 16 bytes of hex, which is a UUID with its dashes taken out. Nothing here
+    can tell the two apart, so a plaintext handed to this verb reaches the
+    database and comes back as the answer an id nobody minted gets. Refusing
+    that shape would mean refusing ids that are real.
+
+    What comes back is the canonical spelling rather than the argument, so the
+    report names the id the database was asked about: `uuid.UUID` also reads
+    braces, a `urn:uuid:` prefix and upper case, and a report echoing those back
+    would name something no row is keyed by.
+    """
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        ledger.fail(
+            "callback_correlator",
+            f"{value} is not a correlator id; the id is the one `rk callback "
+            "provision` printed, and it is not the address that was embedded",
+            code=INVALID_CONFIGURATION,
+            source="argument:--correlator",
+        )
+        return None
 
 
 def _encode(value: dict) -> str:
