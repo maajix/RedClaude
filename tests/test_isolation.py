@@ -450,13 +450,13 @@ class AgentContainerIsolationTest(unittest.TestCase):
             for network in (cls.agent_network, cls.target_network, cls.control_network):
                 docker("network", "create", "--internal", network)
             docker("network", "create", cls.open_network)
-            cls._serve(cls.proxy, cls.agent_network, 18080)
-            cls._serve(cls.target, cls.target_network, 18081)
-            cls._serve(cls.control, cls.control_network, 5432)
+            fixtures.listener(cls.proxy, cls.agent_network, 18080)
+            fixtures.listener(cls.target, cls.target_network, 18081)
+            fixtures.listener(cls.control, cls.control_network, 5432)
             docker("network", "connect", cls.target_network, cls.proxy)
             docker("network", "connect", cls.control_network, cls.proxy)
-            cls.target_ip = cls._address(cls.target, cls.target_network)
-            cls.control_ip = cls._address(cls.control, cls.control_network)
+            cls.target_ip = fixtures.address(cls.target, cls.target_network)
+            cls.control_ip = fixtures.address(cls.control, cls.control_network)
         except BaseException:
             cls.tearDownClass()
             raise
@@ -481,37 +481,6 @@ class AgentContainerIsolationTest(unittest.TestCase):
         root = getattr(cls, "root", None)
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
-
-    @classmethod
-    def _serve(cls, name: str, network: str, port: int) -> None:
-        docker(
-            "run",
-            "--detach",
-            "--rm",
-            "--pull",
-            "never",
-            "--name",
-            name,
-            "--network",
-            network,
-            fixtures.AGENT_IMAGE,
-            "python3",
-            "-m",
-            "http.server",
-            str(port),
-            "--bind",
-            "0.0.0.0",
-        )
-
-    @staticmethod
-    def _address(container: str, network: str) -> str:
-        result = docker(
-            "inspect",
-            "--format",
-            f"{{{{(index .NetworkSettings.Networks {json.dumps(network)}).IPAddress}}}}",
-            container,
-        )
-        return result.stdout.strip()
 
     def boundary(self, *, network: str | None = None) -> isolation.AgentContainer:
         """The described boundary, with the names of things that exist."""
@@ -646,6 +615,224 @@ print(json.dumps({
         self.assertEqual(
             before, docker("network", "ls", "--format", "{{.Name}}").stdout.split()
         )
+
+
+@unittest.skipUnless(LIVE, REASON)
+class BrowserContainerIsolationTest(unittest.TestCase):
+    """PH2-62 criterion 3: the browser's boundary, probed from the browser image.
+
+    The case above proves the proxy adapter contains a tool, using the Agent
+    image as a stand-in. That is the right stand-in for a tool, and it is the
+    wrong one for the browser: the browser image is built by an installation
+    out of a headless Chrome distribution, it is the largest and least
+    controlled thing this harness starts, and it is the one image whose
+    contents an operator did not write. An image can carry its own resolver
+    configuration, its own certificate store and its own proxy defaults, and
+    none of that is visible in the flags `run_tool` passes. So the question is
+    asked again, of the image that actually runs.
+
+    Four destinations, which are the four ways out a browser could have:
+
+    * raw TCP to an address on the internet,
+    * a name resolved outside the run's own network,
+    * the control and provisioning ports of the machine the harness runs on,
+    * and HTTP or HTTPS straight to the target, on the ports a browser speaks.
+
+    Each of them answers from somewhere -- that is what the second case here is
+    for. A containment proof against ports nothing is listening on is a proof
+    that the test environment is empty, and the two cases together are what
+    make the first one a statement about the boundary.
+
+    The probe is python3 rather than Chrome because what is being measured is
+    the container's routing, and a browser that could not reach an address
+    would be indistinguishable from a browser that chose not to. Chrome runs in
+    this image over the same interfaces, under the same environment, on the
+    same network `run_tool` builds; `BrowserCommandTest` in the live suite is
+    where a real one walks a real plan through the real door.
+    """
+
+    #: What the door listens on inside its own container, as everywhere else in
+    #: this suite: the tool is told about the door as a URL, and a port the
+    #: engine chose would have to be read back before that URL could be written.
+    DOOR = 18080
+
+    #: What the target answers on. The two a browser speaks unprompted, and the
+    #: one the rest of this suite uses, so a route that opened would be caught
+    #: whichever port it opened to.
+    TARGET_PORTS = (80, 443, 18081)
+
+    #: What the machine running the harness answers on: the database, and the
+    #: port a provisioning run publishes. A browser that reached either would be
+    #: inside the control plane rather than inside an engagement.
+    CONTROL_PORTS = (5432, 55433)
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        for image, reason in (
+            (fixtures.AGENT_IMAGE, f"the local Agent test image is absent: {fixtures.AGENT_IMAGE}"),
+            (fixtures.BROWSER_IMAGE, f"{fixtures.BROWSER_REASON}; {fixtures.BROWSER_IMAGE} is absent"),
+        ):
+            if docker("image", "inspect", image, check=False).returncode:
+                raise unittest.SkipTest(reason)
+
+        suffix = uuid.uuid4().hex[:12]
+        cls.door_network = f"rk2-browser-door-{suffix}"
+        cls.target_network = f"rk2-browser-target-{suffix}"
+        cls.control_network = f"rk2-browser-control-{suffix}"
+        cls.proxy = f"rk2-browser-proxy-{suffix}"
+        cls.target = f"rk2-browser-web-{suffix}"
+        cls.control = f"rk2-browser-control-{suffix}"
+        cls.root = Path(tempfile.mkdtemp(prefix="rk2-browser-isolation-"))
+        cls.authority = tls.authority(cls.root / "authority")
+
+        try:
+            for network in (cls.door_network, cls.target_network, cls.control_network):
+                docker("network", "create", "--internal", network)
+            fixtures.listener(cls.proxy, cls.door_network, cls.DOOR)
+            fixtures.listener(cls.target, cls.target_network, *cls.TARGET_PORTS)
+            fixtures.listener(cls.control, cls.control_network, *cls.CONTROL_PORTS)
+            # The proxy joins both, so every address the browser is denied is an
+            # address something else on this engine reaches.
+            docker("network", "connect", cls.target_network, cls.proxy)
+            docker("network", "connect", cls.control_network, cls.proxy)
+            cls.target_ip = fixtures.address(cls.target, cls.target_network)
+            cls.control_ip = fixtures.address(cls.control, cls.control_network)
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        for container in (
+            getattr(cls, "proxy", ""),
+            getattr(cls, "target", ""),
+            getattr(cls, "control", ""),
+        ):
+            if container:
+                docker("rm", "--force", container, check=False)
+        for network in (
+            getattr(cls, "door_network", ""),
+            getattr(cls, "target_network", ""),
+            getattr(cls, "control_network", ""),
+        ):
+            if network:
+                docker("network", "rm", network, check=False)
+        root = getattr(cls, "root", None)
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def door(self) -> isolation.AgentContainer:
+        """The boundary the browser's door is described by, with real names."""
+        return fixtures.boundary(
+            image=fixtures.BROWSER_IMAGE,
+            network=self.door_network,
+            proxy_container=self.proxy,
+            proxy_url=f"http://{self.proxy}:{self.DOOR}",
+            certificate=self.authority.certificate,
+        )
+
+    def probe(self, source: str) -> dict:
+        """Run one probe inside the browser image, on the proxy adapter."""
+        answer = isolation.run_tool(
+            isolation.ToolContainer(image=fixtures.BROWSER_IMAGE, door=self.door()),
+            ("python3", "-c", fixtures.PROBE + source),
+            ceilings=isolation.Ceilings(
+                timeout_seconds=120.0,
+                # The ceilings the browser really runs under, so a probe that
+                # could not start under them would be telling us something.
+                memory_mb=1024,
+                cpu_quota=2.0,
+                pids_limit=256,
+                max_output_bytes=8192,
+            ),
+            network="proxy",
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        return json.loads(answer.stdout.data)
+
+    def test_the_browser_reaches_the_door_and_no_other_route_out(self):
+        facts = self.probe("""
+print(json.dumps({
+    'door': reaches(os.environ['HTTP_PROXY'].split('//', 1)[1].split(':')[0], %r),
+    'internet_tcp': reaches('1.1.1.1', 443),
+    'external_dns': resolves('example.com'),
+    'target_name': resolves(%r),
+    'target_http': reaches(%r, 80),
+    'target_https': reaches(%r, 443),
+    'target_other': reaches(%r, 18081),
+    'control_postgres': reaches(%r, 5432),
+    'control_provisioning': reaches(%r, 55433),
+    'rootfs_writable': writable('/rk2-root-write'),
+    'uid': os.getuid(),
+}))
+""" % (
+            self.DOOR,
+            self.target,
+            self.target_ip,
+            self.target_ip,
+            self.target_ip,
+            self.control_ip,
+            self.control_ip,
+        ))
+
+        self.assertTrue(facts["door"])
+        self.assertFalse(facts["internet_tcp"])
+        self.assertFalse(facts["external_dns"])
+        self.assertFalse(facts["target_name"])
+        self.assertFalse(facts["target_http"])
+        self.assertFalse(facts["target_https"])
+        self.assertFalse(facts["target_other"])
+        self.assertFalse(facts["control_postgres"])
+        self.assertFalse(facts["control_provisioning"])
+        self.assertFalse(facts["rootfs_writable"])
+        self.assertEqual(isolation.UID, facts["uid"])
+
+    def test_every_denied_address_is_one_that_answers_from_outside(self):
+        # The other half of the case above, and the reason it means anything.
+        # The proxy sits on all three networks, so it is the vantage point that
+        # is allowed to reach what the browser is not.
+        for host, ports in (
+            (self.target_ip, self.TARGET_PORTS),
+            (self.control_ip, self.CONTROL_PORTS),
+        ):
+            for port in ports:
+                with self.subTest(host=host, port=port):
+                    reached = docker(
+                        "exec", self.proxy, "python3", "-c", fixtures.REACHED,
+                        host, str(port), check=False,
+                    )
+                    self.assertEqual(0, reached.returncode, reached.stderr)
+
+    def test_the_browser_is_told_about_the_door_and_about_no_way_around_it(self):
+        facts = self.probe("""
+print(json.dumps({
+    'proxy_variables': {key: os.environ.get(key) for key in (
+        'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy')},
+    'bypass': {key: os.environ.get(key) for key in ('NO_PROXY', 'no_proxy')},
+    'trust': {key: os.environ.get(key) for key in (
+        'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+        'NODE_EXTRA_CA_CERTS')},
+    'store': os.environ.get('SSL_CERT_DIR'),
+    'ca_readable': os.path.isfile(%r),
+    'key_visible': os.path.exists('/run/ca-key.pem')
+        or os.path.exists('/run/redkraken-ca-key.pem'),
+    'watched': sorted(key for key in os.environ if key in %s),
+}))
+""" % (isolation.CA_FILE, repr(set(_startup.WATCHED_ENV_VECTORS))))
+
+        proxy_url = f"http://{self.proxy}:{self.DOOR}"
+        self.assertEqual({proxy_url}, set(facts["proxy_variables"].values()))
+        # An empty bypass list rather than an absent one: a variable that is not
+        # set is one an image's own default can fill in.
+        self.assertEqual({""}, set(facts["bypass"].values()))
+        self.assertEqual({isolation.CA_FILE}, set(facts["trust"].values()))
+        self.assertEqual("", facts["store"])
+        self.assertTrue(facts["ca_readable"])
+        self.assertFalse(facts["key_visible"])
+        self.assertEqual([], facts["watched"])
 
 
 if __name__ == "__main__":

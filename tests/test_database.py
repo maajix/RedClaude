@@ -122,6 +122,8 @@ from redkraken.store import Store
 from tests import ROOT, browser_door, browser_target
 from tests.fixtures import (
     AGENT_IMAGE,
+    BROWSER_IMAGE,
+    BROWSER_REASON,
     DECISION_QUEUE_COLUMNS,
     EXPORTED,
     FIRST,
@@ -24663,16 +24665,6 @@ class BrowserMissionTest(DatabaseCase):
         self.assertEqual(1, int(registered))
         self.assertEqual((0, ""), (int(problems), str(detail)))
 
-
-#: Where a real browser is. Its own name rather than the Agent image's, because
-#: an image with a browser in it is built by an installation and a case that
-#: fell back to one without would report "no browser here" as a mission failure.
-#: The class skips when it is absent instead of failing: a browser is the price
-#: of this class in the way a server is the price of the module.
-BROWSER_IMAGE = os.environ.get("RK_TEST_BROWSER_IMAGE", "rk2browser:test")
-BROWSER_REASON = (
-    "set RK_TEST_BROWSER_IMAGE to an image holding a headless Chrome and python3"
-)
 
 #: What the twins are asked to do, in the order they are asked. The same plan as
 #: the database case walks, because the selectors it names are the selectors the

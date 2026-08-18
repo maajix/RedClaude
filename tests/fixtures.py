@@ -621,6 +621,17 @@ def subscription(home: Path) -> Path:
 #: about an image no Agent run could use is a proof about nothing.
 AGENT_IMAGE = os.environ.get("RK_TEST_AGENT_IMAGE", "python:3.14-slim")
 
+#: Where a real browser is. Its own name rather than the Agent image's, because
+#: an image with a browser in it is built by an installation, and a case that
+#: fell back to one without would report "no browser here" as a mission failure.
+#: Every case that needs one skips when it is absent instead of failing: a
+#: browser is the price of those cases in the way a server is the price of the
+#: live module.
+BROWSER_IMAGE = os.environ.get("RK_TEST_BROWSER_IMAGE", "rk2browser:test")
+BROWSER_REASON = (
+    "set RK_TEST_BROWSER_IMAGE to an image holding a headless Chrome and python3"
+)
+
 
 #: What the server calls the columns of the two answers the offline suites have
 #: to spell out: `offer_slate()`'s rows and the rows the console's decision
@@ -717,6 +728,76 @@ def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
     if check and result.returncode:
         raise AssertionError((result.stderr or result.stdout).strip())
     return result
+
+
+#: A container that answers TCP on the ports it was given and does nothing
+#: else. `http.server` binds one port, and what the containment proofs need is
+#: a machine that is listening on several -- a web port, a database port, a
+#: provisioning port -- so that "not reachable" is a statement about the route
+#: rather than about there being nothing at the other end.
+LISTENER = """
+import socket, sys, threading, time
+
+def serve(port):
+    listening = socket.socket()
+    listening.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listening.bind(('0.0.0.0', port))
+    listening.listen(16)
+    while True:
+        peer, _ = listening.accept()
+        peer.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok')
+        peer.close()
+
+for port in sys.argv[1:]:
+    threading.Thread(target=serve, args=(int(port),), daemon=True).start()
+while True:
+    time.sleep(3600)
+"""
+
+#: The same question the probes ask, asked from a container that is allowed to
+#: get an answer. A negative result from inside a boundary means nothing unless
+#: something outside it can reach the same address.
+REACHED = """
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2.0):
+    pass
+"""
+
+
+def listener(name: str, network: str, *ports: int, image: str = AGENT_IMAGE) -> None:
+    """One disposable container listening on the ports named, once it is up.
+
+    Waited for rather than assumed: a probe that ran before the listener bound
+    would report a refused connection, which is the same answer the containment
+    proofs are looking for and would make them pass for the wrong reason.
+    """
+    docker(
+        "run", "--detach", "--rm", "--pull", "never", "--name", name,
+        "--network", network, image,
+        "python3", "-c", LISTENER, *(str(port) for port in ports),
+    )
+    deadline = time.monotonic() + 30
+    for port in ports:
+        while True:
+            reached = docker(
+                "exec", name, "python3", "-c", REACHED, "127.0.0.1", str(port),
+                check=False,
+            )
+            if not reached.returncode:
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(f"{name} never listened on {port}")
+            time.sleep(0.2)
+
+
+def address(container: str, network: str) -> str:
+    """One container's address on one network, as the engine reports it."""
+    return docker(
+        "inspect",
+        "--format",
+        f"{{{{(index .NetworkSettings.Networks {json.dumps(network)}).IPAddress}}}}",
+        container,
+    ).stdout.strip()
 
 
 def boundary(**overrides) -> isolation.AgentContainer:
