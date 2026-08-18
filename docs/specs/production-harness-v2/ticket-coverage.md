@@ -154,10 +154,10 @@ Two limits belong in the same breath as the number. The live database suite runs
 only with `RK_TEST_SUPERUSER_URL` set and the container suite only with
 `RK_TEST_CONTAINERS=1`, and the repository has no CI, so a clean checkout
 enforces neither. And a ticked box records the implementer's judgement, not an
-audit. What answers the second one now is `tools/check_audit.py`: 289 mapped
-requirements, 211 distinct citations, and `--run` executes the cited tests and
-counts a skip as a refusal, because a citation that stood down for a missing
-database proves nothing about the requirement citing it. What it still does not
+audit. What answers the second one now is `tools/check_audit.py`: 295 mapped
+requirements, 213 distinct citations, and `--run` executes the cited tests and
+gates and counts a skip as a refusal, because a citation that stood down for a
+missing database proves nothing about the requirement citing it. What it still does not
 answer is whether the cited evidence is any good -- a test that asserts nothing
 satisfies every reading it takes -- and that is ticket 64's.
 

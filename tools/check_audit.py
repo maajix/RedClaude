@@ -6,14 +6,15 @@ shape of the migration those rows describe. None of them has ever read the Spec,
 so the one claim nobody could make from inside this repository is the claim the
 release turns on: that the two hundred and thirty numbered stories, the nineteen
 Implementation Decisions, the twenty-four Testing Decisions, the nine
-Out-of-Scope constraints and the seven registered prototype regressions were each
-built by somebody and are each checked by something that would go red.
+Out-of-Scope constraints, the six release conditions under Further Notes and the
+seven registered prototype regressions were each built by somebody and are each
+checked by something that would go red.
 
 Coverage of a *plan* is what the ticket-coverage audit measures, and it is a
 different and much weaker statement: a plan can cover a Spec perfectly and be
 built not at all. The two are kept apart on purpose, and this file is the one
 that is allowed to say "delivered". What makes that sayable is one table --
-`baseline/spec-evidence.tsv` -- with one row per requirement, and four readings
+`baseline/spec-evidence.tsv` -- with one row per requirement, and these readings
 over it:
 
 * every requirement in the Spec has exactly one row, and the row is frozen at
@@ -21,27 +22,41 @@ over it:
   mapped it stops matching and the release stops;
 * every row names tickets that exist and are resolved, and evidence that is a
   test this checkout can run or a gate this checkout ships -- there is no third
-  kind, which is how "prose-only" is refused rather than warned about;
+  kind, which is how "prose-only" is refused rather than warned about, and this
+  gate is not allowed to be its own evidence;
+* except that a requirement whose work is not finished may say so: `owed:NN`
+  names the open ticket that owes the evidence, in the same way a resolved
+  ticket's unticked box names the open ticket that closes it. An owed row is a
+  tracked absence rather than a claim, and the release outcome resolving while
+  one is still there is itself a failure;
 * every ticket from 01 to 62 is resolved, has no unresolved blocker, and names a
   revision git can resolve: the commit that turned its status into `resolved`;
   and every acceptance box it left unticked says which open ticket closes it, so
   a deferral is a tracked piece of work rather than a box somebody stopped
   looking at;
-* and the dependency graph is acyclic, every blocker exists, and every resolved
+* the dependency graph is acyclic, every blocker exists, and every resolved
   ticket lies on a path to the release outcome -- a ticket nothing downstream
-  names is work the release does not depend on, however green it is.
+  names is work the release does not depend on, however green it is;
+* and each of the eight areas the release is spoken of in holds requirements and
+  reaches its anchors, with the one area that carries a number -- the forty-nine
+  in-scope Playbooks -- checked against the catalogue gate that enforces it.
 
 The last reading is the one with a history. Tickets 66 through 83 were raised
 after the original plan froze, and each of them arrived as a sink beside ticket
 65 rather than as something the release needs; that is the exact shape this
 reading refuses, and the graph is now written so it holds.
 
-Two things this gate deliberately does not do. It does not measure whether the
+Three things about what this gate does not do. It does not measure whether the
 cited evidence is *good* -- a test that asserts nothing would satisfy it, and
-only the code review the next ticket runs can catch that. And by default it does
-not run anything: the static pass proves the map resolves, and `--run` is what
-proves the map passes, because a citation that is skipped for want of a database
-or a container is not evidence of anything either and is reported as such.
+only the code review the next ticket runs can catch that. By default it does not
+run anything: the static pass proves the map resolves, and `--run` is what proves
+the map passes, running the cited tests and then the cited gates, because a
+citation that is skipped for want of a database or a container is not evidence of
+anything either and is reported as such. And it is not one of the gates the
+release gate runs inside its export: criterion 3 reads this repository's history
+for the commit that resolved each ticket, and a tarball committed once as a
+checkout would answer that question with one synthetic revision for every ticket
+in the plan. This gate reads the tracker where the tracker actually happened.
 
 Run it as a module -- `python3 -m tools.check_audit` -- like the other three, and
 for the same reason: it reads the registry through the checker that owns it.
@@ -86,6 +101,24 @@ STORIES = 230
 DECISIONS = 19
 TESTING = 24
 OUT_OF_SCOPE = 9
+NOTES = 6
+
+#: Every top-level section the Spec holds. Frozen so that a section added later
+#: is a section this audit refuses rather than one it never reads: four of these
+#: state requirements, `Further Notes` states release conditions, and the first
+#: two are the argument for all of them. A requirement nobody audits because it
+#: arrived under a heading nobody parsed is the failure this list exists for.
+SECTIONS = (
+    "Problem Statement",
+    "Solution",
+    "User Stories",
+    "Implementation Decisions",
+    "Testing Decisions",
+    "Out of Scope",
+    "Further Notes",
+)
+REQUIREMENT_SECTIONS = ("User Stories", "Implementation Decisions", "Testing Decisions",
+                        "Out of Scope", "Further Notes")
 
 #: Criterion 3's range, and the ticket every resolved ticket must reach.
 AUDITED = range(1, 63)
@@ -107,11 +140,46 @@ AREAS = {
     "first_hunt": ("gate:tools.release_gate",),
 }
 
-#: The one prefix an evidence citation may carry instead of being a test name.
-GATE = "gate:"
-TESTS = "tests"
+#: Criterion 6 names a number as well as a subsystem: "all 49 in-scope
+#: Playbooks". The catalogue gate is what holds the forty-nine to their corpus,
+#: so this audit names the number itself and refuses if that gate is planning a
+#: different one -- read out of its source rather than imported, because
+#: importing it would pull the application into a gate that reads files.
+PLAYBOOKS = 49
+CATALOGUE = "tools.check_coverage"
+IN_SCOPE = re.compile(r"^IN_SCOPE_PLAYBOOKS = (\d+)$", re.MULTILINE)
 
-#: How a ticket file states the two things this gate reads off it.
+#: The two prefixes an evidence citation may carry instead of being a test name.
+#: `gate:` is a repository check this checkout ships. `owed:` is the one honest
+#: way for a requirement to have no evidence yet: it names the open ticket that
+#: owes it, exactly as a deferred acceptance box does, and the release outcome
+#: cannot be resolved while any row still says it.
+GATE = "gate:"
+OWED = "owed:"
+TESTS = "tests"
+TOOLS = "tools"
+
+#: This gate cannot be evidence for a requirement: it is the thing reading the
+#: row, and a check that reports its own map as proof of the map is a circle.
+SELF = "tools.check_audit"
+
+#: The one cited gate `--run` does not run. The release gate builds an install,
+#: provisions two databases and runs the whole suite inside them; a mode meant to
+#: prove the citations resolve does not get to take an hour, and the release gate
+#: is the one citation whose own report is the release record anyway.
+UNRUN = (f"{GATE}tools.release_gate",)
+
+#: The one skip `--run` accepts, keyed on the suite's own words: a test that
+#: requires the *absence* of the measured runtime this mode requires the presence
+#: of. One interpreter cannot be both, and a suite that checks the unmeasured
+#: path is right to say so. Every other stand-down proves nothing and is refused.
+MEASURED = "so this interpreter is a measured runtime"
+
+#: How a ticket file states the two things this gate reads off it. Stricter than
+#: `check_dispositions.ticket_status`, which reads the same field leniently for a
+#: different question: a file the ledger's reader would accept and this one would
+#: not is a file this gate refuses out loud rather than one the two of them
+#: quietly disagree about.
 STATUS = re.compile(r"^\*\*Status:\*\*\s*(.+?)\s*$", re.MULTILINE)
 BLOCKED = re.compile(r"^\*\*Blocked by:\*\*\s*(.+?)\s*$", re.MULTILINE)
 CRITERION = re.compile(r"^- \[( |x)\] (.+)$", re.MULTILINE)
@@ -138,7 +206,7 @@ class Ticket:
     """One issue file, read for the four things the graph and the audit ask of it."""
 
     number: int
-    name: str
+    path: Path
     status: str
     blockers: tuple[int, ...]
     criteria: tuple[tuple[bool, str], ...]
@@ -155,8 +223,17 @@ class Ticket:
 
 @dataclass(frozen=True)
 class Audit:
-    """The Spec, the tracker and the map, gathered once and read together."""
+    """The Spec, the tracker and the map, gathered once and read together.
 
+    One object rather than three arguments threaded through six readings: the
+    registry and the tree it classifies travel with the requirements they were
+    read out of, and a reading that took them separately could be handed a map
+    from one checkout and a tracker from another.
+    """
+
+    #: The status registry, and the tree it classifies as this Spec's.
+    status: dict
+    root: Path
     #: Every requirement the Spec and the registry state, by key, at its own text.
     requirements: dict[str, str]
     #: Every ticket in the tracker, by number.
@@ -173,6 +250,16 @@ class Audit:
             if row["source"] == source:
                 return ticket_numbers(row["tickets"])
         return ()
+
+    @property
+    def evidence(self) -> list[str]:
+        """Every citation the map makes, row by row and in the order it makes them."""
+        return [token for row in self.rows for token in citations(row)]
+
+
+def citations(row: dict[str, str]) -> list[str]:
+    """The evidence one row names, split once so nobody splits it again by hand."""
+    return [token.strip() for token in row["evidence"].split(";") if token.strip()]
 
 
 def spec_root(status: dict) -> Path:
@@ -193,7 +280,7 @@ def spec_root(status: dict) -> Path:
     return CHECKOUT / named[0]
 
 
-def paragraphs(lines: list[str]) -> list[str]:
+def bullets(lines: list[str]) -> list[str]:
     """The top-level bullets of one section, each with its continuation lines joined.
 
     A bullet is the unit the Spec writes a Testing Decision and an Out-of-Scope
@@ -233,22 +320,28 @@ def read_spec(root: Path, status: dict) -> dict[str, str]:
     """
     spec = (root / SPEC_FILE).read_text(encoding="utf-8")
     found = sections(spec)
-    missing = {"User Stories", "Implementation Decisions", "Testing Decisions", "Out of Scope"}
-    missing -= set(found)
-    if missing:
-        raise AuditError("the spec has no " + ", ".join(sorted(missing)) + " section")
+    if set(found) != set(SECTIONS):
+        raise AuditError(
+            "the spec must hold exactly the audited sections; "
+            f"missing {sorted(set(SECTIONS) - set(found))}, "
+            f"unread {sorted(set(found) - set(SECTIONS))}"
+        )
 
     requirements: dict[str, str] = {}
 
-    numbered = [
-        (int(match.group(1)), match.group(2).strip())
-        for line in found["User Stories"]
-        for match in [re.match(r"^(\d+)\.\s+(.*)$", line)]
-        if match
-    ]
-    if [number for number, _ in numbered] != list(range(1, STORIES + 1)):
+    #: A story is its number's line and every line that continues it, for the
+    #: reason a bullet is: half a requirement is not one, and a story that grew a
+    #: second sentence after somebody mapped it has to stop matching.
+    stories: dict[int, list[str]] = {}
+    for line in found["User Stories"]:
+        numbered = re.match(r"^(\d+)\.\s+(.*)$", line)
+        if numbered:
+            stories[int(numbered.group(1))] = [numbered.group(2).strip()]
+        elif stories and line.strip() and not line.startswith("#"):
+            stories[next(reversed(stories))].append(line.strip())
+    if list(stories) != list(range(1, STORIES + 1)):
         raise AuditError(f"the spec must hold user stories 1 through {STORIES}, numbered in order")
-    requirements.update({f"story:{number:03d}": text for number, text in numbered})
+    requirements.update({f"story:{number:03d}": " ".join(body) for number, body in stories.items()})
 
     decisions: dict[str, list[str]] = {}
     for line in found["Implementation Decisions"]:
@@ -264,12 +357,13 @@ def read_spec(root: Path, status: dict) -> dict[str, str]:
     for section, prefix, expected in (
         ("Testing Decisions", "testing", TESTING),
         ("Out of Scope", "scope", OUT_OF_SCOPE),
+        ("Further Notes", "note", NOTES),
     ):
-        bullets = paragraphs(found[section])
-        if len(bullets) != expected:
+        stated = bullets(found[section])
+        if len(stated) != expected:
             raise AuditError(f"the spec must hold {expected} entries under {section}")
         requirements.update({
-            f"{prefix}:{number:02d}": text for number, text in enumerate(bullets, 1)
+            f"{prefix}:{number:02d}": text for number, text in enumerate(stated, 1)
         })
 
     requirements.update({
@@ -310,7 +404,7 @@ def read_tickets(root: Path) -> dict[int, Ticket]:
             raise AuditError(f"ticket {number:02d} states no status or no blockers")
         tickets[number] = Ticket(
             number=number,
-            name=path.stem,
+            path=path,
             status=status.group(1).strip(),
             blockers=ticket_numbers(blocked.group(1)),
             criteria=tuple(
@@ -359,7 +453,7 @@ def gate_names(root: Path) -> frozenset[str]:
     )
 
 
-def resolution(root: Path, ticket: Ticket) -> str:
+def resolution(ticket: Ticket) -> str:
     """The revision that resolved one ticket, or the empty string if none did.
 
     The commit that added the resolved status line to that file, which is the
@@ -377,7 +471,7 @@ def resolution(root: Path, ticket: Ticket) -> str:
             "--format=%H",
             f"-S{RESOLUTION}",
             "--",
-            str((root / ISSUES / f"{ticket.name}.md").relative_to(CHECKOUT)),
+            str(ticket.path.relative_to(CHECKOUT)),
         ],
         capture_output=True,
         text=True,
@@ -416,6 +510,21 @@ def map_errors(audit: Audit) -> list[str]:
         if row["area"] not in AREAS:
             errors.append(f"{source}: {row['area']} is not one of the audited areas")
 
+        evidence = citations(row)
+        if not evidence:
+            # Criterion 5's testless requirement: something somebody believes is
+            # built, with nothing that could report otherwise.
+            errors.append(f"{source}: no test or gate checks it")
+
+        # A requirement whose evidence is owed is a requirement whose work is not
+        # finished, so the open ticket that owes it is also the ticket that is
+        # allowed to be named as implementing it.
+        owing = {
+            number
+            for token in evidence
+            if token.startswith(OWED)
+            for number in ticket_numbers(token[len(OWED):])
+        }
         cited = ticket_numbers(row["tickets"])
         if not cited:
             errors.append(f"{source}: no ticket implements it")
@@ -428,17 +537,31 @@ def map_errors(audit: Audit) -> list[str]:
             f"{source}: ticket {number:02d} is {audit.tickets[number].status}, not {RESOLVED}"
             for number in cited
             if number in audit.tickets and not audit.tickets[number].resolved
+            and number not in owing
         )
 
-        evidence = [token for token in row["evidence"].split(";") if token.strip()]
-        if not evidence:
-            # Criterion 5's testless requirement: something somebody believes is
-            # built, with nothing that could report otherwise.
-            errors.append(f"{source}: no test or gate checks it")
         for token in evidence:
-            token = token.strip()
-            if token.startswith(GATE):
-                if token[len(GATE):] not in audit.gates:
+            if token.startswith(OWED):
+                owed = ticket_numbers(token[len(OWED):])
+                if not owed:
+                    errors.append(f"{source}: {token} names no ticket that owes it")
+                errors.extend(
+                    f"{source}: {token} names a ticket the tracker does not hold"
+                    for number in owed
+                    if number not in audit.tickets
+                )
+                # The mirror of the deferral rule: work that is finished cannot
+                # owe anything, so a resolved ticket here is a row whose evidence
+                # somebody stopped looking for.
+                errors.extend(
+                    f"{source}: {token} is owed by a ticket that is already {RESOLVED}"
+                    for number in owed
+                    if number in audit.tickets and audit.tickets[number].resolved
+                )
+            elif token.startswith(GATE):
+                if token[len(GATE):] == SELF:
+                    errors.append(f"{source}: {token} cannot be its own evidence")
+                elif token[len(GATE):] not in audit.gates:
                     errors.append(f"{source}: {token} is not a gate this checkout ships")
             elif token.startswith(f"{TESTS}."):
                 if token not in audit.runnable:
@@ -450,7 +573,7 @@ def map_errors(audit: Audit) -> list[str]:
     return errors
 
 
-def ticket_errors(audit: Audit, root: Path) -> list[str]:
+def ticket_errors(audit: Audit) -> list[str]:
     """Criterion 3: every ticket in the audited range is done, and the revision says when."""
     errors = []
     for number in AUDITED:
@@ -483,7 +606,7 @@ def ticket_errors(audit: Audit, root: Path) -> list[str]:
             for blocker in ticket.blockers
             if blocker in audit.tickets and not audit.tickets[blocker].resolved
         )
-        if not resolution(root, ticket):
+        if not resolution(ticket):
             errors.append(f"ticket {number:02d}: no revision resolved it")
     return errors
 
@@ -547,9 +670,7 @@ def area_errors(audit: Audit) -> list[str]:
     by_area: dict[str, list[str]] = {area: [] for area in AREAS}
     for row in audit.rows:
         if row["area"] in by_area:
-            by_area[row["area"]].extend(
-                token.strip() for token in row["evidence"].split(";") if token.strip()
-            )
+            by_area[row["area"]].extend(citations(row))
     for area, anchors in AREAS.items():
         if not by_area[area]:
             errors.append(f"{area}: the map covers no requirement in this area")
@@ -564,10 +685,49 @@ def area_errors(audit: Audit) -> list[str]:
     return errors
 
 
-def regression_errors(audit: Audit, status: dict) -> list[str]:
+def playbook_errors(audit: Audit) -> list[str]:
+    """Criterion 6's number: the catalogue gate still plans the forty-nine.
+
+    The audit does not hold the corpus and is not going to import it. What it
+    holds is the count the ticket names, against the gate that enforces it: a
+    catalogue gate quietly re-planned to forty-eight would still pass every
+    reading here, and the requirement that all forty-nine ship would have moved
+    without this file noticing.
+    """
+    source = (CHECKOUT / f"{CATALOGUE.replace('.', '/')}.py").read_text(encoding="utf-8")
+    planned = IN_SCOPE.search(source)
+    if planned is None:
+        return [f"{CATALOGUE} no longer states how many in-scope Playbooks it plans"]
+    if int(planned.group(1)) != PLAYBOOKS:
+        return [
+            f"{CATALOGUE} plans {planned.group(1)} in-scope Playbooks"
+            f" and this audit was written against {PLAYBOOKS}"
+        ]
+    return []
+
+
+def release_errors(audit: Audit) -> list[str]:
+    """Criterion 5's last word: nothing is still owed once the release is declared.
+
+    An owed row is a requirement with no evidence and a ticket that says so. That
+    is an honest state for a repository mid-plan and a dishonest one for a
+    release, so the two are separated by the only event that means the release
+    happened: ticket 65 resolving.
+    """
+    outcome = audit.tickets.get(RELEASE_OUTCOME)
+    if outcome is None or not outcome.resolved:
+        return []
+    return [
+        f"{row['source']}: still owed, and ticket {RELEASE_OUTCOME} is {RESOLVED}"
+        for row in audit.rows
+        if any(token.startswith(OWED) for token in citations(row))
+    ]
+
+
+def regression_errors(audit: Audit) -> list[str]:
     """Criterion 2's registered half: each regression is mapped to the tickets it requires."""
     errors = []
-    for entry in status["regressions"]:
+    for entry in audit.status["regressions"]:
         cited = set(audit.cited(f"regression:{entry['id']}"))
         absent = sorted(set(entry["required_tickets"]) - cited)
         errors.extend(
@@ -578,7 +738,7 @@ def regression_errors(audit: Audit, status: dict) -> list[str]:
     return errors
 
 
-def selected(rows: list[dict[str, str]]) -> list[str]:
+def cited_tests(rows: list[dict[str, str]]) -> list[str]:
     """The cited tests, deduplicated and shortened to the broadest citation of each.
 
     A method cited beside its own case is the case, twice: `unittest` would load
@@ -586,10 +746,10 @@ def selected(rows: list[dict[str, str]]) -> list[str]:
     compared with the count of what was asked for.
     """
     names = {
-        token.strip()
+        token
         for row in rows
-        for token in row["evidence"].split(";")
-        if token.strip() and not token.strip().startswith(GATE)
+        for token in citations(row)
+        if token.startswith(f"{TESTS}.")
     }
     return sorted(
         name
@@ -604,17 +764,56 @@ def run_errors(names: list[str], stream=sys.stderr) -> tuple[list[str], str]:
     A skip is a refusal here rather than a pass. Most of this suite's live arms
     stand down without a database or a container, and a citation that stood down
     proves exactly nothing about the requirement that cites it -- which is the
-    difference between this and running the suite for a green exit code.
+    difference between this and running the suite for a green exit code. The one
+    exception is the inverse case, and it is the suite's own words that identify
+    it: a test which requires the runtime to be absent cannot run in the
+    interpreter this mode requires it to be present in.
     """
     suite = unittest.defaultTestLoader.loadTestsFromNames(names)
     result = unittest.TextTestRunner(verbosity=0, stream=stream).run(suite)
+    inverted = [case for case, reason in result.skipped if MEASURED in reason]
     errors = [f"{case}: failed" for case, _ in result.failures]
     errors.extend(f"{case}: errored" for case, _ in result.errors)
-    errors.extend(f"{case}: skipped, so it proves nothing" for case, _ in result.skipped)
+    errors.extend(
+        f"{case}: skipped, so it proves nothing"
+        for case, reason in result.skipped
+        if MEASURED not in reason
+    )
     report = (
-        f"  {'cited evidence':<22}{len(names):>4}"
-        f"   tests {result.testsRun}  failed {len(result.failures) + len(result.errors)}"
-        f"  skipped {len(result.skipped)}"
+        f"  {'cited tests':<22}{len(names):>4}"
+        f"   ran {result.testsRun}  failed {len(result.failures) + len(result.errors)}"
+        f"  skipped {len(result.skipped) - len(inverted)}  unmeasurable {len(inverted)}"
+    )
+    return errors, report
+
+
+def gate_errors(tokens: list[str], stream=sys.stderr) -> tuple[list[str], str]:
+    """The other half of what the map cites: the gates, run as the modules they are.
+
+    As subprocesses, like an operator would, rather than by importing them: two
+    of them import the application, one of them scans the tree, and none of them
+    was written to be a library this gate calls. What they print is theirs; what
+    this reads is the exit code.
+    """
+    cited = sorted({token for token in tokens if token.startswith(GATE)})
+    run = [token for token in cited if token not in UNRUN]
+    errors = []
+    for token in run:
+        module = token[len(GATE):]
+        result = subprocess.run(
+            [sys.executable, "-m", module],
+            cwd=str(CHECKOUT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            print(result.stdout + result.stderr, file=stream)
+            errors.append(f"{token}: exited {result.returncode}")
+    report = (
+        f"  {'cited gates':<22}{len(cited):>4}"
+        f"   ran {len(run)}  failed {len(errors)}"
+        f"  deferred {len(cited) - len(run)}"
     )
     return errors, report
 
@@ -623,18 +822,10 @@ def report(audit: Audit) -> str:
     """The counts, measured and in one fixed order, so two runs of it diff to nothing."""
     kinds = Counter(row["source"].split(":")[0] for row in audit.rows)
     areas = Counter(row["area"] for row in audit.rows)
-    tests = {
-        token.strip()
-        for row in audit.rows
-        for token in row["evidence"].split(";")
-        if token.strip() and not token.strip().startswith(GATE)
-    }
-    gates = {
-        token.strip()
-        for row in audit.rows
-        for token in row["evidence"].split(";")
-        if token.strip().startswith(GATE)
-    }
+    tests = {token for token in audit.evidence if token.startswith(f"{TESTS}.")}
+    gates = {token for token in audit.evidence if token.startswith(GATE)}
+    owed = {row["source"] for row in audit.rows
+            if any(token.startswith(OWED) for token in citations(row))}
     resolved = sum(1 for ticket in audit.tickets.values() if ticket.resolved)
     deferred = sum(
         len(audit.tickets[number].deferred) for number in AUDITED if number in audit.tickets
@@ -643,9 +834,9 @@ def report(audit: Audit) -> str:
         "spec coverage",
         f"  {'stories':<22}{kinds['story']:>4}   decisions {kinds['decision']}"
         f"  testing {kinds['testing']}  scope {kinds['scope']}"
-        f"  regressions {kinds['regression']}",
+        f"  notes {kinds['note']}  regressions {kinds['regression']}",
         f"  {'evidence':<22}{len(tests) + len(gates):>4}"
-        f"   tests {len(tests)}  gates {len(gates)}",
+        f"   tests {len(tests)}  gates {len(gates)}  owed {len(owed)}",
         f"  {'tickets':<22}{len(audit.tickets):>4}"
         f"   resolved {resolved}  audited {len(AUDITED)}  deferred criteria {deferred}",
     ]
@@ -656,39 +847,42 @@ def report(audit: Audit) -> str:
     return "\n".join(lines)
 
 
-def gather(map_path: Path | None = None) -> tuple[Audit, Path, dict]:
+def gather(map_path: Path | None = None) -> Audit:
     """Read the registry, the Spec, the tracker and the map once."""
     status = read_status()
     root = spec_root(status)
-    return (
-        Audit(
-            requirements=read_spec(root, status),
-            tickets=read_tickets(root),
-            rows=read_table(map_path or MAP, FIELDS, "evidence map"),
-            runnable=runnable_names(CHECKOUT / TESTS),
-            gates=gate_names(CHECKOUT / "tools"),
-        ),
-        root,
-        status,
+    return Audit(
+        status=status,
+        root=root,
+        requirements=read_spec(root, status),
+        tickets=read_tickets(root),
+        rows=read_table(map_path or MAP, FIELDS, "evidence map"),
+        runnable=runnable_names(CHECKOUT / TESTS),
+        gates=gate_names(CHECKOUT / TOOLS),
     )
 
 
 def check(map_path: Path | None = None, run: bool = False) -> str:
     """The release audit. Returns the report, or raises with every reason it failed."""
-    audit, root, status = gather(map_path)
+    audit = gather(map_path)
     errors = [
         *map_errors(audit),
-        *ticket_errors(audit, root),
+        *ticket_errors(audit),
         *graph_errors(audit),
         *area_errors(audit),
-        *regression_errors(audit, status),
+        *playbook_errors(audit),
+        *release_errors(audit),
+        *regression_errors(audit),
     ]
     lines = [report(audit)]
     if run and not errors:
         # After the static pass and only after it: names that do not resolve are
         # names `unittest` refuses to load, and the refusal it raises would be
         # this gate reporting an import error where it has a list of them.
-        failures, measured = run_errors(selected(audit.rows))
+        failures, measured = run_errors(cited_tests(audit.rows))
+        errors.extend(failures)
+        lines.append(measured)
+        failures, measured = gate_errors(audit.evidence)
         errors.extend(failures)
         lines.append(measured)
     if errors:
@@ -701,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--run",
         action="store_true",
-        help="run every cited test and refuse a failure, an error or a skip",
+        help="run every cited test and gate, refusing a failure, an error or a skip",
     )
     arguments = parser.parse_args(argv)
     try:

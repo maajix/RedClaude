@@ -2,10 +2,13 @@
 
 Every reading is asked against the real Spec, the real tracker and the real map
 with one thing changed, because the readings are what the gate is: a test that
-had to edit `spec.md` to reach one would be testing the filesystem. The one
-exception is the run mode, which is asked against a probe in this file -- a suite
-that passes and a suite that stands down -- since the thing it has to prove is
-that a citation which skipped is not evidence.
+had to edit `spec.md` to reach one would be testing the filesystem. Two
+exceptions. The run mode is asked against a probe in this file -- one test that
+passes, one that stands down and one that cannot be measured in an interpreter
+holding the runtime -- since what it has to prove is which of those three counts
+as evidence. And the two readings that are about the shape of a Spec rather than
+about this Spec are asked against a small document written to be read wrongly: a
+story that wraps onto a second line, and a section nobody parses.
 """
 
 import contextlib
@@ -13,6 +16,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,7 +34,9 @@ ROOT = Path(__file__).resolve().parents[1]
 #: this checkout can run.
 STORY = "story:001"
 #: One requirement whose evidence is a gate rather than a test.
-GATE_BACKED = "story:230"
+GATE_BACKED = "decision:01"
+#: One requirement whose evidence is owed by work that is not finished.
+OWED = "story:230"
 
 
 class RunnableProbe(unittest.TestCase):
@@ -41,6 +47,9 @@ class RunnableProbe(unittest.TestCase):
 
     def test_this_one_stands_down(self):
         self.skipTest("no database")
+
+    def test_this_one_cannot_be_measured_here(self):
+        self.skipTest("the sdk is installed, so this interpreter is a measured runtime")
 
 
 class AuditGateTest(unittest.TestCase):
@@ -53,17 +62,18 @@ class AuditGateTest(unittest.TestCase):
     def test_the_report_is_the_spec_measured_against_the_tracker(self):
         self.assertEqual(
             "spec coverage\n"
-            "  stories                230   decisions 19  testing 24  scope 9  regressions 7\n"
-            "  evidence               211   tests 205  gates 6\n"
+            "  stories                230   decisions 19  testing 24  scope 9"
+            "  notes 6  regressions 7\n"
+            "  evidence               213   tests 208  gates 5  owed 2\n"
             "  tickets                 83   resolved 77  audited 62  deferred criteria 11\n"
-            "  area: runtime          143   anchors 1\n"
-            "  area: agents            37   anchors 2\n"
+            "  area: runtime          144   anchors 1\n"
+            "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
             "  area: playbooks         14   anchors 2\n"
             "  area: operator          33   anchors 2\n"
-            "  area: v1_import         17   anchors 2\n"
-            "  area: long_session      15   anchors 2\n"
-            "  area: first_hunt        23   anchors 1",
+            "  area: v1_import         18   anchors 2\n"
+            "  area: long_session      16   anchors 2\n"
+            "  area: first_hunt        25   anchors 1",
             self.report,
         )
 
@@ -159,10 +169,10 @@ class AuditSpecTest(unittest.TestCase):
 
     def test_every_kind_of_requirement_is_read_out_of_the_documents(self):
         self.assertEqual(
-            (230, 19, 24, 9, 7),
+            (230, 19, 24, 9, 6, 7),
             tuple(
                 sum(1 for key in self.requirements if key.startswith(prefix))
-                for prefix in ("story:", "decision:", "testing:", "scope:", "regression:")
+                for prefix in ("story:", "decision:", "testing:", "scope:", "note:", "regression:")
             ),
         )
 
@@ -199,12 +209,88 @@ class AuditSpecTest(unittest.TestCase):
         )
 
 
+#: A Spec with one of everything, for the two readings that are about the shape
+#: of the document rather than about this document.
+SMALL = """# A small spec
+
+## Problem Statement
+
+Why.
+
+## Solution
+
+How.
+
+## User Stories
+
+### A heading the reader is not a requirement
+
+1. As an operator, I want one line,
+   so that what the second line says is part of the story.
+2. As an operator, I want another.
+
+## Implementation Decisions
+
+### 1. One decision
+
+Its body.
+
+## Testing Decisions
+
+- One obligation,
+  continued.
+
+## Out of Scope
+
+- One constraint.
+
+## Further Notes
+
+- One release condition.
+"""
+
+COUNTS = {"STORIES": 2, "DECISIONS": 1, "TESTING": 1, "OUT_OF_SCOPE": 1, "NOTES": 1}
+
+
+class AuditShapeTest(unittest.TestCase):
+    """What a requirement is, asked of a document written to be read wrongly."""
+
+    def read(self, spec: str) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / check_audit.SPEC_FILE).write_text(spec, encoding="utf-8")
+            with contextlib.ExitStack() as patched:
+                for name, value in COUNTS.items():
+                    patched.enter_context(mock.patch.object(check_audit, name, value))
+                return check_audit.read_spec(root, {"regressions": []})
+
+    def test_a_story_that_wraps_is_digested_at_everything_it_says(self):
+        # The failure this prevents is silent: a story truncated to its first
+        # line still matches its digest, and the evidence chosen for the whole
+        # sentence goes on standing for half of it.
+        requirements = self.read(SMALL)
+
+        self.assertEqual(
+            "As an operator, I want one line,"
+            " so that what the second line says is part of the story.",
+            requirements["story:001"],
+        )
+        self.assertEqual("One obligation, continued.", requirements["testing:01"])
+        self.assertEqual("One release condition.", requirements["note:01"])
+
+    def test_a_section_nobody_reads_is_refused_rather_than_skipped(self):
+        with self.assertRaises(check_audit.AuditError) as refused:
+            self.read(SMALL + "\n## Appendix\n\n- A requirement in a new place.\n")
+
+        self.assertIn("unread ['Appendix']", str(refused.exception))
+
+
 class AuditCase(unittest.TestCase):
     """A base for the readings, which are pure functions over one gathered audit."""
 
     @classmethod
     def setUpClass(cls):
-        cls.audit, cls.root, cls.status = check_audit.gather()
+        cls.audit = check_audit.gather()
 
     def altered(self, **changes) -> check_audit.Audit:
         return dataclasses.replace(self.audit, **changes)
@@ -310,6 +396,50 @@ class AuditMapTest(AuditCase):
             ),
         )
 
+    def test_a_requirement_whose_evidence_is_owed_names_the_ticket_that_owes_it(self):
+        # The shipped row: the final review has not run, so nothing checks the
+        # story that asks for it, and the map says which open ticket owes it
+        # rather than citing something that does not check it.
+        self.assertEqual([], check_audit.map_errors(self.audit))
+        row = next(row for row in self.audit.rows if row["source"] == OWED)
+
+        self.assertEqual("owed:64", row["evidence"])
+        self.assertFalse(self.audit.tickets[64].resolved)
+
+    def test_evidence_owed_by_finished_work_is_refused(self):
+        # The mirror of the deferral rule. A resolved ticket owes nothing, so a
+        # row still pointing at one is a row whose evidence nobody went back for.
+        self.assertEqual(
+            [f"{OWED}: owed:20 is owed by a ticket that is already resolved"],
+            check_audit.map_errors(
+                self.altered(rows=self.rows_with(OWED, tickets="20", evidence="owed:20"))
+            ),
+        )
+
+    def test_evidence_owed_by_nobody_is_refused(self):
+        self.assertEqual(
+            [f"{OWED}: owed:99 names a ticket the tracker does not hold"],
+            check_audit.map_errors(
+                self.altered(rows=self.rows_with(OWED, tickets="20", evidence="owed:99"))
+            ),
+        )
+
+    def test_an_unfinished_ticket_may_be_named_only_by_the_row_it_owes(self):
+        # Ticket 64 is open. The row it owes may name it as its implementer; any
+        # other row naming it is a requirement built by unfinished work.
+        self.assertEqual(
+            [f"{STORY}: ticket 64 is ready-for-agent, not resolved"],
+            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, tickets="64"))),
+        )
+
+    def test_this_gate_cannot_be_its_own_evidence(self):
+        self.assertEqual(
+            [f"{STORY}: gate:tools.check_audit cannot be its own evidence"],
+            check_audit.map_errors(
+                self.altered(rows=self.rows_with(STORY, evidence="gate:tools.check_audit"))
+            ),
+        )
+
     def test_a_gate_this_checkout_does_not_ship_is_refused(self):
         self.assertEqual(
             [f"{GATE_BACKED}: gate:tools.check_nothing is not a gate this checkout ships"],
@@ -323,11 +453,11 @@ class AuditTicketTest(AuditCase):
     """Criterion 3: the audited range is finished, and the tracker proves when."""
 
     def test_every_audited_ticket_is_resolved_with_a_revision(self):
-        self.assertEqual([], check_audit.ticket_errors(self.audit, self.root))
+        self.assertEqual([], check_audit.ticket_errors(self.audit))
 
     def test_an_unfinished_ticket_in_the_range_is_named_with_its_status(self):
         errors = check_audit.ticket_errors(
-            self.altered(tickets=self.tickets_with(20, status="ready-for-agent")), self.root
+            self.altered(tickets=self.tickets_with(20, status="ready-for-agent"))
         )
 
         self.assertEqual("ticket 20: ready-for-agent, not resolved", errors[0])
@@ -346,7 +476,7 @@ class AuditTicketTest(AuditCase):
         self.assertEqual(
             ["ticket 20: resolved with no acceptance criteria"],
             check_audit.ticket_errors(
-                self.altered(tickets=self.tickets_with(20, criteria=())), self.root
+                self.altered(tickets=self.tickets_with(20, criteria=()))
             ),
         )
 
@@ -359,7 +489,6 @@ class AuditTicketTest(AuditCase):
                         20, criteria=((False, "the browser was fast enough"),)
                     )
                 ),
-                self.root,
             ),
         )
 
@@ -371,7 +500,6 @@ class AuditTicketTest(AuditCase):
                 self.altered(
                     tickets=self.tickets_with(20, criteria=((False, "closed by ticket 46"),))
                 ),
-                self.root,
             ),
         )
 
@@ -384,7 +512,6 @@ class AuditTicketTest(AuditCase):
                         20, criteria=((False, "**Partial:** Ticket 78 closes it."),)
                     )
                 ),
-                self.root,
             ),
         )
 
@@ -392,7 +519,7 @@ class AuditTicketTest(AuditCase):
         self.assertEqual(
             ["ticket 20: blocked by 77, which is ready-for-agent"],
             check_audit.ticket_errors(
-                self.altered(tickets=self.tickets_with(20, blockers=(77,))), self.root
+                self.altered(tickets=self.tickets_with(20, blockers=(77,)))
             ),
         )
 
@@ -402,12 +529,16 @@ class AuditTicketTest(AuditCase):
         self.assertEqual(
             ["ticket 20: no revision resolved it"],
             check_audit.ticket_errors(
-                self.altered(tickets=self.tickets_with(20, name="20-never-committed")), self.root
+                self.altered(
+                    tickets=self.tickets_with(
+                        20, path=self.audit.root / check_audit.ISSUES / "20-never-committed.md"
+                    )
+                )
             ),
         )
 
     def test_the_revision_it_resolves_is_the_commit_that_resolved_the_ticket(self):
-        revision = check_audit.resolution(self.root, self.audit.tickets[20])
+        revision = check_audit.resolution(self.audit.tickets[20])
         shown = subprocess.run(
             ["git", "-C", str(ROOT), "show", "--format=%H", "-s", revision],
             capture_output=True,
@@ -499,15 +630,56 @@ class AuditRegressionTest(AuditCase):
     """Criterion 2's registered half: each prototype defect keeps its tickets."""
 
     def test_every_registered_regression_names_the_tickets_it_requires(self):
-        self.assertEqual([], check_audit.regression_errors(self.audit, self.status))
+        self.assertEqual([], check_audit.regression_errors(self.audit))
 
     def test_a_regression_mapped_without_a_required_ticket_is_refused(self):
         self.assertEqual(
             ["regression:RK-REG-006: the registry requires ticket 17 and the map does not name it"],
             check_audit.regression_errors(
                 self.altered(rows=self.rows_with("regression:RK-REG-006", tickets="16")),
-                self.status,
             ),
+        )
+
+
+class AuditPlaybookTest(AuditCase):
+    """Criterion 6's number: the audit names the forty-nine and holds a gate to it."""
+
+    def test_the_catalogue_gate_still_plans_the_forty_nine(self):
+        self.assertEqual([], check_audit.playbook_errors(self.audit))
+
+    def test_a_catalogue_planning_a_different_number_is_refused(self):
+        with mock.patch.object(check_audit, "PLAYBOOKS", 48):
+            self.assertEqual(
+                [
+                    "tools.check_coverage plans 49 in-scope Playbooks"
+                    " and this audit was written against 48"
+                ],
+                check_audit.playbook_errors(self.audit),
+            )
+
+    def test_a_catalogue_that_states_no_number_is_refused(self):
+        with mock.patch.object(check_audit, "IN_SCOPE", re.compile("^NOTHING = (1)$")):
+            self.assertEqual(
+                ["tools.check_coverage no longer states how many in-scope Playbooks it plans"],
+                check_audit.playbook_errors(self.audit),
+            )
+
+
+class AuditReleaseTest(AuditCase):
+    """Owed evidence is an honest state for a plan and a dishonest one for a release."""
+
+    def test_evidence_may_be_owed_while_the_release_outcome_is_open(self):
+        self.assertEqual([], check_audit.release_errors(self.audit))
+
+    def test_nothing_may_still_be_owed_once_the_release_outcome_is_resolved(self):
+        resolved = self.altered(
+            tickets=self.tickets_with(check_audit.RELEASE_OUTCOME, status="resolved")
+        )
+
+        self.assertEqual(
+            [f"{OWED}: still owed, and ticket 65 is resolved", "testing:24: still owed,"
+             " and ticket 65 is resolved"],
+            check_audit.release_errors(resolved),
         )
 
 
@@ -515,7 +687,7 @@ class AuditRunTest(AuditCase):
     """The `--run` half: the cited evidence is executed, and a skip proves nothing."""
 
     def test_the_selection_is_every_cited_test_at_its_broadest_citation(self):
-        selected = check_audit.selected(
+        chosen = check_audit.cited_tests(
             [
                 {"evidence": "tests.test_cli.RunCommandTest;gate:tools.check_baseline"},
                 {"evidence": "tests.test_cli.RunCommandTest.test_one;tests.test_ui.ServerTest"},
@@ -524,7 +696,7 @@ class AuditRunTest(AuditCase):
 
         # The method is dropped because its case is cited too: `unittest` would
         # otherwise load and run it under both names.
-        self.assertEqual(["tests.test_cli.RunCommandTest", "tests.test_ui.ServerTest"], selected)
+        self.assertEqual(["tests.test_cli.RunCommandTest", "tests.test_ui.ServerTest"], chosen)
 
     def test_a_citation_that_holds_is_evidence(self):
         errors, report = check_audit.run_errors(
@@ -532,7 +704,18 @@ class AuditRunTest(AuditCase):
         )
 
         self.assertEqual([], errors)
-        self.assertIn("tests 1", report)
+        self.assertIn("ran 1", report)
+
+    def test_a_citation_that_cannot_be_measured_here_is_not_a_refusal(self):
+        # The one inverse case: a test that requires the runtime to be absent
+        # cannot run in the interpreter this mode requires it to be present in.
+        errors, report = check_audit.run_errors(
+            ["tests.test_audit.RunnableProbe.test_this_one_cannot_be_measured_here"],
+            stream=io.StringIO(),
+        )
+
+        self.assertEqual([], errors)
+        self.assertIn("unmeasurable 1", report)
 
     def test_a_citation_that_stood_down_proves_nothing(self):
         errors, _ = check_audit.run_errors(
@@ -546,6 +729,32 @@ class AuditRunTest(AuditCase):
             ],
             errors,
         )
+
+
+class AuditGateRunTest(AuditCase):
+    """The other half of `--run`: the gates the map cites, run as modules."""
+
+    def test_a_gate_that_holds_is_evidence_and_the_release_gate_is_deferred(self):
+        errors, report = check_audit.gate_errors(
+            ["gate:tools.check_baseline", *check_audit.UNRUN], stream=io.StringIO()
+        )
+
+        self.assertEqual([], errors)
+        self.assertIn("ran 1", report)
+        self.assertIn("deferred 1", report)
+
+    def test_a_gate_that_refuses_is_reported_with_its_exit_code(self):
+        errors, _ = check_audit.gate_errors(
+            ["gate:tools.check_nothing"], stream=io.StringIO()
+        )
+
+        self.assertEqual(["gate:tools.check_nothing: exited 1"], errors)
+
+    def test_the_release_gate_is_the_one_citation_this_mode_does_not_run(self):
+        # Named rather than inferred: the release gate builds an install and
+        # provisions two databases, and a mode that proves citations resolve is
+        # not the place that happens.
+        self.assertEqual(("gate:tools.release_gate",), check_audit.UNRUN)
 
 
 if __name__ == "__main__":

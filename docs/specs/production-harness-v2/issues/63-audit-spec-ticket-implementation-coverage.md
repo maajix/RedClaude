@@ -18,10 +18,14 @@
 `baseline/spec-evidence.tsv`, `tools/check_audit.py` and `tests/test_audit.py`.
 The table is the work; the checker is what stops the table from being a
 document. One row per requirement -- 230 stories, 19 Implementation Decisions,
-24 Testing Decisions, 9 Out-of-Scope constraints and the 7 registered prototype
-regressions, 289 rows -- and each row carries the digest of the requirement's own
-text, the tickets that built it and the tests or gates that check it. 211 distinct
-citations: 205 test names and the six repository gates.
+24 Testing Decisions, 9 Out-of-Scope constraints, the 6 release conditions under
+Further Notes and the 7 registered prototype regressions, 295 rows -- and each row
+carries the digest of the requirement's own text, the tickets that built it and
+the tests or gates that check it. 213 distinct citations: 208 test names and five
+repository gates. The Spec's seven top-level sections are frozen too, so a
+requirement arriving under a heading nobody parses is release-blocking rather
+than invisible, and a story is digested at every line it wraps onto rather than
+at its first, because half a requirement is not one.
 
 **The digest is the reason the map cannot rot quietly.** Anything else -- a
 count, a key, a heading -- keeps matching after somebody rewrites the sentence
@@ -36,12 +40,24 @@ third kind.** That single closed vocabulary is criterion 5: a requirement with
 nothing cited is `no test or gate checks it`, and a requirement citing an ADR, a
 heading or a sentence is `neither a test nor a gate`. Prose citations are what an
 audit of a document-heavy project drifts into, and they are refused at the same
-severity as a missing row, because a document cannot go red. Names are resolved
+severity as a missing row, because a document cannot go red. This gate is not
+allowed to be its own evidence either, which is a rule it needed: story 230 asks
+for the final Standards and Spec review and testing decision 24 for final
+acceptance, and both were first mapped to the gate whose own docstring disclaims
+measuring evidence quality. What they say now is `owed:64` and `owed:65` -- the
+one honest way to have no evidence, naming the open ticket that owes it, exactly
+as a resolved ticket's unticked box names the ticket that closes it. An owed row
+is a tracked absence rather than a claim, and ticket 65 resolving while one is
+still there is itself a failure. Names are resolved
 by reading `tests/` with `ast` rather than by importing it, so the static pass
 needs no database and no container -- and `--run` then executes what the rows
-cite, where a skip counts as a refusal: most live arms stand down without a
-server, and a citation that stood down proves nothing about the requirement
-citing it.
+cite, tests and gates both, where a skip counts as a refusal: most live arms
+stand down without a server, and a citation that stood down proves nothing about
+the requirement citing it. Two carve-outs, both named: the release gate is
+reported as deferred rather than run, because it builds an install and provisions
+two databases, and the one skip accepted is the inverse case the suite states in
+its own words -- a test requiring the runtime to be absent cannot run in the
+interpreter this mode requires it to be present in.
 
 **Criterion 3 found eleven unticked boxes on resolved tickets.** 46, 49, 50, 51,
 52, 53, 54, 55, 56 and 57, and all eleven are the same missing thing: the
@@ -67,6 +83,27 @@ by asking the status registry which tree it classifies under this slug. That is
 the same constraint ticket 62 met, and it buys the same thing: a Spec that moves
 without the registry moving with it fails instead of being silently unaudited.
 
+**Criterion 6 names a number, so the audit names it too.** "All 49 in-scope
+Playbooks" is checked against the gate that enforces the catalogue: the audit
+holds 49 itself and refuses if `check_coverage` is planning a different one, read
+out of that gate's source rather than imported, because importing it would pull
+the application into a check that reads files. With `--run` executing cited
+gates, that catalogue check is then actually run rather than merely shipped.
+
+**`--run` inherits the conditions of every arm it runs.** Two of them bit during
+this ticket and are worth writing down. The Agent SDK has to be installed at the
+version `KNOWN_RUNTIME` pins -- a newer one is an unmeasured runtime, and a dozen
+agent citations refuse rather than pass, correctly. And the surface benchmarks
+measure wall time inside the process the audit is already running the other two
+thousand tests in: run under load, `slate` measured 1698.1 ms against a 1500 ms
+budget and the audit refused; run alone on the same machine it measured 192.1 ms.
+The audit is right both times, which is why the fix is an idle host rather than a
+carve-out.
+
 What this does not measure is whether the cited evidence is any good. A test that
 asserts nothing satisfies every reading here. That is ticket 64's job, and the
-reason these two are separate tickets rather than one.
+reason these two are separate tickets rather than one. It is also not one of the
+gates the release gate runs inside its export: criterion 3 reads this
+repository's history for the commit that resolved each ticket, and a tarball
+committed once as a checkout would answer that with one synthetic revision for
+every ticket in the plan.

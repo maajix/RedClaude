@@ -428,10 +428,11 @@ python3 -m tools.check_audit --run
 ```
 
 `baseline/spec-evidence.tsv` holds one row per requirement -- 230 user stories,
-19 Implementation Decisions, 24 Testing Decisions, 9 Out-of-Scope constraints and
-the 7 registered prototype regressions -- and each row names the tickets that
-built it and the tests or gates that check it. The audit reads the Spec, the
-tracker and that table together and refuses:
+19 Implementation Decisions, 24 Testing Decisions, 9 Out-of-Scope constraints, the
+6 release conditions under Further Notes and the 7 registered prototype
+regressions -- and each row names the tickets that built it and the tests or gates
+that check it. The audit reads the Spec, the tracker and that table together and
+refuses:
 
 * a requirement with no row, or a row for a requirement the Spec does not state;
 * a row whose digest no longer matches the requirement's own text, so a story
@@ -439,7 +440,15 @@ tracker and that table together and refuses:
 * a row naming a ticket that does not exist or is not resolved, or evidence that
   is neither a test this checkout can run nor a gate it ships -- there is no
   third kind, which is how a citation to a document is refused rather than
-  counted;
+  counted, and this gate may not be cited as its own evidence;
+* a requirement whose evidence is *owed* -- `owed:64`, the open ticket that will
+  produce it -- where that ticket is finished, does not exist, or where the
+  release outcome has been resolved with the row still saying it. Two rows say it
+  today: the final review and final acceptance are ticket 64's and 65's, and a
+  map that cited something else for them would be citing something that does not
+  check them;
+* a Spec section nobody reads: the seven headings are frozen, so a requirement
+  arriving under a new one is release-blocking rather than invisible;
 * a ticket in 01 through 62 that is unresolved, blocked by unfinished work, or
   has no revision resolving it -- the commit that wrote its resolved status --
   and any acceptance box it left unticked without naming an open ticket that
@@ -454,11 +463,29 @@ tracker and that table together and refuses:
 * a registered prototype regression whose map does not name the tickets the
   registry says it requires.
 
-`--run` then executes every cited test. A failure, an error *and a skip* are all
-refusals: most of the live arms stand down without a database or a container, and
-a citation that stood down proves nothing about the requirement citing it. So the
-run mode is a composed-suite command -- it wants `RK_TEST_SUPERUSER_URL`,
-`RK_TEST_CONTAINERS=1` and the two images, exactly like the composed suite.
+`--run` then executes every cited test and every cited gate. A failure, an error
+*and a skip* are all refusals: most of the live arms stand down without a
+database or a container, and a citation that stood down proves nothing about the
+requirement citing it. So the run mode is a composed-suite command -- it wants
+`RK_TEST_SUPERUSER_URL`, `RK_TEST_CONTAINERS=1`, the two images and the Agent SDK
+installed in the interpreter, exactly like the composed suite. It wants the SDK
+at the one version the runtime is measured against, the pair `KNOWN_RUNTIME`
+names; any other version is an unmeasured runtime, which every agent citation
+refuses on purpose. The one skip it
+accepts is the inverse case, and the suite says so in its own words: a test that
+requires the runtime to be *absent* cannot run where this mode requires it to be
+present. The one citation it does not run is `gate:tools.release_gate`, which
+builds an install and provisions two databases and is reported as deferred.
+
+Run it on an idle machine. The cited set includes the surface benchmarks, and a
+benchmark measures wall time in the process the audit is already running
+everything else in: on a loaded host a median drifts over its budget and the
+audit reports the drift as a failed citation, which is the honest reading of a
+measurement taken under load rather than a fault in the requirement.
 
 What it does not measure is whether the cited evidence is any good; a test that
-asserts nothing would satisfy it. That is the final code review's job.
+asserts nothing would satisfy it. That is the final code review's job. And it is
+not one of the gates the release gate runs inside its export: it reads this
+repository's history for the commit that resolved each ticket, and a tarball
+committed once as a checkout would answer that with one synthetic revision for
+every ticket in the plan.
