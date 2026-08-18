@@ -144,6 +144,7 @@ from tests.fixtures import (
     docker,
     export,
     latched,
+    performance_budgets,
     role_url,
     scratch,
     startup_refusal,
@@ -42625,6 +42626,412 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         self.assertIn("SET lease_expires_at", ELAPSE)
         self.assertNotEqual([], self.lapsed[self.INJECTED])
         self.assertEqual([], self.lapsed["control"])
+
+
+BENCHMARK_SLUG = "selftest-benchmark"
+
+
+class SurfaceBenchmarkTest(ReportFixture, DatabaseCase):
+    """PH2-62 criterion 5: what the five operations cost at engagement size.
+
+    The other criteria of this ticket ask whether something works. This one
+    asks what it costs, which is a different kind of question and needs a
+    different kind of fixture: not the smallest arrangement that can be wrong,
+    but the largest one an operator is going to have. So the Program this class
+    inherits -- two validated Findings, two stamped pivots, one composed chain
+    and the document rendered from it -- is inflated to the Surface a mid-sized
+    web target reaches after recon has run, and the five operations an operator
+    waits on are measured against it.
+
+    The budgets are not written here. They are in `docs/performance-budgets.md`
+    and this case reads them, so the number somebody decided and the number a
+    measurement is held to are one number rather than two that agree until one
+    of them is edited. A budget in that document with no measurement here fails
+    by name, and a measurement here with no budget there fails the same way:
+    either is a gate that silently stopped covering something.
+
+    What the numbers are for is stated in the document and worth repeating in
+    the place they are asserted: they are an order of magnitude above what the
+    operations cost on a development machine, because a budget tight enough to
+    be a target is a budget that fails on a busy laptop and teaches everyone to
+    rerun the suite. What they catch is the other failure -- an operation that
+    took a tenth of a second starting to take thirty because a join lost its
+    index or a bounded read stopped being bounded. Every measurement is printed
+    when the case runs, so drift is visible long before a budget is reached.
+
+    The statistic is the median of five repetitions: not the minimum, which
+    reports a machine that got lucky once, and not the mean, which one
+    scheduler hiccup moves further than a real regression would.
+
+    This case commits and purges its Program at the end, as everything built on
+    `ReplayFixture` does.
+    """
+
+    slug = BENCHMARK_SLUG
+
+    #: How many times each operation runs. Odd, so the median is a measurement
+    #: that happened rather than the average of two that did.
+    REPETITIONS = 5
+
+    #: Where the inflated Surface hangs off the scope the configuration admits:
+    #: `app.example.com:443` under `/api/`, which is what `VALID` includes. A
+    #: selector outside it would build a corpus the projection denies, and a
+    #: denied corpus is not ranked -- so the measurement would be of an empty
+    #: pass and would pass every budget forever.
+    PORT = 443
+    PREFIX = "/api/bench"
+
+    #: The columns every canonical Surface row is written with. Spelled once
+    #: because the three bulk statements below write the same nine, and a row
+    #: that omitted the scope pair would be an entity the projection cannot
+    #: decide.
+    ENTITY_COLUMNS = (
+        "program_id, type, dedup_key, origin, scope_selector_kind,"
+        " scope_selector, scope_port, scope_path_raw, scope_path_norm"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.budgets = performance_budgets()
+        # Written again rather than kept from `ReplayFixture`: the fixture opens
+        # the Program from a path it discards, and the bounded read is a command
+        # that takes a configuration file. Same bytes, so it resolves the same
+        # Program.
+        cls.configuration = write(
+            VALID.replace('name = "acme-web"', f'name = "{cls.slug}"')
+        )
+        cls.inflate()
+        cls.subject = str(
+            cls.connection.execute(
+                "SELECT entity_id::text FROM endpoints e"
+                "  JOIN entities t ON t.id = e.entity_id"
+                " WHERE t.program_id = $1::uuid AND t.dedup_key LIKE $2"
+                " ORDER BY t.dedup_key LIMIT 1",
+                (cls.program_id, f"endpoint:GET {cls.PREFIX}%"),
+            ).scalar()
+        )
+        # One Ranking pass before anything is measured. The pass is not one of
+        # the five: `offer_slate` reads what it left, and a measurement that
+        # ranked first would be reporting two operations under one budget.
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'benchmark')")
+            cls.connection.execute("SELECT rank_pass('runtime')")
+            cls.connection.execute("SELECT advance_lane_quota('runtime')")
+
+        cls.measured = {
+            "slate": cls.measure(cls.slate),
+            "playbook_selection": cls.measure(cls.playbook_selection),
+            "bounded_read": cls.measure(cls.bounded_read),
+            "graph_integrity": cls.measure(cls.graph_integrity),
+            "report_rendering": cls.measure(cls.report_rendering),
+        }
+        cls.report_measurements()
+
+    # -- the corpus ------------------------------------------------------------
+
+    @classmethod
+    def bulk(cls, sql: str, parameters: tuple = ()) -> list:
+        """One bulk write as the role that owns the rows, committed.
+
+        `ReplayFixture.as_owner` returns nothing and two of the statements below
+        need their rows back, so this is that method with a result. The corpus
+        is written in four statements rather than four thousand because what is
+        being built is the size of the Surface, not the path a row arrives by:
+        every one of these rows has a production writer that is tested where
+        that writer is the subject.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'benchmark')")
+            return cls.owner_connection.execute(sql, parameters).rows
+
+    @classmethod
+    def inflate(cls):
+        """The Surface the document declares, built and then projected once.
+
+        Every count here is a deficit rather than an amount: the Program this
+        class inherits already holds an Application, two Endpoints' worth of
+        subjects and the Tasks that carried the Findings, and the budgets are
+        stated against a Program of a stated size rather than against that size
+        plus whatever the fixture happened to bring. So each statement writes
+        the difference, and what the five operations then read is a Program of
+        exactly the declared corpus.
+
+        The projection runs at the end rather than per row for the reason the
+        row count is what it is: `add_entity` refreshes the whole Program's
+        projection on every call, so building this corpus through it would be
+        two thousand projections of a Surface that is only interesting once it
+        is complete.
+        """
+        wanted = cls.budgets.corpus
+
+        cls.bulk(
+            f"""
+            WITH made AS (
+                INSERT INTO entities ({cls.ENTITY_COLUMNS})
+                SELECT $1::uuid, 'application',
+                       format('application:bench-%s', g), 'proposed',
+                       'host', $2, $3::integer,
+                       format('%s/app%s/', $4::text, g),
+                       format('%s/app%s/', $4::text, g)
+                  FROM generate_series(1, $5::integer) AS g
+                RETURNING id, scope_path_raw
+            )
+            INSERT INTO applications (entity_id, base_url, kind)
+            SELECT id, format('https://%s%s', $2, scope_path_raw), 'web' FROM made
+            """,
+            (
+                cls.program_id,
+                HOST,
+                cls.PORT,
+                cls.PREFIX,
+                wanted["applications"] - cls.counted("applications"),
+            ),
+        )
+
+        # Spread across the Applications rather than nested under one: an
+        # Endpoint corpus hanging off a single Application is one join key, and
+        # the pass being measured joins on it.
+        cls.bulk(
+            f"""
+            WITH app AS (
+                SELECT a.entity_id, e.scope_path_raw AS root,
+                       row_number() OVER (ORDER BY e.dedup_key) - 1 AS ordinal
+                  FROM applications a
+                  JOIN entities e ON e.id = a.entity_id
+                 WHERE e.program_id = $1::uuid
+                   AND e.dedup_key LIKE 'application:bench-%'
+            ), spread AS (
+                SELECT app.entity_id AS application_id,
+                       format('%sresource%s', app.root, g) AS path
+                  FROM generate_series(1, $4::integer) AS g
+                  JOIN app ON app.ordinal = (g - 1) % (SELECT count(*) FROM app)
+            ), made AS (
+                INSERT INTO entities ({cls.ENTITY_COLUMNS})
+                SELECT $1::uuid, 'endpoint', format('endpoint:GET %s', path),
+                       'proposed', 'host', $2, $3::integer, path, path
+                  FROM spread
+                RETURNING id, scope_path_raw
+            )
+            INSERT INTO endpoints (entity_id, application_id, method, path_template)
+            SELECT made.id, spread.application_id, 'GET', spread.path
+              FROM made JOIN spread ON spread.path = made.scope_path_raw
+            """,
+            (
+                cls.program_id,
+                HOST,
+                cls.PORT,
+                wanted["endpoints"] - cls.counted("endpoints"),
+            ),
+        )
+
+        cls.bulk(
+            f"""
+            WITH ep AS (
+                SELECT n.entity_id, e.scope_path_raw AS path,
+                       row_number() OVER (ORDER BY e.dedup_key) - 1 AS ordinal
+                  FROM endpoints n
+                  JOIN entities e ON e.id = n.entity_id
+                 WHERE e.program_id = $1::uuid AND e.dedup_key LIKE $4
+            ), spread AS (
+                SELECT ep.entity_id AS endpoint_id, g AS ordinal,
+                       format('%s?p%s', ep.path, g) AS path
+                  FROM generate_series(1, $5::integer) AS g
+                  JOIN ep ON ep.ordinal = (g - 1) % (SELECT count(*) FROM ep)
+            ), made AS (
+                INSERT INTO entities ({cls.ENTITY_COLUMNS})
+                SELECT $1::uuid, 'parameter', format('parameter:%s', path),
+                       'proposed', 'host', $2, $3::integer, path, path
+                  FROM spread
+                RETURNING id, scope_path_raw
+            )
+            INSERT INTO parameters (entity_id, endpoint_id, name, location)
+            SELECT made.id, spread.endpoint_id, format('p%s', spread.ordinal), 'query'
+              FROM made JOIN spread ON spread.path = made.scope_path_raw
+            """,
+            (
+                cls.program_id,
+                HOST,
+                cls.PORT,
+                f"endpoint:GET {cls.PREFIX}%",
+                wanted["parameters"] - cls.counted("parameters"),
+            ),
+        )
+
+        # One Task per subject, not three: 018's live dedup index holds a
+        # Program to a single open Task per subject and kind, so a corpus with
+        # three would not be a bigger backlog, it would be a refusal. Which is
+        # why the declared Task count is the Endpoints and the Parameters
+        # together -- a backlog that size is one this Surface can actually hold.
+        #
+        # The two model-side estimates differ per Task, because a corpus where
+        # every Task promises the same thing is one the ranking can order by
+        # nothing.
+        deficit = wanted["tasks"] - cls.hunts()
+        written = cls.bulk(
+            """
+            INSERT INTO tasks (program_id, kind, status, subject_entity_id,
+                               expected_information_gain, potential_impact)
+            SELECT $1::uuid, 'hunt', 'pending', subject.id,
+                   round((subject.ordinal % 9 + 1)::numeric / 10, 2),
+                   round((subject.ordinal % 7 + 1)::numeric / 10, 2)
+              FROM (
+                SELECT e.id, row_number() OVER (ORDER BY e.dedup_key) AS ordinal
+                  FROM entities e
+                 WHERE e.program_id = $1::uuid
+                   AND e.type = ANY($2::text[])
+                   AND e.scope_path_raw LIKE $3
+                   AND NOT EXISTS (SELECT 1 FROM tasks t
+                                    WHERE t.program_id = $1::uuid
+                                      AND t.kind = 'hunt'
+                                      AND t.subject_entity_id = e.id)
+                 ORDER BY e.dedup_key
+                 LIMIT $4::integer
+              ) AS subject
+            RETURNING id
+            """,
+            (cls.program_id, "{endpoint,parameter}", f"{cls.PREFIX}%", deficit),
+        )
+        assert len(written) == deficit, f"{len(written)} of {deficit} Tasks written"
+
+        cls.bulk("SELECT refresh_scope_projection($1::uuid)", (cls.program_id,))
+
+    @classmethod
+    def hunts(cls) -> int:
+        """How many hunt Tasks this Program holds, whoever wrote them."""
+        return int(
+            cls.connection.execute(
+                "SELECT count(*) FROM tasks"
+                " WHERE program_id = $1::uuid AND kind = 'hunt'",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def counted(cls, table: str) -> int:
+        """How many rows of one kind this Program holds, the corpus's own way."""
+        return int(
+            cls.connection.execute(
+                f"SELECT count(*) FROM {table} d JOIN entities e"
+                f"  ON e.id = d.entity_id WHERE e.program_id = $1::uuid",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    # -- the measurements ------------------------------------------------------
+
+    @classmethod
+    def measure(cls, operation) -> float:
+        """One operation's cost in milliseconds, as the median of five runs."""
+        timings = []
+        for _ in range(cls.REPETITIONS):
+            started = time.perf_counter()
+            operation()
+            timings.append((time.perf_counter() - started) * 1000)
+        return sorted(timings)[len(timings) // 2]
+
+    @classmethod
+    def slate(cls):
+        """`offer_slate()`: rank every claimable Task and write the offer."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'benchmark')")
+            cls.connection.execute("SELECT * FROM offer_slate()").rows
+
+    @classmethod
+    def playbook_selection(cls):
+        """`select_playbooks()`: one subject against the whole shipped catalogue."""
+        cls.connection.execute(
+            "SELECT * FROM select_playbooks($1::uuid, $2::uuid, NULL,"
+            " 'web_hunter', 'constrained', 3)",
+            (cls.program_id, cls.subject),
+        ).rows
+
+    @classmethod
+    def bounded_read(cls):
+        """`rk state`: two connections, one binding and the compact index."""
+        read = state.read(cls.harness.runtime, cls.harness.state, cls.configuration)
+        assert read.ok, read.violations
+
+    @classmethod
+    def graph_integrity(cls):
+        """`check_kill_chains()`, on the connection `rk db verify` holds."""
+        cls.owner_connection.execute("SELECT * FROM check_kill_chains()").rows
+
+    @classmethod
+    def report_rendering(cls):
+        """`reporting.render()` over the long-form Finding bundle."""
+        reporting.render(cls.bundle)
+
+    @classmethod
+    def report_measurements(cls):
+        """Every measurement beside its budget, so drift is readable in passing."""
+        print(f"\n  surface benchmark ({cls.REPETITIONS} repetitions, median)")
+        for name in sorted(cls.measured):
+            budget = cls.budgets.limits.get(name)
+            allowed = "no budget" if budget is None else f"{budget} ms"
+            print(f"    {name:<20}{cls.measured[name]:>9.1f} ms   budget {allowed}")
+
+    # -- what the document and the corpus have to agree about -------------------
+
+    def test_the_corpus_is_the_size_the_budgets_are_stated_against(self):
+        # A budget measured on a corpus a tenth of the declared size is a budget
+        # nothing is holding, so the size is asserted rather than assumed.
+        self.assertEqual(
+            self.budgets.corpus,
+            {
+                "applications": self.counted("applications"),
+                "endpoints": self.counted("endpoints"),
+                "parameters": self.counted("parameters"),
+                "tasks": self.hunts(),
+            },
+        )
+
+    def test_the_surface_this_was_measured_on_is_one_the_scope_admits(self):
+        # The corpus has to be in scope or the ranking pass has nothing to
+        # price: an out-of-scope Task is not filtered late, it is not in the
+        # partial index the pass reads at all.
+        denied = self.connection.execute(
+            "SELECT count(*) FROM entities"
+            " WHERE program_id = $1::uuid AND dedup_key LIKE $2 AND NOT in_scope",
+            (self.program_id, "%bench%"),
+        ).scalar()
+
+        self.assertEqual(0, int(denied))
+
+    def test_every_budget_is_measured_and_every_measurement_is_budgeted(self):
+        # Both directions, because each is a way the gate stops covering
+        # something without failing: a budget nothing measures, and a
+        # measurement nothing bounds.
+        self.assertEqual(sorted(self.budgets.limits), sorted(self.measured))
+
+    # -- the five budgets ------------------------------------------------------
+
+    def test_slate_computation_is_within_budget(self):
+        self.assertWithinBudget("slate")
+
+    def test_playbook_selection_is_within_budget(self):
+        self.assertWithinBudget("playbook_selection")
+
+    def test_the_bounded_read_is_within_budget(self):
+        self.assertWithinBudget("bounded_read")
+
+    def test_graph_integrity_is_within_budget(self):
+        self.assertWithinBudget("graph_integrity")
+
+    def test_report_rendering_is_within_budget(self):
+        self.assertWithinBudget("report_rendering")
+
+    def assertWithinBudget(self, name: str):
+        """One measurement against the document, saying both numbers when it fails."""
+        budget = self.budgets.limits[name]
+        measured = self.measured[name]
+        self.assertLessEqual(
+            measured,
+            budget,
+            f"{name} took {measured:.1f} ms against a budget of {budget} ms"
+            " (docs/performance-budgets.md declares it)",
+        )
 
 
 if __name__ == "__main__":

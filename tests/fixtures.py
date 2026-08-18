@@ -4,6 +4,7 @@ import atexit
 import contextlib
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -19,6 +21,8 @@ from urllib.parse import quote
 
 from redkraken import _launch, _startup, agent, door, isolation, legacy, store, tls, verifier
 from redkraken.document import FENCE
+
+from tests import ROOT
 
 
 VALID = """\
@@ -920,6 +924,64 @@ def frontmatter(fields: dict) -> str:
         lines.append(f"{key}: {rendered}")
     lines.append(FENCE)
     return "\n".join(lines) + "\n"
+
+
+#: The budgets an operator reads, as prose rather than as constants declared
+#: here. `SurfaceBenchmarkTest` builds its corpus and holds its measurements to
+#: what this file says, so the number a budget is stated at and the number a
+#: measurement is compared to are the same number. A constant here and a table
+#: there would agree until somebody edited one of them, and the one that gets
+#: edited is the document.
+BUDGETS = ROOT / "docs" / "performance-budgets.md"
+
+#: The two tables in it. Narrow on purpose: a row is a backticked name and a
+#: number, and anything else on the line is prose about the measurement. A table
+#: that stopped matching reports as an empty table, which fails the case that
+#: reads it rather than passing quietly with nothing to check.
+_CORPUS_ROW = re.compile(r"^\|\s*`([a-z_]+)`\s*\|\s*(\d+)\s*\|\s*$")
+_BUDGET_ROW = re.compile(r"^\|\s*`([a-z_]+)`\s*\|\s*(\d+) ms\s*\|")
+
+
+@dataclass(frozen=True)
+class Budgets:
+    """What `docs/performance-budgets.md` declares, as its two tables.
+
+    `corpus` is the Surface the measurements are taken on -- how many rows of
+    each kind the case has to build before it measures anything -- and `limits`
+    is what each measurement is allowed to cost in milliseconds. Two dicts and
+    not one, because they are answers to different questions and a case that
+    conflated them could build a corpus out of a budget.
+    """
+
+    corpus: dict[str, int]
+    limits: dict[str, int]
+
+
+def performance_budgets(path: Path = BUDGETS) -> Budgets:
+    """Read the budget document, as the case that is held to it reads it.
+
+    Split on the headings first, so a corpus row and a budget row cannot be
+    read out of each other's table: both are a backticked name and a number,
+    and the only thing that distinguishes them is which table they are in.
+    """
+    corpus: dict[str, int] = {}
+    limits: dict[str, int] = {}
+    table = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            table = corpus if line.startswith("## The corpus") else (
+                limits if line.startswith("## The budgets") else None
+            )
+            continue
+        if table is corpus:
+            row = _CORPUS_ROW.match(line)
+        elif table is limits:
+            row = _BUDGET_ROW.match(line)
+        else:
+            continue
+        if row is not None:
+            table[row.group(1)] = int(row.group(2))
+    return Budgets(corpus=corpus, limits=limits)
 
 
 #: One root for everything the suite writes, so a run leaves nothing behind.

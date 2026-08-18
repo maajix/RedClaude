@@ -34,6 +34,13 @@ and they are what the report rendering measurement renders.
 | `parameters` | 800 |
 | `tasks` | 1200 |
 
+The Task count is the Endpoints and the Parameters together, one open `hunt`
+Task each. Not more, because the live dedup index holds a Program to a single
+open Task per subject and kind: a backlog of three per subject is not a bigger
+engagement, it is a refusal. The counts are deficits when the case builds them,
+so the Program the operations are measured on holds exactly this and not this
+plus whatever the fixture it inherits already wrote.
+
 ## The budgets
 
 | Measurement | Budget | What is measured |
