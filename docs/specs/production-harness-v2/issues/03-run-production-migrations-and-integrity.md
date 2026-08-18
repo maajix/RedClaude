@@ -182,21 +182,29 @@ schema, the same class as the `xmin = 2` exclusion the check already carries for
 frozen tuples. The row degrades to part (b) -- an Event exists for it at all --
 and the restore says so rather than passing silently.
 
-The tolerance is the prototype's, unchanged: `docs/prototype/schema/restore.sh`
-decided it and measured the same 13 problems of the same one kind. It lives in
-the only caller that knows a restore happened. `integrity.verify(restored=True)`
-holds the failure as a passing check with its detail extended, and asks
+The tolerance was the prototype's, unchanged: `docs/prototype/schema/restore.sh`
+decided it and measured the same 13 problems of the same one kind. It lived in
+the only caller that knew a restore had happened. `integrity.verify(restored=True)`
+held the failure as a passing check with its detail extended, and asked
 `check_event_log_integrity()` for the problem kinds rather than parsing them out
-of the standing check's detail, because what is tolerated is a kind and the
-kinds are a column. A second problem kind in the same check fails a restore
-exactly as it fails anything else. `rk db verify` stays strict, so a database
-that fails this way without anyone restoring it is still a database whose
-emitter was switched off for a write.
+of the standing check's detail, because what was tolerated was a kind and the
+kinds are a column. A second problem kind in the same check failed a restore
+exactly as it failed anything else, and `rk db verify` stayed strict -- so a
+database that failed this way without anyone restoring it was still a database
+whose emitter had been switched off for a write.
 
 `ArchiveTest` now opens its Program through `program.run` and commits it, so the
 archive carries rows and the case an operator actually meets is the one under
-test: `test_the_restored_database_holds_on_its_own` asserts that a plain
-`rk db verify` still fails, and only on that one problem kind;
-`test_a_populated_archive_restores_into_a_database_the_gate_accepts` asserts
-that the restore holds and that the configuration revisions survived it.
-Reverting `entitled_by_a_restore` fails the second one by name.
+test: `test_the_restored_database_holds_on_its_own` and
+`test_a_populated_archive_restores_into_a_database_the_gate_accepts` between
+them assert that the restore holds, that a plain `rk db verify` of the restored
+database holds too, and that the configuration revisions survived it.
+
+**Superseded by ticket 61.** The tolerance is gone. Migration
+`20260913T010000Z` gave part (d) a second disjunct -- an event whose own tuple
+carries the row's `xmin` accounts for that row -- because a subtransaction write
+recorded an id its parent never reported. A restore rewrites a row and its
+event together, so the same disjunct makes a restored database pass the check
+outright, and `entitled_by_a_restore` was left able to forgive nothing but a
+real defect. `rk db restore` now gates exactly as `rk db verify` does, and
+`ArchiveTest` asserts zero problems rather than one named one.

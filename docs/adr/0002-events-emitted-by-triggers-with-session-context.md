@@ -47,15 +47,26 @@ must go through one helper that populates it.
 - **Dropping a trigger is the failure mode to watch.** A migration that rewrites
   a table can silently detach it. `check_event_log_integrity()` therefore checks
   `pg_trigger` against the config, not only rows against events.
-- **A restore destroys one kind of evidence, and says so.** The check ties a row
-  to its event by `xmin`, which belongs to the tuple rather than to the row.
-  `pg_restore` rewrites every tuple in its own transaction, so
-  `row_last_write_unaccounted` is false for every restored row by construction —
-  the same class as the `xmin = 2` exclusion for frozen tuples. Only
-  `rk db restore` may hold that one failure, and only when it is the sole problem
-  kind; `rk db verify` stays strict, because otherwise a detached emitter would
-  hide behind a restore that never happened.
+- **A row and its event are tied by the tuple, and a rewrite of both is still
+  one write.** The check ties a row to its event by `xmin`, which belongs to the
+  tuple rather than to the row, and an event accounts for its row when the id it
+  recorded is the row's `xmin` *or* when the event's own tuple carries that same
+  `xmin`. The second half is what makes the tie survive machinery that rewrites
+  both together: `pg_restore` rebuilds every tuple under transaction ids the
+  recorded write knew nothing about, and a subtransaction writes a row under an
+  id its parent's `pg_current_xact_id()` does not report. Neither is an emitter
+  that was switched off, and neither needs a tolerance to say so — a restored
+  database passes the check outright, and `rk db restore` gates exactly as
+  `rk db verify` does. What a restore costs part (d) is unchanged by this: once
+  `pg_restore` has rewritten every row and every event under one id, the check
+  can no longer tell an event its transaction wrote from one written later, and
+  the tolerance did not preserve that evidence either -- it forgave the whole
+  check for every restored row. Part (b), whether a row has an event at all,
+  survives a restore and still asks.
 
 Settled in historical ticket 07, decisions 9, 11 and 17.
 Amended by migration 0030 (historical ticket 33) to record the checked
 non-emitter classifications.
+Amended by migration `20260913T010000Z` (ticket 61): a row accounted for by a
+same-tuple write needs no restore entitlement, and the one `rk db restore` used
+to spend is gone.

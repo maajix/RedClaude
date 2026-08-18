@@ -940,8 +940,13 @@ class Slice:
                     source="database",
                 )
                 return None
-        recovered = int(answer.get("tasks_returned") or 0) + int(
-            answer.get("tasks_retired") or 0
+        # Every arm of the settling, because each of the three is a Task taken
+        # off an owner that stopped beating: offered again, retired for its
+        # attempts, or closed because the runtime had already accepted a result
+        # of it and only the closing was lost.
+        recovered = sum(
+            int(answer.get(arm) or 0)
+            for arm in ("tasks_returned", "tasks_retired", "tasks_settled_done")
         )
         ledger.hold(
             "reconciliation",

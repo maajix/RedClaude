@@ -37,8 +37,10 @@ import base64
 import contextlib
 import html
 import http.client
+import inspect
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -51,7 +53,7 @@ import time
 import unittest
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,6 +116,7 @@ from redkraken.outcome import (
     TARGET_UNREACHABLE,
     Ledger,
     Report,
+    Violation,
 )
 from redkraken.store import Store
 from tests import ROOT, browser_door, browser_target
@@ -10718,7 +10721,7 @@ class Child:
             return self.choose(request)
         self.requests.append(request)
         if request.egress is not None:
-            self.answers.append(_launch._spend(request.egress, URL, "GET"))
+            self.answers.append(self.spend(request.egress))
         return agent.AgentRunResult(
             agent_run_id=request.agent_run_id,
             role=request.role,
@@ -10734,6 +10737,16 @@ class Child:
             mission_result=self.result(),
             mission_attempts=1,
         )
+
+    def spend(self, egress: agent.Egress) -> dict:
+        """The one request this child makes, through the door it was handed.
+
+        A method rather than a line inside the call above, because a campaign
+        runs children against several addresses and the address is the only
+        thing that differs: a launcher that overrode the call would be a second
+        copy of everything either side of the request.
+        """
+        return _launch._spend(egress, URL, "GET")
 
     def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
         """What the orchestrator session answers: one pick, or nothing.
@@ -12251,6 +12264,39 @@ class SurfacePromotionTest(DatabaseCase):
         )
         self.assertEqual(before, self.labels("recon"))
 
+    def test_a_promotion_is_a_write_the_event_log_accounts_for(self):
+        # Every Entity, Relationship and Observation a promotion writes is
+        # written inside a `BEGIN ... EXCEPTION` block, so the tuple carries the
+        # subtransaction's id while the event beside it records the transaction
+        # as a whole. Ticket 61 found that pair being read as an unaccounted
+        # write, which made a Program unresumable the moment it promoted
+        # anything: `rk run` refuses a Program failing its own checks.
+        #
+        # Both halves are asserted. That the two ids really do differ, so this
+        # case cannot start passing because the exception block quietly went
+        # away and took the question with it; and that the check reads them as
+        # the one write they are.
+        written = [
+            (int(row[0]), int(row[1]))
+            for row in self.rows(
+                "SELECT o.xmin::text::bigint,"
+                "       (e.xact_id::text::numeric % 4294967296)::bigint"
+                "  FROM observations o JOIN events e"
+                "    ON e.subject_table = 'observations' AND e.subject_id = o.id"
+                " WHERE o.program_id = $1::uuid AND e.type = 'observation.recorded'"
+            )
+        ]
+
+        self.assertTrue(written)
+        self.assertEqual([], [pair for pair in written if pair[0] == pair[1]])
+        self.assertEqual(
+            (),
+            self.connection.execute(
+                "SELECT problem, detail, count FROM check_event_log_integrity($1::uuid)",
+                (self.identifiers["recon"],),
+            ).rows,
+        )
+
 
 #: The Programs the Hypothesis case opens. Two, for the reason the promotion
 #: case opens two: "reachable from this Program" is a claim about a second
@@ -13552,19 +13598,27 @@ class ArchiveTest(DatabaseCase):
         ).scalar()
 
     def test_the_restored_database_holds_on_its_own(self):
-        # Every check but one, and that one is named: `pg_restore` rewrites each
-        # tuple in the restore's own transaction while the events keep the
-        # transaction ids of the writes that really happened, so part (d) of the
-        # event log check is false for every restored row by construction.
-        # `rk db verify` says so rather than tolerating it -- the tolerance
-        # belongs to the restore, which is the only caller that knows why.
+        # Every check, asked of the restored database by a caller that knows
+        # nothing about restores. `pg_restore` rewrites each tuple under a
+        # transaction id the events know nothing about, so the event log check
+        # used to be false for every restored row by construction and the
+        # restore carried a tolerance for it. Part (d) now also accounts for a
+        # row whose event was written by the same transaction as the row, which
+        # is what a restore leaves behind, so there is nothing left to tolerate
+        # and `rk db verify` is where that is proved -- the restore's own gate
+        # could pass on a tolerance rather than on the rows.
         result = migrate.verify(self.target)
 
-        self.assertEqual(["standing:event_log_integrity"], result.facts["failed"])
+        self.assertEqual([], result.facts["failed"])
         with pg.connect(self.target) as connection:
             self.assertEqual(
-                [("row_last_write_unaccounted",)],
-                [tuple(row) for row in connection.execute(integrity.EVENT_LOG_PROBLEMS).rows],
+                [],
+                [
+                    tuple(row)
+                    for row in connection.execute(
+                        "SELECT DISTINCT problem FROM check_event_log_integrity()"
+                    ).rows
+                ],
             )
 
     def test_the_narrowed_runtime_surface_survives_the_restore(self):
@@ -13597,15 +13651,14 @@ class ArchiveTest(DatabaseCase):
             )
 
     def test_a_populated_archive_restores_into_a_database_the_gate_accepts(self):
-        # The whole point of the entitlement: an archive with rows in it used to
-        # fail its own restore, which left an operator restoring a real backup
-        # reading `integrity_failed` over evidence the restore itself destroyed.
+        # An archive with rows in it, restored and gated with no tolerance of
+        # any kind: the check that a restore used to be forgiven for failing
+        # reports no problems at all, and the rows the archive carried are on
+        # the far side of it.
         held = {assertion.name: assertion.detail for assertion in self.read.assertions}
 
         self.assertTrue(self.read.ok, self.read.violations)
-        self.assertIn(
-            "xmin evidence lost to the restore", held["standing:event_log_integrity"]
-        )
+        self.assertEqual("0 problem(s)", held["standing:event_log_integrity"])
         self.assertEqual(
             1,
             self.count(
@@ -18037,6 +18090,9 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         chose.
         """
         cls.weights_before = cls.active_weights()
+        cls.highest_before = int(
+            str(cls.as_owner("SELECT max(version) FROM scheduler_weights").scalar())
+        )
         cls.rewrite_refusal = cls.owner_refusal(
             "UPDATE scheduler_weights SET w_unlock = 0 WHERE version = $1",
             (str(cls.weights_before["version"]),),
@@ -18310,9 +18366,12 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         self.assertIn("named by every Ranking pass", self.delete_refusal)
 
     def test_the_operator_verb_supersedes_rather_than_edits(self):
-        self.assertEqual(
-            self.weights_before["version"] + 1, self.weights_after["version"]
-        )
+        # Above every version that exists and not above the active one: a
+        # version is kept for as long as a Ranking pass names it, so a corpus
+        # this class shares with a case that installed weights of its own has
+        # numbers above the active row that nothing may reuse.
+        self.assertEqual(self.highest_before + 1, self.weights_after["version"])
+        self.assertGreater(self.weights_after["version"], self.weights_before["version"])
         self.assertEqual(self.new_version, self.weights_after["version"])
         self.assertEqual(0.0, float(str(self.weights_after["w_unlock"])))
         # Everything the operator did not name comes with it.
@@ -20274,6 +20333,7 @@ class LeaseTest(DatabaseCase):
                 "tasks_left_to_live_owners": 0,
                 "tasks_returned": 1,
                 "tasks_retired": 0,
+                "tasks_settled_done": 0,
                 "runs_aborted": 1,
                 "leases_released": 1,
                 "hypotheses_returned_to_testable": 1,
@@ -20287,6 +20347,7 @@ class LeaseTest(DatabaseCase):
                 "tasks_left_to_live_owners": 0,
                 "tasks_returned": 0,
                 "tasks_retired": 0,
+                "tasks_settled_done": 0,
                 "runs_aborted": 0,
                 "leases_released": 0,
                 "hypotheses_returned_to_testable": 0,
@@ -20308,6 +20369,7 @@ class LeaseTest(DatabaseCase):
                 "tasks_left_to_live_owners": 1,
                 "tasks_returned": 0,
                 "tasks_retired": 0,
+                "tasks_settled_done": 0,
                 "runs_aborted": 0,
                 "leases_released": 0,
                 "hypotheses_returned_to_testable": 0,
@@ -40303,6 +40365,2266 @@ class RuntimePrivilegeSurfaceTest(DatabaseCase):
         ]
 
         self.assertEqual([], failed)
+
+
+# ===========================================================================
+# PH2-61: one campaign stopped at every commit, against one that was not
+# ===========================================================================
+
+#: What the two campaigns are called. The suffix is the only difference the
+#: comparison at the end is allowed to find: one campaign runs undisturbed and
+#: the other is stopped either side of every commit the harness makes and
+#: restarted each time.
+CAMPAIGN_SLUG = "selftest-campaign"
+
+#: The campaign's one address, and the whole of its declared Surface. Exact
+#: rather than wildcard, because `open_configured_recon` records an Application
+#: per address and opens the first recon Task against it -- a campaign that
+#: seeded its own first Task would be proving recovery over a queue it wrote
+#: itself. The prefix is `/` because that Task's subject is the Application,
+#: whose base URL is the address with nothing after it: under `/v1/` the
+#: harness's own first request would be outside its own scope.
+CAMPAIGN_HOSTS = tuple(f"a{ordinal}.example.net" for ordinal in range(1, 25))
+CAMPAIGN_HOST = CAMPAIGN_HOSTS[0]
+CAMPAIGN_URL = f"http://{CAMPAIGN_HOST}"
+CAMPAIGN_URLS = frozenset(f"http://{host}" for host in CAMPAIGN_HOSTS)
+
+#: The `[[scope.include]]` block those addresses compile to, one rule each.
+#: Two dozen rather than one because the queue has to outlast the stops, and a
+#: stop costs either one Task or two depending on where it lands. A pass stopped
+#: before it committed anything leaves a Task the restart claims again, so that
+#: iteration spends one. A pass stopped after its result was accepted leaves a
+#: Task recovery settles rather than re-runs -- criterion 4's "no fabricated
+#: attempts" is exactly the promise not to hand that Task out a second time --
+#: so the restart takes a fresh one and the iteration spends two. Ten supervisor
+#: stops, half of them after the commit, the first pass, which is stopped by
+#: nothing, and room for the stops the door and the lane commands add. A
+#: campaign that ran out would not read as a queue that emptied: the next stop
+#: would find nothing to be stopped on, and a stop that never happened is a stop
+#: that proves nothing.
+CAMPAIGN_SCOPE = "\n\n".join(
+    f'[[scope.include]]\nhost = "{host}"\nports = [80]\n'
+    'protocols = ["http"]\npaths = ["/"]'
+    for host in CAMPAIGN_HOSTS
+)
+
+CAMPAIGN = (
+    SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE)
+    .replace(
+        '[[scope.include]]\nhost = "api.example.net"\nports = [443]\n'
+        'protocols = ["https"]\npaths = ["/v1/"]',
+        CAMPAIGN_SCOPE,
+    )
+    # The one Identity the campaign's pivots send under. `SCOPED` declares none,
+    # and a pivot states the slot it holds: without the declaration there is no
+    # `identities` row for `identity.provision` to seat material into, and the
+    # investigation would stop at its first stamp.
+    .replace(
+        "[[required_header]]",
+        '[[identity]]\nname = "member"\nslot_ref = "slot://identity/member"\n\n'
+        "[[required_header]]",
+        1,
+    )
+)
+
+#: The ceilings the campaign runs under, as the weights row an operator would
+#: have written to get them. Every session bound is small enough to be crossed
+#: several times over a campaign this long: two turns and two decisions rotate
+#: the orchestrator every second pass, and a capsule fitted to a kilobyte is one
+#: the fitter has to drop rows out of rather than one that happens to fit.
+#:
+#: `lease_ttl` keeps the default half hour, deliberately. Shortening it would
+#: make a stopped run's Lease lapse because the suite is slow, which is exactly
+#: the wall-clock dependency criterion 6 refuses; what moves the clock here is
+#: `elapse`, once, where a restart is meant to find a Lease that has lapsed.
+#:
+#: The capsule ceiling is an eighth of the default rather than the smallest
+#: number that fits. `capsule.SECTIONS` puts the Slate last, so it is the first
+#: thing compaction drops, and a ceiling tight enough to drop it entirely is not
+#: a bounded context but a session with nothing to choose from -- which
+#: `execution.Slice._capsule` refuses by name. An eighth leaves the Slate and
+#: takes the rows either side of it, which is the bound this ticket is about.
+CAMPAIGN_WEIGHTS = 61
+
+#: The whole active row with five columns overridden, rather than a column list
+#: of the ones this case cares about: every weight a later migration adds would
+#: be absent from a list written today and would arrive at its column default,
+#: so the campaign would rank under weights no operator ever chose. `w_unlock`
+#: is the one that mattered -- version 1's default is zero, so a hand-listed
+#: copy ranked the whole campaign with the chain-unlock term switched off, which
+#: is one of the three tickets this one is blocked by.
+CAMPAIGN_CEILINGS = (
+    "INSERT INTO scheduler_weights"
+    " SELECT (jsonb_populate_record(w, jsonb_build_object("
+    "     'version', $1::integer, 'active', false, 'session_max_turns', 2,"
+    "     'session_max_tokens', 60000, 'session_max_decisions', 2,"
+    "     'capsule_max_bytes', 8192, 'capsule_max_tokens', 2048))).*"
+    "   FROM scheduler_weights w WHERE w.active"
+)
+
+#: The one clock this case moves, and the whole of what it fabricates. A Task
+#: nothing is holding is left alone, so a restart after a stop that released its
+#: Lease properly finds the queue it actually left rather than a rewritten one.
+#:
+#: The kind is optional and is what keeps the fabrication to the process that
+#: stopped: a validator dying holds a `validate` Task, and moving the clock on
+#: every Task in flight would also lapse the ones the lane commands are holding
+#: on purpose -- which would be this fixture crashing its own arrangement and
+#: then reading the wreckage as a finding about the harness.
+ELAPSE = (
+    "UPDATE tasks SET lease_expires_at = now() - interval '1 second'"
+    " WHERE program_id = $1::uuid AND status IN ('claimed', 'running')"
+    "   AND lease_expires_at IS NOT NULL AND ($2::text IS NULL OR kind = $2)"
+    " RETURNING label"
+)
+
+#: How many passes a campaign may need to run out of Tasks. A ceiling rather
+#: than a `while True`, because the failure it guards against -- a Task that is
+#: claimed, finished and offered again -- is a loop, and a loop that hangs the
+#: suite says less than one that stops and names itself.
+DRAIN = 60
+
+#: Which weights row is the live one. Two statements rather than one, because
+#: `scheduler_weights_one_active` is an immediate unique index over a partial
+#: predicate: a single UPDATE that both stood the old row down and stood the new
+#: one up would collide or not depending on which row the planner reached first.
+#: The pair is only correct inside one transaction, which is where both callers
+#: run it.
+STAND_DOWN = "UPDATE scheduler_weights SET active = false WHERE active"
+STAND_UP = "UPDATE scheduler_weights SET active = true WHERE version = $1"
+
+#: The version this database was ranking under before the case touched it. Read
+#: rather than named, because which version is live is a fact about how many
+#: times the corpus has been reweighted and not a constant a test may know.
+STANDING_WEIGHTS = "SELECT version FROM scheduler_weights WHERE active"
+
+
+class Crash(BaseException):
+    """What every statement of a process that is no longer running raises.
+
+    A `BaseException` deliberately. Everything between the statement and the
+    supervisor's own `finally` catches `pg.DatabaseError` and carries on, which
+    is the right answer for a statement the server refused and the wrong one
+    for a process that is gone: a stopped supervisor does not report, does not
+    roll back and does not close what it opened. Nothing in the runtime catches
+    this, so the pass unwinds through every `finally` it has without any of them
+    reaching the database.
+    """
+
+
+@contextlib.contextmanager
+def quiet_crashes() -> Iterator[None]:
+    """Let a thread stopped by this fixture die without printing its own death.
+
+    A `Crash` raised inside a request handler is a stop this case arranged and
+    asserts happened. Nothing catches a `BaseException` on the way out of a
+    thread, though, so the default hook would print a traceback for it and a
+    passing run would read as a crashing one. Only `Crash` is swallowed;
+    anything else still reaches the hook that was installed before.
+    """
+    previous = threading.excepthook
+
+    def hook(args: threading.ExceptHookArgs) -> None:
+        if not issubclass(args.exc_type, Crash):
+            previous(args)
+
+    threading.excepthook = hook
+    try:
+        yield
+    finally:
+        threading.excepthook = previous
+
+
+class Stopper:
+    """One process stopped either side of one commit, and stopped for good.
+
+    It stands in front of `execute` on one connection. Statements go through
+    until the marked one has been sent; the `COMMIT` that closes its
+    transaction is then either withheld or sent, and every statement after it --
+    including the `ROLLBACK` the connection's own context manager attempts --
+    raises rather than reaching the server. That is the whole of what a stopped
+    process is when read from the database: the socket goes quiet, and whatever
+    the server had not committed it rolls back on its own.
+
+    Nothing here is a simulation of a crash. The transaction is real, the commit
+    that did or did not happen is real, and what the next process finds is
+    whatever the server actually kept -- which is the only thing this ticket can
+    usefully assert.
+
+    A statement that is its own transaction has no `COMMIT` to withhold, so for
+    that one the stop is either side of the statement itself. `occurrence` is
+    which time the mark is seen, because two different commits in one pass can
+    be made by the same statement: the orchestrator session and the worker are
+    both closed by `finish_task_attempt`, and only the second releases the Lease
+    this ticket is about.
+    """
+
+    def __init__(
+        self, connection: pg.Connection, mark: str, *, after: bool, occurrence: int = 1
+    ) -> None:
+        self.connection = connection
+        self.mark = mark
+        self.after = after
+        self.occurrence = occurrence
+        self.seen = 0
+        self.reached = False
+        self.committed = False
+        self.stopped = False
+        self.sent = connection.execute
+        connection.execute = self
+
+    def __call__(self, sql: str, parameters: tuple = ()) -> pg.Result:
+        if self.stopped:
+            raise Crash(f"{self.where()} and was asked to send {sql.split(chr(10))[0]}")
+        if self.reached and sql == "COMMIT":
+            return self.stop(sql, parameters)
+        if self.mark in sql:
+            self.seen += 1
+            if self.seen == self.occurrence:
+                if not self.connection.in_transaction:
+                    return self.stop(sql, parameters)
+                self.reached = True
+        return self.sent(sql, parameters)
+
+    def stop(self, sql: str, parameters: tuple) -> pg.Result:
+        """Send the commit or do not, and never send anything again."""
+        self.stopped = True
+        if self.after:
+            self.sent(sql, parameters)
+            self.committed = True
+        raise Crash(self.where())
+
+    def where(self) -> str:
+        return f"the process stopped {'after' if self.after else 'before'} the {self.mark} commit"
+
+
+def told(objective: str) -> dict:
+    """What one attempt is about, read out of the sentence the child was given.
+
+    A child has no database. What it knows about the Task it is running is what
+    the runtime wrote into its objective, so reading the subject and the target
+    back out of that is what a real child does -- and a launcher handed them any
+    other way would be a child the runtime never had to tell. It is also the
+    only way one launcher can serve thirteen subjects: which one this attempt is
+    for is a fact about the claim, not about the fixture.
+    """
+    said = {}
+    for line in objective.splitlines():
+        name, _, rest = line.partition(": ")
+        said[name] = rest
+    subject = said["Subject"].removeprefix("the ").removesuffix(".")
+    kind, _, label = subject.partition(" ")
+    method, _, url = said["Target"].partition(" ")
+    return {"kind": kind, "subject": label, "method": method, "url": url}
+
+
+class Hand(Child):
+    """The child a campaign runs: one scripted result per role.
+
+    `Child` answers in one shape, which is what one slice needs. A campaign puts
+    five kinds of Task through the same launcher and what a hunter submits is
+    not what a recon run submits, so the result is looked up by the role the
+    request carries rather than fixed when the launcher is built.
+
+    Everything else is `Child`'s, including the request: a campaign whose
+    children did not spend their capability would produce no Receipts, and a
+    Receipt is what every Observation below has to stand on.
+    """
+
+    def __init__(self, results: dict, **overrides) -> None:
+        super().__init__("", **overrides)
+        #: role -> a callable taking this launcher and returning a mission result.
+        self.results = results
+        self.role = ""
+        #: What the last attempt was told it was for. Empty until one is made:
+        #: an orchestrator session is told what to choose between rather than
+        #: what to run, so this is read off the worker's objective and no other.
+        self.told: dict = {}
+
+    def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
+        self.role = request.role
+        if request.role != roster.ORCHESTRATOR:
+            self.told = told(request.objective)
+            self.subject = self.told["subject"]
+        return super().__call__(request)
+
+    def spend(self, egress: agent.Egress) -> dict:
+        return _launch._spend(egress, self.told["url"], self.told["method"])
+
+    def result(self) -> dict:
+        made = self.results.get(self.role)
+        return super().result() if made is None else made(self)
+
+
+def surveyed(hand: Hand) -> dict:
+    """What the recon child submits: the Surface it found, and one Observation.
+
+    Hung off the subject by `parent_label` rather than proposed as an
+    Application of its own, because the Program already recorded one for this
+    address when it opened -- and the point of running the campaign against a
+    configured target is that the queue it works through is the harness's, not
+    this fixture's.
+
+    Two entities rather than one, because everything after this step needs a
+    subject of its own: the endpoint is what a hunter claims about and the
+    parameter is what the claim is about. Both cite the Receipt the door wrote
+    for this run's own request, which is what makes them promotable at all.
+    """
+    answer = hand.answers[-1]
+    return {
+        "new_entities": [
+            {"ref": "route", "type": "endpoint", "parent_label": hand.told["subject"],
+             "method": "GET", "path_template": "/notes/{id}", "auth_required": True,
+             "receipt_label": answer["receipt"]},
+            {"ref": "field", "type": "parameter", "parent_ref": "route",
+             "name": "id", "location": "path", "reflected": False,
+             "receipt_label": answer["receipt"]},
+        ],
+        "observations": [
+            {"kind": DISCOVERED, "subject_ref": "route",
+             "summary": f"{hand.told['url']} answered {answer['status']} "
+                        "through the door",
+             "receipt_label": answer["receipt"]},
+        ],
+        "completion_claim": {"status": "complete", "note": "one request, read"},
+    }
+
+
+#: What each of the campaign's tool images says it holds, by the executable the
+#: registry named. `tool.run` probes the version before it opens a run and holds
+#: the answer against the registry's pattern, so a stand-in that skipped the
+#: probe would skip the one check that says the image is the tool.
+CAMPAIGN_VERSIONS = {"/usr/bin/jq": "jq-1.7"}
+
+
+class Contained:
+    """Where the container goes, for a campaign that cannot start one.
+
+    `isolation.run_tool` needs an engine, and the assertion suite has none. What
+    it stands between, though, is the whole of these two lanes: the plan the
+    database built, the capability the runtime minted, the streams the
+    supervisor reads back, and the rows it writes from them. So this stands
+    where the engine stands and answers as a child would, and `tool.run` and
+    `browser.run` each run in full either side of it.
+
+    It is not a second implementation of either. The offline lane hands back the
+    input it was given, which is what the filter the plan carries would print;
+    the browser lane reads its plan out of its own input file and spends that
+    plan's capability through the real door, so the navigation is a request the
+    door decided and the Receipt behind it is one the door wrote.
+    """
+
+    def __init__(self, url: str) -> None:
+        #: Where a navigation goes. The plan names a URL of its own and the door
+        #: would decide it either way; this is what the campaign's one address
+        #: is, so the mission reaches the target the rest of the campaign is
+        #: about rather than a second one nothing else mentions.
+        self.url = url
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(
+        self,
+        container: isolation.ToolContainer,
+        argv,
+        *,
+        ceilings: isolation.Ceilings,
+        inputs=None,
+        outputs=(),
+        network: str = "none",
+        scratch_mb: int = 16,
+    ) -> isolation.ToolProcess:
+        command = tuple(str(item) for item in argv)
+        self.calls.append(command)
+        if "--version" in command:
+            return self.version(command)
+        if command == browser.ARGV:
+            return self.mission(dict(inputs or {}))
+        return self.filtered(dict(inputs or {}))
+
+    # -- what each kind of child answers ---------------------------------------
+
+    def version(self, argv: tuple[str, ...]) -> isolation.ToolProcess:
+        said = CAMPAIGN_VERSIONS.get(argv[0])
+        if said is None:
+            raise isolation.Unavailable(f"no campaign image holds {argv[0]}")
+        return _said(said.encode())
+
+    def filtered(self, inputs: dict) -> isolation.ToolProcess:
+        """What the offline tool printed: the bytes it was handed.
+
+        The filter is `.`, so the identity is the honest answer -- and it is the
+        answer the assertions want, because what the campaign compares at the
+        end is whether the Artifact the run produced is the same one on both
+        sides, not whether this stand-in can parse JSON.
+        """
+        return _said(b"".join(inputs.values()))
+
+    def mission(self, inputs: dict) -> isolation.ToolProcess:
+        """One navigation and one capture, with the navigation really made.
+
+        The plan is read back out of the file the supervisor wrote, which is
+        what makes the digest check in `browser._read` mean something: the
+        document below cites the plan's own hash because it was taken from the
+        plan, not because this class was told what it would be.
+        """
+        plan = json.loads(inputs[browser.PLAN_FILE])
+        door_ = plan["door"]
+        answer = _launch._spend(
+            agent.Egress(
+                capability=door_["headers"][proxy.AUTHORIZATION].split()[-1],
+                program_id=door_["headers"][proxy.PROGRAM],
+                proxy_url=f"http://{door_['host']}:{door_['port']}",
+            ),
+            self.url,
+            "GET",
+        )
+        page = json.dumps({"answered": answer.get("status")}).encode()
+        steps, artifacts, kept = [], [], {plan["console"]: b""}
+        for step in plan["steps"]:
+            if step["action"] == "navigate":
+                steps.append({
+                    "ordinal": step["ordinal"],
+                    "action": "navigate",
+                    "outcome": {
+                        "http_status": int(answer.get("status") or 0),
+                        # Replaced by `browser._classified` from the Receipt the
+                        # request above earned. Said here because the action
+                        # declares the key, and an outcome missing a declared
+                        # key is one `record_browser_step` refuses.
+                        "scope_class": "target",
+                        "document_loaded": bool(answer["served"]),
+                    },
+                    "network_requests": 1,
+                })
+                continue
+            steps.append({
+                "ordinal": step["ordinal"],
+                "action": step["action"],
+                "outcome": {"captured": True},
+                "network_requests": 0,
+            })
+            kept[step["artifact"]] = page
+            artifacts.append({
+                "file": step["artifact"],
+                "stream": "dom",
+                "ordinal": step["ordinal"],
+                "output_name": None,
+                "produced_bytes": len(page),
+                "truncated": False,
+            })
+        artifacts.append({
+            "file": plan["console"],
+            "stream": "console",
+            "ordinal": None,
+            "output_name": None,
+            "produced_bytes": 0,
+            "truncated": False,
+        })
+        return _said(
+            json.dumps({
+                "plan_sha256": plan["plan_sha256"],
+                "status": "success" if answer["served"] else "error",
+                "detail": answer.get("detail"),
+                "steps": steps,
+                "artifacts": artifacts,
+            }).encode(),
+            outputs=kept,
+        )
+
+
+def _said(stdout: bytes, outputs: dict | None = None) -> isolation.ToolProcess:
+    """One finished child, in the shape the supervisor reads it back in."""
+    return isolation.ToolProcess(
+        exit_code=0,
+        stdout=isolation.Captured(data=stdout, produced=len(stdout)),
+        stderr=isolation.Captured(data=b"", produced=0),
+        outputs={
+            name: isolation.Captured(data=data, produced=len(data))
+            for name, data in (outputs or {}).items()
+        },
+    )
+
+
+#: The mission the campaign walks. Two steps, because the two are what a browser
+#: lane is: one that reaches the network and earns a Receipt, and one that keeps
+#: what the page became. A longer plan would exercise the driver, which is
+#: ticket 31's subject and is asserted against a real container there.
+CAMPAIGN_MISSION = (
+    {"action": "navigate", "arguments": {"url": CAMPAIGN_URL + "/"}},
+    {"action": "capture_dom", "arguments": {}},
+)
+
+#: What two campaigns cannot agree on and should not be asked to. A label is
+#: a per-Program sequence, an id is a per-row uuid, and a digest over either is
+#: a third spelling of the same thing -- and the fixture's own offline lane
+#: mints a nonce per run on top of all three. None of them is knowledge: they
+#: are the names this database gave to rows it created in an order, and a
+#: comparison made of them would compare the order the two campaigns ran in.
+NAMED = re.compile(r"\b([A-Z]{1,6})\d+\b|\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b"
+                   r"|\b[0-9a-f]{8,}\b|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+                   r"|\b\d{2}:\d{2}:\d{2}\b")
+
+
+def unnamed(rendered: str) -> str:
+    """One campaign's words with everything that only names a row taken out.
+
+    A label keeps its prefix, because the prefix says what kind of thing was
+    cited and only the number says which campaign cited it. Everything else
+    goes whole. What is left is the part of a campaign that is about the
+    target: the claims, the statuses, the verdicts and the routes.
+    """
+    return NAMED.sub(lambda hit: (hit[1] or "") + "#", rendered)
+
+
+class CampaignRecoveryTest(ReportFixture, DatabaseCase):
+    """PH2-61: a campaign stopped at every commit arrives where one that was not.
+
+    Everything else in this module asks whether one step is right. This asks
+    whether the harness converges: two Programs are opened from one
+    configuration, the same campaign is run against both, and one of them is
+    stopped either side of every commit the harness makes and restarted after
+    each stop. What the two hold at the end is compared row for row.
+
+    A stopped process is modelled as the one thing a stopped process is, seen
+    from the database: no statement of that process ever reaches the server
+    again. `Stopper` puts that in front of one connection -- the statements
+    before the named commit go through, the commit itself goes through or does
+    not, and everything after it raises. Nothing is faked about what the server
+    then does with a transaction whose client went away, because nothing has to
+    be: the connection is closed and the work either committed or it did not.
+
+    The moves between the Surface and the report are `ValidatedFindingFixture`'s
+    and are not restated here. They are written against `cls.program_id`, so
+    `focus` is what runs them for one campaign or the other -- which is the
+    whole of what "the same campaign twice" means, and is why the route is
+    inherited rather than copied with a program argument threaded through it.
+
+    This case commits, changes the active `scheduler_weights` row for the length
+    of the campaign, and purges both Programs and restores the weights at the
+    end.
+    """
+
+    #: The Program the inherited arrangement opens for itself, which is not
+    #: either campaign. Named apart from `CAMPAIGN_SLUG` so that the teardown
+    #: below and `ReplayFixture`'s each purge their own and neither reaches the
+    #: other's rows through a prefix.
+    slug = f"{CAMPAIGN_SLUG}-replay"
+
+    #: The campaign's negative knowledge: one claim stated, tested, and answered
+    #: the other way. A campaign whose every Test held would say nothing about
+    #: whether a refutation survives a restart -- and 034 makes a refuted
+    #: Hypothesis permanent, so it is the one row a second pass over the same
+    #: Surface must not be able to reopen.
+    REFUTED = "the notes API hands the whole ledger to anybody who asks"
+    DENIES = [
+        {"id": "the-control-is-refused", "kind": "status_equals", "action": 3, "status": 403}
+    ]
+    ADMITS = {1: (200, "note one"), 2: (200, "note two"), 3: (200, "note three")}
+
+    #: The pivot the question nobody answered is about. A campaign always has one
+    #: decision in flight -- an operator is asleep and the scheduler is not -- and
+    #: a parked question is the piece of state a restart may neither answer on the
+    #: operator's behalf nor lose.
+    PENDING = ("61/ledger", "other_account_data", ["authenticated_session"])
+
+    #: Five of the eight commits criterion 3 names, and the statement whose
+    #: transaction each one closes.
+    #:
+    #: `finish_task_attempt` closes two of a pass's transactions -- the
+    #: orchestrator session is ended by the same verb -- and it is the second
+    #: that releases the Task Lease, so which occurrence is meant is part of
+    #: naming the commit rather than a detail of the stopper.
+    #:
+    #: `agent_start` is the orchestrator's, and a worker's has no line of its
+    #: own because it has no commit of its own: `claim_task` writes the Task's
+    #: claim and the `agent_runs` row that holds it in one statement, so the
+    #: claim commit IS the worker's Agent start and stopping either side of it
+    #: stops both. That is asserted rather than assumed --
+    #: `test_a_worker_starts_in_the_transaction_that_claims_its_task` holds
+    #: every worker run to having been written by the transaction that claimed
+    #: the Task it holds -- because a schema that split them tomorrow would
+    #: leave a commit of criterion 3's eight unstopped and nothing would say so.
+    SUPERVISOR = {
+        "claim": ("claim_task", 1),
+        "agent_start": ("open_orchestrator_session", 1),
+        "tool_start": ("INSERT INTO tool_runs", 1),
+        "promotion": ("promote_proposal", 1),
+        "lease_release": ("finish_task_attempt", 2),
+    }
+
+    #: The other three, which no supervisor makes. Each is stopped in the
+    #: process that makes it -- the Receipt in the door, the verdict in the
+    #: validator, the Halt in the operator's console -- and what they have in
+    #: common is the whole difference from `SUPERVISOR`: the pass that finds out
+    #: is not the pass that was stopped, because no pass was.
+    ELSEWHERE = {
+        "receipt": "record_identity_proxy_exchange",
+        "validation": "record_verdict",
+        "halt": "halt_program",
+    }
+
+    HALT = "SELECT halt_program($1::uuid, $2)"
+    CLEAR = "SELECT clear_program_halt($1::uuid, $2)"
+
+    #: Why the campaign is Halted, once per stop, and why the two sentences are
+    #: different: `halt_program` treats a second Halt giving the same reason as
+    #: the Halt already standing and writes nothing. A fixture that reused one
+    #: string would take an operator's second decision for a repeat of the
+    #: first, and the campaign nothing stopped would end a revision short of the
+    #: one that was stopped -- a difference the comparison would report as a
+    #: fault in recovery rather than as the fixture's own doing.
+    HALTS = (
+        "the operator stopped this campaign to read what it had found",
+        "the operator stopped it again before the day ended",
+    )
+
+    #: The claim the judgement phase is about. One rather than one per stop,
+    #: because the two stops are two judgements of it: the first validator dies
+    #: before its verdict lands, which is what puts the Finding back among the
+    #: candidates, and the second dies after filing one.
+    JUDGED = "the notes API hands a neighbour's note to whoever asks for it"
+
+    #: The campaign that is stopped. The other one runs the same passes with
+    #: nothing in front of them, which is what makes the end of this file a
+    #: comparison rather than two descriptions.
+    INJECTED = "injected"
+
+    #: Every reason a session may close on, in `orchestrator_sessions`' own
+    #: words. The two capsule ceilings are not among them because they bound
+    #: what a session inherits rather than what ends it, which is why criterion
+    #: 2 asks about them through the numbers a session recorded instead.
+    CEILINGS = frozenset({"turns", "tokens", "decisions"})
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = scratch() / "campaign-store"
+        # The name `provisioned_identity` seals under, because the door opens
+        # every slot with one root: a header sealed under one name and an
+        # Identity under another would be an installation with two keys.
+        cls.root_secret = seal.Root(f"{cls.slug}-root", SECRET)
+        cls.standing_weights = int(cls.connection.execute(STANDING_WEIGHTS).scalar())
+        cls.ceilings(CAMPAIGN_WEIGHTS)
+
+        cls.target, _ = counterparty(LiveTarget)
+        cls.authority = tls.authority(scratch() / "campaign-authority")
+        cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
+        cls.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=cls.fence,
+            store=Store(cls.root),
+            connector=cls.dial,
+            resolver=cls.look_up,
+            authority=cls.authority,
+            root_secret=cls.root_secret,
+        )
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.boundary = boundary(
+            proxy_url=f"http://127.0.0.1:{cls.server.server_address[1]}"
+        )
+
+        cls.configurations = {}
+        cls.identifiers = {}
+        cls.documents = {}
+        for name in ("control", "injected"):
+            document = CAMPAIGN.replace(
+                'name = "matrix-web"', f'name = "{CAMPAIGN_SLUG}-{name}"'
+            )
+            path = write(document)
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.configurations[name] = path
+            cls.documents[name] = document
+            cls.identifiers[name] = opened.facts["program_id"]
+            value = scratch() / f"campaign-bounty-{name}.txt"
+            value.write_text(f"rk2-selftest-campaign-{name}", encoding="utf-8")
+            sealed = header.provision(
+                cls.harness.runtime, path, "X-Bounty-Id", value, root_secret=cls.root_secret
+            )
+            assert sealed.ok, (name, sealed.violations)
+
+        cls.passes = {name: [] for name in cls.identifiers}
+        cls.lapsed = {name: [] for name in cls.identifiers}
+        cls.container = Contained(CAMPAIGN_URL)
+        cls.reconnaissance = {name: cls.reconnoitre(name) for name in cls.identifiers}
+        cls.stops = {name: cls.interrupt(name) for name in cls.identifiers}
+        cls.halts = {name: cls.halted(name) for name in cls.identifiers}
+        cls.drained = {name: cls.drain(name) for name in cls.identifiers}
+        # After the queue is empty, because both fabricate a claimed Task of
+        # their own to hold the run they are given: a Task in flight that no
+        # pass will ever finish is exactly what the drain above is waiting for.
+        cls.analyses = {name: cls.analyse(name) for name in cls.identifiers}
+        cls.missions = {name: cls.browse(name) for name in cls.identifiers}
+        cls.investigations = {name: cls.investigate(name) for name in cls.identifiers}
+        # After the investigation rather than inside it: a validator is asked
+        # about a Finding somebody has already opened, and the claim it is asked
+        # about is this phase's own so that the two campaigns' other Findings
+        # are settled before either is stopped mid-judgement.
+        cls.judgements = {name: cls.judged(name) for name in cls.identifiers}
+        # With every phase that has anything to recover behind it, and before
+        # the one that leaves a Program nothing may run against.
+        cls.settled = {name: cls.reconciled_again(name) for name in cls.identifiers}
+        # Last of everything, and the control before the injected campaign,
+        # because this is the one stop nothing recovers from. A request that
+        # left with no Receipt is a hole in the record of what this machine
+        # sent, `check_browser_runs` is a corpus-wide check rather than a
+        # Program-scoped one, and so from the moment the hole exists no `rk run`
+        # against any Program will start. Running it here is what keeps that
+        # true statement from standing in front of every phase above.
+        cls.exchanges = {name: cls.exchanged(name) for name in cls.identifiers}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.fence.close()
+        cls.target.shutdown()
+        cls.target.server_close()
+
+        stored = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
+                "  FROM receipts r JOIN programs p ON p.id = r.program_id"
+                " WHERE p.slug LIKE $1",
+                (f"{CAMPAIGN_SLUG}-%",),
+            ).rows
+            if row[0] is not None
+        ]
+        ciphertexts = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT s.ciphertext_sha256 FROM artifact_seal s JOIN programs p"
+                "    ON p.id = s.scope_id AND s.scope_kind = 'program'"
+                " WHERE p.slug LIKE $1",
+                (f"{CAMPAIGN_SLUG}-%",),
+            ).rows
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM secret_access_log WHERE program_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{CAMPAIGN_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program' AND scope_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE $1)",
+                (f"{CAMPAIGN_SLUG}-%",),
+            )
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{CAMPAIGN_SLUG}-%",)
+            )
+            if stored:
+                cls.connection.execute(
+                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    ("{" + ",".join(stored) + "}",),
+                )
+        # The weights row goes back before the next case runs, because it is the
+        # one thing this case changed that is not its own: every other class in
+        # this module ranks and rotates against the active row. The version that
+        # was standing and not version 1 -- the corpus arrives already
+        # reweighted, so standing version 1 back up would hand every case after
+        # this one a scheduler with the unlock term switched off.
+        cls.ceilings(cls.standing_weights)
+        keep = Store(cls.root)
+        for sha256 in (*stored, *ciphertexts):
+            keep.discard(sha256)
+        super().tearDownClass()
+
+    # -- the machine the campaign runs on -------------------------------------
+
+    @classmethod
+    def ceilings(cls, version: int) -> None:
+        """Make one weights row the live one, installing it the first time.
+
+        The row is never deleted afterwards, because a weights version is named
+        by every Ranking pass it produced and `scheduler_weights_is_immutable`
+        refuses to let that reference go dangling. Standing version 1 back up is
+        the whole of the restoration: what the next case reads is the active
+        row, and an inactive row nothing points at costs it nothing.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            if version == CAMPAIGN_WEIGHTS:
+                cls.owner_connection.execute(CAMPAIGN_CEILINGS, (version,))
+            cls.owner_connection.execute(STAND_DOWN)
+            cls.owner_connection.execute(STAND_UP, (version,))
+
+    @classmethod
+    def look_up(cls, host: str, port: int) -> tuple[str, ...]:
+        """What the campaign's one name resolves to, without asking a real zone."""
+        return (PINNED,)
+
+    @classmethod
+    def dial(
+        cls,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
+    ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
+        """The one authorised name reaches the one target this machine is running."""
+        return http.client.HTTPConnection(
+            "127.0.0.1", cls.target.server_address[1], timeout=timeout
+        ), None
+
+    # -- the campaign ---------------------------------------------------------
+
+    @classmethod
+    def supervisor(cls, name: str, launcher: Child) -> tuple[Ledger, dict]:
+        """One `rk run` pass, on a connection of its own.
+
+        A connection per pass rather than one for the case, because that is what
+        the command does and because it is what a restart has to be: the pass
+        that stopped took its connection with it, and the pass after it is a new
+        process finding out what the last one left.
+        """
+        ledger = Ledger()
+        with pg.connect(cls.harness.runtime) as connection:
+            facts = execution.Slice(
+                boundary=cls.boundary, state=cls.harness.state, launch=launcher
+            ).attempt(ledger, connection, cls.identifiers[name])
+        cls.passes[name].append(facts)
+        return ledger, facts
+
+    #: What a child submits, by the role the claim gave it. One mapping rather
+    #: than a launcher per pass, because a campaign that answered differently on
+    #: the pass after a stop would be proving the fixture and not the harness.
+    SCRIPT = {"recon": surveyed}
+
+    @classmethod
+    def reconnoitre(cls, name: str) -> dict:
+        """The first pass: the recon Task the Program opened, run to a Surface."""
+        hand = Hand(cls.SCRIPT)
+        ledger, facts = cls.supervisor(name, hand)
+        assert not list(ledger.violations), (name, list(ledger.violations))
+        return {"hand": hand, "facts": facts}
+
+    @classmethod
+    def stopped_pass(cls, name: str, mark: str, *, after: bool, occurrence: int) -> Stopper:
+        """One supervisor pass, stopped either side of one commit and gone.
+
+        The connection is this pass's own and is closed on the way out, which is
+        what a stopped process leaves behind: a socket the server finds shut,
+        and an open transaction it rolls back without being asked. Nothing is
+        cleaned up here afterwards -- what the next pass finds is the whole
+        point, and tidying any of it would be answering the question.
+
+        A pass that reaches its end without ever making the named commit is a
+        fixture that stopped nothing, so it fails here rather than passing
+        quietly as a campaign that was never interrupted.
+        """
+        ledger = Ledger()
+        connection = pg.connect(cls.harness.runtime)
+        stopper = Stopper(connection, mark, after=after, occurrence=occurrence)
+        try:
+            execution.Slice(
+                boundary=cls.boundary, state=cls.harness.state, launch=Hand(cls.SCRIPT)
+            ).attempt(ledger, connection, cls.identifiers[name])
+        except Crash:
+            pass
+        else:
+            raise AssertionError(f"{name} ran a whole pass without a {mark} commit")
+        finally:
+            connection.close()
+        return stopper
+
+    @classmethod
+    def stop_one(cls, name: str, maker: Callable[..., Stopper], *, after: bool,
+                 lapse: bool = False, kind: str | None = None, **arguments) -> Stopper | None:
+        """One phase's stop, or the nothing the other campaign makes there.
+
+        Three phases each stop a different process, and all three answer the
+        same three questions afterwards: was this the campaign being stopped at
+        all, did the stopper reach the commit it was named for, and did that
+        commit land on the side the phase asked for. Answered once, so that a
+        phase which forgot to ask cannot exist -- a stopper that never saw its
+        mark is a fixture that stopped nothing and would otherwise read as a
+        campaign that was simply never interrupted.
+
+        `lapse` is the clock, moved here for the same reason: a stop leaves
+        something holding a Lease, and which phases move it and which do not is
+        a fact about the phases rather than a step each one remembers.
+
+        The door's stop is not made through this, because it is not made in one
+        move: the Receipt is written by a process the campaign starts, so its
+        stopper is built with that process and read back after the request it
+        was there to interrupt.
+        """
+        if name != cls.INJECTED:
+            return None
+        stopped = maker(name, after=after, **arguments)
+        assert stopped.stopped, (name, after, maker.__name__)
+        assert stopped.committed == after, (name, after, maker.__name__)
+        if lapse:
+            cls.lapsed[name].append(cls.elapse(name, kind))
+        return stopped
+
+    @classmethod
+    def elapse(cls, name: str, kind: str | None = None) -> list[str]:
+        """Move the clock on what a stopped process was still holding.
+
+        The one fabricated fact in this case, and it is fabricated on purpose.
+        The Lease TTL is half an hour, so a restart that waited for it would be
+        a test that took half an hour, and one that shortened the TTL would make
+        every slow pass in this suite read as a crash -- which is the wall-clock
+        dependency criterion 6 refuses. What is moved is the passage of time and
+        nothing else: `reconcile_leases` still reads the clock it always reads
+        and still decides on its own what a lapsed Lease means, which is the
+        half criterion 4 is about.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            answer = cls.owner_connection.execute(ELAPSE, (cls.identifiers[name], kind))
+        return [str(row[0]) for row in answer.rows]
+
+    @classmethod
+    def recorded(cls, name: str) -> int:
+        """How many Events one campaign has written so far."""
+        cls.focus(name)
+        return int(
+            cls.connection.execute(
+                "SELECT count(*) FROM events WHERE program_id = $1::uuid",
+                (cls.identifiers[name],),
+            ).scalar()
+        )
+
+    @classmethod
+    def reconciled_again(cls, name: str) -> dict:
+        """Both recovery verbs, run again over a campaign nothing has touched.
+
+        Criterion 4's word is idempotently, and every restart above ran against
+        wreckage of its own -- so what none of them can say is what a recovery
+        does when there is nothing to recover. It must do nothing, and nothing
+        includes writing: an Event is emitted for a row that changed, so a
+        second sweep that settled a Task already settled, aborted a run already
+        aborted or handed back a Lease already released would show up here as
+        Events this campaign gained by being asked twice. That is criterion 4's
+        duplicate Event, in the one place a duplicate can be told from an honest
+        second observation.
+
+        Run before the door's death rather than after it, because from the
+        moment a request has no Receipt the harness refuses to start work, and
+        a recovery asked to run against a Program in that state would be
+        measuring the refusal instead.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        before = cls.recorded(name)
+        try:
+            connection.execute(
+                "SELECT set_config('rk2.program_id', $1, false)", (cls.identifiers[name],)
+            )
+            with connection.transaction():
+                connection.execute("SELECT set_actor('runtime', 'selftest')")
+                resumed = connection.execute(
+                    "SELECT resume_program($1::uuid)", (cls.identifiers[name],)
+                ).scalar()
+                reconciled = connection.execute("SELECT reconcile_leases()").scalar()
+        finally:
+            connection.close()
+        return {
+            "resumed": json.loads(str(resumed)),
+            "reconciled": json.loads(str(reconciled)),
+            "before": before,
+            "after": cls.recorded(name),
+        }
+
+    @classmethod
+    def pending(cls, name: str) -> int:
+        """How much work is left to claim, read for the message on the way out.
+
+        A restart that claims nothing is either a harness that lost the Task a
+        stop left behind or a queue with nothing in it, and those are opposite
+        faults. Read before the pass, the count tells them apart: a restart
+        claims exactly when there is something to claim, and both halves of that
+        are assertions. The queue is empty on purpose after the drain, so the
+        phases that follow it are restarts that prove a recovery and claim
+        nothing, which is a true thing to say about them.
+        """
+        return int(
+            cls.connection.execute(
+                "SELECT count(*) FROM tasks"
+                " WHERE program_id = $1::uuid AND status = 'pending'",
+                (cls.identifiers[name],),
+            ).scalar()
+        )
+
+    @classmethod
+    def restart(cls, name: str, between: Callable[[], object] | None = None) -> dict:
+        """The pass after a stop: a new process, finding out what the last left.
+
+        `rk run` and then the ordinary pass, because that is what an operator
+        types and because the harness recovers in two places rather than one.
+        `resume_program` runs once per command, out of the Program's own resume,
+        and it is what ends an orchestrator turn a supervisor died inside -- the
+        Agent run of a stopped pass holds no Task and no pass will ever claim it
+        back. `reconcile_leases` runs at the top of every pass and is what takes
+        a Task off an owner that stopped beating. A restart that ran only the
+        second would leave half the wreckage standing and would prove half the
+        harness.
+
+        Neither is a recovery routine: they are the two ordinary entry points,
+        reconciling first, every time. A harness that needed a third one after a
+        crash would be a harness with a state only its author could get it out
+        of.
+
+        `between` is what a person does after the machine has finished
+        recovering and before the next pass runs. Only the judgement phase
+        passes one, for the reason it gives: asking for a Finding to be looked
+        at again is a decision, and a restart that made it would be the harness
+        deciding what to believe.
+        """
+        resumed = program.run(cls.harness.runtime, cls.configurations[name])
+        assert resumed.ok, (name, list(resumed.violations))
+        if between is not None:
+            between()
+        pending = cls.pending(name)
+        ledger, facts = cls.supervisor(name, Hand(cls.SCRIPT))
+        assert not list(ledger.violations), (name, list(ledger.violations))
+        assert (facts["task"] is not None) == (pending > 0), (name, pending, facts)
+        return facts
+
+    @classmethod
+    def interrupt(cls, name: str) -> list[dict]:
+        """The campaign's middle: one Task per stop, and the restart after it.
+
+        Both campaigns run these passes. Only one of them is stopped first, and
+        that is the whole difference between them -- so a row that ends up in
+        one and not the other is a row a stop created or destroyed.
+        """
+        made = []
+        for commit, (mark, occurrence) in cls.SUPERVISOR.items():
+            for after in (False, True):
+                stopped = cls.stop_one(
+                    name, cls.stopped_pass, after=after, lapse=True,
+                    mark=mark, occurrence=occurrence,
+                )
+                made.append({
+                    "commit": commit,
+                    "after": after,
+                    "stopped": stopped,
+                    "facts": cls.restart(name),
+                })
+        return made
+
+    @classmethod
+    def drain(cls, name: str) -> int:
+        """Passes until nothing is claimable, so both campaigns end in one place.
+
+        Without it the comparison would be between two campaigns that stopped
+        wherever their fault schedule ran out, and every Task one had reached
+        and the other had not would read as a difference the stops caused.
+        """
+        for passes in range(DRAIN):
+            ledger, facts = cls.supervisor(name, Hand(cls.SCRIPT))
+            assert not list(ledger.violations), (name, list(ledger.violations))
+            if facts["task"] is None:
+                return passes
+        raise AssertionError(f"{name} was still claiming Tasks after {DRAIN} passes")
+
+    @classmethod
+    def agent_run_of(cls, name: str, *, role: str, kind: str) -> str:
+        """One live run of one role, as the two lane commands are handed one.
+
+        Not the run the first pass started: `finish_task_attempt` closed that
+        one, and both `open_offline_tool_run` and `authorize_tool_run` refuse a
+        run that has ended -- correctly, because a tool invoked against a
+        finished run is a tool nobody is holding a Lease for. `rk tool invoke`
+        and `rk browser mission` are given the run an operator is watching, so
+        the campaign opens one the same way the lane cases for 30 and 31 do.
+        """
+        run = claimed_agent_run(
+            cls.connection, cls.owner_connection, cls.identifiers[name],
+            role=role, kind=kind,
+        )
+        return str(
+            cls.connection.execute(
+                "SELECT label FROM agent_runs WHERE id = $1::uuid", (run,)
+            ).scalar()
+        )
+
+    @classmethod
+    def analyse(cls, name: str) -> Report:
+        """The offline lane: one stored Artifact, queried, and the answer filed.
+
+        Put through `rk artifact put` rather than written straight into the
+        store, because an offline run's input is an Artifact this Program holds
+        a reference to -- and the reference is what the purge at the end and the
+        comparison in the middle both walk.
+        """
+        source = scratch() / f"campaign-input-{name}.json"
+        source.write_text(json.dumps({"host": CAMPAIGN_HOST}), encoding="utf-8")
+        put = artifact.put(
+            cls.harness.runtime, cls.configurations[name], source, root=cls.root
+        )
+        assert put.ok, (name, put.violations)
+        with mock.patch.object(isolation, "run_tool", cls.container):
+            queried = tool.run(
+                cls.harness.runtime,
+                cls.configurations[name],
+                root=cls.root,
+                image=AGENT_IMAGE,
+                agent_run=cls.agent_run_of(name, role="js_analyst", kind="analyze"),
+                offline_tool="jq",
+                arguments={"filter": ".", "input": put.facts["artifact"]["label"]},
+            )
+        assert queried.ok, (name, queried.violations)
+        return queried
+
+    @classmethod
+    def browse(
+        cls, name: str, *, door: isolation.AgentContainer | None = None, served: bool = True
+    ) -> Report:
+        """The browser lane: one mission, whose navigation the door decided.
+
+        `served` is what the mission is expected to come back having done. A
+        door that stops in the middle of writing a Receipt answers its client
+        nothing, and `_launch._spend` reports that as `door_unreachable` rather
+        than raising -- so the mission is recorded as the failure it was, and a
+        fixture that asserted success either way would be asserting that a dead
+        door and a live one are the same door.
+        """
+        with mock.patch.object(isolation, "run_tool", cls.container):
+            walked = browser.run(
+                cls.harness.runtime,
+                cls.configurations[name],
+                root=cls.root,
+                image=AGENT_IMAGE,
+                authority=cls.authority.directory,
+                agent_run=cls.agent_run_of(name, role="recon", kind="recon"),
+                steps=CAMPAIGN_MISSION,
+                identity_slot=None,
+                door=door or cls.boundary,
+            )
+        assert walked.ok == served, (name, [str(one) for one in walked.violations])
+        return walked
+
+    # -- the three commits no supervisor makes ---------------------------------
+
+    @classmethod
+    def as_human(cls, sql: str, parameters: tuple) -> dict:
+        """One operator verb, on a connection of its own, as `rk halt` runs it.
+
+        A connection per command for the reason `supervisor` opens one per pass:
+        an operator types one thing and the process exits. It is also the only
+        way the Halt verbs are reachable at all -- `human_actor_session` is what
+        they ask about, and no other role in this case can answer it.
+        """
+        with pg.connect(cls.harness.human) as human:
+            human.execute("SELECT set_actor('human', 'selftest')")
+            return json.loads(str(human.execute(sql, parameters).scalar()))
+
+    @classmethod
+    def standing(cls, name: str) -> dict | None:
+        """The Program's Halt as a row, or nothing where it was never Halted.
+
+        Read as the owner because no other role in this case may read the table:
+        `check_operator_surface` names every grant on `program_halts` a problem,
+        which is 011's design -- a Halt is a fact about a Program that the
+        Program's own runtime cannot see, and only reads it through the refusal
+        it causes.
+        """
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            rows = cls.owner_connection.execute(
+                "SELECT status, revision FROM program_halts WHERE program_id = $1::uuid",
+                (cls.identifiers[name],),
+            ).rows
+        return None if not rows else {"status": str(rows[0][0]), "revision": int(rows[0][1])}
+
+    @classmethod
+    def stopped_halt(cls, name: str, *, after: bool) -> Stopper:
+        """The operator's console, stopped either side of the Halt it wrote.
+
+        `halt_program` runs in autocommit, which is what an operator command is:
+        one statement, its own transaction, and no second thing to do. So there
+        is no `COMMIT` to withhold and the stop is either side of the statement
+        itself -- the difference between a console that died before the database
+        heard it and one that died before the person saw the answer.
+        """
+        connection = pg.connect(cls.harness.human)
+        connection.execute("SELECT set_actor('human', 'selftest')")
+        stopper = Stopper(connection, cls.ELSEWHERE["halt"], after=after)
+        try:
+            connection.execute(cls.HALT, (cls.identifiers[name], cls.HALTS[int(after)]))
+        except Crash:
+            pass
+        else:
+            raise AssertionError(f"{name} was Halted with nothing stopping it")
+        finally:
+            connection.close()
+        return stopper
+
+    @classmethod
+    def halted(cls, name: str) -> list[dict]:
+        """The operator's commit: a Halt written, and the Halt lifted after it.
+
+        A Halt is the one thing in this campaign a person decides rather than
+        the harness, and the process that writes it is one the harness does not
+        supervise -- so nothing here is recovered by a restart, and nothing
+        should be. What the stop leaves is either a Halt or no Halt at all, and
+        the recovery is the thing an operator does next: read the state and, if
+        the command never landed, type it again. A fixture that let the restart
+        finish the operator's sentence would be inventing an intent.
+
+        Both campaigns end with the same two Halts, lifted, and at the same
+        revision. That is what makes the pair comparable: the difference between
+        them is which process had to say it twice.
+        """
+        made = []
+        for after, reason in zip((False, True), cls.HALTS):
+            stopped = cls.stop_one(name, cls.stopped_halt, after=after)
+            written = (cls.standing(name) or {}).get("status") == "halted"
+            assert written == (stopped is not None and after), (name, after, written)
+            if not written:
+                cls.as_human(cls.HALT, (cls.identifiers[name], reason))
+            halted = cls.standing(name)
+            assert halted is not None and halted["status"] == "halted", (name, after, halted)
+            cleared = cls.as_human(
+                cls.CLEAR, (cls.identifiers[name], f"{reason}, and it has been read")
+            )
+            made.append({
+                "after": after,
+                "stopped": stopped,
+                "halted": halted,
+                "cleared": cleared,
+                "facts": cls.restart(name),
+            })
+        return made
+
+    @classmethod
+    def doorway(cls, *, mark: str = "", after: bool = False) -> tuple:
+        """A second door, opened for the one stop that has to kill one.
+
+        The class's own door serves every other request this campaign makes and
+        a `Stopper` never gives its connection back, so the door that dies is a
+        door opened to die. Everything else about it is the same door: the same
+        store, resolver, authority and root, because what is being stopped is
+        where a Receipt is written rather than which process wrote it.
+        """
+        fence = proxy.Fence(pg.connect(cls.harness.proxy))
+        stopper = Stopper(fence.connection, mark, after=after) if mark else None
+        server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=fence,
+            store=Store(cls.root),
+            connector=cls.dial,
+            resolver=cls.look_up,
+            authority=cls.authority,
+            root_secret=cls.root_secret,
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, fence, stopper
+
+    @classmethod
+    def exchanged(cls, name: str) -> list[dict]:
+        """The door's commit: a Receipt written, and a Receipt that never was.
+
+        A mission again, because a Receipt is written for a request something
+        made and the campaign's one client of that kind is a browser. What the
+        two sides of this commit leave is not symmetrical and neither side is
+        recoverable, which is the point: the request reached the target either
+        way, so the only question is what the record says afterwards. Stopped
+        before, there is no Receipt and the navigation is `unrecorded` -- the
+        one word 31 keeps for "nothing here matched a Receipt". Stopped after,
+        the Receipt is on file and the child that earned it was told nothing.
+
+        What comes after each is not the same thing either, and that is the
+        answer this phase has to give rather than one it may arrange around.
+        Stopped after, the record is whole and the campaign carries on: the next
+        `rk run` starts, having nothing to mend. Stopped before, it does not --
+        `check_browser_runs` counts the requests a mission started against the
+        Receipts the door wrote for it, and one more request than Receipts is
+        the one thing this schema will not let a Program keep working past. That
+        refusal is the recovery. A restart that mended it would have to invent a
+        Receipt for bytes it never saw, which is the fabrication the check
+        exists to make impossible.
+
+        So the committed side is taken first and the uncommitted side last: from
+        the hole onwards nothing may run, and a phase ordered the other way
+        round would be measuring the harness's refusal rather than its recovery.
+        """
+        made = []
+        for after in (True, False):
+            server, fence, stopper = cls.doorway(
+                mark=cls.ELSEWHERE["receipt"] if name == cls.INJECTED else "", after=after
+            )
+            try:
+                with quiet_crashes():
+                    walked = cls.browse(
+                        name,
+                        door=boundary(
+                            proxy_url=f"http://127.0.0.1:{server.server_address[1]}"
+                        ),
+                        served=stopper is None,
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                fence.close()
+            if stopper is not None:
+                assert stopper.stopped, (name, after, "the door wrote no Receipt at all")
+                assert stopper.committed == after, (name, after)
+            record = {
+                "after": after,
+                "stopped": stopper,
+                "walked": walked,
+                "classified": cls.navigated(walked),
+                "receipts": cls.receipts_of(walked),
+                "facts": None,
+                "refusal": None,
+            }
+            if record["receipts"]:
+                record["facts"] = cls.restart(name)
+            else:
+                record["refusal"] = cls.unaccounted(name, walked)
+            made.append(record)
+        return made
+
+    @classmethod
+    def unaccounted(cls, name: str, walked: Report) -> Violation:
+        """The next `rk run` after a request nothing can account for.
+
+        Read as the recovery it is. `resume_program` runs first and does
+        everything it can -- the aborted run, the returned Task, the released
+        Lease are all there to be found afterwards -- and then the command
+        refuses to start work, naming the mission whose bytes have no Receipt.
+        A campaign that carried on would be a campaign spending its budget on a
+        Program whose record of what it sent is known to be short.
+        """
+        refused = program.run(cls.harness.runtime, cls.configurations[name])
+        assert not refused.ok, (name, "the missing Receipt was not noticed")
+        # The whole refusal rather than the part of it this phase went looking
+        # for. A second failing check would be a second thing the stop cost, and
+        # a filter that pulled one violation out of a list would let the case
+        # report "exactly one thing" about a list it never read.
+        said = list(refused.violations)
+        assert len(said) == 1, (name, [str(one) for one in said])
+        assert said[0].source == "standing:browser_runs", (name, str(said[0]))
+        assert walked.facts["tool_run"]["label"] in (said[0].detail or ""), (
+            name, str(said[0])
+        )
+        return said[0]
+
+    @classmethod
+    def navigated(cls, walked: Report) -> str:
+        """What one mission's navigation was recorded as having reached."""
+        return str(
+            cls.connection.execute(
+                "SELECT r.outcome ->> 'scope_class' FROM browser_step_results r"
+                "  JOIN browser_steps s"
+                "    ON s.tool_run_id = r.tool_run_id AND s.ordinal = r.ordinal"
+                "  JOIN tool_runs t ON t.id = r.tool_run_id"
+                " WHERE t.label = $1 AND t.program_id = $2::uuid AND s.action = 'navigate'",
+                (walked.facts["tool_run"]["label"], walked.facts["program_id"]),
+            ).scalar()
+        )
+
+    @classmethod
+    def receipts_of(cls, walked: Report) -> int:
+        """How many Receipts one mission earned, which is the door's own count."""
+        return int(
+            cls.connection.execute(
+                "SELECT count(*) FROM receipts r JOIN tool_runs t ON t.id = r.tool_run_id"
+                " WHERE t.label = $1 AND t.program_id = $2::uuid",
+                (walked.facts["tool_run"]["label"], walked.facts["program_id"]),
+            ).scalar()
+        )
+
+    @classmethod
+    def stopped_verdict(cls, name: str, claim: dict, *, after: bool) -> Stopper:
+        """The validator's console, stopped either side of the verdict it filed.
+
+        `record_verdict` is the one statement of the validator's turn that
+        decides anything, and it runs in a transaction of its own -- so the two
+        sides of it are a judgement that was never made and a judgement nobody
+        was told about. The connection is this validator's and is closed on the
+        way out, exactly as `stopped_pass` closes a supervisor's.
+        """
+        connection = pg.connect(cls.harness.runtime)
+        connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.identifiers[name],)
+        )
+        stopper = Stopper(connection, cls.ELSEWHERE["validation"], after=after)
+        try:
+            committed(
+                connection,
+                cls.VERDICT,
+                (cls.identifiers[name], claim["finding"], "confirmed",
+                 pg.quote_array(())),
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError(f"{name} filed a verdict with nothing stopping it")
+        finally:
+            connection.close()
+        return stopper
+
+    @classmethod
+    def rejudge(cls, name: str, claim: dict) -> dict | None:
+        """What a person does about a Finding a dead validator gave back.
+
+        Nothing, where the verdict landed: a Finding that is `validated` has
+        been judged and asking for it again would be the fixture disagreeing
+        with the record. Where the stop lost the judgement, recovery has put the
+        claim back among the candidates and left the queue `done` -- which is
+        the state `request_validation` is for, and asking is a decision somebody
+        makes rather than one a restart makes for them.
+        """
+        if cls.status_of(name, claim["finding"]) != "candidate":
+            return None
+        asked = cls.called(cls.REQUEST, (cls.identifiers[name], claim["finding"]))
+        assert asked["outcome"] == "queued", (name, asked)
+        opened = cls.called(
+            cls.SESSION, (cls.identifiers[name], claim["finding"], claim["replay"])
+        )
+        assert opened["outcome"] == "opened", (name, opened)
+        return opened
+
+    @classmethod
+    def status_of(cls, name: str, finding: str) -> str:
+        """What one Finding is currently held to be, in `findings`' own word."""
+        return str(
+            cls.connection.execute(
+                "SELECT status FROM findings WHERE id = $1::uuid AND program_id = $2::uuid",
+                (finding, cls.identifiers[name]),
+            ).scalar()
+        )
+
+    @classmethod
+    def attempts_on(cls, name: str, finding: str) -> list[str]:
+        """Every judgement of one Finding, in the order they were attempted."""
+        return [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT outcome FROM validation_attempts"
+                " WHERE finding_id = $1::uuid AND program_id = $2::uuid"
+                " ORDER BY opened_at, id",
+                (finding, cls.identifiers[name]),
+            ).rows
+        ]
+
+    @classmethod
+    def judged(cls, name: str) -> dict:
+        """The validator's commit: a verdict lost, and a verdict nobody read.
+
+        One claim, judged twice, because the two stops are two judgements of it
+        rather than two claims. The first validator dies before its verdict is
+        committed: the attempt is still open, the Finding is still under
+        judgement, and the Task is held by a run that will never beat again.
+        Recovery is what ends that -- the run is aborted, and ending it closes
+        what it left open, which is the whole of what this ticket added to the
+        two recovery paths. The second dies after the verdict landed: there is
+        nothing open to close, the result was accepted, and the Task is settled
+        rather than handed out again.
+
+        The control campaign judges the same claim once and is told nothing,
+        because a validator that is not stopped answers and closes its own
+        session. Both campaigns end holding one `validated` Finding about it,
+        which is criterion 5's whole question here: a lost verdict costs an
+        attempt, not a truth.
+        """
+        cls.focus(name)
+        # The claim is this campaign's and is carried rather than kept: held on
+        # the class it would be the second campaign's by the time anything read
+        # it, and a comparison of one campaign against itself would pass
+        # whatever the harness did.
+        claim = cls.served(cls.JUDGED)
+        made = []
+        for after in (False, True):
+            stopped = cls.stop_one(
+                name, cls.stopped_verdict, after=after, lapse=True, kind="validate",
+                claim=claim,
+            )
+            if stopped is None and not after:
+                answered = cls.answer(claim, "confirmed")
+                assert answered["verdict"]["status"] == "validated", answered["verdict"]
+            record = {"after": after, "stopped": stopped, "reopened": None}
+
+            def asked_again(record=record) -> None:
+                record["reopened"] = cls.rejudge(name, claim)
+
+            record["facts"] = cls.restart(name, between=asked_again)
+            made.append(record)
+        return {"finding": claim["finding"], "replay": claim["replay"], "stops": made}
+
+    # -- the investigation each campaign performs ------------------------------
+
+    @classmethod
+    def focus(cls, name: str) -> None:
+        """Point the inherited moves at one campaign's Program.
+
+        Everything between `claim_waiting` and `render_the_chain` is written
+        against `cls.program_id` and the connection's `rk2.program_id`, so
+        re-pointing both is the whole of what running one campaign against a
+        second Program takes. The alternative -- a Program argument threaded
+        through thirty inherited methods -- would be an edit to every case in
+        this module for the benefit of one.
+        """
+        cls.program_id = cls.identifiers[name]
+        cls.connection.execute(
+            "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+        )
+
+    @classmethod
+    def investigate(cls, name: str) -> dict:
+        """One campaign's whole investigation, in the order the evidence accrues.
+
+        The lanes above put a Surface and two tool runs in front of it; this is
+        what the campaign does with them. The order is load-bearing in the two
+        places 42 says it is -- pivots are stamped before a severity may claim
+        demonstrated impact, and the composition is written before anything can
+        be rendered -- and in one this ticket adds: the refutation is settled
+        first, so a campaign's negative knowledge is already on the record
+        before anything reads the Surface for what is left to try.
+
+        What comes back is every identifier the comparison below is made of.
+        Returned rather than left on the class because the second campaign
+        overwrites each of `cls.member`, `cls.finding` and `cls.chain_id` as it
+        runs, and a comparison reading those would be a comparison of the
+        injected campaign against itself.
+        """
+        cls.focus(name)
+        cls.identity = cls.provisioned_identity(cls.HERE, document=cls.documents[name])
+        refuted = cls.walked(cls.REFUTED, specification(cls.DENIES), answers=cls.ADMITS)
+        cls.member = {"first": cls.validated(cls.CLAIM), "second": cls.validated(cls.OTHER)}
+        # For 040's reason: a subject that has never been classified is not the
+        # same fact as one the policy denies.
+        cls.project_the_scope()
+        cls.finding = cls.member["first"]["finding"]
+        cls.read_what_the_finding_already_cites()
+        for pivot, route, provides, requires, member in cls.PIVOTS:
+            cls.stamped(pivot, cls.member[member], route, provides, requires, cls.HERE)
+        cls.compose_and_render()
+        cls.render_the_chain()
+        return {
+            "refuted": refuted,
+            "member": cls.member,
+            "finding": cls.finding,
+            "identity": cls.identity,
+            "chain": cls.chain_id,
+            "report": cls.document,
+            "chain_report": cls.chain_document,
+            "parked": cls.undecided(cls.member["second"]),
+        }
+
+    @classmethod
+    def undecided(cls, member: dict) -> dict:
+        """One authorization question, filed and left for an operator to answer.
+
+        The same first two statements `stamped` makes and then nothing: 038
+        parks the question before the run may send anything, so a Test opened
+        and not approved is a Task held by a live run, an unanswered decision,
+        and no impact performed. That is the state a campaign is in whenever it
+        is stopped, and it has to survive being stopped as itself -- neither
+        answered by the restart nor collected as an abandoned attempt.
+        """
+        route, provides, requires = cls.PENDING
+        opened = cls.called(
+            cls.OPEN_TASK,
+            (member["finding"], cls.pivot_spec(route, provides, requires, cls.HERE)),
+        )
+        return cls.called(
+            cls.OPEN_REPLAY,
+            (cls.run_on(opened["task"]), cls.id_of("tests", opened["test"]), cls.HERE),
+        ) | {"task": opened["task"]}
+
+
+    # -- what the two campaigns are compared on -------------------------------
+
+    #: The campaign, projected without a single identifier in it. Two Programs
+    #: opened from one configuration agree on nothing that carries an id or a
+    #: label -- both are per-Program sequences -- so a comparison made of those
+    #: would compare the order two campaigns were created in. What is left is
+    #: what a campaign is for: the claims it made, the evidence it filed, the
+    #: Findings it settled and the routes it stamped.
+    #:
+    #: Every projection is DISTINCT, and that is a statement rather than a
+    #: convenience. A stopped pass that had to be run again is a pass that ran
+    #: twice, and its second run observes the subject a second time honestly.
+    #: Counting rows would count the stops; the campaign's knowledge is the set.
+    TRUTH = {
+        "entities": "SELECT DISTINCT type, dedup_key FROM entities"
+                    " WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "hypotheses": "SELECT DISTINCT property_class, statement, status FROM hypotheses"
+                      " WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "observations": "SELECT DISTINCT kind, summary FROM observations"
+                        " WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "findings": "SELECT DISTINCT title, status, severity, cvss_vector FROM findings"
+                    " WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "verdicts": "SELECT DISTINCT verdict, failed_assertion_ids::text FROM verdicts"
+                    " WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "test_runs": "SELECT DISTINCT r.lane, r.outcome FROM test_runs r"
+                     "  JOIN tests t ON t.id = r.test_id"
+                     " WHERE t.program_id = $1::uuid ORDER BY 1, 2",
+        "pivots": "SELECT DISTINCT transition, provides, requires::text, source"
+                  "  FROM pivot_stamps WHERE program_id = $1::uuid ORDER BY 1, 2",
+        "chain_steps": "SELECT DISTINCT s.depth, p.transition FROM chain_steps s"
+                       "  JOIN pivot_stamps p ON p.id = s.stamp_id"
+                       " WHERE s.program_id = $1::uuid ORDER BY 1, 2",
+        "decisions": "SELECT DISTINCT question_code, question, answered_at IS NOT NULL"
+                     "  FROM pending_decisions WHERE program_id = $1::uuid ORDER BY 1, 2",
+    }
+
+    STAMPS = "SELECT transition FROM pivot_stamps WHERE program_id = $1::uuid"
+    STEPS = "SELECT depth FROM chain_steps WHERE program_id = $1::uuid"
+    PARKED = (
+        "SELECT label, question_code, answered_at IS NOT NULL FROM pending_decisions"
+        " WHERE program_id = $1::uuid ORDER BY label"
+    )
+
+    #: The ceilings, read off the sessions they bounded rather than off the
+    #: weights row that set them: what criterion 2 is about is a session that
+    #: was closed because a ceiling said so, and a session records the numbers
+    #: it was opened under.
+    SESSIONS = (
+        "SELECT generation, weights_version, max_turns, max_tokens, max_decisions,"
+        "       capsule_bytes, capsule_tokens"
+        "  FROM orchestrator_sessions WHERE program_id = $1::uuid ORDER BY generation"
+    )
+    LEADERS = (
+        "SELECT DISTINCT a.role FROM agent_runs a JOIN orchestrator_sessions s"
+        "    ON s.id = a.orchestrator_session_id"
+        " WHERE a.program_id = $1::uuid"
+    )
+
+    #: Why each session ended, in the order they ran. A session closes on one of
+    #: three ceilings and on nothing else, so this is what turns "the campaign
+    #: rotated" into "a ceiling rotated it" -- the difference criterion 2 is
+    #: about, and one a long campaign under ordinary weights would not show.
+    ROTATIONS = (
+        "SELECT close_reason FROM orchestrator_sessions"
+        " WHERE program_id = $1::uuid ORDER BY generation"
+    )
+
+    #: Every Task that reached a terminal state, and the two facts that say
+    #: whether it earned the one it reached: a result the runtime accepted, and
+    #: attempts spent to the ceiling.
+    TERMINAL = (
+        "SELECT t.label, t.status, coalesce(t.abandoned_reason, ''),"
+        "       t.attempts >= w.max_attempts, task_result_accepted(t.id)"
+        "  FROM tasks t, scheduler_weights w"
+        " WHERE t.program_id = $1::uuid AND w.active"
+        "   AND t.status IN ('done', 'abandoned') ORDER BY t.label"
+    )
+
+    #: A run whose Task nobody holds and which nobody ended: the shape a
+    #: supervisor's death leaves, and the one `resume_program` exists to clear.
+    ZOMBIES = (
+        "SELECT a.label FROM agent_runs a"
+        " WHERE a.program_id = $1::uuid AND a.finished_at IS NULL"
+        "   AND NOT EXISTS (SELECT 1 FROM tasks t"
+        "                    WHERE t.id = a.task_id AND t.lease_expires_at > now())"
+    )
+    STRANDED = (
+        "SELECT l.id::text FROM identity_leases l"
+        "  JOIN agent_runs a ON a.id = l.holder_agent_run_id"
+        " WHERE a.program_id = $1::uuid AND l.released_at IS NULL"
+        "   AND a.finished_at IS NOT NULL"
+    )
+    LAPSED_TASKS = (
+        "SELECT label FROM tasks WHERE program_id = $1::uuid"
+        "   AND status IN ('claimed', 'running') AND lease_expires_at <= now()"
+    )
+
+    #: A worker run whose Task was claimed by some other transaction. Asked of
+    #: the runs the pass log names, because those are the runs `claim_task`
+    #: made: the lanes that need a live run of their own open one against a Task
+    #: claimed earlier, which is a second run of an existing claim rather than a
+    #: worker starting. The Event log is where the question is legible, since
+    #: two rows written by one transaction carry one `xact_id` between them.
+    SEPARATELY_STARTED = (
+        "SELECT a.label FROM agent_runs a"
+        " WHERE a.program_id = $1::uuid AND a.label = ANY($2)"
+        "   AND NOT EXISTS ("
+        "        SELECT 1 FROM events w"
+        "          JOIN events c ON c.program_id = w.program_id"
+        "                       AND c.xact_id = w.xact_id"
+        "                       AND c.subject_table = 'tasks'"
+        "                       AND c.subject_id = a.task_id"
+        "         WHERE w.program_id = a.program_id"
+        "           AND w.subject_table = 'agent_runs' AND w.subject_id = a.id)"
+    )
+
+    #: One Task, what it charged for, and what was actually run against it.
+    ATTEMPTED = (
+        "SELECT t.label, t.attempts,"
+        "       (SELECT count(*) FROM agent_runs a WHERE a.task_id = t.id)"
+        "  FROM tasks t WHERE t.program_id = $1::uuid AND t.label = ANY($2)"
+        " ORDER BY t.label"
+    )
+
+    UNDER_JUDGEMENT = (
+        "SELECT label FROM findings WHERE program_id = $1::uuid AND status = 'validating'"
+    )
+    STILL_OPEN = (
+        "SELECT a.id::text FROM validation_attempts a"
+        " WHERE a.program_id = $1::uuid AND a.outcome = 'open'"
+    )
+    STILL_QUEUED = (
+        "SELECT q.id::text FROM validation_queue q"
+        " WHERE q.program_id = $1::uuid AND q.state <> 'done'"
+    )
+
+    @classmethod
+    def slug_of(cls, name: str) -> str:
+        return f"{CAMPAIGN_SLUG}-{name}"
+
+    def rows_for(self, name: str, sql: str, parameters: tuple = ()) -> list:
+        """One campaign's rows, read with the connection pointed at that campaign.
+
+        `focus` before every read rather than a Program argument in every query:
+        the row-level policy is the thing being relied on, so a read that named
+        its Program in a WHERE clause and nothing else would pass against a
+        session still pointed at the other campaign.
+        """
+        self.focus(name)
+        return list(self.connection.execute(sql, (self.identifiers[name], *parameters)).rows)
+
+    def truth(self, name: str) -> dict:
+        return {
+            table: [tuple(None if one is None else unnamed(str(one)) for one in row)
+                    for row in self.rows_for(name, query)]
+            for table, query in self.TRUTH.items()
+        }
+
+    def charged(self, name: str) -> list:
+        """Every Task the campaign's own passes claimed, and what it was charged.
+
+        The Tasks this case fabricates for the offline, browser and validation
+        lanes are left out on purpose: `claimed_agent_run` writes a claimed Task
+        and its run in one statement without going through `claim_task`, so its
+        `attempts` is zero by construction and would read here as a run nobody
+        counted. What the criterion is about is the Tasks a scheduler handed
+        out, which are exactly the ones the pass log names.
+        """
+        claimed = sorted(
+            {facts["task"]["label"] for facts in self.passes[name] if facts["task"]}
+        )
+        return self.rows_for(name, self.ATTEMPTED, (pg.quote_array(claimed),))
+
+    def failed(self, name: str) -> list:
+        """The Program-scoped checks this campaign does not pass, with their words."""
+        return [
+            (check.name, check.detail)
+            for check in integrity.program_checks(self.connection, self.slug_of(name))
+            if not check.ok
+        ]
+
+    def comparable(self, name: str, rendered: str) -> str:
+        """One campaign's report with its own name and its own clock taken out.
+
+        The slug is the one difference between the two configurations and the
+        rendered-at line is a fact about when the second campaign ran, so both
+        are the report saying which campaign it is rather than what it found.
+        """
+        return unnamed(rendered.replace(self.slug_of(name), CAMPAIGN_SLUG))
+
+    def status_of_hypothesis(self, name: str, hypothesis: str) -> str:
+        return str(
+            self.rows_for(
+                name,
+                "SELECT status FROM hypotheses"
+                " WHERE program_id = $1::uuid AND id = $2::uuid",
+                (hypothesis,),
+            )[0][0]
+        )
+
+    # -- criterion 1: the campaign covers every lane the harness has -----------
+
+    def test_the_first_pass_claimed_the_task_the_program_opened(self):
+        for name, run in self.reconnaissance.items():
+            with self.subTest(campaign=name):
+                facts = run["facts"]
+
+                self.assertEqual("recon", facts["task"]["kind"])
+                self.assertEqual("recon", facts["agent_run"]["role"])
+                # Which of the campaign's addresses is a fact about the rank
+                # the Slate gave them, and this arm is about the claim: what it
+                # says is that the pass ran against one the configuration
+                # declared and not against a subject something else invented.
+                self.assertIn(facts["target"]["url"], CAMPAIGN_URLS)
+                self.assertEqual("promoted", facts["promotion"]["status"])
+                self.assertEqual("done", facts["closure"]["task_status"])
+
+    def test_the_offline_lane_filed_what_the_tool_printed(self):
+        for name, filed in self.analyses.items():
+            with self.subTest(campaign=name):
+                self.assertEqual("success", filed.facts["tool_run"]["status"])
+                self.assertEqual("jq", filed.facts["tool_run"]["tool"])
+                self.assertEqual(
+                    {"stdout", "stderr"},
+                    {kept["stream"] for kept in filed.facts["outputs"]},
+                )
+
+    def test_the_browser_lane_navigated_through_the_door(self):
+        for name, walked in self.missions.items():
+            with self.subTest(campaign=name):
+                self.assertEqual("success", walked.facts["tool_run"]["status"])
+                self.assertEqual(
+                    {"console", "dom"},
+                    {kept["stream"] for kept in walked.facts["outputs"]},
+                )
+                # `target` rather than the word the stand-in said: the mission's
+                # one navigation is classified from the Receipt the door wrote
+                # for it, so this is the door's verdict about the campaign's
+                # address and not the container's claim about itself.
+                self.assertEqual(
+                    [("navigate", "target"), ("capture_dom", None)],
+                    [
+                        (str(action), None if verdict is None else str(verdict))
+                        for action, verdict in self.connection.execute(
+                            # Both Programs number their Tool runs from one, so
+                            # the label alone names two runs and the campaign it
+                            # belongs to is half of its identity.
+                            "SELECT s.action, r.outcome ->> 'scope_class'"
+                            "  FROM browser_step_results r"
+                            "  JOIN browser_steps s"
+                            "    ON s.tool_run_id = r.tool_run_id"
+                            "   AND s.ordinal = r.ordinal"
+                            "  JOIN tool_runs t ON t.id = r.tool_run_id"
+                            " WHERE t.label = $1 AND t.program_id = $2::uuid"
+                            " ORDER BY r.ordinal",
+                            (walked.facts["tool_run"]["label"], walked.facts["program_id"]),
+                        ).rows
+                    ],
+                )
+
+    # -- criterion 1, continued: the investigation each campaign performed ------
+
+    def test_the_campaign_stated_tested_and_settled_what_it_knew(self):
+        for name, made in self.investigations.items():
+            with self.subTest(campaign=name):
+                self.focus(name)
+
+                # Negative knowledge first: 034 makes a refutation permanent, so
+                # a campaign that could reopen it after a restart would be a
+                # campaign that forgets what it disproved.
+                self.assertEqual(
+                    "refuted", self.status_of_hypothesis(name, made["refuted"]["hypothesis"])
+                )
+                self.assertEqual(
+                    ["validated", "validated"],
+                    [self.status_of(name, one["finding"]) for one in made["member"].values()],
+                )
+                self.assertEqual(2, len(self.rows_for(name, self.STAMPS)))
+                self.assertEqual(2, len(self.rows_for(name, self.STEPS)))
+                self.assertTrue(made["report"].startswith("# "), name)
+                self.assertIn(self.BAND, made["report"])
+                for transition, *_ in self.PIVOTS:
+                    self.assertIn(transition, made["chain_report"])
+                # The question nobody answered, still nobody's: an operator was
+                # asleep for the whole campaign and no restart may speak for one.
+                # This phase's own, named rather than counted: the inherited
+                # route asks and answers impact questions of its own, and what
+                # this one is about is the last question, asked and left. How
+                # many of each the two campaigns hold is the truth projection's
+                # to compare.
+                parked = {
+                    str(label): (str(code), bool(answered))
+                    for label, code, answered in self.rows_for(name, self.PARKED)
+                }
+                self.assertEqual(
+                    ("impact_unauthorized", False), parked[made["parked"]["parked"]]
+                )
+
+    # -- criterion 2: the ceilings were low enough to turn the campaign over ---
+
+    def test_the_configured_ceilings_rotated_the_orchestrator(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                sessions = self.rows_for(name, self.SESSIONS)
+
+                # The ceilings the campaign installed, read back off the sessions
+                # they bounded. A rotation under the suite's ordinary weights
+                # would prove nothing about ceilings: it would prove the campaign
+                # was long, which is what this case has instead of a real one.
+                self.assertEqual(
+                    [(CAMPAIGN_WEIGHTS, 2, 60000, 2, 8192, 2048)] * len(sessions),
+                    [tuple(int(value) for value in row[1:]) for row in sessions],
+                )
+                self.assertGreater(len(sessions), 1, name)
+                self.assertEqual(
+                    list(range(1, len(sessions) + 1)), [int(row[0]) for row in sessions]
+                )
+                # And a ceiling is what ended each of them. Rotation on its
+                # own is a campaign that was long; the reason column is the
+                # campaign saying which of the configured numbers it ran into.
+                # The last session is closed like the others because the
+                # ceilings are low enough that the pass which opened it ran into
+                # one before the campaign ended -- so this is every session,
+                # and a session left open would be one nothing bounded.
+                reasons = {str(row[0]) for row in self.rows_for(name, self.ROTATIONS)}
+                self.assertNotEqual(set(), reasons)
+                self.assertEqual(set(), reasons - self.CEILINGS)
+
+    def test_every_attempt_was_made_by_a_worker_of_its_own(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                claimed = [facts for facts in self.passes[name] if facts["task"] is not None]
+
+                # A campaign that re-used one worker across attempts would read
+                # here as fewer runs than passes that claimed something. How
+                # many attempts each of those Tasks was charged is the arm below
+                # this one, and is a different question about the same rows.
+                self.assertGreaterEqual(len(claimed), len(self.SUPERVISOR))
+                self.assertEqual(
+                    len(claimed), len({facts["agent_run"]["label"] for facts in claimed})
+                )
+                # And the session the ceilings rotate is the orchestrator's
+                # alone: a worker run bound to one would be a worker inheriting
+                # a context somebody else filled.
+                self.assertEqual(
+                    {roster.ORCHESTRATOR},
+                    {str(row[0]) for row in self.rows_for(name, self.LEADERS)},
+                )
+
+    # -- criterion 3: every commit was stopped on both sides -------------------
+
+    def test_every_supervisor_commit_was_stopped_either_side_of_it(self):
+        for name, stops in self.stops.items():
+            with self.subTest(campaign=name):
+                self.assertEqual(
+                    [(commit, after) for commit in self.SUPERVISOR for after in (False, True)],
+                    [(one["commit"], one["after"]) for one in stops],
+                )
+                if name != self.INJECTED:
+                    self.assertEqual([None] * len(stops), [one["stopped"] for one in stops])
+                    continue
+                self.assertEqual(
+                    [(True, one["after"]) for one in stops],
+                    [(one["stopped"].stopped, one["stopped"].committed) for one in stops],
+                )
+                # Every stop moved the clock on what it left holding, which is
+                # the one fabricated fact in the case and is recorded as one.
+                # These stops and the judgement phase's are the whole of it.
+                self.assertEqual(
+                    len(stops) + len(self.judgements[name]["stops"]),
+                    len(self.lapsed[name]),
+                )
+
+    def test_a_worker_starts_in_the_transaction_that_claims_its_task(self):
+        """Why criterion 3's eight commits are stopped by seven statements.
+
+        Seven of the eight are a commit somebody makes; the eighth, a worker
+        Agent starting, is not a commit at all. `claim_task` inserts the
+        `agent_runs` row in the statement that claims the Task, so the claim
+        commit and the worker's Agent start are one commit and the pair of stops
+        on `claim` is the pair criterion 3 asks for. This is what makes that
+        true, read off the Event log: two rows written by one transaction share
+        an `xact_id`, and every worker run in either campaign shares one with
+        the Task it holds.
+        """
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                claimed = pg.quote_array(
+                    sorted({facts["agent_run"]["label"]
+                            for facts in self.passes[name] if facts["task"]})
+                )
+
+                self.assertEqual(
+                    [], self.rows_for(name, self.SEPARATELY_STARTED, (claimed,))
+                )
+
+    def test_the_door_was_stopped_either_side_of_the_receipt_write(self):
+        for name, made in self.exchanges.items():
+            with self.subTest(campaign=name):
+                self.assertEqual([True, False], [one["after"] for one in made])
+                if name != self.INJECTED:
+                    self.assertEqual(
+                        [("target", 1), ("target", 1)],
+                        [(one["classified"], one["receipts"]) for one in made],
+                    )
+                    self.assertEqual([None, None], [one["refusal"] for one in made])
+                    continue
+                self.assertEqual(
+                    [(True, True), (True, False)],
+                    [(one["stopped"].stopped, one["stopped"].committed) for one in made],
+                )
+                # The Receipt landed and the child was told nothing; then no
+                # Receipt landed and the record says so in the one word 31 keeps
+                # for a navigation nothing accounted for.
+                self.assertEqual(
+                    [("target", 1), (browser.UNCLASSIFIED, 0)],
+                    [(one["classified"], one["receipts"]) for one in made],
+                )
+                self.assertEqual("integrity_failed", made[1]["refusal"].code)
+                self.assertIn("requests_without_receipts", made[1]["refusal"].detail)
+
+    def test_the_validator_was_stopped_either_side_of_the_verdict(self):
+        for name, judged in self.judgements.items():
+            with self.subTest(campaign=name):
+                stops = judged["stops"]
+                self.assertEqual([False, True], [one["after"] for one in stops])
+                self.assertEqual("validated", self.status_of(name, judged["finding"]))
+                if name != self.INJECTED:
+                    self.assertEqual([None, None], [one["stopped"] for one in stops])
+                    self.assertEqual(["answered"], self.attempts_on(name, judged["finding"]))
+                    self.assertEqual([None, None], [one["reopened"] for one in stops])
+                    continue
+                self.assertEqual(
+                    [(True, False), (True, True)],
+                    [(one["stopped"].stopped, one["stopped"].committed) for one in stops],
+                )
+                # The lost verdict cost an attempt and not a truth: the Finding
+                # went back to the candidates, somebody asked again, and the
+                # second judgement is the one on the record.
+                self.assertEqual(
+                    ["unanswered", "answered"], self.attempts_on(name, judged["finding"])
+                )
+                self.assertEqual(
+                    ["opened", None], [(one["reopened"] or {}).get("outcome") for one in stops]
+                )
+
+    def test_the_operator_console_was_stopped_either_side_of_the_halt(self):
+        for name, halts in self.halts.items():
+            with self.subTest(campaign=name):
+                self.assertEqual([False, True], [one["after"] for one in halts])
+                if name == self.INJECTED:
+                    self.assertEqual(
+                        [(True, False), (True, True)],
+                        [(one["stopped"].stopped, one["stopped"].committed) for one in halts],
+                    )
+                else:
+                    self.assertEqual([None, None], [one["stopped"] for one in halts])
+                # Both campaigns end at the same revision, cleared. Nothing here
+                # was recovered by the harness -- the console that died before
+                # the database heard it was typed again by the person who typed
+                # it the first time, and that is the whole of the difference.
+                # 1 and 3 rather than 1 and 2: clearing a Halt is a decision
+                # about the standing as much as raising one, so it takes the
+                # revision between them. Both campaigns reach the same pair,
+                # which is the assertion -- the stopped console's first Halt
+                # never reached the server, and the operator typing it again is
+                # what makes the two campaigns' ledgers the same length.
+                self.assertEqual(
+                    [1, 3], [int(one["halted"]["revision"]) for one in halts]
+                )
+                self.assertEqual({"cleared"}, {one["cleared"]["status"] for one in halts})
+                self.assertEqual({"status": "cleared", "revision": 4}, self.standing(name))
+
+    # -- criterion 4: what every restart reconciled, and what it left alone ----
+
+    def test_no_restart_left_a_zombie_run_or_a_stranded_lease(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                self.assertEqual([], self.rows_for(name, self.ZOMBIES))
+                self.assertEqual([], self.rows_for(name, self.STRANDED))
+                self.assertEqual([], self.rows_for(name, self.LAPSED_TASKS))
+
+    def test_no_restart_fabricated_an_attempt(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                attempted = self.charged(name)
+
+                self.assertNotEqual([], attempted)
+                ceiling = int(
+                    self.connection.execute(
+                        "SELECT max_attempts FROM scheduler_weights WHERE active"
+                    ).scalar()
+                )
+                for label, attempts, runs in attempted:
+                    with self.subTest(task=str(label)):
+                        # An attempt with no run behind it is work the harness
+                        # charged a Task for and never did; a run with no attempt
+                        # is a Task handed out without being counted. A restart
+                        # that re-ran an accepted result would be the second.
+                        self.assertEqual(int(attempts), int(runs))
+                        self.assertLessEqual(int(attempts), ceiling)
+
+    def test_a_second_recovery_over_a_settled_campaign_writes_nothing(self):
+        """Criterion 4's word is idempotently, asked where it can be answered.
+
+        Every restart above ran against wreckage, so each of them proves a
+        recovery rather than the absence of one. This runs both verbs once more
+        with nothing left to find: every count they report must be zero, and the
+        Event log must be exactly as long afterwards as before. A sweep that
+        settled a Task already settled or released a Lease already released
+        would write a row, a row writes an Event, and that Event is criterion
+        4's duplicate -- told apart here from an honest second observation by
+        the fact that nothing happened in between.
+        """
+        for name, again in self.settled.items():
+            with self.subTest(campaign=name):
+                self.assertEqual(again["before"], again["after"])
+                self.assertNotEqual(0, again["before"], name)
+                # Every count except the one that is a reading rather than a
+                # doing: Tasks left alone because something is still holding
+                # them are what a recovery must not touch, not what it did.
+                self.assertEqual(
+                    [],
+                    [(verb, key, value)
+                     for verb in ("resumed", "reconciled")
+                     for key, value in sorted(again[verb].items())
+                     if key != "tasks_left_to_live_owners" and int(value) != 0],
+                )
+
+    def test_no_campaign_closed_a_task_that_had_not_earned_it(self):
+        """Criterion 4's false terminal state, asked of every Task that reached one.
+
+        A Task is `done` because the runtime accepted a structured result of it
+        and `abandoned` for attempts because it has none left, and recovery is
+        the one place both are decided about work nobody was watching. The bug
+        this ticket found was the first of the two: a Task whose result had been
+        accepted went back into the queue, and the campaign paid a second
+        attempt for knowledge it already had. The opposite mistake -- closing a
+        Task the crash left half-done -- would read here as `done` with nothing
+        accepted, which is what `check_execution_closure` calls a leak.
+        """
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                closed = self.rows_for(name, self.TERMINAL)
+
+                self.assertNotEqual([], closed)
+                for label, status, reason, spent, accepted in closed:
+                    with self.subTest(task=str(label)):
+                        if str(status) == "done":
+                            self.assertTrue(bool(accepted), str(label))
+                        elif str(reason) == "attempts_exhausted":
+                            self.assertTrue(bool(spent), str(label))
+
+    def test_the_two_campaigns_recorded_each_thing_the_same_number_of_times(self):
+        """What DISTINCT sets aside, compared rather than dropped.
+
+        A set comparison cannot see a row recorded twice, and a row recorded
+        twice is criterion 4's duplicate -- so the multiplicity is compared
+        here, between the campaigns, with the same projections and without the
+        DISTINCT. Two Programs run through one script write each thing as many
+        times as the script does it, and the stopped one writes it no more
+        often: an attempt whose result the runtime accepted is settled rather
+        than handed out again, which is the arm of `settle_recovered_tasks` this
+        ticket added and the reason a stop no longer costs a second promotion.
+
+        Not asserted per campaign, because these projections are lossy on
+        purpose and multiplicity inside one is ordinary: two Findings of one
+        campaign share a title, two Tests of one Hypothesis share a lane, and a
+        differential records the same sentence about the baseline of each. What
+        is not ordinary is the two campaigns disagreeing about how many.
+        """
+        for table, query in self.TRUTH.items():
+            with self.subTest(rows=table):
+                counted = [
+                    sorted(tuple(unnamed(str(one)) for one in row)
+                           for row in self.rows_for(
+                               name, query.replace("SELECT DISTINCT", "SELECT", 1)))
+                    for name in ("control", self.INJECTED)
+                ]
+
+                self.assertEqual(len(counted[0]), len(counted[1]), table)
+                self.assertEqual(*counted)
+
+    def test_no_finding_was_left_under_judgement_by_a_dead_validator(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                self.assertEqual([], self.rows_for(name, self.UNDER_JUDGEMENT))
+                self.assertEqual([], self.rows_for(name, self.STILL_OPEN))
+                self.assertEqual([], self.rows_for(name, self.STILL_QUEUED))
+
+    def test_each_campaign_is_sound_on_its_own_terms(self):
+        for name in self.identifiers:
+            with self.subTest(campaign=name):
+                self.assertEqual([], self.failed(name))
+
+    # -- criterion 5: the two campaigns arrived in the same place --------------
+
+    def test_the_two_campaigns_hold_the_same_truth(self):
+        control, injected = (self.truth(name) for name in ("control", self.INJECTED))
+
+        for table in self.TRUTH:
+            with self.subTest(rows=table):
+                self.assertEqual(control[table], injected[table])
+                self.assertNotEqual([], control[table], table)
+
+    def test_the_two_campaigns_report_the_same_finding_and_the_same_chain(self):
+        control, injected = (self.investigations[name] for name in ("control", self.INJECTED))
+
+        for rendered in ("report", "chain_report"):
+            with self.subTest(rendered=rendered):
+                self.assertEqual(
+                    self.comparable("control", control[rendered]),
+                    self.comparable(self.INJECTED, injected[rendered]),
+                )
+
+    def test_the_two_campaigns_agree_on_every_integrity_check(self):
+        # Whether either passes is the arm above; this is whether they answer
+        # the same, check for check. A campaign the stops left unsound would
+        # fail both, and one whose stops taught the checks a new question would
+        # fail only this -- which is the difference criterion 5 asks about.
+        verdicts = [
+            [(check.name, check.ok) for check in
+             integrity.program_checks(self.connection, self.slug_of(name))]
+            for name in ("control", self.INJECTED)
+        ]
+
+        self.assertNotEqual([], verdicts[0])
+        self.assertEqual(*verdicts)
+
+        # `program_checks` is the scoped family, and the scoped family is one
+        # check: a comparison that stopped there would say "every integrity
+        # check" about a single one. The two checkers that take a Program
+        # argument are therefore asked directly, by name, and both campaigns
+        # are asked the same way. `check_event_log_integrity` is the one this
+        # ticket's second migration changed, so a difference between the two
+        # campaigns here is the difference between a write a stop accounted for
+        # and one it did not.
+        for checker in ("check_event_log_integrity", "check_transport_claims"):
+            with self.subTest(check=checker):
+                asked = [
+                    [tuple(str(value) for value in row)
+                     for row in self.rows_for(name, f"SELECT * FROM {checker}($1::uuid)")]
+                    for name in ("control", self.INJECTED)
+                ]
+                self.assertEqual(*asked)
+                self.assertEqual([], asked[0])
+
+    def test_the_one_thing_the_two_campaigns_do_not_agree_on_is_named(self):
+        # The corpus-wide check the door's death broke, and the whole of what a
+        # stop cost this campaign that a restart could not give back. It names
+        # the injected campaign's last mission and nothing else, because a
+        # Receipt is the only record of what left this machine and no recovery
+        # may write one it did not see.
+        lost = self.exchanges[self.INJECTED][1]["walked"].facts["tool_run"]["label"]
+
+        self.assertEqual(
+            [("requests_without_receipts", f"{lost}: 1 request(s), 0 receipt(s)")],
+            [(str(problem), str(detail))
+             for problem, detail in self.rows_of("SELECT * FROM check_browser_runs()")],
+        )
+
+    # -- criterion 6: nothing above was decided by a clock or by a sentence ----
+
+    def test_no_assertion_here_waits_on_a_clock_or_reads_a_transcript(self):
+        # The class and everything at module level it is built out of. Reading
+        # only the class would leave the four things that stand between it and
+        # the harness unread -- and a wait put into the stopper, the scripted
+        # child or the container stand-in would be a wait this case depends on
+        # exactly as much as one written in an arm.
+        source = "".join(
+            inspect.getsource(part)
+            for part in (type(self), Stopper, Contained, Hand, quiet_crashes, told, unnamed)
+        )
+
+        # Every stop is proven by what the server kept and every recovery by the
+        # rows the next process found. The one clock this case moves is a Task's
+        # Lease expiry, which is moved by a statement rather than waited out, and
+        # no assertion above reads a container's transcript or a model's summary
+        # for anything -- the children are scripted and their words are inputs.
+        # Spelled in two halves because the arm is reading the file it is
+        # written in: a literal `sleep` followed by a bracket would be found in
+        # this line and nowhere else, and the case would fail at itself.
+        for waiting in ("sleep", "monotonic", "perf_counter", "time.time"):
+            self.assertNotIn(waiting + "(", source)
+        self.assertEqual(1, ELAPSE.count("SET "))
+        self.assertIn("SET lease_expires_at", ELAPSE)
+        self.assertNotEqual([], self.lapsed[self.INJECTED])
+        self.assertEqual([], self.lapsed["control"])
 
 
 if __name__ == "__main__":

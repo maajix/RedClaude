@@ -38,7 +38,7 @@ disk is a broken record even when both halves are individually intact.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import pg, seal
@@ -94,21 +94,6 @@ ROLES_FAMILY = "roles"
 STANDING_FAMILY = "standing"
 ALL_FAMILIES = (BASELINE_FAMILY, ROLES_FAMILY, STANDING_FAMILY)
 RUNTIME_FAMILIES = (BASELINE_FAMILY, STANDING_FAMILY)
-
-#: The one check a restore is entitled to fail, and the one problem kind that
-#: entitlement covers. `check_event_log_integrity()`'s part (d) compares a row's
-#: `xmin` -- the transaction that produced the live tuple -- with the transaction
-#: id recorded on its event. `pg_restore` rewrites every tuple in the restore's
-#: own transaction while the events keep the ids of the writes that really
-#: happened, so that comparison is false for every restored row by construction.
-#: The evidence was destroyed by machinery outside the schema, which is the same
-#: class as the `xmin = 2` exclusion the check already carries for frozen tuples:
-#: the row degrades to part (b), an event exists for it at all, and that is said
-#: rather than silently passed. Nothing else is tolerated -- a second problem
-#: kind in the same check fails a restore exactly as it fails anything else.
-RESTORE_ENTITLEMENT = "event_log_integrity"
-RESTORED_ROW_PROBLEM = "row_last_write_unaccounted"
-EVENT_LOG_PROBLEMS = "SELECT DISTINCT problem FROM check_event_log_integrity()"
 
 #: Every recorded claim about the store, in the order an operator reads them.
 #: No Program in the query: this is the gate, which asks whether the record as a
@@ -210,35 +195,12 @@ def program_checks(connection: pg.Connection, slug: str) -> tuple[Check, ...]:
     return tuple(_standing_checks(connection, (slug,), scoped_only=True))
 
 
-def entitled_by_a_restore(connection: pg.Connection, check: Check) -> Check:
-    """The one failure a restored database may carry, held rather than failed.
-
-    The problem kinds are asked of the checker itself rather than read out of the
-    standing check's detail string, because what is tolerated is a kind and the
-    kinds are a column. Only a restore may ask: `rk db verify` stays strict, so a
-    database that fails this way without anyone restoring it is still a database
-    whose emitter was switched off for a write.
-    """
-    if check.ok or check.family != STANDING_FAMILY or check.name != RESTORE_ENTITLEMENT:
-        return check
-    kinds = {str(problem) for (problem,) in connection.execute(EVENT_LOG_PROBLEMS).rows}
-    if kinds - {RESTORED_ROW_PROBLEM}:
-        return check
-    return replace(
-        check,
-        ok=True,
-        detail=f"{check.detail}: xmin evidence lost to the restore, rows otherwise accounted for",
-    )
-
-
 def verify(
     connection: pg.Connection,
     expected: list[str] | None = None,
     families: Sequence[str] = ALL_FAMILIES,
     store: Path | None = None,
     programs: Sequence[str] | None = None,
-    *,
-    restored: bool = False,
 ) -> Report:
     """Run the gate and report it.
 
@@ -259,11 +221,14 @@ def verify(
     a fact in it and this only changes what the standing family was asked about.
     `rk db verify` itself never names any, so the gate is as strict as it was.
 
-    `restored` is the caller saying it has just loaded an archive, and it buys
-    exactly one named tolerance -- see `RESTORE_ENTITLEMENT`. It is a parameter
-    rather than something the gate works out for itself because no database can
-    tell "these tuples were rewritten by a restore" from "these rows were written
-    with the emitter switched off"; only the command that ran `pg_restore` knows.
+    A restore asks exactly what a migration asks. It used to buy one named
+    tolerance, because `check_event_log_integrity()`'s part (d) compared a row's
+    `xmin` against the transaction id on its event and `pg_restore` rewrites
+    every tuple under a transaction id the events know nothing about. Part (d)
+    now also accounts for a row whose event tuple was written by the same
+    transaction as the row, which is what a restore leaves behind, so a restored
+    database passes the check outright -- and a tolerance that survived that
+    could only ever forgive a real defect.
     """
     ledger = Ledger()
     if not _installed(connection):
@@ -277,8 +242,6 @@ def verify(
 
     try:
         checks = run(connection, expected, families, programs)
-        if restored:
-            checks = tuple(entitled_by_a_restore(connection, check) for check in checks)
     except pg.DatabaseError as error:
         # A registered check that raises is itself a failure of the gate: the
         # invariant it names is unanswered, which is not the same as satisfied.

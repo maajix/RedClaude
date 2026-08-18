@@ -221,9 +221,7 @@ def restore(
             for name, answer in finalized.items():
                 ledger.hold(f"finalize:{name}", str(answer))
 
-            facts = migrate.gate_on_a_fresh_connection(
-                ledger, settings, migrations, restored=True
-            )
+            facts = migrate.gate_on_a_fresh_connection(ledger, settings, migrations)
 
     return report(
         "db restore",
