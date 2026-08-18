@@ -15,7 +15,7 @@
 
 ## What was built
 
-`baseline/spec-evidence.tsv`, `tools/check_audit.py` and `tests/test_audit.py`.
+`baseline/spec-verification.tsv`, `tools/check_audit.py` and `tests/test_audit.py`.
 The table is the work; the checker is what stops the table from being a
 document. One row per requirement -- 230 stories, 19 Implementation Decisions,
 24 Testing Decisions, 9 Out-of-Scope constraints, the 6 release conditions under
@@ -26,6 +26,27 @@ repository gates. The Spec's seven top-level sections are frozen too, so a
 requirement arriving under a heading nobody parses is release-blocking rather
 than invisible, and a story is digested at every line it wraps onto rather than
 at its first, because half a requirement is not one.
+
+**The column is `verification`, not `evidence`.** `CONTEXT.md` owns Evidence as
+the role an observation plays for a claim; what a row here names is what would
+report the requirement broken, which is a different thing, and the v1 disposition
+ledger beside it already spells that column `verification`. One vocabulary, one
+word per idea.
+
+**What a citation is, is decided once.** `citations()` reads a row's column and
+returns a kind -- test, gate, owed or prose -- and every reading after it compares
+kinds. The prefixes `gate:` and `owed:` are cut in exactly one place. The same
+tightening runs through what a citation may name: a class holding no test method,
+directly or from a base in its own module, is not a test this checkout can run,
+because `unittest` loads it to an empty suite and an empty suite passes for the
+same reason a document does. And the one skip `--run` forgives is now matched as
+a whole sentence rather than as a substring, so a test cannot excuse itself from
+being measured by quoting the exception inside a longer reason.
+
+**The audit is inside its own range.** Criterion 3 now reads tickets 01 through
+63 rather than 01 through 62: an audit that exempts the ticket it was delivered
+by is an audit with exactly one ticket nobody reads, and it is the one whose
+author had the most reason to want it unread.
 
 **The digest is the reason the map cannot rot quietly.** Anything else -- a
 count, a key, a heading -- keeps matching after somebody rewrites the sentence

@@ -8,16 +8,21 @@ and ends in a runnable first-hunt release candidate. Coverage is a property of
 the plan; the progress section below is the separate, smaller claim about what
 has been built, and neither section is evidence for the other. Per-story
 implementation is no longer this file's claim to make: ticket 63 built
-`baseline/spec-evidence.tsv` and `tools/check_audit.py`, which hold a digest of
-every requirement's own text against the tickets that built it and the tests or
-gates that check it, and refuse the release when one of them is unmapped.
+`baseline/spec-verification.tsv` and `tools/check_audit.py`, which hold a digest
+of every requirement's own text against the tickets that built it and the tests
+or gates that check it, and refuse the release when one of them is unmapped.
+Every count in this file is a snapshot taken on the date above by reading the
+tracker; the gate is what cannot go stale, and where the two disagree the gate is
+the one that is right.
 
 ## Structural validation
 
 Re-measured 2026-08-18, after tickets 76–80 were raised by implementation reviews
 and research, and 81–83 by authorised live validation, all triaged into the graph.
 The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
-the audit gate parses, so this table and that gate cannot disagree.
+the audit gate parses. Numbers written here are a snapshot of that reading on the
+date above, not a second source for it -- re-run the gate rather than trusting
+this table when the two differ.
 
 | Check | Result |
 | --- | --- |
@@ -180,7 +185,7 @@ later release verification slice.
 | 211–230 — Installation, security and release | 01–03, 07, 10, 11, 15–18, 30, 31, 44–48, 57, 61–65 |
 
 The implementation-time per-story evidence matrix is itself release-blocking and
-now exists: `baseline/spec-evidence.tsv` carries one row per story with the
+now exists: `baseline/spec-verification.tsv` carries one row per story with the
 tickets that built it and the tests that check it. Range coverage here prevents a
 planning omission; that table prevents a prose-only completion claim.
 

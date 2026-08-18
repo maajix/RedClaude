@@ -427,18 +427,23 @@ python3 -m tools.check_audit
 python3 -m tools.check_audit --run
 ```
 
-`baseline/spec-evidence.tsv` holds one row per requirement -- 230 user stories,
+`baseline/spec-verification.tsv` holds one row per requirement -- 230 user stories,
 19 Implementation Decisions, 24 Testing Decisions, 9 Out-of-Scope constraints, the
 6 release conditions under Further Notes and the 7 registered prototype
 regressions -- and each row names the tickets that built it and the tests or gates
-that check it. The audit reads the Spec, the tracker and that table together and
-refuses:
+that check it. The column is `verification` rather than `evidence`: Evidence is
+the role an observation plays for a claim, which `CONTEXT.md` reserves, and the
+v1 ledger beside this one already spells the same idea the same way. The audit
+reads the Spec, the tracker and that table together and refuses:
 
-* a requirement with no row, or a row for a requirement the Spec does not state;
+* a requirement with no row, a row for a requirement the Spec does not state, or
+  a requirement stated twice, since the weaker of two answers is the one nobody
+  reads;
 * a row whose digest no longer matches the requirement's own text, so a story
   reworded after somebody mapped it stops matching;
-* a row naming a ticket that does not exist or is not resolved, or evidence that
-  is neither a test this checkout can run nor a gate it ships -- there is no
+* a row naming a ticket that does not exist or is not resolved, or verification
+  that is neither a test this checkout can run nor a gate it ships -- a case
+  holding no test is not one, because `unittest` loads it to an empty suite -- there is no
   third kind, which is how a citation to a document is refused rather than
   counted, and this gate may not be cited as its own evidence;
 * a requirement whose evidence is *owed* -- `owed:64`, the open ticket that will
@@ -449,7 +454,8 @@ refuses:
   check them;
 * a Spec section nobody reads: the seven headings are frozen, so a requirement
   arriving under a new one is release-blocking rather than invisible;
-* a ticket in 01 through 62 that is unresolved, blocked by unfinished work, or
+* a ticket in 01 through 63 -- the ticket that wrote this gate included -- that
+  is unresolved, blocked by unfinished work, or
   has no revision resolving it -- the commit that wrote its resolved status --
   and any acceptance box it left unticked without naming an open ticket that
   closes it;

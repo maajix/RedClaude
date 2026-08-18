@@ -1,4 +1,4 @@
-source	sha256	area	tickets	evidence
+source	sha256	area	tickets	verification
 story:001	b35895127af98d1ee9156e0109e559fe78e9ffbb7ebf7ffc79e1ede7d8793bf3	operator	04	tests.test_cli.RunCommandTest;tests.test_database.ProgramRunTest
 story:002	e030cbee23e5b51f88891671e0f82f581f62d0801a065ac4a35f91378844972e	operator	04	tests.test_database.ProgramRunTest;tests.test_cli.RunCommandTest
 story:003	a8f713e95e7d12d0d01bbfbe280546ff378a21c246513ffa39bd3d72d8b51d40	operator	04	tests.test_config.ValidConfigurationTest;tests.test_program.RefusalTest

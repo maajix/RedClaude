@@ -49,7 +49,12 @@ class RunnableProbe(unittest.TestCase):
         self.skipTest("no database")
 
     def test_this_one_cannot_be_measured_here(self):
-        self.skipTest("the sdk is installed, so this interpreter is a measured runtime")
+        self.skipTest("claude_agent_sdk is installed, so this interpreter is a measured runtime")
+
+    def test_this_one_borrows_the_sentence_that_excuses_a_skip(self):
+        self.skipTest(
+            "no database is installed, so this interpreter is a measured runtime, roughly"
+        )
 
 
 class AuditGateTest(unittest.TestCase):
@@ -64,8 +69,8 @@ class AuditGateTest(unittest.TestCase):
             "spec coverage\n"
             "  stories                230   decisions 19  testing 24  scope 9"
             "  notes 6  regressions 7\n"
-            "  evidence               213   tests 208  gates 5  owed 2\n"
-            "  tickets                 83   resolved 77  audited 62  deferred criteria 11\n"
+            "  verification           213   tests 208  gates 5  owed 2\n"
+            "  tickets                 83   resolved 77  audited 63  deferred criteria 11\n"
             "  area: runtime          144   anchors 1\n"
             "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
@@ -133,8 +138,8 @@ class AuditGateTest(unittest.TestCase):
         # One exit code, every reason. A gate that stopped at the first missing
         # row would make closing the map a queue rather than a piece of work.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "spec-evidence.tsv"
-            rows = (ROOT / "baseline" / "spec-evidence.tsv").read_text(encoding="utf-8")
+            path = Path(directory) / "spec-verification.tsv"
+            rows = (ROOT / "baseline" / "spec-verification.tsv").read_text(encoding="utf-8")
             path.write_text(
                 "\n".join(
                     line
@@ -285,6 +290,41 @@ class AuditShapeTest(unittest.TestCase):
         self.assertIn("unread ['Appendix']", str(refused.exception))
 
 
+class AuditRunnableTest(unittest.TestCase):
+    """What a citation may name: a module, a case that holds tests, or one test."""
+
+    SUITE = (
+        "import unittest\n\n\n"
+        "class Shared(unittest.TestCase):\n"
+        "    def test_inherited(self):\n        pass\n\n\n"
+        "class Borrowing(Shared):\n    pass\n\n\n"
+        "class Empty(unittest.TestCase):\n"
+        "    def helper(self):\n        pass\n"
+    )
+
+    def names(self) -> frozenset[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = Path(directory)
+            (suite / "test_probe.py").write_text(self.SUITE, encoding="utf-8")
+            return check_audit.runnable_names(suite)
+
+    def test_a_module_and_the_cases_that_hold_tests_are_citable(self):
+        self.assertEqual(
+            {
+                "tests.test_probe",
+                "tests.test_probe.Shared",
+                "tests.test_probe.Shared.test_inherited",
+                "tests.test_probe.Borrowing",
+            },
+            set(self.names()),
+        )
+
+    def test_a_case_that_holds_no_test_at_all_is_not_citable(self):
+        # `unittest` would load it to an empty suite, so citing it is citing
+        # something that cannot fail -- the same hole prose leaves.
+        self.assertNotIn("tests.test_probe.Empty", self.names())
+
+
 class AuditCase(unittest.TestCase):
     """A base for the readings, which are pure functions over one gathered audit."""
 
@@ -311,7 +351,7 @@ class AuditCase(unittest.TestCase):
 
 
 class AuditMapTest(AuditCase):
-    """Criteria 1, 2 and 5: one row per requirement, and no row that is prose."""
+    """Criterion 1: one row per requirement, at the words the requirement states."""
 
     def test_the_shipped_map_covers_the_spec(self):
         self.assertEqual([], check_audit.map_errors(self.audit))
@@ -350,10 +390,27 @@ class AuditMapTest(AuditCase):
             check_audit.map_errors(self.altered(rows=self.rows_with(STORY, area="plumbing"))),
         )
 
+    def test_a_requirement_the_map_states_twice_is_refused(self):
+        # Two rows for one requirement are two answers to a question that has
+        # one, and whichever answer is weaker is the one nobody reads.
+        twice = [*self.audit.rows, next(row for row in self.audit.rows if row["source"] == STORY)]
+
+        self.assertEqual(
+            [f"{STORY}: the map states it 2 times"],
+            check_audit.map_errors(self.altered(rows=twice)),
+        )
+
+
+class AuditCitationTest(AuditCase):
+    """Criteria 2 and 5: who built a requirement, and what would report otherwise."""
+
+    def test_every_shipped_row_names_work_and_a_check(self):
+        self.assertEqual([], check_audit.citation_errors(self.audit))
+
     def test_a_requirement_no_ticket_implements_is_refused(self):
         self.assertEqual(
             [f"{STORY}: no ticket implements it"],
-            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, tickets=""))),
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets=""))),
         )
 
     def test_a_requirement_implemented_by_unfinished_work_is_refused(self):
@@ -361,19 +418,19 @@ class AuditMapTest(AuditCase):
         # says it will be.
         self.assertEqual(
             [f"{STORY}: ticket 77 is ready-for-agent, not resolved"],
-            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, tickets="77"))),
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="77"))),
         )
 
     def test_a_requirement_implemented_by_a_ticket_nobody_wrote_is_refused(self):
         self.assertEqual(
             [f"{STORY}: names ticket 99, which the tracker does not hold"],
-            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, tickets="99"))),
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="99"))),
         )
 
     def test_a_requirement_nothing_checks_is_release_blocking(self):
         self.assertEqual(
             [f"{STORY}: no test or gate checks it"],
-            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, evidence=""))),
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, verification=""))),
         )
 
     def test_a_requirement_checked_only_by_prose_is_release_blocking(self):
@@ -381,9 +438,9 @@ class AuditMapTest(AuditCase):
         # citing nothing -- and it is the citation an audit is most tempted by.
         self.assertEqual(
             [f"{STORY}: docs/adr/0003-program-runtime.md is neither a test nor a gate"],
-            check_audit.map_errors(
+            check_audit.citation_errors(
                 self.altered(
-                    rows=self.rows_with(STORY, evidence="docs/adr/0003-program-runtime.md")
+                    rows=self.rows_with(STORY, verification="docs/adr/0003-program-runtime.md")
                 )
             ),
         )
@@ -391,8 +448,8 @@ class AuditMapTest(AuditCase):
     def test_a_test_this_checkout_cannot_run_is_refused(self):
         self.assertEqual(
             [f"{STORY}: tests.test_database.NoSuchTest is not a test this checkout can run"],
-            check_audit.map_errors(
-                self.altered(rows=self.rows_with(STORY, evidence="tests.test_database.NoSuchTest"))
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(STORY, verification="tests.test_database.NoSuchTest"))
             ),
         )
 
@@ -400,10 +457,10 @@ class AuditMapTest(AuditCase):
         # The shipped row: the final review has not run, so nothing checks the
         # story that asks for it, and the map says which open ticket owes it
         # rather than citing something that does not check it.
-        self.assertEqual([], check_audit.map_errors(self.audit))
+        self.assertEqual([], check_audit.citation_errors(self.audit))
         row = next(row for row in self.audit.rows if row["source"] == OWED)
 
-        self.assertEqual("owed:64", row["evidence"])
+        self.assertEqual("owed:64", row["verification"])
         self.assertFalse(self.audit.tickets[64].resolved)
 
     def test_evidence_owed_by_finished_work_is_refused(self):
@@ -411,16 +468,16 @@ class AuditMapTest(AuditCase):
         # row still pointing at one is a row whose evidence nobody went back for.
         self.assertEqual(
             [f"{OWED}: owed:20 is owed by a ticket that is already resolved"],
-            check_audit.map_errors(
-                self.altered(rows=self.rows_with(OWED, tickets="20", evidence="owed:20"))
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(OWED, tickets="20", verification="owed:20"))
             ),
         )
 
     def test_evidence_owed_by_nobody_is_refused(self):
         self.assertEqual(
             [f"{OWED}: owed:99 names a ticket the tracker does not hold"],
-            check_audit.map_errors(
-                self.altered(rows=self.rows_with(OWED, tickets="20", evidence="owed:99"))
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(OWED, tickets="20", verification="owed:99"))
             ),
         )
 
@@ -429,22 +486,22 @@ class AuditMapTest(AuditCase):
         # other row naming it is a requirement built by unfinished work.
         self.assertEqual(
             [f"{STORY}: ticket 64 is ready-for-agent, not resolved"],
-            check_audit.map_errors(self.altered(rows=self.rows_with(STORY, tickets="64"))),
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="64"))),
         )
 
     def test_this_gate_cannot_be_its_own_evidence(self):
         self.assertEqual(
             [f"{STORY}: gate:tools.check_audit cannot be its own evidence"],
-            check_audit.map_errors(
-                self.altered(rows=self.rows_with(STORY, evidence="gate:tools.check_audit"))
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(STORY, verification="gate:tools.check_audit"))
             ),
         )
 
     def test_a_gate_this_checkout_does_not_ship_is_refused(self):
         self.assertEqual(
             [f"{GATE_BACKED}: gate:tools.check_nothing is not a gate this checkout ships"],
-            check_audit.map_errors(
-                self.altered(rows=self.rows_with(GATE_BACKED, evidence="gate:tools.check_nothing"))
+            check_audit.citation_errors(
+                self.altered(rows=self.rows_with(GATE_BACKED, verification="gate:tools.check_nothing"))
             ),
         )
 
@@ -531,7 +588,7 @@ class AuditTicketTest(AuditCase):
             check_audit.ticket_errors(
                 self.altered(
                     tickets=self.tickets_with(
-                        20, path=self.audit.root / check_audit.ISSUES / "20-never-committed.md"
+                        20, path=check_audit.spec_root(self.audit.status) / check_audit.ISSUES / "20-never-committed.md"
                     )
                 )
             ),
@@ -586,7 +643,7 @@ class AuditGraphTest(AuditCase):
         # attached to nothing downstream. Ticket 64 names them, which is what
         # makes them part of this release rather than beside it.
         self.assertEqual(
-            [f"ticket 83: resolved, and no path reaches ticket 65 from it"],
+            ["ticket 83: resolved, and no path reaches ticket 65 from it"],
             check_audit.graph_errors(
                 self.altered(
                     tickets=self.tickets_with(
@@ -645,7 +702,7 @@ class AuditPlaybookTest(AuditCase):
     """Criterion 6's number: the audit names the forty-nine and holds a gate to it."""
 
     def test_the_catalogue_gate_still_plans_the_forty_nine(self):
-        self.assertEqual([], check_audit.playbook_errors(self.audit))
+        self.assertEqual([], check_audit.playbook_errors())
 
     def test_a_catalogue_planning_a_different_number_is_refused(self):
         with mock.patch.object(check_audit, "PLAYBOOKS", 48):
@@ -654,14 +711,14 @@ class AuditPlaybookTest(AuditCase):
                     "tools.check_coverage plans 49 in-scope Playbooks"
                     " and this audit was written against 48"
                 ],
-                check_audit.playbook_errors(self.audit),
+                check_audit.playbook_errors(),
             )
 
     def test_a_catalogue_that_states_no_number_is_refused(self):
         with mock.patch.object(check_audit, "IN_SCOPE", re.compile("^NOTHING = (1)$")):
             self.assertEqual(
                 ["tools.check_coverage no longer states how many in-scope Playbooks it plans"],
-                check_audit.playbook_errors(self.audit),
+                check_audit.playbook_errors(),
             )
 
 
@@ -689,8 +746,8 @@ class AuditRunTest(AuditCase):
     def test_the_selection_is_every_cited_test_at_its_broadest_citation(self):
         chosen = check_audit.cited_tests(
             [
-                {"evidence": "tests.test_cli.RunCommandTest;gate:tools.check_baseline"},
-                {"evidence": "tests.test_cli.RunCommandTest.test_one;tests.test_ui.ServerTest"},
+                {"verification": "tests.test_cli.RunCommandTest;gate:tools.check_baseline"},
+                {"verification": "tests.test_cli.RunCommandTest.test_one;tests.test_ui.ServerTest"},
             ]
         )
 
@@ -717,6 +774,18 @@ class AuditRunTest(AuditCase):
         self.assertEqual([], errors)
         self.assertIn("unmeasurable 1", report)
 
+    def test_a_stand_down_that_merely_quotes_the_exception_is_still_a_refusal(self):
+        # The carve-out is one sentence, matched whole. A reason that contains it
+        # inside another sentence is a test excusing itself from being measured.
+        errors, report = check_audit.run_errors(
+            ["tests.test_audit.RunnableProbe.test_this_one_borrows_the_sentence_that_excuses_a_skip"],
+            stream=io.StringIO(),
+        )
+
+        self.assertEqual(1, len(errors))
+        self.assertIn("skipped, so it proves nothing", errors[0])
+        self.assertIn("unmeasurable 0", report)
+
     def test_a_citation_that_stood_down_proves_nothing(self):
         errors, _ = check_audit.run_errors(
             ["tests.test_audit.RunnableProbe.test_this_one_stands_down"], stream=io.StringIO()
@@ -734,9 +803,14 @@ class AuditRunTest(AuditCase):
 class AuditGateRunTest(AuditCase):
     """The other half of `--run`: the gates the map cites, run as modules."""
 
+    @staticmethod
+    def cited(verification: str) -> list[check_audit.Citation]:
+        return check_audit.citations({"verification": verification})
+
     def test_a_gate_that_holds_is_evidence_and_the_release_gate_is_deferred(self):
         errors, report = check_audit.gate_errors(
-            ["gate:tools.check_baseline", *check_audit.UNRUN], stream=io.StringIO()
+            self.cited("gate:tools.check_baseline;gate:tools.release_gate"),
+            stream=io.StringIO(),
         )
 
         self.assertEqual([], errors)
@@ -744,8 +818,27 @@ class AuditGateRunTest(AuditCase):
         self.assertIn("deferred 1", report)
 
     def test_a_gate_that_refuses_is_reported_with_its_exit_code(self):
+        # A gate that runs and says no, rather than a name that does not import:
+        # the exit code is the whole of what this mode reads, so the case that
+        # matters is a module which returns one on purpose.
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            (checkout / check_audit.TOOLS).mkdir()
+            (checkout / check_audit.TOOLS / "__init__.py").write_text("", encoding="utf-8")
+            (checkout / check_audit.TOOLS / "check_refuses.py").write_text(
+                "import sys\n\nprint('refused')\nsys.exit(1)\n", encoding="utf-8"
+            )
+            with mock.patch.object(check_audit, "CHECKOUT", checkout):
+                errors, report = check_audit.gate_errors(
+                    self.cited("gate:tools.check_refuses"), stream=io.StringIO()
+                )
+
+        self.assertEqual(["gate:tools.check_refuses: exited 1"], errors)
+        self.assertIn("failed 1", report)
+
+    def test_a_gate_the_checkout_does_not_hold_is_reported_rather_than_skipped(self):
         errors, _ = check_audit.gate_errors(
-            ["gate:tools.check_nothing"], stream=io.StringIO()
+            self.cited("gate:tools.check_nothing"), stream=io.StringIO()
         )
 
         self.assertEqual(["gate:tools.check_nothing: exited 1"], errors)
@@ -754,7 +847,7 @@ class AuditGateRunTest(AuditCase):
         # Named rather than inferred: the release gate builds an install and
         # provisions two databases, and a mode that proves citations resolve is
         # not the place that happens.
-        self.assertEqual(("gate:tools.release_gate",), check_audit.UNRUN)
+        self.assertEqual(("tools.release_gate",), check_audit.UNRUN)
 
 
 if __name__ == "__main__":
