@@ -27,12 +27,12 @@ this table when the two differ.
 | Check | Result |
 | --- | --- |
 | Ticket files | 83, numbered continuously 01–83 |
-| Ticket status | 77 `resolved`, 6 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 475 total, 425 ticked |
-| Blocking edges | 154 exact title-and-number references |
+| Ticket status | 78 `resolved`, 5 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 475 total, 432 ticked |
+| Blocking edges | 158 exact title-and-number references |
 | Dependency graph | Acyclic |
-| Open frontier | 64, 77, 78, 79, 80 -- everything blocking them is resolved |
-| Release reachability | Every ticket except the open 77–80 has a dependency path to ticket 65 |
+| Open frontier | 78, 79, 80 -- everything blocking them is resolved; 64 waits on the three |
+| Release reachability | Every ticket except the open 78–80 has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought |
 | Unticked criteria on resolved tickets | 11, each naming ticket 78 as what closes it |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
@@ -95,10 +95,10 @@ evaluator's proxy route to a loopback fixture is 78's decision to make.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–63, 66–76, 81–83 |
-| Unblocked and open | 64, 77, 78, 79, 80 |
-| Blocked and open | 65, by the final review in 64 |
-| Criteria ticked | 425 of 475 |
+| Resolved | 01–63, 66–77, 81–83 |
+| Unblocked and open | 78, 79, 80 |
+| Blocked and open | 64, by the three research tickets; 65, by the final review in 64 |
+| Criteria ticked | 432 of 475 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
