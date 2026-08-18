@@ -88,10 +88,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from urllib.parse import SplitResult, urljoin, urlsplit
 
-from redkraken import config, identity, migrate, pg, program, scope, seal, tls, vault
+from redkraken import build, config, identity, migrate, pg, program, scope, seal, tls, vault
 from redkraken.outcome import (
     AWAITING_DECISION,
     INTEGRITY_FAILED,
@@ -2923,6 +2924,7 @@ def serve(
     key: seal.Location | None = None,
     contained: bool = False,
     announce: Callable[[str], None] | None = None,
+    build_anchor: Traversable | None = None,
 ) -> Report:
     """Run the fence until it is interrupted.
 
@@ -2942,8 +2944,18 @@ def serve(
     before anything is served on it. The report is written when the listener
     closes, which is far too late to be a readiness signal, and a starter that
     guessed instead would be a race nobody can reproduce.
+
+    Before any of that it verifies its own install: a door serving code that is
+    not the code its build manifest claims writes Receipts it cannot stand
+    behind, so it refuses to listen rather than serve one. `build_anchor` names
+    the package to check and defaults to the installed one; a source checkout has
+    no manifest and passes, which is why the contained door is unaffected.
     """
     ledger = Ledger()
+
+    if not build.record(ledger, build_anchor).ok:
+        return report(SERVE, ledger, endpoint=None, certificate=None)
+
     unbindable = _unbindable(host, contained)
     if unbindable is not None:
         ledger.fail(

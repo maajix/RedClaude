@@ -41,6 +41,16 @@ TARGET_UNREACHABLE = "target_unreachable"
 #: there -- stays `invalid_configuration`, because that one really is a file to
 #: go and fix.
 VAULT_UNREADABLE = "vault_unreadable"
+#: The installed package is not the code its build manifest claims: a module on
+#: disk hashes to something the manifest -- built from a named revision -- did
+#: not record. Its own class because it, like the startup refusal below, is
+#: measured against the running package rather than read out of a file, and
+#: because it names a fault no configuration edit can fix: a door serving code
+#: that is in no commit writes Receipts honest about the request and wrong about
+#: the harness that answered it, so it must refuse to serve rather than report a
+#: readiness it cannot vouch for. An install with no manifest is running from
+#: source and is not this class -- there is nothing to have drifted from.
+BUILD_MISMATCH = "build_mismatch"
 #: The startup assertion refused an agent run: a credential vector was present,
 #: or the effective launch configuration could not be verified. Its own class
 #: because it is the only one here that is measured against a running version
@@ -69,13 +79,17 @@ EXIT_TARGET_UNREACHABLE = 11
 EXIT_AWAITING_DECISION = 12
 EXIT_STARTUP_REFUSED = 13
 EXIT_VAULT_UNREADABLE = 14
+EXIT_BUILD_MISMATCH = 15
 
 #: Reported and exited first-to-last when several classes are observed at once.
 #: An unsupported runtime outranks a missing dependency, which outranks operator
-#: configuration, because the earlier fact explains the later ones. A refused
-#: startup sits between the last two: it is measured on the machine an agent run
-#: would have started on rather than read out of a file, so a configuration that
-#: is otherwise correct neither explains it nor lifts it. The database
+#: configuration, because the earlier fact explains the later ones. Two classes
+#: sit between the last two, both measured against the running harness rather
+#: than read out of a file, so a configuration that is otherwise correct neither
+#: explains nor lifts them: a build that is not the code its manifest claims
+#: comes first -- if the modules on disk are not the ones shipped then every
+#: assertion below it was measured against code no commit vouches for -- and a
+#: refused startup second. The database
 #: classes continue the same order: a connection string that was refused
 #: explains a database nobody reached, an unusable corpus explains a schema that
 #: does not match it, and a schema that does not match explains an invariant
@@ -93,6 +107,7 @@ EXIT_VAULT_UNREADABLE = 14
 PRECEDENCE = (
     (UNSUPPORTED_VERSION, EXIT_UNSUPPORTED_VERSION),
     (MISSING_DEPENDENCY, EXIT_MISSING_DEPENDENCY),
+    (BUILD_MISMATCH, EXIT_BUILD_MISMATCH),
     (STARTUP_REFUSED, EXIT_STARTUP_REFUSED),
     (INVALID_CONFIGURATION, EXIT_INVALID_CONFIGURATION),
     (DATABASE_UNREACHABLE, EXIT_DATABASE_UNREACHABLE),

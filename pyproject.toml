@@ -1,6 +1,12 @@
 [build-system]
 requires = ["setuptools==82.0.1"]
-build-backend = "setuptools.build_meta"
+# A thin in-tree wrapper around setuptools (`build_backend.py`). It purges a
+# stale `build/lib` before every build so the wheel is the working tree, and
+# writes `redkraken/_build.json` -- the revision and per-module digests
+# `rk doctor` verifies the install against. `backend-path` puts the repo root on
+# the build's import path so the frontend can load it.
+build-backend = "build_backend"
+backend-path = ["."]
 
 [project]
 name = "redkraken"
@@ -48,4 +54,7 @@ redkraken = [
     "playbooks/*/references/*",
     "fixtures/*/fixture.md",
     "fixtures/*/app.py",
+    # The build manifest `build_backend.py` writes into the wheel: the revision
+    # and per-module digests `rk doctor` and `rk proxy serve` verify against.
+    "_build.json",
 ]

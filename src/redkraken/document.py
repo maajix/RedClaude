@@ -39,6 +39,10 @@ KEY = re.compile(r"^[a-z][a-z0-9_]*(?:[-:][a-z0-9_]+)*$")
 #: non-empty string that neither begins nor is made of whitespace.
 ENTRY = re.compile(r"^\S.*$")
 
+#: What the interpreter writes beside Python it has compiled. Never part of a
+#: corpus, and skipped by `entries` wherever a corpus is enumerated.
+BYTECODE_DIR = "__pycache__"
+
 
 class DocumentError(Exception):
     """One reason a document does not compile, in the words a test names it by.
@@ -120,6 +124,38 @@ def frontmatter(
     return fields, "\n".join(lines[end + 1:]).strip()
 
 
+def entries(directory: Path) -> list[Path]:
+    """What a corpus directory really holds, in name order, minus compiled bytecode.
+
+    Every corpus here refuses a file nothing declares, and the interpreter writes
+    one into any directory holding Python it has compiled: installing the package
+    byte-compiles the fixture applications and skill scripts it ships. Counting
+    that as a stray would mean a corpus that loads from a checkout and refuses
+    from an install, which is the one place it has to work.
+
+    A *symlink* wearing the name is not skipped. The rule it would slip past is
+    the one that keeps a link into the container's own credentials out of a
+    corpus, and nothing needs a symlinked `__pycache__` to install.
+    """
+    return [
+        entry
+        for entry in sorted(directory.iterdir())
+        if not (entry.name == BYTECODE_DIR and entry.is_dir() and not entry.is_symlink())
+    ]
+
+
+def strays(directory: Path, known: tuple[str, ...]) -> list[str]:
+    """The names in `directory` that `known` does not account for, in name order.
+
+    Every corpus asks this question of its own item directories and the names it
+    reads are the only difference between the three askings, so the walk, the
+    bytecode rule and the ordering live here and the names are the argument. The
+    refusal itself stays with the corpus, because the code and the sentence it
+    raises are that corpus's own.
+    """
+    return sorted(entry.name for entry in entries(directory) if entry.name not in known)
+
+
 def directories(fault: type[DocumentError], root: Path, what: str) -> list[Path]:
     """The corpus directories under `root`, in name order, or the reason there are none.
 
@@ -131,7 +167,7 @@ def directories(fault: type[DocumentError], root: Path, what: str) -> list[Path]
     if not root.is_dir():
         raise fault("corpus_missing", str(root), f"the installed package carries no {what}s")
     found = []
-    for entry in sorted(root.iterdir()):
+    for entry in entries(root):
         if not entry.is_dir() or entry.is_symlink():
             raise fault("stray_file", entry.name, f"the corpus holds {what} directories only")
         found.append(entry)

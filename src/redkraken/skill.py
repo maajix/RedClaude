@@ -315,7 +315,7 @@ def _listing(name: str, directory: Path) -> tuple[str, ...]:
     if not directory.is_dir():
         return ()
     found = []
-    for entry in sorted(directory.iterdir()):
+    for entry in document.entries(directory):
         if not entry.is_file() or entry.is_symlink():
             raise SkillError("stray_file", name, f"{directory.name}/{entry.name} is not a file")
         if not FILE_NAME.match(entry.name):
@@ -366,10 +366,7 @@ def _skill(directory: Path) -> Skill:
     if not isinstance(profile, str) or not PROFILE.match(profile):
         raise SkillError("value_malformed", name, f"{profile!r} is not an evidence profile id")
 
-    stray = sorted(
-        entry.name for entry in directory.iterdir()
-        if entry.name not in (INSTRUCTIONS, SCRIPT_DIR, REFERENCE_DIR)
-    )
+    stray = document.strays(directory, (INSTRUCTIONS, SCRIPT_DIR, REFERENCE_DIR))
     if stray:
         raise SkillError("stray_file", name, f"nothing reads {stray}")
 

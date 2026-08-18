@@ -2,6 +2,8 @@ import unittest
 
 from redkraken import outcome
 from redkraken.outcome import (
+    BUILD_MISMATCH,
+    EXIT_BUILD_MISMATCH,
     EXIT_INVALID_CONFIGURATION,
     EXIT_MISSING_DEPENDENCY,
     EXIT_OK,
@@ -38,6 +40,13 @@ class ExitCodeTest(unittest.TestCase):
         self.assertEqual(
             EXIT_UNSUPPORTED_VERSION,
             outcome.exit_code(found + (violation(UNSUPPORTED_VERSION),)),
+        )
+
+    def test_a_build_mismatch_is_its_own_status_above_operator_configuration(self):
+        self.assertEqual(EXIT_BUILD_MISMATCH, outcome.exit_code((violation(BUILD_MISMATCH),)))
+        self.assertEqual(
+            EXIT_BUILD_MISMATCH,
+            outcome.exit_code((violation(INVALID_CONFIGURATION), violation(BUILD_MISMATCH))),
         )
 
     def test_a_class_this_table_does_not_know_still_exits_non_zero(self):

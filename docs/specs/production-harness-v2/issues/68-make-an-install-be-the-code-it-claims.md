@@ -4,12 +4,19 @@
 
 **Blocked by:** 02 — Boot an installable `rk doctor`.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Installing the working tree ships the working tree, whatever `build/` contains.
-- [ ] `rk doctor` reports the revision the installed package was built from and the digest of the modules it is running.
-- [ ] A build whose manifest does not match the modules on disk is a failed assertion, not a warning.
-- [ ] The failure mode below has a regression test that does not need a git checkout to reproduce.
+**Reading on the How:** all four steps as written, plus one the How did not
+foresee. The wheel and the reader have to walk the tree the same way or the
+manifest is a second opinion rather than a check, so `build_backend.py` puts
+`src/` on its path and calls `redkraken.build.digests` -- the same walk `rk
+doctor` and the door verify with. There is one answer to "what is a shipped
+module", and the manifest cannot disagree with the verification by construction.
+
+- [x] Installing the working tree ships the working tree, whatever `build/` contains. `build_backend.py` removes `build/lib` before delegating to `setuptools.build_meta`; `tests/test_packaging.py::InstallationTest::test_a_stale_staging_directory_does_not_decide_what_ships` stages a poisoned `outcome.py` under `build/lib`, builds a wheel through the backend, and asserts the wheel carries the source bytes.
+- [x] `rk doctor` reports the revision the installed package was built from and the digest of the modules it is running. `doctor.diagnose` carries a `build` block from `build.record`; asserted offline in `tests/test_doctor.py::ReadinessTest::test_the_build_it_is_running_is_reported` and end to end through the installed script in `tests/test_packaging.py::InstallationTest::test_the_installed_command_reports_its_version_and_diagnoses`.
+- [x] A build whose manifest does not match the modules on disk is a failed assertion, not a warning. One `build_mismatch` violation, one assertion name, whichever caller asks: `tests/test_build.py::RecordedAssertionTest`, `tests/test_doctor.py::DistinctOutcomeTest::test_a_build_that_is_not_its_manifest_is_its_own_outcome`, and the door in `tests/test_build.py::ProxyServeBuildTest::test_serve_refuses_to_listen_when_the_install_does_not_match`.
+- [x] The failure mode below has a regression test that does not need a git checkout to reproduce. `InstallationTest.copied()` copies `pyproject.toml`, `README.md`, `build_backend.py` and `src/` and nothing else, so the build under test runs outside a repository and the manifest it writes states `revision: null`. The reader's own cases in `tests/test_build.py::ManifestReadingTest` drive a fabricated `Traversable` and touch neither git nor an install.
 
 ## Why
 
@@ -83,3 +90,40 @@ installation. That is the correct behaviour for a corrupted record and a bad
 outcome for an operator holding a day of real evidence. Whether the answer is a
 purge of the affected Program, a restore, or a witnessed repair verb belongs in
 its own ticket; this one only stops producing the rows.
+
+## What was built
+
+**One walk.** `redkraken/build.py` holds `digests`, which walks a
+`importlib.resources.abc.Traversable` and hashes every `.py` and `.sql` under
+it, skipping `__pycache__`. The anchor is a parameter, so the same function
+serves `resources.files()` in an install, a `pathlib.Path` in the build backend,
+and a tree a test fabricates. `verify` compares that walk against
+`redkraken/_build.json`; `record` writes the result onto a `Ledger` as the
+`build` assertion. `rk doctor` and `rk proxy serve` both call `record`, which is
+why neither states the mismatch wording itself.
+
+**Three states, not two.** No manifest is *source mode*: a checkout running from
+`src/` is not a defective install, so it holds and reports what the tree hashes
+to. A manifest that matches holds and reports the revision. Anything else --
+digest drift, a module the manifest never listed, a manifest that will not parse
+or claims a schema version this build cannot read -- is `build_mismatch`, and the
+door refuses to listen. An unreadable manifest is deliberately not a fourth
+state: an install that cannot say what it is has the same standing as one that
+says the wrong thing.
+
+**The revision is the enclosing repository's or nobody's.** `git rev-parse HEAD`
+answers from whatever repository encloses the working directory, so building an
+unversioned tree nested under one would stamp the wheel with a commit that never
+contained it. `_revision` compares `--show-toplevel` against the backend's own
+root and reports `null` unless they are the same tree.
+
+**Two failures this ticket exposed rather than caused.** `entries()` skipped
+`__pycache__` for the fixture and skill corpora but three callers each wrote
+their own stray-name comparison; that is now `document.strays`. And a
+`.claude/.cc-writes` scratch directory under `src/redkraken/migrations/`, mode
+`0700` and invisible to git because `.gitignore` starts with `.claude/`, was
+bind-mounted into the door container and made `ContainedDoorTest` fail with
+`PermissionError`. Removed.
+
+**Measured:** full suite 2841 tests, `OK (skipped=12)`; baseline, dispositions
+and coverage gates green.

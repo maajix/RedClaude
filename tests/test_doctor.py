@@ -1,3 +1,4 @@
+import hashlib
 import importlib.metadata
 import json
 import sys
@@ -6,6 +7,7 @@ import unittest
 from redkraken import doctor
 from redkraken.doctor import Requirements
 from redkraken.outcome import (
+    EXIT_BUILD_MISMATCH,
     EXIT_INVALID_CONFIGURATION,
     EXIT_MISSING_DEPENDENCY,
     EXIT_OK,
@@ -48,6 +50,14 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(".".join(str(part) for part in sys.version_info[:3]), report["python_version"])
         self.assertEqual(report, json.loads(json.dumps(report)))
 
+    def test_the_build_it_is_running_is_reported(self):
+        report = doctor.diagnose(None).as_dict()
+
+        # The suite runs from a source checkout, so there is no manifest to have
+        # drifted from; doctor still reports what the module tree hashes to.
+        self.assertIs(report["build"]["source"], True)
+        self.assertEqual(64, len(report["build"]["digest"]))
+
     def test_diagnostic_output_carries_hashes_but_no_references(self):
         rendered = json.dumps(doctor.diagnose(write(VALID)).as_dict())
         configuration = json.loads(rendered)["configuration"]
@@ -88,6 +98,25 @@ class DistinctOutcomeTest(unittest.TestCase):
         diagnosis = doctor.diagnose(None, python_version=())
 
         self.assertEqual(EXIT_UNSUPPORTED_VERSION, diagnosis.exit_code)
+
+    def test_a_build_that_is_not_its_manifest_is_its_own_outcome(self):
+        # A fabricated install whose disk has drifted from its manifest: no
+        # wheel and no git checkout, the failure reached through the command.
+        root = scratch()
+        (root / "artifact.py").write_text("print('drift')\n", encoding="utf-8")
+        manifest = {
+            "schema_version": 1,
+            "revision": "b" * 40,
+            "dirty": False,
+            "built_at": "2026-08-17T00:00:00Z",
+            "modules": {"artifact.py": hashlib.sha256(b"print('shipped')\n").hexdigest()},
+        }
+        (root / "_build.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        diagnosis = doctor.diagnose(None, build_anchor=root)
+
+        self.assertEqual(EXIT_BUILD_MISMATCH, diagnosis.exit_code)
+        self.assertEqual(["build:artifact.py"], [item.source for item in diagnosis.violations])
 
     def test_missing_runtime_module_is_its_own_outcome(self):
         diagnosis = doctor.diagnose(

@@ -248,9 +248,7 @@ def _fixture(directory: Path) -> Fixture:
     if missing:
         raise FixtureError("key_missing", name, f"a fixture states {missing}")
 
-    stray = sorted(
-        entry.name for entry in directory.iterdir() if entry.name not in (DOCUMENT, APPLICATION)
-    )
+    stray = document.strays(directory, (DOCUMENT, APPLICATION))
     if stray:
         raise FixtureError("stray_file", name, f"nothing reads {stray}")
 

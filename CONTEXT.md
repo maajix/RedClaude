@@ -819,6 +819,19 @@ CLI's own report. It enforces the subscription-only constraint. It never
 establishes that a request did bill the subscription, which only a receipt can.
 _Avoid_: Guard, preflight, health check, validation
 
+**Build manifest**:
+What an installed harness carries about itself: the revision it was cut from and
+a digest of every module it shipped, written into the wheel by the build backend
+and recomputed against the modules on disk by the install that is running them.
+It is the one manifest outside an evidence bundle, and the qualifier is not
+optional -- a bundle's Manifest indexes evidence, this one indexes code. An
+install carrying none is running from source, which is a state a developer's
+checkout is meant to be in and not a fault. `rk doctor` reports it and the Door
+refuses to listen without it holding, because a Door running code that is in no
+commit writes Receipts that are honest about the request and wrong about the
+harness.
+_Avoid_: Lock file, checksum file, SBOM, build info, version stamp
+
 ## Knowledge
 
 **Skill**:

@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 from redkraken import roster, skill
-from redkraken.document import FENCE
+from redkraken.document import BYTECODE_DIR, FENCE
 from tests.fixtures import frontmatter, scratch
 
 
@@ -254,6 +254,32 @@ class Refusals(unittest.TestCase):
         (scripts / "count.py").write_text(COUNTER)
         refusal = self.refuses("stray_file", root)
         self.assertIn("count.py", refusal.detail)
+
+    def test_compiled_bytecode_beside_a_script_is_the_interpreters_not_a_stray(self):
+        # What `pip install` leaves in every shipped `scripts/` directory. The
+        # corpus has to load from an install, not only from a checkout.
+        root = one(**{"bb:scripts": [
+            {"name": "count.py", "description": "count", "checks": [
+                {"artifacts": [], "stdout": {"count": 0}}]}
+        ]})
+        scripts = root / "a-technique" / skill.SCRIPT_DIR
+        scripts.mkdir()
+        (scripts / "count.py").write_text(COUNTER)
+        cache = scripts / BYTECODE_DIR
+        cache.mkdir()
+        (cache / "count.cpython-314.pyc").write_bytes(b"\x00\x01\x02")
+
+        compiled = skill.compile_corpus(root)
+
+        self.assertEqual(("count.py",), tuple(compiled["a-technique"].scripts))
+
+    def test_a_symbolic_link_wearing_the_bytecode_name_is_still_a_stray(self):
+        root = one()
+        scripts = root / "a-technique" / skill.SCRIPT_DIR
+        scripts.mkdir()
+        (scripts / BYTECODE_DIR).symlink_to(scratch())
+
+        self.refuses("stray_file", root)
 
     def test_a_file_beside_the_instructions_that_nothing_reads_is_refused(self):
         root = one()

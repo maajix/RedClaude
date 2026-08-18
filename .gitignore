@@ -8,3 +8,6 @@ __pycache__/
 build/
 dist/
 .venv/
+# Written into the wheel by build_backend.py during a build and removed after;
+# only ever present mid-build, never committed.
+src/redkraken/_build.json

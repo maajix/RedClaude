@@ -18,7 +18,7 @@ import json
 import unittest
 from pathlib import Path
 
-from redkraken import config, evaluation, fixture, scope
+from redkraken import config, document, evaluation, fixture, scope
 from tests.fixtures import frontmatter, scratch, write
 
 
@@ -195,6 +195,21 @@ class Refusals(unittest.TestCase):
     def test_a_file_nothing_reads_is_refused(self):
         root = one()
         (root / "object-ownership" / "notes.md").write_text("scratch", encoding="utf-8")
+        self.refuses("stray_file", root)
+
+    def test_compiled_bytecode_beside_the_application_is_not_a_stray(self):
+        # `pip install` byte-compiles the application every fixture ships, so
+        # this is in every installed corpus and in no checkout.
+        root = one()
+        cache = root / "object-ownership" / document.BYTECODE_DIR
+        cache.mkdir()
+        (cache / "app.cpython-314.pyc").write_bytes(b"\x00\x01\x02")
+
+        self.assertEqual("object-ownership", compiled(root).name)
+
+    def test_a_symbolic_link_wearing_the_bytecode_name_is_still_a_stray(self):
+        root = one()
+        (root / "object-ownership" / document.BYTECODE_DIR).symlink_to(scratch())
         self.refuses("stray_file", root)
 
     def test_a_corpus_with_nothing_in_it_is_refused(self):

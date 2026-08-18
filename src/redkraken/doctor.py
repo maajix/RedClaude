@@ -13,9 +13,10 @@ import importlib
 import importlib.metadata
 import sys
 from dataclasses import dataclass
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
-from redkraken import __version__, config, outcome
+from redkraken import __version__, build, config, outcome
 from redkraken.outcome import (
     MISSING_DEPENDENCY,
     RESULT_SCHEMA_VERSION,
@@ -63,6 +64,7 @@ class Diagnosis:
 
     application_version: str
     python_version: str
+    build: dict
     assertions: tuple[Assertion, ...]
     configuration: dict | None
     violations: tuple[Violation, ...]
@@ -84,6 +86,7 @@ class Diagnosis:
             "application_version": self.application_version,
             "python_version": self.python_version,
             "supported_python": supported_python(),
+            "build": self.build,
             "assertions": [assertion.as_dict() for assertion in self.assertions],
             "configuration": self.configuration,
             "violations": [violation.as_dict() for violation in self.violations],
@@ -101,17 +104,26 @@ def diagnose(
     *,
     python_version: tuple[int, ...] | None = None,
     requirements: Requirements = REQUIREMENTS,
+    build_anchor: Traversable | None = None,
 ) -> Diagnosis:
     """Report local readiness, and the supplied configuration when there is one.
 
-    The observed interpreter version and the declared requirements are
-    parameters so that the negative outcomes stay reachable from tests without
-    corrupting the running interpreter. Operator commands supply neither.
+    The observed interpreter version, the declared requirements and the package
+    the build assertion reads are parameters so that the negative outcomes stay
+    reachable from tests without corrupting the running interpreter or the
+    installed package. Operator commands supply none of them.
     """
     version = tuple(python_version) if python_version is not None else tuple(sys.version_info[:3])
     ledger = Ledger()
 
     _assert_python(ledger, version)
+    # An install with no manifest is running from source; that holds, and reports
+    # what the tree hashes to. One that matches holds and reports the revision it
+    # was built from. One that does not -- or whose manifest cannot be read -- is
+    # a `build_mismatch`, because a harness running code no commit vouches for
+    # writes Receipts it cannot stand behind. The door asserts the same thing
+    # through the same call, which is why the wording is not written out here.
+    installed = build.record(ledger, build_anchor).as_dict()
     _assert_modules(ledger, requirements.modules)
     _assert_distributions(ledger, requirements.distributions)
     summary = _assert_configuration(ledger, configuration_path)
@@ -119,6 +131,7 @@ def diagnose(
     return Diagnosis(
         application_version=__version__,
         python_version=_version(version),
+        build=installed,
         assertions=tuple(ledger.assertions),
         configuration=summary,
         violations=outcome.ordered(ledger.violations),
