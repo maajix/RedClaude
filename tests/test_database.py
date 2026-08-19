@@ -8759,6 +8759,44 @@ class ProxyEgressTest(DatabaseCase):
                 self.connection.execute("SELECT * FROM find_in_database($1)", (secret,)).rows
             )
 
+    def test_a_hash_another_program_holds_is_not_one_this_agent_may_read(self):
+        # What the door asks before it declines to withhold an authenticated
+        # response, on the real function rather than a stub. The store is one
+        # content-addressed heap for every Program on this host, so a hit in it
+        # is a fact about the disk; reachability is `artifact_references`, and
+        # that table is per Program.
+        content = b"rk2-cross-program-bytes-6d1f"
+        sha, _ = Store(self.root).put(content)
+        self.owner(
+            "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+            " VALUES ($1, $2::bigint, 'text/plain', 'agent_visible')"
+            " ON CONFLICT (sha256) DO NOTHING",
+            (sha, len(content)),
+        )
+        self.owner(
+            "INSERT INTO artifact_references (program_id, sha256, kind)"
+            " VALUES ($1::uuid, $2, 'tool_output')",
+            (self.identifiers["reused-bytes"], sha),
+        )
+        # Not undone on the way out: `reject_mutation_unless_purging` makes an
+        # `artifact_references` row immutable outside a purge, which is the rule
+        # this test relies on holding elsewhere. What it leaves behind is one
+        # agent-visible artifact per Program, with its bytes in the store.
+        capability, _, _ = self.mint("other")
+
+        self.assertFalse(
+            self.fence.reads(self.identifiers["other"], capability, sha),
+            "bytes another Program holds were reported as this one's to read",
+        )
+
+        self.owner(
+            "INSERT INTO artifact_references (program_id, sha256, kind)"
+            " VALUES ($1::uuid, $2, 'tool_output')",
+            (self.identifiers["other"], sha),
+        )
+
+        self.assertTrue(self.fence.reads(self.identifiers["other"], capability, sha))
+
     def test_an_authenticated_fetch_of_bytes_the_agent_already_read_is_recorded(self):
         # The wire view of an authenticated exchange is the target's message
         # unaltered, and that is exactly what an anonymous exchange stores as
@@ -41482,13 +41520,41 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
     def test_the_checks_panel_asks_the_same_function_a_run_asks(self):
         asked = {
             check.name: "yes" if check.ok else "no"
-            for check in integrity.program_checks(self.connection, self.slug)
+            for check in integrity.standing_checks(self.connection, self.slug)
         }
 
         self.assertEqual(
             asked, {name: held for name, held, _ in self.before["checks"]["rows"]}
         )
         self.assertTrue(asked)
+
+    def test_the_checks_panel_is_the_whole_standing_family_and_not_one_row(self):
+        # The registry is what "integrity" means, and exactly one of its checks
+        # is Program-scoped. A panel that asked only for that one would answer
+        # with a single green row while a stale Playbook, an unreachable
+        # Artifact or an overdue validation sat in the rest of the family --
+        # which is silence read as health, and story 205 asks for the opposite.
+        registered = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT name FROM standing_checks WHERE enabled"
+            ).rows
+        }
+        shown = {name for name, _, _ in self.before["checks"]["rows"]}
+
+        self.assertGreater(len(registered), 1)
+        self.assertEqual(len(registered), self.before["checks"]["total"])
+        self.assertLessEqual(shown, registered)
+        # Whatever the console has room for, a check that does not hold is in it:
+        # the read sorts failures first for exactly that reason.
+        self.assertEqual(
+            sorted(name for name, held, _ in self.before["checks"]["rows"] if held == "no"),
+            sorted(
+                check.name
+                for check in integrity.standing_checks(self.connection, self.slug)
+                if not check.ok
+            ),
+        )
 
     def test_the_runs_the_leases_and_the_budgets_are_this_campaigns_own(self):
         self.assertEqual(panels.READY, self.before["agent_runs"]["state"])

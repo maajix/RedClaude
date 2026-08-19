@@ -195,6 +195,23 @@ def program_checks(connection: pg.Connection, slug: str) -> tuple[Check, ...]:
     return tuple(_standing_checks(connection, (slug,), scoped_only=True))
 
 
+def standing_checks(connection: pg.Connection, slug: str) -> tuple[Check, ...]:
+    """The whole standing family, with the Program-scoped ones asked about one.
+
+    What an operator's console shows. `program_checks` is the narrow question a
+    command holding a write open asks; this is the wide one, because a console
+    that answered "integrity" with the single Program-scoped check would report
+    one green row while a stale Playbook, an unreachable Artifact or an overdue
+    validation sat in the sixty-seven it never asked. The corpus-wide rows are
+    committed rows, and reading them from a read-only transaction judges nothing
+    that is halfway written.
+
+    Still not the whole gate: the baseline and role families need a connection
+    that owns the schema, and a console holding one could migrate.
+    """
+    return tuple(_standing_checks(connection, (slug,), scoped_only=False))
+
+
 def verify(
     connection: pg.Connection,
     expected: list[str] | None = None,

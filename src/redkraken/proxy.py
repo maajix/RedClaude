@@ -970,6 +970,12 @@ RESERVE = (
 #: the counters count exchanges rather than attempts.
 RELEASE = "SELECT release_egress_slot($1::uuid, $2)"
 
+#: Whether this Program already holds an agent-visible reference to these bytes.
+#: Asked of the database rather than of the store, because the store is a
+#: content-addressed heap five modules write and a hit in it says the bytes are
+#: on disk, not that this Agent may read them.
+READS = "SELECT program_reads_artifact($1, $2)"
+
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 
 
@@ -1298,6 +1304,20 @@ class Fence:
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
         return as_object(answer)
+
+    def reads(self, program_id: str, capability: str, sha256: str) -> bool:
+        """Whether the Agent of this capability's Program can already read these bytes.
+
+        A refusal is an answer of "no" rather than an exception: this decides
+        whether the door withholds something it is allowed to withhold, and a
+        Program whose capability just lapsed is one the withholding is right for.
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                return bool(self.connection.execute(READS, (capability, sha256)).scalar())
+            except pg.DatabaseError:
+                return False
 
     def open_identity(
         self,
@@ -2536,22 +2556,29 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         if binding is not None:
             binding.changed = binding.session.capture(url, back)
-            if store.holds(digest(wire_received)):
-                # These exact bytes are already an Agent artifact, so some
-                # earlier exchange obtained them without this Identity's
-                # credential and nothing in them can be a reflection of it.
-                # Withholding them would withhold nothing -- the Agent can read
-                # them under the hash it already holds -- and would seal, for a
-                # Program, a ciphertext of that Program's own plaintext.
+            if self.server.fence.reads(
+                authorization.program_id, capability, digest(wire_received)
+            ):
+                # This Program already holds an agent-visible reference to these
+                # exact bytes, so some earlier exchange of its own obtained them
+                # without this Identity's credential and nothing in them can be a
+                # reflection of it. Withholding them would withhold nothing --
+                # the Agent can read them under the hash it already holds -- and
+                # would seal, for a Program, a ciphertext of that Program's own
+                # plaintext.
+                #
+                # Asked of the database and not of the store. The store is a
+                # plain content-addressed heap that five other modules also
+                # write, so a hit in it proves the bytes are on disk and not that
+                # this Agent may read them: bytes filed by another Program, or by
+                # the legacy import, answered "the Agent already has these" about
+                # an Agent that had nothing. `artifact_references` is where
+                # reading is decided, and it is what is asked.
                 #
                 # `response_for_agent` is still applied, and is a no-op whenever
                 # the hit is what the comment above assumes: the unbound path
                 # files the projected view, so bytes filed by it are already
-                # projected and projecting them twice changes nothing. The store
-                # is a plain content-addressed heap that five other modules also
-                # write, and a hit proves only that the bytes are on disk -- not
-                # that this door is what put them there. Where those two differ,
-                # the projection is the answer and the hit is the coincidence.
+                # projected and projecting them twice changes nothing.
                 agent_back, agent_returned, agent_reason = (
                     response_for_agent(back),
                     returned,

@@ -100,14 +100,19 @@ PROGRAM = Read(
     source=FACTS,
 )
 
-#: Whether the Program is sound, asked with the function `rk run` asks it with
-#: and narrowed to this Program. The corpus-wide families are not here: the
-#: roles family reads the role catalogue and the baseline family reads the
-#: server, and `rk db verify` asks both on a connection that owns the schema.
-#: A console holding that connection would be a console that could migrate.
+#: Whether the Program is sound, asked with the function `rk run` asks it with.
+#: The whole standing family, not just the one check the registry flags as
+#: Program-scoped: stale Playbooks, unreachable Artifacts and overdue
+#: validations are checks of their own, and a console that answered "integrity"
+#: with one green row would be reporting silence as health.
+#:
+#: The other two families are not here: the roles family reads the role
+#: catalogue and the baseline family reads the server, and `rk db verify` asks
+#: both on a connection that owns the schema. A console holding that connection
+#: would be a console that could migrate.
 CHECKS = Read(
     name="checks",
-    caption="the standing checks about this Program, as a run asks them",
+    caption="the standing checks, with this Program's own asked about it",
     columns=("check", "holds", "detail"),
     rows="",
     total="",
@@ -619,11 +624,16 @@ def _read(
         rows = _facts(connection, program_id, read)
         return rows, len(rows)
     if read.source == CHECKED:
-        rows = tuple(
-            (check.name, _held(check.ok), check.detail)
-            for check in integrity.program_checks(connection, slug)
+        # Failures first, then by name. A console shows the newest rows of each
+        # kind and this read has no clock, so what "the first twenty" means here
+        # is what an operator opened the page to find out: the checks that do not
+        # hold. The count beside them is the whole family, so a page bounded at
+        # twenty says so rather than implying the rest were asked and passed.
+        checks = sorted(
+            integrity.standing_checks(connection, slug), key=lambda check: (check.ok, check.name)
         )
-        return rows, len(rows)
+        rows = tuple((check.name, _held(check.ok), check.detail) for check in checks)
+        return rows[:limit], len(rows)
     rows = tuple(
         tuple(_text(value) for value in row)
         for row in connection.execute(read.rows, (program_id, limit)).rows

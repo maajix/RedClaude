@@ -569,19 +569,20 @@ def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build
 
 
 def _identity(reader: _Reader, table: dict, source: str) -> dict | None:
-    """Both fields are read before the entry is dropped.
+    """Both fields are read before the entry is dropped, and both are required.
 
     Leaving on a bad name would hide the `slot_ref` violation behind it, and
     that field is the one deciding whether a configuration carries credential
-    material of its own.
+    material of its own. An entry without it is not an identity with no
+    material: `project_identity` stores `str(item["slot_ref"])`, so a missing
+    reference would be written into the state as the four letters `None`.
     """
     name = _name(reader, table, source, SLUG, SLUG.pattern)
     reference = None
-    if "slot_ref" in table:
-        reference = reader.text(
-            table["slot_ref"], f"{source}.slot_ref", _REFERENCE, _REFERENCE_SHAPE
-        )
-    if name is None:
+    raw = reader.required(table, source, "slot_ref")
+    if raw is not None:
+        reference = reader.text(raw, f"{source}.slot_ref", _REFERENCE, _REFERENCE_SHAPE)
+    if name is None or reference is None:
         return None
     return {"name": name, "slot_ref": reference}
 

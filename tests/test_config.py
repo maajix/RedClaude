@@ -379,7 +379,7 @@ class ControlsTest(unittest.TestCase):
             ],
             sorted(violations(
                 VALID
-                + '\n[[identity]]\nname = "member"\n'
+                + '\n[[identity]]\nname = "member"\nslot_ref = "slot://identity/other"\n'
                 + '\n[[required_header]]\nname = "x-bounty-id"\nvalue_ref = "slot://header/other"\n'
             )),
         )
@@ -388,6 +388,17 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(
             [(INVALID_CONFIGURATION, "config:required_header[0].value_ref", "required key is absent")],
             violations(VALID.replace('value_ref = "slot://header/bounty-id"\n', "")),
+        )
+
+    def test_an_identity_must_carry_a_reference(self):
+        """A label with no material is not an identity.
+
+        `project_identity` writes `str(item["slot_ref"])` into the state, so an
+        absent reference would be stored as the four letters `None`.
+        """
+        self.assertEqual(
+            [(INVALID_CONFIGURATION, "config:identity[0].slot_ref", "required key is absent")],
+            violations(VALID.replace('slot_ref = "slot://identity/member"\n', "")),
         )
 
     def test_callback_kind_is_closed(self):

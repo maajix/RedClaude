@@ -209,6 +209,12 @@ class Stub:
         #: would make every test in this file a fixture test.
         self.recorded_fixture: proxy.FixtureAddress | None = None
         self.asked_fixture: list[tuple] = []
+        #: Which hashes this Program already holds an agent-visible reference to,
+        #: and it holds none by default. The door asks before it declines to
+        #: withhold an authenticated response, so a stub that answered yes would
+        #: make every Identity test in this file the collision case.
+        self.readable: set[str] = set()
+        self.asked_reads: list[tuple] = []
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -314,6 +320,16 @@ class Stub:
             raise proxy.Refused("identity slot refused", "the Identity has no provisioned slot")
         self.asserts = (program_id, capability, identity_entity_id, identity_label, root)
         return self.identity
+
+    def reads(self, program_id: str, capability: str, sha256: str) -> bool:
+        """Whether this Program's Agent already holds these bytes by reference.
+
+        The real one asks `artifact_references`, which is per Program; a hit in
+        the content-addressed store is not this question, which is why the door
+        stopped asking the store.
+        """
+        self.asked_reads.append((program_id, capability, sha256))
+        return sha256 in self.readable
 
     def required_headers(
         self, program_id: str, capability: str, root: seal.Root | None
@@ -1558,6 +1574,116 @@ class ExchangeTest(unittest.TestCase):
         self.assertIn(marker.encode(), opened)
         self.assertIn(cookie.encode(), opened)
         self.assertIn(old_cookie.encode(), opened)
+
+    def test_bytes_another_program_filed_are_still_withheld_from_this_agent(self):
+        # The one exception to withholding an authenticated response is that the
+        # Agent can already read these exact bytes. The store cannot answer that:
+        # it is one content-addressed heap for every Program on the host, so bytes
+        # another Program filed sit in it under the same hash. Filed here, and the
+        # fence says this Program holds no reference to them.
+        marker = "rk2-someone-elses-bytes-2b7f14"
+        handler = self.target.RequestHandlerClass
+        prior_headers, prior_answer = handler.response_headers, handler.answer
+        handler.response_headers = (("Set-Cookie", f"session={marker}; HttpOnly"),)
+        handler.answer = f'{{"session":"{marker}"}}'.encode()
+        self.addCleanup(setattr, handler, "response_headers", prior_headers)
+        self.addCleanup(setattr, handler, "answer", prior_answer)
+        self.server.root_secret = seal.Root("test-only-root", b"o" * seal.KEY_BYTES)
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "http://target.example.test/",
+                        "headers": [{"name": "Authorization", "value": f"Bearer {marker}"}],
+                        "cookies": [],
+                    }
+                ],
+            },
+        )
+
+        response = self.through("http://target.example.test/v1/shared-bytes")
+        body = response.read()
+
+        self.assertEqual(b"", body)
+        self.assertNotIn(marker.encode(), body)
+        receipt = self.fence.allowed[0]["receipt"]
+        self.assertNotEqual(receipt["response_agent_sha"], receipt["response_wire_sha"])
+        # And the question was asked of the fence, about the wire bytes, under
+        # the capability this exchange was authorized by.
+        [(program_id, capability, sha256)] = self.fence.asked_reads
+        self.assertEqual((PROGRAM_ID, CAPABILITY), (program_id, capability))
+        self.assertNotEqual(receipt["response_agent_sha"], sha256)
+
+    def test_bytes_this_program_already_holds_are_not_withheld_from_it(self):
+        # The other side of the same question, and the hash it turns on. A
+        # Program that fetched this page anonymously already holds these exact
+        # bytes as an Agent artifact, so the authenticated fetch of them
+        # withholds nothing by handing them over -- and the hash the door asks
+        # about is the one that unbound fetch filed.
+        answer = b'{"public":"no credential produced this"}'
+        handler = self.target.RequestHandlerClass
+        prior_headers, prior_answer = handler.response_headers, handler.answer
+        handler.response_headers = ()
+        handler.answer = answer
+        self.addCleanup(setattr, handler, "response_headers", prior_headers)
+        self.addCleanup(setattr, handler, "answer", prior_answer)
+        # `Date` is the one part of this target's answer that changes between two
+        # requests, and it changes once a second. Left alone, whether the two
+        # exchanges collide would depend on which side of a second boundary they
+        # landed, which is a coin flip and not a test.
+        steady = mock.patch.object(
+            handler, "date_time_string", lambda self, timestamp=None: "Tue, 11 Aug 2026 09:00:00 GMT"
+        )
+        steady.start()
+        self.addCleanup(steady.stop)
+
+        self.through("http://target.example.test/v1/held-bytes").read()
+        anonymous = self.fence.allowed[0]["receipt"]["response_agent_sha"]
+        self.fence.readable.add(anonymous)
+
+        self.server.root_secret = seal.Root("test-only-root", b"h" * seal.KEY_BYTES)
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "http://target.example.test/",
+                        "headers": [{"name": "Authorization", "value": "Bearer held"}],
+                        "cookies": [],
+                    }
+                ],
+            },
+        )
+
+        body = self.through("http://target.example.test/v1/held-bytes").read()
+
+        self.assertEqual([(PROGRAM_ID, CAPABILITY, anonymous)], self.fence.asked_reads)
+        self.assertEqual(answer, body)
 
     def test_an_identity_client_certificate_reaches_only_the_https_connector(self):
         server_authority = tls.authority(scratch() / "mtls-target-authority")
