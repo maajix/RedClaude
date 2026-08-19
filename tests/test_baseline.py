@@ -49,7 +49,7 @@ class BaselineCliTest(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(
-            "baseline ok: classifications=10 regressions=7 artifacts=223\n",
+            "baseline ok: classifications=10 regressions=7 adapters=10 artifacts=223 frozen\n",
             result.stdout,
         )
 
@@ -224,6 +224,88 @@ class BaselineCliTest(unittest.TestCase):
             ["docs/prototype/claim/README.md:3: non-production work claims shipping status"],
             errors,
         )
+
+    def test_a_second_network_client_is_rejected_where_it_appears(self):
+        # Story 221: the alternate path is not opened by a commit that says so,
+        # it is opened by three lines that read as housekeeping.
+        result = run_source(
+            "src/redkraken/collector.py",
+            "import http.client\n\n\ndef fetch(host):\n    return http.client.HTTPConnection(host)\n",
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "src/redkraken/collector.py: reaches http.client outside the approved adapters",
+            result.stderr,
+        )
+
+    def test_a_client_imported_by_name_is_the_same_client(self):
+        result = run_source(
+            "src/redkraken/collector.py",
+            'import importlib\n\n\ndef fetch():\n    return importlib.import_module("socket")\n',
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("reaches socket outside the approved adapters", result.stderr)
+
+    def test_a_receipt_written_from_python_is_rejected(self):
+        result = run_source(
+            "src/redkraken/collector.py",
+            'SAVE = "INSERT INTO receipts (program_id) VALUES ($1)"\n',
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "src/redkraken/collector.py:1: a Receipt is written by the door, not by Python",
+            result.stderr,
+        )
+
+    def test_a_fixture_may_serve_and_may_not_dial(self):
+        listening = run_source(
+            "src/redkraken/fixtures/made-up-pair/app.py",
+            "from http.server import ThreadingHTTPServer\n",
+        )
+        dialling = run_source(
+            "src/redkraken/fixtures/made-up-pair/app.py",
+            "import urllib.request\n",
+        )
+
+        self.assertEqual(0, listening.returncode, listening.stderr)
+        self.assertNotEqual(0, dialling.returncode)
+        self.assertIn(
+            "src/redkraken/fixtures/made-up-pair/app.py: a fixture serves, "
+            "and this one reaches urllib.request",
+            dialling.stderr,
+        )
+
+    def test_an_adapter_that_stopped_speaking_is_delisted_rather_than_kept(self):
+        # An allowlist nobody prunes ends up naming half the tree, and then it
+        # permits rather than bounds.
+        adapters = {"src/redkraken/quiet.py": "nothing, as it turns out"}
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            (repo / "src" / "redkraken").mkdir(parents=True)
+            (repo / "src" / "redkraken" / "quiet.py").write_text("import json\n", encoding="utf-8")
+
+            errors = check_baseline.alternate_path_errors(repo, ["src"], [], adapters)
+
+        self.assertEqual(
+            ["src/redkraken/quiet.py: listed as a network adapter but reaches no wire"], errors
+        )
+
+    def test_an_adapter_the_registry_does_not_hold_is_refused_by_the_registry(self):
+        status = json.loads((ROOT / "baseline" / "status.json").read_text(encoding="utf-8"))
+        for change in (
+            {"src/redkraken/nowhere.py": "a file that is not there"},
+            {"tests/test_baseline.py": "a file outside the production tree"},
+            {"src/redkraken/pg.py": "  "},
+        ):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                registry = Path(temporary) / "status.json"
+                registry.write_text(json.dumps({**status, "network_adapters": change}))
+
+                with self.assertRaises(check_baseline.BaselineError):
+                    check_baseline.read_status(registry)
 
     def test_missing_v1_corpus_fails_without_rewriting_manifest(self):
         before = MANIFEST.read_bytes()

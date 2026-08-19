@@ -1,7 +1,12 @@
 {
   "schema": 1,
   "prototype_root": "docs/prototype",
-  "forbidden_dependency_roots": ["docs", "prototype", ".scratch", "/tmp"],
+  "forbidden_dependency_roots": [
+    "docs",
+    "prototype",
+    ".scratch",
+    "/tmp"
+  ],
   "production_roots": [
     "pyproject.toml",
     "src",
@@ -23,19 +28,27 @@
       "path": "docs/prototype/eval-harness",
       "classification": "falsified_prototype",
       "claim": "Synthetic evaluation behavior with noncanonical Lane values",
-      "regressions": ["RK-REG-007"]
+      "regressions": [
+        "RK-REG-007"
+      ]
     },
     {
       "path": "docs/prototype/schema",
       "classification": "falsified_prototype",
       "claim": "Schema experiments with known Lane-vocabulary and actor-context defects",
-      "regressions": ["RK-REG-004", "RK-REG-007"]
+      "regressions": [
+        "RK-REG-004",
+        "RK-REG-007"
+      ]
     },
     {
       "path": "docs/prototype/scope-proxy",
       "classification": "falsified_prototype",
       "claim": "Proxy experiments with known wire-secrecy and Lane-vocabulary defects",
-      "regressions": ["RK-REG-003", "RK-REG-007"]
+      "regressions": [
+        "RK-REG-003",
+        "RK-REG-007"
+      ]
     },
     {
       "path": "docs/prototype/sdk-auth-probe",
@@ -51,7 +64,12 @@
       "path": "docs/prototype/walking-skeleton",
       "classification": "falsified_prototype",
       "claim": "Composed experiment with proxy, Receipt, process-seam and refusal defects",
-      "regressions": ["RK-REG-001", "RK-REG-002", "RK-REG-005", "RK-REG-006"]
+      "regressions": [
+        "RK-REG-001",
+        "RK-REG-002",
+        "RK-REG-005",
+        "RK-REG-006"
+      ]
     },
     {
       "path": "docs/specs/startup-assertion",
@@ -69,43 +87,76 @@
       "id": "RK-REG-001",
       "area": "proxy",
       "description": "HTTPS could bypass the capability proxy",
-      "required_tickets": [10, 11]
+      "required_tickets": [
+        10,
+        11
+      ]
     },
     {
       "id": "RK-REG-002",
       "area": "receipt_lane",
       "description": "Replay traffic was labeled as agent traffic",
-      "required_tickets": [3, 35]
+      "required_tickets": [
+        3,
+        35
+      ]
     },
     {
       "id": "RK-REG-003",
       "area": "artifact_encryption",
       "description": "Credential-bearing wire material was plaintext",
-      "required_tickets": [7, 43]
+      "required_tickets": [
+        7,
+        43
+      ]
     },
     {
       "id": "RK-REG-004",
       "area": "actor_context",
       "description": "Actor context was session-wide rather than transaction-local",
-      "required_tickets": [3, 4]
+      "required_tickets": [
+        3,
+        4
+      ]
     },
     {
       "id": "RK-REG-005",
       "area": "startup_process_seam",
       "description": "The composed startup proof mocked the claimed process seam",
-      "required_tickets": [16, 17, 20]
+      "required_tickets": [
+        16,
+        17,
+        20
+      ]
     },
     {
       "id": "RK-REG-006",
       "area": "startup_supervisor",
       "description": "Startup refusal did not latch the supervisor",
-      "required_tickets": [17]
+      "required_tickets": [
+        17
+      ]
     },
     {
       "id": "RK-REG-007",
       "area": "lane_vocabulary",
       "description": "Prototype components used control, transport, proxy-internal or runtime-internal as Lane values",
-      "required_tickets": [3, 35]
+      "required_tickets": [
+        3,
+        35
+      ]
     }
-  ]
+  ],
+  "network_adapters": {
+    "src/redkraken/pg.py": "the database wire, spoken on the one socket a command owns",
+    "src/redkraken/proxy.py": "the door: the only place a request of an Agent's leaves this machine",
+    "src/redkraken/tls.py": "the interception material the door presents, and nothing that sends",
+    "src/redkraken/identity.py": "the certificate an Identity pins, installed into the context that will carry it",
+    "src/redkraken/browser_driver.py": "the browser's own socket, and the loopback shim that gives it the door's credentials",
+    "src/redkraken/oob.py": "the out-of-band host a target reaches, and the loopback probe that reads what arrived",
+    "src/redkraken/replay.py": "the replay lane, which re-sends a recorded exchange through the door",
+    "src/redkraken/_launch.py": "the child, which speaks to the model through the door like any other client",
+    "src/redkraken/ui.py": "the operator console, listening on loopback and dialling nothing",
+    "src/redkraken/evaluation.py": "the evaluation's fixture server, which serves the target an evaluation attacks"
+  }
 }

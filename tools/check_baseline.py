@@ -9,11 +9,13 @@ import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tokenize
 import tomllib
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -41,6 +43,45 @@ BASELINE_FILES = {
 #: files and importing the application would make the boundary depend on the thing
 #: it is checking.
 REFERENCE_DIRECTORY = "references"
+#: Every standard-library door onto a socket. Story 221 wants the alternate
+#: path to be impossible to open quietly, and quietly is the operative word: a
+#: second HTTP client is three lines and looks like housekeeping in a diff. The
+#: list is of modules rather than of calls because an import is what a reviewer
+#: and this check can both see, and because `socket.socket` reached through a
+#: local alias is the same wire under a different name. `urllib.parse` and
+#: `http.cookiejar` are absent on purpose: they parse and they store, and
+#: neither opens anything.
+NETWORK_MODULES = frozenset(
+    {
+        "socket",
+        "socketserver",
+        "ssl",
+        "http.client",
+        "http.server",
+        "urllib.request",
+        "ftplib",
+        "imaplib",
+        "poplib",
+        "smtplib",
+        "telnetlib",
+        "xmlrpc.client",
+        "requests",
+        "httpx",
+        "urllib3",
+        "aiohttp",
+    }
+)
+#: The two of those a listener needs. A fixture app serves and never dials, and
+#: this is the difference between the two.
+LISTENER_MODULES = frozenset({"http.server", "socketserver"})
+#: Where the target applications live inside the package.
+FIXTURE_DIRECTORY = "fixtures"
+#: The one statement that files a Receipt, spelled as it would be spelled in
+#: Python. Every Receipt this system has is written by a SQL function the door
+#: calls, which is what makes a Receipt evidence rather than an assertion; a
+#: Python statement writing the row itself would be a Receipt with nothing
+#: behind it, and this is the check that says no.
+RECEIPT_INSERT = re.compile(r"insert\s+into\s+\"?receipts\"?", re.IGNORECASE)
 FIELDS = ("kind", "source", "lines", "sha256")
 EXPECTED_COUNTS = {
     "agent_definition": 11,
@@ -313,6 +354,27 @@ def read_status(path: Path = STATUS) -> dict:
             f"is not covered by the forbidden dependency roots ({', '.join(unguarded)})"
         )
 
+    # Story 221's registry, checked for the two ways an allowlist rots: a path
+    # that is not there any more permits nothing and hides that it permits
+    # nothing, and a path outside the boundary permits something this check
+    # never looks at. What it does not check here is whether each listing is
+    # still reaching a wire -- that needs the file parsed, and belongs with the
+    # parse `alternate_path_errors` already does.
+    adapters = status.get("network_adapters")
+    if not isinstance(adapters, dict) or not adapters:
+        raise BaselineError("status registry needs the network adapters named")
+    scanned = {*production_roots, *paths}
+    for adapter, reason in sorted(adapters.items()):
+        relative = Path(adapter)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise BaselineError(f"unsafe network adapter: {adapter}")
+        if not (CHECKOUT / relative).is_file():
+            raise BaselineError(f"network adapter does not exist: {adapter}")
+        if not any(root in scanned for root in [adapter, *(part.as_posix() for part in relative.parents)]):
+            raise BaselineError(f"network adapter is outside the production tree: {adapter}")
+        if not isinstance(reason, str) or not reason.strip():
+            raise BaselineError(f"network adapter needs the wire it speaks named: {adapter}")
+
     regressions = status.get("regressions", [])
     regression_ids = [entry.get("id") for entry in regressions]
     if len(regression_ids) != len(set(regression_ids)):
@@ -448,13 +510,15 @@ def forbidden_python_dependencies(
     return errors
 
 
-def production_boundary_errors(
-    repo: Path,
-    production_roots: list[str],
-    production_paths: list[str],
-    forbidden_roots: list[str],
-) -> list[str]:
-    errors: list[str] = []
+def production_files(
+    repo: Path, production_roots: list[str], production_paths: list[str]
+) -> Iterator[Path]:
+    """Every path the boundary covers, once each and in a stable order.
+
+    A root and a classified path can name the same tree -- `src` is both -- so
+    the targets are deduplicated before anything is walked; two checks reporting
+    the same file twice would read as two problems.
+    """
     targets = dict.fromkeys([*production_roots, *production_paths])
     for relative_target in targets:
         root = repo / relative_target
@@ -462,49 +526,160 @@ def production_boundary_errors(
             continue
         paths = [root] if root.is_file() or root.is_symlink() else sorted(root.rglob("*"))
         for path in paths:
-            if "__pycache__" in path.parts:
-                continue
-            if path.is_symlink():
-                relative = path.relative_to(repo)
-                errors.append(f"{relative}: forbidden symlink target")
-                continue
-            if not path.is_file():
-                continue
+            if "__pycache__" not in path.parts:
+                yield path
+
+
+def alternate_path_errors(
+    repo: Path,
+    production_roots: list[str],
+    production_paths: list[str],
+    adapters: dict[str, str],
+) -> list[str]:
+    """Story 221: the wire and the Receipt, each written in one place.
+
+    Two rules and one registry. A production module that reaches a socket has to
+    be a module the registry names, so that a second client cannot arrive as a
+    quiet import; and no production module writes a Receipt row, because the
+    Receipt is written by the SQL function the door calls and a row inserted
+    beside it would be evidence of nothing.
+
+    The registry is checked in both directions. A file reaching the wire without
+    a listing is the alternate path this exists to stop, and a listing whose file
+    reaches nothing is the same registry going stale -- an allowlist nobody
+    prunes eventually names half the tree, and then it permits rather than
+    bounds. Both are errors here.
+    """
+    errors: list[str] = []
+    reaching: set[str] = set()
+    present: set[str] = set()
+    for path in production_files(repo, production_roots, production_paths):
+        if path.is_symlink() or not path.is_file() or path.suffix != ".py":
+            continue
+        relative = path.relative_to(repo).as_posix()
+        present.add(relative)
+        try:
+            with tokenize.open(path) as handle:
+                source = handle.read()
+            tree = ast.parse(source, filename=str(path))
+        except (SyntaxError, UnicodeError, OSError):
+            # Unreadable or invalid Python is `production_boundary_errors`'
+            # complaint to make, and making it twice would say the tree has two
+            # problems where it has one.
+            continue
+        for match in RECEIPT_INSERT.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            errors.append(f"{relative}:{line}: a Receipt is written by the door, not by Python")
+        wires = sorted(
+            module
+            for module in imported_modules(tree)
+            if module in NETWORK_MODULES or module.split(".", 1)[0] in NETWORK_MODULES
+        )
+        if not wires:
+            continue
+        if FIXTURE_DIRECTORY in path.relative_to(repo).parts:
+            # A fixture app is the thing being attacked rather than part of the
+            # harness attacking it: it listens, inside containment, and a hundred
+            # of them would drown the registry. What it may not do is dial out,
+            # which is the half of the rule that matters for a target -- one that
+            # can reach the network is one that can be the alternate path.
+            dialling = [module for module in wires if module not in LISTENER_MODULES]
+            if dialling:
+                errors.append(f"{relative}: a fixture serves, and this one reaches {', '.join(dialling)}")
+            continue
+        reaching.add(relative)
+        if relative not in adapters:
+            errors.append(f"{relative}: reaches {', '.join(wires)} outside the approved adapters")
+    # Present and silent, rather than absent: `--repo` may be a tree that holds
+    # a slice of the boundary, and a listing whose file was never scanned has
+    # not gone stale, it just was not read. That the file exists at all is
+    # `read_status`' question, and it asks it of this checkout.
+    for relative in sorted(present & set(adapters) - reaching):
+        errors.append(f"{relative}: listed as a network adapter but reaches no wire")
+    return errors
+
+
+def imported_modules(tree: ast.AST) -> set[str]:
+    """Every module name this source imports, statically or by name.
+
+    The string handed to `importlib.import_module` or `__import__` counts, since
+    an import spelled that way is invisible to a reader of `import` statements
+    and would otherwise be the cheapest way through this check. Only those
+    strings, though: `"requests"` is an English word and `"ssl"` is a setting's
+    value, and a sweep of every constant in the tree reported four modules that
+    import nothing at all.
+    """
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            modules.add(node.module or "")
+        elif isinstance(node, ast.Call) and _imports_by_name(node.func):
+            modules.update(
+                argument.value
+                for argument in node.args
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+            )
+    return modules
+
+
+def _imports_by_name(func: ast.expr) -> bool:
+    """Whether this call is the one that turns a string into a module."""
+    if isinstance(func, ast.Attribute):
+        return func.attr == "import_module"
+    return isinstance(func, ast.Name) and func.id == "__import__"
+
+
+def production_boundary_errors(
+    repo: Path,
+    production_roots: list[str],
+    production_paths: list[str],
+    forbidden_roots: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    for path in production_files(repo, production_roots, production_paths):
+        if path.is_symlink():
             relative = path.relative_to(repo)
-            data = path.read_bytes()
-            first_line = data.splitlines()[0].lower() if data.splitlines() else b""
-            is_python = path.suffix == ".py" or first_line.startswith(b"#!") and b"python" in first_line
-            if is_python:
-                try:
-                    with tokenize.open(path) as handle:
-                        source = handle.read()
-                except (SyntaxError, UnicodeError) as error:
-                    errors.append(f"{relative}: cannot decode Python source: {error}")
-                    continue
-                errors.extend(forbidden_python_dependencies(relative, source, forbidden_roots))
-                continue
+            errors.append(f"{relative}: forbidden symlink target")
+            continue
+        if not path.is_file():
+            continue
+        relative = path.relative_to(repo)
+        data = path.read_bytes()
+        first_line = data.splitlines()[0].lower() if data.splitlines() else b""
+        is_python = path.suffix == ".py" or first_line.startswith(b"#!") and b"python" in first_line
+        if is_python:
             try:
-                source = data.decode("utf-8")
-            except UnicodeDecodeError:
-                errors.append(f"{relative}: non-UTF-8 production file")
+                with tokenize.open(path) as handle:
+                    source = handle.read()
+            except (SyntaxError, UnicodeError) as error:
+                errors.append(f"{relative}: cannot decode Python source: {error}")
                 continue
-            # Markdown ships in the wheel, and one kind of it is prose nobody
-            # executes: a `references/` file is maintainer material, since `Read`
-            # is forbidden to every role and no model can open one. There a bare
-            # word is a word -- "prototype pollution" is a defect class, "the
-            # docs" is a noun -- which is the exemption
-            # `forbidden_python_dependencies` already makes for docstrings.
-            # `SKILL.md` and `playbook.md` do not get it and must not: they are
-            # read by a model, so a bare `/tmp` in one is an instruction to write
-            # where this boundary refuses to go, and only the bare-token sweep
-            # catches a root spelled without a separator.
-            prose = path.suffix == ".md" and path.parent.name == REFERENCE_DIRECTORY
-            for line_number, line in enumerate(source.splitlines(), 1):
-                stripped = line.strip()
-                if not stripped or stripped.startswith(("#", "//", "--")):
-                    continue
-                if forbidden_reference(stripped, forbidden_roots, scan_bare_tokens=not prose):
-                    errors.append(f"{relative}:{line_number}: forbidden tree dependency")
+            errors.extend(forbidden_python_dependencies(relative, source, forbidden_roots))
+            continue
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError:
+            errors.append(f"{relative}: non-UTF-8 production file")
+            continue
+        # Markdown ships in the wheel, and one kind of it is prose nobody
+        # executes: a `references/` file is maintainer material, since `Read`
+        # is forbidden to every role and no model can open one. There a bare
+        # word is a word -- "prototype pollution" is a defect class, "the
+        # docs" is a noun -- which is the exemption
+        # `forbidden_python_dependencies` already makes for docstrings.
+        # `SKILL.md` and `playbook.md` do not get it and must not: they are
+        # read by a model, so a bare `/tmp` in one is an instruction to write
+        # where this boundary refuses to go, and only the bare-token sweep
+        # catches a root spelled without a separator.
+        prose = path.suffix == ".md" and path.parent.name == REFERENCE_DIRECTORY
+        for line_number, line in enumerate(source.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "//", "--")):
+                continue
+            if forbidden_reference(stripped, forbidden_roots, scan_bare_tokens=not prose):
+                errors.append(f"{relative}:{line_number}: forbidden tree dependency")
     return errors
 
 
@@ -585,6 +760,21 @@ def main(argv: list[str] | None = None) -> int:
                 status["forbidden_dependency_roots"],
             )
         )
+        errors.extend(
+            alternate_path_errors(
+                arguments.repo.resolve(),
+                status["production_roots"],
+                production_paths,
+                status["network_adapters"],
+            )
+        )
+        # The census can only be recomputed where the v1 tree is, which is a
+        # checkout this repository does not contain and cannot require: the gate
+        # runs on machines that have never had it. So the comparison stays
+        # optional and the report says which of the two things happened, because
+        # a count printed the same way either way reads as a measurement when
+        # half the time it is a row count of a frozen file.
+        census = "frozen"
         if arguments.v1:
             try:
                 drift = compare_manifest(manifest, collect_v1(arguments.v1.resolve()))
@@ -593,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
             if drift:
                 errors.append("v1 census differs from frozen manifest")
                 errors.extend(drift)
+            census = "recomputed"
         if errors:
             raise BaselineError("\n".join(errors))
     except (BaselineError, OSError) as error:
@@ -603,7 +794,8 @@ def main(argv: list[str] | None = None) -> int:
         "baseline ok: "
         f"classifications={len(status['classifications'])} "
         f"regressions={len(status['regressions'])} "
-        f"artifacts={len(manifest)}"
+        f"adapters={len(status['network_adapters'])} "
+        f"artifacts={len(manifest)} {census}"
     )
     return 0
 
