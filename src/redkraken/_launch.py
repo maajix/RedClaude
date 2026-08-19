@@ -751,6 +751,14 @@ def options_for(
     would be a caller deciding what the roster is for, and the assertion
     checks these fields against the same row this reads them from, so a launch
     that disagreed with the roster would not start.
+
+    `skills` is the roster's grants and `setting_sources` is what it takes to
+    read them: the SDK turns each name into an allowed `Skill(name)` rule, and
+    the CLI finds the instructions behind that name by reading the project
+    location off the working directory -- which `run` staged before this was
+    built. Passed as a list rather than left unset because unset is where the
+    SDK substitutes both its own defaults, and one of them is the operator's
+    home.
     """
     executable = agent.bundled_executable(runtime)
     role = gate.role
@@ -762,7 +770,8 @@ def options_for(
         mcp_servers={agent.SERVER: mcp_server},
         allowed_tools=role.allowed_tools(agent.SERVED),
         hooks=gate_hooks(gate),
-        setting_sources=[],
+        skills=list(role.skills),
+        setting_sources=agent.setting_sources(role),
         permission_mode=agent.PERMISSION_MODE,
         cwd=str(launch),
         env={},
@@ -781,12 +790,13 @@ async def run(
 ) -> dict:
     """Make the launch directory, assert against it, start, corroborate, serve.
 
-    The directory and its settings document come first because they are part of
-    what is asserted: the assertion's questions are "is the working directory
-    the runtime's own" and "what will the CLI load from it", and neither can be
-    asked about a directory that does not exist yet. So a refused launch leaves
-    a directory behind and nothing else -- no transport, no session, no turn.
-    Everything after the assertion is a gate on the step after it.
+    The directory, its settings document and the role's Skills come first
+    because they are part of what is asserted: the assertion's questions are
+    "is the working directory the runtime's own" and "what will the CLI load
+    from it", and neither can be asked about a directory that does not exist
+    yet. So a refused launch leaves a directory behind and nothing else -- no
+    transport, no session, no turn. Everything after the assertion is a gate on
+    the step after it.
 
     `environment`, `runtime` and `transport` are parameters so that a refusal
     can be provoked without provoking the machine that would have to be broken
@@ -800,12 +810,17 @@ async def run(
     """
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
+    role = str(job.get("role") or "")
     launch = agent.launch_directory(str(job["workspace"]), str(job["agent_run_id"]))
     agent.write_settings(launch)
+    # The Skills this role holds, on disk before the options value names them
+    # and before the assertion reads the directory back. A grant staged after
+    # the child started would be a grant the CLI had already finished looking
+    # for.
+    agent.stage_skills(launch, role)
     surface = Surface()
     reader = packet.Reader(packet.Packet.from_dict(dict(job.get("packet") or {})))
     submission = Submission()
-    role = str(job.get("role") or "")
     # Nothing, when the job carried no usable capability block. A run started
     # without one still serves the request tool -- the allowlist is the role's,
     # not the job's -- and the tool answers that it has nothing to spend.

@@ -68,7 +68,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -85,6 +85,13 @@ CORPUS = Path(__file__).resolve().parent / "skills"
 INSTRUCTIONS = "SKILL.md"
 SCRIPT_DIR = "scripts"
 REFERENCE_DIR = "references"
+
+#: Where one launch keeps the instructions its role was granted, relative to
+#: the directory that launch runs in. This is the CLI's own project location:
+#: `agent.setting_sources` opens `project` for a role that loads a Skill and
+#: opens nothing for one that does not, and this directory is what it is opened
+#: for. Relative, because the directory it is under is made per run.
+STAGED = Path(".claude") / "skills"
 
 #: The name a skill answers to, which is its directory's. Narrower than the
 #: `skills.name` column allows on purpose: this is the pattern
@@ -507,6 +514,49 @@ def compile_corpus(root: Path = CORPUS) -> Mapping[str, Skill]:
         skill = _skill(entry)
         compiled[skill.name] = skill
     return MappingProxyType(compiled)
+
+
+def stage(
+    launch: Path | str,
+    names: Sequence[str],
+    corpus: Mapping[str, Skill] | None = None,
+) -> tuple[Path, ...]:
+    """Write the instructions a role was granted where its child will load them.
+
+    A grant is not yet a skill the model can use. `Gate._skill` admits a call
+    by the name the role holds and the CLI answers it by reading a directory,
+    so a grant with no directory behind it is a name the gate lets through and
+    the model then cannot load. This is the step that puts the two in one
+    place, and it writes only the granted names: a child holding the whole
+    corpus would be a child one prompt away from instructions no roster row
+    gave it.
+
+    `SKILL.md` and nothing else. The instructions are what a model loads;
+    `scripts/` is run by the runtime against stored Artifacts rather than by
+    the model against a file, and `references/` is maintainer material this
+    system has no tool to open -- the module docstring says so, and staging
+    either would put files in a child's directory that nothing in its frame can
+    reach. The bytes written are the compiled skill's own `source`, which is
+    what `sha256` digests and what a Task records, so the text a child reads and
+    the digest an installation reports are one object and not two copies.
+
+    `corpus` is a parameter for the reason `compile_corpus`' root is: a test
+    can stage a corpus it wrote. Nothing in the running system passes one.
+    """
+    corpus = SKILLS if corpus is None else corpus
+    root = Path(launch) / STAGED
+    written = []
+    for name in names:
+        one = corpus.get(name)
+        if one is None:
+            raise SkillError("skill_absent", name, "this installation carries no such skill")
+        directory = root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        instructions = directory / INSTRUCTIONS
+        instructions.write_bytes(one.source)
+        instructions.chmod(0o600)
+        written.append(instructions)
+    return tuple(written)
 
 
 #: The compiled corpus, read-only, built at import so a bad corpus is never a

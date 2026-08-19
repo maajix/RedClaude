@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import _startup, capsule as capsule_module, isolation
-from redkraken import packet as packet_module, pg, roster
+from redkraken import packet as packet_module, pg, roster, skill
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -76,6 +76,13 @@ SETTINGS = "settings.json"
 #: And what the runtime writes in it. Empty on purpose -- the file exists to be
 #: the only answer to "which settings loaded", not to configure anything.
 SETTINGS_DOCUMENT: dict[str, dict] = {"env": {}}
+
+#: The one settings *location* a launch ever opens, and only for a role that
+#: loads a Skill. `project` is the directory the child runs in, which is the
+#: launch directory: made by this runtime, written by this runtime, and holding
+#: exactly what `stage_skills` put there. `user` is the operator's own home and
+#: is never opened by anything here.
+PROJECT = "project"
 
 #: The permission bits on everything the runtime creates for one launch.
 PRIVATE = 0o700
@@ -674,6 +681,36 @@ def write_settings(launch: Path) -> Path:
     return settings
 
 
+def setting_sources(role: roster.Role) -> list[str]:
+    """Which of the CLI's settings locations this role's launch opens.
+
+    None for a role that loads no Skill, which is what every launch here opened
+    before there were Skills: an empty list is a CLI reading nothing it was not
+    handed. `project` for a role that does load one, because that is how the
+    CLI finds a skill at all -- it reads the location off the working directory
+    -- and a grant it cannot find is a grant the model cannot use.
+
+    Opening it is not opening the operator's files. The directory is the one
+    `launch_directory` made for this run, private and written only by this
+    runtime, so what `project` names here is what the runtime itself staged.
+    `user` would be the operator's home and is not in the list for any role.
+    """
+    return [PROJECT] if role.skills else []
+
+
+def stage_skills(launch: Path, role: str) -> tuple[Path, ...]:
+    """Put the Skills this role was granted where its child will load them.
+
+    Written from the roster row the options value is built from, so the name
+    the gate admits and the file the CLI reads come from one place. A role
+    this roster does not have stages nothing rather than raising: `assess`
+    refuses an unknown role by name, and failing here first would report a
+    missing directory in place of the missing row that caused it.
+    """
+    granted = roster.ROLES.get(role)
+    return () if granted is None else skill.stage(launch, granted.skills)
+
+
 def assess(
     options: object,
     environment: Mapping[str, str],
@@ -837,9 +874,22 @@ def _option_violations(options: object, launch: Path, role: str) -> list[dict]:
 
     Each one is a containment property rather than a preference: an SDK `env`
     that is not empty can add a watched variable after it was inspected, a
-    setting source that is not empty loads the operator's own files, a sandbox
-    merges settings this runtime did not write, and a working directory that is
-    not the runtime's own is a directory the runtime does not own.
+    sandbox merges settings this runtime did not write, and a working directory
+    that is not the runtime's own is a directory the runtime does not own.
+
+    The settings locations are the same property stated per role. A role that
+    loads no Skill opens none, and a role that loads one opens `project` and
+    only `project`, which is this launch's own directory -- so the widening a
+    Skill grant needs is the narrowest one that lets the CLI read what the
+    runtime staged, and `user` is out of reach either way. Which of the two a
+    launch may be is `setting_sources`' answer and not this function's, because
+    the value asserted and the value built have to come from one place.
+
+    The Skills are the same shape again: the names the options value carries
+    are the roster's grants, and each of them is a file on disk in the
+    directory `project` names. A grant with no file is a name the gate admits
+    and the CLI cannot answer, which is a launch that hands the model a tool
+    call that was always going to fail.
 
     The rest are the roster, restated as a question about this options value.
     They are not asserted because a mismatch would be dangerous by itself --
@@ -860,7 +910,13 @@ def _option_violations(options: object, launch: Path, role: str) -> list[dict]:
     expected = roster.ROLES[role]
     checks = {
         "env": getattr(options, "env", None) == {},
-        "setting_sources": getattr(options, "setting_sources", None) == [],
+        "setting_sources": getattr(options, "setting_sources", None)
+        == setting_sources(expected),
+        "skills": getattr(options, "skills", None) == list(expected.skills),
+        "skills_staged": all(
+            (launch / skill.STAGED / name / skill.INSTRUCTIONS).is_file()
+            for name in expected.skills
+        ),
         "sandbox": getattr(options, "sandbox", "unset") is None,
         "cwd": getattr(options, "cwd", None) == str(launch) and launch.is_dir(),
         "builtin_tools": getattr(options, "tools", None) == expected.visible_tools,

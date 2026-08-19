@@ -15,7 +15,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, isolation, packet, proxy, roster, tls
+from redkraken import _launch, _startup, agent, document, isolation, packet, proxy
+from redkraken import roster, skill, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -47,6 +48,12 @@ NEEDS_CONTAINERS = "set RK_TEST_CONTAINERS=1 to run the contained Agent child"
 #: to start answering before the run that needs it is abandoned.
 UPSTREAM_PORT = 18443
 UPSTREAM_READY = 30.0
+
+#: The role a launch runs as when the subject is Skills. `fixtures.ROLE` holds
+#: none and never will -- the orchestrator may not load instructions -- so a
+#: Skill test cannot use it, and this is the role with the widest grant, which
+#: is the longest list a check reading the whole list can read.
+SKILLED = "web_hunter"
 
 #: The served read the contained child is scripted to call. Any one of the six
 #: would do; this is the one whose arguments are all optional, so the call the
@@ -207,11 +214,18 @@ def options(launch, cli_path: str, role: str = fixtures.ROLE, **overrides):
     Every field the roster decides is read from the roster here too, so a test
     that wants a launch which disagrees with it has to say which field and by
     how much rather than inheriting the disagreement from a literal.
+
+    The Skills are staged as a side effect, because for them the directory is
+    part of the launch being described: `assess` asks whether every granted
+    name is on disk, and a stand-in that named the grants without writing them
+    would be a launch no child could have run.
     """
     compiled = roster.ROLES[role]
+    agent.stage_skills(launch, role)
     fields = {
         "env": {},
-        "setting_sources": [],
+        "skills": list(compiled.skills),
+        "setting_sources": agent.setting_sources(compiled),
         "sandbox": None,
         "cwd": str(launch),
         "tools": compiled.visible_tools,
@@ -291,6 +305,26 @@ class Stream:
 
     async def aclose(self) -> None:
         self.closed += 1
+
+
+def instruction(name: str) -> str:
+    """One line of a skill's own text, long enough to be nobody else's.
+
+    Derived rather than quoted: what it is used for is proving that the
+    instructions reached the model, and a phrase copied into a test goes stale
+    the first time somebody edits the skill. Out of the body and never the
+    frontmatter, because a skill's description is in the system prompt of every
+    session that was *offered* the skill -- a line from there would be carried
+    by a run that loaded nothing. Lines carrying a quote or a backslash are
+    skipped because the thing searched is a JSON document, where both are
+    escaped and neither would match itself.
+    """
+    _, body = document.frontmatter(
+        skill.SkillError, name, skill.INSTRUCTIONS,
+        skill.SKILLS[name].source.decode("utf-8"),
+    )
+    lines = body.splitlines()
+    return max((one for one in lines if '"' not in one and "\\" not in one), key=len)
 
 
 def codes(violations) -> list[str]:
@@ -1477,6 +1511,11 @@ class OptionsTest(unittest.TestCase):
     def built(self, role: str = fixtures.ROLE):
         launch = agent.launch_directory(fixtures.scratch(), "agent-run-1")
         agent.write_settings(launch)
+        # The same three steps `_launch.run` takes before it asserts, in the
+        # same order: a launch whose Skills are not on disk is one the
+        # assertion refuses, so a fixture that skipped this would be testing a
+        # directory no child ever runs in.
+        agent.stage_skills(launch, role)
         runtime = _launch.runtime_facts()
         value = _launch.options_for(
             job(launch.parent, role=role),
@@ -1515,6 +1554,13 @@ class OptionsTest(unittest.TestCase):
                 self.assertEqual(
                     sorted(role.tools.intersection(agent.SERVED)), value.allowed_tools
                 )
+                # The grants, and what it takes to read them. A role that loads
+                # no Skill opens no settings location at all, which is what
+                # every launch here opened before there were Skills.
+                self.assertEqual(list(role.skills), value.skills)
+                self.assertEqual(
+                    ["project"] if role.skills else [], value.setting_sources
+                )
 
     def test_the_gate_is_registered_on_every_event_it_needs(self):
         value, _, _ = self.built()
@@ -1527,6 +1573,65 @@ class OptionsTest(unittest.TestCase):
                 # reach is a gate with a hole shaped like a tool name.
                 self.assertEqual([None], [matcher.matcher for matcher in registered])
                 self.assertTrue(all(matcher.hooks for matcher in registered))
+
+    def test_every_granted_skill_is_on_disk_where_the_cli_will_look_for_it(self):
+        for name, role in roster.ROLES.items():
+            if role.rendered or not role.skills:
+                continue
+            with self.subTest(role=name):
+                _, _, launch = self.built(name)
+                for granted in role.skills:
+                    staged = launch / skill.STAGED / granted / skill.INSTRUCTIONS
+                    self.assertEqual(skill.SKILLS[granted].source, staged.read_bytes())
+
+    def test_a_grant_with_no_instructions_behind_it_is_refused_rather_than_started(self):
+        """A name the gate would admit and the CLI could not answer.
+
+        This is the failure the staging step exists to prevent, so it is
+        provoked by undoing exactly that step and nothing else: the roster
+        still grants the skill, the options value still names it, and the file
+        the CLI reads is gone.
+        """
+        value, runtime, launch = self.built(SKILLED)
+        granted = roster.ROLES[SKILLED].skills[0]
+        (launch / skill.STAGED / granted / skill.INSTRUCTIONS).unlink()
+
+        self.assertIn(
+            "launch:skills_staged",
+            sources(agent.assess(value, {}, runtime, launch_dir=launch,
+                                 role=SKILLED, managed_settings=())),
+        )
+
+    def test_a_launch_naming_a_skill_its_role_was_not_granted_is_refused(self):
+        value, runtime, launch = self.built(SKILLED)
+        ungranted = sorted(set(skill.SKILLS) - set(roster.ROLES[SKILLED].skills))
+        value.skills = sorted([*roster.ROLES[SKILLED].skills, ungranted[0]])
+
+        self.assertIn(
+            "launch:skills",
+            sources(agent.assess(value, {}, runtime, launch_dir=launch,
+                                 role=SKILLED, managed_settings=())),
+        )
+
+    def test_a_launch_that_would_read_the_operators_own_settings_is_refused(self):
+        """`project` is the runtime's own directory. `user` is somebody's home.
+
+        The widening a Skill grant needs is one location and it is the launch
+        directory, so both of the SDK's own defaults are refused here: the pair
+        it substitutes when nothing is set, and the source that is not this
+        runtime's whichever role asks for it.
+        """
+        for opened in (["user", "project"], ["user"], ["local"], None):
+            for role in (fixtures.ROLE, SKILLED):
+                with self.subTest(setting_sources=opened, role=role):
+                    value, runtime, launch = self.built(role)
+                    value.setting_sources = opened
+
+                    self.assertIn(
+                        "launch:setting_sources",
+                        sources(agent.assess(value, {}, runtime, launch_dir=launch,
+                                             role=role, managed_settings=())),
+                    )
 
     def test_a_launch_without_the_gate_is_refused_rather_than_started(self):
         value, runtime, launch = self.built()
@@ -1588,7 +1693,14 @@ class ContainedChildTest(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
     @classmethod
-    def _serve(cls, name: str, network: str, tool: str, arguments: dict | None = None) -> None:
+    def _serve(
+        cls,
+        name: str,
+        network: str,
+        tool: str,
+        arguments: dict | None = None,
+        marker: str = "",
+    ) -> None:
         """Start the model API as a peer, and wait for it to be one.
 
         Parameterised by what the scripted model asks for, because a run whose
@@ -1624,6 +1736,7 @@ class ContainedChildTest(unittest.TestCase):
             AUTHORITY,
             str(UPSTREAM_PORT),
             *((json.dumps(arguments),) if arguments is not None else ()),
+            *((marker,) if marker else ()),
         )
         deadline = time.monotonic() + UPSTREAM_READY
         while time.monotonic() < deadline:
@@ -1633,18 +1746,23 @@ class ContainedChildTest(unittest.TestCase):
         raise AssertionError(docker("logs", name, check=False).stderr)
 
     @contextlib.contextmanager
-    def scripted(self, tool: str, arguments: dict):
-        """A boundary of this test's own, whose model asks for one named call."""
+    def scripted(self, tool: str, arguments: dict, marker: str = ""):
+        """A boundary of this test's own, whose model asks for one named call.
+
+        Yields the boundary and the peer behind it. Both, because what some of
+        these runs assert is what arrived at the far end, and the far end is a
+        container: reading it back means holding its name.
+        """
         suffix = uuid.uuid4().hex[:12]
         network, upstream = f"rk2-canary-{suffix}", f"rk2-canary-upstream-{suffix}"
         docker("network", "create", "--internal", network)
         try:
-            self._serve(upstream, network, tool, arguments)
+            self._serve(upstream, network, tool, arguments, marker)
             yield self.boundary(
                 network=network,
                 proxy_container=upstream,
                 proxy_url=f"http://{upstream}:{UPSTREAM_PORT}",
-            )
+            ), upstream
         finally:
             docker("rm", "--force", upstream, check=False)
             docker("network", "rm", network, check=False)
@@ -1678,10 +1796,26 @@ class ContainedChildTest(unittest.TestCase):
         way to hand a directory to uid 65534 without being root, and it is
         contained anyway: the directory lives under this run's own private
         scratch root, and the credential in it is a literal.
+
+        The credential file is widened for the same reason and by the same
+        rule: `isolation` mounts it in place and refuses a launch whose child
+        could not rewrite it, so a file left at whatever this machine's umask
+        produced is a contained run that never starts here and does start on
+        the next machine.
         """
         home = fixtures.subscription(fixtures.scratch() / "home")
         home.chmod(0o777)
+        (home / ".claude").chmod(0o777)
+        (home / ".claude" / ".credentials.json").chmod(0o666)
         return home
+
+    def carried(self, upstream: str) -> int:
+        """How many requests to that peer carried the line it was watching for."""
+        return sum(
+            1
+            for line in docker("logs", upstream).stdout.splitlines()
+            if fixtures.CARRIED in line
+        )
 
     def requests_seen(self) -> list[tuple[str, str]]:
         """What arrived at the far end, read back across the boundary."""
@@ -1780,7 +1914,7 @@ class ContainedChildTest(unittest.TestCase):
             "prompt": "Explore this workspace.",
             "subagent_type": started,
         }
-        with self.scripted(roster.DELEGATION, delegation) as boundary:
+        with self.scripted(roster.DELEGATION, delegation) as (boundary, _):
             result = agent.agent_run(
                 agent.AgentRunRequest(
                     agent_run_id="agent-run-canary",
@@ -1800,6 +1934,82 @@ class ContainedChildTest(unittest.TestCase):
         # is a refused call inside a live session rather than a session that
         # failed to start -- and no tool was served on the way through.
         self.assertEqual((), result.tools_served)
+        self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
+        self.assertEqual("end_turn", result.stop_reason)
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_a_contained_child_loads_the_skill_its_role_was_granted(self):
+        """The whole join, in a real child: roster grant, staged file, loaded text.
+
+        A grant is four things agreeing -- the roster row, the names in the
+        options value, the directory the launch wrote, and the settings
+        location that makes the CLI read it -- and every one of them can be
+        asserted in-process while the model still gets nothing. So this is
+        asserted where it cannot be faked: the far end reports the skill's own
+        line arriving in a request the child sent up, which it can only do
+        after the CLI found the instructions and put them in the conversation.
+        """
+        granted = roster.ROLES[SKILLED].skills[0]
+        with self.scripted("Skill", {"skill": granted}, instruction(granted)) as (
+            boundary,
+            upstream,
+        ):
+            result = agent.agent_run(
+                agent.AgentRunRequest(
+                    agent_run_id="agent-run-skill",
+                    objective=(
+                        f"Load the {granted} skill, then say "
+                        f"{fixtures.ControlUpstream.SPOKEN}."
+                    ),
+                    container=boundary,
+                    role=SKILLED,
+                    timeout=300.0,
+                )
+            )
+
+            self.assertGreaterEqual(self.carried(upstream), 1)
+
+        # The gate saw the call and admitted it, which is the other half: a run
+        # where nothing was denied and nothing was loaded would look the same
+        # from the outside as one where the hook never fired.
+        self.assertEqual((), result.denials)
+        self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
+        self.assertEqual("end_turn", result.stop_reason)
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_a_child_cannot_load_a_skill_its_role_was_not_granted(self):
+        """The same call under a role that does not hold the name.
+
+        Nothing about the corpus changes -- this installation carries the
+        skill, and another role loads it -- so what refuses is the launch: the
+        role's own row granted it nothing by that name, so nothing by that name
+        was staged, and the CLI answers a name it has no directory for by
+        refusing rather than by reading one. The run finishes anyway, which is
+        what makes the absence of the line evidence rather than a crash.
+        """
+        ungranted = roster.ROLES[SKILLED].skills[0]
+        role = "recon"
+        self.assertNotIn(ungranted, roster.ROLES[role].skills)
+
+        with self.scripted("Skill", {"skill": ungranted}, instruction(ungranted)) as (
+            boundary,
+            upstream,
+        ):
+            result = agent.agent_run(
+                agent.AgentRunRequest(
+                    agent_run_id="agent-run-ungranted",
+                    objective=(
+                        f"Load the {ungranted} skill, then say "
+                        f"{fixtures.ControlUpstream.SPOKEN}."
+                    ),
+                    container=boundary,
+                    role=role,
+                    timeout=300.0,
+                )
+            )
+
+            self.assertEqual(0, self.carried(upstream))
+
         self.assertEqual(fixtures.ControlUpstream.SPOKEN, result.text)
         self.assertEqual("end_turn", result.stop_reason)
 

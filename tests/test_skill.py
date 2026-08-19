@@ -765,5 +765,81 @@ class RefusedByTheRoster(unittest.TestCase):
         roster._check_skills(skill.SKILLS)
 
 
+class Staged(unittest.TestCase):
+    """What a launch directory gets, which is what a child can load.
+
+    A grant in the roster and a file on disk are the two halves of one thing:
+    the CLI answers a `Skill` call by reading a directory, so what these tests
+    hold is that the directory says exactly what the roster granted and nothing
+    else it was never given.
+    """
+
+    def staged(self, *names: str) -> Path:
+        launch = scratch() / "launch"
+        launch.mkdir()
+        skill.stage(launch, names)
+        return launch / skill.STAGED
+
+    def test_a_staged_skill_is_the_bytes_its_digest_names(self):
+        root = self.staged("use-identity")
+        one = skill.SKILLS["use-identity"]
+
+        written = (root / "use-identity" / skill.INSTRUCTIONS).read_bytes()
+        self.assertEqual(one.source, written)
+        self.assertEqual(one.sha256, skill.digest(written))
+
+    def test_only_the_names_that_were_granted_are_written(self):
+        root = self.staged("use-identity", "compare-responses")
+
+        self.assertEqual(
+            ["compare-responses", "use-identity"],
+            sorted(entry.name for entry in root.iterdir()),
+        )
+
+    def test_nothing_a_model_has_no_tool_to_open_is_written(self):
+        # `analyse-source` is the skill that has both, so it is the one that
+        # can show neither is staged: a script is run by the runtime against
+        # stored Artifacts and a reference is maintainer material, and a file
+        # in a child's directory that nothing in its frame can reach is a file
+        # that had no reason to cross the boundary.
+        root = self.staged("analyse-source")
+
+        self.assertTrue(skill.SKILLS["analyse-source"].scripts)
+        self.assertTrue(skill.SKILLS["analyse-source"].references)
+        self.assertEqual(
+            [skill.INSTRUCTIONS],
+            sorted(entry.name for entry in (root / "analyse-source").iterdir()),
+        )
+
+    def test_staging_the_same_grant_twice_leaves_one_copy(self):
+        # A retry re-runs the whole launch. Two copies would be two answers to
+        # what the model read, and a stale one would be the older answer.
+        launch = scratch() / "twice"
+        launch.mkdir()
+        skill.stage(launch, ["use-identity"])
+        skill.stage(launch, ["use-identity"])
+
+        self.assertEqual(
+            [(launch / skill.STAGED / "use-identity" / skill.INSTRUCTIONS)],
+            list((launch / skill.STAGED).rglob("*.md")),
+        )
+
+    def test_a_name_this_installation_does_not_carry_is_refused(self):
+        with self.assertRaises(skill.SkillError) as caught:
+            skill.stage(scratch() / "empty", ["a-technique"])
+
+        self.assertEqual("skill_absent", caught.exception.code)
+
+    def test_a_corpus_a_caller_compiled_is_the_one_that_is_staged(self):
+        compiled = skill.compile_corpus(one())
+        root = scratch() / "elsewhere"
+
+        skill.stage(root, ["a-technique"], compiled)
+        self.assertEqual(
+            compiled["a-technique"].source,
+            (root / skill.STAGED / "a-technique" / skill.INSTRUCTIONS).read_bytes(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

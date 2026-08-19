@@ -14,8 +14,10 @@ back from the log; and the process then does nothing at all, because the run
 under test is the one that ends.
 
 Run as `python -m tests.control_upstream <tool> <authority-dir> <port>
-[arguments-json]`. The last is what the scripted call carries, for the runs
-whose subject is a gate that decides on an argument rather than on a name.
+[arguments-json] [marker]`. The fourth is what the scripted call carries, for
+the runs whose subject is a gate that decides on an argument rather than on a
+name; the fifth is a line the upstream reports having seen in what the child
+sent up, for the runs whose subject is what reached the model.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ def main(argv: list[str]) -> int:
         authority=tls.authority(directory),
         bind=("0.0.0.0", port),
         watch=lambda host, line: print(f"{host}\t{line}", flush=True),
+        marker=argv[5] if len(argv) > 5 else "",
     )
     print(LISTENING, flush=True)
     threading.Event().wait()

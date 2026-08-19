@@ -398,6 +398,12 @@ def tls_counterparty(
     return server, thread, made.certificate
 
 
+#: How the far end reports that a request carried the line it was watching for.
+#: A word of its own, so a supervisor reading the peer's log tells it from the
+#: request lines beside it.
+CARRIED = "carried"
+
+
 class ControlUpstream:
     """The model API, on this machine, answering out of a script.
 
@@ -431,6 +437,7 @@ class ControlUpstream:
         authority: tls.Authority | None = None,
         bind: tuple[str, int] = ("127.0.0.1", 0),
         watch: Callable[[str, str], None] | None = None,
+        marker: str = "",
     ) -> None:
         """The upstream, on loopback by default and anywhere it is asked.
 
@@ -446,9 +453,19 @@ class ControlUpstream:
         tool that takes nothing; a gate that decides on an argument -- which
         role a delegation would start, which skill a call would execute -- can
         only be provoked by a call that has one.
+
+        `marker` is one line the far end watches for in what the child sent up.
+        The request line says a completion was asked for; it does not say what
+        was in the conversation by then, and "the instructions the CLI loaded
+        reached the model" is a claim about exactly that. One line rather than
+        a body because the body is JSON: a newline in it is an escape and would
+        never match itself.
         """
         self.tool = tool
         self.arguments = {} if arguments is None else dict(arguments)
+        self.marker = marker
+        #: How many requests carried it.
+        self.marked = 0
         self.authority = authority or tls.authority(scratch() / "control-authority")
         self.certificate = self.authority.certificate
         #: One entry per request that arrived, as (host, request line).
@@ -512,6 +529,10 @@ class ControlUpstream:
                 self.seen.append((host, line))
                 if self._watch is not None:
                     self._watch(host, line)
+                if self.marker and self.marker.encode("utf-8") in body:
+                    self.marked += 1
+                    if self._watch is not None:
+                        self._watch(host, f"{CARRIED} {self.marker}")
                 if line.startswith("POST /v1/messages"):
                     answer = self._completion(body)
                     kind = b"text/event-stream"
