@@ -13,11 +13,12 @@ reachable only through `playbook_test_verdict` returning `pass` for the exact te
 evaluation run is an Agent run: the fixture listens on loopback, `scope.compile_policy`
 refuses an inclusion naming a loopback address and `authorize_identity_egress_address`
 refuses to dial one, so the work that would grade these eight has no route to the target.
-Ticket 78 is where that route is decided. What did move is the measurement: the corpus is
-now sixteen Playbooks and seventeen fixtures, `playbook_fixture_binding` is total over the
-fixture table, and every one of the eight new fixtures is an out-of-class negative for the
-fifteen Playbooks that do not output its class, so the adversarial half of the arrangement
-exists and is waiting on the runner rather than on authorship.
+Ticket 78 decided that route; ticket 84 grades the corpus over it. What did move is the
+measurement: the corpus is now sixteen Playbooks and seventeen fixtures,
+`playbook_fixture_binding` is total over the fixture table, and every one of the eight new
+fixtures is an out-of-class negative for the fifteen Playbooks that do not output its class,
+so the adversarial half of the arrangement exists and is waiting on the runner rather than
+on authorship.
 
 **Deviation on criterion 2, on the count of names:** the criterion lists seven things to
 tell apart and the vocabulary holds six classes for them. "Federation trust" and "identity
@@ -55,7 +56,7 @@ it.
 - [x] Identity-pairing, response-comparison and flow-mapping capabilities use proxy-side Identity labels without exposing target credentials.
 - [x] Fixtures include positive, secure-control and out-of-class cases for enumeration, session handling, redirect trust and token/identity confusion.
 - [x] Risk effects correctly park credential-changing, session-mutating or third-party-impact actions when grants are absent.
-- [ ] All eight exact hashes pass loadability, selection, grounded positive and adversarial precision gates before stable promotion. **Partial:** loadability and selection hold at the shipped text; the graded halves wait on the route above. Ticket 78 closes it.
+- [ ] All eight exact hashes pass loadability, selection, grounded positive and adversarial precision gates before stable promotion. **Partial:** loadability and selection hold at the shipped text; the graded halves wait on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

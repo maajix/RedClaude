@@ -12,9 +12,9 @@ returning `pass` for the exact text, and an evaluation run is an Agent run: the 
 listens on loopback, `scope.compile_policy` refuses an inclusion naming a loopback address
 and `authorize_identity_egress_address` refuses to dial one, so the work an Agent would do
 has no route to the target that would grade it. `evaluation.py`'s docstring has named that
-seam since 46 and ticket 78 is where the route is decided.
+seam since 46; ticket 78 decided the route and ticket 84 grades the corpus over it.
 
-Two of the seven have a second blocker that ticket 78 does not clear, and the migration
+Two of the seven have a second blocker that ticket 78 did not clear, and the migration
 says so beside the evidence rows rather than here alone. `webhooks` needs a
 `callback_interaction` for a supported claim, and that kind takes `{callback}` provenance
 alone, so a loopback evaluator with no callback channel to register cannot produce one --
@@ -56,7 +56,7 @@ different people, and no schema can make it.
 - [x] Recon-oriented content proposes Surface or Hypotheses through production Mission results and never owns campaign workflow or direct promotion.
 - [x] Each topic has an independently authored relevant positive fixture and participates in meaningful out-of-class adversarial coverage.
 - [x] All seven are loadable by an allowed production role, selectable on matching Surface and absent from non-matching bounded context.
-- [ ] Stable promotion passes the production evaluator for each exact Playbook hash with no ungrounded or off-class claims. **Partial:** all seven are registered, loadable and selected at the text they ship, and their fixtures grade; the graded run needs the real-agent route. Ticket 78 closes it.
+- [ ] Stable promotion passes the production evaluator for each exact Playbook hash with no ungrounded or off-class claims. **Partial:** all seven are registered, loadable and selected at the text they ship, and their fixtures grade; the graded run needs the real-agent route. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

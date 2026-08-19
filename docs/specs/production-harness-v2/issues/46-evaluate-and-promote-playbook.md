@@ -13,14 +13,15 @@ loopback address -- at compile time in `scope.address_refusal` and again at dial
 `authorize_identity_egress_address`. That refusal is what keeps a Program configuration
 from pointing the harness at the machine it runs on, so it was not relaxed for a test.
 A machine with no Agent boundary therefore evaluates end to end and files honest zeroes,
-and the route by which a real Agent reaches a fixture through the door is ticket 78.
+and the route by which a real Agent reaches a fixture through the door is ticket 78's.
+The grading of the corpus over that route is ticket 84's.
 
 - [x] Fixture ground truth and class binding are independent of the Playbook author and include at least one relevant positive and one meaningful out-of-class negative.
 - [x] Each repeat records Playbook hash, fixture hash, selected Skills, grounded canonical claims, true positives, false positives and ungrounded claims.
 - [x] Promotion requires the configured repeated positive result, zero disqualifying ungrounded/off-class claims and runtime provenance for this exact text.
 - [x] A Playbook that always fires, under-declares outputs, lacks a control or is selected only because of its own fixture data fails.
 - [x] Editing, expiry or a later failing verdict demotes the Playbook from stable without deleting historical test runs.
-- [ ] The end-to-end evaluator uses the production Agent, proxy, Test and promotion seams against synthetic fixtures. **Partial:** every seam but the proxy, per the deviation above. Ticket 78 closes it.
+- [ ] The end-to-end evaluator uses the production Agent, proxy, Test and promotion seams against synthetic fixtures. **Partial:** every seam but the proxy, per the deviation above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

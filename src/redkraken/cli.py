@@ -2090,6 +2090,12 @@ def _playbook_evaluate(arguments: argparse.Namespace) -> int:
     them -- `untested` while a fixture in the binding has no run at this text,
     and `fail` once they all do -- rather than from a result invented to fill the
     repeats with.
+
+    The same boundary goes to the evaluator as well as to the work, because it
+    decides where the fixture is served: a child that talks through the door has
+    no route to loopback, so a machine that describes a boundary grades over the
+    door and one that does not grades over loopback. `evaluation.route` is where
+    that reads, and the run says which one it took.
     """
     ledger = Ledger()
     slice_ = _slice(ledger, arguments)
@@ -2104,6 +2110,7 @@ def _playbook_evaluate(arguments: argparse.Namespace) -> int:
             playbook=arguments.playbook,
             fixture_name=arguments.fixture,
             work=_nothing if slice_ is None else slice_.attempt,
+            boundary=None if slice_ is None else slice_.boundary,
         ),
     )
 

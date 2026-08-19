@@ -33,14 +33,32 @@ the Playbook read the target or recited its own class.
 from the rows the two Programs produced. This module reports what it ran; the
 database reports what happened.
 
-One seam is short of production and it is named rather than hidden: the door.
-The fixture listens on loopback, and the door refuses to dial a loopback address
--- `scope.address_refusal` at compile time and `authorize_identity_egress_address`
-at dial time -- which is the rule that keeps a Program configuration from
-pointing the harness at the machine it runs on. So an evaluation whose `work`
-needs the proxy has no route to the fixture today, and one whose `work` does not
-runs end to end and files honest zeroes. Ticket 78 is where that route is
-decided; nothing here should widen what the door will dial in the meantime.
+**There are two routes to the fixture**, and which one a run took is a fact in
+the report rather than a thing to infer from the shape of the numbers.
+
+*loopback*, when no Agent boundary is passed. The fixture listens on 127.0.0.1
+and the caller's `work` talks to it directly. The door has no part in it and
+could not have one: it refuses to dial a loopback address -- `scope.address_refusal`
+at compile time and `authorize_identity_egress_address` at dial time -- which is
+the rule that keeps a Program configuration from pointing the harness at the
+machine it runs on. A `work` that goes through the proxy reaches nothing down
+this route and files honest zeroes, which is what it did before ticket 78 and
+still does on a machine with no container engine.
+
+*door*, when an Agent boundary is passed. The fixture listens on the one address
+this machine answers on from inside that boundary -- `isolation.host_route`, the
+gateway of the door's own routable network, which is private and is not reachable
+from the children's internal network -- and the Program records where it put it
+with `open_fixture_address`. The door dials that address for that Program and
+files ordinary Receipts against it, so a graded run produces the same evidence a
+real engagement produces.
+
+Nothing about what the door will dial was widened to get the second route. The
+fixture address is an address substituted for a host the Program's own policy
+already classes `target`, offered only for a Program in `evaluation_programs`,
+and the
+database refuses to record anything that is not one private host. Both refusals
+named above are untouched, and both still refuse.
 """
 
 from __future__ import annotations
@@ -52,23 +70,41 @@ from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from redkraken import config, fixture, migrate, pg, program
+from redkraken import config, execution, fixture, isolation, migrate, pg, program
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 
 
-__all__ = ["COMMAND", "FACTS", "RUN", "Served", "configuration", "evaluate", "origin", "served"]
+__all__ = [
+    "COMMAND",
+    "FACTS",
+    "RUN",
+    "Route",
+    "Served",
+    "configuration",
+    "evaluate",
+    "origin",
+    "route",
+    "served",
+]
 
 
 COMMAND = "playbook"
 RUN = f"{COMMAND} evaluate"
 
 #: What this command answers on every path, refused or performed.
-FACTS = ("playbook", "fixture", "repeats", "runs", "verdict")
+FACTS = ("playbook", "fixture", "route", "repeats", "runs", "verdict")
 
-#: Loopback and nothing else. A fixture bound to a routable address would be a
-#: synthetic target reachable from off this machine, and the first thing an
-#: evaluation does is point an autonomous agent at it.
+#: Loopback, which is where a fixture listens when nothing has to reach it from
+#: inside a container. A fixture bound to a routable address would be a synthetic
+#: target reachable from off this machine, and the first thing an evaluation does
+#: is point an autonomous agent at it.
 HOST = "127.0.0.1"
+
+#: The two routes, named once. They are the values of the `route` fact and of
+#: `playbook_test_runs.route`, and `check_playbook_tests` reads the second one to
+#: decide whether a run that filed no tool run is a silent zero or a fault.
+LOOPBACK = "loopback"
+DOOR = "door"
 
 #: The domain a fixture is named under in scope, which is not the address it is
 #: bound to. `scope.compile_policy` refuses an inclusion that names a loopback
@@ -87,6 +123,7 @@ DOMAIN = "localhost"
 #: control for that run, not a run of its own.
 PAIR = ("vulnerable", "secure")
 
+OPEN_FIXTURE_ADDRESS = "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)"
 PLAYBOOK = "SELECT id::text, source_sha256 FROM playbooks WHERE path = $1"
 REPEATS = "SELECT required_repeats FROM playbook_test_policy WHERE id = 1"
 MARK = (
@@ -118,15 +155,34 @@ window_seconds = 3600
 
 
 @dataclass(frozen=True, slots=True)
+class Route:
+    """How the Playbook's requests are meant to reach the fixture.
+
+    The name and the address travel together because they are one decision: an
+    evaluation binds where it binds *because* of who has to reach it, and the
+    two halves stored apart is how a run ends up serving on loopback and
+    reporting that it went through the door.
+    """
+
+    name: str
+    host: str
+
+
+@dataclass(frozen=True, slots=True)
 class Served:
     """Where one variant of one fixture is listening.
 
     It does not carry the fixture: `served()` is a context manager around one,
     so every caller already holds the `Fixture` this is about, and a second
     spelling of the name here would be a second thing to keep in step.
+
+    It does carry the host, because on the door route that is not a constant
+    and it is the value the fixture address row is written from. What answered
+    and what was recorded have to be one address or the Receipt is fiction.
     """
 
     variant: str
+    host: str
     port: int
 
 
@@ -161,6 +217,10 @@ class Subject:
     #: between repeats of one measurement.
     work: program.Execute
     corpus: Path
+    #: Decided once for the whole evaluation, not per repeat: two repeats that
+    #: reached the fixture by different routes are not two samples of one
+    #: measurement, whatever the median over them says.
+    route: Route
 
     @property
     def variants(self) -> tuple[str, ...]:
@@ -199,18 +259,33 @@ def origin(one: fixture.Fixture) -> str:
 
 
 @contextlib.contextmanager
-def served(one: fixture.Fixture, variant: str) -> Iterator[Served]:
-    """Serve one variant of one fixture on an ephemeral loopback port."""
+def served(one: fixture.Fixture, variant: str, host: str = HOST) -> Iterator[Served]:
+    """Serve one variant of one fixture on an ephemeral port of one address.
+
+    The address defaults to loopback and is widened by exactly one caller: the
+    door route, which binds on the gateway this machine answers at inside the
+    Agent network so the proxy can dial it. That address is a host address, so
+    what the narrowing buys is bounded: children of the internal network have no
+    route to it, which is the property the door route rests on and what
+    `test_isolation.py` proves. It is one address rather than `0.0.0.0` so that
+    the fixture is not also on every other interface this machine has.
+
+    What is yielded takes the address from the socket rather than from the
+    argument, because a bind that answered somewhere else has to be visible: the
+    fixture address recorded for the door is this address, and the Receipt is
+    pinned to it.
+    """
     handler = _application(one).get("handler")
     if not callable(handler):
         raise fixture.FixtureError(
             "value_malformed", one.name, "app.py does not define handler(variant)"
         )
-    server = ThreadingHTTPServer((HOST, 0), handler(variant))
+    server = ThreadingHTTPServer((host, 0), handler(variant))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield Served(variant=variant, port=server.server_address[1])
+        bound = server.server_address
+        yield Served(variant=variant, host=str(bound[0]), port=int(bound[1]))
     finally:
         server.shutdown()
         server.server_close()
@@ -261,14 +336,56 @@ def configuration(directory: Path, slug: str, one: fixture.Fixture, where: Serve
     return path
 
 
-def _marking(subject: Subject, variant: str) -> program.Execute:
-    """`subject.work`, with the Program marked as an evaluation before it runs.
+def route(ledger: Ledger, boundary: isolation.AgentContainer | None) -> Route | None:
+    """Which route this evaluation takes, and the address it binds the fixture on.
+
+    No boundary is the loopback route and needs nothing of the machine. A
+    boundary is the door route, and the address is asked of the engine rather
+    than configured: the one thing that must be true of it is that the door can
+    reach it, and the door's own network attachment is the only place that fact
+    lives.
+
+    A boundary that is described but cannot be read is a failure, not a quiet
+    fall back to loopback. An operator who described one asked for a run graded
+    through the door, and a loopback run under that name files zeroes that read
+    exactly like a Playbook which found nothing.
+    """
+    if boundary is None:
+        return Route(name=LOOPBACK, host=HOST)
+    try:
+        host = isolation.host_route(
+            isolation.engine_for(boundary.engine), boundary.proxy_container
+        )
+    except isolation.Unavailable as unavailable:
+        ledger.fail(
+            "route",
+            f"an Agent boundary is described, so the fixture has to be served where "
+            f"the door can dial it, and {unavailable}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{execution.PROXY_CONTAINER}",
+        )
+        return None
+    return Route(name=DOOR, host=host)
+
+
+def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execute:
+    """`subject.work`, with the Program prepared to be graded before it runs.
+
+    Two preparations, both inside the wrapper: the Program is marked as an
+    evaluation, and on the door route the address its fixture is listening at is
+    recorded. Neither can follow the work.
 
     Wrapping rather than marking afterwards, and the order is the whole reason:
     the marker is what excludes this Program from `playbook_promotion_evidence`,
     so a Program that ran first and was marked second would spend the interval as
     ordinary runtime evidence. A crash in between would leave it that way for
     good, which is criterion 4's last clause arriving by accident.
+
+    The fixture address is written in the same wrapper and for the same reason
+    one step on: on the door route the work's first request is what has to find
+    the fixture, so the address has to be recorded before the work starts. It is
+    written after the marker rather than before it because the database will
+    only accept it for a Program that is already an evaluation.
     """
 
     def execute(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
@@ -291,6 +408,32 @@ def _marking(subject: Subject, variant: str) -> program.Execute:
             f"{program_id} grades {subject.fixture.name} ({variant}) and "
             "contributes no promotion evidence",
         )
+        if subject.route.name == DOOR:
+            try:
+                connection.execute(
+                    OPEN_FIXTURE_ADDRESS,
+                    (program_id, "http", origin(subject.fixture), where.port, where.host),
+                )
+            except pg.DatabaseError as error:
+                # The database holds every rule about what a fixture address
+                # may be -- one private host, a Program that is an evaluation,
+                # a host and port this Program's own policy already classes
+                # `target`. Its refusal is the message worth reporting; a
+                # second opinion here would be a second place for the rule to
+                # drift.
+                ledger.fail(
+                    "fixture_address",
+                    f"the fixture for {subject.fixture.name} ({variant}) is served at "
+                    f"{where.host}:{where.port} and the database would not record it: {error}",
+                    code=INVALID_CONFIGURATION,
+                    source="function:open_fixture_address",
+                )
+                return {}
+            ledger.hold(
+                "fixture_address",
+                f"{origin(subject.fixture)}:{where.port} is dialled at {where.host} "
+                f"for {program_id}",
+            )
         return subject.work(ledger, connection, program_id)
 
     return execute
@@ -305,6 +448,7 @@ def evaluate(
     work: program.Execute,
     corpus: Path = migrate.CORPUS,
     fixtures: Mapping[str, fixture.Fixture] | None = None,
+    boundary: isolation.AgentContainer | None = None,
 ) -> Report:
     """Run one Playbook against one fixture for the configured repeats, and file each.
 
@@ -317,6 +461,7 @@ def evaluate(
     answers: dict[str, object] = {
         "playbook": playbook,
         "fixture": fixture_name,
+        "route": None,
         "repeats": 0,
         "runs": [],
         "verdict": None,
@@ -347,6 +492,15 @@ def evaluate(
         if ledger.violations:
             return report(RUN, ledger, **answers)
 
+        taken = route(ledger, boundary)
+        if taken is None:
+            return report(RUN, ledger, **answers)
+        answers["route"] = taken.name
+        ledger.hold(
+            "route",
+            f"the fixture is served at {taken.host} and reached over the {taken.name} route",
+        )
+
         rows = connection.execute(PLAYBOOK, (playbook,)).rows
         if not rows:
             ledger.fail(
@@ -363,6 +517,7 @@ def evaluate(
             fixture=one,
             work=work,
             corpus=corpus,
+            route=taken,
         )
 
         repeats = int(str(connection.execute(REPEATS).scalar()))
@@ -429,10 +584,10 @@ def _repeat(
     """One repeat: every variant opened and worked, then counted."""
     programs: dict[str, str] = {}
     for variant in subject.variants:
-        with served(subject.fixture, variant) as where:
+        with served(subject.fixture, variant, subject.route.host) as where:
             path = configuration(workspace, subject.slug(variant, index), subject.fixture, where)
             result = program.run(
-                settings, path, corpus=subject.corpus, execute=_marking(subject, variant)
+                settings, path, corpus=subject.corpus, execute=_graded_work(subject, variant, where)
             )
         ledger.assertions.extend(result.assertions)
         if result.violations or not result.facts.get("program_id"):

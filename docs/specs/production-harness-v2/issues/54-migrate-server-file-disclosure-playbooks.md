@@ -11,11 +11,11 @@ arrangement exists and is total; the evaluation that would grade it has not run,
 from this ticket. All seven ship `draft`. `stable` is reachable only through
 `playbook_test_verdict` returning `pass` for the exact text, and an evaluation run is an Agent
 run against a fixture listening on loopback, which `scope.compile_policy` and
-`authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided.
-What moved is the measurement: the corpus is forty-two Playbooks and forty-three fixtures,
-`playbook_fixture_binding` is still total over the fixture table, and each of the seven new
-fixtures is an out-of-class negative for the forty-one Playbooks that do not output its class.
-The half of the criterion that is about selection is checked and holds:
+`authorize_identity_egress_address` both refuse. Ticket 78 decided that route; ticket 84 grades
+the corpus over it. What moved is the measurement: the corpus is forty-two Playbooks and forty-
+three fixtures, `playbook_fixture_binding` is still total over the fixture table, and each of
+the seven new fixtures is an out-of-class negative for the forty-one Playbooks that do not
+output its class. The half of the criterion that is about selection is checked and holds:
 `PlaybookCorpusSelectionTest` is diagonal across all forty-two subjects, and every one of the
 seven is loadable by exactly one production role.
 
@@ -36,7 +36,7 @@ upload interpretation, document parsing and server-side request behaviour -- lan
 - [x] SSRF and URL-routing evidence uses configured callback or controlled local targets and cannot authorize adjacent-host discovery or third-party contact.
 - [x] File and deserialization tests declare mutation, cleanup and execution ceilings before any higher-risk action.
 - [x] Fixtures include secure normalization, harmless error, decoy secret and non-fetching URL controls.
-- [ ] All seven exact hashes pass loadability, relevant positive recall and adversarial precision gates before stable promotion. **Partial:** loadability holds and the fixtures grade offline; the production gates wait on the route above. Ticket 78 closes it.
+- [ ] All seven exact hashes pass loadability, relevant positive recall and adversarial precision gates before stable promotion. **Partial:** loadability holds and the fixtures grade offline; the production gates wait on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

@@ -11,11 +11,11 @@ arrangement exists and is total; the evaluation that would grade it has not run,
 run from this ticket. All four ship `draft`. `stable` is reachable only through
 `playbook_test_verdict` returning `pass` for the exact text, and an evaluation run is an
 Agent run against a fixture listening on loopback, which `scope.compile_policy` and
-`authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided.
-What moved is the measurement: the corpus is twenty Playbooks and twenty-one fixtures,
-`playbook_fixture_binding` is still total over the fixture table, and each of the four new
-fixtures is an out-of-class negative for the nineteen Playbooks that do not output its
-class.
+`authorize_identity_egress_address` both refuse. Ticket 78 decided that route; ticket 84
+grades the corpus over it. What moved is the measurement: the corpus is twenty Playbooks
+and twenty-one fixtures, `playbook_fixture_binding` is still total over the fixture table,
+and each of the four new fixtures is an out-of-class negative for the nineteen Playbooks
+that do not output its class.
 
 **Deviation on criterion 1, on which classes the four Playbooks output:** the ticket names
 object ownership and function access, and neither is available. `authorization.object_ownership`
@@ -34,7 +34,7 @@ other two are the ticket's own words: `payment-workflows` outputs
 - [x] Business-logic and payment tests state their invariant, pristine baseline, allowed mutation and cleanup before execution.
 - [x] Race-condition fixtures require a sequential control and prove the broken invariant rather than treating timing alone as the Finding.
 - [x] Routing and verb behavior remains within configured scope and cannot expand to arbitrary host or availability testing.
-- [ ] All four exact hashes pass relevant positive and adversarial false-positive evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 closes it.
+- [ ] All four exact hashes pass relevant positive and adversarial false-positive evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

@@ -18,7 +18,8 @@ the one that is right.
 ## Structural validation
 
 Re-measured 2026-08-18, after tickets 76–80 were raised by implementation reviews
-and research, and 81–83 by authorised live validation, all triaged into the graph.
+and research, 81–83 by authorised live validation, and 84 by ticket 78 building
+the route eleven deferred criteria were waiting on, all triaged into the graph.
 The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
 the audit gate parses. Numbers written here are a snapshot of that reading on the
 date above, not a second source for it -- re-run the gate rather than trusting
@@ -26,14 +27,14 @@ this table when the two differ.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 83, numbered continuously 01–83 |
-| Ticket status | 78 `resolved`, 5 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 475 total, 432 ticked |
+| Ticket files | 84, numbered continuously 01–84 |
+| Ticket status | 79 `resolved`, 5 `ready-for-agent`, 0 untriaged |
+| Acceptance criteria | 481 total, 437 ticked |
 | Blocking edges | 158 exact title-and-number references |
 | Dependency graph | Acyclic |
-| Open frontier | 78, 79, 80 -- everything blocking them is resolved; 64 waits on the three |
-| Release reachability | Every ticket except the open 78–80 has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought |
-| Unticked criteria on resolved tickets | 11, each naming ticket 78 as what closes it |
+| Open frontier | 79, 80, 84 -- everything blocking them is resolved; 64 waits on the first two |
+| Release reachability | Every ticket except the open 79, 80 and 84 has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought |
+| Unticked criteria on resolved tickets | 11, each naming ticket 84, which grades the corpus over the route 78 built |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
 Ticket 66 was added after the original 01–65 plan froze, so it did not inherit
@@ -42,8 +43,8 @@ restored it. Tickets 67–76 and 81–83 spent longer in that position: raised b
 the plan while it ran, resolved green, and named by nothing downstream, so they
 were finished work the release did not rest on. Ticket 63's fourth reading is
 what made that visible and refuses it, and ticket 64 now lists all thirteen,
-which is also what its own first criterion asks for. The four that remain outside
-the graph -- 77, 78, 79 and 80 -- are outside it because they are open: the
+which is also what its own first criterion asks for. The three that remain outside
+the graph -- 79, 80 and 84 -- are outside it because they are open: the
 reading is about work that is finished and attached to nothing.
 
 Tickets 71–73 are drift the ticket-18 review found between the compiled roster
@@ -79,26 +80,27 @@ their check drained ahead of the cascade that answers it, and `interception_cas`
 was not reached by the purge at all, so a Program that had minted a CA could not
 be purged by any statement the schema permits.
 
-Tickets 76 through 83 are research and follow-up work rather than plan coverage:
+Tickets 76 through 84 are research and follow-up work rather than plan coverage:
 76 through 78 from implementation reviews, 79 to mine public disclosures for
 techniques the corpus lacks, 80 to measure the documented multiagent failure
 modes against this roster, and 81 through 83 from authorised live validation
 against a real target -- a Program whose stored ceilings contradict each other
 and could not be repaired, the door having no shipped way to run as the Agent
 network's one peer, and no way to reach a claimed Task through that surface. 76
-and 81 through 83 are resolved and now hang off ticket 64. 77 through 80 are
-open, and 78 is the one the rest of the plan is waiting on: eleven criteria
-across tickets 46 and 49 through 57 are ticked nowhere because the production
-evaluator's proxy route to a loopback fixture is 78's decision to make.
+through 78 and 81 through 83 are resolved and now hang off ticket 64, and 79, 80
+and 84 are open. Ticket 84 is what the eleven criteria across tickets 46 and 49
+through 57 now name: 78 built the route from the Agent to a fixture through the
+door and graded one Playbook over it, so what is left is the corpus's own graded
+runs, which cost a real Agent run apiece and can come back `fail`.
 
 ## Implementation progress
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–63, 66–77, 81–83 |
-| Unblocked and open | 78, 79, 80 |
-| Blocked and open | 64, by the three research tickets; 65, by the final review in 64 |
-| Criteria ticked | 432 of 475 |
+| Resolved | 01–63, 66–78, 81–83 |
+| Unblocked and open | 79, 80, 84 |
+| Blocked and open | 64, by the two research tickets; 65, by the final review in 64 |
+| Criteria ticked | 437 of 481 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and

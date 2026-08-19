@@ -84,7 +84,7 @@ import ssl
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -121,6 +121,7 @@ __all__ = [
     "Answer",
     "Authorization",
     "Control",
+    "FixtureAddress",
     "Fence",
     "IdentityBinding",
     "Refused",
@@ -414,6 +415,20 @@ class Authorization:
     scope_class: str
     identity_entity_id: str | None = None
     identity_label: str | None = None
+
+
+@dataclass(frozen=True)
+class FixtureAddress:
+    """Where an evaluation put the fixture it is grading, as the database said.
+
+    Two fields rather than one, because the class is the database's answer and
+    not this process's opinion of it. A door that filled in `fixture` for itself
+    would be describing its own behaviour on a row an auditor reads as a
+    description of the policy.
+    """
+
+    address: str
+    scope_class: str
 
 
 @dataclass(frozen=True)
@@ -864,6 +879,21 @@ AUTHORIZE_ADDRESS = (
     "  FROM authorize_identity_egress_address($1, $2, $3, $4::integer, $5)"
 )
 
+#: The question that comes before both of those, and almost always answers
+#: nothing. An evaluation serves its fixture on one of this machine's own private
+#: addresses and records where it put it; every other request there is has no such
+#: row, and the two decisions above are the whole of what decides it. It is asked
+#: before the name is resolved because that is the point -- an evaluation's target
+#: is scoped as `<fixture>.localhost`, and a lookup would answer 127.0.0.1 and be
+#: refused one line later, correctly and uselessly. The cost is one round trip on
+#: every request, which is the price of the answer coming from the database: a
+#: door that decided for itself which targets are synthetic could call anything
+#: one.
+FIXTURE_ADDRESS = (
+    "SELECT address, scope_class"
+    "  FROM authorize_fixture_address($1, $2, $3, $4::integer)"
+)
+
 #: What that function says when the capability, rather than the address, is what
 #: it refused. Matched as a string because it arrives as one: both refusals carry
 #: `23514`, so the code separates them from a constraint violation and this
@@ -1033,6 +1063,38 @@ class Fence:
             identity_entity_id=str(identity_id) if identity_id is not None else None,
             identity_label=str(identity_label) if identity_label is not None else None,
         )
+
+    def fixture_address(
+        self, program_id: str, capability: str, request: scope.Request
+    ) -> FixtureAddress | None:
+        """Where this Program's fixture is, if this Program is an evaluation.
+
+        Nothing is the ordinary answer and means "resolve the name like any
+        other": the row exists only for a Program that `rk playbook evaluate`
+        opened and only for the one host and port it served a fixture at. What
+        comes back instead of nothing is an address on this machine's own
+        private network, which is where the evaluator bound the fixture so that
+        the door can reach it and the children on the internal network cannot.
+
+        Refusals arrive here the way they arrive at `authorize_address`, because
+        the function asks the same questions for the same reason: this is asked
+        after the name was decided and before anything is dialled, so the
+        capability, the Identity lease and the Program's coverage of the host are
+        all re-read here, and a lease that lapsed in between opens no socket down
+        either route.
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                rows = self.connection.execute(
+                    FIXTURE_ADDRESS,
+                    (capability, request.protocol, request.host, request.port),
+                ).rows
+            except pg.DatabaseError as error:
+                raise _refusal(error, request.host) from error
+        if not rows:
+            return None
+        return FixtureAddress(address=str(rows[0][0]), scope_class=str(rows[0][1]))
 
     def authorize_address(
         self, program_id: str, capability: str, request: scope.Request, address: str
@@ -1945,7 +2007,9 @@ class Handler(BaseHTTPRequestHandler):
         self.slot = slot.id
         try:
             try:
-                addresses = self._pin(authorization, control.capability, request)
+                authorization, addresses = self._pin(
+                    authorization, control.capability, request
+                )
             except Refused as refusal:
                 # Its own block, because by here there is an `authorization` and
                 # the record has to say so. A request refused for its address was
@@ -2119,8 +2183,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _pin(
         self, authorization: Authorization, capability: str, request: scope.Request
-    ) -> tuple[str, ...]:
+    ) -> tuple[Authorization, tuple[str, ...]]:
         """Turn the authorized name into the address that will be dialled.
+
+        A synthetic target first, because it is the one destination whose address
+        is not a property of the name. `rk playbook evaluate` serves a fixture on
+        one of this machine's own private addresses and records where it put it;
+        the name it is scoped under -- `<fixture>.localhost` -- resolves to
+        loopback, which the two steps below would refuse, correctly. So the
+        database is asked for the endpoint before anything is looked up, and
+        when there is one the request is dialled at it and nothing is resolved.
+        The class comes back with the address, and the authorization carries it
+        onward, so the Receipt says the request was allowed as a fixture and pins
+        the address a socket was actually opened to. Everything else in the door
+        is unchanged: a Program with no endpoint takes the three steps below, and
+        no configuration file can produce one.
 
         Three steps in one order, and the order is the point. The name is
         resolved -- which happens here and not earlier, because a lookup is a
@@ -2134,19 +2211,31 @@ class Handler(BaseHTTPRequestHandler):
         right, so a Program that withdrew a network has withdrawn it however the
         request spelled its way there.
 
-        What comes back is every address, not the one that was chosen. The
-        Receipt names them all: an auditor asking why a name was refused needs to
-        see what it answered with, and an auditor reading an allowed exchange
-        needs to see that the other answers were checked too. Only the first is
-        put to the policy, because only the first is dialled -- the rest are held
-        to being routable and to being recorded, and a Program that withdrew one
-        of them has withdrawn a machine this request never contacted.
+        What comes back from those three steps is every address, not the one
+        that was chosen. The Receipt names them all: an auditor asking why a name
+        was refused needs to see what it answered with, and an auditor reading an
+        allowed exchange needs to see that the other answers were checked too.
+        Only the first is put to the policy, because only the first is dialled --
+        the rest are held to being routable and to being recorded, and a Program
+        that withdrew one of them has withdrawn a machine this request never
+        contacted. The fixture branch above comes back with one address because
+        one is all there was: nothing was resolved, so there are no other answers
+        to hold to anything.
         """
+        fixture = self.server.fence.fixture_address(
+            authorization.program_id, capability, request
+        )
+        if fixture is not None:
+            return (
+                replace(authorization, scope_class=fixture.scope_class),
+                (fixture.address,),
+            )
+
         addresses = destination(request.host, request.port, self.server.resolver)
         self.server.fence.authorize_address(
             authorization.program_id, capability, request, addresses[0]
         )
-        return addresses
+        return authorization, addresses
 
     def _exchange(
         self,

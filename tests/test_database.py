@@ -140,6 +140,7 @@ from tests.fixtures import (
     VALID,
     WITHDRAWN,
     Target,
+    address,
     boundary,
     contained_url,
     counterparty,
@@ -37037,7 +37038,7 @@ class PlaybookEvaluationTest(DatabaseCase):
     def arrange(cls, fixture_id: str, variant: str) -> dict[str, str]:
         """The marker, the subject, and the chain one claim has to hang from.
 
-        The marker is written first for the reason `evaluation._marking` writes
+        The marker is written first for the reason `evaluation._graded_work` writes
         it before the work: a Program that ran first and was marked second spent
         the interval contributing promotion evidence.
 
@@ -38059,6 +38060,355 @@ class PlaybookEvaluationTest(DatabaseCase):
             self.problems(),
         )
 
+    # -- PH2-78: the door route, and what may be recorded to reach it ----------
+
+    #: The shape `isolation.host_route` answers with: one private address this
+    #: machine holds on the door's own network. Nothing is dialled in this
+    #: class -- what these cases are about is which addresses the schema will
+    #: record and hand back at all.
+    FIXTURE_ADDRESS = "10.9.0.7"
+
+    #: A capability, as its holder spells it. The token in the database is the
+    #: digest of this, which is why a test can mint one at all: nothing here
+    #: needs the door, only a Tool run holding the hash of a text it knows.
+    CAPABILITY = "selftest-fixture-capability"
+
+    def open_endpoint(self, program: str, **overrides) -> None:
+        """`open_fixture_address` as the evaluator calls it, one field changed."""
+        stated = {
+            "protocol": "http",
+            "host": HOST,
+            "port": 80,
+            "address": self.FIXTURE_ADDRESS,
+        } | overrides
+        self.connection.execute(
+            "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)",
+            (program, stated["protocol"], stated["host"], stated["port"], stated["address"]),
+        )
+
+    def recorded(self) -> list[tuple[str, ...]]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT protocol, host, port::text, host(address) FROM fixture_addresses"
+                " ORDER BY program_id"
+            ).rows
+        ]
+
+    def test_an_endpoint_is_recorded_for_a_host_the_program_already_targets(self):
+        # The whole of what a fixture address may say: the target this Program was
+        # already opened against, at an address on this machine. Everything
+        # narrower than the policy, nothing wider.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+
+            self.assertEqual([("http", HOST, "80", self.FIXTURE_ADDRESS)], self.recorded())
+
+    def test_an_endpoint_is_refused_for_everything_but_one_private_host(self):
+        # Criterion 3 as a table. `scope.compile_policy` and
+        # `authorize_identity_egress_address` are untouched by this ticket, and
+        # this is the reason they can be: a fixture address cannot name a loopback, a
+        # link-local, a documentation or any other routable address, so there is
+        # no Program configuration that points the door at 127.0.0.1 through it.
+        for address in (
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "93.184.216.34",
+            "2001:db8::1",
+            # A range rather than a host: a whole /24 would be a fixture address the
+            # door could read as any of 256 machines.
+            "10.9.0.0/24",
+        ):
+            with self.subTest(address=address), self.scratch():
+                self.assertIn(
+                    "fixture_addresses_address_is_one_private_host",
+                    self.refusal_in_place(
+                        "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3)",
+                        (self.programs[self.OWN, "vulnerable"], HOST, address),
+                    ),
+                )
+
+    def test_an_endpoint_is_refused_when_it_breaks_a_rule_that_names_itself(self):
+        # Each refusal says which rule it broke, because a fixture address that cannot
+        # be recorded is an evaluation that will grade nothing, and "refused" on
+        # its own sends whoever reads it to the wrong file.
+        program = self.programs[self.OWN, "vulnerable"]
+        for name, arguments, expected in (
+            (
+                "protocol",
+                (program, "https", HOST, 80, self.FIXTURE_ADDRESS),
+                "a fixture is served over http, not https",
+            ),
+            (
+                "port",
+                (program, "http", HOST, 0, self.FIXTURE_ADDRESS),
+                "a fixture address states no port in 1-65535",
+            ),
+            (
+                "address",
+                (program, "http", HOST, 80, "not-an-address"),
+                "a fixture address states no address: not-an-address",
+            ),
+            (
+                "host",
+                (program, "http", "elsewhere.example.net", 80, self.FIXTURE_ADDRESS),
+                "does not class elsewhere.example.net:80 as a target",
+            ),
+        ):
+            with self.subTest(rule=name), self.scratch():
+                self.assertIn(
+                    expected,
+                    self.refusal_in_place(
+                        "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)",
+                        arguments,
+                    ),
+                )
+
+    def test_a_program_that_grades_nothing_gets_no_endpoint(self):
+        # The fixture address is the harness's arrangement for measuring a Playbook. A
+        # Program nobody marked as an evaluation is a Program whose Receipts
+        # count as evidence, and an address substituted under one of those would
+        # be a real engagement dialling somewhere it was never pointed.
+        with self.scratch():
+            self.connection.execute(
+                "DELETE FROM evaluation_programs WHERE program_id = $1::uuid",
+                (self.programs[self.OWN, "vulnerable"],),
+            )
+
+            self.assertIn(
+                "is not marked as an evaluation",
+                self.refusal_in_place(
+                    "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3)",
+                    (self.programs[self.OWN, "vulnerable"], HOST, self.FIXTURE_ADDRESS),
+                ),
+            )
+
+    def as_the_door(self, program: str) -> str:
+        """Mint one live capability against this Program and ask as the door asks.
+
+        Assumes an open `scratch()`. The Tool run is inserted rather than
+        authorised through the gate because what is under test is the answer the
+        door gets for a capability that resolves, and the gate's own decision is
+        tested where the gate is.
+
+        The role stays the owner's. `authorize_fixture_address` is a SECURITY
+        DEFINER function whose answer does not depend on who called it -- who
+        may call it at all is a grant, asserted where the other grants are --
+        and a case that switched to `rk2_proxy` would need a second connection
+        and a committed fixture address to say the same thing.
+        """
+        run = str(
+            self.connection.execute(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session', 'operator',"
+                " 'low', '{}'::jsonb) RETURNING id::text",
+                (program,),
+            ).scalar()
+        )
+        self.connection.execute(
+            "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
+            " decision, egress_token_sha256, egress_token_expires_at)"
+            " VALUES ($1::uuid, $2::uuid, 'mcp__rk2__net_request', '{}'::jsonb, 'running',"
+            " 'runtime', 'allow', encode(digest($3, 'sha256'), 'hex'),"
+            " clock_timestamp() + interval '1 hour')",
+            (program, run, self.CAPABILITY),
+        )
+        # Session-local rather than session-wide, so the binding dies with the
+        # transaction this case is rolled back with. `resolve_egress_capability`
+        # reads it: a capability resolves in the Program the caller is bound to
+        # and in no other, which is what keeps one door's answer out of another
+        # Program's fixture addresses.
+        self.connection.execute("SELECT set_config('rk2.program_id', $1, true)", (program,))
+        return self.CAPABILITY
+
+    def asked_as_the_door(self, capability: str, host: str = HOST, port: int = 80) -> list[tuple]:
+        return [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT address, scope_class FROM authorize_fixture_address($1, 'http',"
+                " $2, $3::integer)",
+                (capability, host, port),
+            ).rows
+        ]
+
+    def test_the_door_is_answered_with_the_address_and_the_class_together(self):
+        # Criterion 2's first half. The class is the database's answer rather
+        # than the door's opinion, because the door writes it onto a Receipt an
+        # auditor reads as the policy's decision about the request.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            capability = self.as_the_door(self.programs[self.OWN, "vulnerable"])
+
+            self.assertEqual(
+                [(self.FIXTURE_ADDRESS, "fixture")], self.asked_as_the_door(capability)
+            )
+
+    def test_the_door_is_answered_with_nothing_for_anything_else(self):
+        # No row is the ordinary answer: every request against a real target
+        # gets it, and the door falls through to resolving the name. A refusal
+        # here would make a fixture address a thing every other request has
+        # to be checked against.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            capability = self.as_the_door(self.programs[self.OWN, "vulnerable"])
+
+            self.assertEqual([], self.asked_as_the_door(capability, port=8080))
+            self.assertEqual([], self.asked_as_the_door(capability, host="app.example.net"))
+
+    def test_a_capability_that_does_not_resolve_is_not_told_where_the_fixture_is(self):
+        # The same fence as the decision beside it. This is the last question
+        # before a socket, so a lease that lapsed between the name and the
+        # address opens nothing down this route either.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            self.as_the_door(self.programs[self.OWN, "vulnerable"])
+
+            self.assertIn(
+                "egress capability refused",
+                self.refusal_in_place(
+                    "SELECT address FROM authorize_fixture_address($1, 'http', $2, 80)",
+                    ("not-the-capability", HOST),
+                ),
+            )
+
+    def test_an_identity_lease_that_lapsed_is_not_told_where_the_fixture_is(self):
+        # The other route reaches this check through
+        # `authorize_identity_egress_address`, and a route that skipped it would
+        # be a way to dial with a lease that had been released. The Tool run
+        # selects an Identity; nothing holds one; the fixture address is not
+        # answered with.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            capability = self.as_the_door(self.programs[self.OWN, "vulnerable"])
+            self.connection.execute(
+                "UPDATE tool_runs SET args = '{\"identity_slot\": \"shopper\"}'::jsonb"
+                " WHERE egress_token_sha256 = encode(digest($1, 'sha256'), 'hex')",
+                (capability,),
+            )
+
+            self.assertIn(
+                "Identity lease refused",
+                self.refusal_in_place(
+                    "SELECT address FROM authorize_fixture_address($1, 'http', $2, 80)",
+                    (capability, HOST),
+                ),
+            )
+
+    def test_a_target_withdrawn_after_the_address_was_recorded_is_refused(self):
+        # A recorded address is where a target is dialled, not a standing
+        # permission to dial it. The address was opened against a scope that
+        # classed this host `target`; the Program is recompiled to one that does
+        # not, and the door is refused rather than told where the fixture is.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            capability = self.as_the_door(self.programs[self.OWN, "vulnerable"])
+            program = self.programs[self.OWN, "vulnerable"]
+            # A recompile, spelled the way the schema insists on: a scope change
+            # is a new version and never an edit, so the withdrawal is a version
+            # with no rules under it rather than a deletion from the one the
+            # address was opened against.
+            self.connection.execute(
+                "INSERT INTO program_scope_versions (program_id, version, policy,"
+                " policy_sha256, reason) SELECT $1::uuid, scope_version + 1, '{}'::jsonb,"
+                " encode(digest('{}', 'sha256'), 'hex'), 'selftest withdrawal'"
+                " FROM programs WHERE id = $1::uuid",
+                (program,),
+            )
+            self.connection.execute(
+                "UPDATE programs SET scope_version = scope_version + 1 WHERE id = $1::uuid",
+                (program,),
+            )
+
+            self.assertIn(
+                f"no longer classes {HOST}:80 as a target",
+                self.refusal_in_place(
+                    "SELECT address FROM authorize_fixture_address($1, 'http', $2, 80)",
+                    (capability, HOST),
+                ),
+            )
+
+    def test_a_run_is_filed_with_the_route_its_program_took(self):
+        # Derived at filing from the vulnerable Program's fixture address, so the value
+        # on the row is the arrangement that was in force rather than something
+        # the evaluator claimed about itself.
+        with self.scratch():
+            self.open_endpoint(self.programs[self.OWN, "vulnerable"])
+            behind_the_door = self.file(self.OWN)
+            over_loopback = self.file(self.OUT)
+
+            self.assertEqual(
+                [("door",), ("loopback",)],
+                [
+                    tuple(str(field) for field in row)
+                    for row in self.connection.execute(
+                        "SELECT route FROM playbook_test_runs WHERE id IN ($1::uuid, $2::uuid)"
+                        " ORDER BY route",
+                        (behind_the_door, over_loopback),
+                    ).rows
+                ],
+            )
+
+    def test_a_run_behind_the_door_that_reached_nothing_is_a_reported_problem(self):
+        # Criterion 4. A filed run with no Tool run at all is a Playbook graded
+        # against a fixture nothing ever asked anything of, and behind the door
+        # that cannot be what the Playbook found: the door is how a request is
+        # made, so no Tool run means no request was attempted. Loopback keeps
+        # its silence, because a machine with no Agent boundary files exactly
+        # this shape on purpose and files it honestly.
+        with self.scratch():
+            self.connection.execute("SET LOCAL app.purging = 'on'")
+            for variant in ("vulnerable", "secure"):
+                program = self.programs[self.OUT, variant]
+                self.connection.execute(
+                    "DELETE FROM receipts WHERE program_id = $1::uuid", (program,)
+                )
+                self.connection.execute(
+                    "DELETE FROM tool_runs WHERE program_id = $1::uuid", (program,)
+                )
+            self.open_endpoint(self.programs[self.OUT, "vulnerable"])
+
+            silent = self.file(self.OUT)
+            repeat = str(
+                self.connection.execute(
+                    "SELECT repeat_index::text FROM playbook_test_runs WHERE id = $1::uuid",
+                    (silent,),
+                ).scalar()
+            )
+
+            self.assertIn(
+                (
+                    "error",
+                    "test_run_reached_nothing",
+                    f"{self.SHIPPED} on {self.OUT} repeat {repeat} ran behind the door"
+                    " and filed no tool run",
+                ),
+                self.problems(),
+            )
+
+    def test_a_run_on_loopback_that_reached_nothing_is_not_a_problem(self):
+        # The control for the case above, and the reason the arm reads `route`
+        # rather than the count alone: the same zero on the loopback route is a
+        # machine with no Agent boundary, which is a configuration and not a
+        # fault.
+        with self.scratch():
+            self.connection.execute("SET LOCAL app.purging = 'on'")
+            for variant in ("vulnerable", "secure"):
+                program = self.programs[self.OUT, variant]
+                self.connection.execute(
+                    "DELETE FROM receipts WHERE program_id = $1::uuid", (program,)
+                )
+                self.connection.execute(
+                    "DELETE FROM tool_runs WHERE program_id = $1::uuid", (program,)
+                )
+
+            self.file(self.OUT)
+
+            self.assertEqual(
+                [],
+                [item for item in self.problems() if item[1] == "test_run_reached_nothing"],
+            )
+
 
 class PlaybookEvaluationCommandTest(DatabaseCase):
     """PH2-46 criterion 6: `rk playbook evaluate` against this database.
@@ -38084,8 +38434,9 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
     Two things this deliberately does not do. It does not go through the door,
     because the fixture is on loopback and the door refuses loopback: what an
     evaluation through the proxy needs is a fixture the door's network can
-    reach, which is ticket 31's container shape and not this ticket's. And it
-    grades two fixtures rather than the whole corpus, because what is under test
+    reach, which is `ContainedEvaluationTest` below, on the container shape
+    ticket 78 gave it. And it grades two fixtures rather than the whole corpus,
+    because what is under test
     is the command rather than the catalogue: the binding is total and grows
     with every ticket that ships a fixture, so a class that evaluated all of it
     would re-measure the rule the class above already measures, at one Program
@@ -38178,7 +38529,7 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         """What one open Program does here: read the marker, then ask the target.
 
         Both halves matter. Reading the marker inside the work is what proves
-        `_marking` wrote it BEFORE the work rather than after -- there is no
+        `_graded_work` wrote it BEFORE the work rather than after -- there is no
         other moment from which that ordering is observable. Asking the target
         through the port in this Program's own compiled scope is what proves the
         Program was opened against the fixture that is listening, rather than
@@ -38288,7 +38639,7 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
     # -- what the work saw -----------------------------------------------------
 
     def test_the_program_was_marked_as_an_evaluation_before_the_work_ran(self):
-        # Read from inside the work, so this is the ordering `_marking` promises
+        # Read from inside the work, so this is the ordering `_graded_work` promises
         # and not the state afterwards. A Program worked before it was marked
         # would spend that interval as ordinary promotion evidence.
         self.assertEqual(12, len(self.attempts))
@@ -38532,7 +38883,7 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         self.assertEqual(before, self.opened())
 
     def test_a_program_that_already_grades_something_else_is_not_re_pointed(self):
-        # `_marking`'s other arm, which a resumed Program reaches: the marker is
+        # `_graded_work`'s other arm, which a resumed Program reaches: the marker is
         # left alone and the work does not run, because the rows of a Program
         # already counted as one fixture's evidence cannot also be another's.
         attempted = []
@@ -38543,14 +38894,18 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
             fixture=fixture.FIXTURES[self.OUT],
             work=lambda ledger, connection, program_id: attempted.append(program_id) or {},
             corpus=migrate.CORPUS,
+            route=evaluation.Route(name=evaluation.LOOPBACK, host=evaluation.HOST),
         )
         already = self.reports[self.OWN].facts["runs"][0]["programs"]["vulnerable"]
+        where = evaluation.Served(variant="vulnerable", host=evaluation.HOST, port=44321)
         ledger = Ledger()
         try:
             with self.connection.transaction():
                 self.connection.execute("SET LOCAL ROLE rk2_owner")
                 self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                evaluation._marking(subject, "vulnerable")(ledger, self.connection, already)
+                evaluation._graded_work(subject, "vulnerable", where)(
+                    ledger, self.connection, already
+                )
                 raise Rollback
         except Rollback:
             pass
@@ -38562,6 +38917,444 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         self.assertIn(
             f"already grades {self.OWN} (vulnerable)", ledger.violations[0].detail
         )
+
+    # -- the boundary the command was given ------------------------------------
+
+    def test_the_command_hands_this_machine_s_boundary_to_the_evaluator(self):
+        """The door route is reached from the command, not only from a call.
+
+        `ContainedEvaluationTest` below grades through a door that exists, by
+        handing `evaluation.evaluate` a boundary directly. What that cannot show
+        is the step in front of it: that `rk playbook evaluate` builds the
+        boundary out of this machine's environment and gives it to the evaluator
+        as well as to the work. This is that step, measured at the one place it
+        is observable without starting an Agent -- a boundary naming a door that
+        does not exist, whose route therefore cannot be read.
+
+        A command that dropped the boundary would take the loopback route and
+        report `route: loopback` with no violation at all, so the refusal is the
+        evidence. Nothing is written on either answer: the route is resolved
+        before the first Program is opened.
+        """
+        absent = f"rk2-no-such-door-{uuid.uuid4().hex[:12]}"
+        before = self.opened()
+
+        answered = self.rk(
+            "playbook", "evaluate",
+            "--url", role_url(self.harness.runtime),
+            "--state-url", role_url(self.harness.state),
+            "--playbook", self.SHIPPED,
+            "--fixture", self.OWN,
+            "--workspace", str(self.workspace),
+            **{
+                execution.IMAGE: AGENT_IMAGE,
+                execution.NETWORK: absent,
+                execution.PROXY_CONTAINER: absent,
+                execution.PROXY_URL: f"http://{absent}:18080",
+                execution.CERTIFICATE: str(self.workspace / "authority.pem"),
+            },
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, answered["exit_code"], answered)
+        self.assertIsNone(answered["route"])
+        self.assertEqual(
+            [("invalid_configuration", f"environment:{execution.PROXY_CONTAINER}")],
+            [(item["code"], item["source"]) for item in answered["violations"]],
+        )
+        self.assertIn(absent, answered["violations"][0]["detail"])
+        self.assertEqual(before, self.opened())
+
+    def rk(self, *arguments: str, **environment: str) -> dict:
+        """One shipped command as an operator runs it, and its report read.
+
+        A subprocess rather than a call into `cli`, because a call would read
+        this process's own variables and what is under test is what the command
+        makes of the variables it is given.
+        """
+        result = subprocess.run(
+            [sys.executable, "-m", "redkraken", *arguments],
+            cwd=str(ROOT),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(ROOT / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                **environment,
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertTrue(result.stdout, result.stderr)
+        return json.loads(result.stdout)
+
+
+@unittest.skipUnless(CONTAINERS, CONTAINER_REASON)
+class ContainedEvaluationTest(DatabaseCase):
+    """PH2-78 criterion 1: one Playbook graded through the door that ships.
+
+    `PlaybookEvaluationCommandTest` above grades the same Playbook on loopback
+    and says why it stops there: the fixture listens on an address the door
+    refuses, so an evaluation through the proxy needs a fixture the door's own
+    network can reach. This is that evaluation. `rk proxy door` starts the
+    container, `evaluation.evaluate` is handed the boundary it left behind, and
+    each Program's request is `proxy.send` -- the function `rk proxy request`
+    calls -- so the capability is minted by `authorize_tool_run`, spent at the
+    production fence in the shipped container, and answered with a Receipt.
+
+    Nothing here chooses the address the fixture binds on. `evaluation.route`
+    reads it off the door's one routable attachment, which is the gateway of
+    this class's egress network: the address this machine answers on for the
+    door and for nothing on the internal Agent network. The Program records it
+    when it opens, and the fence hands it back when the door asks where the
+    target is.
+
+    What arrives at the fixture is an unauthenticated GET, so both variants
+    answer 401. That is deliberate: what this class measures is where the bytes
+    went, and a 401 carrying the fixture application's own body is the fixture
+    answering rather than the door. Which of the pair discriminates is the class
+    above's question, and it asks it with the session cookie the probe needs.
+
+    Every Program, run, Receipt and artifact it writes is purged at the end,
+    because both classes above assert exact counts over this same Playbook.
+    """
+
+    settings_for = "migrate"
+
+    #: Fixed for the reason `door.main` gives, and one above `ContainedDoorTest`
+    #: so a leaked container from either class cannot be mistaken for this one's.
+    PORT = 18082
+
+    SHIPPED = "playbooks/object-ownership/playbook.md"
+    FIXTURE = "object-ownership-pair"
+
+    #: A route the fixture serves and an answer neither variant needs a session
+    #: to give. `/notes/2` exists in both halves of the pair, so a 404 here would
+    #: mean the request reached something that is not this fixture.
+    PATH = "/notes/2"
+    UNAUTHENTICATED = 401
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", AGENT_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(f"the local Agent test image is absent: {AGENT_IMAGE}")
+        super().setUpClass()
+
+        suffix = uuid.uuid4().hex[:12]
+        cls.container = f"rk2-graded-{suffix}"
+        cls.network = f"rk2-graded-agent-{suffix}"
+        cls.egress = f"rk2-graded-egress-{suffix}"
+        cls.networks = (cls.network, cls.egress)
+        cls.home = scratch() / f"graded-{suffix}"
+        cls.store = cls.home / "store"
+        cls.authority = cls.home / "authority"
+        for directory in (cls.store, cls.authority):
+            directory.mkdir(parents=True)
+            # The door runs as nobody and writes both of these.
+            directory.chmod(0o777)
+        cls.workspace = scratch()
+        #: One entry per Program, in the order the Programs ran: the slug, and
+        #: what `proxy.send` answered for it. Collected here because the
+        #: evaluator reports what it filed rather than what its work saw.
+        cls.sent = []
+        cls.playbook_id = str(
+            cls.connection.execute(
+                "SELECT id::text FROM playbooks WHERE path = $1", (cls.SHIPPED,)
+            ).scalar()
+        )
+
+        try:
+            docker("network", "create", "--internal", cls.network)
+            docker("network", "create", cls.egress)
+            opened = door.start(cls.environment(), egress=cls.egress)
+            if not opened.ok:
+                raise AssertionError(f"the door did not start: {opened.violations}")
+            # Where this process reaches the door: its address on the routable
+            # network, which is the one attachment anything off the Agent
+            # network can dial it at -- with a loopback hop in front of it, for
+            # the reason `_loopback_hop` gives.
+            cls.listener, cls.door_url = cls._loopback_hop(
+                (address(cls.container, cls.egress), cls.PORT)
+            )
+            cls.report = evaluation.evaluate(
+                cls.harness.runtime,
+                cls.workspace,
+                playbook=cls.SHIPPED,
+                fixture_name=cls.FIXTURE,
+                work=cls.work,
+                boundary=cls.boundary(),
+            )
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        listener = getattr(cls, "listener", None)
+        if listener is not None:
+            # Which is also what ends the thread accepting on it.
+            listener.close()
+        docker("rm", "--force", getattr(cls, "container", ""), check=False)
+        for network in reversed(getattr(cls, "networks", ())):
+            docker("network", "rm", network, check=False)
+        if getattr(cls, "connection", None) is not None:
+            cls.purge()
+        home = getattr(cls, "home", None)
+        if home is not None and home.exists():
+            # Given back before it is removed: the door writes as 65534, and this
+            # process cannot unlink a file in a directory it does not own.
+            docker(
+                "run", "--rm", "--pull", "never",
+                "--mount", f"type=bind,src={home},dst=/given",
+                AGENT_IMAGE, "chown", "--recursive", f"{os.getuid()}:{os.getgid()}", "/given",
+                check=False,
+            )
+            shutil.rmtree(home, ignore_errors=True)
+        super().tearDownClass()
+
+    @classmethod
+    def purge(cls) -> None:
+        """Take back every row this class wrote, in dependency order.
+
+        The Receipts are the difference from the class above's teardown: a
+        graded request through the door files one, with wire artifacts behind
+        it and a seal over each, and those are rows in tables the whole module
+        shares. `app.purging` is what the guards require of anything that
+        deletes rather than closes.
+        """
+        stored = [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT DISTINCT unnest(ARRAY[request_agent_sha, response_agent_sha,"
+                "                             request_wire_sha, response_wire_sha])"
+                "  FROM receipts r JOIN programs p ON p.id = r.program_id"
+                " WHERE p.slug LIKE 'eval-%'"
+            ).rows
+            if row[0] is not None
+        ]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM playbook_test_runs WHERE playbook_id = $1::uuid", (cls.playbook_id,)
+            )
+            cls.connection.execute(
+                "DELETE FROM artifact_seal WHERE scope_kind = 'program' AND scope_id IN"
+                " (SELECT id FROM programs WHERE slug LIKE 'eval-%')"
+            )
+            # `eval-` and not `selftest-eval-`: LIKE anchors at the start, so
+            # this cannot reach the SQL-level class's Programs.
+            cls.connection.execute("DELETE FROM programs WHERE slug LIKE 'eval-%'")
+            for sha in stored:
+                cls.connection.execute("DELETE FROM artifacts WHERE sha256 = $1", (sha,))
+
+    @classmethod
+    def _loopback_hop(cls, door: tuple[str, int]) -> tuple[socket.socket, str]:
+        """A loopback listener that relays to the door, and the URL naming it.
+
+        `proxy.endpoint` refuses a proxy URL that is not this machine, because a
+        capability is plaintext for exactly one hop and that hop may not be a
+        network. A door in a container is not at loopback, so an installation
+        puts something in front of it: a published port, or the shim
+        `browser_driver` starts inside a child. This is that hop and nothing
+        more -- bytes in one side come out the other, unread and unaltered --
+        so the capability, the fence that resolves it and the Receipt it earns
+        are the production ones, and the rule it satisfies is not relaxed.
+        """
+        listener = socket.create_server((evaluation.HOST, 0))
+
+        def pump(source: socket.socket, sink: socket.socket) -> None:
+            try:
+                while True:
+                    chunk = source.recv(65536)
+                    if not chunk:
+                        break
+                    sink.sendall(chunk)
+            except OSError:
+                pass
+            finally:
+                # Half-close rather than close: the other direction may still be
+                # carrying the answer to what this one just finished sending.
+                with contextlib.suppress(OSError):
+                    sink.shutdown(socket.SHUT_WR)
+
+        def relay(client: socket.socket) -> None:
+            try:
+                upstream = socket.create_connection(door, timeout=30)
+            except OSError:
+                client.close()
+                return
+            with client, upstream:
+                upward = threading.Thread(target=pump, args=(client, upstream), daemon=True)
+                upward.start()
+                pump(upstream, client)
+                upward.join(timeout=5)
+
+        def accept() -> None:
+            while True:
+                try:
+                    client, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=relay, args=(client,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        return listener, f"http://{evaluation.HOST}:{listener.getsockname()[1]}"
+
+    @classmethod
+    def environment(cls) -> dict[str, str]:
+        """The variables `README.md` documents, for the one door this class starts."""
+        return {
+            execution.IMAGE: AGENT_IMAGE,
+            execution.NETWORK: cls.network,
+            execution.PROXY_CONTAINER: cls.container,
+            execution.PROXY_URL: f"http://{cls.container}:{cls.PORT}",
+            execution.CERTIFICATE: str(cls.authority / tls.CERTIFICATE_NAME),
+            proxy.AUTHORITY_VARIABLE: str(cls.authority),
+            proxy.DATABASE_VARIABLE: contained_url(cls.harness.proxy),
+            store.ROOT_VARIABLE: str(cls.store),
+        }
+
+    @classmethod
+    def boundary(cls) -> isolation.AgentContainer:
+        """The door as the evaluator is handed it: the same names, as one record."""
+        return isolation.AgentContainer(
+            image=AGENT_IMAGE,
+            network=cls.network,
+            proxy_container=cls.container,
+            proxy_url=f"http://{cls.container}:{cls.PORT}",
+            certificate=cls.authority / tls.CERTIFICATE_NAME,
+        )
+
+    @classmethod
+    def work(cls, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
+        """What one open Program does here: spend a capability on the fixture.
+
+        The configuration this Program was opened from is what `proxy.send`
+        reads, so the file the evaluator wrote is the file the request is
+        authorised against -- there is no second document describing the same
+        Program. The port comes out of the compiled policy for the same reason
+        the class above reads it there: the fixture is on an ephemeral port, and
+        the Program's own scope is where that port was written down.
+        """
+        slug = str(
+            connection.execute(
+                "SELECT slug FROM programs WHERE id = $1::uuid", (program_id,)
+            ).scalar()
+        )
+        port = int(
+            str(
+                connection.execute(
+                    "SELECT port FROM program_scope_rules WHERE program_id = $1::uuid"
+                    " AND effect = 'target' ORDER BY version DESC, ord LIMIT 1",
+                    (program_id,),
+                ).scalar()
+            )
+        )
+        origin = evaluation.origin(fixture.FIXTURES[cls.FIXTURE])
+        result = proxy.send(
+            cls.harness.runtime,
+            cls.workspace / f"{slug}.toml",
+            f"http://{origin}:{port}{cls.PATH}",
+            proxy_url=cls.door_url,
+            timeout=30,
+        )
+        cls.sent.append((slug, result))
+        if result.violations:
+            ledger.refuse(
+                "task",
+                f"{slug} asked {origin}:{port}{cls.PATH} through the door and was refused",
+                result.violations,
+            )
+            return {}
+        answered = result.facts["response"]
+        ledger.hold("task", f"{slug} asked through the door and got {answered['status']}")
+        return {}
+
+    # -- criterion 1: the evaluation reached the fixture through the door -------
+
+    def test_the_evaluation_completed_over_the_door_route(self):
+        self.assertEqual([], list(self.report.violations))
+        self.assertEqual("door", self.report.facts["route"])
+        self.assertEqual(
+            self.report.facts["repeats"], len(self.report.facts["runs"])
+        )
+        self.assertEqual(
+            [["secure", "vulnerable"]] * self.report.facts["repeats"],
+            [sorted(item["programs"]) for item in self.report.facts["runs"]],
+        )
+
+    def test_every_request_was_answered_by_the_fixture_through_the_door(self):
+        self.assertEqual(2 * self.report.facts["repeats"], len(self.sent))
+        for slug, result in self.sent:
+            with self.subTest(program=slug):
+                self.assertEqual([], list(result.violations))
+                self.assertEqual(
+                    self.UNAUTHENTICATED, result.facts["response"]["status"]
+                )
+                # A Receipt names the exchange, so the door is what answered
+                # rather than something else listening at that address.
+                self.assertIsNotNone(result.facts["receipt"])
+
+    # -- criterion 2: the Receipt says which address was dialled ----------------
+
+    def test_each_receipt_is_filed_against_its_evaluation_program_at_the_recorded_address(self):
+        rows = [
+            tuple(str(field) for field in row)
+            for row in self.connection.execute(
+                # `host(...)` and not `::text`: the cast from inet always writes the
+                # netmask, and what the door dialled is an address.
+                "SELECT p.slug, r.decision, r.scope_class, r.pinned_ips, host(e.address),"
+                "       r.status_code::text, r.host, r.port::text"
+                "  FROM receipts r"
+                "  JOIN programs p ON p.id = r.program_id"
+                "  JOIN fixture_addresses e ON e.program_id = r.program_id"
+                " WHERE p.slug LIKE 'eval-%' ORDER BY p.slug"
+            ).rows
+        ]
+        self.assertEqual(len(self.sent), len(rows))
+        origin = evaluation.origin(fixture.FIXTURES[self.FIXTURE])
+        for slug, decision, scope_class, pinned, recorded, status, host, port in rows:
+            with self.subTest(program=slug):
+                self.assertEqual("allowed", decision)
+                # The fourth class, so a synthetic target the harness started
+                # for itself is legible as one and `target` keeps its meaning.
+                self.assertEqual("fixture", scope_class)
+                # The claim criterion 2 makes: the address on the Receipt is the
+                # address the socket was opened to, and that address is the one
+                # the Program recorded rather than anything a name resolved to.
+                self.assertEqual(recorded, pinned)
+                self.assertEqual(origin, host)
+                self.assertEqual(str(self.UNAUTHENTICATED), status)
+        # And the fixture address was a private address on the door's routable network,
+        # never a loopback one: the table's CHECK admits nothing else.
+        self.assertEqual(
+            {isolation.host_route(isolation.engine_for(isolation.ENGINE), self.container)},
+            {row[4] for row in rows},
+        )
+
+    # -- criterion 4: the run says which route it took, and it reached something -
+
+    def test_every_filed_run_is_a_door_run_that_reached_the_fixture(self):
+        rows = self.connection.execute(
+            "SELECT route, tool_runs FROM playbook_test_runs WHERE playbook_id = $1::uuid"
+            " ORDER BY repeat_index",
+            (self.playbook_id,),
+        ).rows
+        self.assertEqual(self.report.facts["repeats"], len(rows))
+        self.assertEqual(["door"] * len(rows), [str(row[0]) for row in rows])
+        for row in rows:
+            self.assertGreater(int(str(row[1])), 0)
+
+    def test_the_audit_check_reports_nothing_against_these_runs(self):
+        problems = [
+            (str(row[0]), str(row[1]))
+            for row in self.connection.execute(
+                "SELECT severity, problem FROM check_playbook_tests()"
+            ).rows
+        ]
+        self.assertEqual([], [item for item in problems if item[1] == "test_run_reached_nothing"])
+
 
 
 IMPORT_SLUG = "selftest-import"

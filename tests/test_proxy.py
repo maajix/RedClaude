@@ -203,6 +203,12 @@ class Stub:
         #: file a header test; the ones that are about required headers set this.
         self.required: list[tuple[str, str]] | Exception = []
         self.opened: list[tuple] = []
+        #: What the database says about a fixture at this host, and it says
+        #: nothing by default. The real one answers with a row for an evaluation
+        #: Program and for no other, so a stub that answered one here always
+        #: would make every test in this file a fixture test.
+        self.recorded_fixture: proxy.FixtureAddress | None = None
+        self.asked_fixture: list[tuple] = []
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -219,6 +225,19 @@ class Stub:
             # PL/pgSQL frame the exception was raised in.
             raise proxy.Refused("capability refused", DATABASE_ERROR)
         return self.decided
+
+    def fixture_address(
+        self, program_id: str, capability: str, request: scope.Request
+    ) -> proxy.FixtureAddress | None:
+        """Where the synthetic target for this Program is, if there is one.
+
+        Recorded as well as answered, because when it is asked is half of what
+        the door promises: after the capability was decided, so a lapsed lease
+        opens no socket down this route either, and before the name is resolved,
+        so a graded run leaks no lookup for a name that means loopback.
+        """
+        self.asked_fixture.append((program_id, capability, request))
+        return self.recorded_fixture
 
     def authorize_address(
         self, program_id: str, capability: str, request: scope.Request, address: str
@@ -959,6 +978,53 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(
             f"{PINNED},93.184.216.36", self.fence.allowed[0]["receipt"]["pinned_ips"]
         )
+
+    def test_a_graded_fixture_is_dialled_at_the_address_the_database_recorded(self):
+        # Ticket 78 criterion 2, from the door's side. An evaluation's target is
+        # named `<fixture>.localhost`, which resolves to an address this door
+        # refuses and must keep refusing, so the recorded fixture address answers
+        # instead -- and it answers before anything is looked up, which is the
+        # only reason there is no lookup here to leak the name.
+        self.fence.recorded_fixture = proxy.FixtureAddress(
+            address="10.9.0.7", scope_class="fixture"
+        )
+
+        response = self.through("http://target.example.test/v1/notes")
+        body = response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual(b'{"note":"target answered"}', body)
+        self.assertEqual([], self.resolved)
+        self.assertEqual([], self.fence.addressed)
+        self.assertEqual([("target.example.test", 80, "http", "10.9.0.7")], self.dialled)
+
+        filed = self.fence.allowed[0]["receipt"]
+        self.assertEqual("10.9.0.7", filed["pinned_ips"])
+        self.assertEqual("fixture", filed["scope_class"])
+
+    def test_the_class_on_a_fixture_receipt_is_the_one_the_database_answered_with(self):
+        # The door does not label these itself. A class invented here would put
+        # this process's opinion of the request in the column an auditor reads
+        # as the policy's decision about it.
+        self.fence.recorded_fixture = proxy.FixtureAddress(
+            address="10.9.0.7", scope_class="egress_support"
+        )
+
+        self.through("http://target.example.test/v1/notes").read()
+
+        self.assertEqual("egress_support", self.fence.allowed[0]["receipt"]["scope_class"])
+
+    def test_a_request_that_was_never_in_scope_is_not_asked_about_a_fixture(self):
+        # The order the fixture address is asked in, from the other end: a capability
+        # that resolves to nothing gets no second question, so an evaluation
+        # whose lease lapsed cannot reach its fixture either.
+        self.fence.out_of_scope.add("target.example.test")
+
+        response = self.through("http://target.example.test/v1/notes")
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.fence.asked_fixture)
+        self.assertEqual([], self.dialled)
 
     def test_a_name_is_not_resolved_for_a_request_that_was_going_to_be_refused(self):
         # A lookup is egress: it leaves this machine carrying the name that was

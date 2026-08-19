@@ -19,11 +19,11 @@ adversarial arrangement exists and is total; the evaluation that would grade it 
 cannot run from this ticket. All five ship `draft`. `stable` is reachable only through
 `playbook_test_verdict` returning `pass` for the exact text, and an evaluation run is an Agent
 run against a fixture listening on loopback, which `scope.compile_policy` and
-`authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided.
-What moved is the measurement: the corpus is forty-seven Playbooks and forty-eight fixtures,
-`playbook_fixture_binding` is still total over the fixture table, and each of the five new
-fixtures is an out-of-class negative for the forty-six Playbooks that do not output its class.
-The half of the criterion that is about selection is checked and holds:
+`authorize_identity_egress_address` both refuse. Ticket 78 decided that route; ticket 84 grades
+the corpus over it. What moved is the measurement: the corpus is forty-seven Playbooks and
+forty-eight fixtures, `playbook_fixture_binding` is still total over the fixture table, and each
+of the five new fixtures is an out-of-class negative for the forty-six Playbooks that do not
+output its class. The half of the criterion that is about selection is checked and holds:
 `PlaybookCorpusSelectionTest` is diagonal across all forty-seven subjects, and every one of the
 five is loadable by exactly one production role.
 
@@ -32,7 +32,7 @@ five is loadable by exactly one production role.
 - [x] Kubernetes and deployment checks remain limited to explicitly scoped web/API ingress and do not expand into infrastructure discovery.
 - [x] Logging and supply-chain fixtures distinguish public metadata from credential/artifact exposure and runtime reachability.
 - [x] Stale upstream knowledge or expired verification prevents stable selection until reevaluated.
-- [ ] All five exact hashes pass role loadability, matching selection and positive/adversarial fixture promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 closes it.
+- [ ] All five exact hashes pass role loadability, matching selection and positive/adversarial fixture promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

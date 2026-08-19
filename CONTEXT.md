@@ -921,6 +921,37 @@ repeat that inherited the previous one's Hypotheses is one measurement counted
 twice.
 _Avoid_: Test program, harness run, dry run, sandbox
 
+**Fixture address**:
+Where an evaluation put the fixture one Program is graded against, and the only
+place that answer is written. One private address on the door's own routable
+network -- never loopback, never link-local, never global -- so a fixture is not
+a second way to reach this host's control ports or the internet. It substitutes
+an address for a host the Program's compiled policy already classes as a target,
+so it moves where a target is dialled and never widens what may be dialled.
+Written after the Program is marked as an evaluation and before its work runs,
+because the work's first request is what has to find the fixture, and held per
+Program with no history: it dies with the evaluation it was opened for. The door
+never reads the table, only asks a definer function, which re-resolves the
+capability, the Identity lease and the coverage question at the Program's scope
+version as it stands now -- a released lease or a withdrawn target refuses here
+exactly as it does on the ordinary route. An exchange answered through one earns
+a Receipt classed `fixture` rather than `target`, so a synthetic target the
+harness started for itself is legible as one and `target` keeps meaning what it
+did; a Receipt cannot carry that class without an address that names it.
+_Avoid_: Fixture host, override, DNS entry, hosts file, redirect
+
+**Evaluation route**:
+How a graded Program reached its fixture: `loopback`, in-process on a machine
+that describes no Agent boundary, or `door`, through the proxy at the address
+the fixture address recorded. Derived at filing from what the vulnerable Program
+opened rather than supplied, so the route a run is filed under is the route it
+took. Which one an evaluation takes is decided by the machine, not by a flag: a
+described boundary is the door route, and a boundary that is described but
+cannot be read is a refusal rather than a quiet fall back to loopback, because
+zeroes filed under a name nobody asked for read exactly like a Playbook that
+found nothing.
+_Avoid_: Mode, transport, proxy setting, direct
+
 **Test verdict**:
 What a Playbook has earned at one exact text: `pass`, `fail`, or `untested`.
 Derived from the filed repeats rather than recorded, and `untested` is neither a

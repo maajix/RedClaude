@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import tempfile
 import time
 import unittest
@@ -615,6 +616,91 @@ print(json.dumps({
         self.assertEqual(
             before, docker("network", "ls", "--format", "{{.Name}}").stdout.split()
         )
+
+    # -- PH2-78: where this machine is, seen from inside the door ---------------
+
+    def engine(self) -> str:
+        return isolation.engine_for(isolation.ENGINE)
+
+    def routable(self) -> str:
+        """Attach the door to the one routable network, for this test only.
+
+        Given back on the way out, because every other case in this class is
+        about a door whose attachments are all internal: a network left
+        connected here would be a route off the Agent network that the
+        containment proofs above would then be measuring.
+        """
+        docker("network", "connect", self.open_network, self.proxy)
+        self.addCleanup(
+            docker, "network", "disconnect", self.open_network, self.proxy, check=False
+        )
+        return docker(
+            "network", "inspect", "--format",
+            "{{(index .IPAM.Config 0).Gateway}}", self.open_network,
+        ).stdout.strip()
+
+    def test_a_door_with_no_route_off_the_agent_network_answers_with_no_address(self):
+        # The arrangement this class holds for every other case: three internal
+        # networks and nothing else. There is no address this machine could be
+        # reached at from in there, so an evaluation that asked is refused rather
+        # than told a number that does not answer.
+        with self.assertRaises(isolation.Unavailable) as refused:
+            isolation.host_route(self.engine(), self.proxy)
+
+        self.assertIn("no network with a route off it", str(refused.exception))
+
+    def test_the_address_is_the_gateway_of_the_one_routable_attachment(self):
+        # And it is this machine: a socket bound there is reached from inside the
+        # door. That is the whole property the fixture route rests on -- the
+        # evaluator serves its fixture at this address, and the door dials it.
+        gateway = self.routable()
+
+        answered = isolation.host_route(self.engine(), self.proxy)
+
+        self.assertEqual(gateway, answered)
+        listening = socket.create_server((answered, 0))
+        self.addCleanup(listening.close)
+        reached = docker(
+            "exec", self.proxy, "python3", "-c", fixtures.REACHED,
+            answered, str(listening.getsockname()[1]),
+            check=False,
+        )
+        self.assertEqual(0, reached.returncode, reached.stderr)
+
+    def test_a_child_cannot_reach_the_address_the_door_answers_this_machine_at(self):
+        # The other half, and the reason a fixture may be served there at all:
+        # the routable attachment is the door's alone, so the address that makes
+        # the fixture reachable does not also make it reachable from the child
+        # being graded against it.
+        self.routable()
+        answered = isolation.host_route(self.engine(), self.proxy)
+        listening = socket.create_server((answered, 0))
+        self.addCleanup(listening.close)
+        port = listening.getsockname()[1]
+        probe = fixtures.PROBE + """
+print(json.dumps({'host': reaches(%r, %d)}))
+""" % (answered, port)
+
+        result = isolation.run(self.boundary(), ("python3", "-c", probe), timeout=20)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["host"])
+
+    def test_a_door_on_two_routable_networks_has_no_one_address(self):
+        # Two answers to "where is this machine" is no answer: a fixture bound at
+        # one of them would be reachable at an address the Receipt does not name,
+        # and a run that guessed wrong would grade a Playbook against nothing.
+        second = f"{self.open_network}-second"
+        docker("network", "create", second)
+        self.addCleanup(docker, "network", "rm", second, check=False)
+        self.routable()
+        docker("network", "connect", second, self.proxy)
+        self.addCleanup(docker, "network", "disconnect", second, self.proxy, check=False)
+
+        with self.assertRaises(isolation.Unavailable) as refused:
+            isolation.host_route(self.engine(), self.proxy)
+
+        self.assertIn("more than one routable network", str(refused.exception))
 
 
 @unittest.skipUnless(LIVE, REASON)

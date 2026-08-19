@@ -1947,12 +1947,12 @@ class PlaybookCommandTest(unittest.TestCase):
         self.assertEqual([], observed["events"])
         self.assertEqual(EXIT_INVALID_CONFIGURATION, observed["exit"])
 
-    def test_the_same_five_facts_are_answered_on_a_path_that_files_nothing(self):
+    def test_the_same_facts_are_answered_on_a_path_that_files_nothing(self):
         result = run(*self.arguments("--url", "postgresql://rk2@127.0.0.1:1/rk2"))
 
         report = json.loads(result.stdout)
         self.assertEqual(
-            ["fixture", "playbook", "repeats", "runs", "verdict"],
+            ["fixture", "playbook", "repeats", "route", "runs", "verdict"],
             sorted(set(report) & set(evaluation.FACTS)),
         )
         self.assertEqual([], report["runs"])

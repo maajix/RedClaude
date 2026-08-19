@@ -27,25 +27,23 @@ adversarial arrangement exists for the two fixtured Playbooks and is total; the 
 would grade it has not run and cannot run from this ticket. All three ship `draft`. `stable` is
 reachable only through `playbook_test_verdict` returning `pass` for the exact text, and an
 evaluation run is an Agent run against a fixture listening on loopback, which `scope.compile_policy`
-and `authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided for
-`request-integrity` and `request-parsing`. It is not where it is decided for `http-desync`, and
-that one is a harder statement: clause 1 of `playbook_test_verdict` returns `untested` for any
-Playbook with no in-class own pair, so no agent run of any kind can move it while it has no
-fixture. Its promotion is blocked on the fixture the deviation above says cannot be written,
-rather than on the loopback route.
-What moved is the measurement: the corpus is fifty Playbooks and fifty fixtures,
+and `authorize_identity_egress_address` both refuse. Ticket 78 decided that route and ticket 84
+grades it for `request-integrity` and `request-parsing`. Neither is where `http-desync` is decided,
+and that one is a harder statement: clause 1 of `playbook_test_verdict` returns `untested` for any
+Playbook with no in-class own pair, so no agent run of any kind can move it while it has no fixture.
+Its promotion is blocked on the fixture the deviation above says cannot be written, rather than on
+the loopback route. What moved is the measurement: the corpus is fifty Playbooks and fifty fixtures,
 `playbook_fixture_binding` is still total over the fixture table, and each of the two new fixtures
-is an out-of-class negative for the forty-nine Playbooks that do not output its class. The
-selection half of the criterion is checked and holds: `PlaybookCorpusSelectionTest` is diagonal
-across all fifty subjects, and all three new Playbooks are loadable by exactly one production
-role.
+is an out-of-class negative for the forty-nine Playbooks that do not output its class. The selection
+half of the criterion is checked and holds: `PlaybookCorpusSelectionTest` is diagonal across all
+fifty subjects, and all three new Playbooks are loadable by exactly one production role.
 
 - [x] HTTP Desync, Request Integrity and Request Parsing each exist as authored v2 Playbooks with complete metadata and scoped risk effects.
 - [x] Tests distinguish target behavior from proxy transformation and use proxy-internal transport observations where interception would invalidate the claim.
 - [x] Smuggling, coalescing, host/header, parameter and integrity variants use controlled local fixtures and explicit negative baselines.
 - [x] Availability-impacting request patterns are absent unless separately granted and bounded.
 - [x] Protocol claims cite exact request/response bytes and transport path rather than banner, generic error or race-only behavior.
-- [ ] All three exact hashes pass relevant positive and adversarial evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 closes it.
+- [ ] All three exact hashes pass relevant positive and adversarial evaluation before stable promotion. **Partial:** the fixtures exist and grade offline; the production evaluation waits on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

@@ -11,12 +11,12 @@ arrangement exists and is total; the evaluation that would grade it has not run,
 run from this ticket. All eight ship `draft`. `stable` is reachable only through
 `playbook_test_verdict` returning `pass` for the exact text, and an evaluation run is an
 Agent run against a fixture listening on loopback, which `scope.compile_policy` and
-`authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided.
-What moved is the measurement: the corpus is twenty-eight Playbooks and twenty-nine
-fixtures, `playbook_fixture_binding` is still total over the fixture table, and each of the
-eight new fixtures is an out-of-class negative for the twenty-seven Playbooks that do not
-output its class. The other half of the criterion -- "no human-only reference leakage into
-model projections" -- is checked and holds:
+`authorize_identity_egress_address` both refuse. Ticket 78 decided that route; ticket 84
+grades the corpus over it. What moved is the measurement: the corpus is twenty-eight
+Playbooks and twenty-nine fixtures, `playbook_fixture_binding` is still total over the
+fixture table, and each of the eight new fixtures is an out-of-class negative for the
+twenty-seven Playbooks that do not output its class. The other half of the criterion -- "no
+human-only reference leakage into model projections" -- is checked and holds:
 `test_no_reference_text_reaches_a_shipped_projection` reads every line over forty characters
 out of all nine attached references and asserts it is absent from the projection the model
 receives.
@@ -29,14 +29,14 @@ they listen on loopback and the egress authoriser refuses loopback. `BrowserComm
 already exercises the containment path -- DOM, screenshot and network evidence bound to a
 Receipt -- against `tests/browser_target.py`, and is skipped without `RK_TEST_BROWSER_IMAGE`.
 So the binding this criterion asks for exists and is tested; what is missing is the same
-loopback route 78 decides.
+graded run over the route 78 built, which is ticket 84's.
 
 - [x] Browser Framing, Browser Messaging, Browser Realtime, Browser Script, Browser Storage, Client-Side Path Traversal, External Resources and Web Cache each exist as authored v2 Playbooks.
 - [x] Each Playbook declares whether evidence requires browser, HTTP differential, DOM, storage, origin, framing or cache capabilities and is loadable by an appropriate role.
-- [ ] Browser fixtures run through production containment and bind DOM, screenshot and network evidence to Receipts and Tool runs. **Partial:** `BrowserCommandTest` proves that binding through the real container; the loopback fixture route is the missing half. Ticket 78 closes it.
+- [ ] Browser fixtures run through production containment and bind DOM, screenshot and network evidence to Receipts and Tool runs. **Partial:** `BrowserCommandTest` proves that binding through the real container; the loopback fixture route is the missing half. Ticket 78 built that route; ticket 84 grades the corpus over it.
 - [x] Controls distinguish executable impact from reflection, browser policy from server policy and target behavior from proxy-induced protocol behavior.
 - [x] Cache, realtime and external-resource tests remain scope- and budget-bound and refuse uncontrolled third-party effects.
-- [ ] All eight exact hashes pass positive and out-of-class adversarial evaluation with no human-only reference leakage into model projections. **Partial:** the projections hold and the fixtures grade; the production evaluation waits on the same route. Ticket 78 closes it.
+- [ ] All eight exact hashes pass positive and out-of-class adversarial evaluation with no human-only reference leakage into model projections. **Partial:** the projections hold and the fixtures grade; the production evaluation waits on the same route. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

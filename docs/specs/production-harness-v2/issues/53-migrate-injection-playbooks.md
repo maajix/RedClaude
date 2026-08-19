@@ -11,23 +11,23 @@ arrangement exists and is total; the evaluation that would grade it has not run,
 from this ticket. All seven ship `draft`. `stable` is reachable only through
 `playbook_test_verdict` returning `pass` for the exact text, and an evaluation run is an Agent
 run against a fixture listening on loopback, which `scope.compile_policy` and
-`authorize_identity_egress_address` both refuse. Ticket 78 is where that route is decided.
-What moved is the measurement: the corpus is thirty-five Playbooks and thirty-six fixtures,
-`playbook_fixture_binding` is still total over the fixture table, and each of the seven new
-fixtures is an out-of-class negative for the thirty-four Playbooks that do not output its
-class. The half of the criterion that is about selection is checked and holds:
+`authorize_identity_egress_address` both refuse. Ticket 78 decided that route; ticket 84 grades
+the corpus over it. What moved is the measurement: the corpus is thirty-five Playbooks and
+thirty-six fixtures, `playbook_fixture_binding` is still total over the fixture table, and each
+of the seven new fixtures is an out-of-class negative for the thirty-four Playbooks that do not
+output its class. The half of the criterion that is about selection is checked and holds:
 `PlaybookCorpusSelectionTest` is diagonal across all thirty-five subjects, every one of the
 seven is loadable by exactly one production role, and
 `test_no_reference_text_reaches_a_shipped_projection` reads every line over forty characters
-out of all fifty-one attached references and asserts it is absent from the projection the
-model receives.
+out of all fifty-one attached references and asserts it is absent from the projection the model
+receives.
 
 - [x] Command/Directory Injection, NoSQL Injection, ORM, Spreadsheet Injection, SQL Injection, SSTI and Structured Injection each exist as authored v2 Playbooks.
 - [x] Output Property classes distinguish query language, command execution, template evaluation, structured-header/document parsing and formula interpretation.
 - [x] Detection defaults to the least mutating action and requires explicit risk/grant metadata before any write or execution effect.
 - [x] Timing, boolean, error and content differentials each include a neutralized control and configured repeat policy.
 - [x] Fixtures include secure twins, noisy endpoints and decoy reflections so a Playbook that always fires fails precision evaluation.
-- [ ] All seven exact hashes are role-loadable, selected only on matching facts and pass grounded positive/adversarial promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 closes it.
+- [ ] All seven exact hashes are role-loadable, selected only on matching facts and pass grounded positive/adversarial promotion gates. **Partial:** loadability and selection hold at the shipped text; the promotion gates wait on the route above. Ticket 78 built that route; ticket 84 grades the corpus over it.
 
 ## Comments
 

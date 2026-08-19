@@ -18,7 +18,8 @@ import json
 import unittest
 from pathlib import Path
 
-from redkraken import config, document, evaluation, fixture, scope
+from redkraken import config, document, evaluation, fixture, isolation, scope
+from redkraken.outcome import Ledger
 from tests.fixtures import frontmatter, scratch, write
 
 
@@ -283,7 +284,7 @@ class Serving(unittest.TestCase):
     """`evaluation.served`: what listens, and whether it is what was digested."""
 
     def get(self, where: evaluation.Served, path: str = "/notes/2") -> tuple[int, bytes]:
-        connection = http.client.HTTPConnection(evaluation.HOST, where.port, timeout=5)
+        connection = http.client.HTTPConnection(where.host, where.port, timeout=5)
         try:
             connection.request("GET", path)
             answer = connection.getresponse()
@@ -337,15 +338,66 @@ class Serving(unittest.TestCase):
         with self.assertRaises(OSError):
             self.get(where)
 
-    def test_it_listens_on_loopback_and_nothing_else(self):
+    def test_it_listens_on_loopback_unless_it_is_told_otherwise(self):
         self.assertEqual("127.0.0.1", evaluation.HOST)
+        with evaluation.served(compiled(one()), "vulnerable") as where:
+            self.assertEqual(evaluation.HOST, where.host)
+
+    def test_it_listens_at_the_one_address_the_route_named(self):
+        # The door route serves the fixture where the proxy can dial it, which
+        # is not loopback -- and it is still one address rather than every
+        # interface, so nothing else this machine is attached to gains a target.
+        # A second loopback address stands in for it here: what is under test is
+        # that `host` is honoured and bounded, and that needs no container.
+        one_fixture = compiled(one())
+        with evaluation.served(one_fixture, "vulnerable", "127.0.0.2") as where:
+            self.assertEqual("127.0.0.2", where.host)
+            self.assertEqual((200, b"vulnerable"), self.get(where))
+            elsewhere = evaluation.Served(variant="vulnerable", host="127.0.0.1", port=where.port)
+            with self.assertRaises(OSError):
+                self.get(elsewhere)
+
+
+class Routing(unittest.TestCase):
+    """`evaluation.route`: which way a run reaches its fixture, decided once."""
+
+    def boundary(self, container: str) -> isolation.AgentContainer:
+        return isolation.AgentContainer(
+            image="rk2-selftest:none",
+            network="rk2-selftest-absent-network",
+            proxy_container=container,
+            proxy_url=f"http://{container}:18080",
+            certificate=Path("/nonexistent/ca.pem"),
+        )
+
+    def test_a_machine_with_no_agent_boundary_grades_over_loopback(self):
+        ledger = Ledger()
+
+        self.assertEqual(
+            evaluation.Route(name=evaluation.LOOPBACK, host=evaluation.HOST),
+            evaluation.route(ledger, None),
+        )
+        self.assertEqual([], list(ledger.violations))
+
+    def test_a_door_that_cannot_be_read_is_a_refusal_and_not_a_fall_back(self):
+        # An operator who described a boundary asked for a run graded through
+        # the door. Serving on loopback under that name would file zeroes that
+        # read exactly like a Playbook which found nothing.
+        ledger = Ledger()
+
+        self.assertIsNone(evaluation.route(ledger, self.boundary("rk2-selftest-absent-door")))
+
+        violation = list(ledger.violations)[0]
+        self.assertEqual(1, len(list(ledger.violations)))
+        self.assertEqual("environment:RK_AGENT_PROXY_CONTAINER", violation.source)
+        self.assertIn("the fixture has to be served where the door can dial it", violation.detail)
 
 
 class Configuration(unittest.TestCase):
     """The Program document each repeat is opened under."""
 
     def written(self, one_fixture: fixture.Fixture, slug: str = "eval-selftest") -> Path:
-        where = evaluation.Served(variant="vulnerable", port=44321)
+        where = evaluation.Served(variant="vulnerable", host=evaluation.HOST, port=44321)
         return evaluation.configuration(scratch(), slug, one_fixture, where)
 
     def test_the_document_is_one_the_production_reader_accepts(self):

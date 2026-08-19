@@ -937,6 +937,51 @@ def one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) -
         )
 
 
+def host_route(engine: str, proxy_container: str) -> str:
+    """The address this machine answers on from inside the door.
+
+    The door sits on two kinds of network: the internal one it is the only peer
+    of, which is how children reach it and has no route anywhere else, and the
+    routable one it reaches targets through.  That second one has a gateway, and
+    the gateway is this host -- so a process bound there is reachable from the
+    door and from nothing a child can address.  That is the property the fixture
+    route in `evaluation.py` is built on, and this is where the address comes
+    from: the engine's own record of the attachment, not a guess at what a
+    bridge numbers its subnet from.
+
+    Exactly one routable attachment, or nothing.  A door on two of them has two
+    answers to "where is this machine", and a fixture bound at one of them would
+    be reachable at an address the Receipt does not name.
+    """
+    record = _inspect(engine, "container", proxy_container)
+    attachments = (record.get("NetworkSettings") or {}).get("Networks") or {}
+    if not isinstance(attachments, dict):
+        raise Unavailable(f"the door's networks cannot be read: {proxy_container}")
+    routes = {}
+    for network, attachment in attachments.items():
+        if not isinstance(attachment, dict):
+            # Refused rather than skipped: an attachment this function cannot
+            # read is a network it cannot say is internal, and skipping it would
+            # let a door on two routable networks answer as if it were on one.
+            raise Unavailable(
+                f"the door's attachment to {network} cannot be read: {proxy_container}"
+            )
+        internal, _ = peers(engine, str(network))
+        gateway = str(attachment.get("Gateway") or "")
+        if not internal and gateway:
+            routes[str(network)] = gateway
+    if not routes:
+        raise Unavailable(
+            f"the door is on no network with a route off it: {proxy_container}"
+        )
+    if len(routes) > 1:
+        raise Unavailable(
+            "the door is on more than one routable network, so this machine has no "
+            "one address from inside it: " + ", ".join(sorted(routes))
+        )
+    return next(iter(routes.values()))
+
+
 def join(
     engine: str,
     network: str,

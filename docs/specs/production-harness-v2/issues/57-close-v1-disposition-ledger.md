@@ -16,10 +16,10 @@ ships, so the document the database would grade is the document in the wheel. Th
 now checked for all fifty. The verdict itself stays where ticket 46 put it -- both
 `playbook_test_verdict` and `playbook_promotion_evidence` take a `p_sha` and no Playbook
 reaches `stable` without one -- and the route by which a real Agent reaches a fixture is
-ticket 78's.
+ticket 78's, and the grading over it ticket 84's.
 
 - [x] The final ledger reconciles exactly 11 Agent definitions, 28 Skill directories, 60 Playbook topics, 112 operator references, 9 sink packs and 3 reserved files.
-- [ ] Exactly 49 in-scope web/API Playbooks exist, validate, are loadable and have passing hash-specific production evaluations. **Partial:** exist, validate, load and are registered at the text they ship, per the deviation above. Ticket 78 closes the evaluation half.
+- [ ] Exactly 49 in-scope web/API Playbooks exist, validate, are loadable and have passing hash-specific production evaluations. **Partial:** exist, validate, load and are registered at the text they ship, per the deviation above. Ticket 78 built that route; ticket 84 grades the evaluation half.
 - [x] Ten Android Playbooks, two Android Skills, one Android Agent and the 39 Android operator references carry explicit reversible scope-retirement records; one remaining topic is absorbed as reference material.
 - [x] All 73 in-scope references and 9 sink packs resolve from at least one bounded Skill or Playbook reference and none is injected globally.
 - [x] There are zero missing replacements, stale source hashes, dangling Skills, unloadable stable Playbooks, duplicate dispositions or unresolved manifest rows.
