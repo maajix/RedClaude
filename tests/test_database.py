@@ -2988,6 +2988,16 @@ class ProgramRunTest(DatabaseCase):
             ).rows
         ]
 
+    def traces(self, program_id: str) -> list[str | None]:
+        """The trace on each of this Program's events, in the order written."""
+        return [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT trace_id FROM events WHERE program_id = $1::uuid ORDER BY seq",
+                (program_id,),
+            ).rows
+        ]
+
     def events(self, program_id: str) -> list[tuple]:
         return [
             tuple(row)
@@ -3072,6 +3082,25 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(1, second.facts["configuration"]["revision"])
         self.assertEqual(1, self.programs(slug))
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(first.facts["program_id"])])
+
+    def test_the_events_of_one_command_carry_that_command_s_trace(self):
+        # ADR 0002 lists `trace_id` with the context a trigger cannot see, and
+        # until a writer existed every row carried a null there. What the
+        # connection helper sets names the run of one command: the rows of one
+        # invocation share it, and a second invocation is a second trace.
+        slug = f"{RUN_SLUG}-traced"
+
+        first = self.run_for(slug)
+        opening = self.traces(first.facts["program_id"])
+        self.run_for(slug)
+        resumed = set(self.traces(first.facts["program_id"])) - set(opening)
+
+        self.assertTrue(opening)
+        self.assertNotIn(None, opening)
+        self.assertEqual(1, len(set(opening)), "one command wrote more than one trace")
+        self.assertEqual(1, len(resumed), "the second run did not write a trace of its own")
+        self.assertNotEqual(set(opening), resumed)
+        self.assertRegex(str(opening[0]), "^[0-9a-f]{32}$")
 
     def test_opening_projects_the_identity_and_resuming_emits_one_more_event(self):
         # The configured Identity and the configured Surface are both durable
@@ -41518,15 +41547,17 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
         self.assertEqual("", facts["purge after"])
 
     def test_the_checks_panel_asks_the_same_function_a_run_asks(self):
-        asked = {
-            check.name: "yes" if check.ok else "no"
+        asked = sorted(
+            (check.name, "yes" if check.ok else "no")
             for check in integrity.standing_checks(self.connection, self.slug)
-        }
-
-        self.assertEqual(
-            asked, {name: held for name, held, _ in self.before["checks"]["rows"]}
         )
+        shown = [(name, held) for name, held, _ in self.before["checks"]["rows"]]
+
         self.assertTrue(asked)
+        # The page is bounded and the family is not, so what is on it is what the
+        # function said about the checks that are on it -- and nothing else.
+        self.assertEqual(sorted(shown), sorted(set(asked) & set(shown)))
+        self.assertEqual(len(shown), len(set(name for name, _ in shown)))
 
     def test_the_checks_panel_is_the_whole_standing_family_and_not_one_row(self):
         # The registry is what "integrity" means, and exactly one of its checks
@@ -41536,9 +41567,7 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
         # which is silence read as health, and story 205 asks for the opposite.
         registered = {
             str(row[0])
-            for row in self.connection.execute(
-                "SELECT name FROM standing_checks WHERE enabled"
-            ).rows
+            for row in self.connection.execute("SELECT name FROM standing_checks").rows
         }
         shown = {name for name, _, _ in self.before["checks"]["rows"]}
 

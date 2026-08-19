@@ -21,6 +21,7 @@ import hashlib
 import os
 import re
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -797,9 +798,26 @@ def passwords_from_environment(environment: dict[str, str] | None = None) -> dic
     return found
 
 
+#: The one name every event row's `trace_id` comes from, and the setting this
+#: helper is the only writer of. ADR 0002 lists it with the context a trigger
+#: cannot see, and until a writer existed the column was null on every row ever
+#: written, so the join it is there for could not be made.
+#:
+#: Session-scoped rather than `SET LOCAL`, which is the exception the actor
+#: context is not. An actor is per transaction and a session-wide declaration of
+#: one decays into somebody else's attribution; a trace names the whole run of a
+#: command, and one command opens one connection here, so the connection is
+#: exactly its extent. Nothing is pooled across commands, so there is no earlier
+#: run for a value to be left over from.
+TRACE = "app.trace_id"
+DECLARE_TRACE = "SELECT set_config($1, $2, false)"
+
+
 def open_connection(ledger: Ledger, settings: pg.Settings) -> pg.Connection | None:
     try:
-        return pg.connect(settings)
+        connection = pg.connect(settings)
+        connection.execute(DECLARE_TRACE, (TRACE, uuid.uuid4().hex))
+        return connection
     except pg.ConnectionError_ as error:
         ledger.fail(
             "connection",
