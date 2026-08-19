@@ -15,6 +15,7 @@ keeps this file honestly clean and keeps the rule able to do its job.
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -110,6 +111,22 @@ class RuleTest(unittest.TestCase):
         for name, planted in CONTROLS.items():
             with self.subTest(name):
                 self.assertNotIn(planted, source)
+
+    def test_a_long_line_is_read_once_rather_than_from_every_offset(self):
+        """The scan is pointed at what a run produced, and a run produces long
+        lines -- a minified script, a base64 body, a one-line JSON log.
+
+        A rule whose leading run is unbounded is retried from every offset
+        inside that run, which is quadratic: this filler took ten seconds at
+        eighty kilobytes before the scheme was bounded, and a tree of them never
+        finished. The budget is generous on purpose. It is not measuring the
+        machine, it is separating linear from quadratic, and at this length the
+        two are three orders of magnitude apart.
+        """
+        filler = "a" * 200_000
+        started = time.monotonic()
+        self.assertEqual([], check_secrets.scan_text(filler, "filler.txt"))
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_a_password_is_keyed_on_the_password_and_not_on_the_host(self):
         """`url_password` captures a group, so one declared sentinel covers every

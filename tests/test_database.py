@@ -156,6 +156,7 @@ from tests.fixtures import (
     unused_pid,
     write,
 )
+from tools import check_secrets
 
 
 SUPERUSER_URL = os.environ.get("RK_TEST_SUPERUSER_URL", "")
@@ -35577,6 +35578,48 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
         self.assertTrue(Store(self.store_root).holds(artifact.digest(held[0].encode())))
         for path, data in self.packed.items():
             self.assertNotIn(self.MARKER.encode(), data, path)
+
+    def test_the_scan_that_guards_what_is_published_reads_the_bundle_itself(self):
+        """Ticket 62 criterion 4, asked of the files it is actually about.
+
+        `check_secrets` takes the directories a run produced -- its own
+        docstring names "reports and evidence bundles" -- and every caller
+        before this one gave it none, so a rule about what leaves this harness
+        was being proved against a checkout. A bundle is where it has to hold:
+        it is the directory somebody else unpacks.
+
+        Not the same question as the marker above. That one asks whether the
+        planted string survived, which is a fact about the redaction rules
+        finding what they were pointed at. This asks whether anything *shaped*
+        like a credential is in there at all, including one nobody planted --
+        an identity's material carried in a projection, a token in an exchange
+        header the stripping missed. Both bundles, because the chain export
+        composes a second set of documents out of the same rows.
+        """
+        for name, where in (("finding", self.where), ("chain", self.root / "chain")):
+            with self.subTest(bundle=name):
+                read = check_secrets.walk(where)
+                # A scan of nothing passes, so what was read is part of the
+                # claim: every file this bundle's own manifest names, and the
+                # manifest itself.
+                named = {
+                    str(item["path"])
+                    for item in json.loads(
+                        (where / verifier.MANIFEST).read_text(encoding="utf-8")
+                    )["files"]
+                }
+                self.assertEqual(
+                    named | {verifier.MANIFEST},
+                    {str(path.relative_to(where)) for path in read},
+                )
+                self.assertEqual(
+                    [],
+                    [
+                        str(finding)
+                        for path in read
+                        for finding in check_secrets.scan_file(path, where)
+                    ],
+                )
 
     def test_another_persons_address_and_number_are_replaced_by_a_marker(self):
         applied = {item["rule"] for item in self.manifest["redactions"]}

@@ -134,7 +134,12 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "url_password",
         "a password written inline in a URL",
-        re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@\"']+:([^\s/@\"']+)@"),
+        # The scheme is bounded rather than starred. Unbounded, the run before
+        # `://` is retried from every offset inside it, and a generated fixture
+        # of a million filler characters -- which a run leaves behind and this
+        # scan is pointed at -- takes quadratic time to report nothing. Thirty
+        # two is past every scheme IANA has registered.
+        re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s:/@\"']+:([^\s/@\"']+)@"),
         "postgresql://rk2_runtime:PROBEcheckSecretsUrlPassword@127.0.0.1:5432/rk2",
         "postgresql://rk2_runtime@127.0.0.1:5432/rk2",
     ),
