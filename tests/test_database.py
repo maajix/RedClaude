@@ -36441,6 +36441,7 @@ class PlaybookSelectionTest(DatabaseCase):
     REASONS = {
         "status_deprecated": "test_a_deprecated_playbook_is_dropped",
         "expired": "test_a_playbook_past_its_review_date_is_dropped",
+        "edited": "test_a_playbook_edited_since_it_was_graded_is_dropped",
         "risk_forbidden": "test_a_forbidden_playbook_is_dropped_under_every_ceiling",
         "risk_above_ceiling": "test_a_ceiling_under_the_risk_floor_drops_it",
         "class_mismatch": "test_a_class_the_playbook_does_not_produce_drops_it",
@@ -37015,6 +37016,44 @@ class PlaybookSelectionTest(DatabaseCase):
             self.synthetic(self.SECOND, stale_after="2020-01-01T00:00:00Z")
 
             self.assertEqual("expired", self.candidates()[self.SECOND])
+
+    def graded(self, identifier: str, sha256: str) -> None:
+        """The row 046's edit trigger files: a text this Playbook was stable at.
+
+        Written rather than driven. Reaching `stable` needs a promotion and a
+        promotion needs runtime provenance for the exact bytes, which is
+        `PlaybookEvaluationTest`'s subject -- and what the funnel reads is this
+        row, whoever wrote it.
+        """
+        self.connection.execute(
+            "INSERT INTO playbook_demotions (playbook_id, playbook_sha256, cause, detail)"
+            " VALUES ($1::uuid, $2, 'edited', 'written by the self test')",
+            (identifier, sha256),
+        )
+
+    def test_a_playbook_edited_since_it_was_graded_is_dropped(self):
+        # Story 176: "edited or expired Playbooks excluded from new Tasks until
+        # reevaluated". The Playbook is `draft`, which is also what one nobody
+        # ever promoted looks like -- so the ledger is the only thing that can
+        # tell them apart. The shipped Playbook is the second kind and stays
+        # selectable in the same answer: excluding drafts would empty the
+        # catalogue rather than exclude the edit.
+        with self.scratch():
+            self.graded(self.synthetic(self.SECOND), "f" * 64)
+
+            self.assertEqual({self.SHIPPED: None, self.SECOND: "edited"}, self.candidates())
+
+    def test_a_playbook_reverted_to_a_text_that_was_graded_is_selectable(self):
+        # Stable at one text, edited to a second, stable there, edited back:
+        # two rows, and the current digest is one of them. The evidence is
+        # about these bytes, so the maintainer who undid a change is not made
+        # to re-earn what was never lost.
+        with self.scratch():
+            identifier = self.synthetic(self.SECOND)
+            self.graded(identifier, "a" * 64)
+            self.graded(identifier, "f" * 64)
+
+            self.assertEqual({self.SHIPPED: None, self.SECOND: None}, self.candidates())
 
     def test_a_playbook_already_exhausted_on_this_subject_is_dropped(self):
         # Against the row the fixture committed, whose outcome is what a run
@@ -39114,6 +39153,21 @@ class PlaybookEvaluationTest(DatabaseCase):
                 self.demotions(),
             )
             self.assertEqual(3 * len(self.GRADED), len(self.counts()))
+            # The digest the row carries is the one the standing belonged to,
+            # not the one on disk afterwards. Story 176's exclusion is decided
+            # by comparing exactly these two, so a row that filed the new text
+            # would read as a Playbook that had never been edited at all.
+            self.assertEqual(
+                [self.playbook_sha],
+                [
+                    str(row[0])
+                    for row in self.connection.execute(
+                        "SELECT playbook_sha256 FROM playbook_demotions"
+                        " WHERE playbook_id = $1::uuid",
+                        (self.playbook_id,),
+                    ).rows
+                ],
+            )
 
     def test_a_failing_verdict_demotes_the_playbook_and_says_why(self):
         with self.scratch():
