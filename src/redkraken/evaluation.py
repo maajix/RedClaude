@@ -76,11 +76,14 @@ from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 
 __all__ = [
     "COMMAND",
+    "COST",
+    "COST_FACTS",
     "FACTS",
     "RUN",
     "Route",
     "Served",
     "configuration",
+    "cost",
     "evaluate",
     "origin",
     "route",
@@ -90,9 +93,13 @@ __all__ = [
 
 COMMAND = "playbook"
 RUN = f"{COMMAND} evaluate"
+COST = f"{COMMAND} cost"
 
 #: What this command answers on every path, refused or performed.
 FACTS = ("playbook", "fixture", "route", "repeats", "runs", "verdict")
+
+#: What `cost` answers, on the same terms.
+COST_FACTS = ("route", "repeats", "envelope_tokens", "playbooks", "programs", "tokens")
 
 #: Loopback, which is where a fixture listens when nothing has to reach it from
 #: inside a container. A fixture bound to a routable address would be a synthetic
@@ -135,6 +142,29 @@ MARKED = (
     " WHERE program_id = $1::uuid"
 )
 RECORD = "SELECT record_playbook_test_run($1::uuid, $2, $3::uuid, $4::uuid)::text"
+ENVELOPE = "SELECT cost_reference_tokens FROM scheduler_weights WHERE active"
+
+#: What the corpus still owes, per Playbook, at the text each one ships. The
+#: repeat count is a parameter rather than a scalar subquery so that the number
+#: the report states and the number the arithmetic used are the same read.
+#:
+#: A fixture already run more times than the policy asks is owed nothing rather
+#: than owed a negative, and a run at an older text counts for nothing at all --
+#: `playbook_sha256` is the join, the same way `playbook_test_verdict` reads it.
+OWED = (
+    "WITH bound AS ("
+    "  SELECT p.path, b.kind,"
+    "         (SELECT count(*) FROM playbook_test_runs r"
+    "           WHERE r.playbook_id = p.id"
+    "             AND r.playbook_sha256 = p.source_sha256"
+    "             AND r.fixture_id = b.fixture_id) AS filed"
+    "    FROM playbooks p, LATERAL playbook_fixture_binding(p.id) b)"
+    " SELECT path, count(*)::bigint,"
+    "        sum(least(filed, $1::bigint))::bigint,"
+    "        sum(greatest($1::bigint - filed, 0)"
+    "            * CASE WHEN kind = 'own_pair' THEN 2 ELSE 1 END)::bigint"
+    "   FROM bound GROUP BY path ORDER BY path"
+)
 VERDICT = "SELECT verdict, reason FROM playbook_test_verdict($1::uuid, NULL)"
 
 #: Budgets a fixture evaluation runs under. Small on purpose and not
@@ -544,6 +574,116 @@ def evaluate(
             ledger.hold("verdict", f"{verdict[0][0]}: {verdict[0][1]}")
 
     return report(RUN, ledger, **answers)
+
+
+def cost(
+    settings: pg.Settings,
+    *,
+    boundary: isolation.AgentContainer | None = None,
+) -> Report:
+    """What grading the whole shipped corpus would cost, before any of it runs.
+
+    Ticket 84 asks for the cost stated before the campaign starts, and the
+    reason it asks is that every repeat is a real Agent run: the number here is
+    not how long a query takes, it is how many autonomous sessions an operator
+    is about to pay for. So it is counted off the two things the verdict counts
+    off -- `playbook_fixture_binding` and `playbook_test_policy` -- and it
+    discounts what is already filed at the text each Playbook ships, because a
+    corpus half graded owes half a campaign.
+
+    The unit is tokens, which is what this harness reserves in: 023 says the
+    scarce resource is rate-limit budget rather than dollars, and
+    `scheduler_weights.cost_reference_tokens` is the envelope one Agent run is
+    ranked against. What is reported is therefore the reservation the campaign
+    implies rather than a bill, and no price is invented to make it one.
+
+    The route is stated with the number because it decides whether the campaign
+    measures anything: `rk playbook evaluate` on a machine that describes no
+    Agent boundary opens each Program and attempts nothing inside it, so a
+    corpus graded that way costs nothing and files zeroes.
+    """
+    ledger = Ledger()
+    answers: dict[str, object] = {
+        "route": None,
+        "repeats": 0,
+        "envelope_tokens": None,
+        "playbooks": [],
+        "programs": 0,
+        "tokens": 0,
+    }
+
+    connection = migrate.open_connection(ledger, settings)
+    if connection is None:
+        return report(COST, ledger, **answers)
+
+    with connection:
+        program.assert_runtime_connection(ledger, connection)
+        if ledger.violations:
+            return report(COST, ledger, **answers)
+
+        taken = route(ledger, boundary)
+        if taken is None:
+            return report(COST, ledger, **answers)
+        answers["route"] = taken.name
+        ledger.hold(
+            "route",
+            f"the campaign would run over the {taken.name} route"
+            + (
+                f", dialling each fixture at {taken.host} through the door"
+                if taken.name == DOOR
+                else ", where a Program is opened and nothing is attempted in it, "
+                "so what it would file is zeroes"
+            ),
+        )
+
+        repeats = int(str(connection.execute(REPEATS).scalar()))
+        answers["repeats"] = repeats
+        ledger.hold(
+            "policy",
+            f"{repeats} repeat(s) of every fixture in a Playbook's binding, "
+            "from playbook_test_policy",
+        )
+
+        envelope = connection.execute(ENVELOPE).scalar()
+        if envelope is None:
+            ledger.fail(
+                "envelope",
+                "no scheduler_weights row is active, so there is no envelope an "
+                "Agent run reserves and no cost this campaign can be stated in",
+                code=INVALID_CONFIGURATION,
+                source="table:scheduler_weights",
+            )
+            return report(COST, ledger, **answers)
+        answers["envelope_tokens"] = int(str(envelope))
+
+        owed = [
+            {
+                "playbook": str(path),
+                "fixtures": int(str(fixtures)),
+                "repeats_filed": int(str(filed)),
+                "programs": int(str(programs)),
+            }
+            for path, fixtures, filed, programs in connection.execute(OWED, (repeats,)).rows
+        ]
+        answers["playbooks"] = owed
+        answers["programs"] = sum(int(one["programs"]) for one in owed)
+        answers["tokens"] = int(answers["programs"]) * int(answers["envelope_tokens"])
+
+        ledger.hold(
+            "corpus",
+            f"{len(owed)} Playbook(s) against "
+            f"{max((int(one['fixtures']) for one in owed), default=0)} bound fixture(s) each, "
+            f"{sum(int(one['repeats_filed']) for one in owed)} of the required repeat(s) "
+            "already filed at the text they ship",
+        )
+        ledger.hold(
+            "cost",
+            f"{answers['programs']} Agent run(s) still owed, reserving "
+            f"{answers['tokens']} token(s) against the {answers['envelope_tokens']}-token "
+            "envelope one run is ranked against",
+        )
+
+    return report(COST, ledger, **answers)
 
 
 def _nameable(ledger: Ledger, subject: Subject, repeats: int) -> bool:

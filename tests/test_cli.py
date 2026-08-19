@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 import redkraken
-from redkraken import cli, evaluation, migrate, operator, pg, verifier
+from redkraken import cli, evaluation, execution, migrate, operator, pg, verifier
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -1971,6 +1971,75 @@ class PlaybookCommandTest(unittest.TestCase):
 
         self.assertNotIn("s3cr3t-runtime", result.stdout)
         self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+
+class PlaybookCostCommandTest(unittest.TestCase):
+    """`rk playbook cost`: what the corpus campaign costs, before it is started.
+
+    Ticket 84 wants the cost stated before the run, so this takes no argument at
+    all beyond the store it reads: the number is a property of the corpus the
+    database digested and the policy it carries, and an operator who could pass
+    a repeat count or a Playbook list could state a cost the campaign then does
+    not honour.
+    """
+
+    def test_the_store_is_the_only_thing_named_by_the_environment(self):
+        result = run("playbook", "cost")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("playbook cost", report["command"])
+        self.assertEqual(
+            ["environment:RK_DATABASE_URL"],
+            [item["source"] for item in report["violations"]],
+        )
+
+    def test_the_same_facts_are_answered_on_a_path_that_counts_nothing(self):
+        result = run("playbook", "cost", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            ["envelope_tokens", "playbooks", "programs", "repeats", "route", "tokens"],
+            sorted(set(report) & set(evaluation.COST_FACTS)),
+        )
+        self.assertEqual([], report["playbooks"])
+        self.assertEqual(0, report["programs"])
+        self.assertEqual(0, report["tokens"])
+
+    def test_a_database_nobody_answers_at_is_its_own_class(self):
+        result = run("playbook", "cost", "--url", "postgresql://rk2@127.0.0.1:1/rk2")
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, result.returncode)
+        self.assertEqual("playbook cost", json.loads(result.stdout)["command"])
+
+    def test_the_connection_string_is_never_echoed_back(self):
+        result = run(
+            "playbook", "cost", "--url", "postgresql://rk2:s3cr3t-runtime@127.0.0.1:1/rk2"
+        )
+
+        self.assertNotIn("s3cr3t-runtime", result.stdout)
+        self.assertNotIn("s3cr3t-runtime", result.stderr)
+
+    def test_a_boundary_described_in_part_is_refused_before_the_store_is_read(self):
+        """The half-described boundary `_slice` refuses, asked of the command
+        that opens no Program: a cost stated for the door route on a machine
+        that cannot reach the door is a cost for a campaign that will not run."""
+        result = subprocess.run(
+            [sys.executable, "-m", "redkraken", "playbook", "cost"],
+            cwd=str(ROOT),
+            env={**environment(), execution.IMAGE: "rk2-agent:test"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.returncode)
+        report = json.loads(result.stdout)
+        self.assertEqual("playbook cost", report["command"])
+        self.assertEqual(
+            ["environment:RK_AGENT_NETWORK"],
+            [item["source"] for item in report["violations"]],
+        )
 
 
 class InterruptedCommandTest(unittest.TestCase):

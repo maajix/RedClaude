@@ -28,6 +28,7 @@ from redkraken import (
     execution,
     header,
     identity,
+    isolation,
     legacy,
     migrate,
     oob,
@@ -1449,6 +1450,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluating.set_defaults(run=_playbook_evaluate)
 
+    costing = grading.add_parser(
+        "cost",
+        help=(
+            "state what grading the shipped corpus costs before any of it runs: "
+            "the Agent runs still owed at the text each Playbook ships, and the "
+            f"budget they reserve (${DATABASE_URL})"
+        ),
+    )
+    _add_url(costing, RUNTIME)
+    costing.set_defaults(run=_playbook_cost)
+
     reports = commands.add_parser(
         "report", help="render what holds, for a Finding or for a kill chain"
     )
@@ -2115,6 +2127,25 @@ def _playbook_evaluate(arguments: argparse.Namespace) -> int:
     )
 
 
+def _playbook_cost(arguments: argparse.Namespace) -> int:
+    """State the corpus campaign's cost, and the route it would be run over.
+
+    The boundary is read for the same reason `rk playbook evaluate` reads it and
+    the agent connection is not read at all: no Program is opened here, so there
+    is nothing for the agent role to hold, but which route the campaign would
+    take decides whether the runs it is about to pay for measure anything.
+    """
+    ledger = Ledger()
+    boundary = _boundary(ledger)
+    if ledger.violations:
+        return _render(report(evaluation.COST, ledger))
+    return _with_settings(
+        arguments,
+        evaluation.COST,
+        lambda settings: evaluation.cost(settings, boundary=boundary),
+    )
+
+
 def _nothing(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
     """The work a machine with no Agent boundary does inside an open Program.
 
@@ -2131,8 +2162,14 @@ def _nothing(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict
     return {}
 
 
-def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | None:
-    """The execution slice this machine is configured for, or nothing."""
+def _boundary(ledger: Ledger) -> isolation.AgentContainer | None:
+    """The Agent boundary this machine describes, or nothing.
+
+    A boundary described in part is a refusal rather than nothing, and the
+    difference matters to every caller: a machine that describes none has asked
+    for the path where children are not started, and one that describes half of
+    one has asked for children and mis-said how to contain them.
+    """
     if not execution.requested(os.environ):
         return None
     boundary, missing = execution.boundary(os.environ)
@@ -2145,6 +2182,13 @@ def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | N
             code=INVALID_CONFIGURATION,
             source=f"environment:{missing[0]}",
         )
+    return boundary
+
+
+def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | None:
+    """The execution slice this machine is configured for, or nothing."""
+    boundary = _boundary(ledger)
+    if boundary is None:
         return None
     agent = _url(ledger, AGENT, arguments.state_url, program.COMMAND)
     if agent is None:

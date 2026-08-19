@@ -39453,8 +39453,15 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         #: where it happened.
         cls.attempts = []
         cls.reports = {}
+        #: What the corpus owed before this class graded anything, and after.
+        #: Read around the evaluations rather than asserted as a constant: the
+        #: campaign's size is a property of two corpora that grow with every
+        #: ticket that ships a Playbook or a fixture, and what this class can
+        #: state about it is the difference its own runs made.
+        cls.owed_before = evaluation.cost(cls.harness.runtime)
         for fixture_id in (cls.OWN, cls.OUT):
             cls.reports[fixture_id] = cls.evaluate(fixture_id)
+        cls.owed_after = evaluation.cost(cls.harness.runtime)
         # Read from the first report rather than at the end: the verdict after
         # one fixture is a different answer from the verdict after both, and it
         # is the answer a single `rk playbook evaluate` gives an operator.
@@ -39933,6 +39940,53 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
         )
         self.assertIn(absent, answered["violations"][0]["detail"])
         self.assertEqual(before, self.opened())
+
+    def test_the_corpus_campaign_states_its_size_before_anything_is_graded(self):
+        """PH2-84 criterion 5's second half: the cost, stated before the run.
+
+        Every number is derived from a corpus this test does not restate, and
+        the one relation asserted is the one that makes it a cost rather than a
+        count: the campaign reserves one Agent-run envelope per Agent run.
+        """
+        facts = self.owed_before.facts
+
+        self.assertEqual((), self.owed_before.violations)
+        self.assertEqual(evaluation.LOOPBACK, facts["route"])
+        self.assertEqual(
+            [len(playbook.PLAYBOOKS)],
+            [len(facts["playbooks"])],
+        )
+        self.assertEqual(
+            {len(fixture.FIXTURES)},
+            {one["fixtures"] for one in facts["playbooks"]},
+        )
+        self.assertEqual(
+            facts["programs"] * facts["envelope_tokens"], facts["tokens"]
+        )
+
+    def test_the_repeats_this_class_filed_are_off_what_the_corpus_still_owes(self):
+        """The discount, which is what makes the number a campaign and not a
+        catalogue. Two fixtures at three repeats each, both halves of every
+        repeat: twelve Agent runs the corpus no longer owes, all of them on the
+        one Playbook this class grades and none of them on any other."""
+        before = {one["playbook"]: one for one in self.owed_before.facts["playbooks"]}
+        after = {one["playbook"]: one for one in self.owed_after.facts["playbooks"]}
+
+        self.assertEqual(
+            12, self.owed_before.facts["programs"] - self.owed_after.facts["programs"]
+        )
+        self.assertEqual(12, before[self.SHIPPED]["programs"] - after[self.SHIPPED]["programs"])
+        self.assertEqual(
+            6, after[self.SHIPPED]["repeats_filed"] - before[self.SHIPPED]["repeats_filed"]
+        )
+        self.assertEqual(
+            [],
+            [
+                path
+                for path in before
+                if path != self.SHIPPED and before[path] != after[path]
+            ],
+        )
 
     def rk(self, *arguments: str, **environment: str) -> dict:
         """One shipped command as an operator runs it, and its report read.
