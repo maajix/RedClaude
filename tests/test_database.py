@@ -14236,8 +14236,20 @@ class ArchiveTest(DatabaseCase):
         assert provisioned.ok, provisioned.violations
         cls.target = cls.harness.restore.replace(database=RESTORED)
         cls.archive = scratch() / "rk2.dump"
-        cls.written = backup.dump(cls.harness.migrate, cls.archive)
-        cls.read = backup.restore(cls.target, cls.archive)
+        # Evidence bytes, filed the way a tool run files them, because the rows
+        # an archive carries point at files by hash: a backup of the rows alone
+        # restores a database whose every citation names a file nobody has.
+        cls.root = scratch() / "store"
+        cls.restored_root = scratch() / "restored-store"
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.artifact = artifact.filed(
+                cls.connection, Store(cls.root), cls.program, ARCHIVE_BYTES,
+                kind="tool_output",
+            )["sha256"]
+        cls.written = backup.dump(cls.harness.migrate, cls.archive, store=cls.root)
+        cls.read = backup.restore(cls.target, cls.archive, store=cls.restored_root)
 
     @classmethod
     def tearDownClass(cls):
@@ -14248,6 +14260,10 @@ class ArchiveTest(DatabaseCase):
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL app.purging = 'on'")
             cls.connection.execute("DELETE FROM programs WHERE slug = $1", (ARCHIVE_SLUG,))
+            # `artifacts` is program-global, so the cascade cannot reach it: the
+            # reference goes with the Program and the bytes' row would outlive
+            # every case that knows why it is there.
+            cls.connection.execute("DELETE FROM artifacts WHERE sha256 = $1", (cls.artifact,))
         super().tearDownClass()
 
     def test_the_archive_is_written_and_identified_by_its_bytes(self):
@@ -14257,10 +14273,55 @@ class ArchiveTest(DatabaseCase):
         self.assertEqual(64, len(self.written.facts["sha256"]))
 
     def test_an_existing_archive_is_never_overwritten(self):
-        again = backup.dump(self.harness.migrate, self.archive)
+        again = backup.dump(self.harness.migrate, self.archive, store=self.root)
 
         self.assertEqual(EXIT_INVALID_CONFIGURATION, again.exit_code)
         self.assertIn("already exists", again.violations[0].detail)
+
+    def test_the_artifact_bytes_travel_beside_the_archive(self):
+        self.assertEqual(str(backup.beside(self.archive)), self.written.facts["store"])
+        self.assertEqual(1, self.written.facts["stored"])
+        self.assertEqual(
+            backup.beside(self.archive).stat().st_size, self.written.facts["store_bytes"]
+        )
+        self.assertEqual(64, len(self.written.facts["store_sha256"]))
+
+    def test_the_restore_puts_the_bytes_back_where_it_was_pointed(self):
+        filed = self.restored_root / self.artifact[:2] / self.artifact
+
+        self.assertEqual(ARCHIVE_BYTES, filed.read_bytes())
+
+    def test_the_restored_database_can_open_every_artifact_it_names(self):
+        # The claim the whole pair of files is for, and the only one that is
+        # about both halves at once: the restore's own gate held the restored
+        # rows against the restored bytes and found nothing it could not open.
+        held = self.read.facts["artifacts"]
+
+        self.assertTrue(held["sound"], held)
+        self.assertEqual([], held["broken"])
+        self.assertGreaterEqual(held["verified"], 1)
+        self.assertEqual(str(self.restored_root), held["root"])
+
+    def test_a_dump_that_would_leave_the_evidence_behind_is_refused(self):
+        # Refused rather than warned. An operator who takes this backup finds
+        # out at the restore otherwise, which is the one moment the database it
+        # was taken from is already gone.
+        alone = backup.dump(self.harness.migrate, scratch() / "alone.dump")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, alone.exit_code)
+        self.assertIn("no store was given", alone.violations[0].detail)
+
+    def test_the_gate_every_migration_ends_with_opens_the_store_it_was_given(self):
+        # The other half of the same defect: a restore repairs itself by running
+        # `rk db migrate` again, and a gate that never opened the root would
+        # report a database as sound while its evidence was unreadable.
+        empty = scratch() / "emptied"
+        empty.mkdir()
+
+        blind = migrate.migrate(self.target, store=empty)
+
+        self.assertFalse(blind.ok)
+        self.assertIn(self.artifact[:12], str(blind.facts["artifacts"]["broken"]))
 
     def test_a_target_that_already_holds_something_is_refused(self):
         # Refused before `pg_restore` runs, so what the operator reads is which
@@ -14434,6 +14495,10 @@ class ArchiveTest(DatabaseCase):
 
         self.assertIn("app.actor_kind is unset", refusal.exception.primary)
 
+
+#: What the archive has to carry that is not a row: bytes filed under their
+#: own hash, which every citation in the restored database points at by name.
+ARCHIVE_BYTES = b"the tool output a restored finding cites\n"
 
 #: The Program the fingerprint case opens. One Program holding both twins,
 #: because two Programs would make "the same surface" a claim about isolation

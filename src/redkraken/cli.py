@@ -1892,6 +1892,13 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate", help=f"apply every pending migration, then verify (${MIGRATE_URL})"
     )
     _add_url(migrate_, MIGRATION)
+    _add_root(
+        migrate_,
+        help=(
+            "the store the closing gate holds every recorded artifact against "
+            f"(default: ${ARTIFACTS.variable})"
+        ),
+    )
     migrate_.set_defaults(run=_migrate)
 
     verify = operations.add_parser(
@@ -1916,6 +1923,14 @@ def build_parser() -> argparse.ArgumentParser:
     dump = operations.add_parser("dump", help=f"write a full archive (${MIGRATE_URL})")
     _add_url(dump, MIGRATION)
     dump.add_argument("--to", type=Path, required=True, metavar="path", help="where to write it")
+    _add_root(
+        dump,
+        help=(
+            f"the artifact bytes to carry beside the archive, as <path>{backup.STORE_SUFFIX}; "
+            "a database that references any and no store given is refused "
+            f"(default: ${ARTIFACTS.variable})"
+        ),
+    )
     dump.set_defaults(run=_dump)
 
     restore = operations.add_parser(
@@ -1923,6 +1938,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_url(restore, RESTORATION)
     restore.add_argument("--from", dest="archive", type=Path, required=True, metavar="path")
+    _add_root(
+        restore,
+        help=(
+            f"where to unpack <path>{backup.STORE_SUFFIX} before the gate runs "
+            f"(default: ${ARTIFACTS.variable})"
+        ),
+    )
     restore.set_defaults(run=_restore)
 
     return parser
@@ -3082,7 +3104,12 @@ def _provision(arguments: argparse.Namespace) -> int:
 
 
 def _migrate(arguments: argparse.Namespace) -> int:
-    return _with_settings(arguments, "db migrate", migrate.migrate)
+    # Not refused when absent, for `_verify`'s reason: the gate has an answer
+    # either way, and an operator with no store still has a corpus to apply.
+    store = artifact.root_from_environment(arguments.artifacts)
+    return _with_settings(
+        arguments, "db migrate", lambda settings: migrate.migrate(settings, store=store)
+    )
 
 
 def _verify(arguments: argparse.Namespace) -> int:
@@ -3100,14 +3127,21 @@ def _status(arguments: argparse.Namespace) -> int:
 
 
 def _dump(arguments: argparse.Namespace) -> int:
+    # Absent is a question the operation answers rather than one refused here:
+    # a database that references no artifact has a whole backup without a store,
+    # and one that references any does not. Only the command can tell which.
+    store = artifact.root_from_environment(arguments.artifacts)
     return _with_settings(
-        arguments, "db dump", lambda settings: backup.dump(settings, arguments.to)
+        arguments, "db dump", lambda settings: backup.dump(settings, arguments.to, store=store)
     )
 
 
 def _restore(arguments: argparse.Namespace) -> int:
+    store = artifact.root_from_environment(arguments.artifacts)
     return _with_settings(
-        arguments, "db restore", lambda settings: backup.restore(settings, arguments.archive)
+        arguments,
+        "db restore",
+        lambda settings: backup.restore(settings, arguments.archive, store=store),
     )
 
 

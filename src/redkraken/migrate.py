@@ -402,12 +402,20 @@ def provision(
     )
 
 
-def migrate(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
+def migrate(
+    settings: pg.Settings, *, corpus: Path = CORPUS, store: Path | None = None
+) -> Report:
     """Apply every pending migration, then make the run's invariants true.
 
     Rerunning is the ordinary case: with nothing pending the finalizers and the
     integrity gate still run, which is what makes a restored database repairable
     by the same command that built it.
+
+    A store root, when this run was given one, is what the gate at the end holds
+    the recorded artifacts against. Optional because a database with no store
+    beside it is a database this command still has to be able to migrate, and
+    passed through because the alternative is a gate that ends every run by not
+    asking the one question no registered check can ask.
     """
     migrations, refusals = load(corpus)
     ledger = Ledger()
@@ -487,7 +495,7 @@ def migrate(settings: pg.Settings, *, corpus: Path = CORPUS) -> Report:
             # Inside the lock, on a connection of its own: a gate that ran after
             # letting go would be answering for a database another runner may
             # already be changing.
-            facts = gate_on_a_fresh_connection(ledger, settings, migrations)
+            facts = gate_on_a_fresh_connection(ledger, settings, migrations, store=store)
 
     return report(
         "db migrate",
@@ -585,6 +593,7 @@ def gate_on_a_fresh_connection(
     ledger: Ledger,
     settings: pg.Settings,
     migrations: tuple[Migration, ...],
+    store: Path | None = None,
 ) -> dict[str, object]:
     """Run the integrity gate the way the next connection will see the database.
 
@@ -596,13 +605,19 @@ def gate_on_a_fresh_connection(
     The gate's own answers are returned rather than folded into the ledger,
     because how many checks ran is the number that says whether "the gate
     passed" means anything.
+
+    The store is the half of the check no registered checker can run: a hash in
+    a table names bytes on a filesystem, and SQL cannot open one. Both callers
+    end a command that has just rewritten the database -- a migration and a
+    restore -- which is exactly where an artifact that has gone missing must
+    stop being a thing only `rk artifact audit` would ever notice.
     """
     connection = open_connection(ledger, settings)
     if connection is None:
         return {}
     with connection:
         gate = integrity.verify(
-            connection, expected=[item.identity for item in migrations]
+            connection, expected=[item.identity for item in migrations], store=store
         )
     ledger.assertions.extend(gate.assertions)
     ledger.violations.extend(gate.violations)
