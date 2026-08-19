@@ -57,7 +57,7 @@ not shown.
 ## What was built
 
 `baseline/multiagent-modes.tsv` is the answer, and everything below is what one
-of its seven rows cites. One row per mode, with a verdict from a closed set --
+of its eight rows cites. One row per mode, with a verdict from a closed set --
 `measured`, `enforced`, `reproduced`, `not_reproduced` -- the mechanism that
 earned it, and the test that is the run. `tests/test_modes.py` imports every
 cited run and looks it up, so a record whose citations went stale fails the
@@ -65,15 +65,26 @@ suite rather than being discovered a year later by somebody reading the file.
 A `reproduced` row has to name a ticket in its note, which is the criterion
 about gaps being tickets rather than paragraphs, enforced on the record itself.
 
-**Correlated choice is measured.** `wave_report(uuid)` counts what a Program's
-agents came back with -- distinct subjects, distinct Property classes, distinct
-claims -- against how many of them ran, off the `hypothesis_provenance` rows
+**Correlated choice is measured.** `wave_report(uuid)` counts what one wave came
+back with -- distinct subjects, distinct Property classes, distinct claims --
+against how many agents were in it, off the `hypothesis_provenance` rows
 20260814T070000Z has written since Hypotheses became promotable. Nothing new is
-recorded to make the measurement possible, and a Program whose wave never
-happened reads as zeroes rather than as a missing table. `panels.WAVE` puts the
-five numbers on the operator console. `WaveMeasurementTest` promotes through the
-real proposal path from four distinct agent runs: four agents, two subjects, two
-Property classes, three claims. The measurement is emitted, not described.
+recorded to make the measurement possible, and a wave that came back with
+nothing reads as zeroes rather than as a missing table.
+
+The wave is the window, computed before anything is counted in it: a
+gaps-and-islands walk over the run intervals, where a run that starts at or
+after the latest end so far opens a new wave and one that starts before it joins
+the one running, and the report is the last wave's. Without that the four counts
+would describe an engagement's lifetime and the ratio would be one no wave ever
+had. `agents run` is the wave's size and `peak concurrent` is its own maximum,
+so four agents that were never more than two at a time read as what they were.
+
+`panels.WAVE` puts the five numbers on the operator console.
+`WaveMeasurementTest` promotes through the real proposal path from four distinct
+agent runs: four agents, two subjects, two Property classes, three claims -- in
+a Program that also holds a fifth hunter and a fourth claim from a wave that
+ended two hours earlier, which the report does not count.
 
 **The duplicate is refused at the claim.** `subject_held_for(tasks)` is a new
 arm of `claimable_for`, between `lane_full` and `global_subagent_cap`: a Task
@@ -84,8 +95,12 @@ subject or no Task, and the moment the first run ends the same Task is claimable
 again. Asking the model to diversify is asking the thing that is correlated to
 correct its own correlation.
 
-The key includes `kind` because a `validate` and a `hunt` over one subject are
-not the same work. It is not the same key as `tasks_live_dedup_idx`, and the
+The key includes `kind`, which the criterion does not: a `validate` and a `hunt`
+over one subject are not the same work, and refusing the validate for the hunt
+that raised it would stop the Test the claim exists to run. A NULL Property
+class compares as a value rather than being skipped, so two recon Tasks over one
+Entity collide -- two agents looking at one thing is what the criterion is
+about, whether or not either of them carries a Hypothesis yet. It is not the same key as `tasks_live_dedup_idx`, and the
 difference is the finding: that index is unique over
 `(program_id, kind, subject_entity_id, hypothesis_id, finding_id)`, so it
 already refused two live Tasks naming one Hypothesis. What it admits is two
@@ -122,14 +137,25 @@ is no group here whose belief could displace a private fact. The enforcement is
 recorded as its own row rather than folded into that one, because what is
 enforced is the packet and what is unreachable is the mode.
 
-**Turf wars split in two.** The workspace half is not reproduced: every child
+**Turf wars split in three.** The privilege half is not reproduced: every child
 runs `--read-only` as uid 65534 with `cap-drop ALL`, `no-new-privileges`, a
-tmpfs scratch of its own and no engine socket, the only writable host state is
-what the runtime mounts, and the canonical rows are written through verbs the
-database authorises per Program. There is no path from one child to another's
-filesystem, process table or credential.
+tmpfs scratch of its own, no engine socket and no shared PID namespace, and the
+canonical rows are written through verbs the database authorises per Program.
+There is no account to disable and no process of another child to signal.
 
-The network half is reproduced, and it is the one gap this ticket found.
+The workspace half is reproduced, and it needs no privilege at all.
+`RK_AGENT_HOME` is one host directory per installation, `isolation._supplied`
+carries it as the one row of that table that is not read-only, and every child
+is told it is `HOME` -- so two children that run at once are two agents with one
+writable directory between them.
+`test_two_children_running_at_once_read_and_write_one_home` launches both
+through a barrier inside the launch call, after each has passed `one_peer` and
+before either has attached, and each writes a file the other reads while both
+are still running. That is the paper's planted code in the smallest form this
+harness can be asked about. Ticket 86 is where it is answered.
+
+The network half is reproduced too, and it is the gap that needs the two
+children to overlap.
 `isolation.run` calls `one_peer`, which refuses if anything but the door is on
 the Agent network, and then starts a container on that network. It is a
 check-then-act, the engine holds nothing between the two, and `RK_AGENT_NETWORK`
@@ -139,8 +165,8 @@ every route across itself.
 `test_a_peer_that_arrives_after_the_check_is_reachable_by_the_child` shows it
 deterministically rather than by racing: the peer is attached inside the launch
 call, after `one_peer` has returned, and the child comes up and reaches it.
-Ticket 85 is where that is answered; the test says in its own docstring that it
-exists to record the gap and should not outlive it.
+Ticket 85 is where that is answered; both gap tests say in their own docstrings
+that they exist to record a gap and should not outlive it.
 
 `check_wave_measurement()` holds all of it from the standing side: neither wave
 function is reachable from a connection an agent holds, `subject_held_for` reads

@@ -866,17 +866,19 @@ harness.
 _Avoid_: Lock file, checksum file, SBOM, build info, version stamp
 
 **Wave**:
-The agents of one Program that ran at once, counted by what they came back with
-rather than by what they cost: how many distinct subjects, Property classes and
-claims reached the record, against how many agents ran. It is a measurement and
-not a control, because the failure it is about -- instances of one model reading
-one Surface and deciding alike -- is invisible from inside any one run. Where a
-wave doubles up, the scheduler refuses rather than the model being asked to
-diversify: a second claim on a subject and Property class another claim already
-holds is declined while that one runs and admitted the moment it ends. A Program
-whose agents came back with nothing is zeroes, which is a reading and not a gap.
+One busy period of a Program's agents: the runs that overlap, and the runs that
+overlap those. It is counted by what it came back with rather than by what it
+cost -- how many distinct subjects, Property classes and claims reached the
+record, against how many agents were in it -- and a run that started after the
+last one ended belongs to the next wave rather than this one, so an engagement's
+earlier waves are not read as the one running now. It is a measurement and not a
+control, because the failure it is about -- instances of one model reading one
+Surface and deciding alike -- is invisible from inside any one run. Where a wave
+doubles up, the scheduler refuses rather than the model being asked to diversify:
+a second claim on a subject and Property class another claim already holds is
+declined while that one runs and admitted the moment it ends. A wave that came
+back with nothing is zeroes, which is a reading and not a gap.
 _Avoid_: Batch, swarm, fan-out, round
-
 
 ## Knowledge
 

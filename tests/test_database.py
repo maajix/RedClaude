@@ -13315,12 +13315,16 @@ class WaveMeasurementTest(DatabaseCase):
     is what the instrument reads on an engagement whose shape is known: four
     hunters, three claims, two of the hunters on the same claim.
 
+    A wave is the busy period and not the engagement, so this Program also holds
+    a fifth hunter that ran and finished two hours before the four started, with
+    a claim of its own. Everything the report says is about the four.
+
     The second Program is the control, and carries the three things the count
-    must not do. Its two runs never overlapped, so a peak is an overlap and not
-    a total. Neither came back with a claim, so a wave that returned nothing
-    reads as zero rather than as nothing at all. And one of its runs holds no
-    Task, which is a supervisor rather than a hunter and is not what "agents
-    run" counts.
+    must not do. Its two runs never overlapped, so they are two waves of one and
+    the report is the later one's. Neither came back with a claim, so a wave that
+    returned nothing reads as zero rather than as nothing at all. And one of its
+    runs holds no Task, which is a supervisor rather than a hunter and is not
+    what "agents run" counts.
 
     Everything writes as `rk2_runtime`. The report is an operator read, and one
     case here proves the agent connection cannot reach it: telling a model how
@@ -13410,6 +13414,23 @@ class WaveMeasurementTest(DatabaseCase):
             summary="a second member's dashboard came back under another member's session",
             control="the owner's own dashboard answered identically twice",
         ))
+
+        # A wave that is over, in the same Program, with a claim of its own. It
+        # is in the record and it is not in the report: what four hunters came
+        # back with is not a count that reaches back into whatever the Program
+        # did an hour ago, and a report that summed the engagement would say a
+        # ratio no wave ever had.
+        cls.runs["epsilon"] = cls.hunter(
+            cls.program_id, kind="recon", role="recon",
+            subject=cls.held["application"],
+        )
+        cls.promote("epsilon", cls.claim(
+            "the dashboard is served to a caller holding no session",
+            subject=cls.held["application"], property_class=ACCESS,
+            summary="the dashboard rendered with no cookie on the request",
+            control="the same dashboard answered identically for its owner",
+        ))
+        cls.ended("epsilon", started="3 hours", finished="2 hours")
 
         # The control Program: two runs that did not overlap, and a third that
         # holds no Task.
@@ -13508,6 +13529,28 @@ class WaveMeasurementTest(DatabaseCase):
                 ).scalar()
             )
         return seeded
+
+    @classmethod
+    def ended(cls, hunter: str, *, started: str, finished: str) -> None:
+        """Move a run and the Task it answers into a wave that is over.
+
+        After the promotion rather than before it: a result is staged against a
+        run that is going, so pushing the interval back once the claim is on
+        record is how this case arranges an earlier wave without a clock to wait
+        for.
+        """
+        held = cls.runs[hunter]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "UPDATE agent_runs SET started_at = now() - $2::interval,"
+                " finished_at = now() - $3::interval WHERE id = $1::uuid",
+                (held["run"], started, finished),
+            )
+            cls.connection.execute(
+                "UPDATE tasks SET status = 'done' WHERE id = $1::uuid",
+                (held["task"],),
+            )
 
     @classmethod
     def promote(cls, hunter: str, payload: dict) -> dict:
@@ -13653,6 +13696,35 @@ class WaveMeasurementTest(DatabaseCase):
             self.reported(self.program_id),
         )
 
+    def test_a_wave_that_ended_is_not_counted_in_the_one_running_now(self):
+        # Five runs and four claims are what this Program has; four and three
+        # are what its last wave came back with. The difference is the fifth
+        # hunter, which ran and finished two hours before any of the four
+        # started -- a lifetime total would read the ratio 5:4 off an engagement
+        # in which no wave of five ever ran.
+        self.assertEqual(
+            (5, 4),
+            tuple(
+                int(value)
+                for value in self.connection.execute(
+                    "SELECT (SELECT count(*) FROM agent_runs a"
+                    "         WHERE a.program_id = $1::uuid AND a.task_id IS NOT NULL),"
+                    "       (SELECT count(DISTINCT hp.hypothesis_id)"
+                    "          FROM hypothesis_provenance hp"
+                    "         WHERE hp.program_id = $1::uuid)",
+                    (self.program_id,),
+                ).rows[0]
+            ),
+        )
+        self.assertEqual(
+            [("agents run", 4), ("distinct claims", 3)],
+            [
+                measured
+                for measured in self.reported(self.program_id)
+                if measured[0] in ("agents run", "distinct claims")
+            ],
+        )
+
     def test_a_claim_two_hunters_reached_carries_both_of_their_names(self):
         # The trail is per proposal and the count is per claim: two rows behind
         # one Hypothesis, the second of them marked as the one that converged.
@@ -13669,12 +13741,14 @@ class WaveMeasurementTest(DatabaseCase):
         )
 
     def test_a_program_whose_hunters_came_back_with_nothing_reads_as_zero(self):
-        # Two runs that never overlapped are a peak of one, and a run holding no
-        # Task is a supervisor rather than a hunter. None of the first Program's
-        # four is counted here, which is the other half of what this asserts.
+        # Two runs that never overlapped are two waves of one and not one wave
+        # of two, so the last wave is the later run alone. A run holding no Task
+        # is a supervisor rather than a hunter and is in neither. None of the
+        # first Program's five is counted here, which is the other half of what
+        # this asserts.
         self.assertEqual(
             [
-                ("agents run", 2),
+                ("agents run", 1),
                 ("peak concurrent", 1),
                 ("distinct subjects", 0),
                 ("distinct property classes", 0),

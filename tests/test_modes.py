@@ -14,7 +14,6 @@ cited run passes: the suite is what says that, and asking it here would mean
 this file starting a database.
 """
 
-import csv
 import importlib
 import unittest
 
@@ -34,9 +33,15 @@ VERDICTS = {"measured", "enforced", "reproduced", "not_reproduced"}
 
 
 def rows() -> list[dict[str, str]]:
-    """The record, as one dictionary per mode."""
-    with MODES.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
+    """The record, as one dictionary per mode, off the reader the gates use.
+
+    The same `table_rows` the shape test reads and not a second parser beside
+    it: two readers over one file is two answers to whether a row is well
+    formed, and the shape test only holds for the reader it happens to be
+    asking.
+    """
+    [header, *body] = table_rows(MODES)
+    return [dict(zip(header, row)) for row in body]
 
 
 class ModesRecordTest(unittest.TestCase):
@@ -63,15 +68,16 @@ class ModesRecordTest(unittest.TestCase):
     def test_every_mode_the_ticket_measured_is_here(self):
         """The four modes the paper names, against the rows that answer them.
 
-        Named rather than counted: a record that lost the flooding row would
-        still have seven rows if somebody added an eighth, and the criterion is
+        Named rather than counted: a record that lost the flooding row still
+        has as many rows the day somebody adds another, and the criterion is
         about the four modes rather than about the size of the file.
         """
         self.assertEqual(
             [],
             sorted(
                 {"correlated_choice", "correlated_duplicate", "resource_flooding",
-                 "consensus_over_evidence", "turf_wars_network"}
+                 "consensus_over_evidence", "turf_wars_workspace",
+                 "turf_wars_network"}
                 - {row["mode"] for row in self.rows}
             ),
         )

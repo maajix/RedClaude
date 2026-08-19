@@ -8,9 +8,11 @@ import os
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import unittest
 import uuid
+from concurrent import futures
 from pathlib import Path
 from unittest import mock
 
@@ -485,13 +487,14 @@ class AgentContainerIsolationTest(unittest.TestCase):
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
 
-    def boundary(self, *, network: str | None = None) -> isolation.AgentContainer:
+    def boundary(self, *, network: str | None = None, **supplied) -> isolation.AgentContainer:
         """The described boundary, with the names of things that exist."""
         return fixtures.boundary(
             network=network or self.agent_network,
             proxy_container=self.proxy,
             proxy_url=f"http://{self.proxy}:18080",
             certificate=self.authority.certificate,
+            **supplied,
         )
 
     def test_only_the_proxy_is_reachable_and_only_the_run_root_is_installed(self):
@@ -630,6 +633,105 @@ print(json.dumps({'arrived': reaches(%r, 18081)}))
         self.assertEqual([arriving], attached)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(json.loads(result.stdout)["arrived"])
+
+    def test_two_children_running_at_once_read_and_write_one_home(self):
+        """Ticket 80, criterion 5: the workspace half, measured rather than assumed.
+
+        What separates two children is real and is listed in the row beside this
+        one: read-only root, uid 65534, cap-drop ALL, no engine socket, and a
+        scratch tmpfs each. What is not separated is `RK_AGENT_HOME`. It is one
+        host directory per installation, it crosses writable because the CLI
+        keeps session state in it, and every child is told it is `HOME`.
+
+        So two children that run at once are two agents with one writable
+        directory between them. This starts both and has each write a file and
+        wait for the other's, which is the paper's "planted code disguised as
+        another agent's" in the smallest form that can be asserted: what one
+        wrote, the other read, while both were running.
+
+        Both are launched through a barrier in the launch call itself, after
+        each has passed `one_peer` and before either has attached, because the
+        boundary check refuses a second child that is already up -- that refusal
+        is the network half of this mode and ticket 85's subject, and this test
+        is about the home rather than about the network.
+
+        Ticket 86 is where the home is answered.
+        """
+        home = Path(tempfile.mkdtemp(prefix="rk2-home-", dir=self.root))
+        # The mode the runtime demands of a home: the child is a user this
+        # machine has no name for, so a directory only the operator can write is
+        # refused before anything starts.
+        home.chmod(0o777)
+        probe = fixtures.PROBE + """
+import sys, time
+
+mine, theirs = sys.argv[1], sys.argv[2]
+home = os.environ['HOME']
+started = time.time()
+with open(os.path.join(home, mine), 'w') as handle:
+    handle.write('the session state of ' + mine)
+
+read = ''
+deadline = time.monotonic() + 25
+while time.monotonic() < deadline:
+    try:
+        with open(os.path.join(home, theirs)) as handle:
+            read = handle.read()
+        break
+    except OSError:
+        time.sleep(0.1)
+
+print(json.dumps({
+    'home': home,
+    'read': read,
+    'listed': sorted(os.listdir(home)),
+    'started': started,
+    'ended': time.time(),
+}))
+"""
+        # Neither child starts until both have passed the boundary check, so
+        # this is the same window ticket 85 names rather than a race this test
+        # would sometimes lose.
+        gate = threading.Barrier(2, timeout=60)
+        launch = isolation.subprocess.run
+
+        def paired(command, **keywords):
+            if len(command) > 1 and command[1] == "run":
+                gate.wait()
+            return launch(command, **keywords)
+
+        def child(mine: str, theirs: str):
+            return isolation.run(
+                self.boundary(home=home),
+                ("python3", "-c", probe, mine, theirs),
+                timeout=60,
+            )
+
+        with mock.patch.object(isolation.subprocess, "run", paired):
+            with futures.ThreadPoolExecutor(max_workers=2) as pool:
+                both = [
+                    pool.submit(child, "first", "second"),
+                    pool.submit(child, "second", "first"),
+                ]
+                results = [running.result() for running in both]
+
+        for result in results:
+            self.assertEqual(0, result.returncode, result.stderr)
+        facts = [json.loads(result.stdout) for result in results]
+
+        self.assertEqual(
+            ["the session state of second", "the session state of first"],
+            [seen["read"] for seen in facts],
+        )
+        for seen in facts:
+            self.assertEqual(isolation.HOME_DIR, seen["home"])
+            self.assertEqual(["first", "second"], seen["listed"])
+        # Both were going while it happened: each only stopped once it had the
+        # other's file, so the windows overlap rather than queue.
+        self.assertLess(
+            max(seen["started"] for seen in facts),
+            min(seen["ended"] for seen in facts),
+        )
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that

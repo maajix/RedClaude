@@ -11,9 +11,9 @@
 -- Two functions, and the split between them is the ticket's own: measure first,
 -- enforce second.
 --
--- `wave_report` is the measurement. It counts what a Program's runs came back
--- with -- distinct subjects, distinct Property classes, distinct claims --
--- against how many agents ran, and it counts them off `hypothesis_provenance`,
+-- `wave_report` is the measurement. It counts what one wave came back with --
+-- distinct subjects, distinct Property classes, distinct claims -- against how
+-- many agents were in it, and it counts them off `hypothesis_provenance`,
 -- which 20260814T070000Z already writes one row of per staged element that
 -- reached a Hypothesis. Nothing new is recorded to make the measurement
 -- possible: correlation is a property of rows this schema has kept since
@@ -51,12 +51,25 @@
 -- the function, where the vocabulary is, instead of in a Python tuple that
 -- would have to be edited beside it.
 --
--- `peak concurrent` is here because without it the other four describe a
--- Program's lifetime rather than a wave. It is a sweep over the run intervals,
--- ordered `at, delta` so that -1 lands before +1 at one instant: a run that
--- ends exactly when another starts did not overlap it, and counting it as an
--- overlap would report a wave where there was a queue. An unfinished run is
--- live now, which is what `coalesce(finished_at, now())` says.
+-- A wave is a busy period and not a lifetime, so the window is computed before
+-- anything is counted in it. `numbered` is the gaps-and-islands walk over the
+-- run intervals: a run that starts at or after the latest end so far opens a
+-- new wave, and one that starts before it joins the one running. The report is
+-- the last wave's, because what an operator asks after dispatching eight
+-- hunters is what those eight came back with, not what the engagement has done
+-- since it opened -- and a Program whose runs never stopped overlapping has one
+-- wave, which is the honest reading of a queue that never drained.
+--
+-- The same instant rule in both places: `started_at >= earlier_end` opens a new
+-- wave for a run that begins exactly when the previous one ended, and `ORDER BY
+-- at, delta` lands -1 before +1 at one instant, so a handover is not counted as
+-- an overlap either time. An unfinished run is live now, which is what
+-- `coalesce(finished_at, now())` says.
+--
+-- `agents run` is the wave's size and `peak concurrent` is its own maximum. The
+-- two differ whenever the wave was a chain rather than a burst, which is what
+-- makes the ratio underneath readable: four agents that were never more than
+-- two at a time bought two agents' concurrency.
 --
 -- Only runs that answer a Task are counted. A run with no Task is not in the
 -- wave -- it is the orchestrator that dispatched it -- and counting it would
@@ -69,10 +82,27 @@ LANGUAGE sql STABLE AS $fn$
           FROM agent_runs a
          WHERE a.program_id = p_program AND a.task_id IS NOT NULL
     ),
+    reached AS (
+        SELECT id, started_at, ended_at,
+               max(ended_at) OVER (ORDER BY started_at, id
+                                   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                 AS earlier_end
+          FROM runs
+    ),
+    numbered AS (
+        SELECT id, started_at, ended_at,
+               count(*) FILTER (WHERE earlier_end IS NULL OR started_at >= earlier_end)
+                 OVER (ORDER BY started_at, id ROWS UNBOUNDED PRECEDING) AS wave
+          FROM reached
+    ),
+    wave AS (
+        SELECT id, started_at, ended_at FROM numbered
+         WHERE wave = (SELECT max(wave) FROM numbered)
+    ),
     edges AS (
-        SELECT started_at AS at, 1 AS delta FROM runs
+        SELECT started_at AS at, 1 AS delta FROM wave
          UNION ALL
-        SELECT ended_at, -1 FROM runs
+        SELECT ended_at, -1 FROM wave
     ),
     overlap AS (
         SELECT sum(delta) OVER (ORDER BY at, delta) AS live FROM edges
@@ -82,12 +112,12 @@ LANGUAGE sql STABLE AS $fn$
           FROM hypothesis_provenance hp
           JOIN hypotheses h ON h.id = hp.hypothesis_id
          WHERE hp.program_id = p_program
-           AND hp.agent_run_id IN (SELECT id FROM runs)
+           AND hp.agent_run_id IN (SELECT id FROM wave)
     )
     SELECT v.ord, v.measure, v.measured
       FROM (VALUES
         (0, 'agents run',
-            (SELECT count(*) FROM runs)),
+            (SELECT count(*) FROM wave)),
         (1, 'peak concurrent',
             coalesce((SELECT max(live) FROM overlap), 0)),
         (2, 'distinct subjects',
@@ -104,9 +134,12 @@ REVOKE ALL ON FUNCTION wave_report(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION wave_report(uuid) TO rk2_runtime;
 
 COMMENT ON FUNCTION wave_report(uuid) IS
-    'What a Program''s agents came back with, against how many of them ran: '
-    'the wave''s size, how many of it overlapped, and the distinct subjects, '
-    'Property classes and claims its runs reached. Ticket 80''s first '
+    'What a Program''s last wave came back with, against how many agents were '
+    'in it: the wave''s size, how many of it overlapped at once, and the '
+    'distinct subjects, Property classes and claims its runs reached. A wave is '
+    'the busy period -- runs that overlap, and the runs that overlap those -- '
+    'so an engagement''s earlier waves are not counted in the one running now. '
+    'Ticket 80''s first '
     'criterion -- correlated choice is a number this harness emits rather than '
     'a property it assumes it has or does not. Counted off '
     'hypothesis_provenance, so a claim two agents converged on is one claim '
@@ -282,25 +315,23 @@ LANGUAGE sql STABLE AS $fn$
            ~* '(now\(\)|current_timestamp|clock_timestamp)'
 
   UNION ALL
-    -- (c) The duplicate itself, as rows. Self-clearing rather than permanent:
-    --     both statuses it reads are ones a run leaves, so a pair claimed
-    --     before this arm existed reports until the older run finishes and then
-    --     stops. What it cannot report is a pair this file admitted, because
+    -- (c) The duplicate itself, as rows, and asked through the same function
+    --     the claim path asks rather than restated here: a check that spelled
+    --     the rule out a second time would keep reporting the old rule the day
+    --     the rule changed, which is the failure a standing check exists to
+    --     catch rather than to have. Self-clearing rather than permanent: both
+    --     statuses it reads are ones a run leaves, so a pair claimed before
+    --     this arm existed reports until the older run finishes and then stops.
+    --     What it cannot report is a pair this file admitted, because
     --     `claim_task` holds a Program-wide advisory lock and re-asks
-    --     `claimable_for` inside it.
+    --     `claimable_for` inside it. One row per claim in a colliding pair, so
+    --     a pair names both of the runs an operator would have to look at.
     SELECT 'duplicate_subject_claimed', a.label,
            'another claim of this Program holds the same kind, subject and '
            'Property class'
       FROM tasks a
-      JOIN tasks b
-        ON b.program_id = a.program_id AND b.id <> a.id AND b.kind = a.kind
-       AND b.subject_entity_id = a.subject_entity_id
      WHERE a.status IN ('claimed', 'running')
-       AND b.status IN ('claimed', 'running')
-       AND a.subject_entity_id IS NOT NULL
-       AND (SELECT h.property_class FROM hypotheses h WHERE h.id = a.hypothesis_id)
-           IS NOT DISTINCT FROM
-           (SELECT h.property_class FROM hypotheses h WHERE h.id = b.hypothesis_id)
+       AND subject_held_for(a)
 $fn$;
 
 REVOKE ALL ON FUNCTION check_wave_measurement() FROM PUBLIC;

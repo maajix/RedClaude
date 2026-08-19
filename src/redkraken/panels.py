@@ -355,18 +355,20 @@ BUDGETS = Read(
     ),
 )
 
-#: What the Program's agents came back with, against how many of them ran.
-#: Ticket 80's first criterion emitted rather than described: a wave of eight
-#: that reached two subjects is a pair of numbers here and not a paragraph
-#: somewhere. The five measures are the function's, in the function's order,
-#: because the vocabulary of a measurement belongs beside the statement that
-#: takes it; this read only prints what came back. Operator-side, like every
+#: What the Program's last wave came back with, against how many agents were in
+#: it. Ticket 80's first criterion emitted rather than described: a wave of
+#: eight that reached two subjects is a pair of numbers here and not a paragraph
+#: somewhere. The five measures are the function's, in the function's order and
+#: under the function's names, because the vocabulary of a measurement belongs
+#: beside the statement that takes it; this read only prints what came back, and
+#: the total asks the same function rather than stating five, so the header
+#: cannot outlive a measure the function stops taking. Operator-side, like every
 #: panel: `rk state` is the model's read, and the model reading how many of its
 #: peers proposed what is the consensus a blind packet is built to withhold.
 WAVE = Read(
     name="wave",
-    caption="what the agents came back with, against how many of them ran",
-    columns=("measure", "count"),
+    caption="what the last wave came back with, against how many agents ran in it",
+    columns=("measure", "measured"),
     rows=(
         "SELECT measure, measured::text FROM wave_report($1)"
         " ORDER BY ord LIMIT $2"
