@@ -865,6 +865,19 @@ commit writes Receipts that are honest about the request and wrong about the
 harness.
 _Avoid_: Lock file, checksum file, SBOM, build info, version stamp
 
+**Wave**:
+The agents of one Program that ran at once, counted by what they came back with
+rather than by what they cost: how many distinct subjects, Property classes and
+claims reached the record, against how many agents ran. It is a measurement and
+not a control, because the failure it is about -- instances of one model reading
+one Surface and deciding alike -- is invisible from inside any one run. Where a
+wave doubles up, the scheduler refuses rather than the model being asked to
+diversify: a second claim on a subject and Property class another claim already
+holds is declined while that one runs and admitted the moment it ends. A Program
+whose agents came back with nothing is zeroes, which is a reading and not a gap.
+_Avoid_: Batch, swarm, fan-out, round
+
+
 ## Knowledge
 
 **Skill**:

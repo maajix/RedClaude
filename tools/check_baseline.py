@@ -33,6 +33,7 @@ BASELINE_FILES = {
     "v1-dispositions.json",
     "spec-verification.tsv",
     "technique-intake.tsv",
+    "multiagent-modes.tsv",
 }
 #: The directory name a Skill or a Playbook keeps maintainer prose under. Spelled
 #: here rather than imported from `skill.py`, because this check reads the tree as

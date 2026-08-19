@@ -1467,6 +1467,15 @@ CONTROLS = (
         "        >= (SELECT w.max_concurrent_subagents FROM scheduler_weights w"
         "             WHERE w.active) $ctl$",
     ),
+    Control(
+        # PH2-80's wave counts, handed to the connection a model holds. The
+        # reason they are measured on the operator's side at all is that an
+        # agent which can read how many of its peers proposed what has been
+        # given the consensus a blind packet exists to withhold -- and 029's
+        # default privileges would make this grant on their own.
+        "standing:wave_measurement",
+        "GRANT EXECUTE ON FUNCTION wave_report(uuid) TO rk2_state",
+    ),
     # PH2-74 has four arms and gets four controls, one per arm, each written so
     # that the arm it names is the only one it trips. The gate only asserts the
     # check goes red, so nothing here would notice a control that went red for a
@@ -7650,7 +7659,21 @@ BUDGETS = {
         requests=500, lane_requests=500, concurrency=4, burst=500, window_seconds=3600,
         lane_tokens=10000,
     ),
+    # PH2-80's, and the same two requests as `budget`: what it is for is what
+    # happens after they are gone, and a Program of its own is what keeps a loop
+    # of refusals out of the counting the arms above make.
+    "polling": budgets(
+        requests=2, run_requests=1, lane_requests=2, concurrency=4, burst=500,
+        window_seconds=3600, lane_tokens=10000,
+    ),
 }
+
+#: How many requests the polling loop makes past the ceiling. Enough that a door
+#: refusing by accident -- a stale reservation, a bucket refilling -- would let
+#: one through, and small enough that the arm is a second of the suite rather
+#: than a minute of it. The paper's own run made 2.4 million; what is under test
+#: is that the number the engagement sees does not move with it.
+POLLED = 25
 
 
 class ProxyEgressTest(DatabaseCase):
@@ -10360,6 +10383,40 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(("blocked", "budget exhausted", None), self.latest("budget"))
         self.assertIsNone(answer.headers.get("Retry-After"))
         self.assertEqual((2, 1), self.spent("budget"))
+
+    def test_a_polling_loop_past_an_exhausted_budget_reaches_nothing(self):
+        # PH2-80 criterion 3, and the multiagent paper's resource-flooding mode
+        # asked of this door. Agents given a job queue escalated to polling it
+        # thirty times a second, and one run made 2.4 million requests for 117
+        # accepted jobs. Against a bug bounty program that is the fastest way
+        # out of one, and the thing that can refuse it is not an instruction:
+        # a model that has decided to poll keeps polling, so what has to stop is
+        # what the engagement sees. The Program's total never refills, so every
+        # request past it is answered by this machine -- `contacted` stays at
+        # the number the policy wrote while `exhausted` counts the loop.
+        program_id = self.identifiers["polling"]
+        capability, _, _ = self.mint("polling")
+        self.assertEqual(200, self.attempt(capability, program_id)[0])
+        self.assertEqual(200, self.attempt(capability, program_id)[0])
+
+        seen = len(self.target.seen)
+        resolved = len(self.resolved)
+        dialled = len(self.dialled)
+        polled = [self.answered(capability, program_id) for _ in range(POLLED)]
+
+        self.assertEqual([407] * POLLED, [answer.status for answer in polled])
+        self.assertEqual(
+            {proxy.BUDGETED}, {answer.headers.get(proxy.DECISION) for answer in polled}
+        )
+        self.assertEqual(
+            {"budget exhausted"}, {answer.headers.get(proxy.DETAIL) for answer in polled}
+        )
+        # Two numbers, and the distance between them is the finding: the loop is
+        # this size and the engagement's record of it is not.
+        self.assertEqual((2, POLLED), self.spent("polling"))
+        self.assertEqual(seen, len(self.target.seen), "the target was reached past the budget")
+        self.assertEqual(resolved, len(self.resolved), "a name was resolved past the budget")
+        self.assertEqual(dialled, len(self.dialled), "a socket was opened past the budget")
 
     def test_a_rate_limited_request_is_refused_with_the_time_it_may_be_retried(self):
         # The other half of criterion 4. `throttle` allows a burst of two per
@@ -13237,6 +13294,443 @@ class HypothesisPromotionTest(DatabaseCase):
 
         self.assertEqual((0, ""), (int(row[0]), str(row[1])))
 
+#: The two Programs the wave case opens. One is the wave; the second is here to
+#: be absent from the first one's numbers, because what came back is a count for
+#: one engagement and never for the installation.
+WAVE_SLUG = "selftest-wave"
+
+#: The second Property class this case claims under. The dedup key is the
+#: subject and the class together, so two hunters claiming different properties
+#: of one route are two claims and two claiming the same one are one.
+ACCESS = "authorization.function_access"
+
+
+class WaveMeasurementTest(DatabaseCase):
+    """80: how many agents ran, against what they came back with.
+
+    A wave is N agents dispatched over one Program at once. The failure mode the
+    literature names is that N of them return N wordings of the same claim and
+    the engagement is billed N times for one finding. Nothing in this harness
+    prevents that. `wave_report` is the instrument that shows it, and this case
+    is what the instrument reads on an engagement whose shape is known: four
+    hunters, three claims, two of the hunters on the same claim.
+
+    The second Program is the control, and carries the three things the count
+    must not do. Its two runs never overlapped, so a peak is an overlap and not
+    a total. Neither came back with a claim, so a wave that returned nothing
+    reads as zero rather than as nothing at all. And one of its runs holds no
+    Task, which is a supervisor rather than a hunter and is not what "agents
+    run" counts.
+
+    Everything writes as `rk2_runtime`. The report is an operator read, and one
+    case here proves the agent connection cannot reach it: telling a model how
+    many of its peers already agreed is exactly the contamination the blind
+    validation packet exists to prevent.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # `UNSEEDED` rather than `SCOPED`, and for the promotion case's reason:
+        # `labels` below reads the Entities this Program holds one of per type,
+        # and an Application the configuration recorded when it opened would
+        # hide the one the recon result promoted.
+        cls.identifiers = {}
+        for name in ("wave", "quiet"):
+            path = write(
+                UNSEEDED.replace('name = "matrix-web"', f'name = "{WAVE_SLUG}-{name}"')
+                + DECLARED
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+        cls.program_id = cls.identifiers["wave"]
+        cls.receipt = cls.receipted(cls.program_id)
+
+        # The recon hunter first, and the Surface it comes back with: a claim
+        # needs a subject to be about and an Observation to stand on before the
+        # other three can say anything at all.
+        cls.runs = {"alpha": cls.hunter(cls.program_id)}
+        cls.promote("alpha", cls.recon())
+        cls.held = cls.labels(cls.program_id)
+        cls.promote("alpha", cls.claim(
+            "the note id is honoured for a member who does not own it",
+            subject=cls.held["endpoint"], property_class=OWNERSHIP,
+            summary="a member read another member's note",
+        ))
+        cls.first = str(
+            cls.connection.execute(
+                "SELECT h.id::text FROM hypotheses h"
+                "  JOIN entities e ON e.id = h.subject_entity_id"
+                " WHERE h.program_id = $1::uuid AND h.property_class = $2"
+                "   AND e.label = $3",
+                (cls.program_id, OWNERSHIP, cls.held["endpoint"]),
+            ).scalar()
+        )
+
+        # Beta says the same thing in different words on its own new evidence,
+        # and one Hypothesis comes out of the pair. Gamma claims a different
+        # property of the same route and delta a property of a different
+        # subject: the two axes the count separates.
+        #
+        # Each of the three holds a Task whose dedup key differs from the other
+        # two, because `tasks_live_dedup_idx` already refuses a second live Task
+        # on one Program's kind, subject, claim and Finding. That index is the
+        # duplicate this schema refuses at the door of the queue; the arm 80
+        # added refuses the one it does not, which is two live Tasks about one
+        # subject under one Property class by way of two different claim rows.
+        cls.runs["beta"] = cls.hunter(
+            cls.program_id, kind="hunt", role="web_hunter", subject=cls.held["endpoint"]
+        )
+        cls.promote("beta", cls.claim(
+            "any member can read any note by guessing its id",
+            subject=cls.held["endpoint"], property_class=OWNERSHIP,
+            summary="the same read succeeded from a second session",
+        ))
+        cls.runs["gamma"] = cls.hunter(
+            cls.program_id, kind="hunt", role="web_hunter",
+            subject=cls.held["endpoint"], hypothesis=cls.first,
+        )
+        cls.promote("gamma", cls.claim(
+            "the route answers a caller who holds no session at all",
+            subject=cls.held["endpoint"], property_class=ACCESS,
+            summary="the route answered with no cookie on the request",
+        ))
+        cls.runs["delta"] = cls.hunter(
+            cls.program_id, kind="hunt", role="web_hunter",
+            subject=cls.held["application"],
+        )
+        cls.promote("delta", cls.claim(
+            "the dashboard is rendered for whichever member asks for it",
+            subject=cls.held["application"], property_class=OWNERSHIP,
+            summary="a second member's dashboard came back under another member's session",
+            control="the owner's own dashboard answered identically twice",
+        ))
+
+        # The control Program: two runs that did not overlap, and a third that
+        # holds no Task.
+        cls.quiet = cls.identifiers["quiet"]
+        cls.hunter(cls.quiet, started="3 hours", finished="2 hours")
+        cls.hunter(cls.quiet, kind="hunt", role="web_hunter",
+                   started="1 hour", finished="30 minutes")
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session',"
+                " 'selftest', 'low', '{}'::jsonb)",
+                (cls.quiet,),
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{WAVE_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def receipted(cls, program_id: str) -> str:
+        """One exchange on record, because the evidence here cites a Receipt."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host, method, scheme,"
+                    " path) VALUES ($1::uuid, 'agent', 'blocked',"
+                    " 'refused before contact', now(), 'target', 1,"
+                    " 'app.example.com', 'GET', 'http', '/') RETURNING label",
+                    (program_id,),
+                ).scalar()
+            )
+
+    @classmethod
+    def hunter(
+        cls,
+        program_id: str,
+        *,
+        kind: str = "recon",
+        role: str = "recon",
+        subject: str | None = None,
+        hypothesis: str | None = None,
+        started: str | None = None,
+        finished: str | None = None,
+    ) -> dict:
+        """One Task, the run holding it, and the tool run that run cites.
+
+        A caller that names intervals gets a run that started and ended that
+        long ago and a Task already done, which is how this case arranges two
+        runs that never overlapped without waiting for a clock. Everything else
+        is still going, because a wave is what overlaps.
+        """
+        seeded: dict[str, str] = {}
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            seeded["task"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                    " hypothesis_id, claimed_at, lease_expires_at)"
+                    " VALUES ($1::uuid, $2, CASE WHEN $3::text IS NULL THEN 'claimed'"
+                    "                            ELSE 'done' END,"
+                    "         (SELECT e.id FROM entities e WHERE e.program_id = $1::uuid"
+                    "           AND e.label = $4), $5::uuid, now(),"
+                    "         now() + interval '30 minutes') RETURNING id::text",
+                    (program_id, kind, finished, subject, hypothesis),
+                ).scalar()
+            )
+            seeded["run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, runs_as, model,"
+                    " effort, mission_packet, started_at, finished_at)"
+                    " VALUES ($1::uuid, $2::uuid, $3, 'subagent', 'selftest', 'low',"
+                    " '{}'::jsonb, now() - coalesce($4::interval, interval '0'),"
+                    " CASE WHEN $5::text IS NULL THEN NULL"
+                    "      ELSE now() - $5::interval END) RETURNING id::text",
+                    (program_id, seeded["task"], role, started, finished),
+                ).scalar()
+            )
+            seeded["tool_run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'mcp__rk2__http_request', '{}'::jsonb, 'success', 'runtime')"
+                    " RETURNING label",
+                    (program_id, seeded["run"], seeded["task"]),
+                ).scalar()
+            )
+        return seeded
+
+    @classmethod
+    def promote(cls, hunter: str, payload: dict) -> dict:
+        """One result staged and promoted, the way the supervisor does both."""
+        held = cls.runs[hunter]
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.program_id,
+                agent_run_id=held["run"],
+                task_id=held["task"],
+            )
+        with cls.connection.transaction():
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            return proxy.as_object(
+                cls.connection.execute(
+                    "SELECT promote_proposal($1::uuid)", (staged.proposal_id,)
+                ).scalar()
+            )
+
+    @classmethod
+    def recon(cls) -> dict:
+        """The Surface the claims are about, and the control they cite."""
+        tool_run = cls.runs["alpha"]["tool_run"]
+        return {
+            "new_entities": [
+                {"ref": "site_app", "type": "application",
+                 "base_url": "http://app.example.com/", "kind": "web",
+                 "tool_run_label": tool_run},
+                {"ref": "route", "type": "endpoint", "parent_ref": "site_app",
+                 "method": "GET", "path_template": "/notes/{id}",
+                 "auth_required": True, "tool_run_label": tool_run},
+            ],
+            "observations": [
+                {"kind": INVARIANT, "subject_ref": "route",
+                 "summary": "the owner's own note answered identically twice",
+                 "receipt_label": cls.receipt},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def claim(
+        cls,
+        statement: str,
+        *,
+        subject: str,
+        property_class: str,
+        summary: str,
+        control: str | None = None,
+    ) -> dict:
+        """One claim, the differential it rests on, and the control it cites.
+
+        A caller that names a control gets one staged in this same result about
+        its own subject, because a control is an Observation of the thing the
+        claim is about and the recon walk made exactly one, about the route.
+        """
+        observations = [
+            {"ref": "seen", "kind": DIFFERENTIAL, "subject_label": subject,
+             "summary": summary, "receipt_label": cls.receipt},
+        ]
+        steady: dict = {"observation_label": cls.held[INVARIANT]}
+        if control is not None:
+            observations.append(
+                {"ref": "steady", "kind": INVARIANT, "subject_label": subject,
+                 "summary": control, "receipt_label": cls.receipt}
+            )
+            steady = {"observation_ref": "steady"}
+        return {
+            "observations": observations,
+            "hypotheses": [
+                {"ref": "claim", "subject_label": subject,
+                 "property_class": property_class,
+                 "identity_a_label": cls.held["identity_member"],
+                 "statement": statement, "rationale": rationale()},
+            ],
+            "evidence": [
+                {"hypothesis_ref": "claim", "observation_ref": "seen",
+                 "polarity": "supports", "role": "variant"},
+                dict(hypothesis_ref="claim", polarity="supports", role="control",
+                     **steady),
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def labels(cls, program_id: str) -> dict:
+        """This Program's rows, under the name a payload would call them by."""
+        found = {
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT type, min(label) FROM entities WHERE program_id = $1::uuid"
+                " GROUP BY type HAVING count(*) = 1",
+                (program_id,),
+            ).rows
+        }
+        found.update({
+            "identity_" + str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT i.slot_name, e.label FROM identities i"
+                "  JOIN entities e ON e.id = i.entity_id"
+                " WHERE i.program_id = $1::uuid",
+                (program_id,),
+            ).rows
+        })
+        found.update({
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT kind, min(label) FROM observations"
+                " WHERE program_id = $1::uuid GROUP BY kind",
+                (program_id,),
+            ).rows
+        })
+        return found
+
+    def reported(self, program_id: str) -> list:
+        return [
+            (str(row[0]), int(row[1]))
+            for row in self.connection.execute(
+                "SELECT measure, measured FROM wave_report($1::uuid) ORDER BY ord",
+                (program_id,),
+            ).rows
+        ]
+
+    # -- what the wave came back with -----------------------------------------
+
+    def test_the_report_counts_the_hunters_against_what_they_came_back_with(self):
+        # Four ran and three claims came back, because two of the four made the
+        # same one. That gap is what the instrument exists for: it is a number
+        # here and it is nowhere else in this harness.
+        self.assertEqual(
+            [
+                ("agents run", 4),
+                ("peak concurrent", 4),
+                ("distinct subjects", 2),
+                ("distinct property classes", 2),
+                ("distinct claims", 3),
+            ],
+            self.reported(self.program_id),
+        )
+
+    def test_a_claim_two_hunters_reached_carries_both_of_their_names(self):
+        # The trail is per proposal and the count is per claim: two rows behind
+        # one Hypothesis, the second of them marked as the one that converged.
+        self.assertEqual(
+            [(self.runs["alpha"]["run"], False), (self.runs["beta"]["run"], True)],
+            [
+                (str(row[0]), bool(row[1]))
+                for row in self.connection.execute(
+                    "SELECT agent_run_id::text, converged FROM hypothesis_provenance"
+                    " WHERE hypothesis_id = $1::uuid ORDER BY converged",
+                    (self.first,),
+                ).rows
+            ],
+        )
+
+    def test_a_program_whose_hunters_came_back_with_nothing_reads_as_zero(self):
+        # Two runs that never overlapped are a peak of one, and a run holding no
+        # Task is a supervisor rather than a hunter. None of the first Program's
+        # four is counted here, which is the other half of what this asserts.
+        self.assertEqual(
+            [
+                ("agents run", 2),
+                ("peak concurrent", 1),
+                ("distinct subjects", 0),
+                ("distinct property classes", 0),
+                ("distinct claims", 0),
+            ],
+            self.reported(self.quiet),
+        )
+
+    def test_the_console_panel_shows_the_numbers_the_report_computes(self):
+        read = panels.BY_NAME["wave"]
+
+        self.assertEqual(
+            [
+                ("agents run", "4"),
+                ("peak concurrent", "4"),
+                ("distinct subjects", "2"),
+                ("distinct property classes", "2"),
+                ("distinct claims", "3"),
+            ],
+            [
+                (str(row[0]), str(row[1]))
+                for row in self.connection.execute(
+                    read.rows, (self.program_id, 50)
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            5, int(self.connection.execute(read.total, (self.program_id,)).scalar())
+        )
+
+    def test_a_model_cannot_ask_how_many_of_its_peers_agreed(self):
+        # The report is an operator read. A hunter that could see two of its
+        # peers had already claimed the thing in front of it would be reading a
+        # consensus, and every validation performed after that would be grading
+        # a claim the grader had been told the answer to.
+        with pg.connect(self.harness.state) as session:
+            try:
+                session.execute(
+                    "SELECT * FROM wave_report($1::uuid)", (self.program_id,)
+                )
+                message = ""
+            except pg.DatabaseError as error:
+                message = error.primary or str(error)
+
+        self.assertIn("permission denied for function wave_report", message)
+
+    def test_the_standing_check_reports_nothing_about_this_installation(self):
+        # Through the registry rather than by calling the function, because a
+        # check nothing runs is a check that cannot fail.
+        [row] = self.connection.execute(
+            "SELECT problems, detail FROM run_standing_checks()"
+            " WHERE name = 'wave_measurement'"
+        ).rows
+
+        self.assertEqual((0, ""), (int(row[0]), str(row[1])))
+
 
 #: The Programs the refusal case opens. Two of them, because one thing a
 #: refusal must not be able to do is close a run another Program opened.
@@ -15693,6 +16187,7 @@ class SchedulerFixture:
         subject: str,
         worth: str,
         property_class: str = "authorization.object_ownership",
+        identity: str | None = None,
     ) -> str:
         """One testable Hypothesis on the subject.
 
@@ -15704,20 +16199,51 @@ class SchedulerFixture:
         unique over `(subject, identity_a, identity_b, property_class)`: two
         Hypotheses about one subject have to disagree about what property is at
         stake, which is the point the index is making.
+
+        `identity` is the other way two claims about one subject can disagree
+        under that same index, and the one 80 needs: two claims about the same
+        property of one route, each held for a different member. It is also
+        what a clamped run takes its Lease on, so two Tasks arranged this way
+        are refused for their subject rather than for an Identity they share.
         """
         return str(
             cls.scalar(
                 "INSERT INTO hypotheses (program_id, subject_entity_id,"
-                " property_class, statement, status)"
-                " VALUES ($1::uuid, $2::uuid, $3, $4, 'testable') RETURNING id::text",
+                " identity_a_entity_id, property_class, statement, status)"
+                " VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, 'testable')"
+                " RETURNING id::text",
                 (
                     cls.identifiers[name],
                     subject,
+                    identity,
                     property_class,
                     f"a hypothesis {worth}",
                 ),
             )
         )
+
+    @classmethod
+    def identity(cls, name: str, slot: str) -> str:
+        """One named Identity in a Program, the way recon records one.
+
+        Both rows, because they are cited by different things: a Lease is taken
+        on the Entity and `task_identities` points at the `identities` row, so
+        an Identity that is only one of the two is one no clamped run can act
+        as.
+        """
+        program_id = cls.identifiers[name]
+        entity = str(
+            cls.as_owner(
+                "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
+                (program_id, HOST, f"identity:{slot}"),
+            ).scalar()
+        )
+        cls.as_owner(
+            "INSERT INTO identities (entity_id, program_id, slot_name, class)"
+            " VALUES ($1::uuid, $2::uuid, $3, 'anonymous')",
+            (entity, program_id, slot),
+        )
+        return entity
 
     # -- what the scenarios are built out of -----------------------------------
 
@@ -15962,6 +16488,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             ("contended", AFFORDABLE),
             ("roster", AFFORDABLE),
             ("capped", AFFORDABLE),
+            ("doubled", AFFORDABLE),
         ):
             # `UNSEEDED` rather than `SCOPED`: `seed` below writes the Tasks
             # every scenario here is about, and 083 opens a `recon` Task of its
@@ -15988,6 +16515,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.arrange_contended()
         cls.arrange_model_and_effort()
         cls.arrange_subagent_cap()
+        cls.arrange_subject_held()
 
     @classmethod
     def tearDownClass(cls):
@@ -16145,20 +16673,10 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         """The Identity a hunt needs is leased between the offer and the claim."""
         cls.seed("held", 1, kind="hunt")
         program_id = cls.identifiers["held"]
+        cls.slate_member = cls.identity("held", "slate-member")
         with cls.connection.transaction():
             cls.connection.execute("SET LOCAL ROLE rk2_owner")
             cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
-            cls.identity = str(
-                cls.connection.execute(
-                    "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
-                    (program_id, HOST, "identity:slate-member"),
-                ).scalar()
-            )
-            cls.connection.execute(
-                "INSERT INTO identities (entity_id, program_id, slot_name, class)"
-                " VALUES ($1::uuid, $2::uuid, 'slate-member', 'anonymous')",
-                (cls.identity, program_id),
-            )
             # A hunt Task is only ready with a testable Hypothesis under it, and
             # a Hypothesis about an Identity is what makes the Task need one.
             hypothesis = str(
@@ -16169,7 +16687,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                     " 'authorization.object_ownership', 'a slate hypothesis', 'testable'"
                     "   FROM tasks WHERE program_id = $1::uuid AND kind = 'hunt'"
                     " RETURNING id::text",
-                    (program_id, cls.identity),
+                    (program_id, cls.slate_member),
                 ).scalar()
             )
             cls.connection.execute(
@@ -16191,7 +16709,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             "INSERT INTO identity_leases (program_id, identity_entity_id,"
             " holder_agent_run_id, expires_at)"
             " VALUES ($1::uuid, $2::uuid, $3::uuid, now() + interval '10 minutes')",
-            (program_id, cls.identity, holder),
+            (program_id, cls.slate_member, holder),
         )
         cls.identity_held = cls.refusal(
             "SELECT claim_task($1)", (cls.offered_held[0]["task_label"],)
@@ -16443,6 +16961,98 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         finally:
             cls.set_cap(cls.cap_before)
         cls.cap_after = cls.cap()
+
+    @classmethod
+    def arrange_subject_held(cls):
+        """Two hunts on one route and one property of it, one at a time.
+
+        80's criterion 2. `tasks_live_dedup_idx` already refuses a second live
+        Task on one Program's kind, subject, claim and Finding, so the pair that
+        gets past it is the pair that disagrees about the claim row and agrees
+        about everything a hunter would actually do: the same route, the same
+        property of it, two Hypotheses that differ only in the member they are
+        held for. Two agents given that pair make the same requests of the same
+        place, and the engagement pays for the answer twice.
+
+        The hunt lane admits two and the subagent cap is back where the
+        arrangement before this one found it, so the refusal in the middle can
+        only be the arm this ticket added -- and `claimable_for` is asked for it
+        by name rather than read out of the exception. The Task is claimed once
+        the first run is closed, which is the half that says a hold is not a
+        ban.
+
+        The first run is closed with `error` rather than `completed` because a
+        Task may not reach `done` without a promoted result: what this needs is
+        the run off the board, not a finding it never made.
+        """
+        program_id = cls.identifiers["doubled"]
+        [seeded] = cls.seed("doubled", 1)
+        subject = str(
+            cls.scalar(
+                "SELECT subject_entity_id::text FROM tasks"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (program_id, seeded),
+            )
+        )
+        cls.as_owner(
+            "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (
+                program_id,
+                seeded,
+                cls.hypothesis(
+                    "doubled", subject, "one member reads another's note",
+                    identity=cls.identity("doubled", "slate-doubled-first"),
+                ),
+            ),
+        )
+        cls.doubled_second = str(
+            cls.scalar(
+                "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
+                " hypothesis_id, expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, 0.4, 0.4)"
+                " RETURNING label",
+                (
+                    program_id,
+                    subject,
+                    cls.hypothesis(
+                        "doubled", subject, "a third member reads it too",
+                        identity=cls.identity("doubled", "slate-doubled-second"),
+                    ),
+                ),
+            )
+        )
+
+        cls.bind("doubled")
+        cls.doubled_offered = cls.offered_labels(cls.offer())
+        run = cls.call("SELECT claim_task($1)", (seeded,))
+        cls.doubled_first = cls.claimed_by("doubled", run)
+        cls.doubled_refusal = cls.refusal("SELECT claim_task($1)", (cls.doubled_second,))
+        cls.doubled_held = cls.claimable("doubled", cls.doubled_second)
+        cls.doubled_while_running = cls.offered_labels(cls.offer())
+
+        cls.call(
+            "SELECT finish_task_attempt($1::uuid, 'error')",
+            (
+                str(
+                    cls.scalar(
+                        "SELECT id::text FROM agent_runs"
+                        " WHERE program_id = $1::uuid AND label = $2",
+                        (program_id, str(run)),
+                    )
+                ),
+            ),
+        )
+        cls.doubled_freed = cls.claimable("doubled", cls.doubled_second)
+        cls.doubled_after = cls.offered_labels(cls.offer())
+        cls.doubled_taken = cls.claimed_by(
+            "doubled", cls.call("SELECT claim_task($1)", (cls.doubled_second,))
+        )
+
+    @classmethod
+    def offered_labels(cls, slate: tuple) -> tuple[str, ...]:
+        """What a slate names, in the order it named it."""
+        return tuple(str(entry["task_label"]) for entry in slate)
 
     @classmethod
     def cap(cls) -> int:
@@ -16984,6 +17594,37 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         # The version number is not restored and is not meant to be: PH2-26 says
         # a change is a new version, so putting the cap back is one more of them.
         self.assertEqual(self.cap_before, self.cap_after)
+
+    # -- one subject, one kind, one Property class at a time (80) --------------
+
+    def test_both_hunts_are_offered_before_either_is_claimed(self):
+        # The starting point the refusal below is a change from: nothing about
+        # either Task refuses it while the other is still pending, which is what
+        # makes the middle of this scenario the arm and not the arrangement.
+        self.assertEqual({self.doubled_first, self.doubled_second},
+                         set(self.doubled_offered))
+
+    def test_a_second_hunt_on_a_held_subject_is_refused_while_the_first_runs(self):
+        # 80's criterion 2. Both Tasks are a `hunt` about one route under
+        # `authorization.object_ownership`, and they differ in the claim row and
+        # the member it is held for -- which is the pair `tasks_live_dedup_idx`
+        # lets through and this arm does not.
+        self.assertIn("subject_held", self.doubled_refusal)
+        self.assertEqual("subject_held", self.doubled_held)
+
+    def test_the_slate_stops_offering_what_the_running_hunt_holds(self):
+        # The offer and the claim ask one function, so a Task the claim would
+        # refuse is not a Task the orchestrator is shown. The Program has two
+        # Tasks and one of them is running, so what is left to offer is nothing.
+        self.assertEqual((), self.doubled_while_running)
+
+    def test_the_held_subject_is_claimable_again_once_the_first_run_ends(self):
+        # The other half of the criterion: a hold is not a ban. The run is
+        # closed, the Task comes back to the slate, and the claim that was
+        # refused takes it -- with nothing about the Task itself changed.
+        self.assertIsNone(self.doubled_freed)
+        self.assertIn(self.doubled_second, self.doubled_after)
+        self.assertEqual(self.doubled_second, self.doubled_taken)
 
     # -- the invariant ---------------------------------------------------------
 
@@ -20698,23 +21339,6 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
         cls.reprojected_still = cls.acts_as("reprojected", label)
 
     # -- what the scenarios are built out of -----------------------------------
-
-    @classmethod
-    def identity(cls, name: str, slot: str) -> str:
-        """One named Identity in a Program, the way recon records one."""
-        program_id = cls.identifiers[name]
-        entity = str(
-            cls.as_owner(
-                "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)",
-                (program_id, HOST, f"identity:{slot}"),
-            ).scalar()
-        )
-        cls.as_owner(
-            "INSERT INTO identities (entity_id, program_id, slot_name, class)"
-            " VALUES ($1::uuid, $2::uuid, $3, 'anonymous')",
-            (entity, program_id, slot),
-        )
-        return entity
 
     @classmethod
     def hypothesis_for(
@@ -29084,6 +29708,278 @@ class BlindValidationTest(ValidatedFindingFixture, DatabaseCase):
         )
         self.assertEqual((0, ""), (int(problems), str(detail)))
 
+
+
+BLIND_WAVE_SLUG = "selftest-blind-wave"
+
+
+class BlindPacketUnderConcurrencyTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 80, criterion 4: still blind while the rest of the roster works.
+
+    037 proved the packet is an allowlist against a session standing alone, and
+    a document that is blind when nobody else is running is not the claim the
+    multiagent report puts in question. Its hidden-profile result is that a
+    model asked to judge alongside others scores 17-36% where a model judging
+    alone scores near 100%: what the group already believes displaces the fact
+    one agent holds. The validator here is meant to be that solo judge, so the
+    question is what the packet says when there is something to be displaced by.
+
+    The arrangement makes there be something. A peer's claim about the same
+    subject is carried all the way to a recorded verdict before the packet under
+    test is served, a third agent opens a candidate about that same subject
+    while the session is open, and the document is read again by two connections
+    that are both inside transactions neither has committed. Every read is the
+    same bytes, and the shape below says why it could not be otherwise: the
+    packet is built from columns a table names, and no column of the four
+    relations agreement is kept in is one of them.
+    """
+
+    slug = BLIND_WAVE_SLUG
+
+    #: The claim under judgement, the peer's claim about the same subject, and
+    #: the one a third agent opens while the validator is reading. Three
+    #: sentences rather than one repeated, because the arm that matters is that
+    #: none of them reaches the packet and a repeated sentence could not tell
+    #: which one leaked.
+    JUDGED = "the orders API hands over a neighbour's order to anyone who asks"
+    PEER = "the orders API hands over a neighbour's invoice as well"
+    BESIDE = "the orders API hands over a neighbour's address while you read this"
+
+    #: Every key a packet may carry, written out rather than derived from the
+    #: allowlist. 037 already asserts the document against
+    #: `validation_packet_columns`, which is the check that a column reaches the
+    #: key it says it does -- and which a migration adding a field and its
+    #: allowlist row together would satisfy. This one is the criterion's own: a
+    #: field carrying a peer's conclusion or a count of who agreed fails here
+    #: whatever else it brings with it, because the shape is stated in the test
+    #: and a new key is not in it.
+    SHAPE = {
+        "packet": ("artifacts", "finding", "hypothesis", "runs", "test"),
+        "finding": ("class", "demonstrated", "label", "opened_at", "property_class"),
+        "hypothesis": ("label", "property_class", "status"),
+        "test": ("actions", "assertions", "label", "spec_sha256"),
+        "runs": ("assertion_results", "finished_at", "lane", "outcome", "receipts",
+                 "started_at"),
+        "receipts": ("at", "host", "label", "lane", "method", "ordinal", "path", "port",
+                     "query_sha256", "request", "response", "role", "scheme",
+                     "status_code"),
+        "artifacts": ("byte_size", "content_type", "sha256"),
+    }
+
+    #: What a field carrying agreement would have to be called. Matched as
+    #: substrings against every key name, so `peer_count` and `agreed_by` are
+    #: caught by the same list -- a second reading of the same rule as the shape
+    #: above, kept because it is the one that fails with the reason in its own
+    #: message rather than as a difference between two tuples.
+    AGREEMENT = ("agree", "consensus", "vote", "peer", "verdict", "opinion",
+                 "confidence", "narrative", "summary", "rationale", "majority",
+                 "count", "score", "review", "others")
+
+    #: The relations a conclusion of somebody else's is kept in. The migration
+    #: refuses to apply if the packet reads a column of any of them; this is the
+    #: same statement made of the function that is installed.
+    KEPT_IN = ("verdicts", "validation_attempts", "validation_queue", "review_gates")
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+
+        # A peer's conclusion, on file and about the same subject: judged all
+        # the way to a verdict, because a candidate nobody answered is not yet
+        # anything for the packet to have leaked.
+        cls.peer = cls.validated(cls.PEER)
+        cls.judged = cls.served(cls.JUDGED, subject=cls.peer["subject"])
+        cls.served_packet = cls.judged["opened"]["packet"]
+
+        # A third agent, working while the session is open. `candidate` is the
+        # whole of 036's route -- a claim, a Test, a replay that settles it and
+        # a Finding opened on the result -- so what lands beside the validator
+        # is an agent's actual output rather than a row written to look like
+        # one.
+        cls.beside = cls.candidate(cls.BESIDE, subject=cls.peer["subject"])
+        cls.after_the_peer = cls.read_by(cls.connection)
+        cls.together = cls.read_at_the_same_time()
+
+        cls.answer(cls.judged, "confirmed")
+        cls.problems = cls.rows_of("SELECT * FROM check_validations()")
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def read_by(cls, connection: pg.Connection) -> dict:
+        """The document for the Finding under judgement, as this connection sees it."""
+        return json.loads(
+            str(
+                connection.execute(
+                    "SELECT rk2_validation_packet($1::uuid, $2::uuid, $3::uuid)",
+                    (cls.program_id, cls.judged["finding"], cls.judged["replay"]),
+                ).scalar()
+            )
+        )
+
+    @classmethod
+    def read_at_the_same_time(cls) -> list[dict]:
+        """Four reads by two connections, neither of which has committed.
+
+        Both transactions are opened before either reads and neither is ended
+        until both have read twice, so no document here was taken after the
+        other reader finished. Rolled back rather than committed: reading is all
+        they came to do, and a commit would be this case writing something the
+        counts elsewhere never asked for.
+        """
+        readers = [pg.connect(cls.harness.runtime), pg.connect(cls.harness.runtime)]
+        try:
+            for reader in readers:
+                reader.execute(
+                    "SELECT set_config('rk2.program_id', $1, false)", (cls.program_id,)
+                )
+                reader.execute("BEGIN")
+            return ([cls.read_by(reader) for reader in readers]
+                    + [cls.read_by(reader) for reader in reversed(readers)])
+        finally:
+            for reader in readers:
+                reader.execute("ROLLBACK")
+                reader.close()
+
+    # -- what the document is --------------------------------------------------
+
+    def test_the_document_is_these_keys_and_no_others(self):
+        packet = self.served_packet
+        self.assertEqual(list(self.SHAPE["packet"]), sorted(packet))
+        for part in ("finding", "hypothesis", "test"):
+            with self.subTest(part=part):
+                self.assertEqual(list(self.SHAPE[part]), sorted(packet[part]))
+
+        self.assertEqual(["opened", "replay"], sorted(packet["runs"]))
+        for lane, run in packet["runs"].items():
+            with self.subTest(run=lane):
+                self.assertEqual(list(self.SHAPE["runs"]), sorted(run))
+                self.assertNotEqual([], run["receipts"])
+                for receipt in run["receipts"]:
+                    self.assertEqual(list(self.SHAPE["receipts"]), sorted(receipt))
+
+        self.assertNotEqual([], packet["artifacts"])
+        for held in packet["artifacts"]:
+            self.assertEqual(list(self.SHAPE["artifacts"]), sorted(held))
+
+    def test_nothing_the_document_carries_is_named_for_agreement(self):
+        """The same rule as the shape, said as the reason rather than as a list.
+
+        Asked of the allowlist as well as of the document, because the allowlist
+        is where a field is admitted: a key added there and not yet reached by
+        the function would pass a reading of the served document alone.
+        """
+        named = {"packet." + key for key in self.served_packet}
+        for part in ("finding", "hypothesis", "test"):
+            named |= {f"{part}.{key}" for key in self.served_packet[part]}
+        for run in self.served_packet["runs"].values():
+            named |= {f"runs.{key}" for key in run}
+            for receipt in run["receipts"]:
+                named |= {f"receipts.{key}" for key in receipt}
+        for held in self.served_packet["artifacts"]:
+            named |= {f"artifacts.{key}" for key in held}
+        named |= {
+            str(row[0])
+            for row in self.rows(
+                "SELECT DISTINCT unnest(packet_keys) FROM validation_packet_columns"
+            )
+        }
+
+        self.assertEqual(
+            [],
+            sorted(
+                key for key in named
+                if any(word in key.lower() for word in self.AGREEMENT)
+            ),
+        )
+
+    def test_the_packet_reaches_none_of_the_relations_agreement_is_kept_in(self):
+        """The migration's own assertion, asked of the function that is installed.
+
+        037 made this statement about the relations a hunter's prose lives in.
+        None of the four here holds prose -- a verdict is a word from a closed
+        vocabulary, an attempt is a row with an outcome, a queue is a position
+        and a gate is a state -- and every one of them is somebody else's
+        conclusion, which is the half of the criterion that was not covered.
+        """
+        self.assertEqual(
+            (),
+            self.rows(
+                "SELECT DISTINCT c.relname FROM pg_depend d"
+                "  JOIN pg_class c ON c.oid = d.refobjid"
+                " WHERE d.classid = 'pg_proc'::regclass"
+                "   AND d.objid = 'rk2_validation_packet(uuid,uuid,uuid)'::regprocedure"
+                "   AND d.refclassid = 'pg_class'::regclass"
+                "   AND c.relname = ANY($1::text[])",
+                (pg.quote_array(self.KEPT_IN),),
+            ),
+        )
+        self.assertEqual(
+            [],
+            [name for name in self.KEPT_IN
+             if not self.rows("SELECT to_regclass($1) IS NOT NULL", (name,))[0][0]],
+        )
+
+    # -- what the concurrency does to it ---------------------------------------
+
+    def test_a_peer_and_a_verdict_of_its_own_are_there_to_have_been_leaked(self):
+        """The arrangement, asserted before anything is concluded from it.
+
+        A test that showed the packet unchanged while nothing was written beside
+        it would show nothing at all, so what the peers wrote is read back here:
+        one verdict on file about the same subject, and three Findings on it.
+        """
+        self.assertEqual(
+            [(3, 1)],
+            [
+                (int(row[0]), int(row[1]))
+                for row in self.rows(
+                    "SELECT (SELECT count(*) FROM findings f"
+                    "         JOIN finding_hypotheses fh ON fh.finding_id = f.id"
+                    "         JOIN hypotheses h ON h.id = fh.hypothesis_id"
+                    "        WHERE h.subject_entity_id = $1::uuid),"
+                    "       (SELECT count(*) FROM verdicts v"
+                    "        WHERE v.finding_id = $2::uuid)",
+                    (self.peer["subject"], self.peer["finding"]),
+                )
+            ],
+        )
+        self.assertNotEqual(self.peer["finding"], self.judged["finding"])
+        self.assertNotEqual(self.beside["finding"], self.judged["finding"])
+
+    def test_the_document_read_beside_them_is_the_document_that_was_served(self):
+        self.assertEqual(self.served_packet, self.after_the_peer)
+
+    def test_two_validators_reading_at_once_are_handed_one_document(self):
+        self.assertEqual(4, len(self.together))
+        for index, read in enumerate(self.together):
+            with self.subTest(read=index):
+                self.assertEqual(self.served_packet, read)
+
+    def test_what_was_served_is_still_what_the_attempt_recorded(self):
+        """The digest, over a packet that had a wave running around it.
+
+        036's stale arm is the same statement in the other direction: a document
+        that changed under a session is refused rather than answered. Nothing
+        changed under this one, so the verdict is taken -- which is what makes
+        the equality above a property of the packet and not of a session that
+        was going to be refused anyway.
+        """
+        self.assertEqual("validated", self.judged["verdict"]["status"])
+        self.assertEqual(
+            [True],
+            [
+                row[0]
+                for row in self.rows(
+                    "SELECT va.packet_sha256 = rk2_validation_digest($2::jsonb)"
+                    "  FROM validation_attempts va WHERE va.id = $1::uuid",
+                    (self.judged["opened"]["attempt"], json.dumps(self.served_packet)),
+                )
+            ],
+        )
+
+    def test_the_standing_check_holds_over_what_this_case_wrote(self):
+        self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 JUDGE_COMMAND_SLUG = "selftest-judge-command"
 
@@ -40373,7 +41269,7 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
     # -- criterion 1: the panels are the campaign, and they run -----------------
 
     def test_every_panel_this_console_shows_runs_against_the_live_schema(self):
-        # The one thing `tests/test_ui.py` cannot ask. Nine statements over
+        # The one thing `tests/test_ui.py` cannot ask. Ten statements over
         # columns from a dozen migrations, and a renderer that would show a
         # panel that failed exactly as convincingly as one that worked.
         self.assertEqual(list(panels.NAMES), list(self.before))
@@ -40387,9 +41283,12 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
         # Findings, chains and reports are panels; Tasks, Surface, Hypotheses and
         # Tests are the model's own compact read; pending decisions are the
         # operator's queue. Nothing in the criterion is unreachable from here.
+        # `wave` is ticket 80's and not 60's, and it is here rather than in a
+        # set of its own because a panel this console does not show is a
+        # measurement nobody reads.
         self.assertEqual(
             {"program", "checks", "slates", "agent_runs", "tool_runs", "leases",
-             "budgets", "findings", "chains", "reports"},
+             "budgets", "findings", "chains", "reports", "wave"},
             set(self.before),
         )
         self.assertIn("records", dict(ui.NAVIGATION).values())

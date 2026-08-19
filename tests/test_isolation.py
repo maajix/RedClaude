@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from redkraken import _startup, isolation, tls
 from tests import fixtures
@@ -570,6 +572,64 @@ print(json.dumps({
                 isolation.run(self.boundary(), ("true",))
         finally:
             docker("network", "disconnect", self.agent_network, self.target, check=False)
+
+    def test_a_peer_that_arrives_after_the_check_is_reachable_by_the_child(self):
+        """Ticket 80, criterion 5: the window between the check and the launch.
+
+        The refusal above is what containment between two children rests on:
+        every launch reads the network first and stops if anything other than
+        the door is on it, so a second child cannot come up beside a first.
+        That holds for two launches that are ordered. It is a check-then-act,
+        the engine holds nothing between the two, and one network name serves a
+        whole installation -- so two launches that overlap can both read a clear
+        network and both attach to it.
+
+        Demonstrated rather than argued, and deterministically rather than by
+        racing: the peer is attached inside the launch call itself, after
+        `one_peer` has returned and before the engine is asked to start
+        anything. The engine command is the one that begins `run`; everything
+        before it in this call is the check reading the engine's records.
+
+        What comes back is the gap: the child starts, and reaches a machine the
+        boundary check said was not there. Nothing here is a defect in the
+        refusal, which does what it says -- the gap is that ordering the launches
+        is what makes it hold, and nothing does. Ticket 85 is where that is
+        answered.
+        """
+        subnet = docker(
+            "network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}",
+            self.agent_network,
+        ).stdout.strip()
+        # A fixed address, so the child can be told where to look before the
+        # peer that answers there exists. High in the range, because the engine
+        # assigns from the bottom of it and an address it had already handed out
+        # would fail the attach rather than demonstrate anything.
+        arriving = str(ipaddress.ip_network(subnet).network_address + 250)
+        probe = fixtures.PROBE + """
+print(json.dumps({'arrived': reaches(%r, 18081)}))
+""" % arriving
+
+        attached = []
+        launch = isolation.subprocess.run
+
+        def racing(command, **keywords):
+            if not attached and len(command) > 1 and command[1] == "run":
+                attached.append(arriving)
+                docker("network", "connect", "--ip", arriving,
+                       self.agent_network, self.target)
+            return launch(command, **keywords)
+
+        try:
+            with mock.patch.object(isolation.subprocess, "run", racing):
+                result = isolation.run(
+                    self.boundary(), ("python3", "-c", probe), timeout=20
+                )
+        finally:
+            docker("network", "disconnect", self.agent_network, self.target, check=False)
+
+        self.assertEqual([arriving], attached)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["arrived"])
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that
