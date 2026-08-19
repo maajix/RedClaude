@@ -68,3 +68,70 @@ infrastructure the sandbox this was built in does not have. The five unticked
 boxes are one run of the surface that now exists, and the eleven deferred
 criteria across tickets 46 and 49 through 57 are waiting on its result rather
 than on anything else being built.
+
+## The decision on spend
+
+Delegated to the agent and taken here, so the ticket says what it is waiting
+for rather than waiting for it to be decided again. **The full 16200-run
+campaign is not what to buy.** What to buy is a slice of it at full binding and
+shipped repeats, and the end-to-end question the campaign does not answer goes
+to a real engagement instead.
+
+### Why the campaign cannot simply be trimmed
+
+The two obvious economies are both refused by the schema, and the refusals are
+the design rather than an oversight:
+
+* **Fewer fixtures per Playbook.** `playbook_test_verdict` clause 3 -- "the
+  binding is total, so the run set must be too" -- returns `untested` while any
+  bound fixture has no run at that text, and `untested` blocks promotion. The
+  totality is what ticket 17 bought: the `out` half is every fixture authored
+  for somebody else's Playbook, which is the only reason an author cannot pick
+  the cases their own Playbook is graded on. Grading a Playbook against a
+  chosen subset of its binding buys a number nobody should believe.
+* **Fewer repeats.** `playbook_test_policy.required_repeats` is settable from 1
+  to 32, and dropping it to 1 would cut the campaign to 5400 runs. The
+  migration that introduced it says why 3 is the floor: it is the smallest
+  number for which the median in clause 4 means agreement rather than
+  rounding. Turning it down does not make the campaign cheaper; it makes
+  `pass` mean something weaker without saying so in the verdict.
+
+So the only honest lever is **which Playbooks are graded**, each one whole.
+
+### What a slice costs, and what it buys
+
+One Playbook graded fully is 54 bound fixtures x 3 repeats x 2 Programs per
+own-pair repeat = **324 Agent runs**, reserving 64800000 tokens against the
+same 200000-token envelope `rk playbook cost` reports the whole campaign
+against. Ten Playbooks is 3240 runs and a fifth of the campaign; each of the
+ten gets a verdict that can actually promote it to `stable` at its own `p_sha`,
+and the other forty stay `draft` with `check_playbook_tests` saying so every
+run, which is the state the harness already models honestly.
+
+Run it with the surface criterion 5 already ticked: `rk playbook evaluate
+--playbook <path> --fixture <name>` once per bound fixture, on a machine
+carrying the boundary ticket 78 built.
+
+### Why the rest goes to an engagement rather than to more runs
+
+`select_playbooks` sorts `(status = 'stable') DESC` and **does not filter on
+it**. A `draft` Playbook is selectable today; it ranks below a graded one and
+is otherwise usable. So the corpus being ungraded does not stop a hunt, and a
+hunt is where the failures this campaign structurally cannot see live -- scope
+compilation against a real program, the door against a real upstream, evidence
+against a target nobody authored a ground truth for. The campaign measures
+whether a Playbook fires where its own catalogue says it should; it says
+nothing about whether the harness finds a bug.
+
+Order, therefore: grade a slice so the ranking has something behind it, hunt
+for the rest, and let what the hunt breaks decide which further Playbooks are
+worth 324 runs each.
+
+### What stays open
+
+`ready-for-human` is unchanged. The decision is which spend to authorise; the
+spend still needs an Agent credential and the boundary an agent image, internal
+network, door and certificate make up, none of which this sandbox has. The
+eleven deferred criteria across tickets 46 and 49 through 57 stay deferred, and
+they stay deferred for the Playbooks outside the slice however large the slice
+is.

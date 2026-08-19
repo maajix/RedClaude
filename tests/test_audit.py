@@ -35,8 +35,11 @@ ROOT = Path(__file__).resolve().parents[1]
 STORY = "story:001"
 #: One requirement whose evidence is a gate rather than a test.
 GATE_BACKED = "decision:01"
-#: One requirement whose evidence is owed by work that is not finished.
-OWED = "story:230"
+#: One requirement whose evidence is owed by work that is not finished. It is
+#: the last one left: the final review has run, so the story that asked for it
+#: cites the record that review left, and what is still owed is the acceptance
+#: run around it.
+OWED = "testing:24"
 
 
 class RunnableProbe(unittest.TestCase):
@@ -69,8 +72,8 @@ class AuditGateTest(unittest.TestCase):
             "spec coverage\n"
             "  stories                230   decisions 19  testing 24  scope 9"
             "  notes 6  regressions 7\n"
-            "  verification           213   tests 208  gates 5  owed 2\n"
-            "  tickets                 86   resolved 83  audited 63  deferred criteria 11\n"
+            "  verification           216   tests 211  gates 5  owed 1\n"
+            "  tickets                 88   resolved 84  audited 63  deferred criteria 11\n"
             "  area: runtime          144   anchors 1\n"
             "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
@@ -464,14 +467,15 @@ class AuditCitationTest(AuditCase):
         )
 
     def test_a_requirement_whose_evidence_is_owed_names_the_ticket_that_owes_it(self):
-        # The shipped row: the final review has not run, so nothing checks the
-        # story that asks for it, and the map says which open ticket owes it
-        # rather than citing something that does not check it.
+        # The shipped row: final acceptance has not run, so the part of this
+        # requirement nothing checks says which open ticket owes it rather than
+        # citing something that does not check it. The parts that have run cite
+        # what they left, which is why the row holds both kinds at once.
         self.assertEqual([], check_audit.citation_errors(self.audit))
         row = next(row for row in self.audit.rows if row["source"] == OWED)
 
-        self.assertEqual("owed:64", row["verification"])
-        self.assertFalse(self.audit.tickets[64].resolved)
+        self.assertIn("owed:65", row["verification"].split(";"))
+        self.assertFalse(self.audit.tickets[65].resolved)
 
     def test_evidence_owed_by_finished_work_is_refused(self):
         # The mirror of the deferral rule. A resolved ticket owes nothing, so a
@@ -492,11 +496,11 @@ class AuditCitationTest(AuditCase):
         )
 
     def test_an_unfinished_ticket_may_be_named_only_by_the_row_it_owes(self):
-        # Ticket 64 is open. The row it owes may name it as its implementer; any
+        # Ticket 65 is open. The row it owes may name it as its implementer; any
         # other row naming it is a requirement built by unfinished work.
         self.assertEqual(
-            [f"{STORY}: ticket 64 is ready-for-agent, not resolved"],
-            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="64"))),
+            [f"{STORY}: ticket 65 is ready-for-agent, not resolved"],
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="65"))),
         )
 
     def test_this_gate_cannot_be_its_own_evidence(self):
@@ -745,8 +749,7 @@ class AuditReleaseTest(AuditCase):
         )
 
         self.assertEqual(
-            [f"{OWED}: still owed, and ticket 65 is resolved", "testing:24: still owed,"
-             " and ticket 65 is resolved"],
+            [f"{OWED}: still owed, and ticket 65 is resolved"],
             check_audit.release_errors(resolved),
         )
 

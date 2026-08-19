@@ -143,7 +143,7 @@ and ordinary resume all reconcile from current rows.
 48. As a scheduler, I want the runtime to offer a bounded Slate, so that the orchestrator never controls the whole queue.
 49. As a scheduler, I want the orchestrator to choose only within the offered Slate, so that model judgement cannot bypass safety filters.
 50. As a scheduler, I want the runtime to revalidate readiness, budget, Lane quota, scope and identity availability at claim time, so that a stale Slate cannot authorize work.
-51. As a scheduler, I want a deterministic fallback when the orchestrator chooses nothing or chooses off-Slate, so that poor model output cannot stall the campaign.
+51. As a scheduler, I want a deterministic fallback when the orchestrator chooses nothing, and a refusal rather than a substitution when it chooses off-Slate, so that poor model output cannot stall the campaign and a choice nobody made is never answered.
 52. As a scheduler, I want each Task protected by an expiring Lease, so that concurrent workers cannot execute the same attempt.
 53. As a scheduler, I want each Identity protected by an exclusive Lease, so that two hunters cannot mix target sessions.
 54. As a scheduler, I want Task and Identity Leases for one Agent run to share a heartbeat, so that partial liveness cannot strand one resource.
@@ -535,9 +535,15 @@ and ordinary resume all reconcile from current rows.
 ### 11. Token-efficient context and session rotation
 
 - Mission packets are compiled from canonical rows for one Task and contain its
-  objective, scope subset, budgets, Identity labels, selected Skills and
-  Playbooks, relevant positive and negative knowledge, stop conditions,
-  revisions, digests and omission markers.
+  objective, scope subset, budgets, relevant positive and negative knowledge,
+  stop conditions, revisions, digests and omission markers. The selected
+  Playbooks arrive with the objective and the role's Skills are staged into the
+  child's launch directory: both are read before the first turn rather than
+  fetched during it, and a packet carrying a second copy would be a second
+  statement of what the run was given. Identity is not among them. Which
+  Identity a request is sent under is bound to the Tool run by the database at
+  the moment the capability is minted, so a packet naming one would be naming a
+  choice the child does not make.
 - Mission packets have a configured serialized byte and estimated-token ceiling.
   Large Artifacts and full records are fetched by stable identifier rather than
   embedded.

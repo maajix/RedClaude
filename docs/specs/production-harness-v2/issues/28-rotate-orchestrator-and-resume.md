@@ -107,12 +107,13 @@ can tell an entry about a Task that has since moved from one that has not. The
 integrity checks are the exception and stay at revision 0 on purpose: a check is
 a reading of this moment and not a row anything revises.
 
-Criterion 6 is `_compacted`: the fit runs against the byte ceiling minus the
-measured cost of the empty document, each pass subtracts the excess the last one
-actually measured, and a capsule still over after four passes is refused rather
-than sent. The two refusals say different things, because they are different
-faults: a ceiling too small for the document's framing is a setting to change,
-and a fit that has not converged in four passes is this module not converging.
+Criterion 6 is `packet.compacted`: the fit runs against the byte ceiling
+minus the measured cost of the empty document, each pass subtracts the excess
+the last one actually measured, and a capsule still over after four passes is
+refused rather than sent. The two refusals say different things, because they
+are different faults: a ceiling too small for the document's framing is a
+setting to change, and a fit that has not converged in four passes is this
+module not converging.
 `byte_ceiling` is `min(bytes, tokens * 4)`, so both configured limits bind
 exactly. Every section states its own omission, because a subtraction a
 model has to perform first is a subtraction it can decline to perform.
