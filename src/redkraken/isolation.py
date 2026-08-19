@@ -1112,21 +1112,32 @@ def own_home(template: Path | None) -> Iterator[Path | None]:
     homes = _private_directory(HOMES)
     _sweep(homes)
     own = homes / f"rk2-home-{uuid.uuid4().hex}"
-    try:
-        # Modes and links as they were: `_mounts` decides whether the child can
-        # write its home from the mode it finds, so a copy that widened one
-        # would answer a question the operator has already been asked.
-        shutil.copytree(source, own, symlinks=True, ignore=_not_the_credential(source))
-    except (OSError, shutil.Error) as error:
-        shutil.rmtree(own, ignore_errors=True)
-        raise Unavailable(f"the Agent home could not be copied for this run: {source} ({error})")
-    # Held open under a lock for as long as the run has it, which is what makes
-    # `_sweep` able to tell a live copy from a dead one. `finally` does not run
-    # for a process that is killed, and what a killed run leaves here is not an
-    # inert file like a stale network claim -- it is a copy of a credential.
+    # Made and claimed before a byte is copied into it. The lock is what tells
+    # `_sweep` a live copy from a dead one, and a copy that is filled first is a
+    # copy that spends the whole `copytree` looking dead -- so a second launch
+    # sweeping at that moment would take away the credential this one is in the
+    # middle of writing. `finally` does not run for a process that is killed,
+    # and what a killed run leaves here is not an inert file like a stale
+    # network claim: it is a home the next run must not be handed.
+    own.mkdir(parents=True)
     handle = os.open(own, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            # Modes and links as they were: `_mounts` decides whether the child
+            # can write its home from the mode it finds, so a copy that widened
+            # one would answer a question the operator has already been asked.
+            shutil.copytree(
+                source,
+                own,
+                symlinks=True,
+                ignore=_not_the_credential(source),
+                dirs_exist_ok=True,
+            )
+        except (OSError, shutil.Error) as error:
+            raise Unavailable(
+                f"the Agent home could not be copied for this run: {source} ({error})"
+            )
         yield own
     finally:
         os.close(handle)
@@ -1156,10 +1167,15 @@ def _sweep(homes: Path) -> None:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            os.close(handle)
             continue
+        try:
+            # Removed while the lock is still held, so a launch that claims this
+            # name a moment later claims a directory that is going away rather
+            # than one it will find half-swept.
+            shutil.rmtree(leftover, ignore_errors=True)
         finally:
             os.close(handle)
-        shutil.rmtree(leftover, ignore_errors=True)
 
 
 def _not_the_credential(source: Path) -> Callable[[str, list[str]], set[str]]:

@@ -96,6 +96,43 @@ class AuthorityTest(unittest.TestCase):
         self.assertEqual(first.certificate, second.certificate)
         self.assertEqual(first.certificate.read_bytes(), second.certificate.read_bytes())
 
+    def test_a_root_at_the_end_of_its_life_is_replaced_and_takes_its_leaves(self):
+        # Idempotence is reuse of something usable. `DAYS` is seven and a
+        # campaign is longer, so a door that restarts on the eighth day would
+        # otherwise keep presenting an authority every client has stopped
+        # believing -- and the SPKI pin makes chromium believe it anyway, which
+        # is the failure that would look like interception working.
+        root = scratch() / "ca"
+        first = tls.authority(root)
+        first.context("target.example")
+        self.assertTrue(sorted(root.glob("leaf-*.pem")))
+        issued = first.certificate.read_bytes()
+
+        with mock.patch.object(tls, "MARGIN", 100 * 24 * 3600):
+            second = tls.authority(root)
+
+        self.assertNotEqual(issued, second.certificate.read_bytes())
+        # The leaves went with it: every one was signed by the key that is being
+        # replaced, so one left here is one a later run would reuse under a root
+        # that no longer signs anything.
+        self.assertEqual([], sorted(root.glob("leaf-*.pem")))
+
+    def test_a_leaf_at_the_end_of_its_life_is_issued_again_under_the_same_root(self):
+        root = scratch() / "ca"
+        made = tls.authority(root)
+        made.context("target.example")
+        leaf = sorted(root.glob("leaf-*.pem"))[0]
+        issued = leaf.read_bytes()
+
+        # Only the leaf is spent here: the question is whether a live root
+        # reissues one of its own certificates, not whether it replaces itself.
+        with mock.patch.object(tls, "_spent", lambda path: path.name.startswith("leaf-")):
+            again = tls.authority(root)
+            context = again.context("target.example")
+
+        self.assertNotEqual(issued, leaf.read_bytes())
+        self.assertTrue(handshake(context, tls.trust(made.certificate), "target.example"))
+
     def test_the_signing_key_is_not_readable_by_other_accounts(self):
         made = tls.authority(scratch() / "ca")
 

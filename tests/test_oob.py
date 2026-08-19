@@ -44,6 +44,10 @@ UNREACHABLE = "postgresql://rk2_runtime@127.0.0.1:1/rk2"
 #: The Program `PUBLISHED` names, which is the directory the publisher serves.
 SLUG = "matrix-web"
 
+#: The channel `PUBLISHED` declares with its correlator in the path, which is
+#: the one a publisher can serve and the one every listener here is told it is.
+CHANNEL = "oob-files"
+
 #: One engagement file, the shape the ticket was written for: a DTD a target
 #: with an XXE parses and fetches, which is the payload a canary cannot carry.
 EXPLOIT = b'<!ENTITY % rk SYSTEM "file:///etc/hostname">\n'
@@ -245,6 +249,32 @@ class Resolves:
         return self
 
 
+class NoteTest(unittest.TestCase):
+    """What the publisher writes down about a request it was sent.
+
+    The note is the operator's, and the request line in it is the target's:
+    `BaseHTTPRequestHandler` escapes control characters before writing one, and
+    an override that only changes where the line goes must not also change what
+    is in it.
+    """
+
+    def note(self, format: str, *arguments: object) -> str:
+        written: list[str] = []
+        handler = oob.Request.__new__(oob.Request)
+        handler.server = mock.Mock(note=written.append)
+        handler.log_message(format, *arguments)
+        return written[0]
+
+    def test_a_request_line_does_not_write_to_the_operators_terminal(self):
+        written = self.note("%s resolves no live correlator", "/\x1b[2Jc0ffee/x.dtd")
+
+        self.assertNotIn("\x1b", written)
+        self.assertIn("\\x1b", written)
+
+    def test_an_ordinary_line_is_the_line_it_was_given(self):
+        self.assertEqual("/c0ffee/x.dtd was answered", self.note("%s was answered", "/c0ffee/x.dtd"))
+
+
 class ProbeTest(unittest.TestCase):
     """The readiness question `rk oob up` asks before it binds a name.
 
@@ -258,9 +288,10 @@ class ProbeTest(unittest.TestCase):
         published = oob.publishable(Ledger(), base(), SLUG, write(PUBLISHED))
         assert published is not None
         cls.listener = oob.Listener(
-            (oob.LISTEN_HOST, 0), published, Resolves(), None, lambda line: None
+            (oob.LISTEN_HOST, 0), published, Resolves(), None, lambda line: None, CHANNEL
         )
         cls.port = cls.listener.server_address[1]
+        cls.probe = f"{oob.LISTEN_HOST}:{cls.port}"
         cls.serving = threading.Thread(target=cls.listener.serve_forever, daemon=True)
         cls.serving.start()
 
@@ -287,6 +318,36 @@ class ProbeTest(unittest.TestCase):
         # What the same request looks like through the edge, which is a request
         # for a correlator called `health`.
         self.assertEqual((404, b"not found"), self.ask("dull-tunnel.trycloudflare.com")[:2])
+
+    def test_a_head_of_the_probe_leaves_the_connection_where_it_found_it(self):
+        # `protocol_version = "HTTP/1.1"` means the socket is reused, and a HEAD
+        # answered with a body is a body the next answer starts inside of. Two
+        # requests on one connection is the only way to see it.
+        session = http.client.HTTPConnection(oob.LISTEN_HOST, self.port, timeout=5)
+        try:
+            session.request("HEAD", oob.HEALTH_PATH, headers={"Host": self.probe})
+            first = session.getresponse()
+            self.assertEqual((200, b""), (first.status, first.read()))
+            session.request("GET", oob.HEALTH_PATH, headers={"Host": self.probe})
+            second = session.getresponse()
+            self.assertEqual((200, b"ok"), (second.status, second.read()))
+        finally:
+            session.close()
+
+    def test_a_method_this_host_does_not_answer_is_answered_anyway(self):
+        # A blind server-side request forged by something we planted can be a
+        # POST. `send_error(501)` never reached `_answer`, so the arrival was
+        # not even counted; now it is, and the refusal names what may be asked.
+        before = self.listener.answered
+        session = http.client.HTTPConnection(oob.LISTEN_HOST, self.port, timeout=5)
+        try:
+            session.request("POST", "/deadbeefdeadbeefdeadbeefdeadbeef/x.dtd", body=b"x")
+            answer = session.getresponse()
+            self.assertEqual(405, answer.status)
+            self.assertEqual("GET, HEAD", answer.getheader("Allow"))
+        finally:
+            session.close()
+        self.assertEqual(before + 1, self.listener.answered)
 
     def test_a_port_nobody_is_on_is_not_a_publisher(self):
         self.assertFalse(oob._listening(1))

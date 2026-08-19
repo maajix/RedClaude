@@ -228,6 +228,15 @@ UNREACHABLE = "target-unreachable"
 #: forgot to pass it would file the target's state as a refused capability again.
 TARGET_FAULT = frozenset({"target unresolved", "target unreachable"})
 
+#: The door lost the session it decides with. Its own token because it is the
+#: one answer here that no Receipt stands behind: `pg.ConnectionError_` is a
+#: sibling of `pg.DatabaseError` rather than a subclass, so a session that went
+#: away is not a statement the server refused, and there is nothing to file the
+#: attempt against and nothing a caller can mint its way past. Answered rather
+#: than dropped, because a client left holding a socket that closes mid-request
+#: cannot tell this door from the target it was asking for.
+UNAVAILABLE = "door-unavailable"
+
 #: The Program requires a header on every request and the door cannot produce its
 #: value. Its own token because it is the one refusal here that the caller cannot
 #: act on at all: the capability is live, the scope allows the target, the budget
@@ -1029,8 +1038,26 @@ class Fence:
         its own -- `resolve_egress_capability` requires the capability's own Tool
         run to belong to the bound Program, so a capability offered under
         somebody else's Program resolves to no row at all.
+
+        Guarded here rather than at each of the twelve places that bind, because
+        every one of them wraps the query that follows and none of them wrapped
+        this. A bind that raises `pg.DatabaseError` -- a session lost, or one
+        left in an aborted transaction by the request before -- escapes handlers
+        that catch `Refused`, and the exchange this one belongs to then gets no
+        Receipt, no answer and no line in the log, which is the one failure this
+        module says out loud. Typed, it is a refusal like any other: the caller
+        answers 502, and the record that can still be written is written.
+
+        A lost session is deliberately not caught here. `pg.ConnectionError_` is
+        a sibling class, and a fence with no session behind it cannot file the
+        refusal it would be raising -- so it belongs to `_serve`, which answers
+        `door-unavailable` and says so out loud, rather than to a `Refused` that
+        promises a Receipt nothing can write.
         """
-        self.connection.execute(BIND, (program_id,))
+        try:
+            self.connection.execute(BIND, (program_id,))
+        except pg.DatabaseError as error:
+            raise Refused("program bind refused", str(error)) from error
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -1935,6 +1962,24 @@ class Handler(BaseHTTPRequestHandler):
     slot_program: str | None = None
 
     def _serve(self) -> None:
+        """Decide one request, and answer even when the session is gone.
+
+        `pg.ConnectionError_` is a sibling of `pg.DatabaseError` and not a
+        subclass of it, so every typed guard under this one -- the binds, the
+        reads, the receipt writes -- lets a lost session past. Uncaught it
+        reaches `socketserver`, which prints a traceback and drops the socket:
+        no answer, no row, and a caller that cannot tell a door that stopped
+        deciding from a target that stopped answering. Caught here it is one
+        502 carrying the token that says which, and the log line `log_error`
+        exists for -- the record could not be written, so this is said out loud.
+        """
+        try:
+            self._decide()
+        except pg.ConnectionError_ as error:
+            self.log_error("no session for %s: %s", self.path, error)
+            self._answer(502, UNAVAILABLE, body=b"")
+
+    def _decide(self) -> None:
         arrival = datetime.now(timezone.utc)
         control = take_control(self.headers)
         if self.tunnel is not None:
@@ -2333,7 +2378,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.server.fence.release(self.slot_program, slot, self.contacted)
-        except (pg.DatabaseError, OSError) as error:
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
             self.log_error("no release for %s: %s", slot, error)
 
     def _forward(
@@ -2815,7 +2860,7 @@ class Handler(BaseHTTPRequestHandler):
         written: str | None = None
         try:
             written = self.server.fence.blocked_receipt(program_id, capability, receipt)
-        except (pg.DatabaseError, OSError, Refused) as error:
+        except (pg.DatabaseError, pg.ConnectionError_, OSError, Refused) as error:
             self.log_error("no blocked receipt for %s: %s", program_id, error)
         # The refusal names the row it just wrote, in the same words the served
         # path names its own: a caller that cannot cite the record cannot show

@@ -524,6 +524,12 @@ def collect(
     is its own transaction, so the refusal is rolled back before the next one
     starts -- without that, one unreadable panel would leave every panel after
     it reporting a transaction that was already aborted.
+
+    Both database classes count. `pg.ConnectionError_` is a sibling of
+    `pg.DatabaseError` and not a subclass of it, so a session that went away
+    escapes a guard naming only the second -- and what an operator gets for a
+    lost connection is then no page at all, in place of a page whose panels each
+    say why they are empty.
     """
     collected = []
     for name in names:
@@ -534,7 +540,7 @@ def collect(
             continue
         try:
             found = panel(connection, program_id, slug, wanted, limit=limit)
-        except pg.DatabaseError as error:
+        except (pg.DatabaseError, pg.ConnectionError_) as error:
             collected.append(
                 Panel(
                     name=wanted.name,

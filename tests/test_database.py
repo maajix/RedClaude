@@ -6509,6 +6509,12 @@ PUBLISHER_SLUG = "selftest-publisher"
 #: and lives in `callback_channel_bindings`, which is the whole subject below.
 PUBLISHED_CHANNEL = "oob-files"
 
+#: A second declared channel of the same Program, which keeps its correlator in
+#: a DNS label and has no publisher at all. What it is here for is the arrival
+#: this host must not answer: a live correlator of this Program that names a
+#: channel this host does not serve.
+LABELLED_CHANNEL = "oob-http"
+
 #: The one file the publisher serves. An external entity is the payload this
 #: channel exists for -- a target that fetches this is a target that resolved
 #: something we planted -- and its bytes are what a fetch has to return.
@@ -6614,6 +6620,17 @@ class CallbackPublisherTest(DatabaseCase):
             f"/{secrets.token_hex(16)}/{PUBLISHED_FILE}", records=False
         )
         cls.after_stranger = cls.counts()
+        # A canary of this Program minted on a different declared channel: live,
+        # attributable, and addressed at a name this host was never pointed at.
+        cls.elsewhere = callback.provision(
+            cls.harness.runtime, cls.configuration, LABELLED_CHANNEL, "TEC1"
+        )
+        assert cls.elsewhere.ok, cls.elsewhere.violations
+        cls.misplaced = str(cls.elsewhere.facts["callback"]["address"]).split(".")[0]
+        cls.misdirected = cls.fetch(
+            f"/{cls.misplaced}/{PUBLISHED_FILE}", records=False, counter="misdirected"
+        )
+        cls.after_misdirected = cls.counts()
 
         cls.ended = oob.down(cls.harness.runtime, cls.configuration, PUBLISHED_CHANNEL)
         assert cls.ended.ok, cls.ended.violations
@@ -6750,7 +6767,7 @@ class CallbackPublisherTest(DatabaseCase):
             )
 
     @classmethod
-    def fetch(cls, target: str, *, records: bool) -> tuple[int, bytes]:
+    def fetch(cls, target: str, *, records: bool, counter: str = "") -> tuple[int, bytes]:
         """One request as it arrives from the edge: the tunnel's own `Host`.
 
         And the client address in the header a quick tunnel adds, which is the
@@ -6764,7 +6781,7 @@ class CallbackPublisherTest(DatabaseCase):
         `records` says which of its two counters this request moves, so waiting
         for the wrong one fails here rather than passing an assertion early.
         """
-        counter = "recorded" if records else "refused"
+        counter = counter or ("recorded" if records else "refused")
         listener = cls.listeners[0]
         before = getattr(listener, counter)
         session = http.client.HTTPConnection(oob.LISTEN_HOST, cls.port, timeout=10)
@@ -6904,6 +6921,22 @@ class CallbackPublisherTest(DatabaseCase):
         self.assertEqual((404, b"not found"), self.unattributed)
         self.assertEqual(self.after_query, self.after_stranger)
 
+    def test_a_canary_of_another_channel_is_not_answered_out_of_this_root(self):
+        # The correlator is live and it is this Program's, and this host is not
+        # where it was pointed: the publisher holds the Program's files and the
+        # binding is per channel, so answering would hand the engagement's
+        # payloads to whoever learned a name we never published at. Counted
+        # apart from the stranger's probe, because an operator reading the
+        # report is being told two different things.
+        self.assertEqual((404, b"not found"), self.misdirected)
+        self.assertEqual(self.after_stranger, self.after_misdirected)
+        self.assertEqual(1, self.listeners[0].misdirected)
+        self.assertNotIn(PUBLISHED_BYTES, self.misdirected[1])
+        self.assertTrue(
+            any(f"channel {LABELLED_CHANNEL}" in line for line in self.log),
+            self.log[-5:],
+        )
+
     def test_releasing_the_binding_ends_every_correlator_minted_against_it(self):
         # Criterion 4. Nothing is cleaned up: the correlator names a binding
         # that is released, so it resolves to nothing and the canary that was
@@ -6916,7 +6949,7 @@ class CallbackPublisherTest(DatabaseCase):
             },
         )
         self.assertEqual((404, b"not found"), self.orphaned)
-        self.assertEqual(self.after_stranger, self.after_release)
+        self.assertEqual(self.after_misdirected, self.after_release)
 
     def test_a_binding_whose_tunnel_is_gone_is_released_before_the_next_one(self):
         # Criterion 4's first clause. The morning after: a name bound to a

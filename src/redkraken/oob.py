@@ -303,12 +303,19 @@ class Listener(http.server.HTTPServer):
         connection: pg.Connection,
         keep: Store,
         note: Callable[[str], None],
+        channel: str,
     ) -> None:
         super().__init__(address, Request)
         self.published = published
         self.connection = connection
         self.keep = keep
         self.note = note
+        #: The one channel this publisher serves. A correlator is minted against
+        #: a channel and a channel is bound to one name, so a correlator of some
+        #: other channel arriving here is a request this host has no file for --
+        #: and handing one over would publish the engagement to whoever learned
+        #: a correlator we never pointed at this name.
+        self.channel = channel
         self.answered = 0
         self.recorded = 0
         #: Arrivals nobody could attribute: the first segment resolved no live
@@ -317,6 +324,11 @@ class Listener(http.server.HTTPServer):
         #: And arrivals that were attributable and the writer refused, which is
         #: a different thing to have to explain and is counted apart from them.
         self.lost = 0
+        #: Arrivals whose correlator is live on another channel of this Program.
+        #: Attributable, and not to anything this host serves: counted apart
+        #: from both, because a stranger's probe and a canary that came in the
+        #: wrong door are different things for an operator to read.
+        self.misdirected = 0
 
 
 class Request(http.server.BaseHTTPRequestHandler):
@@ -338,14 +350,50 @@ class Request(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._answer(with_body=False)
 
+    def _arrived_by_another_method(self) -> None:
+        """A method this host does not answer, from a target that still fired.
+
+        The payload is what decides the method, not us: an entity resolver
+        fetches, and a server-side request forged by something we planted may
+        POST. Refusing it before the correlator is read would throw away the
+        observation the canary exists to make, so the arrival is recorded and
+        then refused -- which is the same order `_answer` uses, and the opposite
+        of what `send_error` on an unhandled verb did.
+
+        The connection closes rather than reading a body: a request body here is
+        bytes a target chose the length of, and 405 is the whole answer.
+        """
+        self.close_connection = True
+        listener: Listener = self.server
+        listener.answered += 1
+        correlator, _ = _requested(self.path)
+        if correlator is not None and self._serves(correlator):
+            self._record(listener, correlator, self.headers.get("Host", ""), self.path)
+        self.send_response(405)
+        self.send_header("Allow", "GET, HEAD")
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    do_POST = _arrived_by_another_method
+    do_PUT = _arrived_by_another_method
+    do_PATCH = _arrived_by_another_method
+    do_DELETE = _arrived_by_another_method
+    do_OPTIONS = _arrived_by_another_method
+
     def log_message(self, format: str, *args: object) -> None:
         """Every line through the publisher's own note, never through stderr.
 
         `BaseHTTPRequestHandler` writes to `sys.stderr` by default, which for a
         command whose report is machine-read is output nobody asked for in the
         middle of it.
+
+        Control characters are translated the way CPython's own `log_message`
+        translates them, which this override would otherwise drop: the request
+        target is a target's bytes, and an operator reading the publisher's
+        notes should not have their terminal written to by one.
         """
-        self.server.note(format % args)
+        self.server.note((format % args).translate(self._control_char_table))
 
     def _answer(self, with_body: bool) -> None:
         listener: Listener = self.server
@@ -357,7 +405,7 @@ class Request(http.server.BaseHTTPRequestHandler):
             # Asked by `rk oob up` before it binds a name, and answerable by
             # nothing that came through the tunnel: a quick tunnel routes by
             # hostname and sends its own, so this Host cannot arrive from there.
-            self._send(200, "text/plain; charset=utf-8", b"ok", with_body=True)
+            self._send(200, "text/plain; charset=utf-8", b"ok", with_body=with_body)
             return
 
         correlator, name = _requested(target)
@@ -367,13 +415,7 @@ class Request(http.server.BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", b"not found", with_body=with_body)
             return
 
-        channel = _resolves(listener.connection, correlator)
-        if channel is None:
-            # Nothing to attribute it to. A row naming no correlator would be a
-            # claim about a target nobody can stand behind, so this arrival gets
-            # an answer and a log line and no record.
-            listener.refused += 1
-            self.log_message("%s resolves no live correlator of this Program", target)
+        if not self._serves(correlator):
             self._send(404, "text/plain; charset=utf-8", b"not found", with_body=with_body)
             return
 
@@ -390,6 +432,37 @@ class Request(http.server.BaseHTTPRequestHandler):
         # record is what we make of it. A file that is not there is still an
         # arrival: the payload fired and reached us, which is the observation.
         self._record(listener, correlator, host, target)
+
+    def _serves(self, correlator: str) -> bool:
+        """Whether this correlator is live on the channel this host publishes.
+
+        Two questions, and the second is the one a global store of files makes
+        necessary: a correlator may be live and belong to another channel of the
+        same Program -- a DNS canary, or a second tunnel -- and this publisher
+        holds the Program's files, not that channel's. Answering such a request
+        out of the mapping would hand the engagement's payloads to whoever
+        learned a name we never pointed here, and the record that followed would
+        be refused by the writer anyway, because an arrival states a path and a
+        channel that carries its correlator in a label states none.
+        """
+        listener: Listener = self.server
+        channel = _resolves(listener.connection, correlator)
+        if channel is None:
+            # Nothing to attribute it to. A row naming no correlator would be a
+            # claim about a target nobody can stand behind, so this arrival gets
+            # an answer and a log line and no record.
+            listener.refused += 1
+            self.log_message("%s resolves no live correlator of this Program", self.path)
+            return False
+        if channel != listener.channel:
+            listener.misdirected += 1
+            self.log_message(
+                "%s resolves a correlator of channel %s, which this host does not serve",
+                self.path,
+                channel,
+            )
+            return False
+        return True
 
     def _record(self, listener: Listener, correlator: str, host: str, target: str) -> None:
         arrival = {
@@ -543,7 +616,7 @@ def serve(
         speak = note if note is not None else _to_stderr
         try:
             listener = Listener(
-                (LISTEN_HOST, port), published, connection, Store(Path(store)), speak
+                (LISTEN_HOST, port), published, connection, Store(Path(store)), speak, channel
             )
         except OSError as error:
             ledger.fail(
@@ -576,6 +649,7 @@ def serve(
         "answered": listener.answered,
         "recorded": listener.recorded,
         "unattributed": listener.refused,
+        "misdirected": listener.misdirected,
         "unrecorded": listener.lost,
     }
     ledger.hold(

@@ -21,6 +21,7 @@ from tests import ROOT
 LEDGER = ROOT / "baseline" / "v1-dispositions.tsv"
 INTAKE = ROOT / "baseline" / "technique-intake.tsv"
 MODES = ROOT / "baseline" / "multiagent-modes.tsv"
+REVIEW = ROOT / "baseline" / "final-review.tsv"
 
 
 def table_rows(path: Path, without: str | None = None) -> list[list[str]]:

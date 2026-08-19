@@ -130,6 +130,14 @@ FLAGS = (
     # be one more Receipt for something nobody asked for.
     "--disable-breakpad",
     "--metrics-recording-only",
+    # Chromium exempts loopback from a proxy unless it is told not to, and this
+    # container has two loopback ports: the shim the door is behind, and
+    # chromium's own debugger. Without this, a page that asks for
+    # `http://127.0.0.1:9222/json/new?url=...` is a request that never reaches
+    # the door, earns no Receipt and gets no scope decision -- the second
+    # network path story 121 says there is not. With it, the same request goes
+    # to the shim like every other, and is refused there by name.
+    "--proxy-bypass-list=<-loopback>",
 )
 
 

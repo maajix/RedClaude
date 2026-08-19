@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import operator, panels, pg, ui
-from redkraken.outcome import EXIT_INVALID_CONFIGURATION
+from redkraken.outcome import EXIT_INVALID_CONFIGURATION, Ledger
 from tests import fixtures
 
 
@@ -29,6 +29,7 @@ from tests import fixtures
 #: holds, so that "no page carries a credential" is a question with an answer.
 SECRET = "not-the-real-one"
 RUNTIME = f"postgresql://rk2_runtime:{SECRET}@127.0.0.1:1/rk2"
+PROGRAM = "6f1b0e0a-2f3f-4a2e-9a1f-6d0a2c5b7e31"
 AGENT = f"postgresql://rk2_agent:{SECRET}@127.0.0.1:1/rk2"
 HUMAN = f"postgresql://rk2_human:{SECRET}@127.0.0.1:1/rk2"
 
@@ -473,6 +474,28 @@ class PanelTest(unittest.TestCase):
 
     def test_the_ladder_this_ticket_names_is_the_ladder_the_findings_panel_carries(self):
         self.assertEqual(ui.RUNGS, tuple(c for c in panels.FINDINGS.columns if c in ui.RUNGS))
+
+    def test_a_session_that_went_away_leaves_a_page_of_panels_that_say_so(self):
+        """`pg.ConnectionError_` is not a `pg.DatabaseError`; both end the same way.
+
+        A lost session used to escape `collect` uncaught and take the whole
+        report with it, so an operator whose database went away got a command
+        that raised instead of a page saying which reads did not happen.
+        """
+        class Lost:
+            def transaction(self):
+                raise pg.ConnectionError_("the session went away")
+
+        ledger = Ledger()
+
+        collected = panels.collect(ledger, Lost(), PROGRAM, "acme", limit=5)
+
+        self.assertEqual(len(panels.NAMES), len(collected))
+        self.assertEqual({panels.ERROR}, {held.state for held in collected})
+        self.assertEqual(
+            [], [held.name for held in collected if "went away" not in held.detail]
+        )
+        self.assertEqual(len(panels.NAMES), len(ledger.violations))
 
 
 class ServerTest(unittest.TestCase):

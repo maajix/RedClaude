@@ -18,7 +18,7 @@ from concurrent import futures
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _startup, isolation, tls
+from redkraken import _startup, browser_driver, isolation, tls
 from tests import SOURCE, fixtures
 from tests.fixtures import docker
 
@@ -247,6 +247,37 @@ except isolation.Unavailable as refusal:
                 with isolation.own_home(template) as second:
                     self.assertTrue(first.is_dir())
                     self.assertNotEqual(first, second)
+
+        self.assertEqual([], sorted(homes.glob("rk2-home-*")))
+
+    def test_a_copy_in_progress_is_already_claimed_against_the_next_sweep(self):
+        """The window between making a home and holding it is a home nothing
+        holds, and the next launch sweeps exactly what nothing holds.
+
+        So the directory is made and locked before a byte goes into it. Proven
+        by sweeping from inside the copy, which is the moment that window was:
+        the copy that is being filled has to survive its own launch's sweep.
+        """
+        base = Path(tempfile.mkdtemp(prefix="rk2-homes-"))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        homes = base / f"{isolation.HOMES}-{os.getuid()}"
+        homes.mkdir(mode=0o700)
+        template = self.seeded()
+        copied = shutil.copytree
+
+        def sweep_while_copying(*arguments, **options):
+            # After the bytes and before this launch would have taken its lock,
+            # which is the window the old order left open: a copy nothing holds
+            # is what a sweep is for, and this copy is a live run's.
+            answer = copied(*arguments, **options)
+            isolation._sweep(homes)
+            return answer
+
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(base)}):
+            with mock.patch.object(isolation.shutil, "copytree", sweep_while_copying):
+                with isolation.own_home(template) as own:
+                    self.assertTrue(own.is_dir())
+                    self.assertTrue((own / ".claude").is_dir())
 
         self.assertEqual([], sorted(homes.glob("rk2-home-*")))
 
@@ -1344,6 +1375,37 @@ print(json.dumps({
         self.assertTrue(facts["ca_readable"])
         self.assertFalse(facts["key_visible"])
         self.assertEqual([], facts["watched"])
+
+
+class BrowserEgressFlagTest(unittest.TestCase):
+    """PH2-31 story 121: the page's one way out, including to this container.
+
+    The driver runs inside the boundary and the boundary is a network with one
+    peer, so what is left to decide is what chromium exempts from the proxy of
+    its own accord. It exempts loopback, and this container has two loopback
+    ports: the shim the door is behind and chromium's own debugger. A page that
+    could reach either would be a request with no Receipt and no scope decision
+    -- a second network path, which is the one thing the story names.
+    """
+
+    def argv(self) -> list[str]:
+        plan = {"viewport_width": 1280, "viewport_height": 800, "certificate_pin": "pin"}
+        with mock.patch.object(browser_driver.subprocess, "Popen") as started:
+            browser_driver.start_browser(plan, None)
+        return list(started.call_args.args[0])
+
+    def test_loopback_is_not_exempt_from_the_proxy_the_door_is_behind(self):
+        self.assertIn("--proxy-bypass-list=<-loopback>", self.argv())
+
+    def test_the_bypass_is_stated_wherever_the_proxy_is(self):
+        # One flag without the other is the hole: a proxy chromium is pointed at
+        # and a destination it decides to reach around it.
+        argv = self.argv()
+        self.assertTrue(
+            any(item.startswith("--proxy-server=") for item in argv)
+            and any(item.startswith("--proxy-bypass-list=") for item in argv),
+            argv,
+        )
 
 
 if __name__ == "__main__":

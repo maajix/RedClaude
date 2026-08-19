@@ -796,6 +796,56 @@ class RefusalTest(unittest.TestCase):
                 self.assertIn("line 63 at RAISE", refused.detail)
 
 
+class FenceTest(unittest.TestCase):
+    """The bind every decision starts with, on a session that will not take it.
+
+    Every method here binds the Program before it asks anything, and each of the
+    twelve wraps only the query that follows. What the bind itself raises is the
+    difference between a refusal the caller is told about and an exception the
+    handler above it never named -- and the two database classes are siblings,
+    so they leave by different doors on purpose.
+    """
+
+    REQUEST = scope.Request(
+        protocol="http", host="target.example.test", port=80,
+        path_raw="/v1/notes", path_norm="/v1/notes",
+    )
+
+    class Session:
+        """A connection whose only statement is the bind, and it fails."""
+
+        def __init__(self, error: Exception):
+            self.error = error
+            self.asked: list[str] = []
+
+        def execute(self, statement: str, parameters: tuple = ()) -> object:
+            self.asked.append(statement)
+            raise self.error
+
+    def fence(self, error: Exception) -> tuple[proxy.Fence, Session]:
+        session = self.Session(error)
+        return proxy.Fence(session), session
+
+    def test_a_bind_the_server_refuses_is_a_refusal_and_not_a_loose_exception(self):
+        fenced, session = self.fence(pg.DatabaseError({"C": "25P02", "M": "in aborted transaction"}))
+
+        with self.assertRaises(proxy.Refused) as raised:
+            fenced.authorize(PROGRAM_ID, CAPABILITY, "GET", self.REQUEST)
+
+        self.assertEqual("program bind refused", raised.exception.reason)
+        self.assertIn("in aborted transaction", raised.exception.detail)
+        self.assertEqual([proxy.BIND], session.asked)
+
+    def test_a_bind_with_no_session_left_is_not_dressed_up_as_a_refusal(self):
+        # The sibling class, and the one case a `Refused` would be a lie: what
+        # files a Receipt is what broke, so it belongs to the handler's own
+        # answer rather than to a refusal that promises a row.
+        fenced, _ = self.fence(pg.ConnectionError_("the session went away"))
+
+        with self.assertRaises(pg.ConnectionError_):
+            fenced.reserve(PROGRAM_ID, CAPABILITY, self.REQUEST)
+
+
 class ExchangeTest(unittest.TestCase):
     """What happens on the wire, against a stub decision and a real target."""
 
@@ -949,6 +999,34 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(200, receipt["status_code"])
         self.assertEqual("target", receipt["scope_class"])
         self.assertEqual(64, len(receipt["query_sha256"]))
+
+    def test_a_session_that_went_away_is_answered_and_said_out_loud(self):
+        # Every guard in the fence names `pg.DatabaseError`, and
+        # `pg.ConnectionError_` is its sibling rather than its subclass, so a
+        # session that went away used to escape into `socketserver`: the socket
+        # was dropped with no answer, no row and nothing telling the caller
+        # whether this door or the target was what stopped. It is the one
+        # refusal no Receipt can stand behind -- what would file it is what
+        # broke -- so it is answered under its own token and logged, which is
+        # what `log_error` is for.
+        def lost(*arguments: object, **named: object) -> None:
+            raise pg.ConnectionError_(
+                "rk2_proxy@127.0.0.1:5432/rk2 closed the connection"
+            )
+
+        self.fence.authorize = lost
+
+        with mock.patch.object(proxy.Handler, "log_error") as said:
+            response = self.through("http://target.example.test/v1/notes")
+            body = response.read()
+
+        self.assertEqual(502, response.status)
+        self.assertEqual(proxy.UNAVAILABLE, response.headers[proxy.DECISION])
+        self.assertEqual(b"", body)
+        self.assertEqual([], self.dialled)
+        self.assertEqual([], self.fence.blocked)
+        self.assertEqual([], self.fence.allowed)
+        self.assertIn("closed the connection", said.call_args.args[-1].args[0])
 
     def test_the_address_that_was_decided_is_the_address_that_was_dialled(self):
         # Criterion 2. The name is resolved once, that answer is what the second

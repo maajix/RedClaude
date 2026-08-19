@@ -57,6 +57,12 @@ OPENSSL = "openssl"
 #: still trusts after the door that owns its key has stopped answering.
 DAYS = 7
 
+#: How much life a certificate has to have left for this door to keep using it.
+#: A door that reuses a certificate expiring in a minute is a door whose next
+#: exchange fails for a reason no Receipt explains, and a long campaign restarts
+#: often enough to hit it: `DAYS` is seven and story 224's campaign is longer.
+MARGIN = 3600
+
 #: The curve. P-256 rather than Ed25519 because it is the one every TLS client
 #: in an agent's toolbox can verify, including the ones built against older
 #: libraries, and interception that fails on the client's side is an outage with
@@ -251,7 +257,7 @@ class Authority:
         key = self._signing_key()
         stamp = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
         certificate = self.directory / f"leaf-{stamp}.pem"
-        if certificate.exists():
+        if certificate.exists() and not _spent(certificate):
             return certificate, key
         request = self.directory / f"leaf-{stamp}.csr"
         extensions = self.directory / f"leaf-{stamp}.ext"
@@ -302,8 +308,15 @@ def authority(directory: Path | str) -> Authority:
     if not directory.is_dir():
         raise Unusable(f"{directory} cannot hold a certificate authority: not a directory")
     made = Authority(directory, certificate, key)
-    if certificate.exists() and key.exists():
+    if certificate.exists() and key.exists() and not _spent(certificate):
         return made
+    # A root at the end of its life takes its leaves with it: every one of them
+    # was signed by this key and states a validity this authority is about to
+    # be outside of, so a leaf left here would be reused under a root that no
+    # longer signs anything. The signing key stays, which keeps the SPKI pin the
+    # child was told about the same across the reissue.
+    for spent in sorted(directory.glob("leaf-*.pem")):
+        spent.unlink(missing_ok=True)
     _run(
         [
             OPENSSL, "req", "-x509", "-noenc", "-sha256",
@@ -374,6 +387,29 @@ def _san(host: str) -> str:
 def _own(path: Path) -> None:
     """Key material, readable by this account and no other."""
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _spent(certificate: Path) -> bool:
+    """Whether this certificate is past `MARGIN` from the end of its life.
+
+    Asked of a file rather than remembered, because the reuse this answers is
+    reuse across processes: the door that issued it is not the door reading it a
+    week later. `-checkend` is openssl's own answer and its exit code is the
+    whole result -- nonzero for "expires within that many seconds", which is
+    also what an unreadable or truncated certificate gets, and both are reasons
+    to issue a new one rather than to hand this one to a client.
+    """
+    if shutil.which(OPENSSL) is None:
+        raise Missing(
+            f"{OPENSSL} is not on PATH; it issues the certificate that lets this "
+            "door see inside a tunnel"
+        )
+    finished = subprocess.run(
+        [OPENSSL, "x509", "-checkend", str(MARGIN), "-noout", "-in", str(certificate)],
+        capture_output=True,
+        check=False,
+    )
+    return finished.returncode != 0
 
 
 def _run(command: list[str]) -> bytes:
