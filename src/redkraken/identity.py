@@ -150,7 +150,12 @@ class Origin:
     scheme: str
     host: str
     port: int
-    headers: tuple[tuple[str, str], ...]
+    #: The names and their values, and the values are credentials -- an
+    #: `Authorization` line, a session cookie, an API key. Out of the `repr`
+    #: for the same reason the certificate below it is: this is a frozen
+    #: dataclass, so the default `repr` is what a traceback frame, a logged
+    #: object and an `assert` message would all render in full.
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
     source_url: str
     client_certificate: ClientCertificate | None = field(default=None, repr=False)
 
@@ -198,7 +203,15 @@ class Session:
             url = raw.get("url")
             if not isinstance(url, str):
                 raise Invalid(f"origins[{index}].url must be a string")
-            parts = urlsplit(url)
+            try:
+                parts = urlsplit(url)
+            except ValueError as error:
+                # `urlsplit` raises on a malformed IPv6 literal, and this is
+                # material a vault may have written: an uncaught `ValueError`
+                # leaves `provision` as a traceback rather than as a refusal,
+                # and a traceback out of this function is one raised with the
+                # resolved document in its frames.
+                raise Invalid(f"origins[{index}].url is not a URL") from error
             if parts.scheme not in ("http", "https") or not parts.hostname:
                 raise Invalid(f"origins[{index}].url must be an absolute HTTP URL")
             if parts.username is not None or parts.password is not None or parts.fragment:
@@ -624,7 +637,12 @@ def _headers(value: object, origin: int) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, list):
         raise Invalid(f"origins[{origin}].headers must be a list")
     answer: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    #: Where each name was first given, so the refusal for a repeat can name
+    #: the two positions. The name itself is not said: `vault.resolve` replaces
+    #: every string in the document, including one written in the `name`
+    #: position, so a message quoting it would be this module writing a
+    #: credential into a violation the command reports.
+    seen: dict[str, int] = {}
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise Invalid(f"origins[{origin}].headers[{index}] must be an object")
@@ -636,7 +654,10 @@ def _headers(value: object, origin: int) -> tuple[tuple[str, str], ...]:
         if lowered in _FORBIDDEN or lowered.startswith("x-redkraken-"):
             raise Invalid(f"origins[{origin}].headers[{index}].name is proxy-owned")
         if lowered in seen:
-            raise Invalid(f"origins[{origin}].headers repeats {name}")
+            raise Invalid(
+                f"origins[{origin}].headers[{index}].name repeats "
+                f"origins[{origin}].headers[{seen[lowered]}].name"
+            )
         if not isinstance(header_value, str) or "\r" in header_value or "\n" in header_value:
             raise Invalid(f"origins[{origin}].headers[{index}].value is not one header value")
         try:
@@ -645,7 +666,7 @@ def _headers(value: object, origin: int) -> tuple[tuple[str, str], ...]:
             raise Invalid(
                 f"origins[{origin}].headers[{index}].value is not HTTP header text"
             ) from error
-        seen.add(lowered)
+        seen[lowered] = index
         answer.append((name, header_value))
     return tuple(answer)
 

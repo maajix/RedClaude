@@ -71,8 +71,17 @@ DEFAULT_TOKEN_PATH = Path("~/.config/op/claude-sa-token")
 #: What the child inherits. `op` keeps its account configuration under HOME and
 #: reaches a running desktop app through the user's runtime directory, so both
 #: have to survive, and every `OP_` variable travels because that is the channel
-#: an interactive `op signin` session arrives on. Everything else is dropped, so
-#: nothing this process happens to be carrying can change what a read means.
+#: an interactive `op signin` session arrives on. Nothing outside those two sets
+#: is carried.
+#:
+#: `OP_` is a whole namespace and not one session variable, so what an operator
+#: exports there does reach the read: `OP_ACCOUNT` chooses which account answers
+#: it and `OP_DEBUG` makes the child verbose on the stderr `_refusal` may quote.
+#: That is inheritance working as intended -- the environment is where a signed-
+#: in operator's session lives -- and it is not a way past this module's own
+#: check, which is the allowlist at `Reference.__post_init__`: it runs on the
+#: reference before any child is started, so no environment reaches a vault
+#: this repository has not named.
 PASSED_THROUGH = ("PATH", "HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "TMPDIR")
 
 #: One read over the network. Long enough for a slow round trip, short enough

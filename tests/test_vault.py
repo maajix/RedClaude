@@ -260,6 +260,17 @@ class ChildProcessTest(VaultTestCase):
             set(self.stub.environment),
         )
 
+    def test_the_whole_op_namespace_travels_and_not_only_a_session(self):
+        # `OP_` is a namespace, so what the operator exports there reaches the
+        # read: the account it picks and the stderr a refusal may quote.
+        self.run_op(
+            answered("value"),
+            environ={"PATH": "/usr/bin", "OP_ACCOUNT": "my.1password.com", "OP_DEBUG": "1"},
+        )
+
+        self.assertEqual("my.1password.com", self.stub.environment["OP_ACCOUNT"])
+        self.assertEqual("1", self.stub.environment["OP_DEBUG"])
+
     def test_a_read_that_succeeded_returns_exactly_what_op_printed(self):
         # `--no-newline`, so there is no newline to strip and a value that ends
         # in one survives.

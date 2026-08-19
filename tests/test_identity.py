@@ -244,6 +244,55 @@ class ProvisionedMaterialTest(unittest.TestCase):
 
         self.assertEqual(["vault:no_such_item"], [item.source for item in report.violations])
 
+    def written(self, headers: list[dict], url: str = "https://app.example.com/") -> Path:
+        """One origin, spelled by the test, for the refusals below."""
+        document = {
+            "schema_version": 1,
+            "origins": [{"url": url, "headers": headers, "cookies": []}],
+        }
+        return write(json.dumps(document), name="identity.json")
+
+    def test_a_refusal_about_a_resolved_name_names_the_position_and_not_the_name(self):
+        # `vault.resolve` replaces every string in the document, and a reference
+        # written in the `name` position is a credential by the time `_headers`
+        # reads it -- so the one refusal that quoted the name it was given put
+        # that credential into the command's own report.
+        token = "RK-SYNTHETIC-CREDENTIAL-3f9a"
+        headers = [{"name": REFERENCE, "value": "one"}, {"name": REFERENCE, "value": "two"}]
+        with mock.patch.object(vault, "read", return_value=vault.Secret(token, PARSED)):
+            with mock.patch.object(migrate, "open_connection", return_value=None):
+                report = self.provision(self.written(headers))
+
+        self.assertNotIn(token, json.dumps(report.as_dict()))
+        self.assertIn(
+            "origins[0].headers[1].name repeats origins[0].headers[0].name",
+            " ".join(item.detail for item in report.violations),
+        )
+
+    def test_material_whose_url_is_not_one_is_refused_rather_than_raised(self):
+        # `urlsplit` raises on a malformed IPv6 literal, and an exception out of
+        # here is one raised with the resolved document in its frames.
+        with mock.patch.object(migrate, "open_connection", return_value=None):
+            report = self.provision(
+                self.written([{"name": "Authorization", "value": "one"}], url="https://[abc")
+            )
+
+        self.assertIn(
+            "origins[0].url is not a URL",
+            " ".join(item.detail for item in report.violations),
+        )
+
+    def test_the_headers_an_origin_carries_are_not_in_the_shape_it_prints(self):
+        # Every other credential-bearing field in this tree is out of its own
+        # `repr`; this is a frozen dataclass, so the default is what a traceback
+        # frame renders.
+        origin = identity.Origin(
+            "https", "app.example.com", 443, (("Authorization", CREDENTIAL),),
+            "https://app.example.com/",
+        )
+
+        self.assertNotIn(CREDENTIAL, repr(origin))
+
     def test_material_with_no_reference_in_it_never_asks_the_vault(self):
         # An operator who keeps their material on disk is not made to have a
         # 1Password account.
