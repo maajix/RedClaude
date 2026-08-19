@@ -1,19 +1,53 @@
+import contextlib
 import hashlib
 import importlib.metadata
 import json
 import sys
 import unittest
+from unittest import mock
 
-from redkraken import doctor
+from redkraken import doctor, execution, isolation, playbook, proxy
 from redkraken.doctor import Requirements
 from redkraken.outcome import (
     EXIT_BUILD_MISMATCH,
+    EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
+    EXIT_INVALID_CORPUS,
     EXIT_MISSING_DEPENDENCY,
     EXIT_OK,
     EXIT_UNSUPPORTED_VERSION,
 )
 from tests.fixtures import VALID, scratch, write
+
+
+@contextlib.contextmanager
+def described(**engine):
+    """A machine describing a full boundary and a trust root that is current.
+
+    The certificate is a file rather than a certificate: what `doctor` asks of
+    it is whether it exists and whether `tls.spent` says it is finished, and
+    minting a real one to answer the second question would make every boundary
+    test wait on `openssl`. The `isolation` calls each test wants stubbed are
+    passed by name, because the ones it does not stub would inspect containers
+    that do not exist on the machine running the suite.
+    """
+    certificate = scratch() / "ca.pem"
+    certificate.write_text("-- not read, `spent` is the answer --", encoding="utf-8")
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(doctor.tls, "spent", lambda path: False))
+        for name, stub in engine.items():
+            stack.enter_context(mock.patch.object(doctor.isolation, name, stub))
+        yield {
+            execution.IMAGE: "rk-agent:test",
+            execution.NETWORK: "rk-agent-net",
+            execution.PROXY_CONTAINER: "rk-proxy",
+            execution.PROXY_URL: "http://rk-proxy:8080",
+            execution.CERTIFICATE: str(certificate),
+        }
+
+
+def detail(diagnosis, name: str) -> str:
+    return next(item.detail for item in diagnosis.assertions if item.name == name)
 
 
 def installed_distribution() -> tuple[str, str] | None:
@@ -191,6 +225,153 @@ class AggregationTest(unittest.TestCase):
                 if assertion.name.startswith("module:")
             },
         )
+
+
+
+class SubjectTest(unittest.TestCase):
+    """Story 12's other four subjects, each asked of what a machine describes."""
+
+    def test_a_machine_that_describes_nothing_is_told_that_it_described_nothing(self):
+        diagnosis = doctor.diagnose(None)
+
+        self.assertTrue(diagnosis.ok)
+        self.assertEqual("no connection string supplied", detail(diagnosis, "database"))
+        self.assertIn("no trust root described", detail(diagnosis, "proxy_trust_root"))
+        self.assertEqual("no Agent boundary described", detail(diagnosis, "agent_boundary"))
+
+    def test_a_connection_string_this_client_cannot_use_is_refused(self):
+        diagnosis = doctor.diagnose(None, database_url="mysql://rk@127.0.0.1/rk")
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn(
+            "must be postgresql://", " ".join(item.detail for item in diagnosis.violations)
+        )
+
+    def test_a_database_nothing_answers_on_is_refused_rather_than_held(self):
+        # Port 1 on the loopback interface: refused immediately, so this asks
+        # the unreachable path without a server and without a wait.
+        diagnosis = doctor.diagnose(None, database_url="postgresql://rk@127.0.0.1:1/rk")
+
+        self.assertEqual(EXIT_DATABASE_UNREACHABLE, diagnosis.exit_code)
+        self.assertIn("db status", detail(diagnosis, "database"))
+
+    def test_the_program_that_issues_certificates_is_named_when_it_is_absent(self):
+        with mock.patch.object(doctor.shutil, "which", lambda name: None):
+            diagnosis = doctor.diagnose(None)
+
+        self.assertEqual(EXIT_MISSING_DEPENDENCY, diagnosis.exit_code)
+        self.assertIn("openssl is not on PATH", detail(diagnosis, "certificate_tool"))
+
+    def test_a_trust_root_that_is_not_a_file_is_refused(self):
+        directory = scratch()
+
+        diagnosis = doctor.diagnose(
+            None, environment={proxy.CA_VARIABLE: str(directory / "absent.pem")}
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("not a readable file", detail(diagnosis, "proxy_trust_root"))
+
+    def test_a_trust_root_at_the_end_of_its_life_is_refused_before_a_run_needs_it(self):
+        certificate = scratch() / "ca.pem"
+        certificate.write_text("-- not read, `spent` is the answer --", encoding="utf-8")
+
+        with mock.patch.object(doctor.tls, "spent", lambda path: True):
+            diagnosis = doctor.diagnose(
+                None, environment={proxy.CA_VARIABLE: str(certificate)}
+            )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("end of its life", detail(diagnosis, "proxy_trust_root"))
+
+    def test_a_current_trust_root_and_a_real_authority_directory_hold(self):
+        directory = scratch()
+        certificate = directory / "ca.pem"
+        certificate.write_text("-- not read --", encoding="utf-8")
+
+        with mock.patch.object(doctor.tls, "spent", lambda path: False):
+            diagnosis = doctor.diagnose(
+                None,
+                environment={
+                    proxy.CA_VARIABLE: str(certificate),
+                    proxy.AUTHORITY_VARIABLE: str(directory),
+                },
+            )
+
+        self.assertTrue(diagnosis.ok)
+        self.assertIn("is current", detail(diagnosis, "proxy_trust_root"))
+        self.assertIn("can hold", detail(diagnosis, "proxy_authority"))
+
+    def test_a_diagnosis_never_mints_the_authority_it_reports_on(self):
+        directory = scratch()
+
+        diagnosis = doctor.diagnose(
+            None, environment={proxy.AUTHORITY_VARIABLE: str(directory)}
+        )
+
+        self.assertTrue(diagnosis.ok)
+        self.assertEqual([], list(directory.iterdir()))
+
+    def test_a_boundary_described_in_part_names_what_is_missing(self):
+        diagnosis = doctor.diagnose(
+            None, environment={execution.IMAGE: "rk-agent:test"}
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn(execution.NETWORK, detail(diagnosis, "agent_boundary"))
+
+    def test_a_boundary_with_no_container_engine_is_a_missing_dependency(self):
+        def absent(name):
+            raise isolation.Unavailable(f"the configured container engine is not on PATH: {name}")
+
+        with described(engine_for=absent) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertEqual(EXIT_MISSING_DEPENDENCY, diagnosis.exit_code)
+        self.assertIn("not on PATH", detail(diagnosis, "agent_boundary"))
+
+    def test_a_network_holding_a_peer_other_than_the_door_is_refused(self):
+        def crowded(engine, network, proxy_container, proxy_host):
+            raise isolation.Unavailable("the Agent network has peers other than the proxy: rk-old")
+
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}", one_peer=crowded
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("rk-old", detail(diagnosis, "agent_boundary"))
+
+    def test_a_boundary_that_holds_is_reported_as_the_one_peer_it_is(self):
+        asked = []
+
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: asked.append(seen),
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertTrue(diagnosis.ok)
+        self.assertEqual([("/usr/bin/docker", "rk-agent-net", "rk-proxy", "rk-proxy")], asked)
+        self.assertIn("holds rk-proxy alone", detail(diagnosis, "agent_boundary"))
+
+    def test_a_corpus_that_no_longer_compiles_is_refused_here_and_not_mid_run(self):
+        def broken():
+            raise playbook.PlaybookError("skill_unknown", "recon/dns", "names skill sweep")
+
+        diagnosis = doctor.diagnose(None, corpora=(("playbooks", broken),))
+
+        self.assertEqual(EXIT_INVALID_CORPUS, diagnosis.exit_code)
+        self.assertIn("skill_unknown", detail(diagnosis, "catalogue:playbooks"))
+
+    def test_the_shipped_corpora_are_compiled_and_counted(self):
+        diagnosis = doctor.diagnose(None)
+
+        for name in ("playbooks", "skills", "fixtures"):
+            with self.subTest(corpus=name):
+                counted, _, word = detail(diagnosis, f"catalogue:{name}").partition(" ")
+                self.assertEqual("compiled", word)
+                self.assertGreater(int(counted), 0)
 
 
 class NoSideEffectTest(unittest.TestCase):

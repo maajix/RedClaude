@@ -296,6 +296,19 @@ class CompileTest(unittest.TestCase):
                 roster._compile()
         self.assertIn("is not a value shape", str(raised.exception))
 
+    def test_a_value_pattern_on_something_with_no_values_is_refused(self):
+        # `values_pattern` binds what an object's members hold. On a string it
+        # would bind nothing while reading as a constraint, which is the one
+        # way an argument can look checked and be open.
+        contract = dataclasses.replace(
+            roster.CONTRACTS["mcp__rk2__get_slate"],
+            arguments={"note": roster.Argument("string", values_pattern="^[a-z]+\\Z")},
+        )
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__get_slate": contract}):
+            with self.compiling() as raised:
+                roster._compile()
+        self.assertIn("only an object's members have values", str(raised.exception))
+
     def test_a_model_alias_the_pair_does_not_resolve_is_refused(self):
         # An alias is a request. A role naming one the pair does not know would
         # still start -- on some other model, and without saying which.
@@ -799,6 +812,36 @@ class GateTest(unittest.TestCase):
                 url="https://x",
                 headers={"X Bad Name": "v"},
             ),
+            # A header value carrying a request of its own.
+            hunting(
+                "mcp__rk2__http_request",
+                method="GET",
+                url="https://x",
+                headers={"X-Trace": "a\r\nX-Injected: b"},
+            ),
+            # And the trailing newline that `$` would have let through, which
+            # is the same smuggling with the second line still to come.
+            hunting(
+                "mcp__rk2__http_request",
+                method="GET",
+                url="https://x",
+                headers={"X-Trace": "a\n"},
+            ),
+            # The two arguments this contract used to declare and the runtime
+            # never served: a body the child has no store to name, and an
+            # identity the runtime chose before the child started.
+            hunting(
+                "mcp__rk2__http_request",
+                method="GET",
+                url="https://x",
+                body_artifact_hash="a" * 64,
+            ),
+            hunting(
+                "mcp__rk2__http_request",
+                method="GET",
+                url="https://x",
+                identity_slot="operator",
+            ),
             # A number outside its bounds.
             hunting("mcp__rk2__get_attack_surface", limit=0),
         ):
@@ -825,12 +868,75 @@ class GateTest(unittest.TestCase):
             )
         )
 
-    def test_an_argument_deeper_than_the_scan_is_not_searched_forever(self):
+    def test_a_document_the_scan_cannot_read_to_the_bottom_is_denied(self):
+        # The bound is not a way through. Stopping at it used to answer "no
+        # forbidden name here" about a document the scan had not finished, so
+        # a `program_id` under one wrapper more than the bound was neither
+        # seen nor refused -- and a free-text element declares no shape, so
+        # the wrappers cost the caller nothing.
         document = {"api_key": "x"}
         for _ in range(roster.DEPTH + 2):
             document = {"next": document}
 
-        self.assertIsNone(roster._forbidden_argument(document))
+        with self.assertRaises(roster._Deeper):
+            roster._forbidden_argument(document)
+
+        denial = self.denied(self.gate, roster.Call(tool=agent_read(), arguments=document))
+        self.assertEqual(roster.INVALID_ARGUMENT, denial.rule)
+        self.assertIn(f"deeper than the {roster.DEPTH} levels", denial.reason)
+
+    def test_a_program_selector_wrapped_past_the_bound_is_denied_inside_free_text(self):
+        # The case the bound made reachable, on the surface that made it cheap:
+        # `observations` is `free_text`, so its served schema is `{"type":
+        # "array"}` and nothing objects to the wrappers on the way down.
+        hunter = roster.Gate("web_hunter")
+        hunter.bind("agent-1", "web_hunter")
+        smuggled = {"program_id": "other-program"}
+        for _ in range(roster.DEPTH):
+            smuggled = {"a": smuggled}
+
+        denial = self.denied(
+            hunter,
+            roster.Call(
+                tool="mcp__rk2__submit_mission_result",
+                arguments={
+                    "observations": [smuggled],
+                    "completion_claim": {"status": "complete"},
+                },
+                agent_id="agent-1",
+                agent_type="web_hunter",
+            ),
+        )
+        self.assertEqual(roster.INVALID_ARGUMENT, denial.rule)
+        self.assertIn(f"deeper than the {roster.DEPTH} levels", denial.reason)
+
+    def test_an_element_as_deep_as_a_real_one_is_still_admitted(self):
+        # The bound refuses now, so it has to sit clear of anything a hunter
+        # would actually file. This is deeper than any contract describes and
+        # is still read to the bottom rather than refused.
+        hunter = roster.Gate("web_hunter")
+        hunter.bind("agent-1", "web_hunter")
+
+        self.assertIsNone(
+            hunter.decide(
+                roster.Call(
+                    tool="mcp__rk2__submit_mission_result",
+                    arguments={
+                        "observations": [
+                            {
+                                "note": "reflected",
+                                "request": {
+                                    "headers": {"Cookie": {"parsed": {"session": ["a", "b"]}}}
+                                },
+                            }
+                        ],
+                        "completion_claim": {"status": "complete"},
+                    },
+                    agent_id="agent-1",
+                    agent_type="web_hunter",
+                )
+            )
+        )
 
     def test_a_skill_the_role_was_not_granted_is_denied(self):
         gate = roster.Gate("recon")
@@ -1059,6 +1165,15 @@ class ContractSchemaTest(unittest.TestCase):
         artifact = roster.CONTRACTS["mcp__rk2__get_artifact"].schema()
 
         self.assertEqual(list(roster.ENTITY_TYPES), surface["properties"]["entity_type"]["enum"])
+        # A header set is bounded on both halves: the names by `propertyNames`
+        # and what those names carry by `additionalProperties`, because a value
+        # that may hold a line break is a value that may hold a second request.
+        request = roster.CONTRACTS["mcp__rk2__http_request"].schema()["properties"]["headers"]
+        self.assertEqual({"pattern": "^[A-Za-z][A-Za-z0-9-]{0,63}\\Z"}, request["propertyNames"])
+        self.assertEqual(
+            {"type": "string", "pattern": "^[\\x20-\\x7e]{0,1024}\\Z"},
+            request["additionalProperties"],
+        )
         self.assertEqual(
             {"type": "string", "pattern": roster._label("R")},
             receipts["properties"]["receipt_labels"]["items"],

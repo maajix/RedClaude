@@ -1,4 +1,5 @@
 import argparse
+import ast
 import io
 import json
 import os
@@ -133,6 +134,57 @@ def required(parser: argparse.ArgumentParser) -> set[str]:
         for string in action.option_strings
         if string.startswith("--")
     }
+
+
+def _namespace_reads() -> dict[str, set[str]]:
+    """Per handler in `cli`, every attribute it takes off the parsed namespace.
+
+    Static, over the source, because the alternative is running each command far
+    enough to find out -- and how far is far enough is exactly what varies: the
+    reach that opened this hole was behind an Agent boundary. `_actions` is read
+    above for the same reason this reads the ast: the binding between a parser
+    and its handler is a name argparse stores and never checks.
+
+    The walk crosses one call boundary at a time and keeps crossing, so a handler
+    that hands the namespace to a helper that hands it on again is still credited
+    with what the last one reads. Only calls to functions defined in this module
+    are followed; anything else is somebody else's namespace.
+    """
+    tree = ast.parse(Path(cli.__file__).read_text())
+    defined = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+
+    def reads(name: str, parameter: str, seen: frozenset[tuple[str, str]]) -> set[str]:
+        if (name, parameter) in seen or name not in defined:
+            return set()
+        seen = seen | {(name, parameter)}
+        node = defined[name]
+        found = {
+            child.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == parameter
+        }
+        for child in ast.walk(node):
+            if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)):
+                continue
+            callee = defined.get(child.func.id)
+            if callee is None:
+                continue
+            names = [argument.arg for argument in callee.args.args]
+            for position, passed in enumerate(child.args):
+                if isinstance(passed, ast.Name) and passed.id == parameter:
+                    if position < len(names):
+                        found |= reads(child.func.id, names[position], seen)
+        return found
+
+    answered = {}
+    for name, node in defined.items():
+        if node.args.args:
+            answered[name] = reads(name, node.args.args[0].arg, frozenset())
+    return answered
 
 
 def observe(*arguments: str) -> dict:
@@ -2310,6 +2362,28 @@ class OperatorSurfaceTest(unittest.TestCase):
 
         self.assertEqual(EXIT_USAGE, result.returncode)
         self.assertIn("usage: rk finding report", result.stderr)
+
+    def test_every_handler_reads_only_arguments_its_own_parser_declares(self):
+        """The other half of the surface audit: what the parsers hand over.
+
+        Every case above reads the parsers and asks what an operator may type.
+        This reads the handlers and asks what they then take off the namespace,
+        because the two are written hundreds of lines apart and argparse binds
+        them by nothing at all -- a handler reaching for an attribute its own
+        subcommand never declared raises `AttributeError` at the point the
+        operator ran it, which is a traceback rather than a refusal and is
+        reachable only on the machines configured far enough to get there.
+
+        The walk follows the namespace through the helpers, because that is how
+        the gap opens in practice: `rk playbook evaluate` declared everything it
+        named itself and passed the namespace to a helper that named one more.
+        """
+        reads = _namespace_reads()
+        for name, parser in self.commands.items():
+            handler = parser.get_default("run")
+            declared = {action.dest for action in parser._actions} | set(parser._defaults)
+            with self.subTest(name):
+                self.assertEqual(set(), reads.get(handler.__name__, set()) - declared)
 
 
 if __name__ == "__main__":

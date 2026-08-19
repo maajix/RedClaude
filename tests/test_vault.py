@@ -229,6 +229,13 @@ class SecretTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             vars(self.secret)
 
+    def test_it_answers_no_state_to_the_protocol_that_reads_slots(self):
+        # `vars()` is not the whole of reflection: since 3.11 the inherited
+        # `object.__getstate__` reads `__slots__`, so a caller reaching for the
+        # protocol by hand rather than through `pickle` got the value back.
+        with self.assertRaises(TypeError):
+            self.secret.__getstate__()
+
 
 class ChildProcessTest(VaultTestCase):
     """What `op` is handed, which is where a token leaks if it leaks anywhere."""

@@ -257,7 +257,7 @@ class Authority:
         key = self._signing_key()
         stamp = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
         certificate = self.directory / f"leaf-{stamp}.pem"
-        if certificate.exists() and not _spent(certificate):
+        if certificate.exists() and not spent(certificate):
             return certificate, key
         request = self.directory / f"leaf-{stamp}.csr"
         extensions = self.directory / f"leaf-{stamp}.ext"
@@ -308,15 +308,19 @@ def authority(directory: Path | str) -> Authority:
     if not directory.is_dir():
         raise Unusable(f"{directory} cannot hold a certificate authority: not a directory")
     made = Authority(directory, certificate, key)
-    if certificate.exists() and key.exists() and not _spent(certificate):
+    if certificate.exists() and key.exists() and not spent(certificate):
         return made
     # A root at the end of its life takes its leaves with it: every one of them
     # was signed by this key and states a validity this authority is about to
     # be outside of, so a leaf left here would be reused under a root that no
     # longer signs anything. The signing key stays, which keeps the SPKI pin the
     # child was told about the same across the reissue.
-    for spent in sorted(directory.glob("leaf-*.pem")):
-        spent.unlink(missing_ok=True)
+    # Named `leaf` rather than `spent`: `spent` is the module function this
+    # branch was reached by, and binding it here would make the test above it an
+    # unbound local read in the same scope -- an authority that exists would
+    # raise rather than be reused, which is the one case this function is for.
+    for leaf in sorted(directory.glob("leaf-*.pem")):
+        leaf.unlink(missing_ok=True)
     _run(
         [
             OPENSSL, "req", "-x509", "-noenc", "-sha256",
@@ -389,7 +393,7 @@ def _own(path: Path) -> None:
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
-def _spent(certificate: Path) -> bool:
+def spent(certificate: Path) -> bool:
     """Whether this certificate is past `MARGIN` from the end of its life.
 
     Asked of a file rather than remembered, because the reuse this answers is

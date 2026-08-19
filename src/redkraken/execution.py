@@ -1,4 +1,4 @@
-"""One ready Task, run from the queue to a canonical Observation.
+"""One ready Task, run from the Slate to a canonical Observation.
 
 This is the slice `rk run` was missing. Everything either side of it already
 existed and was tested on its own: the scheduler decides what is worth doing,
@@ -39,7 +39,7 @@ from pathlib import Path
 
 from redkraken import agent, capsule as capsule_module, isolation, migrate
 from redkraken import packet as packet_module, pg, playbook as playbook_module
-from redkraken import program, proposal, proxy, roster, state as state_module
+from redkraken import program, proposal, proxy, roster, state as state_module, store
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
 
 
@@ -135,7 +135,7 @@ ACCEPTED_STOPS = (
 #: because `offer_slate` on its own offers nothing: `rank_candidates` filters on
 #: `t.estimated_cost`, which is NULL until a ranking writes it, and NULL fails
 #: the affordability comparison silently. A runtime that only offered would find
-#: an empty slate for every Task it had just created and report an idle queue.
+#: an empty slate for every Task it had just created and report an idle slate.
 #:
 #: `advance_lane_quota` sits between them because 0037 says it does: the quota
 #: is an input to the entitlement sort and to nothing in the priority formula,
@@ -203,6 +203,41 @@ PLANNING = (
     "Slate no longer carries is refused rather than replaced. Name nothing and the "
     "runtime claims the first entry that still holds."
 )
+
+#: What ends a worker run, said to the worker. Every one of them is a mechanism
+#: this runtime already had and never mentioned: `_launch` breaks the message
+#: loop the turn the token ceiling is crossed, the SDK ends the session at the
+#: role's turn count, and `authorize_tool_run` refuses to mint against a Task
+#: whose Lease has expired. A child that learns any of the three by hitting it
+#: has already spent the attempt it would have shortened.
+MISSION_STOPS = (
+    "you submit the mission result, which is the only ending that files anything",
+    "a ceiling above is reached, which cuts the run where it stands",
+    "this Task's Lease expires, after which no further request is authorised",
+)
+
+#: The same, for the session that chooses rather than runs. It holds no Lease --
+#: nothing was claimed for it -- so the third condition is not one it has.
+PLANNING_STOPS = (
+    "you pick a Task, which is the whole of this decision",
+    "a ceiling above is reached, which cuts the run where it stands",
+)
+
+
+def _bounds(
+    tokens: int | None, subagents: int, turns: int, stops: tuple[str, ...]
+) -> packet_module.Bounds:
+    """What one run may spend, from the three parties that each bound part of it.
+
+    The token cap is the scheduler's reservation out of the Program's capacity,
+    the subagent cap is the weights row the scheduler ranked under, and the turn
+    count is the role's. They are gathered here rather than in `packet` because
+    the packet is compiled as `rk2_state`, which can see none of the three.
+    """
+    return packet_module.Bounds(
+        tokens=tokens, subagents=subagents, turns=turns, stop_conditions=stops
+    )
+
 
 #: The one outcome word no `scheduler.chose` row ever carries. `record_choice`
 #: writes five; this is the sixth, and it exists for the case where the write
@@ -287,6 +322,24 @@ STARTED = (
 #: keys on, and a Task that recorded a second set would have two answers to
 #: "which text did the model read".
 RECORDED = "SELECT count(*)::int FROM playbook_selections WHERE task_id = $1::uuid"
+
+#: What one Mission packet may cost, from the row that says what anything may
+#: cost. Read on the runtime connection rather than carried on the claim,
+#: because unlike the subagent and token caps the scheduler did not rank or
+#: reserve under this one -- it binds the document, at the moment the document
+#: is built.
+PACKET_LIMITS = (
+    "SELECT packet_max_bytes, packet_max_tokens FROM scheduler_weights WHERE active"
+)
+
+#: Story 182's demotion, asked at the one moment its answer changes something.
+#: `demote_playbooks` takes the stable Playbooks whose own test now fails or
+#: whose review date has passed, writes the ledger row and puts them back to
+#: draft. It runs immediately before a selection because that is where a stale
+#: `stable` costs something: `select_playbooks` drops an expired Playbook on its
+#: own, and a failing one it would otherwise keep -- the status is what says the
+#: catalogue stands behind it, and nothing else in a hunt reads the verdict.
+DEMOTE = "SELECT count(*) FROM demote_playbooks()"
 
 #: The selection, run and written down in one call. Three of the five arguments
 #: are left to the database's own defaults rather than restated here, because
@@ -844,6 +897,11 @@ class Slice:
     state: pg.Settings
     launch: Callable[..., agent.AgentRunResult] = agent.agent_run
     timeout: float = agent.TIMEOUT
+    #: Where the Artifact bytes are, so the packet can carry the readable head
+    #: of each one. Optional because the rest of a pass does not need it: a
+    #: machine that names no store still offers, claims and runs, and its
+    #: packet says `not_staged` for every Artifact instead of quoting one.
+    artifacts: Path | None = None
 
     def attempt(self, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
         """Reconcile, offer, claim, run, promote, close. Once, and closed either way.
@@ -965,7 +1023,7 @@ class Slice:
         )
         return closed
 
-    # -- the queue ---------------------------------------------------------
+    # -- the slate ---------------------------------------------------------
 
     def _reconcile(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
         """What an owner that stopped beating left behind, before anything is offered.
@@ -1129,7 +1187,17 @@ class Slice:
         and a child that died differ in what the Ledger says and not in what
         the pass does next, which is to fall back to the runtime's own walk.
         """
-        mission = self._packet(ledger, program_id)
+        mission = self._packet(
+            ledger,
+            connection,
+            program_id,
+            _bounds(
+                session.token_cap,
+                session.subagent_cap,
+                roster.ROLES[roster.ORCHESTRATOR].max_turns,
+                PLANNING_STOPS,
+            ),
+        )
         if mission is None:
             return None
         resume = self._capsule(ledger, connection, program_id, session, offered)
@@ -1430,7 +1498,12 @@ class Slice:
         if selected is None:
             return
 
-        mission = self._packet(ledger, program_id)
+        mission = self._packet(
+            ledger,
+            connection,
+            program_id,
+            _bounds(claimed.token_cap, claimed.subagent_cap, role.max_turns, MISSION_STOPS),
+        )
         if mission is None:
             return
         facts["packet"] = {
@@ -1634,7 +1707,9 @@ class Slice:
         try:
             with connection.transaction():
                 _actor(connection)
+                demoted = 0
                 if not connection.execute(RECORDED, (claimed.task_id,)).scalar():
+                    demoted = int(connection.execute(DEMOTE).scalar() or 0)
                     connection.execute(
                         RECORD_SELECTION, (claimed.task_id, claimed.subject_entity_id)
                     )
@@ -1666,6 +1741,16 @@ class Slice:
         facts["playbooks"] = [
             {"path": one.path, "sha256": one.sha256, "version": one.version} for one in kept
         ]
+        if demoted:
+            # Said out loud because it is a change to the catalogue, made by a
+            # hunt that was only asking what to run. The rows are in
+            # `playbook_demotions` either way; this is so the operator reading
+            # one pass can see that the shape of the corpus moved under it.
+            ledger.hold(
+                "playbooks",
+                f"{demoted} stable Playbook(s) were demoted before this selection: "
+                "their own test fails or their review date has passed",
+            )
         ledger.hold(
             "playbooks",
             f"{claimed.task_label} runs under "
@@ -1677,8 +1762,22 @@ class Slice:
         )
         return tuple(one.projection for one in kept)
 
-    def _packet(self, ledger: Ledger, program_id: str) -> packet_module.Packet | None:
-        """What the child may read, compiled as the role whose reads are bounded."""
+    def _packet(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        program_id: str,
+        bounds: packet_module.Bounds,
+    ) -> packet_module.Packet | None:
+        """What the child may read, compiled as the role whose reads are bounded.
+
+        Two connections, because the ceiling and the rows are read by different
+        roles. The limits come off the runtime connection this pass already
+        holds -- `rk2_state` cannot see the weights row, and should not -- and
+        the rows come off an agent-scoped one, where row level security decides
+        which Program they belong to.
+        """
+        limits = self._packet_limits(connection)
         session = migrate.open_connection(ledger, self.state)
         if session is None:
             return None
@@ -1689,7 +1788,59 @@ class Slice:
                 session.execute("SET TRANSACTION READ ONLY")
                 if not state_module.bind_agent_session(ledger, session, program_id):
                     return None
-                return packet_module.compile(session)
+                try:
+                    return packet_module.compile(
+                        session, limits=limits, bounds=bounds, load=self._excerpt_loader()
+                    )
+                except packet_module.PacketError as error:
+                    ledger.fail(
+                        "packet",
+                        f"the child could not be told what it may read: {error}",
+                        code=INVALID_CONFIGURATION,
+                        source="database",
+                    )
+                    return None
+
+    def _packet_limits(self, connection: pg.Connection) -> packet_module.Limits:
+        """The configured ceiling one packet is fitted to.
+
+        Decision 11 asks for a configured ceiling and not a defaulted one, so
+        this is a read rather than a constant. A weights row that is not there
+        is the module's own numbers, which is what the columns default to
+        anyway: both callers refuse a pass with no active weights row well
+        before this, so an empty answer here is a shape to have rather than a
+        second setting to keep in step.
+        """
+        rows = connection.execute(PACKET_LIMITS).rows
+        if not rows:
+            return packet_module.Limits()
+        return packet_module.Limits(
+            byte_limit=int(rows[0][0]), token_limit=int(rows[0][1])
+        )
+
+    def _excerpt_loader(self) -> Callable[[str], bytes | None] | None:
+        """How the packet reads an Artifact's bytes, or nothing if there is no store.
+
+        The store is content-addressed and the runtime is the side that may
+        address it that way -- the child has no route to it at all, which is
+        why the head of each Artifact travels inside the packet or not at all.
+
+        Every failure answers `None` rather than raising. A hash the store does
+        not hold and a hash whose bytes no longer match it are both "this
+        Artifact has no readable head here", and a compile that raised on one
+        would lose the packet over a single missing file.
+        """
+        if self.artifacts is None:
+            return None
+        keep = store.Store(self.artifacts)
+
+        def load(sha256: str) -> bytes | None:
+            try:
+                return keep.load(sha256)
+            except (store.Missing, store.Corrupt, OSError):
+                return None
+
+        return load
 
     def _capsule(
         self,
@@ -1965,7 +2116,7 @@ class Slice:
             ledger.fail(
                 "closure",
                 f"the refused attempt on {claimed.task_label} could not be returned "
-                f"to the queue: {error}",
+                f"to pending: {error}",
                 code=INTEGRITY_FAILED,
                 source="database",
             )

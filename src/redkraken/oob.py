@@ -261,7 +261,7 @@ def _forbidden(root: Path, configuration: Path) -> str | None:
         return "it is the home directory"
     if (root / ".git").exists():
         return "it holds a .git, so it is a working tree rather than a publish root"
-    if configuration.parent == root or root in configuration.parents:
+    if root in configuration.parents:
         return f"the configuration {configuration.name} is inside it"
     return None
 
@@ -344,11 +344,45 @@ class Request(http.server.BaseHTTPRequestHandler):
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
+    #: Seconds one connection may be silent for. `HTTPServer` here is
+    #: single-threaded on purpose -- the publisher answers one target at a time
+    #: and its state is one mapping -- and `HTTP/1.1` keeps a connection open
+    #: between requests, so without this one idle keep-alive through the tunnel
+    #: blocks the next `readline` forever and the host stops answering anybody.
+    #: `handle_one_request` turns the timeout into a closed connection.
+    timeout = 30.0
+
+    #: The most of a declared request body this host will read before answering.
+    #: It reads one at all so that a `GET` carrying `Content-Length` does not
+    #: leave its body in the buffer to be parsed as the next request line, and
+    #: it stops here because the body is not what this host is for: a target
+    #: that sent more than this gets its connection closed rather than its
+    #: request answered off a desynchronised stream.
+    MAX_BODY_BYTES = 64 * 1024
+
     def do_GET(self) -> None:
         self._answer(with_body=True)
 
     def do_HEAD(self) -> None:
         self._answer(with_body=False)
+
+    def _body(self) -> bytes:
+        """Whatever the request declared, read off the stream before answering.
+
+        Returned rather than discarded because it is part of what arrived, and
+        the transcript this host files is the request bytes a reader weighs.
+        """
+        try:
+            declared = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return b""
+        if declared <= 0:
+            return b""
+        if declared > self.MAX_BODY_BYTES:
+            self.close_connection = True
+            return b""
+        return self.rfile.read(declared)
 
     def _arrived_by_another_method(self) -> None:
         """A method this host does not answer, from a target that still fired.
@@ -397,16 +431,22 @@ class Request(http.server.BaseHTTPRequestHandler):
 
     def _answer(self, with_body: bool) -> None:
         listener: Listener = self.server
-        listener.answered += 1
         target = self.path
         host = self.headers.get("Host", "")
+        # Before anything is written back, because the response goes out on the
+        # same connection the body is still sitting in.
+        arrived = self._body()
 
         if target == HEALTH_PATH and host == f"{LISTEN_HOST}:{listener.server_address[1]}":
             # Asked by `rk oob up` before it binds a name, and answerable by
             # nothing that came through the tunnel: a quick tunnel routes by
             # hostname and sends its own, so this Host cannot arrive from there.
+            # Counted by nothing: `answered` is what targets fetched, and an
+            # operator's own probe in that number is a number about us.
             self._send(200, "text/plain; charset=utf-8", b"ok", with_body=with_body)
             return
+
+        listener.answered += 1
 
         correlator, name = _requested(target)
         if correlator is None:
@@ -422,8 +462,14 @@ class Request(http.server.BaseHTTPRequestHandler):
         body = listener.published.files.get(name) if name is not None else None
         self._send(
             200 if body is not None else 404,
-            CONTENT_TYPES.get(Path(name).suffix, "application/octet-stream")
-            if name is not None
+            # Keyed rather than defaulted: a published name carries a
+            # `PUBLISHABLE` suffix, startup refuses the root otherwise, and the
+            # map is total over those eight. The name that is not published is
+            # the refusal above and reads as one -- an `application/octet-stream`
+            # fallback would have answered a spelling nobody published with a
+            # type this host says at line 74 it does not serve.
+            CONTENT_TYPES[Path(name).suffix]
+            if body is not None
             else "text/plain; charset=utf-8",
             body if body is not None else b"not found",
             with_body=with_body,
@@ -431,7 +477,7 @@ class Request(http.server.BaseHTTPRequestHandler):
         # After the answer, because the fetch is what the target did and the
         # record is what we make of it. A file that is not there is still an
         # arrival: the payload fired and reached us, which is the observation.
-        self._record(listener, correlator, host, target)
+        self._record(listener, correlator, host, target, arrived)
 
     def _serves(self, correlator: str) -> bool:
         """Whether this correlator is live on the channel this host publishes.
@@ -464,7 +510,14 @@ class Request(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
-    def _record(self, listener: Listener, correlator: str, host: str, target: str) -> None:
+    def _record(
+        self,
+        listener: Listener,
+        correlator: str,
+        host: str,
+        target: str,
+        arrived: bytes = b"",
+    ) -> None:
         arrival = {
             "host": host.rsplit(":", 1)[0] if host.count(":") == 1 else host,
             "arrival_kind": "http",
@@ -481,9 +534,7 @@ class Request(http.server.BaseHTTPRequestHandler):
             "received_at": None,
             "path": target,
         }
-        raw = proxy.transcript(
-            self.requestline, list(self.headers.items()), b""
-        )
+        raw = proxy.transcript(self.requestline, list(self.headers.items()), arrived)
         try:
             answer, _, _ = callback.record(
                 listener.connection, listener.keep, correlator, arrival, raw,

@@ -2,10 +2,10 @@
 
 The build backend (`build_backend.py` at the repo root) writes `_build.json`
 into every wheel: the revision the wheel was cut from and a SHA-256 of every
-`.py` and `.sql` module it ships. This module reads that manifest back and
-recomputes the digests against the modules actually on disk, so `rk doctor` can
-report what an install is running and `rk proxy serve` can refuse to run one
-whose code is not the code its manifest names.
+file it ships. This module reads that manifest back and recomputes the digests
+against what is actually on disk, so `rk doctor` can report what an install is
+running and `rk proxy serve` can refuse to run one whose code is not the code
+its manifest names.
 
 The walk that produces those digests is `digests()` here, and the backend
 imports it rather than carrying its own: two walks that had to agree would
@@ -44,9 +44,18 @@ ASSERTION = "build"
 #: not vouch for.
 SCHEMA_VERSION = 1
 
-#: A digest is recorded for every module of these kinds -- the code the harness
-#: runs and the schema it applies.
-HASHED_SUFFIXES = (".py", ".sql")
+#: What the walk below leaves out, which is everything the manifest cannot name.
+#: `__pycache__` is generated on import and differs per interpreter; the manifest
+#: itself cannot carry its own digest.
+#:
+#: Everything else the wheel ships is hashed, by kind and not by extension. An
+#: allowlist of suffixes was the earlier shape and it drifted: `.py` and `.sql`
+#: covered the code and the schema, and left every `playbook.md`, `SKILL.md`,
+#: `fixture.md`, reference page, skill script and measurement outside the one
+#: check that refuses a tampered install. A Playbook is instructions this harness
+#: acts on -- editing one after install is editing what the model is told, and
+#: the in-database `sha256` catches that only where a selection reads it.
+UNHASHED = (BYTECODE_DIR, MANIFEST)
 
 
 class ManifestError(ValueError):
@@ -228,12 +237,12 @@ def _load(root: Traversable) -> dict | None:
 def _walk(node: Traversable, prefix: str, found: dict[str, str]) -> None:
     for child in node.iterdir():
         name = child.name
-        if name == BYTECODE_DIR:
+        if name in UNHASHED:
             continue
         path = f"{prefix}{name}"
         if child.is_dir():
             _walk(child, f"{path}/", found)
-        elif name.endswith(HASHED_SUFFIXES):
+        else:
             found[path] = digest(child.read_bytes())
 
 

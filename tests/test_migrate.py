@@ -84,6 +84,24 @@ class CorpusTest(unittest.TestCase):
         self.assertIn("control_plane", purposes)
         self.assertIn("transport_measurement", purposes)
 
+    def test_only_one_verb_sets_the_causing_event_from_inside_the_database(self):
+        # Every other write takes its cause from the connection helper, which
+        # sets it once for the transaction. `open_task` is the argued exception:
+        # it names an Event it emits itself as the cause of the Task it then
+        # opens, and it saves and restores what it found. The exception holds
+        # only while it is the only one -- two setters is two places the causal
+        # chain is decided, and they diverge the first time one of them forgets
+        # to put back what it took. This is that condition, enforced rather
+        # than tracked.
+        setters = [
+            item.identity
+            for item in self.migrations
+            if "set_config('app.caused_by_event_id'" in item.sql
+        ]
+        self.assertEqual(
+            ["20260831T000000Z__a_program_opens_the_first_task_of_its_own_scope"], setters
+        )
+
     def test_the_emitter_binds_the_actor_to_the_writing_transaction(self):
         # RK-REG-004: a session-wide actor context outlives the write it
         # describes, so the emitter compares it against the current transaction.

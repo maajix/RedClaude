@@ -99,12 +99,6 @@ STAGED = Path(".claude") / "skills"
 #: name is a skill whose scripts cannot be run.
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
-#: A file inside a skill. It is a name and never a path: no separator, no
-#: parent, no leading dot. Checked in `_resolved` and nowhere else, so that
-#: "is this a file inside the skill" has one answer with one refusal code
-#: however the file came to be declared.
-FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
-
 #: `evidence_profiles.id` and `offline_tools.tool`, restated where the corpus
 #: names them. Both are checked for real against the database by the standing
 #: check the migration installs; these only refuse a value that could not be
@@ -190,9 +184,10 @@ class Case:
         """The stdin envelope a checked script reads, defined here and nowhere else.
 
         `mcp__rk2__run_skill_script` has a contract in `roster` and no handler
-        yet, so this is the only executable statement of the shape -- which is
-        why the checks run against it: whatever serves that tool later has to
-        produce this, and a script that reads something else fails here first.
+        in any launch -- ticket 87 owes that channel -- so this is the only
+        executable statement of the shape, which is why the checks run against
+        it: whatever serves that tool later has to produce this, and a script
+        that reads something else fails here first.
         """
         return json.dumps(
             {
@@ -283,7 +278,7 @@ def _script(name: str, directory: Path, entry: Any) -> Script:
         # Criterion 3. A script with no case is deterministic behaviour nobody
         # has run, which is the state this key exists to make impossible.
         raise SkillError("check_missing", name, f"{script_name} declares no check")
-    path = _resolved(name, directory / SCRIPT_DIR, script_name)
+    path = document.resolved(SkillError, name, directory / SCRIPT_DIR, script_name)
     return Script(
         name=script_name,
         description=description,
@@ -291,44 +286,6 @@ def _script(name: str, directory: Path, entry: Any) -> Script:
         path=path,
         sha256=digest(path.read_bytes()),
     )
-
-
-def _resolved(name: str, parent: Path, file_name: str) -> Path:
-    """One file inside a skill, or the reason it is not one.
-
-    Two rules rather than one, because they fail differently. The pattern
-    refuses a name that is a path -- `../`, an absolute path, a separator --
-    before anything touches the filesystem. Resolution refuses a name that is
-    not a path and reaches outside anyway, which on a filesystem means a
-    symbolic link: a corpus file that is a link into the container's own
-    credentials would pass every text rule in this module.
-    """
-    if not FILE_NAME.match(file_name):
-        raise SkillError("path_escape", name, f"{file_name!r} is not a file name")
-    candidate = parent / file_name
-    if candidate.is_symlink():
-        raise SkillError("path_escape", name, f"{file_name} is a symbolic link")
-    if not candidate.is_file():
-        raise SkillError("file_missing", name, f"{parent.name}/{file_name} is declared and absent")
-    resolved = candidate.resolve()
-    root = parent.resolve()
-    if not resolved.is_relative_to(root):
-        raise SkillError("path_escape", name, f"{file_name} resolves outside {parent.name}/")
-    return resolved
-
-
-def _listing(name: str, directory: Path) -> tuple[str, ...]:
-    """What is actually in `scripts/` or `references/`, refusing anything odd."""
-    if not directory.is_dir():
-        return ()
-    found = []
-    for entry in document.entries(directory):
-        if not entry.is_file() or entry.is_symlink():
-            raise SkillError("stray_file", name, f"{directory.name}/{entry.name} is not a file")
-        if not FILE_NAME.match(entry.name):
-            raise SkillError("path_escape", name, f"{directory.name}/{entry.name} is not a file name")
-        found.append(entry.name)
-    return tuple(found)
 
 
 def _skill(directory: Path) -> Skill:
@@ -340,12 +297,7 @@ def _skill(directory: Path) -> Skill:
     if not source_path.is_file() or source_path.is_symlink():
         raise SkillError("file_missing", name, f"there is no {INSTRUCTIONS}")
     source = source_path.read_bytes()
-    try:
-        text = source.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} is not UTF-8") from error
-    if "\r" in text:
-        raise SkillError("frontmatter_malformed", name, f"{INSTRUCTIONS} carries a carriage return")
+    text = document.text(SkillError, name, INSTRUCTIONS, source)
 
     fields, body = document.frontmatter(SkillError, name, INSTRUCTIONS, text)
     if not body:
@@ -389,7 +341,7 @@ def _skill(directory: Path) -> Skill:
         if "bb:references" in fields else ()
     )
     reference_paths = {
-        reference: _resolved(name, directory / REFERENCE_DIR, reference)
+        reference: document.resolved(SkillError, name, directory / REFERENCE_DIR, reference)
         for reference in references
     }
 
@@ -401,7 +353,9 @@ def _skill(directory: Path) -> Skill:
         (SCRIPT_DIR, {script.name for script in scripts}),
         (REFERENCE_DIR, set(references)),
     ):
-        undeclared = sorted(set(_listing(name, directory / directory_name)) - declared)
+        undeclared = sorted(
+            set(document.listing(SkillError, name, directory / directory_name)) - declared
+        )
         if undeclared:
             raise SkillError("stray_file", name, f"{directory_name}/ carries undeclared {undeclared}")
 
@@ -532,11 +486,11 @@ def stage(
     gave it.
 
     `SKILL.md` and nothing else. The instructions are what a model loads;
-    `scripts/` is run by the runtime against stored Artifacts rather than by
-    the model against a file, and `references/` is maintainer material this
-    system has no tool to open -- the module docstring says so, and staging
-    either would put files in a child's directory that nothing in its frame can
-    reach. The bytes written are the compiled skill's own `source`, which is
+    `scripts/` is run here, by `check`, and by nothing during a run -- the tool
+    that would run one over stored Artifacts is `mcp__rk2__run_skill_script`,
+    which ticket 87 owes -- and `references/` is maintainer material this system
+    has no tool to open. The module docstring says so, and staging either would
+    put files in a child's directory that nothing in its frame can reach. The bytes written are the compiled skill's own `source`, which is
     what `sha256` digests and what a Task records, so the text a child reads and
     the digest an installation reports are one object and not two copies.
 

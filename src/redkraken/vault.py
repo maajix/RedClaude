@@ -224,8 +224,9 @@ class Secret:
 
     Everything about it is a barrier between the value and the places a string
     ends up on its own. It does not render -- `repr`, `str` and `format` all give
-    the reference back -- it has no attribute dictionary to walk, it refuses to
-    be copied or pickled, and `json.dumps` cannot serialise it. So a secret
+    the reference back -- it has no attribute dictionary to walk, it answers no
+    state to reflect over, it refuses to be copied or pickled, and `json.dumps`
+    cannot serialise it. So a secret
     interpolated into a log line, an event payload or an exception message is a
     reference, and reaching the value at all means writing `reveal()`.
 
@@ -254,6 +255,13 @@ class Secret:
 
     def __format__(self, specification: str) -> str:
         return repr(self)
+
+    def __getstate__(self):
+        # `__slots__` leaves no `__dict__`, but since 3.11 the inherited
+        # `object.__getstate__` reads the slots and answers the value anyway.
+        # `__reduce__` below already refuses every ordinary serialiser; this
+        # closes the one door reflection can still open by hand.
+        raise TypeError("a Secret answers no state")
 
     def __reduce__(self):
         raise TypeError("a Secret is not copied, pickled or serialised")

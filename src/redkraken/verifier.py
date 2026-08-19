@@ -78,6 +78,11 @@ MARKER = re.compile(r"\[redacted rule=[a-z_]+ bytes=[0-9]+\]")
 #: which is wrong.
 ARTIFACTS = "artifacts.json"
 
+#: The rendered document, and the one file in a bundle that a row outside the
+#: bundle can also name. When the manifest says which rendering it is, this is
+#: the file that claim is about.
+REPORT = "report.md"
+
 
 def digest(data: bytes) -> str:
     """The identifier of some bytes, in the one form the whole tree uses."""
@@ -149,6 +154,7 @@ def verify(root: Path) -> dict:
                 _problem("required_file_unlisted", path, "the manifest owes this file and omits it")
             )
     problems.extend(_artifacts(root, listed))
+    problems.extend(_rendering(root, listed, document.get("rendering")))
     problems.extend(_residue(root, listed, document.get("redaction_rules", ())))
     return _answer(root, len(listed), problems)
 
@@ -227,6 +233,38 @@ def _artifacts(root: Path, listed: Mapping[str, Mapping]) -> list[dict]:
                 )
             )
     return problems
+
+
+def _rendering(root: Path, listed: Mapping[str, Mapping], named: object) -> list[dict]:
+    """Whether the report shipped is the rendering the manifest says it is.
+
+    The one claim in a bundle about something outside it. `report.md` can be a
+    document a human read and approved, and an approval names exact bytes; when
+    the exporter says which rendering those were, a recipient can hold the file
+    against that hash without this harness in the middle -- which is the only
+    way the claim is worth anything, since every other hash here was written by
+    the same export that wrote the file.
+
+    A bundle with no `rendering` key makes no such claim and is not failed for
+    it: a chain has no rendering row, and a Finding nobody has read has none
+    either.
+    """
+    if not isinstance(named, Mapping):
+        return []
+    stated = str(named.get("content_sha256"))
+    entry = listed.get(REPORT)
+    if entry is None:
+        return [_problem("rendering_unlisted", REPORT, "the manifest names a rendering and no report")]
+    if entry.get("sha256") != stated:
+        return [
+            _problem(
+                "rendering_mismatch",
+                REPORT,
+                f"the manifest names rendering {str(named.get('id'))} at {stated[:12]} "
+                f"and ships {str(entry.get('sha256'))[:12]}",
+            )
+        ]
+    return []
 
 
 def _scanned(path: str) -> bool:

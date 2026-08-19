@@ -126,7 +126,7 @@ class AuthorityTest(unittest.TestCase):
 
         # Only the leaf is spent here: the question is whether a live root
         # reissues one of its own certificates, not whether it replaces itself.
-        with mock.patch.object(tls, "_spent", lambda path: path.name.startswith("leaf-")):
+        with mock.patch.object(tls, "spent", lambda path: path.name.startswith("leaf-")):
             again = tls.authority(root)
             context = again.context("target.example")
 

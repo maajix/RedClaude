@@ -29,10 +29,11 @@ same hash in Python would be a second answer to that check.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Protocol
 
 from redkraken import pg
 
@@ -59,6 +60,13 @@ DEFAULT_TOKENS = 8192
 DEFAULT_EXCERPT = 4096
 DEFAULT_PAGE = 25
 
+#: How many times a document over its ceiling is re-fitted before it is refused.
+#: Each pass subtracts the excess the last one measured, and dropping rows drops
+#: what hangs off them -- a packet's excerpts are staged from the Artifact rows
+#: that survived -- so a document converges in one or two. Four is the count at
+#: which "it is not converging" is a better answer than another pass.
+COMPACTIONS = 4
+
 #: Content types whose bytes are worth putting in a context window at all. An
 #: Artifact outside this set is staged as metadata and the child is told the
 #: bytes were not staged, rather than being handed a screenful of replacement
@@ -74,7 +82,30 @@ TEXTUAL = (
 
 
 class PacketError(ValueError):
-    """A packet document that is not one. Raised at the boundary, not below it."""
+    """A packet document that is not one, or not one that fits. Raised at the
+    boundary, not below it."""
+
+
+class Document(Protocol):
+    """What a compaction needs of the document it is fitting: its sent size.
+
+    A protocol rather than a base class because the two documents that are
+    fitted here -- the packet and the capsule -- share no fields, only a
+    ceiling and the question of whether they are under it.
+    """
+
+    @property
+    def document_bytes(self) -> int: ...
+
+
+def encode(document: Mapping[str, Any]) -> bytes:
+    """A document as it goes out, which is the only form worth measuring.
+
+    Public because the capsule is a second document measured against the same
+    kind of ceiling, and one encoder is how the two cannot come to disagree
+    about what a byte is.
+    """
+    return json.dumps(document, separators=(",", ":"), default=str).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +149,48 @@ class Limits:
             token_limit=int(document.get("tokens", DEFAULT_TOKENS)),
             excerpt=int(document.get("excerpt", DEFAULT_EXCERPT)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Bounds:
+    """What this run may spend and what ends it, told to the child spending it.
+
+    Decision 11 asks a Mission packet to carry budgets and stop conditions.
+    They are a field of the packet rather than a `Section` because they are
+    neither rows nor droppable: a compaction that made room by dropping the
+    budget would drop the sentence saying how much room there is, and a run
+    that learns its ceiling by hitting it has already spent the attempt.
+
+    `None` is a ceiling nobody set, which is a different fact from a ceiling of
+    zero: a Program that stated no token total reserved nothing, and what
+    bounds that run is its turn count alone.
+    """
+
+    tokens: int | None = None
+    subagents: int | None = None
+    turns: int | None = None
+    stop_conditions: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return {
+            "tokens": self.tokens,
+            "subagents": self.subagents,
+            "turns": self.turns,
+            "stop_conditions": list(self.stop_conditions),
+        }
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> Bounds:
+        return cls(
+            tokens=_count(document.get("tokens")),
+            subagents=_count(document.get("subagents")),
+            turns=_count(document.get("turns")),
+            stop_conditions=tuple(str(one) for one in document.get("stop_conditions") or ()),
+        )
+
+
+def _count(value: Any) -> int | None:
+    return None if value is None else int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +265,7 @@ class Packet:
 
     revision: int = 0
     limits: Limits = field(default_factory=Limits)
+    bounds: Bounds = field(default_factory=Bounds)
     sections: Mapping[str, Section] = field(default_factory=dict)
     excerpts: Mapping[str, str] = field(default_factory=dict)
 
@@ -200,7 +274,30 @@ class Packet:
 
     @property
     def bytes(self) -> int:
+        """What the rows cost, which is what a fitter decides drops against.
+
+        Not what the packet costs. `document_bytes` is that, and the two are
+        different numbers because `revision`, `limits`, the per-section framing
+        and every excerpt ride outside the rows.
+        """
         return _size(self.rows())
+
+    @property
+    def document_bytes(self) -> int:
+        """What the whole document costs, framing and excerpts included.
+
+        This is the number the byte ceiling is on, because this is what crosses
+        into the child. A fit checked against `bytes` alone passes while the
+        thing actually sent is larger, and the excerpts are the larger part of
+        that difference: they are staged from the rows that survived the fit,
+        so no measurement taken before it has seen them.
+        """
+        return len(encode(self.as_dict()))
+
+    @property
+    def document_tokens(self) -> int:
+        """The document's size in the same approximate tokens `Limits` bounds."""
+        return math.ceil(self.document_bytes / BYTES_PER_TOKEN)
 
     def rows(self) -> list[Row]:
         return [row for name in SECTIONS for row in self.section(name).rows]
@@ -209,6 +306,7 @@ class Packet:
         return {
             "revision": self.revision,
             "limits": self.limits.as_dict(),
+            "bounds": self.bounds.as_dict(),
             "sections": {
                 name: self.section(name).as_dict()
                 for name in SECTIONS
@@ -236,6 +334,7 @@ class Packet:
             return cls(
                 revision=int(document.get("revision", 0)),
                 limits=Limits.from_dict(dict(document.get("limits", {}))),
+                bounds=Bounds.from_dict(dict(document.get("bounds", {}))),
                 sections=sections,
                 excerpts={
                     str(key): str(value)
@@ -337,6 +436,69 @@ def bound(
     }
 
 
+def emptied(sections: Mapping[str, Section]) -> dict[str, Section]:
+    """The same sections with no rows: what the framing alone costs."""
+    return {
+        name: Section(name=name, total=section.total)
+        for name, section in sections.items()
+    }
+
+
+def compacted[T: Document](
+    staged: Mapping[str, Section],
+    limits: Limits,
+    build: Callable[[Mapping[str, Section]], T],
+    *,
+    order: Sequence[str] = SECTIONS,
+    noun: str = "packet",
+    error: type[Exception] = PacketError,
+) -> T:
+    """Fit a document under its ceiling, or refuse to send one that is over.
+
+    `bound` fits rows against a byte budget, but the ceiling is on the
+    serialized document -- the rows plus its own framing plus whatever the
+    surviving rows drag in with them. So the budget starts one framing short
+    and each pass subtracts the excess the last one actually measured, which is
+    the only number that accounts for what the fit could not know in advance.
+
+    A document still over the ceiling with every row dropped is a ceiling
+    smaller than the empty document, which no amount of compaction reaches.
+    That is a configuration this cannot satisfy, and a refusal names it rather
+    than sending something the runtime quietly broke its own bound to send.
+
+    The two refusals are separate sentences because they are separate faults. A
+    ceiling below the framing is a setting to change; a fit that has not
+    converged in `COMPACTIONS` passes is this module not converging, and telling
+    an operator to raise a limit would be advice about the wrong thing.
+
+    `noun`, `order` and `error` are parameters for the same reason `bound`
+    takes `order`: the capsule is a second document with the same
+    rows-under-a-ceiling problem, different sections and its own word for what
+    went wrong, and it should get this policy rather than a copy of it.
+    """
+    framing = build(emptied(staged)).document_bytes
+    budget = limits.byte_ceiling - framing
+    if budget < 0:
+        raise error(
+            f"the {noun} does not fit: {limits.byte_ceiling} bytes "
+            f"({limits.byte_limit} configured, {limits.token_limit} tokens) "
+            f"leaves no room for the {framing} byte(s) of document framing"
+        )
+    for _ in range(COMPACTIONS):
+        built = build(bound(staged, byte_limit=budget, order=order))
+        excess = built.document_bytes - limits.byte_ceiling
+        if excess <= 0:
+            return built
+        budget -= excess
+        if budget < 0:
+            break
+    raise error(
+        f"the {noun} does not fit: {COMPACTIONS} compaction(s) did not bring it "
+        f"under {limits.byte_ceiling} bytes "
+        f"({limits.byte_limit} configured, {limits.token_limit} tokens)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The compile
 # ---------------------------------------------------------------------------
@@ -420,6 +582,7 @@ def compile(
     connection: pg.Connection,
     *,
     limits: Limits | None = None,
+    bounds: Bounds | None = None,
     load: Callable[[str], bytes | None] | None = None,
 ) -> Packet:
     """Compile one Program's packet on an agent-scoped connection.
@@ -428,20 +591,69 @@ def compile(
     accepted, and none appears in any query: `rk2_state` sees one Program's rows
     because row level security says so, and a compile that took a Program would
     be a second opinion about which one -- the exact thing ticket 05 removed.
+
+    `bounds` is the exception that proves it: what this run may spend was
+    reserved by the scheduler on the runtime's connection, so it arrives as an
+    argument rather than as a query. A ceiling this side could read for itself
+    would be a ceiling the child's own role could read differently.
     """
     limits = limits or Limits()
-    sections: dict[str, Section] = {}
+    bounds = bounds or Bounds()
+    staged: dict[str, Section] = {}
     for name, kind in RECORD_KINDS.items():
-        sections[name] = _records(connection, name, kind, limits.rows)
-    sections["evidence"] = _evidence(connection, limits.rows)
-    sections["artifacts"] = _artifacts(connection, limits.rows)
-    kept = bound(sections, byte_limit=limits.byte_ceiling)
-    return Packet(
-        revision=int(connection.execute(REVISION).rows[0][0]),
-        limits=limits,
-        sections={name: kept[name] for name in SECTIONS},
-        excerpts=_excerpts(kept["artifacts"], limits.excerpt, load),
-    )
+        staged[name] = _records(connection, name, kind, limits.rows)
+    staged["evidence"] = _evidence(connection, limits.rows)
+    staged["artifacts"] = _artifacts(connection, limits.rows)
+    revision = int(connection.execute(REVISION).rows[0][0])
+    heads = _cached(load)
+
+    def build(kept: Mapping[str, Section]) -> Packet:
+        """One candidate document: the rows as fitted, then whatever heads fit.
+
+        The heads go last and take only the room the rows left, because a head
+        is the one part of this document that is optional. An Artifact whose
+        bytes were not staged is still an Artifact the child knows about and
+        can hand to `exec.tool_run`; an Artifact whose row was dropped to make
+        space for somebody else's head is one it cannot ask about at all.
+        """
+        bare = Packet(
+            revision=revision,
+            limits=limits,
+            bounds=bounds,
+            sections={name: kept[name] for name in SECTIONS},
+        )
+        return replace(
+            bare,
+            excerpts=_excerpts(
+                kept["artifacts"],
+                limits.excerpt,
+                heads,
+                room=limits.byte_ceiling - bare.document_bytes,
+            ),
+        )
+
+    return compacted(staged, limits, build)
+
+
+def _cached(
+    load: Callable[[str], bytes | None] | None,
+) -> Callable[[str], bytes | None] | None:
+    """The same loader, asked for each hash once.
+
+    A compaction builds the document more than once, and the Artifact rows that
+    survive one pass mostly survive the next. Without this, a store read costs
+    as many disk reads as there were passes to answer the same question.
+    """
+    if load is None:
+        return None
+    held: dict[str, bytes | None] = {}
+
+    def once(sha256: str) -> bytes | None:
+        if sha256 not in held:
+            held[sha256] = load(sha256)
+        return held[sha256]
+
+    return once
 
 
 def _records(connection: pg.Connection, name: str, kind: str, rows: int) -> Section:
@@ -497,7 +709,11 @@ def _artifacts(connection: pg.Connection, rows: int) -> Section:
 
 
 def _excerpts(
-    artifacts: Section, ceiling: int, load: Callable[[str], bytes | None] | None
+    artifacts: Section,
+    ceiling: int,
+    load: Callable[[str], bytes | None] | None,
+    *,
+    room: int,
 ) -> dict[str, str]:
     """Stage the readable head of each Artifact, or stage nothing for it.
 
@@ -510,10 +726,17 @@ def _excerpts(
     Loaded by hash and keyed by label: the store is content-addressed and the
     runtime compiling the packet is the side that may address it that way, which
     is exactly the asymmetry ticket 06 asked for.
+
+    `room` is what is left of the packet's ceiling once the rows are in, and a
+    head that does not fit in it is skipped rather than ending the staging --
+    one Artifact whose head is 4 KB should not cost the next one its 200 bytes.
+    Skipped and dropped read the same way to the child, which is told the bytes
+    were not staged either way.
     """
     if load is None:
         return {}
     excerpts: dict[str, str] = {}
+    empty = len(encode(excerpts))
     for row in artifacts.rows:
         if not _textual(str(row.record.get("content_type") or "")):
             continue
@@ -522,8 +745,12 @@ def _excerpts(
         if blob is None:
             continue
         head = _decodable(blob[:ceiling])
-        if head is not None:
-            excerpts[row.label] = head
+        if head is None:
+            continue
+        staged = {**excerpts, row.label: head}
+        if len(encode(staged)) - empty > room:
+            continue
+        excerpts = staged
     return excerpts
 
 

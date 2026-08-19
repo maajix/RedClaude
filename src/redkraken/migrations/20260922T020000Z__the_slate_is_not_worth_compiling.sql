@@ -1,0 +1,51 @@
+-- Ticket 64: the slate is not worth compiling.
+--
+-- `docs/performance-budgets.md` gives the slate 1500 ms, and on a quiet machine
+-- against the case's own corpus `offer_slate()` costs 185 ms. Run inside the
+-- composed suite the same case on the same corpus reported 1140.9 ms, then
+-- 1759.6, then 2626.3, because `tests/test_database.py` builds one database
+-- that every case in the module shares: the benchmark runs late, against tables
+-- carrying every other case's Programs.
+--
+-- The reading that suggests itself is that the slate has stopped being scoped
+-- to its Program and started scanning the installation. That reading is wrong,
+-- and it is worth saying why, because the wrong fix for it is an index nothing
+-- needed. At 100200 Tasks across six Programs, 200 of them the measured
+-- Program's, `EXPLAIN ANALYZE` on the statement inside this function reports
+-- `Index Scan using tasks_program_id_label_key` with `rows=200`, and a Nested
+-- Loop that finishes at `actual time=6.664..6.664`. The scoping holds. What the
+-- same plan also reports is this:
+--
+--     JIT:
+--       Functions: 71
+--       Timing: ... Optimization 228.977 ms, Emission 180.574 ms,
+--               Total 430.504 ms
+--     Execution Time: 437.602 ms
+--
+-- Postgres decides whether to compile a plan from the planner's cost estimate
+-- against `jit_above_cost`, and a cost estimate is a number about the whole
+-- relation, not about the rows a scoped predicate will actually touch. As the
+-- installation's Tasks grow, the estimate for a ranking pass over seven factor
+-- expressions crosses the threshold and every call starts paying LLVM to
+-- compile 71 functions for a query that runs in seven milliseconds. The tax is
+-- paid per call, it is paid whether or not any Task is offered, and it grows
+-- with rows this Program does not own -- which is exactly the shape of the
+-- regression the budget exists to catch, arriving from the one direction the
+-- budget's author would not have looked.
+--
+-- Measured on that corpus, calling `offer_slate()` five times and taking the
+-- median: 477.6 ms as the schema ships, 10.0 ms with the clause below, 9.9 ms
+-- with `SET jit = off` on the session. The per-function clause reproduces the
+-- session-wide number, which is what says the compilation was the whole cost.
+--
+-- Off for this function and not for the database, because JIT is worth having
+-- where a query really does grind through rows -- `check_kill_chains()` over a
+-- large graph is the honest candidate -- and a database-level setting would
+-- take it from those too. The clause goes on `offer_slate` rather than on
+-- `rank_candidates`, which is where the expensive plan actually is, for two
+-- reasons: `rank_candidates` is `LANGUAGE sql`, so a SET clause on it would
+-- stop the planner inlining it and change the plan this file is trying to leave
+-- alone, and a `SET` on a PL/pgSQL function is in force for everything the call
+-- executes, `rank_candidates` included. `offer_slate` is the only caller.
+
+ALTER FUNCTION offer_slate() SET jit = off;

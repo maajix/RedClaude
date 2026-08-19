@@ -46,6 +46,24 @@ class SessionTest(unittest.TestCase):
         )
         self.assertEqual([("Accept", "application/json")], elsewhere)
 
+    def test_what_the_identity_would_spend_is_listed_value_by_value(self):
+        # What the door redacts out of an Agent's view of a response, so it is
+        # the values and not the headers: a target echoes `control-owned` into
+        # a body far more often than it echoes `Bearer control-owned`, and a
+        # cookie comes back as its crumb's value rather than as the `Cookie`
+        # line that carried it.
+        session = self.session()
+        session.capture(
+            "https://app.example.com/notes",
+            [("Set-Cookie", "session=two; Path=/; Secure; HttpOnly")],
+        )
+
+        self.assertEqual(
+            ("Bearer control-owned", "control-owned", "one", "two"),
+            session.secrets("https://app.example.com/notes"),
+        )
+        self.assertEqual((), session.secrets("https://other.example.com/notes"))
+
     def test_target_cookies_survive_an_encrypted_slot_round_trip(self):
         session = self.session()
 

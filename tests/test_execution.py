@@ -14,8 +14,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import shutil
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from redkraken import (
@@ -30,6 +33,7 @@ from redkraken import (
     proposal,
     proxy,
     roster,
+    store,
 )
 from redkraken.outcome import Ledger
 from tests import fixtures
@@ -294,6 +298,10 @@ class Recorder:
         # how many rows the Task already has, which is what tells a first
         # attempt from a retry.
         self.recorded = answers.get("recorded", 0)
+        # How many stable Playbooks the demotion took back to draft on the way
+        # in. Zero is the ordinary pass; a case says otherwise to see the pass
+        # report a catalogue that moved under it.
+        self.demoted = answers.get("demoted", 0)
         self.selections = list(
             answers.get("selections", [(SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256,
                                         SELECTED_PLAYBOOK.version)])
@@ -353,6 +361,10 @@ class Recorder:
                 "leases_released": 0,
             },
         )
+        # What the weights row says one Mission packet may cost. An empty list
+        # is a scheduler with no active row, which is a real state and the one
+        # the module answers with its own defaults.
+        self.packet_limits = list(answers.get("packet_limits", [(65536, 8192)]))
         # Whether `close_startup_refusal` found an open run to close. False is
         # a run something else already ended, which is not this pass's to close.
         self.refusal_closed = answers.get("refusal_closed", True)
@@ -453,6 +465,8 @@ class Recorder:
             return list(self.started)
         if sql == execution.RECORDED:
             return [(self.recorded,)]
+        if sql == execution.DEMOTE:
+            return [(self.demoted,)]
         if sql == execution.RECORD_SELECTION:
             return [(len(self.selections),)]
         if sql == execution.SELECTED:
@@ -467,6 +481,8 @@ class Recorder:
             return [(json.dumps(self.reconciliation),)]
         if sql == execution.LEASE_TTL:
             return [(self.lease_ttl,)]
+        if sql == execution.PACKET_LIMITS:
+            return list(self.packet_limits)
         if sql == execution.HEARTBEAT:
             # Answered in order and then repeated, so a test can say what the
             # second beat found without saying it about the first.
@@ -657,6 +673,57 @@ def compiled(mission: packet.Packet | None = None):
         yield session
 
 
+class PacketLimitsTest(unittest.TestCase):
+    """Decision 11's word "configured": which numbers a packet is fitted to.
+
+    The capsule beside it has been configured since ticket 28, and the packet
+    was fitted to whatever constants `packet.py` held -- so an operator who
+    lowered the one ceiling they could set bounded one of the two documents a
+    child reads. What is asserted here is the read: that the ceiling comes off
+    the weights row, on the connection that can see it.
+    """
+
+    def fitted(self, **answers) -> packet.Limits:
+        """The limits one compile was handed, from a weights row that says so."""
+        with compiled():
+            with mock.patch.object(
+                execution.packet_module, "compile", return_value=packet.Packet()
+            ) as compile:
+                execution.Slice(boundary=BOUNDARY, state=STATE)._packet(
+                    Ledger(), Recorder(**answers), PROGRAM, packet.Bounds()
+                )
+        return compile.call_args.kwargs["limits"]
+
+    def test_the_packet_is_fitted_to_the_ceiling_the_weights_row_states(self):
+        # Numbers that are not the module's defaults, because a test that used
+        # the defaults would pass against a runtime that read nothing at all.
+        self.assertEqual(
+            packet.Limits(byte_limit=4096, token_limit=512),
+            self.fitted(packet_limits=[(4096, 512)]),
+        )
+
+    def test_the_ceiling_is_read_as_the_runtime_and_not_as_the_agent(self):
+        # `rk2_state` cannot see `scheduler_weights` and should not: what every
+        # pass may spend is not a fact about the one Program a packet is of.
+        runtime = Recorder()
+        with compiled() as session:
+            with mock.patch.object(
+                execution.packet_module, "compile", return_value=packet.Packet()
+            ):
+                execution.Slice(boundary=BOUNDARY, state=STATE)._packet(
+                    Ledger(), runtime, PROGRAM, packet.Bounds()
+                )
+
+        self.assertIn(execution.PACKET_LIMITS, runtime.statements)
+        self.assertNotIn(execution.PACKET_LIMITS, session.statements)
+
+    def test_a_scheduler_with_no_active_row_is_the_modules_own_numbers(self):
+        # Both callers refuse a pass with no active weights row well before
+        # this, and the columns default to these very numbers, so an empty
+        # answer is a shape to have rather than a second setting to keep in step.
+        self.assertEqual(packet.Limits(), self.fitted(packet_limits=[]))
+
+
 def attempt(connection: Recorder, launcher: Launcher | None = None, **overrides):
     """One attempt, with the ledger and facts it produced."""
     ledger = Ledger()
@@ -665,6 +732,63 @@ def attempt(connection: Recorder, launcher: Launcher | None = None, **overrides)
     )
     facts = runner.attempt(ledger, connection, PROGRAM)
     return ledger, facts
+
+
+class ExcerptLoaderTest(unittest.TestCase):
+    """The one thing the packet cannot compile for itself: Artifact bytes.
+
+    The child has no route to the store, so the readable head of an Artifact
+    reaches it inside the packet or not at all. Ticket 19's first criterion
+    offers "reachable Artifacts under explicit bounds" and the served tool text
+    offers a byte range, and both of those are promises about a loader the one
+    production caller has to hand over.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rk2-excerpts-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.keep = store.Store(self.root)
+
+    def test_the_compile_is_given_a_loader_when_the_machine_names_a_store(self):
+        with compiled():
+            with mock.patch.object(
+                execution.packet_module, "compile", return_value=packet.Packet()
+            ) as compile:
+                execution.Slice(
+                    boundary=BOUNDARY, state=STATE, artifacts=self.root
+                )._packet(Ledger(), Recorder(), PROGRAM, packet.Bounds())
+
+        self.assertIsNotNone(compile.call_args.kwargs["load"])
+
+    def test_a_machine_that_names_no_store_says_so_rather_than_inventing_one(self):
+        with compiled():
+            with mock.patch.object(
+                execution.packet_module, "compile", return_value=packet.Packet()
+            ) as compile:
+                execution.Slice(boundary=BOUNDARY, state=STATE)._packet(
+                    Ledger(), Recorder(), PROGRAM, packet.Bounds()
+                )
+        self.assertIsNone(compile.call_args.kwargs["load"])
+
+    def test_the_loader_reads_what_the_store_holds(self):
+        sha256, _ = self.keep.put(b"<html>a page the hunter filed</html>")
+        load = execution.Slice(
+            boundary=BOUNDARY, state=STATE, artifacts=self.root
+        )._excerpt_loader()
+
+        self.assertEqual(b"<html>a page the hunter filed</html>", load(sha256))
+
+    def test_an_artifact_the_store_lost_is_a_head_that_is_not_here(self):
+        """Not an exception. A packet is not worth losing over one missing file,
+        and `_excerpts` already has a word for an Artifact it cannot quote."""
+        sha256, _ = self.keep.put(b"the bytes that were filed")
+        load = execution.Slice(
+            boundary=BOUNDARY, state=STATE, artifacts=self.root
+        )._excerpt_loader()
+        store.path_for(self.root, sha256).write_bytes(b"not what it is named after")
+
+        self.assertIsNone(load(sha256))
+        self.assertIsNone(load("0" * 64))
 
 
 class BoundaryTest(unittest.TestCase):
@@ -1356,6 +1480,35 @@ class PlaybookSelectionTest(unittest.TestCase):
         with compiled():
             attempt(connection)
         self.assertEqual([(TASK, SUBJECT)], connection.sent(execution.RECORD_SELECTION))
+
+    def test_a_stale_stable_playbook_is_demoted_before_the_selection_reads_it(self):
+        # Story 182. `demote_playbooks` had no caller, so a Playbook whose own
+        # test had started failing stayed `stable` and stayed selectable: the
+        # status is the whole of what says the catalogue stands behind it.
+        # Running it in the same transaction as the selection is what makes the
+        # two agree -- a demotion that committed after the pick would have
+        # picked what it then withdrew.
+        connection = Recorder(demoted=2)
+        with compiled():
+            ledger, _ = attempt(connection)
+
+        self.assertLess(
+            connection.statements.index(execution.DEMOTE),
+            connection.statements.index(execution.RECORD_SELECTION),
+        )
+        self.assertIn(
+            "2 stable Playbook(s) were demoted",
+            " ".join(item.detail for item in ledger.assertions),
+        )
+
+    def test_a_retry_does_not_demote_again_because_it_selects_nothing(self):
+        # The selection is recorded once per Task. A retry reads the rows the
+        # first attempt froze, so there is no pick for a demotion to precede.
+        connection = Recorder(recorded=1)
+        with compiled():
+            attempt(connection)
+
+        self.assertEqual([], connection.sent(execution.DEMOTE))
 
     def test_the_choice_is_made_before_the_capability_the_child_would_spend(self):
         # The migration's own title: a Playbook is chosen before the model

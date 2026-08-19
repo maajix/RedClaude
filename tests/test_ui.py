@@ -14,7 +14,9 @@ one is a page an operator is looking at while believing something untrue.
 
 from __future__ import annotations
 
+import ast
 import http.client
+import re
 import threading
 import unittest
 from pathlib import Path
@@ -52,7 +54,7 @@ def panel(**overrides) -> dict:
     fields = {
         "name": "findings",
         "caption": "every Finding",
-        "columns": ("finding", "exploited", "blocked"),
+        "columns": ("finding", "demonstrated", "blocked"),
         "rows": (("F1", "true", "false"),),
         "total": 1,
         "state": panels.READY,
@@ -232,10 +234,31 @@ class ActionTest(unittest.TestCase):
             set(ui.ACTIONS), set(ui.DECISION_ACTIONS) | set(ui.CONTROL_ACTIONS)
         )
 
-    def test_a_grant_that_will_not_parse_is_the_default_and_not_a_refusal(self):
+    def test_an_empty_grant_is_the_default_and_a_filled_one_that_will_not_parse_is_not(self):
+        # Ticket 64: `rk decision answer --grant-hours "two days"` exits 2, and a
+        # console that read the same characters as the default window would be
+        # granting one thing while reporting another.
         self.assertEqual(operator.DEFAULT_GRANT_HOURS, ui._hours(""))
-        self.assertEqual(operator.DEFAULT_GRANT_HOURS, ui._hours("two days"))
+        self.assertEqual(operator.DEFAULT_GRANT_HOURS, ui._hours("   "))
         self.assertEqual(4.0, ui._hours("4"))
+        with self.assertRaises(ui.Malformed):
+            ui._hours("two days")
+
+    def test_a_grant_that_will_not_parse_refuses_the_form_before_the_verb_runs(self):
+        answer = ui.respond(
+            self.console,
+            "POST",
+            "/act",
+            self.form(verb=operator.ANSWER, label="D-0001", verdict="approve",
+                      grant_hours="two days", reason="because"),
+        )
+
+        self.assertEqual(400, answer.status)
+        self.assertIn("is not a number of hours", answer.body)
+        # And it refused here rather than at the database: this console has no
+        # connection, so a form that reached `operator.answer` would have raised
+        # something else entirely.
+        self.assertIn("grant, in hours", answer.body)
 
 
 class RenderingTest(unittest.TestCase):
@@ -259,10 +282,10 @@ class RenderingTest(unittest.TestCase):
         self.assertIn("warn", ui._mark("freshness", "stale"))
         self.assertNotIn("warn", ui._mark("freshness", "current"))
 
-    def test_exploited_is_progress_where_blocked_is_a_refusal_to_send(self):
+    def test_a_demonstration_is_progress_where_blocked_is_a_refusal_to_send(self):
         # The same word in two columns, marked opposite ways round, which is
         # why the warnings are pairs rather than values.
-        self.assertIn("rung", ui._mark("exploited", "true"))
+        self.assertIn("rung", ui._mark("demonstrated", "true"))
         self.assertIn("warn", ui._mark("blocked", "true"))
 
     def test_a_ready_panel_is_a_table_with_a_caption_and_header_cells(self):
@@ -289,7 +312,7 @@ class RenderingTest(unittest.TestCase):
 
     def test_a_panel_that_could_not_be_read_carries_the_refusal_and_not_a_blank(self):
         body = ui._panel_html(
-            panel(rows=(), total=0, state=panels.ERROR, detail="permission denied"), linked=True
+            panel(rows=(), total=0, state=panels.REFUSED, detail="permission denied"), linked=True
         )
 
         self.assertIn("this panel could not be read: permission denied", body)
@@ -397,26 +420,106 @@ class AccessTest(unittest.TestCase):
 
 
 class SurfaceTest(unittest.TestCase):
-    """That the console is an adapter, asked of the module rather than of a page."""
+    """That the console is an adapter, asked of the module rather than of a page.
 
-    #: Uppercase on purpose. The corpus writes SQL in uppercase and HTML in
-    #: lowercase, so `<select>` on a form is not a SELECT against a table.
-    STATEMENTS = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", " FROM ", "COMMIT")
+    Read as a syntax tree rather than as text. The first version of this case
+    searched the source for six uppercase words and two spellings of a call,
+    which any of `select `, `.execute_script(` or `pg.connect(` walks straight
+    past -- a habit with a spellcheck, where the ticket claims a structure.
+    What a tree can say instead is what this module imports, what it calls and
+    what its strings are, and none of those has a lowercase escape hatch.
+    """
+
+    #: A string is SQL when it reads like a statement, not when it holds a word.
+    #: `<select name=...>` on a form is a `select ` by any case-insensitive
+    #: search of the text and is not a query; a `select` with a `from` after it
+    #: is not an HTML tag by any spelling.
+    STATEMENTS = (
+        r"\bselect\b[\s\S]*\bfrom\b",
+        r"^\s*(insert|update|delete|create|drop|alter|grant|revoke)\s",
+        r"\b(commit|rollback|begin\s+transaction)\b",
+    )
+
+    #: What reaching a database looks like as a call, whatever it is spelled
+    #: against: `execute`, `execute_script`, `executemany`, a connection, a
+    #: cursor or a transaction. `panels`, `state`, `operator` and `reporting`
+    #: hold every one of these on this console's behalf.
+    FORBIDDEN_CALLS = ("execute", "connect", "connection", "cursor", "transaction")
+
+    #: The modules a page may reach, and `pg` is here for one name only. A page
+    #: composes an answer out of the four readers and the settings it was handed;
+    #: an import beyond these is a second way to reach state, which is the thing
+    #: criterion 2 says a console does not have.
+    IMPORTS = {"config", "operator", "outcome", "panels", "pg", "reporting", "state"}
 
     def setUp(self):
         self.source = Path(ui.__file__).read_text(encoding="utf-8")
+        self.tree = ast.parse(self.source)
 
     def test_this_console_holds_no_statement_of_its_own(self):
         # Criterion 2. Every view is one call into `panels`, `state`, `operator`
         # or `reporting`; a statement here would be a second definition of
         # something the CLI already answers, free to drift from it.
+        literals = [
+            node.value
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
         for statement in self.STATEMENTS:
-            with self.subTest(statement=statement.strip()):
-                self.assertNotIn(statement, self.source)
+            pattern = re.compile(statement, re.IGNORECASE)
+            with self.subTest(statement=statement):
+                self.assertEqual([], [one for one in literals if pattern.search(one)])
 
     def test_this_console_opens_no_connection_and_executes_nothing(self):
-        self.assertNotIn(".execute(", self.source)
-        self.assertNotIn("open_connection", self.source)
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Attribute, ast.Name))
+        }
+        reached = {
+            node.attr
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "pg"
+        }
+
+        self.assertEqual(
+            [],
+            sorted(
+                name
+                for name in called
+                if any(name.startswith(verb) for verb in self.FORBIDDEN_CALLS)
+            ),
+        )
+        # The one thing this module takes from `pg` is the shape of a setting it
+        # hands on. A second name would be this console reaching the driver.
+        self.assertEqual({"Settings"}, reached)
+
+    def test_the_modules_a_page_may_reach_are_the_four_readers_and_no_other(self):
+        """The import list as the statement, since an adapter is what it imports.
+
+        `.execute(` is a spelling; an import is a reachability fact. A module
+        that never names a driver, a socket or a subprocess cannot open one
+        however its calls are written, and that is what makes criterion 2
+        structural instead of a search anybody can walk past.
+        """
+        imported = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "redkraken"
+            ):
+                _, _, submodule = node.module.partition("redkraken.")
+                imported |= {submodule} if submodule else {
+                    alias.name for alias in node.names
+                }
+            elif isinstance(node, ast.Import):
+                imported |= {
+                    alias.name for alias in node.names if alias.name.startswith("redkraken")
+                }
+
+        self.assertEqual(self.IMPORTS, imported)
 
     def test_the_reads_a_page_makes_are_the_ones_the_cli_makes(self):
         for name in ("panels.read", "panels.forms", "state.read", "operator.queue",
@@ -491,7 +594,7 @@ class PanelTest(unittest.TestCase):
         collected = panels.collect(ledger, Lost(), PROGRAM, "acme", limit=5)
 
         self.assertEqual(len(panels.NAMES), len(collected))
-        self.assertEqual({panels.ERROR}, {held.state for held in collected})
+        self.assertEqual({panels.REFUSED}, {held.state for held in collected})
         self.assertEqual(
             [], [held.name for held in collected if "went away" not in held.detail]
         )

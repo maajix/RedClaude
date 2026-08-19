@@ -93,6 +93,13 @@ class PublishableTest(unittest.TestCase):
         self.assertEqual({"exploit.dtd": EXPLOIT}, answer.files)
         self.assertEqual(len(EXPLOIT), answer.byte_size())
 
+    def test_every_publishable_suffix_has_a_type_this_host_will_say(self):
+        # What lets the answer key the map rather than default it. The default
+        # was `application/octet-stream`, which line 74 says on purpose is not
+        # in the map -- so the fallback answered with a type the module states
+        # it does not serve.
+        self.assertEqual(sorted(oob.PUBLISHABLE), sorted(oob.CONTENT_TYPES))
+
     def test_a_file_added_after_the_read_is_not_published(self):
         root = base()
         answer = oob.publishable(Ledger(), root, SLUG, write(PUBLISHED))
@@ -348,6 +355,42 @@ class ProbeTest(unittest.TestCase):
         finally:
             session.close()
         self.assertEqual(before + 1, self.listener.answered)
+
+    def test_a_get_carrying_a_body_leaves_the_connection_where_it_found_it(self):
+        # The other half of the HEAD case, from the target's side: a body this
+        # host never read stays in the buffer and is parsed as the next request
+        # line. Two requests on one connection is the only way to see it.
+        session = http.client.HTTPConnection(oob.LISTEN_HOST, self.port, timeout=5)
+        try:
+            session.request(
+                "GET", oob.HEALTH_PATH, body=b"GET /injected HTTP/1.1\r\n\r\n",
+                headers={"Host": self.probe},
+            )
+            self.assertEqual((200, b"ok"), (lambda one: (one.status, one.read()))(
+                session.getresponse()
+            ))
+            session.request("GET", oob.HEALTH_PATH, headers={"Host": self.probe})
+            second = session.getresponse()
+            self.assertEqual((200, b"ok"), (second.status, second.read()))
+        finally:
+            session.close()
+
+    def test_the_operators_own_probe_is_not_counted_as_a_target_fetch(self):
+        # `answered` is what targets fetched. `rk oob up` probes before it binds
+        # a name, and its own probe in that number is a number about us.
+        before = self.listener.answered
+
+        self.assertEqual((200, b"ok"), self.ask(self.probe))
+
+        self.assertEqual(before, self.listener.answered)
+
+    def test_a_connection_that_goes_quiet_does_not_hold_the_one_thread(self):
+        # Single-threaded and keep-alive: without a socket timeout one idle
+        # connection through the tunnel blocks `readline` and the host stops
+        # answering anybody. The attribute is the whole mechanism, so it is what
+        # is asserted -- waiting one out would put the timeout in the suite.
+        self.assertIsNotNone(oob.Request.timeout)
+        self.assertGreater(oob.Request.timeout, 0)
 
     def test_a_port_nobody_is_on_is_not_a_publisher(self):
         self.assertFalse(oob._listening(1))

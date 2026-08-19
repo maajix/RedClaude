@@ -314,6 +314,30 @@ class Session:
             answer.append(("Cookie", cookie))
         return answer
 
+    def secrets(self, url: str) -> tuple[str, ...]:
+        """Every credential value this Identity would put on a request to `url`.
+
+        The values rather than the headers, because what must not come back to
+        the Agent is the material itself wherever a target chooses to echo it,
+        and a target echoes a cookie's value into a body far more often than it
+        echoes the `Cookie` line that carried it. A crumb and a scheme-prefixed
+        token are each split for the same reason: `sid=abc` reflected as `abc`
+        is the same secret arriving under a different spelling.
+        """
+        origin = next((item for item in self.origins if item.matches(url)), None)
+        values = []
+        for _, value in origin.headers if origin is not None else ():
+            values.append(value)
+            scheme, _, token = value.partition(" ")
+            if scheme and token and " " not in token:
+                values.append(token)
+        request = _Request(url)
+        self.jar.add_cookie_header(request)
+        for crumb in (request.get_header("Cookie") or "").split(";"):
+            _, _, value = crumb.partition("=")
+            values.append(value.strip())
+        return tuple(dict.fromkeys(value for value in values if value.strip()))
+
     def capture(self, url: str, headers: list[tuple[str, str]]) -> bool:
         """Keep target-issued cookies in this Identity and report whether it changed."""
         values = [value for name, value in headers if name.lower() in ("set-cookie", "set-cookie2")]

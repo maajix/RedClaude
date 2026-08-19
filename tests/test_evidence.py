@@ -354,6 +354,95 @@ class ManifestTest(unittest.TestCase):
             self.built()["digest"], self.built(rules=[WORD])["digest"]
         )
 
+    def test_a_bundle_with_no_filed_rendering_makes_no_claim_about_one(self):
+        self.assertNotIn("rendering", self.built())
+
+
+class ApprovedReportTest(unittest.TestCase):
+    """Ticket 64: which bytes become `report.md`, and what says so.
+
+    The staleness check compares the rows a rendering was made from. It cannot
+    compare the document, because the renderer takes an optional narrative: a
+    filed rendering may carry one, and a re-render of the same rows does not.
+    So a bundle could ship a report that differed from the approved one by whole
+    paragraphs with every hash in it agreeing.
+    """
+
+    APPROVED = b"# F-0007\n\nwhat a human read, narrative and all.\n"
+    FRESH = "# F-0007\n"
+
+    def answers(self, **filed: object) -> evidence._Answers:
+        answers = evidence._Answers(
+            evidence.EXPORT, subject="finding", label="F-0007", template="hackerone-v1"
+        )
+        answers.slug = "selftest"
+        if filed:
+            answers.filed = {
+                "rendering": "0192f000-0000-7000-8000-000000000001",
+                "rendered_at": "2026-08-19T09:00:00Z",
+                "approved": True,
+                "content": self.APPROVED.decode("utf-8"),
+                "content_sha256": verifier.digest(self.APPROVED),
+            } | filed
+        return answers
+
+    def test_a_finding_nobody_has_read_ships_the_document_just_rendered(self):
+        ledger = Ledger()
+
+        self.assertEqual(
+            self.FRESH.encode("utf-8"),
+            evidence._approved(ledger, self.answers(), self.FRESH),
+        )
+
+    def test_a_filed_rendering_is_what_the_bundle_ships_and_not_the_re_render(self):
+        ledger = Ledger()
+        answers = self.answers(approved=True)
+
+        self.assertEqual(self.APPROVED, evidence._approved(ledger, answers, self.FRESH))
+        # And it says so, because a bundle whose report is not what these rows
+        # render to today is a thing an operator should read in the outcome
+        # rather than discover by diffing.
+        said = " ".join(item.detail for item in ledger.assertions if item.name == "report")
+        self.assertIn("is not what these rows render to today", said)
+
+    def test_a_filed_rendering_whose_bytes_are_not_its_hash_is_refused(self):
+        ledger = Ledger()
+        answers = self.answers(content="somebody else's document\n")
+
+        self.assertIsNone(evidence._approved(ledger, answers, self.FRESH))
+        self.assertEqual(
+            ["report_renderings"], [item.source for item in ledger.violations]
+        )
+
+    def test_the_manifest_names_the_rendering_the_report_is(self):
+        answers = self.answers(approved=True)
+        document = evidence._manifest(
+            answers,
+            {"digest": "a" * 64},
+            evidence._Evidence(
+                receipts=[], artifacts=[], specifications=[],
+                required=["report.md"], exclusions=[], rules=[],
+            ),
+            {"report.md": self.APPROVED},
+            [],
+        )
+
+        self.assertEqual(
+            {
+                "id": "0192f000-0000-7000-8000-000000000001",
+                "rendered_at": "2026-08-19T09:00:00Z",
+                "approved": True,
+                "content_sha256": verifier.digest(self.APPROVED),
+            },
+            document["rendering"],
+        )
+        # The claim is checkable by somebody who has only the bundle: the file
+        # entry and the rendering entry are the same hash.
+        self.assertEqual(
+            document["rendering"]["content_sha256"],
+            next(item["sha256"] for item in document["files"] if item["path"] == "report.md"),
+        )
+
 
 class RefusedBundleTest(unittest.TestCase):
     """`_verified`: what becomes of a bundle its own verifier will not pass."""

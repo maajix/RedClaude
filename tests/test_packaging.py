@@ -244,7 +244,9 @@ class InstallationTest(unittest.TestCase):
             carried = {
                 name[len("redkraken/") :]
                 for name in archive.namelist()
-                if name.startswith("redkraken/") and name.endswith(build.HASHED_SUFFIXES)
+                if name.startswith("redkraken/")
+                and not name.endswith("/")
+                and not set(name.split("/")) & set(build.UNHASHED)
             }
         self.assertEqual(source.read_bytes(), shipped)
 

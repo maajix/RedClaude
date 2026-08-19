@@ -133,6 +133,19 @@ class Refusals(unittest.TestCase):
         unclosed = FENCE + "\ndescription: a thing\n" + BODY
         self.refuses("frontmatter_malformed", corpus(object_ownership=unclosed))
 
+    def test_a_document_the_two_parsers_would_read_differently_is_refused(self):
+        # The same two rules as the Skill and fixture corpora, from the same
+        # place: `document.text` holds them once so the three corpora cannot
+        # start meaning different things by the same bytes.
+        self.refuses(
+            "frontmatter_malformed", corpus(object_ownership=document(FRONTMATTER) + "\r\n")
+        )
+        raw = corpus(object_ownership=document(FRONTMATTER))
+        (raw / "object-ownership" / playbook.DOCUMENT).write_bytes(
+            b"---\ndescription: \xff\n---\nx\n"
+        )
+        self.refuses("frontmatter_malformed", raw)
+
     def test_a_playbook_with_no_body_teaches_nothing(self):
         self.refuses("body_missing", one(body="\n"))
 

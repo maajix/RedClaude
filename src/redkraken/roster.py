@@ -273,10 +273,15 @@ FORBIDDEN_SETTINGS = frozenset(
 #: contract here and still takes arguments.
 FORBIDDEN_ARGUMENTS = FORBIDDEN_SELECTORS | FORBIDDEN_INSTRUCTIONS | FORBIDDEN_SETTINGS
 
-#: How deep the argument scan goes. A bound rather than a budget: it exists so
-#: a pathological document cannot make the gate the slow part of a tool call,
-#: and every contract on this surface is far shallower than this.
-DEPTH = 8
+#: How deep the argument scan goes before it refuses to keep reading. It
+#: exists so a pathological document cannot make the gate the slow part of a
+#: tool call, and it sits far below Python's own recursion limit so a nested
+#: payload cannot end the scan by ending the interpreter. Reaching it is a
+#: denial and not a pass: a document whose remainder went unread is exactly
+#: where a Program identifier would be put. It is set well clear of anything a
+#: contract describes -- the deepest is two levels -- so that refusing at it
+#: refuses only documents no call was ever going to be.
+DEPTH = 16
 
 #: The directions a model-facing tool can have. There is no `commit` among
 #: them, and that absence is the point: claiming a Task, promoting a proposal
@@ -311,6 +316,15 @@ class RosterError(ValueError):
     """The roster does not compile, or does not match the observed inventory."""
 
 
+class _Deeper(Exception):
+    """The scan reached `DEPTH` with a document still below it.
+
+    Raised rather than returned because `_forbidden_argument` answers with the
+    name it found, and "I stopped before the bottom" is not a name. The gate
+    turns it into a refusal.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Argument:
     """One argument of one model-facing tool, and what constrains its value.
@@ -327,12 +341,19 @@ class Argument:
     enum: tuple[str, ...] = ()
     pattern: str | None = None
     items_pattern: str | None = None
+    values_pattern: str | None = None
     bounds: tuple[int, int] | None = None
     free_text: bool = False
 
     @property
     def constrained(self) -> bool:
-        return bool(self.enum or self.pattern or self.items_pattern or self.bounds)
+        return bool(
+            self.enum
+            or self.pattern
+            or self.items_pattern
+            or self.values_pattern
+            or self.bounds
+        )
 
     def schema(self) -> dict:
         """This argument as JSON Schema, which is the earliest place it binds.
@@ -355,6 +376,11 @@ class Argument:
             body["propertyNames"] = {"pattern": self.items_pattern}
         elif self.items_pattern:
             body["items"] = {"type": "string", "pattern": self.items_pattern}
+        if self.values_pattern:
+            # And one over what those keys carry. A well-formed name says
+            # nothing about its value, and on an argument that is put on a
+            # wire the value is the half that can carry a second request.
+            body["additionalProperties"] = {"type": "string", "pattern": self.values_pattern}
         return body
 
 
@@ -715,9 +741,23 @@ CONTRACTS: dict[str, Contract] = {
                 enum=("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"),
             ),
             "url": Argument("string", required=True, pattern="^https?://"),
-            "headers": Argument("object", items_pattern="^[A-Za-z][A-Za-z0-9-]{0,63}$"),
-            "body_artifact_hash": Argument("string", pattern=_HASH),
-            "identity_slot": Argument("string", pattern="^[a-z][a-z0-9_]{0,30}$"),
+            # Names, and what those names carry. The value pattern ends at
+            # `\Z` rather than `$` because `$` also matches before a trailing
+            # newline, and a trailing newline is exactly the character a header
+            # value would smuggle a second request in with.
+            "headers": Argument(
+                "object",
+                items_pattern="^[A-Za-z][A-Za-z0-9-]{0,63}\\Z",
+                values_pattern="^[\\x20-\\x7e]{0,1024}\\Z",
+            ),
+            # No body and no identity. Both were declared here and neither was
+            # ever reachable: the child has no store, so it cannot name a body
+            # the door could send, and the runtime opens the Tool run with the
+            # identity already chosen and the capability already minted, so an
+            # identity named at call time would be naming a decision that has
+            # been taken. A declared argument the runtime drops is a promise
+            # the schema cannot keep, and the honest form of "not yet" is not
+            # to declare it.
         },
     ),
     "mcp__rk2__run_tool": Contract(
@@ -1066,7 +1106,19 @@ class Gate:
                 UNLISTED_TOOL, tool, role.name, f"{role.name} was not granted {tool}"
             )
 
-        forbidden = _forbidden_argument(call.arguments, _opaque(tool))
+        try:
+            forbidden = _forbidden_argument(call.arguments, _opaque(tool))
+        except _Deeper:
+            # The one call the scan cannot answer for. Refused rather than
+            # admitted, because what it carries below the bound is unread, and
+            # unread is the state a smuggled Program identifier wants the gate
+            # to be in.
+            return Denial(
+                INVALID_ARGUMENT,
+                tool,
+                role.name,
+                f"nests deeper than the {DEPTH} levels the gate reads",
+            )
         if forbidden is not None:
             return Denial(
                 FORBIDDEN_ARGUMENT,
@@ -1241,13 +1293,17 @@ def _forbidden_argument(arguments: Any, opaque: Collection[str] = ()) -> str | N
 def _scan(value: Any, names: Collection[str], depth: int) -> str | None:
     """The first key of this document that is one of `names`.
 
-    The depth bound is not a correctness limit: every contract on this surface
-    is two levels deep at most, so a document deeper than the bound is already
-    not a call any contract describes. It exists so a pathological payload
-    cannot make the gate the slow part of a tool call.
+    Every contract on this surface is two levels deep at most, so a document
+    deeper than `DEPTH` is already not a call any contract describes, and the
+    scan stops rather than following it down. It stops by raising: a scan that
+    returned `None` there would report "no forbidden name in this document"
+    about a document it had not finished reading, and nine wrappers around a
+    `program_id` would be a way through the one rule ticket 19 names by itself.
     """
-    if depth >= DEPTH:
+    if not isinstance(value, (Mapping, list, tuple)):
         return None
+    if depth >= DEPTH:
+        raise _Deeper(depth)
     if isinstance(value, Mapping):
         for name, inner in value.items():
             if isinstance(name, str) and name.strip().lower() in names:
@@ -1332,6 +1388,16 @@ def _value_fault(argument: Argument, value: Any) -> str | None:
         for member in members:
             if not isinstance(member, str) or not re.search(argument.items_pattern, member):
                 return f"contains {member!r}, which does not match {argument.items_pattern}"
+    if argument.values_pattern is not None and isinstance(value, Mapping):
+        # And by what they hold, for the same reason the names are bounded: a
+        # header value that can hold a line break is a header set that can hold
+        # a request the caller never declared.
+        for name, member in value.items():
+            if not isinstance(member, str) or not re.search(argument.values_pattern, member):
+                return (
+                    f"carries {name!r} as {member!r}, "
+                    f"which does not match {argument.values_pattern}"
+                )
     if argument.bounds is not None:
         low, high = argument.bounds
         measure = value if isinstance(value, int) else len(value)
@@ -1677,7 +1743,9 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
         raise RosterError(f"{tool}.{name}: an unconstrained argument states why it is one")
     if argument.free_text and contract.group == "validate.judge":
         raise RosterError(f"{tool}.{name}: the validator's surface takes no free text")
-    for expression in (argument.pattern, argument.items_pattern):
+    if argument.values_pattern is not None and argument.kind != "object":
+        raise RosterError(f"{tool}.{name}: only an object's members have values")
+    for expression in (argument.pattern, argument.items_pattern, argument.values_pattern):
         if expression is not None:
             try:
                 re.compile(expression)

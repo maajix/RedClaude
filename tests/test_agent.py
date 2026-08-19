@@ -961,6 +961,29 @@ class ServedToolTest(unittest.TestCase):
 
         self.assertEqual(sorted(agent.BARE.values()), sorted(offered))
 
+    def test_the_contracts_no_launch_serves_are_the_five_the_runtime_answers_for(self):
+        """The declared surface is wider than the served one, and by how much.
+
+        Four of these are a decision rather than a gap: the runtime asks for a
+        validation, files a report, parks a Tool run for a human and runs an
+        offline tool, each on its own connection, so the model-facing contract
+        is a name the roster keeps for the risk rules and the allowlists rather
+        than a handler anybody built. `run_skill_script` is the one nothing
+        answers -- a Skill's scripts run under `skill.check` in CI and nowhere
+        during a run -- and ticket 87 owes it. Pinned as a list because a sixth
+        entry appearing here is a tool some role holds and no child can call.
+        """
+        self.assertEqual(
+            [
+                "mcp__rk2__park_for_human",
+                "mcp__rk2__request_report",
+                "mcp__rk2__request_validation",
+                "mcp__rk2__run_skill_script",
+                "mcp__rk2__run_tool",
+            ],
+            sorted(set(roster.CONTRACTS) - set(agent.SERVED)),
+        )
+
     def test_every_tool_is_offered_with_its_roster_schema_and_one_description(self):
         # The schema is the pair's promise and the gate is ours, so the served
         # document has to be the roster's own -- a second copy here would be a
@@ -1206,6 +1229,45 @@ class RequestToolTest(unittest.TestCase):
         self.assertEqual(200, answer["status"])
         self.assertEqual("RC1", answer["receipt"])
         self.assertEqual("hello", answer["body"])
+
+    def test_the_headers_the_call_named_are_what_the_capability_is_spent_with(self):
+        # `headers` is declared on the contract, so it reaches the wire: a
+        # declared argument the runtime drops is a promise the schema cannot
+        # keep. A call that names none sends none, which is the shape every
+        # request had before this one was threaded through.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                self.answer(
+                    handler,
+                    {
+                        "method": "GET",
+                        "url": "http://x.test/a",
+                        "headers": {"X-Trace": "abc"},
+                    },
+                )
+                self.answer(handler, {"method": "GET", "url": "http://x.test/a"})
+
+        self.assertEqual({"X-Trace": "abc"}, calls[0][1]["headers"])
+        self.assertEqual({}, calls[1][1]["headers"])
+
+    def test_a_header_no_client_will_put_on_a_wire_is_reported_as_a_refusal(self):
+        # What `http.client` raises for a value with a line break in it. The
+        # gate refuses those first, so arriving here means the request cannot
+        # be sent at all -- and the difference between that and a door that did
+        # not answer is a difference the model is told rather than a traceback
+        # inside a handler that reports nothing.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(error=ValueError("Invalid header value b'a\\r\\nb'")):
+                answer = self.answer(
+                    handler,
+                    {"method": "GET", "url": "http://x.test/a", "headers": {"X-T": "a\r\nb"}},
+                )
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(_launch.UNUSABLE_TARGET, answer["reason"])
+        self.assertIn("Invalid header value", answer["detail"])
 
     def test_a_plain_target_needs_no_trust_and_a_tls_one_loads_it(self):
         loaded: list[Path] = []
@@ -2065,6 +2127,70 @@ print(json.dumps({
 
         self.assertEqual("pre_spawn", raised.exception.phase)
         self.assertEqual([agent.UNMEASURED_RUNTIME], codes(raised.exception.violations))
+
+
+class BoundsTest(unittest.TestCase):
+    """What a run is told it may spend, before it spends any of it.
+
+    The enforcement is older than the statement and did not change: the loop
+    still breaks the turn the token ceiling is crossed. What changed is that
+    the run now knows the number while it can still act on it.
+    """
+
+    def test_every_ceiling_that_was_set_is_named_and_the_others_are_not(self):
+        self.assertEqual(
+            "This run may spend 40000 token(s), counted across every turn, 12 turn(s), "
+            "3 subagent(s) at once.\n"
+            "It ends when you submit the result, or when a ceiling is reached.\n\n",
+            _launch.stated(
+                packet.Bounds(
+                    tokens=40000,
+                    turns=12,
+                    subagents=3,
+                    stop_conditions=("you submit the result", "a ceiling is reached"),
+                )
+            ),
+        )
+
+    def test_a_ceiling_nobody_set_is_not_reported_as_one(self):
+        # `None` is a Program that reserved nothing, which is not a budget of
+        # zero and must not read as one.
+        self.assertEqual(
+            "This run may spend 8 turn(s).\n\n",
+            _launch.stated(packet.Bounds(turns=8)),
+        )
+
+    def test_a_run_with_no_bounds_says_nothing_about_them(self):
+        self.assertEqual("", _launch.stated(packet.Bounds()))
+
+    @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+    def test_the_child_reads_its_bounds_before_it_reads_its_objective(self):
+        seen: list[str] = []
+
+        async def transport(*, prompt, **_):
+            seen.append(prompt)
+            yield _launch.SystemMessage(
+                _launch.INIT, {"apiKeySource": agent.EXPECTED_KEY_SOURCE}
+            )
+
+        bounded = job(
+            fixtures.scratch(),
+            objective="Say nothing.",
+            packet=packet.Packet(
+                bounds=packet.Bounds(tokens=40000, stop_conditions=("you stop",))
+            ).as_dict(),
+        )
+        asyncio.run(
+            _launch.run(
+                bounded, environment={}, runtime=_launch.runtime_facts(), transport=transport
+            )
+        )
+
+        self.assertEqual(
+            "This run may spend 40000 token(s), counted across every turn.\n"
+            "It ends when you stop.\n\nSay nothing.",
+            seen[0],
+        )
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)

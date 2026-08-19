@@ -132,10 +132,22 @@ class Store:
         crash part-way leaves no file under a hash whose bytes are incomplete --
         the one corruption that would otherwise survive every check that reads
         by name.
+
+        A hit is verified rather than adopted. Existence is not content: a file
+        damaged after it was filed -- by the disk, by a restore, by anything
+        that did not come through here -- would otherwise be taken as these
+        bytes because its name matches, and the caller would commit a reference
+        over material nobody has read back. That is the one corruption this
+        module says it stops, and the name it is filed under is not evidence of
+        it. So the bytes are read and hashed, and a disagreement is `Corrupt`
+        rather than a second write: rewriting would erase the only sign that
+        something else on this machine is damaging files, and every other row
+        already pointing at that hash would silently start meaning something new.
         """
         sha256 = digest(data)
         path = path_for(self.root, sha256)
         if path.exists():
+            self.load(sha256)
             return sha256, False
         path.parent.mkdir(parents=True, exist_ok=True)
         pending = path.with_name(f".{sha256}.{os.getpid()}")

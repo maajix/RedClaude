@@ -70,10 +70,6 @@ PREFIX = "playbooks"
 #: recorded path satisfies `playbooks.path`'s pattern without escaping.
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
-#: A file inside a Playbook: a name, never a path. Same rule and same reason as
-#: the Skill corpus -- no separator, no parent, no leading dot.
-FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
-
 #: `property_class_families.id` and `property_classes.id`, restated where the
 #: corpus names them. Which families and classes exist is the database's
 #: question and the foreign keys are what answer it; these refuse a string that
@@ -400,41 +396,6 @@ def _evidence(name: str, value: Any) -> tuple[Expectation, ...]:
     return rows
 
 
-def _resolved(name: str, parent: Path, file_name: str) -> Path:
-    """One file inside a Playbook, or the reason it is not one.
-
-    Two rules, because they fail differently. The pattern refuses a name that is
-    a path before anything touches the filesystem; resolution refuses a name that
-    is not a path and reaches outside anyway, which on a filesystem means a
-    symbolic link.
-    """
-    if not FILE_NAME.match(file_name):
-        raise PlaybookError("path_escape", name, f"{file_name!r} is not a file name")
-    candidate = parent / file_name
-    if candidate.is_symlink():
-        raise PlaybookError("path_escape", name, f"{file_name} is a symbolic link")
-    if not candidate.is_file():
-        raise PlaybookError("file_missing", name, f"{parent.name}/{file_name} is declared and absent")
-    resolved = candidate.resolve()
-    if not resolved.is_relative_to(parent.resolve()):
-        raise PlaybookError("path_escape", name, f"{file_name} resolves outside {parent.name}/")
-    return resolved
-
-
-def _listing(name: str, directory: Path) -> tuple[str, ...]:
-    """What is actually in `references/`, refusing anything odd."""
-    if not directory.is_dir():
-        return ()
-    found = []
-    for entry in document.entries(directory):
-        if not entry.is_file() or entry.is_symlink():
-            raise PlaybookError("stray_file", name, f"{directory.name}/{entry.name} is not a file")
-        if not FILE_NAME.match(entry.name):
-            raise PlaybookError("path_escape", name, f"{directory.name}/{entry.name} is not a file name")
-        found.append(entry.name)
-    return tuple(found)
-
-
 def _playbook(directory: Path) -> Playbook:
     name = directory.name
     if not NAME.match(name):
@@ -444,12 +405,7 @@ def _playbook(directory: Path) -> Playbook:
     if not source_path.is_file() or source_path.is_symlink():
         raise PlaybookError("file_missing", name, f"there is no {DOCUMENT}")
     source = source_path.read_bytes()
-    try:
-        text = source.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise PlaybookError("frontmatter_malformed", name, f"{DOCUMENT} is not UTF-8") from error
-    if "\r" in text:
-        raise PlaybookError("frontmatter_malformed", name, f"{DOCUMENT} carries a carriage return")
+    text = document.text(PlaybookError, name, DOCUMENT, source)
 
     fields, body = document.frontmatter(PlaybookError, name, DOCUMENT, text)
     if not body:
@@ -504,7 +460,11 @@ def _playbook(directory: Path) -> Playbook:
         Reference(
             name=file_name,
             path=f"{PREFIX}/{name}/{REFERENCE_DIR}/{file_name}",
-            sha256=digest(_resolved(name, directory / REFERENCE_DIR, file_name).read_bytes()),
+            sha256=digest(
+                document.resolved(
+                    PlaybookError, name, directory / REFERENCE_DIR, file_name
+                ).read_bytes()
+            ),
         )
         for file_name in (
             document.strings(PlaybookError, name, "bb:references", fields["bb:references"], ENTRY)
@@ -512,7 +472,8 @@ def _playbook(directory: Path) -> Playbook:
         )
     )
     undeclared = sorted(
-        set(_listing(name, directory / REFERENCE_DIR)) - {one.name for one in references}
+        set(document.listing(PlaybookError, name, directory / REFERENCE_DIR))
+        - {one.name for one in references}
     )
     if undeclared:
         # Both directions, as the Skill corpus does. A declared file that is

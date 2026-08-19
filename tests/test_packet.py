@@ -243,6 +243,9 @@ class PacketDocumentTest(unittest.TestCase):
                 artifacts=section("artifacts", [artifact("AF1", "a" * 64)]),
             ),
             excerpts={"AF1": "hello"},
+            bounds=packet.Bounds(
+                tokens=40000, subagents=3, turns=12, stop_conditions=("you submit",)
+            ),
         )
 
     def test_a_packet_survives_the_round_trip_it_is_sent_through(self):
@@ -254,6 +257,19 @@ class PacketDocumentTest(unittest.TestCase):
         self.assertEqual(17, again.revision)
         self.assertEqual(3, again.section("surface").total)
         self.assertEqual("hello", again.excerpts["AF1"])
+        # Decision 11's budgets and stop conditions, on the side that has no
+        # database to read them from.
+        self.assertEqual(40000, again.bounds.tokens)
+        self.assertEqual(("you submit",), again.bounds.stop_conditions)
+
+    def test_a_ceiling_nobody_set_crosses_as_nothing_rather_than_as_zero(self):
+        # A Program that reserved no tokens and a Program that may spend none
+        # are different runs, and a document that flattened them would have the
+        # child stop before its first turn.
+        again = packet.Packet.from_dict(json.loads(json.dumps(packet.Packet().as_dict())))
+
+        self.assertIsNone(again.bounds.tokens)
+        self.assertEqual((), again.bounds.stop_conditions)
 
     def test_the_smaller_of_the_two_ceilings_is_the_one_that_binds(self):
         # A compile honouring only the larger would satisfy the configuration
@@ -400,7 +416,69 @@ class CompileTest(unittest.TestCase):
 
         self.assertLess(len(compiled.section("surface").rows), 20)
         self.assertEqual(20, compiled.section("surface").total)
-        self.assertLessEqual(compiled.bytes, 400)
+        self.assertLessEqual(compiled.document_bytes, 400)
+
+    def test_the_measurement_is_of_the_document_that_is_actually_sent(self):
+        compiled = packet.compile(self.connection())
+
+        self.assertEqual(
+            len(json.dumps(compiled.as_dict(), separators=(",", ":"), default=str)),
+            compiled.document_bytes,
+        )
+        self.assertEqual(
+            -(-compiled.document_bytes // packet.BYTES_PER_TOKEN), compiled.document_tokens
+        )
+        # And it is not the other measurement. The rows are what a fitter drops
+        # against; `revision`, `limits`, the section framing and the excerpts
+        # all cross the boundary without being rows.
+        self.assertGreater(compiled.document_bytes, compiled.bytes)
+
+    def test_the_ceiling_binds_the_heads_the_packet_carries_and_not_only_its_rows(self):
+        # The defect this closes: excerpts are staged from the rows that
+        # survived the fit, so a compile that measured the fit alone sent a
+        # document larger than the ceiling by however much text it had loaded.
+        blobs = {f"{n:064x}": b"z" * 4096 for n in range(6)}
+        recorder = self.connection(
+            staged={"entity": [], "hypothesis": [], "receipt": []},
+            totals={"entity": 0, "hypothesis": 0, "receipt": 0},
+            evidence=[],
+            artifacts=[artifact(f"AF{n}", f"{n:064x}", byte_size=4096) for n in range(6)],
+        )
+        limits = packet.Limits(rows=6, byte_limit=8192)
+
+        compiled = packet.compile(recorder, limits=limits, load=blobs.get)
+
+        self.assertLessEqual(compiled.document_bytes, limits.byte_ceiling)
+        self.assertLess(len(compiled.excerpts), 6)
+        self.assertEqual(6, compiled.section("artifacts").total)
+
+    def test_a_ceiling_below_the_empty_document_is_refused_not_emptied(self):
+        # A ceiling no document fits under is a setting to change, and sending
+        # a packet that breaks it would be the runtime overruling its own bound.
+        with self.assertRaises(packet.PacketError) as refused:
+            packet.compile(self.connection(), limits=packet.Limits(byte_limit=32))
+
+        self.assertIn("does not fit", str(refused.exception))
+        self.assertIn("32", str(refused.exception))
+        self.assertIn("framing", str(refused.exception))
+
+    def test_an_artifacts_bytes_are_read_once_however_often_the_fit_runs(self):
+        # A compaction builds the document more than once. The store is on
+        # disk, and asking it the same question per pass is a cost the child
+        # never sees and the operator pays.
+        asked: list[str] = []
+
+        def load(sha256: str) -> bytes | None:
+            asked.append(sha256)
+            return b"readable"
+
+        recorder = self.connection(
+            artifacts=[artifact("AF2", "b" * 64), artifact("AF3", "c" * 64)]
+        )
+
+        packet.compile(recorder, limits=packet.Limits(byte_limit=700), load=load)
+
+        self.assertEqual(sorted(set(asked)), sorted(asked))
 
 
 class ReaderTest(unittest.TestCase):

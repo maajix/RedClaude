@@ -369,6 +369,56 @@ class ArtifactIndexTest(unittest.TestCase):
         self.assertTrue(verifier.verify(self.root)["ok"])
 
 
+class RenderingTest(unittest.TestCase):
+    """Ticket 64: the one claim a bundle makes about something outside itself.
+
+    `report.md` can be a document a human read and approved, and an approval
+    names exact bytes. Every other hash in a bundle was written by the export
+    that wrote the file it names, so this is the only check here a recipient can
+    make against a fact they were told separately.
+    """
+
+    REPORT = b"# F-0007\n\nnothing anybody would redact\n"
+
+    def setUp(self):
+        self.root = scratch()
+
+    def named(self, **changes: object) -> dict:
+        return {
+            "id": "0192f000-0000-7000-8000-000000000001",
+            "rendered_at": "2026-08-19T09:00:00Z",
+            "approved": True,
+            "content_sha256": verifier.digest(self.REPORT),
+        } | changes
+
+    def test_a_report_that_is_the_rendering_the_manifest_names_passes(self):
+        bundled(self.root, plain(), rendering=self.named())
+
+        self.assertTrue(verifier.verify(self.root)["ok"])
+
+    def test_a_report_that_is_not_the_rendering_named_is_a_finding(self):
+        bundled(self.root, plain(), rendering=self.named(content_sha256="c" * 64))
+
+        answer = verifier.verify(self.root)
+
+        self.assertEqual(["rendering_mismatch"], codes(answer))
+        self.assertEqual(verifier.REPORT, answer["problems"][0]["path"])
+        self.assertIn("cccccccccccc", answer["problems"][0]["detail"])
+
+    def test_a_manifest_naming_a_rendering_and_shipping_no_report(self):
+        files = {name: data for name, data in plain().items() if name != verifier.REPORT}
+        bundled(self.root, files, required=["verify.py"], rendering=self.named())
+
+        self.assertEqual(["rendering_unlisted"], codes(verifier.verify(self.root)))
+
+    def test_a_bundle_that_claims_no_rendering_is_not_faulted_for_one(self):
+        """A chain has no rendering row and a Finding nobody has read has none.
+        Failing those would be failing a bundle for a claim it did not make."""
+        bundled(self.root, plain())
+
+        self.assertTrue(verifier.verify(self.root)["ok"])
+
+
 class CommandTest(unittest.TestCase):
     """`python3 verify.py <bundle>`: one argument, one document, one status."""
 

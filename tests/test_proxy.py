@@ -30,6 +30,8 @@ sends the plaintext capability only to the local proxy".
 
 from __future__ import annotations
 
+import ast
+import base64
 import http.client
 import json
 import os
@@ -45,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
 from redkraken import identity, pg, proxy, scope, seal, tls
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
@@ -427,14 +430,47 @@ class HeaderTest(unittest.TestCase):
                 self.assertIsNone(proxy.capability_of(value))
 
     def test_a_reflected_identity_in_a_redirect_cannot_enter_receipt_notes(self):
-        marker = b"private-redirect-token"
+        # A header carrying credential material is dropped rather than marked,
+        # because a `Location` reading `/continue/[redacted]` canonicalises
+        # into a URL no target pointed at and the Receipt would record it as
+        # the link this exchange made.
+        marker = "private-redirect-token"
         headers, _ = proxy.project_identity_response(
-            [("Location", f"/continue/{marker.decode()}")], b""
+            [("Location", f"/continue/{marker}")], b"", (marker,)
         )
 
         location = next((value for name, value in headers if name.lower() == "location"), None)
         self.assertIsNone(proxy.redirected("https://app.example.com/start", location))
         self.assertEqual([], headers)
+
+    def test_a_redirect_that_reflects_nothing_is_still_the_agents_to_read(self):
+        headers, body = proxy.project_identity_response(
+            [("Location", "/continue"), ("Content-Type", "text/html"), ("Set-Cookie", "a=1")],
+            b"<a href=/continue>",
+            ("private-redirect-token",),
+        )
+
+        self.assertEqual([("Location", "/continue"), ("Content-Type", "text/html")], headers)
+        self.assertEqual(b"<a href=/continue>", body)
+
+    def test_a_credential_echoed_in_an_encoding_is_redacted_in_the_body(self):
+        # The spellings a value survives a round trip through a web application
+        # in. A hash of it or half of it is not recoverable by search and is
+        # not claimed to be -- what covers those is the sealed wire view.
+        marker = "rk2-encoded-identity-token"
+        encoded = base64.b64encode(marker.encode()).decode()
+        _, body = proxy.project_identity_response(
+            [],
+            f"raw={marker} quoted={quote(marker, safe='')} b64={encoded} "
+            f"hex={marker.encode().hex()}".encode(),
+            (marker,),
+        )
+
+        self.assertNotIn(marker.encode(), body)
+        self.assertNotIn(encoded.encode(), body)
+        self.assertEqual(
+            b"raw=[redacted] quoted=[redacted] b64=[redacted] hex=[redacted]", body
+        )
 
     def test_every_control_and_hop_by_hop_header_is_dropped_from_the_forwarded_request(self):
         headers = message(
@@ -862,6 +898,57 @@ class FenceTest(unittest.TestCase):
             fenced.reserve(PROGRAM_ID, CAPABILITY, self.REQUEST)
 
 
+class RollbackTest(unittest.TestCase):
+    """What a refused exchange takes out of the Store, which is not everything.
+
+    `Store.discard` states its own bound: safe for a ciphertext, whose fresh
+    nonce makes its hash unreachable to any other writer, and false of
+    plaintext, "where another Program may already have committed a reference to
+    exactly those bytes". The store is content-addressed and global, so the flag
+    `put` returns says this process wrote the file and not that nobody has
+    referenced it since -- and `_forward` has four rollback paths that ran
+    between those two facts.
+
+    Read off the source rather than driven, because what is being asserted is a
+    property of every path out of one method and there are more of them than a
+    fixture can reach. A new rollback arm that discards a transcript fails here.
+    """
+
+    def discards(self) -> list[ast.Call]:
+        tree = ast.parse(Path(proxy.__file__).read_text())
+        return [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "discard"
+        ]
+
+    def test_a_refused_exchange_discards_only_what_it_sealed(self):
+        # Each surviving call is the loop variable of a walk over the envelopes
+        # this exchange sealed. `request_sha` and `response_sha` are the agent
+        # view transcripts and are a purge's to collect: `artifacts_due_for_purge`
+        # refcounts across Programs, and this method cannot.
+        sealed = {
+            node.target.id
+            for node in ast.walk(ast.parse(Path(proxy.__file__).read_text()))
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Name)
+            and node.iter.id == "ciphertext_new"
+            and isinstance(node.target, ast.Name)
+        }
+
+        self.assertTrue(sealed)
+        self.assertEqual(
+            sealed,
+            {
+                node.args[0].id
+                for node in self.discards()
+                if node.args and isinstance(node.args[0], ast.Name)
+            },
+        )
+
+
 class ExchangeTest(unittest.TestCase):
     """What happens on the wire, against a stub decision and a real target."""
 
@@ -1015,6 +1102,40 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(200, receipt["status_code"])
         self.assertEqual("target", receipt["scope_class"])
         self.assertEqual(64, len(receipt["query_sha256"]))
+
+    def test_the_callers_headers_are_sent_and_a_forged_control_header_is_not(self):
+        # `http_request` declares `headers`, so a hunter that asks for a header
+        # gets one on the wire -- and the same call cannot mint itself a
+        # capability or claim a Program by naming those headers itself. Both
+        # halves are one request: `X-Trace` arrives at the target, and the two
+        # forged control headers are gone before the door reads them, which is
+        # why the door reads one capability rather than two and answers.
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+            headers={
+                "X-Trace": "abc",
+                proxy.AUTHORIZATION: "RedKraken " + "b" * 64,
+                proxy.PROGRAM: "22222222-2222-2222-2222-222222222222",
+                "Content-Length": "99",
+            },
+        )
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual("R1", answer.receipt)
+        self.assertIsNone(answer.decision)
+        self.assertEqual(1, len(self.fence.allowed))
+        self.assertEqual(CAPABILITY, self.fence.addressed[0][1])
+
+        _, _, arrived = self.target.seen[0]
+        self.assertIn(("x-trace", "abc"), arrived)
+        named = [name for name, _ in arrived]
+        self.assertNotIn(proxy.AUTHORIZATION.lower(), named)
+        self.assertNotIn(proxy.PROGRAM.lower(), named)
+        # A length this client did not measure is a length nothing may state.
+        self.assertNotIn("99", [value for name, value in arrived if name == "content-length"])
 
     def test_a_session_that_went_away_is_answered_and_said_out_loud(self):
         # Every guard in the fence names `pg.DatabaseError`, and
@@ -1546,7 +1667,12 @@ class ExchangeTest(unittest.TestCase):
         response = self.through("http://target.example.test/v1/reflection")
         body = response.read()
 
-        self.assertEqual(b"", body)
+        # Redacted rather than withheld: the Agent reads the answer its own
+        # request earned, and every spelling of the credential that earned it
+        # is gone from the answer.
+        self.assertEqual(
+            b'{"authorization":"[redacted]","old":"[redacted]","session":"[redacted]"}', body
+        )
         self.assertNotIn(marker.encode(), body)
         self.assertNotIn(cookie.encode(), body)
         self.assertNotIn(old_cookie.encode(), body)
@@ -1575,8 +1701,8 @@ class ExchangeTest(unittest.TestCase):
         self.assertIn(cookie.encode(), opened)
         self.assertIn(old_cookie.encode(), opened)
 
-    def test_bytes_another_program_filed_are_still_withheld_from_this_agent(self):
-        # The one exception to withholding an authenticated response is that the
+    def test_bytes_another_program_filed_are_still_redacted_for_this_agent(self):
+        # The one exception to redacting an authenticated response is that the
         # Agent can already read these exact bytes. The store cannot answer that:
         # it is one content-addressed heap for every Program on the host, so bytes
         # another Program filed sit in it under the same hash. Filed here, and the
@@ -1617,7 +1743,7 @@ class ExchangeTest(unittest.TestCase):
         response = self.through("http://target.example.test/v1/shared-bytes")
         body = response.read()
 
-        self.assertEqual(b"", body)
+        self.assertEqual(b'{"session":"[redacted]"}', body)
         self.assertNotIn(marker.encode(), body)
         receipt = self.fence.allowed[0]["receipt"]
         self.assertNotEqual(receipt["response_agent_sha"], receipt["response_wire_sha"])
@@ -2388,6 +2514,7 @@ class TunnelTest(unittest.TestCase):
         capability: str = CAPABILITY,
         program: str = PROGRAM_ID,
         method: str = "GET",
+        headers: dict[str, str] | None = None,
     ) -> proxy.Answer:
         """One request the way `rk proxy request` sends one.
 
@@ -2405,6 +2532,7 @@ class TunnelTest(unittest.TestCase):
             5.0,
             scope.canonical_request(url),
             self.trust,
+            headers=headers,
         )
 
     def tunnel(self, url: str, **control: str) -> tuple[scope.Request, ssl.SSLSocket]:
@@ -2471,6 +2599,31 @@ class TunnelTest(unittest.TestCase):
         self.assertEqual("target", filed["scope_class"])
         self.assertEqual(64, len(filed["query_sha256"]))
         self.assertTrue(filed["intercepted"])
+
+    def test_the_callers_headers_ride_inside_the_tunnel_and_not_on_the_connect(self):
+        # The HTTPS half of what `ExchangeTest` asks of plain HTTP. The hop that
+        # carries the message is the one inside the tunnel, so that is where a
+        # caller's header goes; the CONNECT carries the capability and nothing
+        # the caller wrote, which is what keeps a forged control header out of
+        # the hop the door actually reads.
+        answer = self.spend(
+            "https://target.example.test/v1/notes",
+            headers={
+                "X-Trace": "abc",
+                proxy.AUTHORIZATION: "RedKraken " + "b" * 64,
+                proxy.PROGRAM: "22222222-2222-2222-2222-222222222222",
+            },
+        )
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual("R1", answer.receipt)
+        self.assertEqual(1, len(self.fence.allowed))
+
+        _, _, arrived = self.target.seen[0]
+        self.assertIn(("x-trace", "abc"), arrived)
+        named = [name for name, _ in arrived]
+        self.assertNotIn(proxy.AUTHORIZATION.lower(), named)
+        self.assertNotIn(proxy.PROGRAM.lower(), named)
 
     def test_the_capability_is_read_when_the_two_hops_carry_a_header_each(self):
         # What an ordinary client does. A door that read the CONNECT alone would

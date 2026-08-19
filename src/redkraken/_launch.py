@@ -529,20 +529,28 @@ def _request(surface: Surface, door: agent.Egress | None):
             )
         return _content(
             await asyncio.to_thread(
-                _spend, door, str(given.get("url") or ""), str(given.get("method") or "GET")
+                _spend,
+                door,
+                str(given.get("url") or ""),
+                str(given.get("method") or "GET"),
+                _headers(given.get("headers")),
             )
         )
 
     return handler
 
 
-def _spend(door: agent.Egress, url: str, method: str) -> dict:
+def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]) -> dict:
     """One exchange through the door, as the four facts a model can act on.
 
     The Receipt label is the first of them and the reason the rest are bounded:
     an Observation the runtime will promote has to cite a Receipt, and the way
     to say more about the body than fits here is to analyse the Artifact the
     door already wrote rather than to read it into this context.
+
+    The headers go through as the caller wrote them, minus the ones that
+    describe a hop: `proxy.spend` drops those, because the capability and the
+    Program on this request are the runtime's to state and not the child's.
     """
     try:
         listener = proxy.peer(door.proxy_url)
@@ -564,10 +572,18 @@ def _spend(door: agent.Egress, url: str, method: str) -> dict:
             capability=door.capability,
             program_id=door.program_id,
             method=method,
+            headers=headers,
             trust=trust,
         )
     except (OSError, http.client.HTTPException) as error:
         return {"served": False, "reason": DOOR_UNREACHABLE, "detail": str(error)}
+    except ValueError as error:
+        # What `http.client` raises for a header value carrying a line break.
+        # The gate refuses those before the call arrives, so reaching this is
+        # a request that cannot be put on a wire rather than a door that could
+        # not be reached -- and the answer to it is a refusal, not a crashed
+        # handler that tells the child nothing.
+        return {"served": False, "reason": UNUSABLE_TARGET, "detail": str(error)}
 
     body = answer.body[: packet.DEFAULT_EXCERPT]
     return {
@@ -580,6 +596,48 @@ def _spend(door: agent.Egress, url: str, method: str) -> dict:
         "truncated": len(answer.body) > len(body),
         "body": body.decode("utf-8", "replace"),
     }
+
+
+def stated(bounds: packet.Bounds) -> str:
+    """The run's own ceilings, as the first thing the child reads.
+
+    Decision 11 puts budgets and stop conditions in the Mission packet, and
+    this is where the packet's copy becomes something the model can act on.
+    The alternative is what this replaced: the ceiling was enforced in the loop
+    below and never mentioned, so a run learned its budget by being cut off
+    mid-answer -- which is the one moment the knowledge is worth nothing.
+
+    Empty for a run that was given no bounds, so a job that carries none reads
+    exactly as it did before rather than opening with a paragraph about
+    nothing.
+    """
+    ceilings = [
+        f"{value} {noun}"
+        for value, noun in (
+            (bounds.tokens, "token(s), counted across every turn"),
+            (bounds.turns, "turn(s)"),
+            (bounds.subagents, "subagent(s) at once"),
+        )
+        if value is not None
+    ]
+    said = []
+    if ceilings:
+        said.append("This run may spend " + ", ".join(ceilings) + ".")
+    if bounds.stop_conditions:
+        said.append("It ends when " + ", or when ".join(bounds.stop_conditions) + ".")
+    return "\n".join(said) + "\n\n" if said else ""
+
+
+def _headers(given: object) -> dict[str, str]:
+    """The headers a call carried, as strings, or none at all.
+
+    Cast rather than trusted, for the same reason the url and the method are:
+    the gate has already refused every name and value outside the contract, and
+    what this handler acts on is what arrived rather than what was promised.
+    """
+    if not isinstance(given, Mapping):
+        return {}
+    return {str(name): str(value) for name, value in given.items()}
 
 
 def _slate(surface: Surface, choice: Choice):
@@ -860,7 +918,9 @@ async def run(
         )
     assert gate is not None
 
-    messages = (transport or query)(prompt=str(job["objective"]), options=options)
+    messages = (transport or query)(
+        prompt=stated(reader.packet.bounds) + str(job["objective"]), options=options
+    )
     api_key_source = await _corroborate(messages, surface, runtime)
 
     # What the claim reserved for this run, or nothing when it reserved nothing.

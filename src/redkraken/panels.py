@@ -39,14 +39,16 @@ COMMAND = "ui read"
 #: and not all of them; the count beside them is what makes that honest.
 DEFAULT_ROWS = 20
 
-#: What a panel is, once it has been asked. `pending` is the read that did not
-#: happen: a deadline spent before its turn, which is the state a console shows
-#: while it is still loading the rest.
+#: What a panel is, once it has been asked, in the four words CONTEXT.md gives
+#: this state. `pending` is the read that did not happen: a deadline spent
+#: before its turn, which is the state a console shows while it is still
+#: loading the rest. `refused` is the statement the database would not answer,
+#: which is a panel saying so rather than an error the page has to interpret.
 READY = "ready"
 EMPTY = "empty"
 PENDING = "pending"
-ERROR = "error"
-STATES = (READY, EMPTY, PENDING, ERROR)
+REFUSED = "refused"
+STATES = (READY, EMPTY, PENDING, REFUSED)
 
 #: Where a panel's rows come from. Most are one statement over one Program.
 #: `facts` is the read whose subject is single -- a Program is one Program, and
@@ -138,7 +140,7 @@ PROGRAM_FACTS = (
 #: Criterion 4's ladder, as rows rather than as a status column, because the
 #: seven words are not one machine's vocabulary. `proposed` and `supported`
 #: belong to the Hypothesis machine, `validated` and `reported` to the Finding
-#: machine, and `attempted`, `observed` and `exploited` are not statuses at all
+#: machine, and `attempted`, `observed` and `demonstrated` are not statuses at all
 #: -- they are a Test that ran, an Observation that is cited and a
 #: demonstration that holds. Each is asked of the rows that would carry it, so
 #: a rung shows because the thing happened and not because a column says so.
@@ -154,7 +156,7 @@ FINDINGS = Read(
         "observed",
         "supported",
         "validated",
-        "exploited",
+        "demonstrated",
         "reported",
         "blocked",
     ),
@@ -316,9 +318,16 @@ LEASES = Read(
     total="SELECT count(*) FROM identity_leases WHERE program_id = $1",
 )
 
-#: The whole Program's tokens first, then each lane. A null ceiling is spelled
+#: The whole Program's ceilings first, then each lane. A null ceiling is spelled
 #: rather than blanked: "no ceiling" and "not known" are different answers and
-#: an empty cell would be read as either.
+#: an empty cell would be read as either -- which is why the Program row is read
+#: from `program_capacity` and not from `program_budget`. `program_budget` has no
+#: request columns at all, so the row used to carry three empty cells under
+#: headers the lanes below filled in, and a blank in a column whose other rows
+#: are numbers reads as "nothing spent" rather than "not asked". Capacity answers
+#: the same six questions per Program that `lane_budget` answers per lane, and
+#: both are read the same way here: spent is spend plus what claims in flight
+#: have promised, and left is what a further claim would have to fit inside.
 BUDGETS = Read(
     name="budgets",
     caption="what each ceiling allows, what has been spent and what is left",
@@ -336,11 +345,13 @@ BUDGETS = Read(
         "       request_ceiling, requests_spent, requests_left"
         "  FROM ("
         "    SELECT 0 AS ord, 'program' AS scope,"
-        "           coalesce(b.token_budget::text, 'no ceiling') AS token_ceiling,"
-        "           b.tokens_spent::text AS tokens_spent,"
-        "           coalesce(b.tokens_left::text, 'no ceiling') AS tokens_left,"
-        "           '' AS request_ceiling, '' AS requests_spent, '' AS requests_left"
-        "      FROM program_budget b WHERE b.program_id = $1"
+        "           coalesce(c.token_budget::text, 'no ceiling') AS token_ceiling,"
+        "           (c.tokens_spent + c.tokens_reserved)::text AS tokens_spent,"
+        "           coalesce(c.tokens_free::text, 'no ceiling') AS tokens_left,"
+        "           coalesce(c.request_budget::text, 'no ceiling') AS request_ceiling,"
+        "           (c.requests_spent + c.requests_reserved)::text AS requests_spent,"
+        "           coalesce(c.requests_free::text, 'no ceiling') AS requests_left"
+        "      FROM program_capacity c WHERE c.program_id = $1"
         "    UNION ALL"
         "    SELECT 1, l.kind,"
         "           coalesce(l.token_budget::text, 'no ceiling'),"
@@ -355,7 +366,7 @@ BUDGETS = Read(
         " LIMIT $2"
     ),
     total=(
-        "SELECT (SELECT count(*) FROM program_budget WHERE program_id = $1)"
+        "SELECT (SELECT count(*) FROM program_capacity WHERE program_id = $1)"
         "     + (SELECT count(*) FROM lane_budget WHERE program_id = $1)"
     ),
 )
@@ -553,7 +564,7 @@ def collect(
                     columns=wanted.columns,
                     rows=(),
                     total=0,
-                    state=ERROR,
+                    state=REFUSED,
                     detail=str(error),
                 )
             )

@@ -228,12 +228,7 @@ def _fixture(directory: Path) -> Fixture:
 
     source = _read(name, directory / APPLICATION, APPLICATION)
     ground_truth = _read(name, directory / DOCUMENT, DOCUMENT)
-    try:
-        text = ground_truth.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise FixtureError("frontmatter_malformed", name, f"{DOCUMENT} is not UTF-8") from error
-    if "\r" in text:
-        raise FixtureError("frontmatter_malformed", name, f"{DOCUMENT} carries a carriage return")
+    text = document.text(FixtureError, name, DOCUMENT, ground_truth)
 
     fields, body = document.frontmatter(FixtureError, name, DOCUMENT, text)
     if not body:

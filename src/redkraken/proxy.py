@@ -73,6 +73,7 @@ refuses everything it is asked and nothing it is not.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import hmac
 import ipaddress
@@ -83,14 +84,14 @@ import socket
 import ssl
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from urllib.parse import SplitResult, urljoin, urlsplit
+from urllib.parse import SplitResult, quote, urljoin, urlsplit
 
 from redkraken import build, config, identity, migrate, pg, program, scope, seal, tls, vault
 from redkraken.outcome import (
@@ -103,7 +104,7 @@ from redkraken.outcome import (
     Report,
     report,
 )
-from redkraken.store import Store, digest
+from redkraken.store import Corrupt, Store, digest
 
 
 __all__ = [
@@ -338,6 +339,11 @@ REDIRECTS = frozenset({301, 302, 303, 307, 308})
 # Response fields whose value is authentication material issued by the target,
 # rather than content the Agent may consume.  Header names are the enforceable
 # boundary available before ticket 12 adds per-Identity body projections.
+#: What stands in an Agent-visible body where a credential value stood. A
+#: marker rather than an empty string, so that a body the Agent reads says a
+#: value was taken out rather than reading as a body the target sent short.
+REDACTION = b"[redacted]"
+
 WIRE_RESPONSE_HEADERS = frozenset(
     {
         "authentication-info",
@@ -639,15 +645,75 @@ def response_for_agent(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 def project_identity_response(
-    headers: list[tuple[str, str]], body: bytes
+    headers: list[tuple[str, str]], body: bytes, secrets: Sequence[str] = ()
 ) -> tuple[list[tuple[str, str]], bytes]:
-    """Withhold target-controlled Identity response fields from the Agent view.
+    """The Agent's view of a response some Identity's credential was spent on.
 
-    Credential reflection is not safely recognizable: a target may transform,
-    split or encode a value before returning it. The exact headers and body
-    remain available only through the sealed wire view.
+    Redaction and not suppression, because the two halves of the message are
+    read by different things. A body is read by the Agent, and story 120 asks
+    for exactly that: agent-visible Artifacts redacted, so that exact bytes can
+    be cited without exposing injected secrets. Withholding it whole would cite
+    nothing and would make an authenticated exchange -- the one an access
+    control finding is made of -- an exchange whose answer nobody may read.
+
+    A header is not read, it is parsed, so one carrying credential material is
+    dropped rather than marked: `/continue/[redacted]` is a `Location` that
+    canonicalises into a URL no target ever pointed at, and something
+    downstream would treat it as one. Dropped, it is absent, and the sealed
+    wire view is where the exact bytes stay.
+
+    Reflection is still not perfectly recognisable -- a target may transform a
+    value beyond any spelling `_renderings` knows -- so what this narrows is
+    the ordinary case rather than closing the class. What makes that honest is
+    the record: the Agent view and the wire view are hashed separately and the
+    difference is sealed, so an exchange whose redaction was incomplete is one
+    an auditor can still see whole.
     """
-    return [], b""
+    renderings = [rendering for secret in secrets for rendering in _renderings(secret)]
+    kept = [
+        (name, value)
+        for name, value in response_for_agent(headers)
+        # Name and value both: a target that echoes a token into a header's
+        # name has reflected it as surely as one that echoes it into the value,
+        # and the field it chose is not the Agent's business either way.
+        if not any(
+            rendering in f"{name}: {value}".encode("utf-8", "surrogateescape")
+            for rendering in renderings
+        )
+    ]
+    for rendering in renderings:
+        body = body.replace(rendering, REDACTION)
+    return kept, body
+
+
+def _renderings(secret: str) -> tuple[bytes, ...]:
+    """The spellings of one credential value a target is likely to echo back.
+
+    A value that made it onto a wire comes back through whatever the target did
+    with it on the way: quoted into a URL, encoded into a token, printed into a
+    debug page. These are the transformations that survive a round trip through
+    an ordinary web application without changing what the value is, so they are
+    the ones searched for. Anything richer -- a hash, a truncation, half a value
+    on each side of a template -- is not recoverable by search and is not
+    pretended to be.
+    """
+    raw = secret.encode("utf-8", "surrogateescape")
+    if not raw:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (
+                raw,
+                quote(secret, safe="").encode("ascii"),
+                base64.b64encode(raw),
+                base64.b64encode(raw).rstrip(b"="),
+                base64.urlsafe_b64encode(raw),
+                base64.urlsafe_b64encode(raw).rstrip(b"="),
+                raw.hex().encode("ascii"),
+                raw.hex().upper().encode("ascii"),
+            )
+        )
+    )
 
 
 def origin_form(url: str) -> str:
@@ -2585,14 +2651,48 @@ class Handler(BaseHTTPRequestHandler):
                     reason,
                 )
             else:
-                agent_back, agent_returned = project_identity_response(back, returned)
+                agent_back, agent_returned = project_identity_response(
+                    back, returned, binding.session.secrets(url)
+                )
                 agent_reason = ""
         else:
             agent_back, agent_returned = response_for_agent(back), returned
             agent_reason = reason
         received = transcript(f"HTTP/1.1 {status} {agent_reason}", agent_back, agent_returned)
-        request_sha, request_new = store.put(sent)
-        response_sha, response_new = store.put(received)
+        try:
+            # The newness flag is dropped on purpose. It says this process
+            # wrote the file, which is not the question a rollback asks: the
+            # store is content-addressed and global, so between this `put` and
+            # the refusal below another Program can have `put` the same
+            # plaintext, been told it was already filed, and committed a
+            # reference to it. Deleting it then would empty a row somebody else
+            # holds. `Store.discard` says so itself -- safe for a ciphertext,
+            # whose nonce makes its hash unreachable to anyone else, and false
+            # of plaintext. Plaintext nobody ends up referencing is retention's
+            # to collect -- `artifacts_due_for_purge` is the view that refcounts
+            # it across Programs, and no command runs one yet. Bytes left in the
+            # store are a bounded cost; bytes deleted out from under another
+            # Program's committed reference are evidence loss.
+            request_sha, _ = store.put(sent)
+            response_sha, _ = store.put(received)
+        except (Corrupt, OSError) as error:
+            # The exchange happened and its bytes cannot be filed. Answered as a
+            # refusal rather than allowed to escape, for the reason every other
+            # failure in this method is: the caller must not read a 200 for an
+            # exchange nothing recorded, and a `Corrupt` here says another file
+            # already under one of these hashes is damaged -- which is a fact
+            # about this machine that belongs on a Receipt and in the log, not
+            # in a traceback nobody catches.
+            return self._refuse(
+                authorization.program_id,
+                capability,
+                Refused("artifact store refused", str(error), status=502,
+                        target_status=status),
+                arrival,
+                url=url,
+                authorization=authorization,
+                egress=egress,
+            )
 
         seals: list[dict] = []
         ciphertext_new: set[str] = set()
@@ -2627,10 +2727,6 @@ class Handler(BaseHTTPRequestHandler):
         if transformations:
             root = self.server.root_secret
             if root is None:
-                if request_new:
-                    store.discard(request_sha)
-                if response_new:
-                    store.discard(response_sha)
                 return self._refuse(
                     authorization.program_id,
                     capability,
@@ -2650,10 +2746,6 @@ class Handler(BaseHTTPRequestHandler):
                     authorization.program_id, capability, root
                 )
             except Refused as refusal:
-                if request_new:
-                    store.discard(request_sha)
-                if response_new:
-                    store.discard(response_sha)
                 refusal.target_status = status
                 return self._refuse(
                     authorization.program_id,
@@ -2677,7 +2769,21 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 envelope = encrypted.encode()
-                ciphertext_sha, is_new = store.put(envelope)
+                try:
+                    ciphertext_sha, is_new = store.put(envelope)
+                except (Corrupt, OSError) as error:
+                    for written in ciphertext_new:
+                        store.discard(written)
+                    return self._refuse(
+                        authorization.program_id,
+                        capability,
+                        Refused("wire response refused", str(error), status=502,
+                                target_status=status),
+                        arrival,
+                        url=url,
+                        authorization=authorization,
+                        egress=egress,
+                    )
                 if is_new:
                     ciphertext_new.add(ciphertext_sha)
                 seals.append(
@@ -2705,14 +2811,14 @@ class Handler(BaseHTTPRequestHandler):
         # nobody asked for, and an auditor cannot tell a followed redirect from
         # an agent that invented a target for itself.
         #
-        # Except when an Identity was bound. `project_identity_response` withholds
-        # the whole response head, `Location` included, because a redirect target
-        # is as capable of reflecting a credential as any other target-controlled
-        # field -- and a Receipt is read by more roles than the Agent view is.
-        # So those exchanges record no link, and an auditor reading one sees an
-        # unlinked child rather than a link that leaked. Reading `back` here
-        # instead would put the withheld bytes back on the record it was
-        # withheld from.
+        # Read off the Agent view rather than off `back`, because an Identity was
+        # possibly bound and a redirect target reflects a credential as readily
+        # as any other target-controlled field. `project_identity_response`
+        # drops a `Location` carrying one, so such an exchange records no link
+        # and an auditor reading it sees an unlinked child rather than a link
+        # that leaked -- and a Receipt is read by more roles than the Agent view
+        # is. Reading `back` here would put those bytes back on the record they
+        # were kept off.
         onward = (
             redirected(url, _header(agent_back, "Location")) if status in REDIRECTS else None
         )
@@ -2783,12 +2889,9 @@ class Handler(BaseHTTPRequestHandler):
             # record that can still be written is written: a blocked Receipt
             # naming the target, the status it answered with and the moment of
             # egress. It cannot name the transcripts, because registering them is
-            # precisely what failed, and bytes no row can reach are discarded
-            # rather than left in the store for nobody.
-            if request_new:
-                store.discard(request_sha)
-            if response_new:
-                store.discard(response_sha)
+            # precisely what failed, and the envelopes this exchange sealed are
+            # discarded rather than left in the store for nobody -- those and
+            # nothing else, for the reason the `put` above gives.
             for sha256 in ciphertext_new:
                 store.discard(sha256)
             return self._refuse(
@@ -3583,6 +3686,7 @@ def spend(
     capability: str,
     program_id: str,
     method: str = "GET",
+    headers: Mapping[str, str] | None = None,
     timeout: float = TIMEOUT,
     trust: ssl.SSLContext | None = None,
 ) -> Answer:
@@ -3610,6 +3714,7 @@ def spend(
         timeout,
         scope.canonical_request(url),
         trust,
+        headers=headers,
     )
 
 
@@ -3622,6 +3727,8 @@ def _through(
     timeout: float,
     request: scope.Request,
     trust: ssl.SSLContext | None,
+    *,
+    headers: Mapping[str, str] | None = None,
 ) -> Answer:
     """The request itself, with the capability on the hop that reaches the door.
 
@@ -3630,13 +3737,20 @@ def _through(
     ordinary origin-form request inside it, which is what every client does --
     and the control headers go on the CONNECT, because that is the hop the
     capability is for and the one the door can read.
+
+    The caller's own headers ride the hop that carries the message: alongside
+    the control headers on plain HTTP, and inside the tunnel on HTTPS, where
+    the door cannot read them anyway. The control headers are applied last, so
+    a caller that names one is naming a value this hop overwrites rather than
+    one it sends.
     """
     host, port = listener
     control = {AUTHORIZATION: f"RedKraken {capability}", PROGRAM: program_id}
+    carried = _carried(headers)
     if trust is None:
         client = http.client.HTTPConnection(host, port, timeout=timeout)
         try:
-            client.request(method.upper(), url, headers=control)
+            client.request(method.upper(), url, headers={**carried, **control})
             return _answered(client.getresponse())
         finally:
             client.close()
@@ -3655,12 +3769,26 @@ def _through(
         client = http.client.HTTPConnection(request.host, request.port, timeout=timeout)
         client.sock = secured
         try:
-            client.request(method.upper(), origin_form(url))
+            client.request(method.upper(), origin_form(url), headers=carried)
             return _answered(client.getresponse())
         finally:
             client.close()
     finally:
         raw.close()
+
+
+def _carried(headers: Mapping[str, str] | None) -> dict[str, str]:
+    """The caller's own headers, minus anything that describes a hop.
+
+    The rule the door applies to what arrives, applied here to what leaves. A
+    caller does not get to name its own capability, the Program it claims or a
+    length this client did not measure, and saying so with the predicate that
+    already says it means the two sides cannot drift apart on which names are
+    the connection's rather than the message's.
+    """
+    return {
+        name: value for name, value in (headers or {}).items() if not describes_this_hop(name)
+    }
 
 
 def _tunnel(

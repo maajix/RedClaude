@@ -279,6 +279,11 @@ def _current(
     A chain has no rendering row -- an approval is a transition of one Finding --
     and a Finding nobody has filed a rendering for is not stale. Neither is
     refused; there is nothing there to have gone out of date.
+
+    What it read is kept, because equal sources are not equal bytes: the
+    renderer takes an optional narrative, a filed rendering may carry one and a
+    re-render of the same rows does not. `_written` ships the filed document
+    itself for that reason, and this is where it comes from.
     """
     if answers.subject != "finding":
         return True
@@ -298,6 +303,7 @@ def _current(
             source="report_renderings",
         )
         return False
+    answers.filed = filed
     ledger.hold(
         "rendering",
         f"the rendering filed at {filed['rendered_at']} is still of this source"
@@ -340,8 +346,11 @@ def _written(
 ) -> Report:
     """Write the whole bundle, then hold it against the verifier that ships in it."""
     keep = store.Store(root)
+    approved = _approved(ledger, answers, document)
+    if approved is None:
+        return _report(ledger, answers)
     files: dict[str, bytes] = {
-        "report.md": document.encode("utf-8"),
+        "report.md": approved,
         "source.json": _json(source),
         "spec.json": _json({"specifications": gathered.specifications}),
         "receipts.json": _json(gathered.receipts),
@@ -415,6 +424,50 @@ def _written(
     return _verified(ledger, answers, out)
 
 
+def _approved(ledger: Ledger, answers: _Answers, document: str) -> bytes | None:
+    """The report a bundle ships: the filed rendering, or this fresh one.
+
+    `_current` has already refused a rendering made from rows that have since
+    moved, so what is left here is the other half of the same question. Two
+    documents can be made from one source and not be the same document: the
+    renderer takes an optional narrative, the filed rendering may carry one and
+    the render above passes none. Shipping the re-render would put a `report.md`
+    in the bundle that differs from the approved document by whole paragraphs,
+    under a manifest whose hashes all agree with each other -- a bundle that
+    asserts approval of a document nobody approved.
+
+    So the filed bytes are the bundle's, and the fresh render stays what it is
+    for: the soundness recheck that raises before anything is written. A Finding
+    nobody has read, and every chain, ship the render -- there is no other
+    document to prefer.
+
+    The digest is checked rather than trusted. `report_renderings` is immutable
+    and the column is a stored hash of the same row's text, so a disagreement is
+    a database that has stopped meaning what this reads it as, and is refused
+    loudly here rather than travelling into a bundle that names it.
+    """
+    fresh = document.encode("utf-8")
+    if answers.filed is None:
+        return fresh
+    approved = str(answers.filed["content"]).encode("utf-8")
+    stated = str(answers.filed["content_sha256"])
+    if verifier.digest(approved) != stated:
+        ledger.fail(
+            "rendering",
+            f"the rendering filed at {answers.filed['rendered_at']} names content "
+            f"{stated[:12]} and its bytes hash to {verifier.digest(approved)[:12]}",
+            code=INVALID_CONFIGURATION,
+            source="report_renderings",
+        )
+        return None
+    ledger.hold(
+        "report",
+        f"report.md is the filed rendering {stated[:12]}"
+        + ("" if approved == fresh else ", which is not what these rows render to today"),
+    )
+    return approved
+
+
 def _artifacts(
     keep: store.Store, named: Sequence[Mapping], rules: Sequence[Mapping]
 ) -> tuple[list[dict], dict[str, bytes], list[dict]]:
@@ -480,6 +533,18 @@ def _manifest(
         "template": answers.template,
         "program": answers.slug,
         "source_digest": source.get("digest"),
+        # Which rendering `report.md` is, when it is one somebody filed. A
+        # recipient can then check the file they were sent against the row an
+        # approval points at, rather than against a re-render they cannot make.
+        # Absent rather than null for a chain and for an unread Finding: there
+        # is no rendering, and a key spelling that as `null` would put the
+        # question in the manifest of every bundle that cannot answer it.
+        **({} if answers.filed is None else {"rendering": {
+            "id": str(answers.filed["rendering"]),
+            "rendered_at": answers.filed["rendered_at"],
+            "approved": answers.filed["approved"],
+            "content_sha256": answers.filed["content_sha256"],
+        }}),
         "required": sorted(gathered.required),
         "files": [
             {"path": path, "bytes": len(files[path]), "sha256": verifier.digest(files[path])}
@@ -656,6 +721,10 @@ class _Answers:
     slug: str | None = None
     program_id: str | None = None
     bundle: dict = field(default_factory=dict)
+    #: The last rendering filed for this Finding, once `_current` has read it.
+    #: `None` for a chain and for a Finding nobody has read, which is why the
+    #: bundle falls back to the document it just rendered.
+    filed: dict | None = None
 
 
 def _report(ledger: Ledger, answers: _Answers) -> Report:

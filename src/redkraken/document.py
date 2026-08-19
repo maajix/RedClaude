@@ -43,6 +43,11 @@ ENTRY = re.compile(r"^\S.*$")
 #: corpus, and skipped by `entries` wherever a corpus is enumerated.
 BYTECODE_DIR = "__pycache__"
 
+#: A file inside a corpus item: a name and never a path -- no separator, no
+#: parent, no leading dot. One pattern for every corpus, because a name that is
+#: a path is refused for the same reason wherever it is declared.
+FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
 
 class DocumentError(Exception):
     """One reason a document does not compile, in the words a test names it by.
@@ -174,6 +179,66 @@ def directories(fault: type[DocumentError], root: Path, what: str) -> list[Path]
     if not found:
         raise fault("corpus_missing", str(root), f"a corpus with no {what} in it")
     return found
+
+
+def resolved(fault: type[DocumentError], name: str, parent: Path, file_name: str) -> Path:
+    """One file inside a corpus item, or the reason it is not one.
+
+    Two rules, because they fail differently. The pattern refuses a name that is
+    a path -- `../`, an absolute path, a separator -- before anything touches the
+    filesystem. Resolution refuses a name that is not a path and reaches outside
+    anyway, which on a filesystem means a symbolic link: a corpus file that is a
+    link into the container's own credentials would pass every text rule either
+    corpus has.
+    """
+    if not FILE_NAME.match(file_name):
+        raise fault("path_escape", name, f"{file_name!r} is not a file name")
+    candidate = parent / file_name
+    if candidate.is_symlink():
+        raise fault("path_escape", name, f"{file_name} is a symbolic link")
+    if not candidate.is_file():
+        raise fault("file_missing", name, f"{parent.name}/{file_name} is declared and absent")
+    found = candidate.resolve()
+    if not found.is_relative_to(parent.resolve()):
+        raise fault("path_escape", name, f"{file_name} resolves outside {parent.name}/")
+    return found
+
+
+def listing(fault: type[DocumentError], name: str, directory: Path) -> tuple[str, ...]:
+    """What a corpus item's file directory really holds, refusing anything odd.
+
+    A directory that is not there is empty rather than wrong: every corpus here
+    declares its files and a corpus item that declares none has nothing to hold
+    them in. What is refused is a name in it that no declaration could reach --
+    a symlink, a nested directory, a name that is a path.
+    """
+    if not directory.is_dir():
+        return ()
+    found = []
+    for entry in entries(directory):
+        if not entry.is_file() or entry.is_symlink():
+            raise fault("stray_file", name, f"{directory.name}/{entry.name} is not a file")
+        if not FILE_NAME.match(entry.name):
+            raise fault("path_escape", name, f"{directory.name}/{entry.name} is not a file name")
+        found.append(entry.name)
+    return tuple(found)
+
+
+def text(fault: type[DocumentError], name: str, file_name: str, source: bytes) -> str:
+    """The bytes of a corpus document as characters, or why they are not one.
+
+    Both refusals are about the second reader. A document that is not UTF-8 is
+    one the CLI's own parse and this one would disagree about, and a carriage
+    return is the one character that makes a line here and a line there differ
+    without showing it in either.
+    """
+    try:
+        decoded = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise fault("frontmatter_malformed", name, f"{file_name} is not UTF-8") from error
+    if "\r" in decoded:
+        raise fault("frontmatter_malformed", name, f"{file_name} carries a carriage return")
+    return decoded
 
 
 def line(fault: type[DocumentError], name: str, key: str, value: Any, limit: int) -> str:

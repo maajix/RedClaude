@@ -236,6 +236,22 @@ class StoreTest(unittest.TestCase):
 
         self.assertIn(value, str(raised.exception))
 
+    def test_filing_bytes_over_a_damaged_file_of_their_name_fails_closed(self):
+        # A hit is verified, not adopted. The damaged file is left exactly as it
+        # was found, so the sign that something on this machine is corrupting
+        # artifacts survives the second write instead of being papered over by
+        # it -- and no caller commits a reference over bytes nobody read back.
+        keep = store()
+        value, _ = keep.put(BODY)
+        damaged = BODY + b"tampered"
+        artifact.path_for(keep.root, value).write_bytes(damaged)
+
+        with self.assertRaises(artifact.Corrupt) as raised:
+            keep.put(BODY)
+
+        self.assertIn(value, str(raised.exception))
+        self.assertEqual(damaged, artifact.path_for(keep.root, value).read_bytes())
+
     def test_a_range_is_verified_against_the_whole_plaintext(self):
         keep = store()
         value, _ = keep.put(BODY)

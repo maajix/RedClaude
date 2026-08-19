@@ -56,7 +56,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from redkraken import artifact, config, evidence, migrate, pg, program, reporting, store, verifier
-from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
+from redkraken.outcome import (
+    INTEGRITY_FAILED,
+    INVALID_CONFIGURATION,
+    Ledger,
+    Report,
+    report,
+)
 
 
 __all__ = [
@@ -374,6 +380,19 @@ def _recorded(
             f"the export was refused: {_sentence(error)}",
             code=INVALID_CONFIGURATION,
             source="record_v1_import",
+        )
+        return _report(ledger, answers)
+    except store.Corrupt as damaged:
+        # The store already holds a file under this artifact's hash whose bytes
+        # are not these. The import stops rather than recording a reference over
+        # material nobody read back: an export is the one path by which bytes
+        # this harness never collected arrive, so the one thing it must never do
+        # is hand a v1 name to a v2 file that has since been damaged.
+        ledger.fail(
+            "artifact",
+            f"an artifact this export retained is already filed here as other bytes: {damaged}",
+            code=INTEGRITY_FAILED,
+            source="artifact_store",
         )
         return _report(ledger, answers)
     except OSError as error:

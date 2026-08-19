@@ -78,13 +78,21 @@ SUMMARY_CHARACTERS = 160
 #: dash when it was not: a tick and a cross are the same shape to somebody
 #: having the page read to them, and what the criterion asks is that the seven
 #: stay distinct rather than that they be coloured.
-RUNGS = ("proposed", "attempted", "observed", "supported", "validated", "exploited", "reported")
+RUNGS = (
+    "proposed",
+    "attempted",
+    "observed",
+    "supported",
+    "validated",
+    "demonstrated",
+    "reported",
+)
 
 #: The three cells that read the opposite way round from the rungs beside them:
 #: a Finding that is blocked cannot be sent, a check that does not hold is a
 #: Program that is unsound, and a rendering that is stale describes a Finding
 #: that has moved. Each is a `(column, value)` pair and not a value, because a
-#: `true` is progress under `exploited` and a refusal to send under `blocked`,
+#: `true` is progress under `demonstrated` and a refusal to send under `blocked`,
 #: so what makes it a warning is which column it is in.
 WARNINGS = {("blocked", "true"), ("holds", "no"), ("freshness", "stale")}
 
@@ -264,18 +272,31 @@ def _clear_gate(console: Console, form: Mapping[str, str]) -> Report:
     )
 
 
-def _hours(given: str) -> float:
-    """The grant a form asked for, defaulting where the flag defaults.
+class Malformed(Exception):
+    """One field of a submitted form that cannot be read as what it asks for.
 
-    A number that will not parse is the default and not a refusal: the database
-    revalidates an approval whatever window it is given, so the failure this
-    could produce is a form rejected over a typo in a field the operator was
-    allowed to leave empty.
+    Raised where the field is parsed and answered where the form is, so that a
+    console reads a value in one place rather than validating it in another.
     """
+
+
+def _hours(given: str) -> float:
+    """The grant a form asked for, defaulting only where the flag defaults.
+
+    An empty field is the default, because the field is optional and the flag it
+    stands for has one. A field the operator filled in is not: `rk` exits 2 on
+    the same characters, and a console that read "12h" or "twelve" as the
+    default would widen the window the operator asked to narrow and would report
+    the grant it made as the grant that was requested. The two surfaces answer
+    the same input the same way, which is the whole of decision 18's "the same
+    operator verbs".
+    """
+    if not given.strip():
+        return operator.DEFAULT_GRANT_HOURS
     try:
         return float(given)
     except ValueError:
-        return operator.DEFAULT_GRANT_HOURS
+        raise Malformed(f"grant, in hours: {given!r} is not a number of hours") from None
 
 
 REASON = Field("reason", "why", placeholder="the sentence an audit reads afterwards")
@@ -712,7 +733,10 @@ def _acted(console: Console, form: Mapping[str, str]) -> Response:
     if missing:
         return _refused(console, 400, f"{verb} needs {', '.join(missing)}")
 
-    answer = action.call(console, form)
+    try:
+        answer = action.call(console, form)
+    except Malformed as unreadable:
+        return _refused(console, 400, f"{verb} was given {unreadable}")
     result = answer.facts.get("result")
     body = [
         _section(
@@ -768,7 +792,7 @@ def _mark(column: str, value: str) -> str:
     dash where the claim never got there. The warnings are the two answers that
     read the opposite way round from the rest and the two words that are a
     problem, which is why they are a set of pairs and not a set of values -- a
-    `true` is progress under `exploited` and a refusal to send under `blocked`.
+    `true` is progress under `demonstrated` and a refusal to send under `blocked`.
     """
     if column in RUNGS:
         if value == "true":
@@ -823,7 +847,7 @@ def _panel_html(shown: Mapping[str, object], *, linked: bool) -> str:
             heading,
             f'<p class="pending">{_e(shown["detail"] or "not read yet")}</p>',
         )
-    if state_ == panels.ERROR:
+    if state_ == panels.REFUSED:
         return _section(
             heading,
             f'<p class="warn">this panel could not be read: {_e(shown["detail"])}</p>',

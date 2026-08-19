@@ -175,8 +175,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnose = commands.add_parser(
         "doctor",
-        help="report local runtime readiness and validate a Program configuration",
+        help=f"report local runtime readiness and validate a configuration (${MIGRATE_URL})",
+        description=(
+            "Whether this machine can be trusted to run a Program: the "
+            "interpreter and its declared requirements, the schema the database "
+            "holds, the trust root and authority the door would issue from, the "
+            "Agent network and its one peer, and whether the three shipped "
+            "corpora still compile. Each subject beyond the interpreter is asked "
+            "of what this machine describes -- a connection string, a "
+            "certificate, an Agent boundary -- and a subject nothing describes "
+            "is reported as undescribed rather than as healthy. Reads only: it "
+            "starts no container, mints no certificate and writes no row."
+        ),
     )
+    _add_url(diagnose, MIGRATION)
     diagnose.add_argument(
         "--config",
         type=Path,
@@ -217,6 +229,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: ${AGENT.variable}); needed only when {execution.IMAGE} "
             "and the rest of the Agent boundary are set"
         ),
+    )
+    _add_root(
+        runner,
+        "where the Artifact bytes live, so the Mission packet can carry the "
+        f"readable head of each one (default: ${ARTIFACTS.variable})",
     )
     runner.set_defaults(run=_run)
 
@@ -1448,6 +1465,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"{execution.IMAGE} and the rest of the Agent boundary are set"
         ),
     )
+    # The same store `rk run` takes, and for the same reason it is not optional
+    # to declare: each repeat is a Program whose Mission packet quotes the
+    # readable head of every Artifact it can reach, and `_slice` below reads
+    # this flag off the namespace whatever the command was. A parser that
+    # omitted it would not make the store unnecessary; it would make the
+    # evaluator raise on the machines that have one.
+    _add_root(
+        evaluating,
+        "where the Artifact bytes live, so each repeat's Mission packet can "
+        f"carry the readable head of each one (default: ${ARTIFACTS.variable})",
+    )
     evaluating.set_defaults(run=_playbook_evaluate)
 
     costing = grading.add_parser(
@@ -2070,7 +2098,18 @@ def _add_key(parser: argparse.ArgumentParser) -> None:
 
 
 def _doctor(arguments: argparse.Namespace) -> int:
-    diagnosis = doctor.diagnose(arguments.config)
+    """Diagnose this machine, on the environment this process was given.
+
+    The connection string is optional here where every other database command
+    requires one: a machine with no database configured is a machine `rk doctor`
+    still has four other answers for, and refusing the whole command over a
+    missing variable would withhold them.
+    """
+    diagnosis = doctor.diagnose(
+        arguments.config,
+        environment=os.environ,
+        database_url=arguments.url or os.environ.get(MIGRATE_URL),
+    )
     print(json.dumps(diagnosis.as_dict(), indent=2))
     return diagnosis.exit_code
 
@@ -2215,7 +2254,15 @@ def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | N
     agent = _url(ledger, AGENT, arguments.state_url, program.COMMAND)
     if agent is None:
         return None
-    return execution.Slice(boundary=boundary, state=agent)
+    # The store is not required. A machine that names none still offers,
+    # claims and runs; its packet says `not_staged` for every Artifact rather
+    # than quoting one, which is the same answer it gives for an Artifact whose
+    # bytes are elsewhere.
+    return execution.Slice(
+        boundary=boundary,
+        state=agent,
+        artifacts=artifact.root_from_environment(arguments.artifacts),
+    )
 
 
 def _state(arguments: argparse.Namespace) -> int:

@@ -4963,7 +4963,7 @@ class MissionPacketTest(DatabaseCase):
     def test_a_byte_ceiling_is_honoured_by_the_compiled_document(self):
         compiled = self.compiled("a", limits=packet.Limits(byte_limit=600))
 
-        self.assertLessEqual(compiled.bytes, 600)
+        self.assertLessEqual(compiled.document_bytes, 600)
         self.assertLess(
             len(compiled.rows()),
             sum(compiled.section(name).total for name in packet.SECTIONS),
@@ -5335,6 +5335,29 @@ class ArtifactStoreTest(DatabaseCase):
                 (self.identifiers["a"],),
             ).scalar(),
         )
+
+    def test_storing_bytes_over_a_damaged_file_of_their_name_is_refused(self):
+        # The hit that must not be adopted. A file damaged after it was filed
+        # still carries the right name, so a put that trusted the name would
+        # commit a reference over bytes nobody has read back. Nothing is written
+        # and nothing is repaired: the damage is reported, because a rewrite
+        # here would erase the only sign of it and would quietly change what
+        # every row already pointing at this hash means.
+        sha256 = artifact.digest(PLAINTEXT)
+        path = artifact.path_for(self.root, sha256)
+        intact = path.read_bytes()
+        counted = "SELECT count(*) FROM artifact_references WHERE sha256 = $1"
+        before = self.connection.execute(counted, (sha256,)).scalar()
+        path.write_bytes(intact + b"damaged")
+        try:
+            refused = self.store("a", self.shared, content_type="text/plain")
+        finally:
+            path.write_bytes(intact)
+
+        self.assertFalse(refused.ok)
+        self.assertEqual(["integrity_failed"], [item.code for item in refused.violations])
+        self.assertEqual(["artifact_store"], [item.source for item in refused.violations])
+        self.assertEqual(before, self.connection.execute(counted, (sha256,)).scalar())
 
     def test_the_recorded_identifier_is_the_hash_of_the_bytes_on_disk(self):
         # Criterion 2, at the only place the two can disagree: the name the
@@ -10908,7 +10931,7 @@ class Child:
         thing that differs: a launcher that overrode the call would be a second
         copy of everything either side of the request.
         """
-        return _launch._spend(egress, URL, "GET")
+        return _launch._spend(egress, URL, "GET", {})
 
     def choose(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
         """What the orchestrator session answers: one pick, or nothing.
@@ -11397,6 +11420,63 @@ class ExecutionSliceTest(DatabaseCase):
         self.assertEqual(set(packet.SECTIONS), set(sections))
         self.assertEqual(2, sections["surface"])
         self.assertEqual(0, sections["receipts"])
+
+    def test_what_one_child_reads_is_bounded_by_both_configured_ceilings(self):
+        """Decision 11's ceiling and story 66's, on the documents that crossed.
+
+        One child reads two documents -- the packet it is briefed with and, if
+        it is the one that chooses, the capsule it inherits -- and only the
+        capsule's ceiling was ever configured, so an operator lowering the one
+        setting they could reach bounded half of what a session costs. Measured
+        on the serialized documents rather than on their rows, because bytes
+        are what crosses.
+        """
+        row = self.connection.execute(
+            "SELECT packet_max_bytes, packet_max_tokens, capsule_max_bytes,"
+            " capsule_max_tokens FROM scheduler_weights WHERE active"
+        ).dicts()[0]
+        configured = {
+            name: int(str(row[f"{name}_max_bytes"])) for name in ("packet", "capsule")
+        }
+        planning = self.child.choices[0]
+        working = self.child.requests[0]
+
+        for name, document in (
+            ("packet", working.packet),
+            ("packet", planning.packet),
+            ("capsule", planning.capsule),
+        ):
+            with self.subTest(document=name):
+                self.assertLessEqual(document.document_bytes, configured[name])
+        self.assertLessEqual(
+            planning.packet.document_bytes + planning.capsule.document_bytes,
+            configured["packet"] + configured["capsule"],
+        )
+        # And the ceiling honoured is the row's rather than the module's, which
+        # is the difference between a bound and a coincidence.
+        self.assertEqual(
+            (configured["packet"], int(str(row["packet_max_tokens"]))),
+            (working.packet.limits.byte_limit, working.packet.limits.token_limit),
+        )
+
+    def test_the_child_is_told_what_it_may_spend_and_what_ends_it(self):
+        """Decision 11's budgets and stop conditions, on the run they bound.
+
+        The numbers are asserted against the ones the job carries rather than
+        against literals, because that is the whole claim: what the child is
+        told it may spend is what the runtime will stop it at. A packet stating
+        a second, friendlier ceiling would be worse than stating none.
+        """
+        for started, stops in (
+            (self.child.requests[0], execution.MISSION_STOPS),
+            (self.child.choices[0], execution.PLANNING_STOPS),
+        ):
+            with self.subTest(role=started.role):
+                bounds = started.packet.bounds
+                self.assertEqual(started.token_cap, bounds.tokens)
+                self.assertEqual(started.subagent_cap, bounds.subagents)
+                self.assertEqual(roster.ROLES[started.role].max_turns, bounds.turns)
+                self.assertEqual(stops, bounds.stop_conditions)
 
     def test_the_one_request_was_served_through_the_door(self):
         self.assertEqual(1, len(self.child.answers))
@@ -17655,6 +17735,30 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
 
     def test_a_full_lane_offers_nothing(self):
         self.assertEqual((), self.lane_full)
+
+    def test_the_slate_refuses_the_compilation_it_never_earns_back(self):
+        """The `jit = off` clause is on the function, not left to the caller.
+
+        The cost of `offer_slate()` on the case's own corpus is seven
+        milliseconds of execution behind four hundred of LLVM: the planner
+        decides to compile from a cost estimate over the whole `tasks` relation,
+        and the Program-scoped index scan under it touches two hundred rows
+        whatever the installation holds. So the tax arrives with rows this
+        Program does not own, which is why nothing about this Program's numbers
+        would ever explain it, and why it belongs on the function rather than in
+        whichever session happens to notice.
+
+        `proconfig` and not a timing, because a timing is the thing the
+        performance budget already measures and it is the thing a busy machine
+        can fail on its own. What this asks is only that the clause survived --
+        a `CREATE OR REPLACE FUNCTION offer_slate()` in a later migration drops
+        it silently, and the next reading anyone takes is the slow one.
+        """
+        settings = self.connection.execute(
+            "SELECT coalesce(array_to_string(p.proconfig, ' '), '')"
+            "  FROM pg_proc p WHERE p.proname = 'offer_slate'"
+        ).scalar()
+        self.assertIn("jit=off", settings)
 
     def test_an_unaffordable_task_is_not_offered(self):
         self.assertEqual(3, len(self.offered_spent))
@@ -34919,6 +35023,46 @@ class ReportProjectionTest(ReportFixture, DatabaseCase):
             self.assertIn(str(self.of[name]["label"]), transitions)
         self.assertIn("specification sha256", " ".join(said["chain_evidence"]))
 
+    def test_the_chain_band_is_the_end_impact_and_not_the_best_member(self):
+        """Story 158: what the composition reached, counted once.
+
+        The arrangement makes the difference visible. The first member is the
+        one this case grades and it is `high`; the chain pivots off it into the
+        second, which nobody has graded -- so a band taken over the members
+        would read `high` and would be claiming that Finding's impact a second
+        time inside a report that already cites it as a step. What the chain
+        demonstrated at its end is what it is worth, and here that is not
+        stated yet.
+        """
+        severity = self.chain_bundle["severity"]
+        ends = [str(item["stamp"]) for item in severity["ends"]]
+        carried = {str(item["stamp"]): str(item["band"]) for item in severity["carried"]}
+
+        self.assertEqual([str(self.of["token"]["label"])], ends)
+        self.assertEqual({str(self.of["reach"]["label"]): self.BAND}, carried)
+        self.assertFalse(severity["graded"])
+        self.assertEqual("demonstrated_end_impact", severity["basis"])
+
+        said = " ".join(self.chain_said["chain_severity"])
+        self.assertIn("Band: not stated", said)
+        self.assertIn(str(self.of["reach"]["label"]), said)
+        self.assertNotIn(f"Band: {self.BAND}", said)
+
+    def test_the_end_of_a_chain_is_the_step_nothing_was_pivoted_from(self):
+        # The bundle's own edges say which step that is, so this asks the two
+        # readings to agree rather than asserting a stamp label twice.
+        pivoted_from = {str(edge["from"]) for edge in self.chain_bundle["edges"]}
+        every = {str(step["stamp"]) for step in self.chain_bundle["steps"]}
+
+        self.assertEqual(
+            sorted(every - pivoted_from),
+            sorted(str(item["stamp"]) for item in self.chain_bundle["severity"]["ends"]),
+        )
+        self.assertEqual(
+            sorted(pivoted_from),
+            sorted(str(item["stamp"]) for item in self.chain_bundle["severity"]["carried"]),
+        )
+
     def test_the_chain_report_carries_every_members_limitations(self):
         # A chain is at most as well established as its members, so a limitation
         # stated on a member's own report and dropped here would be one the
@@ -35140,6 +35284,7 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
             "blocked", label=cls.label_of(cls.member["second"]["finding"])
         )
         cls.of_a_stale_rendering = cls.after_the_rows_moved()
+        cls.narrated = cls.exported_after_a_narrative_was_approved()
 
         cls.export_problems = cls.rows_of("SELECT * FROM check_evidence_export()")
 
@@ -35227,6 +35372,41 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
             (cls.finding, cls.FORM, reporting.render(cls.fresh_source), reporting.VERSION),
         )
         assert cls.filed_here["outcome"] == "recorded", cls.filed_here
+
+    @classmethod
+    def exported_after_a_narrative_was_approved(cls) -> dict:
+        """Ticket 64: the document a human read is not the document these rows make.
+
+        The rendering this case filed at the start and a fresh render of the same
+        rows are the same bytes, which is what makes it useless for this: the
+        staleness check compares the source and would pass either way. So a
+        rendering is filed carrying a narrative the renderer accepts -- prose
+        that introduces no fact the projection does not already have -- and it
+        becomes the last document anybody read.
+
+        Filed of the rows as they now stand, after the arm above moved them, so
+        that nothing here is stale: the only difference between the approved
+        document and a re-render of the same source is the paragraph, which is
+        the whole of what an export could ship instead of what was approved.
+        """
+        source = cls.bundle_of(cls.FINDING_SOURCE, (cls.finding, cls.FORM))
+        cls.approved_text = reporting.render(
+            source,
+            narrative={"limitations": "Read once, in the window this Program was open."},
+        )
+        cls.approved = cls.called(
+            cls.FILE, (cls.finding, cls.FORM, cls.approved_text, reporting.VERSION)
+        )
+        assert cls.approved["outcome"] == "recorded", cls.approved
+        answer = cls.export("narrated")
+        assert answer.ok, answer.violations
+        return {
+            "report": answer,
+            "manifest": json.loads(
+                (cls.root / "narrated" / verifier.MANIFEST).read_text(encoding="utf-8")
+            ),
+            "bytes": (cls.root / "narrated" / "report.md").read_bytes(),
+        }
 
     @classmethod
     def label_of(cls, finding: str) -> str:
@@ -35540,6 +35720,37 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
             )[0][0],
         )
 
+    def test_the_exclusion_lines_are_ordered_by_the_database_like_the_other_reads(self):
+        """Criterion 5, at the one read that was not ordered.
+
+        The lines land in the manifest verbatim and the manifest is digested,
+        so their order is part of what "repeated export from identical
+        canonical rows is deterministic" means. An unordered union answers in
+        whatever order a plan produced, and two honest exports of one Finding
+        would then carry two digests -- which a recipient checking a bundle
+        against its manifest cannot be asked to explain.
+
+        Asked of the function over both receipt sets at once, because each
+        bundle here has one line to withhold and one line is in order however
+        the arms are evaluated.
+        """
+        for manifest in (self.manifest, self.chain_manifest):
+            codes = [item["code"] for item in manifest["excluded"]]
+            self.assertEqual(sorted(codes), codes)
+
+        together = [
+            str(row[0])
+            for row in self.rows(
+                "SELECT code FROM evidence_exclusions("
+                " finding_evidence_receipts($1::uuid)"
+                " || chain_evidence_receipts($2::uuid))",
+                (self.finding, self.id_of("chains", self.chain["chain"])),
+            )
+        ]
+
+        self.assertGreater(len(together), 1)
+        self.assertEqual(sorted(together), together)
+
     def test_every_read_the_export_makes_is_bound_to_one_program(self):
         """Criterion 2's last clause, asked of the functions rather than of a run.
 
@@ -35765,6 +35976,39 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
                 if assertion.name == "rendering"
             ),
         )
+
+    def test_the_report_shipped_is_the_document_that_was_read_and_not_a_re_render(self):
+        """Ticket 64: `source_digest` equal is not the same as bytes equal.
+
+        The renderer takes an optional narrative, the approved rendering carries
+        one and a fresh render of the same rows does not. A bundle that shipped
+        the re-render would differ from the approved document by that paragraph
+        and every hash in the manifest would still agree with every other.
+        """
+        source = self.bundle_of(self.FINDING_SOURCE, (self.finding, self.FORM))
+
+        self.assertEqual(self.approved_text.encode("utf-8"), self.narrated["bytes"])
+        self.assertNotEqual(reporting.render(source).encode("utf-8"), self.narrated["bytes"])
+        self.assertIn("Narrative (authored", self.narrated["bytes"].decode("utf-8"))
+
+    def test_the_manifest_names_the_rendering_its_report_is(self):
+        named = self.narrated["manifest"]["rendering"]
+
+        self.assertEqual(str(self.approved["rendering"]), named["id"])
+        self.assertEqual(verifier.digest(self.narrated["bytes"]), named["content_sha256"])
+        # The same hash the manifest's own file entry carries, so a recipient
+        # holding the bundle against the row an approval points at is holding it
+        # against the file they were sent.
+        self.assertEqual(
+            named["content_sha256"],
+            next(item["sha256"] for item in self.narrated["manifest"]["files"]
+                 if item["path"] == verifier.REPORT),
+        )
+
+    def test_a_chain_bundle_claims_no_rendering_because_a_chain_has_none(self):
+        # An approval is a transition of one Finding. A chain manifest carrying
+        # the key at all would be a claim nothing could answer.
+        self.assertNotIn("rendering", self.chain_manifest)
 
     def test_a_bundle_is_not_written_into_a_directory_that_holds_one(self):
         self.assertFalse(self.into_an_occupied_directory.ok)
@@ -37072,6 +37316,32 @@ class PlaybookSelectionTest(DatabaseCase):
 
         self.assertIn("permission denied", str(raised.exception).lower())
 
+    def test_no_catalogue_column_is_published_to_the_role_the_model_reads_through(self):
+        # Decision 15 one layer under `playbook.Projection`. The projection has
+        # no field a provenance line, a status or a trigger fact could occupy;
+        # this is the same sentence about the tables those live in, and it is
+        # the stronger form of "what the model may read is a subset of what the
+        # projection carries" -- the readable set here is empty, so the runtime
+        # handing the projection over is the only way a Playbook reaches a model.
+        self.assertEqual(
+            [],
+            [
+                (str(row[0]), str(row[1]))
+                for row in self.connection.execute(
+                    "SELECT table_name, column_name FROM state_read_surface"
+                    " WHERE table_name IN ('playbooks', 'playbook_triggers',"
+                    " 'playbook_outputs', 'playbook_skills', 'playbook_evidence',"
+                    " 'playbook_selections')"
+                    " ORDER BY table_name, column_name"
+                ).rows
+            ],
+        )
+        with pg.connect(self.harness.state) as session:
+            with self.assertRaises(pg.DatabaseError) as raised:
+                session.execute("SELECT provenance FROM playbooks")
+
+        self.assertIn("permission denied", str(raised.exception).lower())
+
     # -- criterion 6: a matching and a non-matching subject --------------------
 
     def test_a_matching_subject_selects_the_playbook(self):
@@ -38353,6 +38623,9 @@ class PlaybookEvaluationTest(DatabaseCase):
     #: `transport.tls_configuration` is settled by a measurement the proxy takes
     #: on a lane it does not intercept, so grading it needs a target serving two
     #: TLS configurations to that lane rather than a handler a fixture can write.
+    #: Ticket 88 owns that fixture and the half of `evaluation.served` that
+    #: could serve it; until it lands, ticket 84's campaign files no verdict
+    #: for this Playbook however many runs it spends.
     UNGRADED = "playbooks/http-desync/playbook.md"
 
     #: The pair whose ground truth contains the Playbook's declared class, and
@@ -41064,6 +41337,28 @@ class V1ImportTest(DatabaseCase):
         self.assertEqual("domain:app.example.com", self.entity("S-app")["dedup_key"])
         self.assertEqual("app.example.com", self.entity("S-app")["scope_selector"])
 
+    def test_an_export_whose_bytes_are_filed_here_as_other_bytes_is_refused(self):
+        # The store already holds this artifact from the import above, so the
+        # hash names a file rather than writing one. Damage that file and the
+        # name still matches: an import that trusted it would hand a v1 record
+        # to bytes nobody read back. Nothing is recorded, and the file is left
+        # damaged, because repairing it here would erase the only sign of it.
+        sha256 = store.digest(KEEP_BYTES)
+        path = artifact.path_for(self.root, sha256)
+        intact = path.read_bytes()
+        counted = "SELECT count(*) FROM v1_imports WHERE program_id = $1::uuid"
+        before = self.counted(counted, (self.program_id,))
+        path.write_bytes(intact + b"damaged")
+        try:
+            refused = self.imported(v1_export())
+        finally:
+            path.write_bytes(intact)
+
+        self.assertFalse(refused.ok)
+        self.assertEqual(["integrity_failed"], [item.code for item in refused.violations])
+        self.assertEqual(["artifact_store"], [item.source for item in refused.violations])
+        self.assertEqual(before, self.counted(counted, (self.program_id,)))
+
     # -- criterion 3: what may keep its provenance ---------------------------
 
     def test_a_row_the_export_retained_bytes_for_is_imported_surface(self):
@@ -41641,8 +41936,8 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
     because the renderer never sees a column name it did not get from the row.
 
     So the arrangement is 42's, which carries a claim the whole way -- proposed,
-    attempted, observed, supported, validated, exploited and rendered -- and the
-    console is opened over it. Criterion 4's ladder is then a question about
+    attempted, observed, supported, validated, demonstrated and rendered -- and
+    the console is opened over it. Criterion 4's ladder is then a question about
     rows rather than about a mock: each rung is asked of the table that would
     carry it, and a rung that showed because a status column said so rather than
     because the thing happened would show here on a Finding that never did it.
@@ -41948,6 +42243,31 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
             "program", self.before["budgets"]["rows"][0][0], self.before["budgets"]["rows"]
         )
 
+    def test_the_program_row_of_the_budgets_panel_answers_every_column(self):
+        """Ticket 64: the row under the six headers fills all six of them.
+
+        The Program row used to be read from `program_budget`, which carries no
+        request columns at all, so the three request cells were literal empty
+        strings under headers the lane rows below them filled in. An empty cell
+        in a column of numbers reads as a zero, and "this Program has spent no
+        requests" is a different claim from "this read did not ask".
+        """
+        shown = dict(
+            zip(self.before["budgets"]["columns"], self.before["budgets"]["rows"][0])
+        )
+
+        self.assertEqual("program", shown["scope"])
+        self.assertEqual([], [name for name, cell in shown.items() if cell == ""])
+        # And the answer is this Program's own, rather than a placeholder that
+        # happens not to be empty: the door was walked in `setUpClass`, so the
+        # requests spent here are the ones the capacity view counts.
+        spent = self.connection.execute(
+            "SELECT (requests_spent + requests_reserved)::text FROM program_capacity"
+            " WHERE program_id = $1::uuid",
+            (self.program_id,),
+        ).scalar()
+        self.assertEqual(str(spent), shown["requests spent"])
+
     def test_a_lease_names_the_identity_and_the_run_that_holds_it(self):
         held = dict(
             zip(self.before["leases"]["columns"], self.before["leases"]["rows"][0])
@@ -41966,7 +42286,7 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
         row = self.row_for(self.before, "findings", self.label)
 
         for rung in ("proposed", "attempted", "observed", "supported", "validated",
-                     "exploited"):
+                     "demonstrated"):
             with self.subTest(rung=rung):
                 self.assertEqual("true", row[rung], row)
         self.assertEqual("false", row["reported"])
@@ -42091,7 +42411,7 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
 
         shown = {item["panel"]: item for item in answer.facts["panels"]}
         self.assertEqual(EXIT_INVALID_CONFIGURATION, answer.exit_code)
-        self.assertEqual(panels.ERROR, shown["leases"]["state"])
+        self.assertEqual(panels.REFUSED, shown["leases"]["state"])
         self.assertIn("no_such_column", shown["leases"]["detail"])
         self.assertEqual(panels.READY, shown["budgets"]["state"])
 
@@ -42106,7 +42426,7 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
             )
 
         [shown] = answer.facts["panels"]
-        self.assertEqual(panels.ERROR, shown["state"])
+        self.assertEqual(panels.REFUSED, shown["state"])
         self.assertIn("read-only", shown["detail"])
         self.assertEqual(
             self.before["leases"]["total"], self.panels_of(self.console)["leases"]["total"]
@@ -42952,7 +43272,7 @@ class Hand(Child):
         return super().__call__(request)
 
     def spend(self, egress: agent.Egress) -> dict:
-        return _launch._spend(egress, self.told["url"], self.told["method"])
+        return _launch._spend(egress, self.told["url"], self.told["method"], {})
 
     def result(self) -> dict:
         made = self.results.get(self.role)
@@ -43080,6 +43400,7 @@ class Contained:
             ),
             self.url,
             "GET",
+            {},
         )
         page = json.dumps({"answered": answer.get("status")}).encode()
         steps, artifacts, kept = [], [], {plan["console"]: b""}

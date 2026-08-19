@@ -8,8 +8,10 @@ from tests.fixtures import scratch
 
 
 #: A package tree in miniature: a top-level module, a migration, a fixture app,
-#: and two files no digest covers (a document and a measurement). Small on
-#: purpose -- what each test varies is the one module under it.
+#: a document and a measurement. Every one of them is shipped, so every one of
+#: them is hashed -- the document and the measurement are here because they were
+#: the kinds an earlier suffix allowlist left out. Small on purpose: what each
+#: test varies is the one file under it.
 SAMPLE = {
     "artifact.py": b"print('artifact')\n",
     "migrations/0001_first.sql": b"select 1;\n",
@@ -39,7 +41,7 @@ def manifest_for(files: dict[str, bytes], **overrides) -> dict:
         "modules": {
             relative: hashlib.sha256(data).hexdigest()
             for relative, data in files.items()
-            if relative.endswith(build.HASHED_SUFFIXES)
+            if not set(relative.split("/")) & set(build.UNHASHED)
         },
     }
     body.update(overrides)
@@ -70,9 +72,8 @@ class ManifestReadingTest(unittest.TestCase):
         self.assertTrue(verification.source_mode)
         self.assertTrue(verification.ok)
         self.assertIsNone(verification.problem())
-        # Three modules: the .py and .sql. The document and the measurement are
-        # shipped but are not code, so no digest covers them.
-        self.assertEqual(3, verification.module_count)
+        # Five: everything the tree ships, which is what the manifest names.
+        self.assertEqual(5, verification.module_count)
 
     def test_a_manifest_that_matches_the_disk_reports_its_revision(self):
         verification = build.verify(installed(SAMPLE))
@@ -81,8 +82,26 @@ class ManifestReadingTest(unittest.TestCase):
         self.assertTrue(verification.ok)
         self.assertIsNone(verification.problem())
         self.assertEqual("a1b2c3d4" * 5, verification.revision)
-        self.assertEqual(3, verification.module_count)
+        self.assertEqual(5, verification.module_count)
         self.assertEqual(64, len(verification.tree_digest))
+
+    def test_an_edited_document_is_a_mismatch_like_an_edited_module(self):
+        # The reason this walk stopped being an extension allowlist. A Playbook,
+        # a Skill and a fixture are instructions this harness acts on, and an
+        # install whose documents were edited after it was built is not the
+        # install its manifest names.
+        root = installed(SAMPLE)
+        (root / "migrations" / "README.md").write_bytes(b"edited after install\n")
+
+        verification = build.verify(root)
+
+        self.assertFalse(verification.ok)
+        self.assertEqual("migrations/README.md", verification.mismatch)
+
+    def test_the_manifest_itself_is_never_one_of_the_files_it_names(self):
+        # It cannot carry its own digest, so a walk that hashed it would make
+        # every install refuse.
+        self.assertNotIn(build.MANIFEST, build.digests(installed(SAMPLE)))
 
     def test_a_changed_module_is_named_as_the_first_difference(self):
         root = installed(SAMPLE)

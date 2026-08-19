@@ -1,28 +1,61 @@
 """Local runtime readiness: the operation behind `rk doctor`.
 
-`diagnose` answers one question — can this machine be trusted to run a Program
-— by asserting the interpreter, the declared runtime requirements and, when the
-operator supplies one, a Program configuration. It reads; it never creates
-state, contacts a target or starts an Agent run. Every fact it reports is a
-name, a version, a count or a digest.
+`diagnose` answers one question -- can this machine be trusted to run a Program
+-- by asserting the interpreter, the declared runtime requirements, the state
+this installation depends on and, when the operator supplies one, a Program
+configuration. It reads; it never creates state, contacts a target or starts an
+Agent run. Every fact it reports is a name, a version, a count or a digest.
+
+Story 12 names five subjects and this asks about all five: runtime versions,
+database state, proxy readiness, container isolation and catalogue integrity.
+Each of the four beyond the interpreter is asked of something the operator has
+described -- a connection string, a trust root, an Agent boundary -- and where
+nothing was described the answer is that nothing was, rather than a hold that
+reads as readiness. A machine with no database configured is not a machine with
+a healthy one.
+
+Nothing here re-implements a check another module owns. The database answer is
+the one `rk db status` gives, the boundary answer is the assertion `isolation`
+makes before it starts a child, and the catalogue answer is the compilation each
+corpus refuses with. What this module adds is the asking.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import shutil
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.resources.abc import Traversable
 from pathlib import Path
 
-from redkraken import __version__, build, config, outcome
+from redkraken import (
+    __version__,
+    build,
+    config,
+    document,
+    execution,
+    fixture,
+    isolation,
+    migrate,
+    outcome,
+    pg,
+    playbook,
+    proxy,
+    skill,
+    tls,
+)
 from redkraken.outcome import (
+    INVALID_CONFIGURATION,
+    INVALID_CORPUS,
     MISSING_DEPENDENCY,
     RESULT_SCHEMA_VERSION,
     UNSUPPORTED_VERSION,
     Assertion,
     Ledger,
+    Report,
     Violation,
 )
 
@@ -56,6 +89,21 @@ class Requirements:
 
 #: The requirements this application declares. Operator commands use these.
 REQUIREMENTS = Requirements()
+
+#: One corpus: the word an operator reads in the report, and the compilation
+#: that either produces documents or refuses. A pair rather than a module
+#: reference, because what this asks of a corpus is the one function all three
+#: expose and nothing else about them.
+Corpus = tuple[str, "Callable[[], Mapping[str, object]]"]
+
+#: The three corpora an installation ships. Compiled from the installed package
+#: -- each `compile_corpus` defaults to the directory beside its own module --
+#: so what is diagnosed is what this machine would actually read.
+CORPORA: tuple[Corpus, ...] = (
+    ("playbooks", playbook.compile_corpus),
+    ("skills", skill.compile_corpus),
+    ("fixtures", fixture.compile_corpus),
+)
 
 
 @dataclass(frozen=True)
@@ -105,15 +153,25 @@ def diagnose(
     python_version: tuple[int, ...] | None = None,
     requirements: Requirements = REQUIREMENTS,
     build_anchor: Traversable | None = None,
+    environment: Mapping[str, str] | None = None,
+    database_url: str | None = None,
+    corpora: tuple[Corpus, ...] = CORPORA,
 ) -> Diagnosis:
     """Report local readiness, and the supplied configuration when there is one.
 
-    The observed interpreter version, the declared requirements and the package
-    the build assertion reads are parameters so that the negative outcomes stay
+    The observed interpreter version, the declared requirements, the package the
+    build assertion reads, the environment the boundary is described in and the
+    corpora that are compiled are parameters so that the negative outcomes stay
     reachable from tests without corrupting the running interpreter or the
-    installed package. Operator commands supply none of them.
+    installed package.
+
+    An unstated environment describes nothing rather than defaulting to this
+    process's own. The two probes that read it can start subprocesses against
+    whatever a machine happens to export, and a caller that has not said which
+    environment it means has not asked about any machine's containers.
     """
     version = tuple(python_version) if python_version is not None else tuple(sys.version_info[:3])
+    described = {} if environment is None else environment
     ledger = Ledger()
 
     _assert_python(ledger, version)
@@ -126,6 +184,10 @@ def diagnose(
     installed = build.record(ledger, build_anchor).as_dict()
     _assert_modules(ledger, requirements.modules)
     _assert_distributions(ledger, requirements.distributions)
+    _assert_database(ledger, database_url)
+    _assert_proxy(ledger, described)
+    _assert_isolation(ledger, described)
+    _assert_catalogue(ledger, corpora)
     summary = _assert_configuration(ledger, configuration_path)
 
     return Diagnosis(
@@ -191,6 +253,204 @@ def _assert_distributions(ledger: Ledger, distributions: tuple[tuple[str, str], 
             code=MISSING_DEPENDENCY,
             source=f"runtime:distribution:{name}",
         )
+
+
+def _assert_database(ledger: Ledger, url: str | None) -> None:
+    """Whether the database this machine points at holds the schema it ships.
+
+    The answer `rk db status` gives, folded in whole rather than derived a
+    second time: which migrations are recorded and which the corpus still owes
+    is one question, and a second reading of it here could differ from the
+    command an operator is told to run.
+    """
+    if not url:
+        ledger.hold("database", "no connection string supplied")
+        return
+    try:
+        settings = pg.settings_from_url(url, application_name="rk doctor")
+    except ValueError as error:
+        # The parser's own words, which name the unusable parameter and never
+        # echo the string back: a connection string carries a password.
+        ledger.fail(
+            "database",
+            f"the connection string cannot be used: {error}",
+            code=INVALID_CONFIGURATION,
+            source="connection_string",
+        )
+        return
+    answer = migrate.status(settings)
+    applied = answer.facts.get("applied") or ()
+    pending = answer.facts.get("pending") or ()
+    _fold(
+        ledger,
+        "database",
+        answer,
+        f"{len(applied)} migration(s) recorded and {len(pending)} pending "
+        f"at {answer.facts.get('target', 'the configured database')}",
+    )
+
+
+def _assert_proxy(ledger: Ledger, environment: Mapping[str, str]) -> None:
+    """Whether the door could be trusted if a child were started against it now.
+
+    Read-only about material that is otherwise made on demand: `tls.authority`
+    mints a root when the directory holds none, and a diagnosis that called it
+    would be creating the readiness it reports. So the certificate is asked
+    whether it exists and whether it is spent, the directory is asked whether it
+    is a directory, and the program that would issue the next one is asked
+    whether it is installed at all.
+    """
+    if shutil.which(tls.OPENSSL) is None:
+        ledger.fail(
+            "certificate_tool",
+            f"{tls.OPENSSL} is not on PATH; it issues the certificate that lets the "
+            "door see inside a tunnel",
+            code=MISSING_DEPENDENCY,
+            source=f"program:{tls.OPENSSL}",
+        )
+    else:
+        ledger.hold("certificate_tool", f"{tls.OPENSSL} is installed")
+
+    directory = environment.get(proxy.AUTHORITY_VARIABLE)
+    if not directory:
+        ledger.hold("proxy_authority", f"no authority directory described (${proxy.AUTHORITY_VARIABLE})")
+    elif not Path(directory).is_dir():
+        ledger.fail(
+            "proxy_authority",
+            f"the authority directory is not a directory: {directory}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{proxy.AUTHORITY_VARIABLE}",
+        )
+    else:
+        ledger.hold("proxy_authority", f"{directory} can hold the door's authority")
+
+    _assert_trust_root(ledger, environment.get(proxy.CA_VARIABLE))
+
+
+def _assert_trust_root(ledger: Ledger, certificate: str | None) -> None:
+    """Whether the root a child would be handed is one a child could use."""
+    if not certificate:
+        ledger.hold("proxy_trust_root", f"no trust root described (${proxy.CA_VARIABLE})")
+        return
+    path = Path(certificate)
+    if not path.is_file():
+        ledger.fail(
+            "proxy_trust_root",
+            f"the trust root is not a readable file: {path}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{proxy.CA_VARIABLE}",
+        )
+        return
+    try:
+        spent = tls.spent(path)
+    except tls.Unusable as error:
+        ledger.fail(
+            "proxy_trust_root",
+            f"the trust root cannot be read: {error}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{proxy.CA_VARIABLE}",
+        )
+        return
+    if spent:
+        # Not a state the door cannot recover from -- it reissues on its next
+        # start -- but a child already holding this one keeps holding it, so an
+        # operator opening a long session is told before it expires under them.
+        ledger.fail(
+            "proxy_trust_root",
+            f"the trust root at {path} is at the end of its life and will be reissued",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{proxy.CA_VARIABLE}",
+        )
+        return
+    ledger.hold("proxy_trust_root", f"{path} is current")
+
+
+def _assert_isolation(ledger: Ledger, environment: Mapping[str, str]) -> None:
+    """Whether the Agent boundary this machine describes is the one it claims.
+
+    The assertion `isolation` makes before it starts a child, made here without
+    starting one: the network is internal, the door is attached to it, the proxy
+    URL names that peer, and nothing else is on the network. A machine that
+    describes no boundary describes none, which is `rk run` used the way every
+    ticket before the boundary used it rather than a failure.
+    """
+    if not execution.requested(environment):
+        ledger.hold("agent_boundary", "no Agent boundary described")
+        return
+    container, missing = execution.boundary(environment)
+    if container is None:
+        ledger.fail(
+            "agent_boundary",
+            "the Agent boundary is described only in part: "
+            + ", ".join(missing)
+            + (" is unset" if len(missing) == 1 else " are unset")
+            + ", and no child starts without all of them",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{missing[0]}",
+        )
+        return
+    try:
+        engine = isolation.engine_for(container.engine)
+    except isolation.Unavailable as error:
+        ledger.fail(
+            "agent_boundary", str(error), code=MISSING_DEPENDENCY, source="program:container_engine"
+        )
+        return
+    try:
+        host, _ = isolation.proxy_peer(container.proxy_url)
+        isolation.one_peer(engine, container.network, container.proxy_container, host)
+    except isolation.Unavailable as error:
+        ledger.fail(
+            "agent_boundary",
+            str(error),
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{execution.NETWORK}",
+        )
+        return
+    ledger.hold(
+        "agent_boundary",
+        f"{container.network} is internal and holds {container.proxy_container} alone",
+    )
+
+
+def _assert_catalogue(ledger: Ledger, corpora: tuple[Corpus, ...]) -> None:
+    """Whether the corpora this installation ships still compile.
+
+    Compiled rather than counted, because a corpus is a set of documents the
+    runtime reads at the moment it needs one: an installation whose Playbook
+    names a Skill nobody ships refuses at selection time, on the run that needed
+    it. This is where an operator finds that out instead.
+    """
+    for name, compile_corpus in corpora:
+        try:
+            compiled = compile_corpus()
+        except document.DocumentError as error:
+            ledger.fail(
+                f"catalogue:{name}",
+                f"the installed {name} corpus does not compile: {error}",
+                code=INVALID_CORPUS,
+                source=f"corpus:{name}",
+            )
+        else:
+            ledger.hold(f"catalogue:{name}", f"{len(compiled)} compiled")
+
+
+def _fold(ledger: Ledger, name: str, answer: Report, held: str) -> None:
+    """Record another command's report as one assertion of this diagnosis.
+
+    The violations cross over whole. A diagnosis that summarised them would be a
+    second wording of a refusal the operator can already act on, and the exit
+    code this command returns is derived from their codes rather than from any
+    sentence written here.
+    """
+    if answer.violations:
+        ledger.refuse(
+            name,
+            f"`{answer.command}` refused: {len(answer.violations)} violation(s)",
+            answer.violations,
+        )
+        return
+    ledger.hold(name, held)
 
 
 def _assert_configuration(ledger: Ledger, path: Path | None) -> dict | None:

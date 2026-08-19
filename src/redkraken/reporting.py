@@ -147,11 +147,19 @@ def _gate(bundle: Mapping[str, object], kind: str) -> None:
     all soft, and a chain renders when 040 says it is sound -- and 040's own
     soundness already asks the two review gates that hold a member, so a chain
     that renders is a chain whose members are review-cleared.
+
+    Both arms refuse a bundle that answered nothing, and for the same reason.
+    `report_source_bundle` always emits a blocker list, empty or not, but this
+    function is a mapping-in one that `evidence` calls as well, so the bundle
+    is not always the one that SQL built. A missing list is nobody having
+    asked, which must not read as nothing having objected.
     """
     if kind == "chain":
         if not bundle.get("sound"):
             raise Refused("chains", [str(bundle.get("unsound") or "the chain is not sound")])
         return
+    if "blockers" not in bundle:
+        raise Refused("report_blockers", ["the bundle states no blocker list"])
     hard = [
         f"{item['code']}: {item['detail']}"
         for item in bundle.get("blockers") or ()
@@ -408,6 +416,53 @@ def _chain_transitions(bundle: Mapping) -> list[str]:
     ]
 
 
+def _chain_severity(bundle: Mapping) -> list[str]:
+    """Story 158: the band the chain reached, and the arithmetic it refuses.
+
+    Two things a triager has to be able to tell apart: what this chain
+    demonstrated at its end, and what its steps are worth on their own. The
+    first is the band; the second is printed as the route and stated as not
+    added, because a member's impact is already claimed by that member's own
+    report and a chain that added them together would claim it twice.
+    """
+    severity = bundle["severity"]
+    if not severity["ends"]:
+        return ["This chain ends nowhere, so no end impact can be read off it."]
+    if severity["graded"]:
+        lines = [f"- Band: {severity['band']}, from the demonstrated end impact"]
+    else:
+        ungraded = ", ".join(
+            f"{end['stamp']} ({end['member']})"
+            for end in severity["ends"]
+            if end["basis"] == "undetermined"
+        )
+        lines = [
+            f"- Band: not stated. This chain ends at {ungraded}, which carries no "
+            "severity of its own yet, and a composition cannot be banded above "
+            "where it ends.",
+        ]
+    for end in severity["ends"]:
+        vector = f", CVSS {end['score']} {end['vector']}" if end["vector"] else ""
+        lines.append(f"- Demonstrated at {end['stamp']} ({end['member']}): {end['band']}{vector}")
+    if severity["carried"]:
+        route = ", ".join(
+            f"{item['stamp']} ({item['member']}) {item['band']}" for item in severity["carried"]
+        )
+        lines.extend([
+            "",
+            f"The steps this chain went through to reach it: {route}. Each states "
+            "that band in its own report and none of them is added to the band "
+            "above: this chain is worth what it demonstrated at the end, once.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "This chain is one step, so its end impact is that step's own and "
+            "there is nothing beside it to add.",
+        ])
+    return lines
+
+
 def _chain_evidence(bundle: Mapping) -> list[str]:
     evidence = bundle["evidence"]
     if not evidence:
@@ -442,6 +497,7 @@ _BLOCKS: dict[str, Callable[[Mapping], list[str]]] = {
     "chain_composition": _chain_composition,
     "chain_transitions": _chain_transitions,
     "chain_evidence": _chain_evidence,
+    "chain_severity": _chain_severity,
 }
 
 

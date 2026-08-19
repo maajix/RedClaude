@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,14 +52,6 @@ from redkraken import integrity, packet, pg
 #: are gathered in for the fit, which is why the Slate is last -- it is the one
 #: section the next pass recomputes from the database anyway.
 SECTIONS = ("lifecycle", "budget", "integrity", "work", "slate")
-
-#: How many times a capsule over its ceiling is compacted before it is refused.
-#: The fit drops rows against a budget that leaves room for the document's own
-#: framing, and each pass subtracts exactly the measured excess, so a capsule
-#: converges in one or two. Four is the count at which "it is not converging"
-#: is a better answer than another pass.
-COMPACTIONS = 4
-
 
 class CapsuleError(ValueError):
     """A capsule that cannot be built or is not one. Raised at the boundary."""
@@ -130,7 +122,7 @@ class Capsule:
         two sizes across two documents is how a ceiling comes to be checked
         against a number that is not the one it bounds.
         """
-        return len(_encode(self.as_dict()))
+        return len(packet.encode(self.as_dict()))
 
     @property
     def document_tokens(self) -> int:
@@ -182,11 +174,6 @@ def _stated(section: packet.Section) -> dict:
     body = section.as_dict()
     body["omitted"] = max(section.total - len(section.rows), 0)
     return body
-
-
-def _encode(document: Mapping[str, Any]) -> bytes:
-    """The document as it goes out, which is the only form worth measuring."""
-    return json.dumps(document, separators=(",", ":"), default=str).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -438,61 +425,9 @@ def compile(
             sections={name: sections[name] for name in SECTIONS},
         )
 
-    return _compacted(staged, limits, build)
-
-
-def _compacted(
-    staged: Mapping[str, packet.Section],
-    limits: packet.Limits,
-    build: Callable[[Mapping[str, packet.Section]], Capsule],
-) -> Capsule:
-    """Fit the capsule under its ceiling, or refuse to send one that is over.
-
-    Criterion 6 names both halves -- "refused or further compacted" -- and they
-    are one loop. `packet.bound` fits rows against a byte budget, but what the
-    ceiling is on is the serialized document, which is the rows plus its own
-    framing; so the budget starts one framing short and each pass subtracts the
-    excess the last one actually measured.
-
-    A capsule still over the ceiling with every row dropped is a ceiling smaller
-    than the empty document, which no amount of compaction reaches. That is a
-    configuration this cannot satisfy, and a refusal names it rather than
-    starting a session against a bound the runtime quietly broke.
-
-    The two refusals are separate sentences because they are separate faults. A
-    ceiling below the framing is a setting to change; a fit that has not
-    converged in `COMPACTIONS` passes is this module not converging, and telling
-    an operator to raise a limit would be advice about the wrong thing.
-    """
-    framing = len(_encode(build(_emptied(staged)).as_dict()))
-    budget = limits.byte_ceiling - framing
-    if budget < 0:
-        raise CapsuleError(
-            f"the capsule does not fit: {limits.byte_ceiling} bytes "
-            f"({limits.byte_limit} configured, {limits.token_limit} tokens) "
-            f"leaves no room for the {framing} byte(s) of document framing"
-        )
-    for _ in range(COMPACTIONS):
-        capsule = build(packet.bound(staged, byte_limit=budget, order=SECTIONS))
-        excess = capsule.document_bytes - limits.byte_ceiling
-        if excess <= 0:
-            return capsule
-        budget -= excess
-        if budget < 0:
-            break
-    raise CapsuleError(
-        f"the capsule does not fit: {COMPACTIONS} compaction(s) did not bring it "
-        f"under {limits.byte_ceiling} bytes "
-        f"({limits.byte_limit} configured, {limits.token_limit} tokens)"
+    return packet.compacted(
+        staged, limits, build, order=SECTIONS, noun="capsule", error=CapsuleError
     )
-
-
-def _emptied(staged: Mapping[str, packet.Section]) -> dict[str, packet.Section]:
-    """The same sections with no rows: what the framing alone costs."""
-    return {
-        name: packet.Section(name=name, total=section.total)
-        for name, section in staged.items()
-    }
 
 
 def _lifecycle(connection: pg.Connection, program_id: str) -> packet.Section:

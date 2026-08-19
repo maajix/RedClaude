@@ -114,6 +114,16 @@ class Refusals(unittest.TestCase):
         unclosed = FENCE + "\ndescription: a thing\n" + BODY
         self.refuses("frontmatter_malformed", corpus(a_technique=unclosed))
 
+    def test_a_document_the_two_parsers_would_read_differently_is_refused(self):
+        # `document.text` states both rules for all three corpora: bytes that
+        # are not UTF-8 are bytes the CLI's parse and this one disagree about,
+        # and a carriage return is the one character that makes a line here and
+        # a line there differ without showing it in either.
+        self.refuses("frontmatter_malformed", corpus(a_technique=document(FRONTMATTER) + "\r\n"))
+        raw = corpus(a_technique=document(FRONTMATTER))
+        (raw / "a-technique" / skill.INSTRUCTIONS).write_bytes(b"---\ndescription: \xff\n---\nx\n")
+        self.refuses("frontmatter_malformed", raw)
+
     def test_an_empty_frontmatter_is_refused_rather_than_defaulted(self):
         empty = f"{FENCE}\n{FENCE}\n{BODY}"
         self.refuses("frontmatter_malformed", corpus(a_technique=empty))

@@ -408,11 +408,25 @@ def put(
         if program_id is None:
             return _report(ledger, answers)
 
-        with connection.transaction():
-            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {PUT}",))
-            answers.artifact = filed(
-                connection, keep, program_id, data, kind=kind, content_type=content_type
+        try:
+            with connection.transaction():
+                connection.execute("SELECT set_actor('runtime', $1)", (f"rk {PUT}",))
+                answers.artifact = filed(
+                    connection, keep, program_id, data, kind=kind, content_type=content_type
+                )
+        except Corrupt as damaged:
+            # The store already holds a file under this hash whose bytes are not
+            # these. Nothing is committed and nothing is rewritten: the operator
+            # is told which file on this machine is damaged, because the row this
+            # command would have written would have named bytes nobody can read
+            # back, and that is the skew `audit` has no way to repair.
+            ledger.fail(
+                "integrity",
+                f"the store already holds {digest(data)[:12]} as other bytes: {damaged}",
+                code=INTEGRITY_FAILED,
+                source="artifact_store",
             )
+            return _report(ledger, answers)
 
     record = answers.artifact
     ledger.hold(

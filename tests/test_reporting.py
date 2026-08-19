@@ -168,6 +168,7 @@ def chain_bundle(**changes: object) -> dict:
             {"id": "chain_composition", "name": "How this chain was established"},
             {"id": "chain_transitions", "name": "Transitions"},
             {"id": "chain_evidence", "name": "Evidence"},
+            {"id": "chain_severity", "name": "Severity"},
             {"id": "limitations", "name": "Limitations"},
         ],
         "sound": True,
@@ -213,6 +214,22 @@ def chain_bundle(**changes: object) -> dict:
                 "spec_sha256": "d" * 64,
             }
         ],
+        "severity": {
+            "band": "high",
+            "basis": "demonstrated_end_impact",
+            "graded": True,
+            "ends": [
+                {
+                    "stamp": "P-0002",
+                    "member": "F-0009",
+                    "band": "high",
+                    "basis": "demonstrated",
+                    "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+                    "score": 8.1,
+                }
+            ],
+            "carried": [{"stamp": "P-0001", "member": "F-0007", "band": "medium"}],
+        },
         "limitations": [],
     }
     bundle.update(changes)
@@ -306,6 +323,19 @@ class GateTest(unittest.TestCase):
             reporting.render(
                 {"kind": "chain", "chain": None, "template": "platform.chain_long_form"}
             )
+
+    def test_a_finding_bundle_stating_no_blocker_list_is_refused_like_the_chain(self):
+        # The same asymmetry from the other side: `render` is a mapping-in
+        # function `evidence` calls too, so a bundle that never asked 034 is a
+        # bundle that reaches here, and an absent list is not an empty one.
+        bundle = finding_bundle()
+        del bundle["blockers"]
+
+        with self.assertRaises(reporting.Refused) as refusal:
+            reporting.render(bundle)
+
+        self.assertEqual("report_blockers", refusal.exception.source)
+        self.assertEqual(("the bundle states no blocker list",), refusal.exception.reasons)
 
 
 class FormTest(unittest.TestCase):
@@ -433,6 +463,73 @@ class ChainFormTest(unittest.TestCase):
         self.assertIn("   requires session:member", document)
         self.assertIn("   provides data:orders by read", document)
         self.assertIn("- P-0001 -> P-0002 (data:orders)", document)
+
+    def test_the_band_is_the_end_impact_and_the_route_is_not_added_to_it(self):
+        document = reporting.render(chain_bundle())
+
+        self.assertIn("- Band: high, from the demonstrated end impact", document)
+        self.assertIn(
+            "- Demonstrated at P-0002 (F-0009): high, CVSS 8.1 "
+            "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+            document,
+        )
+        self.assertIn("P-0001 (F-0007) medium", " ".join(document.split()))
+        self.assertIn("none of them is added to the band above", " ".join(document.split()))
+
+    def test_a_one_step_chain_says_there_is_nothing_beside_the_end_to_add(self):
+        document = reporting.render(
+            chain_bundle(
+                severity={
+                    "band": "critical",
+                    "basis": "demonstrated_end_impact",
+                    "graded": True,
+                    "ends": [
+                        {
+                            "stamp": "P-0001",
+                            "member": "F-0007",
+                            "band": "critical",
+                            "basis": "demonstrated",
+                            "vector": None,
+                            "score": None,
+                        }
+                    ],
+                    "carried": [],
+                }
+            )
+        )
+
+        self.assertIn("- Band: critical, from the demonstrated end impact", document)
+        self.assertIn("- Demonstrated at P-0001 (F-0007): critical\n", document)
+        self.assertIn("nothing beside it to add", " ".join(document.split()))
+
+    def test_a_chain_ending_at_an_ungraded_finding_says_so_instead_of_printing_info(self):
+        # `info` is where a Finding sits before anybody grades it, so a chain
+        # that printed it as its band would understate a composition that
+        # reached further than its last member has been assessed.
+        document = reporting.render(
+            chain_bundle(
+                severity={
+                    "band": "info",
+                    "basis": "demonstrated_end_impact",
+                    "graded": False,
+                    "ends": [
+                        {
+                            "stamp": "P-0002",
+                            "member": "F-0009",
+                            "band": "info",
+                            "basis": "undetermined",
+                            "vector": None,
+                            "score": None,
+                        }
+                    ],
+                    "carried": [{"stamp": "P-0001", "member": "F-0007", "band": "high"}],
+                }
+            )
+        )
+
+        self.assertIn("- Band: not stated. This chain ends at P-0002 (F-0009)", document)
+        self.assertNotIn("- Band: info", document)
+        self.assertIn("P-0001 (F-0007) high", " ".join(document.split()))
 
     def test_a_chain_that_states_no_edge_says_so_rather_than_printing_a_heading(self):
         document = reporting.render(chain_bundle(edges=[]))
