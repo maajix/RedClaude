@@ -19,17 +19,35 @@ from tests import ROOT
 
 
 LEDGER = ROOT / "baseline" / "v1-dispositions.tsv"
+INTAKE = ROOT / "baseline" / "technique-intake.tsv"
 
 
-def ledger_rows(without: str | None = None) -> list[list[str]]:
-    """The shipped ledger as raw rows, optionally missing the row for one source."""
-    with LEDGER.open(encoding="utf-8", newline="") as handle:
+def table_rows(path: Path, without: str | None = None) -> list[list[str]]:
+    """One shipped table as raw rows, optionally missing the row keyed on a value.
+
+    Raw rather than dictionaries because these are the inputs to negatives: a
+    test that deletes a column or widens a row has to be able to write something
+    the reader will refuse, and a dictionary cannot hold a malformed row.
+    """
+    with path.open(encoding="utf-8", newline="") as handle:
         return [row for row in csv.reader(handle, delimiter="\t") if row[0] != without]
 
 
-def written(rows: list[list[str]], directory: str) -> Path:
-    """Those rows as a ledger inside `directory`, in the format the gates read."""
-    path = Path(directory) / "v1-dispositions.tsv"
+def ledger_rows(without: str | None = None) -> list[list[str]]:
+    """The shipped disposition ledger, optionally missing the row for one source."""
+    return table_rows(LEDGER, without)
+
+
+def intake_rows(without: str | None = None) -> list[list[str]]:
+    """The shipped intake ledger, optionally missing the row for one technique."""
+    return table_rows(INTAKE, without)
+
+
+def written(
+    rows: list[list[str]], directory: str, name: str = "v1-dispositions.tsv"
+) -> Path:
+    """Those rows as a table inside `directory`, in the format the gates read."""
+    path = Path(directory) / name
     with path.open("w", encoding="utf-8", newline="") as handle:
         csv.writer(
             handle, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_NONE

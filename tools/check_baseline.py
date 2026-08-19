@@ -32,6 +32,7 @@ BASELINE_FILES = {
     "v1-dispositions.tsv",
     "v1-dispositions.json",
     "spec-verification.tsv",
+    "technique-intake.tsv",
 }
 #: The directory name a Skill or a Playbook keeps maintainer prose under. Spelled
 #: here rather than imported from `skill.py`, because this check reads the tree as
@@ -175,15 +176,22 @@ def collect_v1(v1: Path) -> list[dict[str, str]]:
     return sorted(rows, key=lambda row: (row["kind"], row["source"]))
 
 
-def read_table(path: Path, fields: tuple[str, ...], noun: str) -> list[dict[str, str]]:
-    """One of `baseline/`'s tab-separated tables, keyed by `source`.
+def read_table(
+    path: Path, fields: tuple[str, ...], noun: str, key: str = "source"
+) -> list[dict[str, str]]:
+    """One of `baseline/`'s tab-separated tables, keyed by one of its columns.
 
-    Shared because that directory now holds two of them and they have to be read
-    identically: a table read under a different quoting rule is a different
+    Shared because that directory now holds several of them and they have to be
+    read identically: a table read under a different quoting rule is a different
     table, and these are the files that must mean the same thing on every
     machine. The semantics of each stay with its own reader; what is here is the
-    file format and the two properties both have, that every row has exactly the
-    declared fields and that a source appears once.
+    file format and the two properties they all have, that every row has exactly
+    the declared fields and that the key appears once.
+
+    The key is a parameter because a table's unit is not always its source. The
+    intake ledger reads one technique per row and several techniques can come
+    off one page, so there the unit is the technique and a repeated URL is
+    ordinary rather than a duplicate.
     """
     try:
         with path.open(encoding="utf-8", newline="") as handle:
@@ -200,11 +208,11 @@ def read_table(path: Path, fields: tuple[str, ...], noun: str) -> list[dict[str,
         # declared width shows up as one or the other. A surplus column reads
         # clean otherwise, which is the quiet way a frozen table gains a field.
         if None in row or any(value is None or "\t" in value for value in row.values()):
-            raise BaselineError(f"malformed {noun} row: {row.get('source')}")
-    sources = [row["source"] for row in rows]
-    duplicates = sorted(source for source, count in Counter(sources).items() if count > 1)
+            raise BaselineError(f"malformed {noun} row: {row.get(key)}")
+    keys = [row[key] for row in rows]
+    duplicates = sorted(one for one, count in Counter(keys).items() if count > 1)
     if duplicates:
-        raise BaselineError(f"duplicate {noun} source: " + ", ".join(duplicates))
+        raise BaselineError(f"duplicate {noun} {key}: " + ", ".join(duplicates))
     return rows
 
 

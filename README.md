@@ -332,6 +332,7 @@ python3 -m unittest discover -q
 python3 tools/check_baseline.py
 python3 -m tools.check_dispositions
 python3 -m tools.check_coverage
+python3 -m tools.check_intake
 ```
 
 The third is the migration ledger: for each of the 223 artifacts the census
@@ -346,6 +347,12 @@ role and registered in the schema at the exact text this checkout ships; the 73
 operator references and 9 sink packs are each attached to one Skill or Playbook
 that declares them and nothing sits loose in a `references/` directory; and the
 52 retirements split by kind under a scope whose reversal is on record.
+
+The fifth is the technique intake: one row per public source read, carrying its
+digest, the Property class it maps to and what it produced. Producing nothing is
+an outcome with a reason rather than a gap, a row cannot claim a fixture for a
+class the schema records as not agent-makeable, and a fixture whose provenance
+cites the intake ticket and which no row produced fails the gate.
 
 The composed suite is the same modules with a server and a container engine
 behind them. It needs a PostgreSQL 18 superuser URL and, for the container
