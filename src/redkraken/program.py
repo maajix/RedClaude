@@ -298,12 +298,21 @@ def run(
 def _workable(ledger: Ledger, state: _State) -> bool:
     """Whether this Program is in a state anything may be attempted against.
 
-    Three refusals rather than one, because they are three different facts and
+    Four refusals rather than one, because they are four different facts and
     an operator reading "nothing happened" deserves to know which. A closed or
     retired Program is not a fault at all, which is why it is held rather than
     failed: the run resumed it correctly and there is nothing left to work on.
+    A Halt is the same shape and says so in the operator's own words: the
+    scheduler would refuse every Task anyway, and this is where that refusal
+    gets a name instead of an empty slate.
     """
     if ledger.violations:
+        return False
+    if state.halted:
+        ledger.hold(
+            "execution",
+            "the Program is halted; nothing was claimed until an operator lifts it",
+        )
         return False
     if state.pending:
         ledger.hold(
@@ -334,6 +343,7 @@ class _State:
     scope: dict | None = None
     first_tasks: dict | None = None
     lifecycle: str | None = None
+    halted: bool = False
     pending: list[dict] | None = None
     integrity: dict | None = None
     execution: dict | None = None
@@ -1130,6 +1140,13 @@ def _read_durable_state(ledger: Ledger, connection: pg.Connection, state: _State
             None if closed_at is None else str(closed_at),
             None if purge_after is None else str(purge_after),
         )
+        state.halted = bool(
+            connection.execute(
+                "SELECT EXISTS (SELECT 1 FROM program_halts"
+                " WHERE program_id = $1::uuid AND status = 'halted')",
+                (program_id,),
+            ).scalar()
+        )
         state.pending = [
             {
                 "id": str(row["id"]),
@@ -1159,7 +1176,8 @@ def _read_durable_state(ledger: Ledger, connection: pg.Connection, state: _State
         return
     ledger.hold(
         "durable_state",
-        f"{state.lifecycle}, {len(state.pending)} pending decision(s)",
+        f"{state.lifecycle}{' and halted' if state.halted else ''}, "
+        f"{len(state.pending)} pending decision(s)",
     )
 
 

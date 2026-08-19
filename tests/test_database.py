@@ -16762,6 +16762,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             ("roster", AFFORDABLE),
             ("capped", AFFORDABLE),
             ("doubled", AFFORDABLE),
+            ("halted", AFFORDABLE),
         ):
             # `UNSEEDED` rather than `SCOPED`: `seed` below writes the Tasks
             # every scenario here is about, and 083 opens a `recon` Task of its
@@ -16789,6 +16790,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.arrange_model_and_effort()
         cls.arrange_subagent_cap()
         cls.arrange_subject_held()
+        cls.arrange_halted()
 
     @classmethod
     def tearDownClass(cls):
@@ -17320,6 +17322,55 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.doubled_after = cls.offered_labels(cls.offer())
         cls.doubled_taken = cls.claimed_by(
             "doubled", cls.call("SELECT claim_task($1)", (cls.doubled_second,))
+        )
+
+    @classmethod
+    def arrange_halted(cls):
+        """A Program an operator stopped, with a slate already on the table.
+
+        Stories 14 and 15 from the side the egress door cannot reach. The Halt
+        is asserted after the slate was offered, which is the case that matters:
+        the entries were claimable when they were written down, and what the
+        operator asked for is that nothing more starts. Every way a Task can be
+        reached is then asked once -- the named claim, the runtime's own walk,
+        and the next offer -- because a Halt that only refuses one of the three
+        is a Halt an orchestrator can walk around.
+
+        Then it is lifted, on the same rows and with nothing else changed. A
+        Halt is a stop and not a cancellation, and the Task that comes back is
+        the proof: no attempt was spent while it was down.
+        """
+        cls.halted_seeded = cls.seed("halted", 3)
+        cls.bind("halted")
+        cls.halted_offered = cls.offered_labels(cls.offer())
+        cls.operator(
+            "SELECT halt_program($1::uuid, $2)",
+            (cls.identifiers["halted"], "the target asked us to stop"),
+        )
+        cls.halted_reason = cls.claimable("halted", cls.halted_offered[0])
+        cls.halted_refusal = cls.refusal("SELECT claim_task($1)", (cls.halted_offered[0],))
+        cls.halted_walk = cls.call("SELECT claim_task()")
+        cls.halted_slate = cls.offered_labels(cls.offer())
+        cls.halted_attempts = cls.attempts_of("halted", cls.halted_offered[0])
+
+        cls.operator(
+            "SELECT clear_program_halt($1::uuid, $2)",
+            (cls.identifiers["halted"], "the window reopened"),
+        )
+        cls.lifted_reason = cls.claimable("halted", cls.halted_offered[0])
+        cls.lifted_slate = cls.offered_labels(cls.offer())
+        cls.lifted_claim = cls.claimed_by(
+            "halted", cls.call("SELECT claim_task($1)", (cls.halted_offered[0],))
+        )
+
+    @classmethod
+    def attempts_of(cls, name: str, label: str) -> int:
+        """How many attempts one Task has spent, whatever its status is now."""
+        return int(
+            cls.scalar(
+                "SELECT attempts FROM tasks WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], label),
+            )
         )
 
     @classmethod
@@ -17890,6 +17941,32 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         # refuse is not a Task the orchestrator is shown. The Program has two
         # Tasks and one of them is running, so what is left to offer is nothing.
         self.assertEqual((), self.doubled_while_running)
+
+    def test_a_halted_program_offers_nothing_and_claims_nothing(self):
+        # Stories 14 and 15. The Halt is enforced at the egress door on every
+        # exchange, which stops the children already running; this is the other
+        # half the console has always promised -- no new work until it is
+        # lifted. Without it a halted Program went on claiming and starting
+        # children whose every request the door refused, spending an attempt
+        # each time, and three of those abandoned the Task.
+        self.assertEqual(3, len(self.halted_offered))
+        self.assertEqual("halted", self.halted_reason)
+        self.assertIn("halted", self.halted_refusal)
+        self.assertIsNone(self.halted_walk)
+        self.assertEqual((), self.halted_slate)
+
+    def test_a_halt_spends_no_attempt_on_the_work_it_refuses(self):
+        # A stop and not a cancellation. Every refusal above is the scheduler
+        # declining to start something, so the Task is exactly as ready as it
+        # was -- which is what makes a Halt liftable rather than expensive.
+        self.assertEqual(0, self.halted_attempts)
+
+    def test_lifting_the_halt_puts_the_same_work_back_on_the_slate(self):
+        # The arm reads current status, so clearing needs nothing re-ranked and
+        # nothing rewritten: the next call falls through it.
+        self.assertIsNone(self.lifted_reason)
+        self.assertEqual(sorted(self.halted_offered), sorted(self.lifted_slate))
+        self.assertEqual(self.halted_offered[0], self.lifted_claim)
 
     def test_the_held_subject_is_claimable_again_once_the_first_run_ends(self):
         # The other half of the criterion: a hold is not a ban. The run is

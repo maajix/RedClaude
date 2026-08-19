@@ -20,6 +20,7 @@ from redkraken import config, pg, program
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
+    Ledger,
 )
 from tests.fixtures import VALID, write
 
@@ -117,6 +118,69 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(
             "retired", program.lifecycle("2026-08-09 12:00:00+00", "2026-11-07 12:00:00+00")
         )
+
+
+class WorkableTest(unittest.TestCase):
+    """Which durable fact stops a run before it claims anything, and what it says.
+
+    Four facts, four sentences. The scheduler enforces three of them itself and
+    would refuse every Task anyway; what this decides is whether the operator
+    reads why, or reads an empty slate and guesses.
+    """
+
+    def workable(self, **facts) -> tuple[bool, str]:
+        ledger = Ledger()
+        state = program._State(**{"lifecycle": "open", "pending": [], **facts})
+        answer = program._workable(ledger, state)
+        return answer, "" if not ledger.assertions else ledger.assertions[-1].detail
+
+    def test_an_open_program_with_nothing_outstanding_is_worked(self):
+        answer, said = self.workable()
+
+        self.assertTrue(answer)
+        self.assertEqual("", said)
+
+    def test_a_halted_program_is_named_as_halted_rather_than_as_empty(self):
+        # Stories 14 and 15. `claimable_for` refuses every Task of a halted
+        # Program, so a run that got this far would offer an empty slate and
+        # stop with nothing to say. This is the sentence three consoles have
+        # always promised: no new work until it is lifted.
+        answer, said = self.workable(halted=True)
+
+        self.assertFalse(answer)
+        self.assertIn("halted", said)
+        self.assertIn("lifts it", said)
+
+    def test_a_halt_is_read_before_the_decisions_it_makes_moot(self):
+        # Both are true and only one is actionable: answering the question does
+        # not restart the Program, and lifting the Halt does.
+        answer, said = self.workable(halted=True, pending=[{"question_code": "scope"}])
+
+        self.assertFalse(answer)
+        self.assertIn("halted", said)
+
+    def test_a_question_waiting_on_a_human_stops_the_run(self):
+        answer, said = self.workable(pending=[{"question_code": "scope"}])
+
+        self.assertFalse(answer)
+        self.assertIn("waiting on a human", said)
+
+    def test_a_closed_program_is_held_rather_than_failed(self):
+        answer, said = self.workable(lifecycle="closed")
+
+        self.assertFalse(answer)
+        self.assertIn("closed", said)
+
+    def test_a_run_that_already_refused_says_nothing_further(self):
+        # The violation is the answer. A second sentence about a Halt or a
+        # lifecycle here would be a fact read off state the refusal may have
+        # stopped before filling in.
+        ledger = Ledger()
+        ledger.fail("integrity", "a check failed", code="x", source="database")
+        state = program._State(lifecycle="open", pending=[], halted=True)
+
+        self.assertFalse(program._workable(ledger, state))
+        self.assertEqual(1, len(ledger.assertions))
 
 
 class RefusalTest(unittest.TestCase):
