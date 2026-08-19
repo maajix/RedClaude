@@ -232,6 +232,40 @@ class Projection:
     def sha256(self) -> str:
         return digest(self.canonical().encode("utf-8"))
 
+    def text(self) -> str:
+        """The projection as prose, which is the form a model can be handed.
+
+        Every field on this dataclass is rendered, because the class docstring's
+        guarantee is about the fields and not about this method: a projection
+        that carried something the render dropped would be a second, quieter
+        filter, and the one above is meant to be the only one. `test_playbook`
+        holds this to that by asserting each field's value is findable here.
+
+        The metadata is stated rather than summarised. A model told a Playbook
+        is `read_only` and `stable_session` is told what it may do with it, and
+        those two words are the same ones the selection filtered on -- so the
+        run and the row that recorded it describe the same authority.
+        """
+        lines = [
+            f"# Playbook: {self.path}",
+            "",
+            self.description,
+            "",
+            f"It may conclude about: {', '.join(self.property_classes) or 'nothing'}.",
+            f"It uses the Skills: {', '.join(self.skills) or 'none'}.",
+            f"Risk: {self.risk}. Effects: {self.effects}. Baseline: {self.baseline}.",
+        ]
+        if self.evidence:
+            lines.append("What it owes before a Finding of its class may move:")
+            lines.extend(
+                f"  - to {one.to_status}: at least {one.min_count} "
+                f"{one.polarity or 'either-way'} {one.kind} observation(s) "
+                f"from a {one.role}"
+                for one in self.evidence
+            )
+        lines.extend(["", self.instructions.strip()])
+        return "\n".join(lines)
+
 
 @dataclass(frozen=True, slots=True)
 class Playbook:
@@ -533,3 +567,12 @@ def compile_corpus(root: Path = CORPUS) -> Mapping[str, Playbook]:
 #: The compiled corpus, read-only, built at import so a bad corpus is never a
 #: running one. `roster._check_playbooks` is what holds it to the roster.
 PLAYBOOKS: Mapping[str, Playbook] = compile_corpus()
+
+#: The same corpus under the name the catalogue uses. `playbooks` is unique on
+#: `path` and `playbook_selections` records the Playbook by its row, so a
+#: selection read back names a path -- and the runtime has to get from that back
+#: to the text that was selected. Derived from `PLAYBOOKS` rather than compiled
+#: again, so the two cannot hold different documents under the same name.
+BY_PATH: Mapping[str, Playbook] = MappingProxyType(
+    {one.path: one for one in PLAYBOOKS.values()}
+)

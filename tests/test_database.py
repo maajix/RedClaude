@@ -11037,6 +11037,10 @@ DECIDED = {
     "task": ("label", "kind", "attempts", "subject", "subject_type"),
     "agent_run": ("label", "role", "stop_reason"),
     "target": None,
+    #: Kept whole. A selection carries a path and two digests and no row
+    #: identifier at all, so two Programs seeded alike must run under exactly
+    #: the same Playbooks -- which is the decision this section is.
+    "playbooks": None,
     "packet": ("sections",),
     "tool_run": ("label", "decision"),
     "receipt": None,
@@ -11334,6 +11338,36 @@ class ExecutionSliceTest(DatabaseCase):
         self.assertEqual(self.subject, facts["task"]["subject"])
         self.assertEqual("recon", facts["agent_run"]["role"])
         self.assertEqual({"url": URL, "method": "GET"}, facts["target"])
+
+    def test_the_task_runs_under_the_playbooks_the_row_says_it_does(self):
+        # PH2-64. `select_playbooks` and `record_playbook_selection` were built
+        # for this and had no caller, so a Task ran under nothing while
+        # `rk playbook evaluate` graded verdicts by `playbook_sha256`. The tie
+        # is what is asserted and not a count: the corpus grows, and what has
+        # to hold is that the rows the Task carries are the text the child was
+        # handed, in both directions and including neither.
+        #
+        # This Task is a `recon` one, and the corpus is written for
+        # `web_hunter` -- so today it keeps nothing, and the case that runs a
+        # kept row all the way through is `PlaybookSelectionTest`.
+        kept = [
+            str(row[0])
+            for row in self.runtime.execute(
+                "SELECT p.path FROM playbook_selections s"
+                " JOIN playbooks p ON p.id = s.playbook_id"
+                " JOIN tasks t ON t.id = s.task_id"
+                " WHERE t.label = $1 AND s.dropped_because IS NULL"
+                " ORDER BY s.rank",
+                (self.facts["task"]["label"],),
+            ).rows
+        ]
+        self.assertEqual(kept, [one["path"] for one in self.facts["playbooks"]])
+        objective = self.child.requests[0].objective
+        projected = [playbook.BY_PATH[path].projection.text() for path in kept]
+        self.assertEqual(projected, [one for one in projected if one in objective])
+        # The other direction, which the loop above cannot reach when nothing
+        # was kept: the marker is in the prompt exactly when a row is.
+        self.assertEqual(bool(kept), "# Playbook: " in objective)
 
     def test_the_child_was_started_inside_the_boundary_with_one_capability(self):
         self.assertEqual(1, len(self.child.requests))
@@ -37256,6 +37290,88 @@ class PlaybookSelectionTest(DatabaseCase):
         ):
             with self.subTest(statement=statement.split()[0]):
                 self.assertIn("immutable", self.refusal(statement))
+
+    # -- PH2-64: the runtime that runs it --------------------------------------
+
+    def claimed(self, task: str, subject: str) -> execution.Claimed:
+        """The claim as `execution.STARTED` would read it back for this Task."""
+        return execution.Claimed(
+            agent_run_id=str(uuid.uuid4()),
+            agent_run_label="AR-selection",
+            role="web_hunter",
+            task_id=self.tasks[task],
+            task_label=f"T-{task}",
+            kind="hunt",
+            attempts=1,
+            subject_entity_id=self.subjects[subject],
+            subject_type="endpoint",
+            subject_label="GET /notes/{id}",
+            method="GET",
+            url=f"{BASE_URL}/notes/1",
+            subagent_cap=1,
+            token_cap=None,
+        )
+
+    def playbooks(self, claimed: execution.Claimed) -> tuple:
+        """`execution.Slice._playbooks` against the real catalogue.
+
+        The unit case holds the sequence against a recorder. What only a server
+        can answer is whether the three statements the runtime issues are the
+        ones this schema has, whether `rk2_runtime` may issue them, and whether
+        the digests the freeze wrote are the digests of the documents this
+        installation carries -- which is the whole of what makes a graded run a
+        statement about a Playbook rather than about the harness.
+        """
+        ledger = Ledger()
+        facts: dict = {}
+        slice_ = execution.Slice(
+            boundary=boundary(proxy_url="http://127.0.0.1:1"), state=self.harness.state
+        )
+        return ledger, facts, slice_._playbooks(ledger, self.runtime, claimed, facts)
+
+    def test_the_runtime_runs_the_selection_this_schema_holds(self):
+        # `other` is the subject nothing is about and its Task was never
+        # recorded against, so this is the writing path: the grant, the
+        # statement and the read-back, over a selection that kept nothing.
+        ledger, facts, selected = self.playbooks(self.claimed("other", "other"))
+
+        self.assertEqual([], list(ledger.violations), ledger.violations)
+        self.assertEqual((), selected)
+        self.assertEqual([], facts["playbooks"])
+
+    def test_the_runtime_hands_over_the_document_the_freeze_named(self):
+        # `matching` was recorded in `setUpClass`, so this is the retry path:
+        # what the first attempt froze is read back, checked against the
+        # compiled corpus, and projected. A digest that had drifted either way
+        # would refuse here rather than reach a child.
+        claimed = self.claimed("matching", "matching")
+        ledger, facts, selected = self.playbooks(claimed)
+
+        self.assertEqual([], list(ledger.violations), ledger.violations)
+        self.assertEqual((self.COMPILED.projection,), selected)
+        self.assertEqual(
+            [
+                {
+                    "path": self.COMPILED.path,
+                    "sha256": self.COMPILED.sha256,
+                    "version": self.COMPILED.version,
+                }
+            ],
+            facts["playbooks"],
+        )
+        self.assertIn(self.COMPILED.projection.text(), claimed.objective(selected))
+
+    def test_recording_a_second_time_is_refused_by_the_constraint(self):
+        # Which is why the runtime asks whether the Task already chose. A
+        # second record would freeze a second set of digests onto one Task,
+        # and "which text did the model read" would have two answers.
+        self.assertIn(
+            "playbook_selections",
+            self.refusal(
+                "SELECT record_playbook_selection($1::uuid, $2::uuid, $3)",
+                (self.tasks["matching"], self.subjects["matching"], "authorization"),
+            ),
+        )
 
     def test_recording_against_a_task_that_does_not_exist_is_refused(self):
         self.assertIn(

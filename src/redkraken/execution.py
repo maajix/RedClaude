@@ -33,12 +33,12 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import agent, capsule as capsule_module, isolation, migrate
-from redkraken import packet as packet_module, pg
+from redkraken import packet as packet_module, pg, playbook as playbook_module
 from redkraken import program, proposal, proxy, roster, state as state_module
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
 
@@ -260,7 +260,7 @@ REFUSED = {
 STARTED = (
     "SELECT ar.id::text, ar.label, ar.role,"
     " t.id::text, t.label, t.kind, t.attempts,"
-    " e.type, e.label,"
+    " e.id::text, e.type, e.label,"
     " coalesce(ep.method, 'GET'),"
     " CASE"
     "   WHEN ep.entity_id IS NOT NULL THEN rtrim(pa.base_url, '/')"
@@ -278,6 +278,33 @@ STARTED = (
     " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
     " LEFT JOIN applications ap ON ap.entity_id = e.id"
     " WHERE ar.label = $1 AND ar.program_id = $2::uuid"
+)
+
+#: Whether this Task's Playbooks have already been decided. A retry finds them
+#: decided: `playbook_selections` is unique on (task_id, playbook_id), so a
+#: second record is refused by the constraint -- and it should be. The digests
+#: frozen on the first attempt are what the grading in `rk playbook evaluate`
+#: keys on, and a Task that recorded a second set would have two answers to
+#: "which text did the model read".
+RECORDED = "SELECT count(*)::int FROM playbook_selections WHERE task_id = $1::uuid"
+
+#: The selection, run and written down in one call. Three of the five arguments
+#: are left to the database's own defaults rather than restated here, because
+#: this runtime does not hold them: there is no property class for a Task whose
+#: subject has not been narrowed, no autonomy ceiling anywhere in the installed
+#: configuration, and no cap on the selection that is this caller's to set. The
+#: program and the role the function derives from the Task itself.
+RECORD_SELECTION = "SELECT record_playbook_selection($1::uuid, $2::uuid)"
+
+#: What was kept, read back rather than assumed from the count the call returns.
+#: The row is what the run is graded against, so the row is what the child is
+#: handed -- an ordering by rank because the ranks are the selection's own
+#: preference and the prompt reads top down.
+SELECTED = (
+    "SELECT p.path, s.playbook_sha256, s.playbook_version"
+    " FROM playbook_selections s JOIN playbooks p ON p.id = s.playbook_id"
+    " WHERE s.task_id = $1::uuid AND s.dropped_because IS NULL"
+    " ORDER BY s.rank"
 )
 
 #: The Tool run the capability is minted against. `proxy.OPEN_TOOL_RUN` cannot
@@ -533,11 +560,16 @@ class Session:
 class Claimed:
     """One claimed Task and the run the database opened for it.
 
-    A single value rather than twelve passed around together, because every
+    A single value rather than fourteen passed around together, because every
     step below the claim needs some of them and no step needs a different
-    twelve. `url` is the one that can be absent: a subject that is neither an
+    fourteen. `url` is the one that can be absent: a subject that is neither an
     application nor an endpoint has no address to send a request to, and that
     is a refusal with a reason rather than a missing field to work around.
+
+    `subject_entity_id` is the subject as a row rather than as a name. The
+    label is what a report and a prompt say; the id is what `playbook_selections`
+    and `select_playbooks` are keyed on, and resolving one from the other later
+    would be a second lookup of a subject this row already identified.
 
     `subagent_cap` is the odd one: it describes the weights row rather than the
     Task, and it is here because it has to travel with the claim. The scheduler
@@ -559,6 +591,7 @@ class Claimed:
     task_label: str
     kind: str
     attempts: int
+    subject_entity_id: str
     subject_type: str
     subject_label: str
     method: str
@@ -576,15 +609,16 @@ class Claimed:
             task_label=str(row[4]),
             kind=str(row[5]),
             attempts=int(row[6]),
-            subject_type=str(row[7]),
-            subject_label=str(row[8]),
-            method=str(row[9]),
-            url=None if row[10] is None else str(row[10]),
-            subagent_cap=int(row[11]),
-            token_cap=None if row[12] is None else int(row[12]),
+            subject_entity_id=str(row[7]),
+            subject_type=str(row[8]),
+            subject_label=str(row[9]),
+            method=str(row[10]),
+            url=None if row[11] is None else str(row[11]),
+            subagent_cap=int(row[12]),
+            token_cap=None if row[13] is None else int(row[13]),
         )
 
-    def objective(self) -> str:
+    def objective(self, playbooks: Sequence[playbook_module.Projection]) -> str:
         """The whole of what the child is told, and the shape of what it owes back.
 
         The target is named because the child cannot look it up: its packet
@@ -592,9 +626,17 @@ class Claimed:
         rule is stated because it is the rule promotion applies -- an
         Observation citing no Receipt is dropped, and a child that learns that
         from the drop has already spent the attempt.
+
+        The Playbooks come last and in full, because they are the longest part
+        and the instructions above are what the run is graded on. An empty
+        sequence is a real answer and reads as one: the selection ran and this
+        subject's facts matched nothing, which is a hunt with no strategy behind
+        it rather than a hunt whose strategy went missing. It is a parameter and
+        not a default for the same reason -- a caller that forgot it would
+        produce exactly the prompt this method was written to stop producing.
         """
         mission = MISSIONS.get(self.kind, f"Carry out this {self.kind} Task.")
-        return (
+        prompt = (
             f"{mission}\n\n"
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
@@ -603,6 +645,16 @@ class Claimed:
             "thing you actually established, each citing the Receipt the request "
             "answered with. Nothing you write becomes canonical until the runtime "
             "promotes it, and it promotes only what cites a Receipt from this run."
+        )
+        if not playbooks:
+            return prompt
+        selected = "\n\n".join(one.text() for one in playbooks)
+        return (
+            f"{prompt}\n\n"
+            f"The runtime selected {len(playbooks)} Playbook(s) for this subject and "
+            "recorded the selection against this Task. They are how to ask the "
+            "question, not what to report; the paragraph above is still what you "
+            f"owe back.\n\n{selected}"
         )
 
     def facts(self) -> dict:
@@ -815,6 +867,7 @@ class Slice:
             "task": None,
             "agent_run": None,
             "target": None,
+            "playbooks": None,
             "packet": None,
             "heartbeat": None,
             "tool_run": None,
@@ -1298,7 +1351,7 @@ class Slice:
         # into an all-NULL record and every comparison against it is unknown --
         # so the first place it can be said out loud is here, where the cap the
         # child would run under is missing rather than wrong.
-        if rows[0][11] is None:
+        if rows[0][12] is None:
             ledger.fail(
                 "claim",
                 f"{label} was claimed with no active scheduler_weights row to cap it",
@@ -1370,6 +1423,13 @@ class Slice:
             )
             return
 
+        # Before the packet and before the capability, which is what the
+        # migration that built the selection is named for: a Playbook chosen
+        # after the child started would be a Playbook it did not read.
+        selected = self._playbooks(ledger, connection, claimed, facts)
+        if selected is None:
+            return
+
         mission = self._packet(ledger, program_id)
         if mission is None:
             return
@@ -1393,7 +1453,9 @@ class Slice:
             # one thing a late beat could contradict.
             try:
                 with self._heartbeat(ledger, connection, claimed, facts):
-                    result = self._child(ledger, claimed, mission, door, lifetime, program_id)
+                    result = self._child(
+                        ledger, claimed, selected, mission, door, lifetime, program_id
+                    )
             except RuntimeError as error:
                 # The container ran and its account of itself did not survive:
                 # a child killed at its timeout, or one that died mid-session.
@@ -1531,6 +1593,80 @@ class Slice:
             "revocation",
             f"{tool_run['label']} closed as {outcome}; its capability no longer resolves",
         )
+
+    def _playbooks(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        claimed: Claimed,
+        facts: dict,
+    ) -> tuple[playbook_module.Projection, ...] | None:
+        """Which Playbooks this attempt runs under, chosen and written down.
+
+        Chosen in the database and read back out of it, because the selection is
+        a decision about this Task and not a filter this process may apply
+        privately. `record_playbook_selection` writes the kept rows and the
+        dropped ones with their reasons, and freezes the two digests as they
+        stand; those rows are what `rk playbook evaluate` grades a run against.
+        A set assembled here and never recorded would leave every verdict keyed
+        on `playbook_sha256` measuring the harness instead of the Playbook.
+
+        Keeping nothing is an answer and not a failure. A subject whose facts
+        match no trigger has no strategy in the corpus, and the hunt goes ahead
+        under the Task's own instructions -- which is the state every run before
+        this one was in, said out loud rather than by omission.
+
+        What is refused is a selection that cannot be shown: a row naming a path
+        this installation does not carry, or one whose frozen digest is not the
+        digest of the text about to be handed over. Either way the record would
+        describe something other than what the model read, and a grading run
+        against it would be reading the wrong document.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                if not connection.execute(RECORDED, (claimed.task_id,)).scalar():
+                    connection.execute(
+                        RECORD_SELECTION, (claimed.task_id, claimed.subject_entity_id)
+                    )
+                rows = connection.execute(SELECTED, (claimed.task_id,)).rows
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "playbooks",
+                f"no Playbook could be selected for {claimed.task_label}: {error}",
+                code=INVALID_CONFIGURATION,
+                source="database",
+            )
+            return None
+
+        kept = []
+        for row in rows:
+            path, source_sha256, version = str(row[0]), str(row[1]), str(row[2])
+            one = playbook_module.BY_PATH.get(path)
+            if one is None or one.sha256 != source_sha256 or one.version != version:
+                ledger.fail(
+                    "playbooks",
+                    f"{claimed.task_label} was selected {path}, which this installation "
+                    "does not carry at the digest the selection froze",
+                    code=INTEGRITY_FAILED,
+                    source="corpus",
+                )
+                return None
+            kept.append(one)
+
+        facts["playbooks"] = [
+            {"path": one.path, "sha256": one.sha256, "version": one.version} for one in kept
+        ]
+        ledger.hold(
+            "playbooks",
+            f"{claimed.task_label} runs under "
+            + (
+                ", ".join(one.path for one in kept)
+                if kept
+                else "no Playbook: nothing in the corpus is about this subject"
+            ),
+        )
+        return tuple(one.projection for one in kept)
 
     def _packet(self, ledger: Ledger, program_id: str) -> packet_module.Packet | None:
         """What the child may read, compiled as the role whose reads are bounded."""
@@ -1735,6 +1871,7 @@ class Slice:
         self,
         ledger: Ledger,
         claimed: Claimed,
+        playbooks: Sequence[playbook_module.Projection],
         mission: packet_module.Packet,
         door: agent.Egress,
         lifetime: float,
@@ -1751,7 +1888,7 @@ class Slice:
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
             agent_run_id=claimed.agent_run_id,
-            objective=claimed.objective(),
+            objective=claimed.objective(playbooks),
             container=self.boundary,
             role=claimed.role,
             program_id=program_id,

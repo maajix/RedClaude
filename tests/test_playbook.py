@@ -302,6 +302,34 @@ class Projection(unittest.TestCase):
         self.assertTrue(projection.evidence)
         self.assertIn("Name the object", projection.instructions)
 
+    def test_the_render_shows_every_field_the_projection_carries(self):
+        # `text()` is what the runtime hands a child, and the class docstring's
+        # guarantee is about the fields. A render that dropped one would be a
+        # second filter -- quieter than the first and never reviewed as one.
+        rendered = compiled(cited()).projection.text()
+        self.assertNotIn(MARKER, rendered)
+        for name in playbook.Projection.__dataclass_fields__:
+            with self.subTest(field=name):
+                value = getattr(compiled(cited()).projection, name)
+                if name == "evidence":
+                    for one in value:
+                        self.assertIn(one.to_status, rendered)
+                        self.assertIn(one.kind, rendered)
+                        self.assertIn(one.role, rendered)
+                elif isinstance(value, tuple):
+                    for one in value:
+                        self.assertIn(one, rendered)
+                else:
+                    self.assertIn(value.strip(), rendered)
+
+    def test_the_render_does_not_move_what_the_projection_is_identified_by(self):
+        # A render is a view. If it were part of the canonical form, changing
+        # how a Playbook reads to a model would change the digest a selection
+        # froze -- and every recorded run would look as though it read
+        # different text.
+        one_playbook = compiled(cited())
+        self.assertNotIn(one_playbook.projection.text(), one_playbook.projection.canonical())
+
     def test_a_playbook_keeps_no_second_copy_of_what_it_projects(self):
         # The projection is the one place these values live. A field of the same
         # name beside it would be a second copy that a later edit could move

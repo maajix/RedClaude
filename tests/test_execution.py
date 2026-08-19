@@ -25,6 +25,7 @@ from redkraken import (
     isolation,
     packet,
     pg,
+    playbook,
     program,
     proposal,
     proxy,
@@ -41,6 +42,11 @@ TOOL_RUN = "44444444-4444-4444-8444-444444444444"
 PROPOSAL = "55555555-5555-4555-8555-555555555555"
 SESSION = "66666666-6666-4666-8666-666666666666"
 CAMPAIGN = "77777777-7777-4777-8777-777777777777"
+SUBJECT = "88888888-8888-4888-8888-888888888888"
+
+#: One Playbook out of the installed corpus, which is what a selection can
+#: name: the runtime refuses a row whose digests are not a document it holds.
+SELECTED_PLAYBOOK = playbook.PLAYBOOKS["object-ownership"]
 
 #: What `Launcher.picks` means when nobody said, named here for the tests that
 #: pass it. The sentinel itself is `fixtures`', because the launcher fixture in
@@ -80,6 +86,7 @@ def claimed(**overrides) -> execution.Claimed:
         "task_label": "T1",
         "kind": "recon",
         "attempts": 1,
+        "subject_entity_id": SUBJECT,
         "subject_type": "endpoint",
         "subject_label": "GET /login",
         "method": "GET",
@@ -102,6 +109,7 @@ def started_row(**overrides) -> tuple:
         subject.task_label,
         subject.kind,
         subject.attempts,
+        subject.subject_entity_id,
         subject.subject_type,
         subject.subject_label,
         subject.method,
@@ -279,6 +287,17 @@ class Recorder:
             },
         )
         self.lifetime = answers.get("lifetime", 300.0)
+        # What the selection decided, as `SELECTED` reads it back. A real
+        # Playbook out of the installed corpus, because the runtime checks the
+        # digests it is handed against the documents it carries -- a made-up
+        # path here would exercise the refusal and nothing else. `recorded` is
+        # how many rows the Task already has, which is what tells a first
+        # attempt from a retry.
+        self.recorded = answers.get("recorded", 0)
+        self.selections = list(
+            answers.get("selections", [(SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256,
+                                        SELECTED_PLAYBOOK.version)])
+        )
         # An idle reconciliation: nothing had lapsed, and the one Task this
         # recorder's slate is about is this run's own to claim.
         self.reconciliation = answers.get(
@@ -422,6 +441,12 @@ class Recorder:
             return [(json.dumps(self._choice(parameters)),)]
         if sql == execution.STARTED:
             return list(self.started)
+        if sql == execution.RECORDED:
+            return [(self.recorded,)]
+        if sql == execution.RECORD_SELECTION:
+            return [(len(self.selections),)]
+        if sql == execution.SELECTED:
+            return list(self.selections)
         if sql == execution.OPEN_TOOL_RUN:
             return [(TOOL_RUN, "TR9")]
         if sql == proxy.AUTHORIZE_TOOL_RUN:
@@ -728,22 +753,41 @@ class ObjectiveTest(unittest.TestCase):
     """What the child is told, which is the only thing it is told."""
 
     def test_the_objective_names_the_target_the_packet_cannot_hold(self):
-        text = claimed().objective()
+        text = claimed().objective(())
         self.assertIn("GET https://app.example.com/login", text)
         self.assertIn("the endpoint GET /login", text)
 
     def test_the_objective_states_the_rule_promotion_will_apply(self):
-        text = claimed().objective()
+        text = claimed().objective(())
         self.assertIn("mcp__rk2__http_request", text)
         self.assertIn("mcp__rk2__submit_mission_result", text)
         self.assertIn("Receipt", text)
 
     def test_a_kind_nobody_wrote_prose_for_is_described_rather_than_refused(self):
-        self.assertIn("Carry out this exotic Task", claimed(kind="exotic").objective())
+        self.assertIn("Carry out this exotic Task", claimed(kind="exotic").objective(()))
 
     def test_every_kind_the_roster_dispatches_has_its_own_sentence(self):
         dispatched = {kind for role in roster.ROLES.values() for kind in role.task_kinds}
         self.assertEqual(set(), dispatched - set(execution.MISSIONS))
+
+    def test_a_selected_playbook_is_carried_into_what_the_child_is_told(self):
+        """The whole projection, because a summary is not what was selected."""
+        projection = SELECTED_PLAYBOOK.projection
+        text = claimed().objective((projection,))
+        self.assertIn(projection.text(), text)
+        self.assertIn("selected 1 Playbook(s)", text)
+
+    def test_the_playbooks_do_not_displace_what_the_run_owes_back(self):
+        text = claimed().objective((SELECTED_PLAYBOOK.projection,))
+        self.assertIn("mcp__rk2__submit_mission_result", text)
+        self.assertLess(
+            text.index("mcp__rk2__submit_mission_result"),
+            text.index(SELECTED_PLAYBOOK.projection.text()),
+        )
+
+    def test_a_subject_nothing_was_selected_for_is_told_no_more_than_before(self):
+        """Not a sentence about an empty list: an empty list is not a Playbook."""
+        self.assertNotIn("Playbook", claimed().objective(()))
 
 
 class SlateTest(unittest.TestCase):
@@ -1284,6 +1328,121 @@ class CapsuleTest(unittest.TestCase):
         self.assertEqual("T1", facts["task"]["label"])
         self.assertEqual([False], [stated.ok for stated in self.stated("rotation")])
         self.assertIn("could not be rotated", self.ledger.violations[0].detail)
+
+
+class PlaybookSelectionTest(unittest.TestCase):
+    """The Playbooks an attempt runs under: chosen, recorded, and handed over.
+
+    Stories 173-175 and Decision 15. `select_playbooks` and
+    `record_playbook_selection` were built for this and had no caller, so a
+    Task ran under nothing and every verdict `rk playbook evaluate` keyed on
+    `playbook_sha256` was a verdict about the harness.
+    """
+
+    def test_the_selection_is_recorded_against_the_task_and_its_subject(self):
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertEqual([(TASK, SUBJECT)], connection.sent(execution.RECORD_SELECTION))
+
+    def test_the_choice_is_made_before_the_capability_the_child_would_spend(self):
+        # The migration's own title: a Playbook is chosen before the model
+        # reads it. Choosing after the Tool run is open would be an
+        # authorisation minted for a run whose strategy was not yet decided.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertLess(
+            connection.statements.index(execution.RECORD_SELECTION),
+            connection.statements.index(execution.OPEN_TOOL_RUN),
+        )
+
+    def test_the_child_is_handed_the_projection_of_what_was_kept(self):
+        launcher = Launcher()
+        with compiled():
+            attempt(Recorder(), launcher)
+        self.assertIn(SELECTED_PLAYBOOK.projection.text(), launcher.only.objective)
+
+    def test_what_was_kept_is_reported_with_the_digests_it_was_frozen_at(self):
+        with compiled():
+            _, facts = attempt(Recorder())
+        self.assertEqual(
+            [
+                {
+                    "path": SELECTED_PLAYBOOK.path,
+                    "sha256": SELECTED_PLAYBOOK.sha256,
+                    "version": SELECTED_PLAYBOOK.version,
+                }
+            ],
+            facts["playbooks"],
+        )
+
+    def test_a_retry_runs_under_what_the_first_attempt_was_given(self):
+        # `playbook_selections` is unique on (task_id, playbook_id), so a
+        # second record would be refused by the constraint. The rows are read
+        # back either way: what the first attempt froze is what this one runs
+        # under, whatever the catalogue has done since.
+        launcher = Launcher()
+        connection = Recorder(recorded=3)
+        with compiled():
+            attempt(connection, launcher)
+        self.assertNotIn(execution.RECORD_SELECTION, connection.statements)
+        self.assertIn(SELECTED_PLAYBOOK.projection.text(), launcher.only.objective)
+
+    def test_a_subject_no_playbook_is_about_still_gets_its_attempt(self):
+        # Keeping nothing is an answer. The corpus has no strategy for this
+        # subject, which is a hunt under the Task's own instructions and not a
+        # failure to report.
+        launcher = Launcher()
+        connection = Recorder(selections=[])
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
+        self.assertEqual([], ledger.violations)
+        self.assertEqual([], facts["playbooks"])
+        self.assertNotIn("Playbook", launcher.only.objective)
+
+    def test_a_playbook_this_installation_does_not_carry_stops_the_attempt(self):
+        launcher = Launcher()
+        connection = Recorder(
+            selections=[("playbooks/nowhere/playbook.md", "0" * 64, "1" * 64)]
+        )
+        with compiled():
+            ledger, _ = attempt(connection, launcher)
+        self.assertEqual([], launcher.requests)
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+        self.assertEqual(execution.INTEGRITY_FAILED, ledger.violations[0].code)
+        self.assertEqual("corpus", ledger.violations[0].source)
+
+    def test_a_document_that_moved_past_the_digest_it_froze_stops_the_attempt(self):
+        # The path is one this installation carries and the bytes behind it are
+        # not the bytes the selection recorded. Handing the current text over
+        # would make `playbook_sha256` name a document the model never read.
+        connection = Recorder(
+            selections=[(SELECTED_PLAYBOOK.path, "0" * 64, SELECTED_PLAYBOOK.version)]
+        )
+        with compiled():
+            ledger, _ = attempt(connection)
+        self.assertEqual(execution.INTEGRITY_FAILED, ledger.violations[0].code)
+
+    def test_a_projection_that_moved_past_its_version_stops_the_attempt(self):
+        # The other digest, and the one that decides what was read: the
+        # document can be identical and the projection different only if the
+        # two are computed from different bytes, which is corpus rot.
+        connection = Recorder(
+            selections=[(SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256, "1" * 64)]
+        )
+        with compiled():
+            ledger, _ = attempt(connection)
+        self.assertEqual(execution.INTEGRITY_FAILED, ledger.violations[0].code)
+
+    def test_a_selection_the_database_refused_stops_the_attempt(self):
+        connection = Recorder(
+            raises={execution.RECORD_SELECTION: database_error("no role executes that kind")}
+        )
+        with compiled():
+            ledger, _ = attempt(connection)
+        self.assertEqual(execution.INVALID_CONFIGURATION, ledger.violations[0].code)
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
 
 
 class AttemptTest(unittest.TestCase):
