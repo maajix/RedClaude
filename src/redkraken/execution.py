@@ -1456,6 +1456,15 @@ class Slice:
                     result = self._child(
                         ledger, claimed, selected, mission, door, lifetime, program_id
                     )
+            except agent.StartupRefusal as refusal:
+                # Before the `RuntimeError` arm, which it is one of: a machine
+                # that would not start the child is not a child that died, and
+                # the two endings settle the Task differently.
+                facts["agent_run"]["stop_reason"] = "refusal"
+                facts["closure"] = self._refused(
+                    ledger, connection, program_id, claimed, refusal
+                )
+                return
             except RuntimeError as error:
                 # The container ran and its account of itself did not survive:
                 # a child killed at its timeout, or one that died mid-session.
@@ -1879,11 +1888,12 @@ class Slice:
     ) -> agent.AgentRunResult | None:
         """The one child, started inside the boundary with the one capability.
 
-        No connection is passed to the launcher. It takes one only to record a
-        startup refusal, and this caller records the whole attempt itself: a
-        refusal here returns the Task through `finish_task_attempt` in the
-        `finally` above, which is the same cleanup by a different name, and
-        letting both run would be two closings racing over one row.
+        No connection is passed to the launcher, which takes one only to record
+        a startup refusal. It cannot have this one: the heartbeat is beating on
+        it for as long as this call runs, and the single reason sharing it with
+        that thread is safe is that nothing else touches it until the thread is
+        joined. So the refusal is left to leave here as an exception, and the
+        caller closes it a line later, on the other side of that join.
         """
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
@@ -1900,14 +1910,6 @@ class Slice:
         )
         try:
             result = self.launch(request)
-        except agent.StartupRefusal as refusal:
-            ledger.refuse(
-                "startup_assertion",
-                f"the child was refused in {refusal.phase} by "
-                f"{len(refusal.violations)} vector(s)",
-                agent.diagnostics(refusal).violations,
-            )
-            return None
         except isolation.Unavailable as error:
             ledger.fail(
                 "boundary",
@@ -1922,6 +1924,65 @@ class Slice:
             f"after {result.answers} answer(s), {result.mission_attempts} submission(s)",
         )
         return result
+
+    def _refused(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        program_id: str,
+        claimed: Claimed,
+        refusal: agent.StartupRefusal,
+    ) -> dict | None:
+        """End an attempt this machine would not start, without charging it.
+
+        Story 55 asks a startup refusal to return the Task to pending without
+        consuming an attempt, and the ordinary closing cannot say that:
+        `finish_task_attempt` settles the attempt as spent, which is the honest
+        arithmetic for a child that ran and the wrong one for a child that was
+        never started. Three refusals on one machine would otherwise abandon a
+        Task as `attempts_exhausted` that nothing had yet attempted, and no
+        Event would say what actually happened -- the refusal is a property of
+        this host, and the Task is as ready as it was.
+
+        `close_refusal` is what says it: the Task goes back to pending with its
+        attempt returned, the bindings and Leases are released, and one
+        redacted `startup.refused` Event records the phase and the vectors. Its
+        `False` means there was nothing open left to close, and the answer to
+        that is to let the ordinary closing run rather than to report a
+        refunded attempt that nobody refunded.
+        """
+        ledger.refuse(
+            "startup_assertion",
+            f"the child was refused in {refusal.phase} by "
+            f"{len(refusal.violations)} vector(s)",
+            agent.diagnostics(refusal).violations,
+        )
+        try:
+            closed = agent.close_refusal(
+                connection, program_id, claimed.agent_run_id, refusal
+            )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "closure",
+                f"the refused attempt on {claimed.task_label} could not be returned "
+                f"to the queue: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        if not closed:
+            ledger.hold(
+                "closure",
+                f"{claimed.agent_run_label} was already closed when the refusal was "
+                "recorded; the ordinary closing settles it",
+            )
+            return None
+        ledger.hold(
+            "closure",
+            f"{claimed.task_label} is pending again, still on attempt "
+            f"{claimed.attempts}, which the refusal did not spend",
+        )
+        return {"task_status": "pending", "startup_refusal": True}
 
     # -- what it produced --------------------------------------------------
 
@@ -2073,6 +2134,12 @@ class Slice:
     ) -> dict | None:
         """The one call that ends the attempt, whatever happened above it.
 
+        Unless the attempt has already ended. A startup refusal closes its own
+        run, because returning the Task with its attempt unspent is the one
+        ending `finish_task_attempt` cannot express, and calling both would be
+        two closings racing over one row -- the second of them charging the
+        attempt the first had just given back.
+
         Its answer is the report's, not this runtime's opinion: the Task's
         status comes from whether a proposal was promoted, and a runtime that
         reported what it hoped for would be reporting the one thing the trigger
@@ -2084,6 +2151,9 @@ class Slice:
         which the reservation has already been given back against a run whose
         cost had not been recorded yet.
         """
+        already = facts.get("closure")
+        if already is not None:
+            return already
         run = facts.get("agent_run") or {}
         stop_reason = run.get("stop_reason") or "error"
         try:

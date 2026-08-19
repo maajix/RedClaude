@@ -353,6 +353,9 @@ class Recorder:
                 "leases_released": 0,
             },
         )
+        # Whether `close_startup_refusal` found an open run to close. False is
+        # a run something else already ended, which is not this pass's to close.
+        self.refusal_closed = answers.get("refusal_closed", True)
         self.raises: dict[str, Exception] = answers.get("raises", {})
 
     def execute(self, sql: str, parameters: tuple = ()) -> pg.Result:
@@ -387,6 +390,13 @@ class Recorder:
     @property
     def statements(self) -> list[str]:
         return [sql for sql, _ in self.calls]
+
+    def position(self, statement: str) -> int:
+        """Where in the sequence one statement was issued, first time only."""
+        for at, (sql, _) in enumerate(self.calls):
+            if sql == statement:
+                return at
+        raise AssertionError(f"{statement} was never issued: {self.statements}")
 
     def sent(self, statement: str) -> list[tuple]:
         return [parameters for sql, parameters in self.calls if sql == statement]
@@ -470,6 +480,8 @@ class Recorder:
             return [(json.dumps(self.fingerprint),)]
         if sql == execution.FINISH:
             return [(json.dumps(self.closure),)]
+        if sql == execution.agent.CLOSE:
+            return [(self.refusal_closed,)]
         if sql == proxy.PARK_TOOL_RUN:
             return [("PD1",)]
         if sql == proposal.INSERT:
@@ -1687,16 +1699,87 @@ class RefusalTest(unittest.TestCase):
         self.assertEqual([], launcher.requests)
         self.closed(connection)
 
+    def refusal(self) -> agent.StartupRefusal:
+        with fixtures.unlatched():
+            return fixtures.startup_refusal()
+
     def test_a_refused_child_is_reported_as_a_refusal_and_closed_as_one(self):
         connection = Recorder()
-        with fixtures.unlatched():
-            refusal = fixtures.startup_refusal()
+        refusal = self.refusal()
         launcher = Launcher(error=refusal)
         with compiled():
             ledger, facts = attempt(connection, launcher)
         self.assertTrue(ledger.violations)
         self.assertEqual("refusal", facts["agent_run"]["stop_reason"])
+        # Through `close_startup_refusal` and not `finish_task_attempt`: the
+        # phase, both runtime versions and the vectors, none of which the
+        # ordinary closing has anywhere to put.
+        run, phase, sdk, cli, violations = connection.sent(execution.agent.CLOSE)[0]
+        self.assertEqual((RUN, "pre_spawn"), (run, phase))
+        self.assertEqual(refusal.sdk_version, sdk)
+        self.assertEqual(len(refusal.violations), len(json.loads(violations)))
+        self.assertEqual(refusal.cli_version, cli)
+
+    def test_a_refusal_does_not_spend_the_attempt_it_never_made(self):
+        # Story 55. Three of these on one machine would otherwise abandon a
+        # Task as `attempts_exhausted` that nothing had yet attempted: what was
+        # refused is this host, and the Task is as ready as it was.
+        connection = Recorder()
+        with compiled():
+            ledger, facts = attempt(connection, Launcher(error=self.refusal()))
+
+        self.assertEqual([], connection.finished())
+        self.assertEqual("pending", facts["closure"]["task_status"])
+        self.assertTrue(
+            any("did not spend" in item.detail for item in ledger.assertions)
+        )
+
+    def test_the_refusal_is_recorded_after_the_heartbeat_has_stopped_beating(self):
+        # The thread shares this connection, and the whole reason that is safe
+        # is that nothing else touches it until the thread is joined. A refusal
+        # written from inside the launcher would be the exception.
+        connection = Recorder()
+        with compiled():
+            attempt(connection, Launcher(error=self.refusal()))
+
+        self.assertLess(
+            connection.position(execution.LEASE_TTL),
+            connection.position(execution.agent.CLOSE),
+        )
+        self.assertLess(
+            connection.position(execution.agent.CLOSE),
+            connection.position(proxy.CLOSE_TOOL_RUN),
+        )
+        self.assertEqual([(TOOL_RUN, "error")], connection.sent(proxy.CLOSE_TOOL_RUN))
+
+    def test_a_refusal_that_could_not_be_recorded_falls_back_to_the_closing(self):
+        # A Task left claimed by a machine that refused it is worse than one
+        # charged an attempt it did not make: the Lease is what would have to
+        # lapse before anything else could try.
+        connection = Recorder(raises={execution.agent.CLOSE: database_error("gone")})
+        with compiled():
+            ledger, facts = attempt(connection, Launcher(error=self.refusal()))
+
         self.assertEqual([(RUN, "refusal", None, None)], connection.finished())
+        self.assertTrue(
+            any("could not be returned" in item.detail for item in ledger.violations)
+        )
+        self.assertEqual("done", facts["closure"]["task_status"])
+
+    def test_a_run_something_else_already_closed_is_left_to_the_closing(self):
+        # `close_startup_refusal` answers false when there is nothing open
+        # left, which is what a reconciliation that already took this run looks
+        # like from here. Reporting a refunded attempt then would be reporting
+        # an arithmetic nobody performed.
+        connection = Recorder(refusal_closed=False)
+        with compiled():
+            ledger, facts = attempt(connection, Launcher(error=self.refusal()))
+
+        self.assertEqual([(RUN, "refusal", None, None)], connection.finished())
+        self.assertEqual("done", facts["closure"]["task_status"])
+        self.assertTrue(
+            any("already closed" in item.detail for item in ledger.assertions)
+        )
 
     def test_an_unavailable_boundary_is_a_violation_and_not_a_traceback(self):
         connection = Recorder()
