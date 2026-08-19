@@ -488,6 +488,10 @@ _EDGES = " \t\"'`()[]{}<>,.;:!?*_"
 #: `1.4` after the sentence's own full stop has been stripped.
 _MARKS = frozenset("/:@=?&%#")
 
+#: Characters that join one word's parts rather than separating two words, when
+#: they stand between two alphanumerics: `redirect_uri`, `X-Forwarded-Host`.
+_JOINS = frozenset("-_")
+
 
 def _narrative(
     bundle: Mapping[str, object],
@@ -534,7 +538,53 @@ def _narrative(
 
 
 def _claims(token: str) -> bool:
-    return any(char.isdigit() for char in token) or not _MARKS.isdisjoint(token) or "." in token
+    """Whether a token is a fact rather than a word.
+
+    Story 201 bounds a narrative by "identifiers already present", and the
+    identifiers it names are a host, a path and a parameter. A path carries a
+    slash and a query parameter an equals sign or an ampersand, so `_MARKS`
+    catches those whole; a digit or an interior dot catches an address, a
+    version and a dotted host. What those miss is the identifier spelled in
+    letters alone -- `redirect_uri`, `X-Forwarded-Host`, `IMDS`, `redirectUri`
+    -- which reads as a measurement to whoever reads the report, and is exactly
+    the parameter or header a rephrasing must not be able to introduce.
+
+    Shape is the whole test, because the alternative is a dictionary. A word
+    joined by `-` or `_`, a word carrying a capital anywhere but its first
+    letter, and a word that is all capitals count as identifiers even where
+    prose would have written them: `well-known` and `JavaScript` have to be in
+    the projection to be said. That is friction, and it is the friction that
+    fails safe -- the writer is told which token to drop and rephrases, and no
+    document leaves claiming something nothing measured.
+
+    A single bare lowercase word stays prose, and that is the residue this
+    cannot decide: `intranet` is a host to a reader and a noun to a parser, and
+    telling them apart needs a vocabulary this refuses to keep.
+    """
+    if any(char.isdigit() for char in token) or not _MARKS.isdisjoint(token):
+        return True
+    return "." in token or _joined(token) or _capitalised(token)
+
+
+def _joined(token: str) -> bool:
+    """Whether a `-` or `_` binds one word's parts rather than dashing two."""
+    return any(
+        middle in _JOINS and left.isalnum() and right.isalnum()
+        for left, middle, right in zip(token, token[1:], token[2:])
+    )
+
+
+def _capitalised(token: str) -> bool:
+    """Whether a token's capitals are an identifier's and not a sentence's.
+
+    A leading capital is where every sentence starts, so it says nothing; a
+    capital after one is `redirectUri`, and a token that is capitals throughout
+    is `IMDS` or `GET`. One letter is neither, which keeps `I` and `A` prose.
+    """
+    letters = [char for char in token if char.isalpha()]
+    if len(letters) < 2:
+        return False
+    return all(char.isupper() for char in letters) or any(char.isupper() for char in letters[1:])
 
 
 def _permitted(bundle: Mapping[str, object]) -> frozenset[str]:

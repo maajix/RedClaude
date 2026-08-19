@@ -501,7 +501,52 @@ class NarrativeTest(unittest.TestCase):
                 finding_bundle(), narrative={"impact_sentence": "Reachable on 4444."}
             )
 
+    def test_a_parameter_spelled_in_letters_is_a_fact_like_any_other(self):
+        # Story 201 names the parameter beside the host and the path, and a
+        # parameter name carries no slash, no digit and no dot -- so a predicate
+        # reading punctuation alone lets a sentence invent one.
+        with self.assertRaises(reporting.Refused) as refusal:
+            reporting.render(
+                finding_bundle(),
+                narrative={"impact_sentence": "The handler also trusts redirect_uri."},
+            )
+
+        self.assertIn("redirect_uri", refusal.exception.reasons[0])
+
+    def test_a_header_the_projection_never_saw_cannot_be_named(self):
+        with self.assertRaises(reporting.Refused) as refusal:
+            reporting.render(
+                finding_bundle(),
+                narrative={"remediation": "Stop honouring X-Forwarded-Host here."},
+            )
+
+        self.assertIn("X-Forwarded-Host", refusal.exception.reasons[0])
+
+    def test_a_bare_capitalised_acronym_is_a_claim_and_not_a_word(self):
+        with self.assertRaises(reporting.Refused) as refusal:
+            reporting.render(
+                finding_bundle(), narrative={"impact_sentence": "The IMDS answers too."}
+            )
+
+        self.assertIn("IMDS", refusal.exception.reasons[0])
+
+    def test_the_identifiers_the_projection_carries_may_still_be_said(self):
+        # The bound is the projection and not a ban on the shape: this bundle
+        # carries `IDOR` as the class short name and `read_other_user_data` as
+        # an effect, so a sentence using them introduces nothing.
+        document = reporting.render(
+            finding_bundle(),
+            narrative={
+                "impact_sentence": "This IDOR is read_other_user_data and nothing more."
+            },
+        )
+
+        self.assertIn("This IDOR is read_other_user_data and nothing more.", document)
+
     def test_ordinary_words_are_not_asked_to_be_facts(self):
+        # The bare lowercase word is the one shape this cannot decide, so it is
+        # left as prose deliberately: nothing here tells `handler` the noun from
+        # `handler` the parameter without a vocabulary of English.
         document = reporting.render(
             finding_bundle(),
             narrative={"remediation": "The fix is cheap and belongs in the handler."},
