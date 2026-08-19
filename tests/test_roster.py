@@ -329,6 +329,24 @@ class SurfaceTest(unittest.TestCase):
                 with self.subTest(tool=name, argument=argument):
                     self.assertNotIn(argument.lower(), roster.FORBIDDEN_ARGUMENTS)
 
+    def test_no_tool_names_the_environment_or_the_settings_a_launch_was_given(self):
+        """Story 95's third noun, beside credentials and environment variables.
+
+        Every name here is decided by the roster or by the launcher and then
+        re-checked against the roster before a child starts, so an argument
+        spelling one would be the model choosing what it was started as. The
+        contracts are asked by the loop above; this asks the surface a built-in
+        arrives on, which has no contract to be closed against.
+        """
+        self.assertLessEqual(
+            {"env", "environment", "settings", "cwd", "model", "isolation"},
+            roster.FORBIDDEN_SETTINGS,
+        )
+        self.assertLessEqual(roster.FORBIDDEN_SETTINGS, roster.FORBIDDEN_ARGUMENTS)
+        for name in sorted(roster.FORBIDDEN_SETTINGS):
+            with self.subTest(argument=name):
+                self.assertEqual(name, roster._forbidden_argument({name: "x"}))
+
     def test_no_tool_creates_a_process_the_roster_did_not_enumerate(self):
         # `Bash` is forbidden to every role, and the constrained form that
         # replaces it takes a binary from a closed list rather than a name.
@@ -458,6 +476,73 @@ class GateTest(unittest.TestCase):
                 denial = self.denied(self.gate, call(tool))
                 self.assertEqual(roster.UNLISTED_TOOL, denial.rule)
                 self.assertEqual("orchestrator", denial.role)
+
+    def test_a_delegation_says_only_what_the_roster_reads(self):
+        """Story 93: built-in delegation cannot escape the roster.
+
+        The bundled CLI ships three further fields on this tool, and each one
+        undoes something the roster decided: `model` overrides the row the
+        launch is assessed against, `isolation` chooses a filesystem topology,
+        and `run_in_background` returns at launch rather than at completion,
+        which frees the cap's slot while the child is still running.
+        """
+        self.assertIsNone(
+            self.gate.decide(
+                roster.Call(
+                    tool=roster.DELEGATION,
+                    arguments={
+                        "description": "hunt this",
+                        "prompt": "the objective",
+                        roster.SUBAGENT_TYPE: "web_hunter",
+                    },
+                    ticket="admitted",
+                )
+            )
+        )
+        for name, value in (
+            ("model", "opus"),
+            ("isolation", "worktree"),
+            ("run_in_background", True),
+            ("anything_else", 1),
+        ):
+            with self.subTest(argument=name):
+                denial = self.denied(
+                    roster.Gate("orchestrator"),
+                    roster.Call(
+                        tool=roster.DELEGATION,
+                        arguments={roster.SUBAGENT_TYPE: "web_hunter", name: value},
+                        ticket=name,
+                    ),
+                )
+                self.assertEqual(roster.FORBIDDEN_ARGUMENT, denial.rule)
+                self.assertIn(name, denial.reason)
+
+    def test_a_backgrounded_delegation_cannot_hand_its_slot_back_early(self):
+        """The cap consequence of the argument above, asked as the count.
+
+        `PostToolUse` fires when the tool returns, and a backgrounded `Task`
+        returns at launch. Admitting one would release its slot while the child
+        ran, so the ceiling would be as wide as the session cared to make it.
+        """
+        gate = roster.Gate("orchestrator")
+        for attempt in range(roster.ROLES["web_hunter"].max_concurrent + 3):
+            gate.decide(
+                roster.Call(
+                    tool=roster.DELEGATION,
+                    arguments={
+                        roster.SUBAGENT_TYPE: "web_hunter",
+                        "run_in_background": True,
+                    },
+                    ticket=f"backgrounded-{attempt}",
+                )
+            )
+            gate.release(f"backgrounded-{attempt}")
+
+        self.assertEqual(0, gate.outstanding)
+        self.assertEqual(
+            [roster.FORBIDDEN_ARGUMENT] * (roster.ROLES["web_hunter"].max_concurrent + 3),
+            [denial.rule for denial in gate.denials],
+        )
 
     def test_the_older_name_of_the_delegation_tool_is_the_same_tool(self):
         # The pair announces `Task` and has been observed to spell the same
@@ -729,7 +814,16 @@ class GateTest(unittest.TestCase):
         )
 
     def test_a_builtin_tool_is_not_argument_checked_against_a_contract_it_has_none_of(self):
+        # True of the contract check and only of it: `CONTRACTS` is the set of
+        # schemas this runtime serves, and `Task` is served by the CLI. The
+        # closed set for it is `DELEGATION_ARGUMENTS`, and the gate carries it,
+        # so the same call is still refused a layer further in.
         self.assertIsNone(roster._argument_fault(roster.DELEGATION, {"anything": 1}))
+        self.assertIsNotNone(
+            roster.Gate("orchestrator").decide(
+                call(roster.DELEGATION, subagent_type="web_hunter", anything=1)
+            )
+        )
 
     def test_an_argument_deeper_than_the_scan_is_not_searched_forever(self):
         document = {"api_key": "x"}

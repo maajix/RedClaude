@@ -88,6 +88,17 @@ ALIASES = {"Agent": DELEGATION}
 #: The argument that names what a delegation would start.
 SUBAGENT_TYPE = "subagent_type"
 
+#: The whole of what a delegation may say. `Task` is a built-in and so has no
+#: `Contract` here to be closed against -- `CONTRACTS` is the set of schemas
+#: this runtime serves, and this is a tool the CLI serves -- so the closed set
+#: is stated here and enforced by `_delegation` instead. Everything else the
+#: bundled CLI ships on that tool decides something the roster already decided:
+#: `model` overrides the row a child is assessed against, `isolation` is the
+#: filesystem topology `FORBIDDEN_BUILTINS` bans `EnterWorktree` for, and
+#: `run_in_background` returns at launch rather than at completion, which would
+#: free the cap's slot while the delegation it counted was still running.
+DELEGATION_ARGUMENTS = frozenset({"description", "prompt", SUBAGENT_TYPE})
+
 #: The argument that names what a `Skill` call would execute.
 SKILL = "Skill"
 SKILL_NAME = "skill"
@@ -232,10 +243,35 @@ FORBIDDEN_INSTRUCTIONS = frozenset(
     }
 )
 
+#: Names for the runtime's own launch and session configuration: the third
+#: noun in story 95, beside credentials and environment variables. Every one of
+#: these is decided by the roster or by the launcher and re-checked against the
+#: roster before a child starts, so an argument spelling one is a model
+#: choosing what it was started as. The built-in delegation tool is the case
+#: that makes this concrete -- the bundled CLI ships `model`, `isolation` and
+#: `run_in_background` on it -- and a built-in has no contract here to be
+#: closed against, so the name is refused wherever it appears instead.
+FORBIDDEN_SETTINGS = frozenset(
+    {
+        "env",
+        "environment",
+        "setting_sources",
+        "settings",
+        "cwd",
+        "working_directory",
+        "sandbox",
+        "permission_mode",
+        "isolation",
+        "model",
+        "effort",
+        "max_turns",
+    }
+)
+
 #: Argument names no model-facing tool may declare, whatever the tool. Checked
 #: on the call as well as on the contracts, because a built-in tool has no
 #: contract here and still takes arguments.
-FORBIDDEN_ARGUMENTS = FORBIDDEN_SELECTORS | FORBIDDEN_INSTRUCTIONS
+FORBIDDEN_ARGUMENTS = FORBIDDEN_SELECTORS | FORBIDDEN_INSTRUCTIONS | FORBIDDEN_SETTINGS
 
 #: How deep the argument scan goes. A bound rather than a budget: it exists so
 #: a pathological document cannot make the gate the slow part of a tool call,
@@ -1101,7 +1137,21 @@ class Gate:
         return None
 
     def _delegation(self, role: Role, call: Call) -> Denial | None:
-        """Who may be started, by whom, and how many at once."""
+        """What may be said, who may be started, by whom, and how many at once.
+
+        The argument set is closed first, because a delegation that overrode
+        the model or backgrounded itself would be admitted against a roster it
+        had already stepped out of, and the cap it was counted under would be
+        given back before the child it counted had finished.
+        """
+        for name in call.arguments:
+            if name not in DELEGATION_ARGUMENTS:
+                return Denial(
+                    FORBIDDEN_ARGUMENT,
+                    DELEGATION,
+                    role.name,
+                    f"{DELEGATION} takes no argument named {name!r}",
+                )
         wanted = call.arguments.get(SUBAGENT_TYPE)
         target = ROLES.get(wanted) if isinstance(wanted, str) else None
         if target is None:
