@@ -52,7 +52,12 @@ from typing import NamedTuple
 from redkraken import fixture, playbook, skill
 
 from tools.check_baseline import BASELINE, CHECKOUT, BaselineError, read_table
-from tools.check_dispositions import inserted_ids, schema_text
+from tools.check_dispositions import (
+    inserted_ids,
+    inserted_pairs,
+    parse_replacement,
+    schema_text,
+)
 
 
 LEDGER = BASELINE / "technique-intake.tsv"
@@ -73,6 +78,7 @@ FIELDS = (
 #: mirror rule needs it: a fixture written from a disclosure has to be claimed by
 #: a row, or the corpus has grown by a file nobody can say where it came from.
 INTAKE_TICKET = "ticket 79"
+CITES = re.compile(rf"\b{INTAKE_TICKET}\b")
 
 #: Where an accepted technique may land, and what resolves the name. The three
 #: are the three forms knowledge takes in this repository -- a case that grades
@@ -99,14 +105,14 @@ UNGRADEABLE = {
 }
 
 TECHNIQUE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){2,7}$")
+#: The digest of the bytes the source served, exactly as they arrived and before
+#: anything rendered them, so a second reader can recompute it from one fetch.
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 #: As precise as the source states and no more. An academy page carries no date,
 #: an RFC carries a month, an advisory carries a day, and inventing the missing
 #: digits would be the one part of the row that nobody could check.
 PUBLISHED = re.compile(r"^(?:undated|[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?)$")
 DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-PRODUCED = re.compile(r"^([a-z_]+):(\S+)$")
-
 #: What a restatement looks like from the outside. The floor refuses a row whose
 #: rationale is a label, and the ceiling refuses one that is turning into a
 #: transcript of somebody's report. Neither can tell a restatement from a quote;
@@ -122,30 +128,20 @@ class IntakeError(Exception):
 
 
 class Vocabulary(NamedTuple):
-    """Everything a row resolves against, read once from this checkout.
+    """Everything a row resolves against, read once.
 
     One value rather than four parameters because they are read together and
     make no sense apart: a row is checked against what the schema declares and
     what the package ships, and a check that had one without the others could
-    only ever half-resolve a row.
+    only ever half-resolve a row. The first three come off the schema corpus on
+    disk; `outputs` comes off the installed package, because an output that
+    exists has to be one that loads.
     """
 
     classes: frozenset[str]
     events: frozenset[str]
     outputs: dict[str, frozenset[str]]
     makeability: dict[str, str]
-
-
-class Produced(NamedTuple):
-    """A produced value, split once so nobody splits it again by hand."""
-
-    namespace: str
-    name: str
-
-
-def parse_produced(value: str) -> Produced | None:
-    match = PRODUCED.match(value)
-    return Produced(*match.groups()) if match else None
 
 
 def read_ledger(path: Path = LEDGER) -> list[dict[str, str]]:
@@ -156,7 +152,7 @@ def read_ledger(path: Path = LEDGER) -> list[dict[str, str]]:
         raise IntakeError(str(error)) from error
 
 
-def resolvable_names() -> dict[str, frozenset[str]]:
+def outputs_on_disk() -> dict[str, frozenset[str]]:
     """Every name an output may point at, read from the installed package.
 
     The corpus is the compiled one rather than a listing of directories, so a
@@ -171,31 +167,22 @@ def resolvable_names() -> dict[str, frozenset[str]]:
     }
 
 
-def makeability(schema: str) -> dict[str, str]:
-    """Per Property class, what the transport register says a claim can rest on.
-
-    Read for one rule: a class the schema records as `probe_only` or
-    `unmakeable` cannot be graded by a fixture, because what the reading would
-    land on is the interception proxy or the authority this harness issued
-    rather than anything a target did. The register is the schema's own decision
-    and this ledger defers to it instead of holding a second opinion beside it.
-    """
-    found: dict[str, str] = {}
-    for block in re.finditer(
-        r"INSERT INTO transport_makeability \([^)]*\) VALUES(.*?);\n", schema, re.DOTALL
-    ):
-        found.update(re.findall(r"\('([^']+)',\s*'([a-z_]+)'", block.group(1)))
-    return found
-
-
 def vocabulary(checkout: Path) -> Vocabulary:
-    """What this checkout declares, as one value the row check reads."""
+    """What this checkout declares, as one value the row check reads.
+
+    `makeability` is the transport register, read for one rule: a class the
+    schema records as `probe_only` or `unmakeable` cannot be graded by a fixture,
+    because what the reading would land on is the interception proxy or the
+    authority this harness issued rather than anything a target did. The register
+    is the schema's own decision and this ledger defers to it instead of holding
+    a second opinion beside it.
+    """
     schema = schema_text(checkout)
     return Vocabulary(
         classes=frozenset(inserted_ids(schema, "property_classes")),
         events=frozenset(inserted_ids(schema, "event_types")),
-        outputs=resolvable_names(),
-        makeability=makeability(schema),
+        outputs=outputs_on_disk(),
+        makeability=inserted_pairs(schema, "transport_makeability"),
     )
 
 
@@ -253,7 +240,7 @@ def row_error(row: dict[str, str], words: Vocabulary) -> tuple[str, str]:
             " a technique that fits none of them proposes a migration"
         ), ""
 
-    produced = parse_produced(row["produced"])
+    produced = parse_replacement(row["produced"])
     if not produced:
         return f"{technique}: {row['produced']!r} is not a namespaced outcome", ""
     if produced.namespace == "none":
@@ -267,7 +254,7 @@ def row_error(row: dict[str, str], words: Vocabulary) -> tuple[str, str]:
     else:
         cited = produced
         if produced.namespace == "covered_by":
-            cited = parse_produced(produced.name)
+            cited = parse_replacement(produced.name)
             if not cited or cited.namespace not in OUTPUTS:
                 return (
                     f"{technique}: covered_by names what covers it,"
@@ -279,7 +266,7 @@ def row_error(row: dict[str, str], words: Vocabulary) -> tuple[str, str]:
             return f"{technique}: there is no {cited.namespace} {cited.name}", ""
         state = "produced" if produced.namespace in OUTPUTS else "covered"
         settled = words.makeability.get(row["property_class"], "")
-        if produced.namespace == "fixture" and settled and settled != "agent_ok":
+        if cited.namespace == "fixture" and settled and settled != "agent_ok":
             # The schema settled this before the ledger existed, and it settled
             # it about the containment rather than about the technique. A
             # fixture here would be graded through the thing that makes the
@@ -317,7 +304,7 @@ def report(rows: list[dict[str, str]], states: dict[str, str]) -> str:
     """The counts, in one fixed order, so two runs of it diff to nothing."""
     counted = Counter(states.values())
     reasons = Counter(
-        parse_produced(row["produced"]).name
+        parse_replacement(row["produced"]).name
         for row in rows
         if states.get(row["technique"]) in ("refused", "ungradeable")
     )
@@ -361,13 +348,17 @@ def check(ledger: Path = LEDGER, checkout: Path = CHECKOUT) -> str:
     # a row is a file in the corpus with no provenance anybody can check, which
     # is the state this ledger exists to make impossible.
     for name, one in sorted(fixture.FIXTURES.items()):
-        if INTAKE_TICKET in one.provenance and f"fixture:{name}" not in claimed:
+        if CITES.search(one.provenance) and f"fixture:{name}" not in claimed:
             errors.append(f"no intake row produced fixture {name}, which cites {INTAKE_TICKET}")
 
     counted = Counter(states.values())
     if not counted["produced"]:
         errors.append("an intake that produced nothing has read nothing worth keeping")
-    if not (counted["refused"] + counted["covered"] + counted["ungradeable"]):
+    if not counted["refused"]:
+        # `covered` and `ungradeable` are resolutions rather than refusals: one
+        # says the corpus already grades the shape and the other says the
+        # containment settles it. Neither is the judgement this rule is about,
+        # which is a technique read and found not worth keeping.
         errors.append("an intake that never refuses anything is an intake that is not reading")
     if errors:
         raise IntakeError("\n".join(errors))

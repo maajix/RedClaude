@@ -85,11 +85,11 @@ does not grade, and now they are the only ones with a written reason.
 `recovery-flow-pair` builds a reset link's authority from the request's own
 `Host` header on one variant; `identifier-oracle-pair` refuses an unregistered
 address and a wrong password differently on one variant; `per-origin-limit-pair`
-counts an unauthenticated route per origin on one variant; `resource-cost-pair`
-enforces the same per-origin request limit on both variants and bounds the work
-inside one request on only one of them. Each declares one class, and each
-document argues why its neighbours are not merely absent from the ground truth
-but could not be true of what it serves. One migration,
+counts an unauthenticated route per origin per window on one variant;
+`resource-cost-pair` enforces the same per-origin request limit on both variants
+and bounds the work inside one request on only one of them. Each declares one
+class, and each document argues why its neighbours are not merely absent from
+the ground truth but could not be true of what it serves. One migration,
 `20260915T000000Z__four_disclosed_techniques_arrive_as_fixtures.sql`, registers
 all four at both digests; no Playbook names any of them, because the binding is
 total and derived.

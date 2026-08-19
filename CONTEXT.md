@@ -908,6 +908,22 @@ Two digests, again for two things that move independently -- the application
 that was served, and the ground truth it was graded by.
 _Avoid_: Test case, sample, mock, lab
 
+**Disclosed technique**:
+A shape read out of somebody else's published report and kept as one row of the
+intake ledger: the page it came from, the digest of what was read, the Property
+class it maps to, what it produced and a restatement in this repository's words.
+It is not a Playbook and does not become one by being written down. What a row
+may produce is a Fixture that grades the shape, a Playbook step or a Skill
+reference -- or nothing at all with a reason on the row: already covered by what
+the corpus grades, target-specific, unreproducible, dead, or ungradeable because
+the containment settles the class rather than any target. Retrieval is a
+maintainer act and leaves no trace at run time: nothing here fetches a report,
+so no reading of one crosses the door or earns a Receipt. A row that produced
+something carries a review date for the reason a Playbook does -- what was true
+of a live technique one year is a claim rather than a fact.
+_Avoid_: Trick, payload, writeup, finding (a Finding is this harness's own
+demonstrated claim, never somebody else's report)
+
 **Evaluation Program**:
 A Program opened to grade a Playbook rather than to hunt a target, marked as one
 before its work runs and named with the Playbook it grades and the half of the

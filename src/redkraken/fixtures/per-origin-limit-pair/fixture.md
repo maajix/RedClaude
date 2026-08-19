@@ -14,8 +14,8 @@ bb:provenance: Written for ticket 79 from the unauthenticated-endpoint abuse pat
 session, no cookie and no header that changes the answer.
 
 * **vulnerable** answers every request that arrives.
-* **secure** answers five per origin and then refuses with `429` and a
-  `Retry-After`.
+* **secure** answers five per origin per sixty seconds and then refuses with
+  `429` and a `Retry-After` naming what is left of the window.
 
 ## Why this fixture is here
 
@@ -44,4 +44,7 @@ withhold: `authorization.object_ownership` and
 `information_disclosure.excess_field` are not gaps here, there is nothing on
 this route that could make either true. Both variants answer `404` identically
 for every other path and every other method, so the sequence a reading counts is
-the only thing that differs.
+the only thing that differs. The allowance refills, which is what makes the
+`Retry-After` true rather than decorative: a reading that spent it once can
+spend it again a window later, and the secure variant is a rate limit rather
+than a route that closed.

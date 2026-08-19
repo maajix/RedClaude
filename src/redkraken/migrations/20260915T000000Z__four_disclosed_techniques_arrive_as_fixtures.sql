@@ -60,16 +60,16 @@ INSERT INTO fixtures (id, kind, path, source_sha256, ground_truth_sha256) VALUES
   '0bd3c61d5bc52fb73b832272dd1be645150bc21cd656e2eae3ade3c8349803d7'),
  ('per-origin-limit-pair', 'own_pair',
   'fixtures/per-origin-limit-pair/fixture.md',
-  '95e4ee63ae8403da5bf72e7a650fd29a61cdf3ee070f81a713409cfe9c5c9f70',
-  'fafe9ae076cc546dd56d4db7ad74438e6659071f39a216e8ce04a218c18f12c8'),
+  '4a79ce0958312eee67f185c8796731d1070bd27a51b8c4d195796c18cbf1588f',
+  '3935565fad56dc343d274b8fc3cd45ac4d369b2236a650e4df0a1b59017b03b7'),
  ('recovery-flow-pair', 'own_pair',
   'fixtures/recovery-flow-pair/fixture.md',
   '742ced004434665bfc5c785d49aceb7a715baecebdb9f7a36440904ea4ecf618',
   'c829ac113c3ab2037085cd33262d22bb3cf72c9f28952515219631c55e1897e1'),
  ('resource-cost-pair', 'own_pair',
   'fixtures/resource-cost-pair/fixture.md',
-  'b4e8faa6c6b6bb3d8008a9dca98f98c677d739e9150d99b3fd316919d2aa99ad',
-  'fb398fbfb491b636c890a50326875325e3526bddb3e8c53e56adf07452492fc1')
+  '88d3b2663fc76df90639b9e62892625ee2498db51ad168ee2956f8925db37859',
+  '6be4284a13b1c16e36216058509e6a5677b8b2ec8c7f5687f0a703b6e4e060dc')
 ON CONFLICT (id) DO UPDATE SET
     kind                = excluded.kind,
     path                = excluded.path,

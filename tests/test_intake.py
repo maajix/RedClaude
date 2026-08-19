@@ -17,6 +17,7 @@ that a directory exists.
 import ast
 import hashlib
 import http.client
+import datetime as dt
 import json
 import tempfile
 import unittest
@@ -28,10 +29,23 @@ from tests.ledger import INTAKE, intake_rows, written
 from tools import check_baseline, check_intake
 
 
+def shipped(technique: str) -> list[str]:
+    """One shipped row, found by the technique it is about rather than by position.
+
+    Position would be a second thing the ledger's order means, and the order is
+    the reader's convenience: a row inserted above these would silently move a
+    negative onto a different rule.
+    """
+    for row in intake_rows():
+        if row[0] == technique:
+            return row
+    raise AssertionError(f"no intake row for {technique}")
+
+
 #: A row that passes, to be broken one rule at a time. It is the shipped row for
 #: the technique that produced the recovery fixture, so a negative below changes
 #: exactly what its rule is about.
-ACCEPTED = dict(zip(check_intake.FIELDS, intake_rows()[1]))
+ACCEPTED = dict(zip(check_intake.FIELDS, shipped("host-header-recovery-link")))
 
 #: Where the retrieved pages are not. Named here because criterion 3 is a claim
 #: about the whole package rather than about one module: retrieval is a
@@ -141,6 +155,22 @@ class IntakeLedgerTest(unittest.TestCase):
         for row in self.rows:
             self.assertEqual("", check_intake.source_error(row["source_url"]), row["technique"])
 
+    def test_no_review_date_has_passed(self):
+        # The only version of a review date that gets read is one that fails the
+        # suite on the day, which is how the Playbook corpus reads its own. When
+        # this fires: re-read the source, check the technique is still what the
+        # row says, then move the date or retire what it produced.
+        for row in self.rows:
+            if row["review_by"] == check_intake.NO_REVIEW:
+                continue
+            with self.subTest(technique=row["technique"]):
+                self.assertGreater(
+                    dt.date.fromisoformat(row["review_by"]), dt.date.today(),
+                    f"{row['technique']} was due for review on {row['review_by']}:"
+                    f" re-read {row['source_url']}, then move the date or retire"
+                    f" {row['produced']}",
+                )
+
     def test_a_restatement_carries_no_report_prose_from_its_source(self):
         # Not provable by a checker and not claimed to be. What is checkable is
         # the size of the claim and that nothing was pasted in wholesale, which
@@ -217,6 +247,22 @@ class IntakeRowTest(unittest.TestCase):
             "host-header-recovery-link: the schema records transport.request_framing"
             " as unmakeable; a fixture cannot grade it",
             self.error(broken(property_class="transport.request_framing")),
+        )
+
+    def test_a_covering_fixture_is_read_by_the_transport_rule_too(self):
+        # The rule is about the fixture that is cited, not about which column
+        # cited it: a class the containment settles is not graded by a fixture
+        # this ledger produced or by one it points at.
+        self.assertEqual(
+            "host-header-recovery-link: the schema records transport.certificate_trust"
+            " as probe_only; a fixture cannot grade it",
+            self.error(
+                broken(
+                    property_class="transport.certificate_trust",
+                    produced="covered_by:fixture:url-authority-pair",
+                    review_by="-",
+                )
+            ),
         )
 
     def test_producing_nothing_needs_a_reason_from_the_closed_set(self):
@@ -338,7 +384,7 @@ class IntakeCoverageTest(unittest.TestCase):
 
     def test_two_rows_may_not_produce_one_output(self):
         rows = intake_rows()
-        duplicate = list(rows[2])
+        duplicate = list(shipped("refusal-shape-account-oracle"))
         duplicate[0] = "second-claim-on-one-fixture"
         duplicate[6] = "fixture:recovery-flow-pair"
         self.assertEqual(
@@ -358,15 +404,18 @@ class IntakeCoverageTest(unittest.TestCase):
         )
 
     def test_a_technique_appears_once(self):
-        rows = intake_rows()
+        again = shipped("graphql-alias-rate-bypass")
         self.assertEqual(
             "duplicate intake technique: graphql-alias-rate-bypass",
-            self.refusal(rows + [rows[5]]),
+            self.refusal(intake_rows() + [again]),
         )
 
     def test_an_intake_that_refuses_nothing_is_not_reading(self):
-        rows = intake_rows()
-        kept = [rows[0]] + [row for row in rows[1:] if row[6].startswith("fixture:")]
+        # Covered and ungradeable rows survive the cut deliberately: neither is
+        # the judgement this rule is about, which is a technique read and found
+        # not worth keeping.
+        header, *rows = intake_rows()
+        kept = [header] + [row for row in rows if not row[6].startswith("none:")]
         self.assertEqual(
             "an intake that never refuses anything is an intake that is not reading",
             self.refusal(kept),
@@ -469,7 +518,9 @@ class ProducedFixtureTest(unittest.TestCase):
             "per-origin-limit-pair", "secure", "GET", "/api/v1/quotes", repeats=sixth
         )
         self.assertEqual((429, "rate limit exceeded"), (status, refused["error"]))
-        self.assertEqual("60", headers["Retry-After"])
+        # What is left of the window rather than a constant, because the
+        # allowance refills and the refusal says when.
+        self.assertIn(int(headers["Retry-After"]), range(1, 61))
 
     def test_one_request_spends_what_it_likes_on_one_variant_only(self):
         batch = {"operations": [{"kind": "render"}] * 200}
@@ -477,11 +528,14 @@ class ProducedFixtureTest(unittest.TestCase):
             "resource-cost-pair", "vulnerable", "POST", "/api/v1/render", batch
         )
         self.assertEqual((200, 200, 800), (status, answered["completed"], answered["spent"]))
-        status, refused, _ = self.ask(
+        status, refused, headers = self.ask(
             "resource-cost-pair", "secure", "POST", "/api/v1/render", batch
         )
         self.assertEqual(429, status)
         self.assertEqual((25, 200), (refused["ceiling"], refused["asked"]))
+        # Waiting does not make an oversized batch acceptable, so the refusal
+        # that names the ceiling carries no `Retry-After` to wait for.
+        self.assertIsNone(headers.get("Retry-After"))
 
     def test_both_halves_of_the_cost_pair_count_requests_identically(self):
         # What makes the class `resource_cost` rather than a missing limit: the

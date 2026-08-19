@@ -39,6 +39,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from collections.abc import Iterator
 from typing import NamedTuple
 
 from redkraken import playbook, roster, skill
@@ -194,19 +195,40 @@ def read_ledger(path: Path = LEDGER) -> list[dict[str, str]]:
         raise LedgerError(str(error)) from error
 
 
-def inserted_ids(text: str, table: str) -> set[str]:
-    """The first column of every row of every `INSERT INTO <table> ... VALUES` block.
+def inserted_values(text: str, table: str) -> Iterator[str]:
+    """Every `INSERT INTO <table> ... VALUES` block's rows, as raw SQL.
 
     A regular expression over SQL rather than a connection to a database, because
     the schema corpus on disk is the definition and a database is only ever a
-    copy of it. It is deliberately narrow -- `('` and then a quoted value -- and
-    a corpus it stops recognising makes rows fail to resolve, which is a refusal
-    somebody reads, not a pass nobody notices.
+    copy of it. It is deliberately narrow, and a corpus it stops recognising
+    makes rows fail to resolve, which is a refusal somebody reads, not a pass
+    nobody notices.
     """
-    found: set[str] = set()
     for block in re.finditer(rf"INSERT INTO {table} \([^)]*\) VALUES(.*?);", text, re.DOTALL):
-        found.update(re.findall(r"\('([^']+)'", block.group(1)))
-    return found
+        yield block.group(1)
+
+
+def inserted_ids(text: str, table: str) -> set[str]:
+    """The first column of every row those blocks insert."""
+    return {
+        found
+        for values in inserted_values(text, table)
+        for found in re.findall(r"\('([^']+)'", values)
+    }
+
+
+def inserted_pairs(text: str, table: str) -> dict[str, str]:
+    """The first two columns of every row those blocks insert, keyed by the first.
+
+    For the tables that are registers rather than vocabularies: a row there says
+    something about the id beside it, and a reader that only got the ids would
+    have to go back to the text for the half that matters.
+    """
+    return {
+        key: value
+        for values in inserted_values(text, table)
+        for key, value in re.findall(r"\('([^']+)',\s*'([^']+)'", values)
+    }
 
 
 def schema_text(checkout: Path) -> str:

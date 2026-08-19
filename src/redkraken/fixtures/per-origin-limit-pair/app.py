@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler
+from math import ceil
+from time import monotonic
 from urllib.parse import urlsplit
 
 
@@ -23,9 +25,11 @@ VARIANTS = ("vulnerable", "secure")
 #: a single request never trips it.
 ALLOWANCE = 5
 
-#: How long the secure variant tells a refused caller to wait. Never slept on by
-#: anything here: it is what the refusal says, not what the fixture does.
-RETRY_AFTER = "60"
+#: The window the allowance is spent in, in seconds, and what a refusal tells
+#: the caller to wait. A counter that never refilled would make `Retry-After` a
+#: promise this fixture does not keep, and would leave the secure variant
+#: refusing every later reading of every other class for the life of the process.
+WINDOW = 60
 
 #: Static, so the only thing that can vary across a sequence is whether it was
 #: served at all.
@@ -43,7 +47,7 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
     if variant not in VARIANTS:
         raise ValueError(f"variant is one of {list(VARIANTS)}, not {variant!r}")
     counts_the_origin = variant == "secure"
-    served: dict[str, int] = {}
+    served: dict[str, tuple[float, int]] = {}
 
     class Fixture(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -52,13 +56,20 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
             if urlsplit(self.path).path != "/api/v1/quotes":
                 self.answer(404, NOT_FOUND)
                 return
-            origin = self.client_address[0]
-            spent = served.get(origin, 0) + 1
-            served[origin] = spent
+            spent, wait = self.spend(self.client_address[0])
             if counts_the_origin and spent > ALLOWANCE:
-                self.answer(429, TOO_MANY, retry_after=RETRY_AFTER)
+                self.answer(429, TOO_MANY, retry_after=str(wait))
                 return
             self.answer(200, {"quotes": list(ROWS)})
+
+        def spend(self, origin: str) -> tuple[int, int]:
+            """What this origin has spent in the open window, and the wait left of it."""
+            now = monotonic()
+            opened, spent = served.get(origin, (now, 0))
+            if now - opened >= WINDOW:
+                opened, spent = now, 0
+            served[origin] = (opened, spent + 1)
+            return spent + 1, max(1, ceil(WINDOW - (now - opened)))
 
         def do_POST(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's spelling
             self.answer(404, NOT_FOUND)

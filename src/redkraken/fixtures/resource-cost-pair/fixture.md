@@ -12,14 +12,16 @@ bb:provenance: Written for ticket 79 from the batched-operation abuse pattern th
 
 `POST /api/v1/render` takes `{"operations": [{"kind": "render"}, ...]}` and
 answers with what it completed and what that cost. Both variants refuse an
-origin after twenty requests, with the same `429` and the same `Retry-After`.
-One request is where they differ:
+origin after twenty requests in sixty seconds, with the same `429` and the same
+`Retry-After`. One request is where they differ:
 
 * **vulnerable** performs whatever the batch names. A single request carrying
   two hundred operations is answered `200` with `"completed": 200`, spending
   fifty times what the operator's limit was written to allow.
 * **secure** refuses a batch of more than twenty-five operations with `429`,
-  naming the ceiling and what was asked.
+  naming the ceiling and what was asked, and carrying no `Retry-After`: waiting
+  does not make an oversized batch acceptable, and a smaller one is accepted
+  immediately.
 
 ## Why this fixture is here
 
@@ -36,8 +38,8 @@ put a parser between the reading and that ratio without changing the claim.
 ## What makes the class `resource_cost` and not a rate-limiting gap
 
 Both variants enforce the same per-origin request limit, so a run that counts
-requests measures the two sides as identical: twenty answered, then `429` from
-both. The only reading that separates them is one that varies the size of a
+requests measures the two sides as identical: twenty answered in a window, then
+`429` from both, and the same allowance again a window later. The only reading that separates them is one that varies the size of a
 single request. `rate_limiting.per_origin` is therefore not merely absent from
 the ground truth -- the limit that class is about is present and working on the
 vulnerable variant.

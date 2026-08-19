@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler
+from math import ceil
+from time import monotonic
 from urllib.parse import urlsplit
 
 
@@ -31,7 +33,12 @@ OPERATION_CEILING = 25
 #: this fixture has to get the same answer under any machine load.
 UNIT_COST = 4
 
-RETRY_AFTER = "60"
+#: The window the request allowance is spent in, in seconds, and what a refusal
+#: tells the caller to wait. The batch refusal carries no `Retry-After` at all:
+#: waiting does not make an oversized batch acceptable, and the answer already
+#: says what would be.
+WINDOW = 60
+
 NOT_FOUND = {"error": "no such route"}
 TOO_MANY = {"error": "rate limit exceeded"}
 BAD_REQUEST = {"error": "operations is a list of {\"kind\": \"render\"} objects"}
@@ -43,7 +50,7 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
     if variant not in VARIANTS:
         raise ValueError(f"variant is one of {list(VARIANTS)}, not {variant!r}")
     bounds_one_request = variant == "secure"
-    requests: dict[str, int] = {}
+    requests: dict[str, tuple[float, int]] = {}
 
     class Fixture(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -52,11 +59,9 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
             if urlsplit(self.path).path != "/api/v1/render":
                 self.answer(404, NOT_FOUND)
                 return
-            origin = self.client_address[0]
-            sent = requests.get(origin, 0) + 1
-            requests[origin] = sent
+            sent, wait = self.spend(self.client_address[0])
             if sent > REQUEST_ALLOWANCE:
-                self.answer(429, TOO_MANY, retry_after=RETRY_AFTER)
+                self.answer(429, TOO_MANY, retry_after=str(wait))
                 return
             asked = self.request_body()
             batch = asked.get("operations") if isinstance(asked, dict) else None
@@ -66,11 +71,7 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
                 self.answer(400, BAD_REQUEST)
                 return
             if bounds_one_request and len(batch) > OPERATION_CEILING:
-                self.answer(
-                    429,
-                    dict(TOO_MUCH, ceiling=OPERATION_CEILING, asked=len(batch)),
-                    retry_after=RETRY_AFTER,
-                )
+                self.answer(429, dict(TOO_MUCH, ceiling=OPERATION_CEILING, asked=len(batch)))
                 return
             # The work itself is not done: what a reading needs is what the
             # request was allowed to ask for, and a fixture that actually spent
@@ -84,6 +85,15 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
                     "requests_remaining": REQUEST_ALLOWANCE - sent,
                 },
             )
+
+        def spend(self, origin: str) -> tuple[int, int]:
+            """What this origin has spent in the open window, and the wait left of it."""
+            now = monotonic()
+            opened, sent = requests.get(origin, (now, 0))
+            if now - opened >= WINDOW:
+                opened, sent = now, 0
+            requests[origin] = (opened, sent + 1)
+            return sent + 1, max(1, ceil(WINDOW - (now - opened)))
 
         def request_body(self) -> object:
             try:
