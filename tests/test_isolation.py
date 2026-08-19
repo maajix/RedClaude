@@ -99,6 +99,39 @@ except isolation.Unavailable as refusal:
             with isolation.held(second):
                 pass
 
+    def test_claims_kept_somewhere_that_is_not_this_user_s_own_are_refused(self):
+        """The claims directory is where two `rk run` processes find each other.
+
+        So a directory this user does not own -- or, as here, a symlink standing
+        where it should be -- is somewhere another user can put a lock file, and
+        a launch that took its claim there would be holding something nobody
+        else is reading. `lstat` is what decides it, because a link is refused
+        for what it is rather than for what it points at.
+        """
+        base = Path(tempfile.mkdtemp(prefix="rk2-claims-"))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        elsewhere = base / "elsewhere"
+        elsewhere.mkdir()
+        (base / f"{isolation.LOCKS}-{os.getuid()}").symlink_to(elsewhere)
+
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(base)}):
+            with self.assertRaisesRegex(isolation.Unavailable, "not this user's own"):
+                with isolation.held("rk2-agent-network"):
+                    pass
+
+    def test_a_claims_directory_anyone_else_could_read_is_tightened_first(self):
+        """An existing directory is used rather than refused, at 0700 or not at all."""
+        base = Path(tempfile.mkdtemp(prefix="rk2-claims-"))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        directory = base / f"{isolation.LOCKS}-{os.getuid()}"
+        directory.mkdir(mode=0o755)
+
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(base)}):
+            with isolation.held("rk2-agent-network"):
+                pass
+
+        self.assertEqual(0o700, directory.stat().st_mode & 0o777)
+
     def test_the_child_environment_is_a_copied_list_plus_the_runtime_door(self):
         operator = {name: f"operator-{name}" for name in isolation.INHERITED}
         operator.update(

@@ -151,13 +151,26 @@ ENVELOPE = "SELECT cost_reference_tokens FROM scheduler_weights WHERE active"
 #: A fixture already run more times than the policy asks is owed nothing rather
 #: than owed a negative, and a run at an older text counts for nothing at all --
 #: `playbook_sha256` is the join, the same way `playbook_test_verdict` reads it.
+#:
+#: The route is the second parameter, and it is what a filed run has to match to
+#: count off. `playbook_test_verdict` counts a repeat whichever route filed it,
+#: which is right for a verdict -- a run is a run -- and wrong for this number:
+#: the loopback route opens a Program and attempts nothing in it, so a corpus
+#: with 16200 loopback rows against it would report a campaign that owes nothing
+#: and has measured nothing. What is stated is what the campaign *this machine*
+#: would run still has to do.
+#:
+#: The two Programs an `own_pair` fixture costs per repeat is `Subject.variants`
+#: read in SQL: `PAIR` is the vulnerable and secure halves, and a fixture that is
+#: not its own pair borrows the other half from a fixture that is.
 OWED = (
     "WITH bound AS ("
     "  SELECT p.path, b.kind,"
     "         (SELECT count(*) FROM playbook_test_runs r"
     "           WHERE r.playbook_id = p.id"
     "             AND r.playbook_sha256 = p.source_sha256"
-    "             AND r.fixture_id = b.fixture_id) AS filed"
+    "             AND r.fixture_id = b.fixture_id"
+    "             AND r.route = $2) AS filed"
     "    FROM playbooks p, LATERAL playbook_fixture_binding(p.id) b)"
     " SELECT path, count(*)::bigint,"
     "        sum(least(filed, $1::bigint))::bigint,"
@@ -600,7 +613,10 @@ def cost(
     The route is stated with the number because it decides whether the campaign
     measures anything: `rk playbook evaluate` on a machine that describes no
     Agent boundary opens each Program and attempts nothing inside it, so a
-    corpus graded that way costs nothing and files zeroes.
+    corpus graded that way costs nothing and files zeroes. It is also what a
+    filed run has to match to be counted off -- runs from the other route are
+    rows about a different campaign, and discounting them would state a corpus
+    as half graded on the strength of repeats that reached nothing.
     """
     ledger = Ledger()
     answers: dict[str, object] = {
@@ -663,7 +679,9 @@ def cost(
                 "repeats_filed": int(str(filed)),
                 "programs": int(str(programs)),
             }
-            for path, fixtures, filed, programs in connection.execute(OWED, (repeats,)).rows
+            for path, fixtures, filed, programs in connection.execute(
+                OWED, (repeats, taken.name)
+            ).rows
         ]
         answers["playbooks"] = owed
         answers["programs"] = sum(int(one["programs"]) for one in owed)
@@ -674,7 +692,7 @@ def cost(
             f"{len(owed)} Playbook(s) against "
             f"{max((int(one['fixtures']) for one in owed), default=0)} bound fixture(s) each, "
             f"{sum(int(one['repeats_filed']) for one in owed)} of the required repeat(s) "
-            "already filed at the text they ship",
+            f"already filed on the {taken.name} route at the text they ship",
         )
         ledger.hold(
             "cost",

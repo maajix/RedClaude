@@ -969,7 +969,14 @@ def held(network: str) -> Iterator[None]:
     # environment, and a name is not a filename until something has decided what
     # `..` in it means.
     claim = directory / (hashlib.sha256(network.encode("utf-8")).hexdigest()[:32] + ".lock")
-    handle = os.open(claim, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        handle = os.open(claim, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        # A claim that cannot be opened is a launch that cannot be held, and a
+        # launch that cannot be held is refused in this module's own words --
+        # a bare errno here would reach the operator as an unhandled failure of
+        # something they never asked for.
+        raise Unavailable(f"the Agent network claim could not be opened: {claim} ({error})")
     try:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -995,8 +1002,11 @@ def _lock_directory() -> Path:
     """
     base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
     directory = base / f"{LOCKS}-{os.getuid()}"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    status = directory.lstat()
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        status = directory.lstat()
+    except OSError as error:
+        raise Unavailable(f"the Agent network claims have nowhere to live: {directory} ({error})")
     if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
         raise Unavailable(f"the Agent network claims are not this user's own: {directory}")
     if status.st_mode & 0o077:

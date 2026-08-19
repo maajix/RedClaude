@@ -39421,6 +39421,13 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
     Every Program, run row and workspace document it makes is its own, and the
     Programs are purged at the end: the class above asserts exact counts over
     the same Playbook.
+
+    Ticket 84's `rk playbook cost` is measured here too, and here rather than in
+    a class of its own because what it states is what an evaluation still owes:
+    the campaign is read once before these evaluations and once after, so the
+    repeats this class files are asserted as the drop between them. A cost class
+    that filed nothing could only ever assert the corpus against itself, which
+    is the arithmetic restated rather than measured.
     """
 
     settings_for = "migrate"
