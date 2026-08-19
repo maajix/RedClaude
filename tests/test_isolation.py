@@ -7,6 +7,8 @@ import json
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -17,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import _startup, isolation, tls
-from tests import fixtures
+from tests import SOURCE, fixtures
 from tests.fixtures import docker
 
 
@@ -32,6 +34,70 @@ class ContainerEnvironmentTest(unittest.TestCase):
     decidable without one, and the machine that has to prove nothing crosses is
     not always the machine that can start something for it not to cross into.
     """
+
+    #: What a second `rk run` process does: takes the same claim and reports
+    #: whether it got it. Run with this process's environment, because which
+    #: directory the claims live in is read from it and two processes that
+    #: disagreed about that would be two processes claiming different things.
+    CLAIMANT = """
+import json, sys
+from redkraken import isolation
+
+try:
+    with isolation.held(sys.argv[1]):
+        print(json.dumps({"held": True}), flush=True)
+        sys.stdin.readline()
+except isolation.Unavailable as refusal:
+    print(json.dumps({"held": False, "refusal": str(refusal)}), flush=True)
+"""
+
+    def claimant(self, network: str) -> subprocess.Popen:
+        """Start one, and take it and its pipes away when the case ends."""
+        process = subprocess.Popen(
+            [sys.executable, "-c", self.CLAIMANT, network],
+            env={**os.environ, "PYTHONPATH": str(SOURCE)},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
+        self.addCleanup(process.kill)
+        return process
+
+    def test_a_second_process_cannot_claim_a_network_the_first_one_holds(self):
+        """PH2-85 criterion 4: the claim is the kernel's, not this interpreter's.
+
+        Two `rk run` processes on one machine is the case, so the second one
+        here is a real process rather than a second call. It is refused while
+        the first holds the claim, and gets it as soon as the first is gone --
+        the second half matters as much: a claim that outlived the launch that
+        took it would be an installation that can launch once.
+        """
+        network = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+        first = self.claimant(network)
+        self.assertEqual({"held": True}, json.loads(first.stdout.readline()))
+
+        with self.assertRaisesRegex(isolation.Unavailable, "holds the Agent network"):
+            with isolation.held(network):
+                pass
+
+        first.stdin.write("\n")
+        first.stdin.flush()
+        self.assertEqual(0, first.wait(timeout=30))
+        with isolation.held(network):
+            pass
+
+    def test_one_claim_is_per_network_rather_than_per_installation(self):
+        """A claim on one network says nothing about another. `run_tool` builds
+        a network per run for exactly this reason, and an installation that
+        described two Agent networks would be two boundaries rather than one."""
+        first = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+        second = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+
+        with isolation.held(first):
+            with isolation.held(second):
+                pass
 
     def test_the_child_environment_is_a_copied_list_plus_the_runtime_door(self):
         operator = {name: f"operator-{name}" for name in isolation.INHERITED}
@@ -576,65 +642,55 @@ print(json.dumps({
         finally:
             docker("network", "disconnect", self.agent_network, self.target, check=False)
 
-    def test_a_peer_that_arrives_after_the_check_is_reachable_by_the_child(self):
-        """Ticket 80, criterion 5: the window between the check and the launch.
+    def test_a_second_launch_inside_the_first_s_window_is_refused(self):
+        """PH2-85 criteria 1 and 2: the window between the check and the launch.
 
-        The refusal above is what containment between two children rests on:
-        every launch reads the network first and stops if anything other than
-        the door is on it, so a second child cannot come up beside a first.
-        That holds for two launches that are ordered. It is a check-then-act,
-        the engine holds nothing between the two, and one network name serves a
-        whole installation -- so two launches that overlap can both read a clear
-        network and both attach to it.
+        The refusal above is what containment between two children rested on:
+        every launch reads the network first and stops if anything but the door
+        is on it, so a second child cannot come up beside a first. That held for
+        two launches that were ordered, and nothing ordered them -- it is a
+        check-then-act, the engine holds nothing between the read and the `run`,
+        and one network name serves a whole installation, so two launches inside
+        each other's window both read a clear network and both attached.
 
-        Demonstrated rather than argued, and deterministically rather than by
-        racing: the peer is attached inside the launch call itself, after
-        `one_peer` has returned and before the engine is asked to start
-        anything. The engine command is the one that begins `run`; everything
-        before it in this call is the check reading the engine's records.
+        `isolation.held` is what orders them now, and this is the overlap it is
+        claimed against: the second launch is made from inside the first's
+        window, at the exact moment the engine is about to be asked to start the
+        first child, which is where the old gap was demonstrated. What comes
+        back is a typed refusal naming the network rather than a second peer,
+        and the first child then runs to completion -- a claim that refused the
+        launch holding it would be a boundary that never launches anything.
 
-        What comes back is the gap: the child starts, and reaches a machine the
-        boundary check said was not there. Nothing here is a defect in the
-        refusal, which does what it says -- the gap is that ordering the launches
-        is what makes it hold, and nothing does. Ticket 85 is where that is
-        answered.
+        What is ordered is this installation's launches. A peer attached to the
+        Agent network by something that is not a launch -- an operator's own
+        `docker network connect` -- is not this claim's subject and never was:
+        it is what `one_peer` reads, and the next launch is refused for it.
         """
-        subnet = docker(
-            "network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}",
-            self.agent_network,
-        ).stdout.strip()
-        # A fixed address, so the child can be told where to look before the
-        # peer that answers there exists. High in the range, because the engine
-        # assigns from the bottom of it and an address it had already handed out
-        # would fail the attach rather than demonstrate anything.
-        arriving = str(ipaddress.ip_network(subnet).network_address + 250)
-        probe = fixtures.PROBE + """
-print(json.dumps({'arrived': reaches(%r, 18081)}))
-""" % arriving
-
-        attached = []
+        started = threading.Event()
+        release = threading.Event()
         launch = isolation.subprocess.run
 
-        def racing(command, **keywords):
-            if not attached and len(command) > 1 and command[1] == "run":
-                attached.append(arriving)
-                docker("network", "connect", "--ip", arriving,
-                       self.agent_network, self.target)
+        def waiting(command, **keywords):
+            if len(command) > 1 and command[1] == "run":
+                started.set()
+                if not release.wait(60):
+                    raise AssertionError("the first launch was never released")
             return launch(command, **keywords)
 
-        try:
-            with mock.patch.object(isolation.subprocess, "run", racing):
-                result = isolation.run(
-                    self.boundary(), ("python3", "-c", probe), timeout=20
-                )
-        finally:
-            docker("network", "disconnect", self.agent_network, self.target, check=False)
+        with mock.patch.object(isolation.subprocess, "run", waiting):
+            with futures.ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(isolation.run, self.boundary(), ("true",), timeout=60)
+                try:
+                    self.assertTrue(started.wait(60))
+                    with self.assertRaisesRegex(
+                        isolation.Unavailable, "holds the Agent network"
+                    ):
+                        isolation.run(self.boundary(), ("true",), timeout=60)
+                finally:
+                    release.set()
+                self.assertEqual(0, first.result(timeout=120).returncode)
 
-        self.assertEqual([arriving], attached)
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertTrue(json.loads(result.stdout)["arrived"])
-
-    def test_two_children_running_at_once_read_and_write_one_home(self):
+    def test_a_child_reads_what_the_child_before_it_left_in_one_home(self):
         """Ticket 80, criterion 5: the workspace half, measured rather than assumed.
 
         What separates two children is real and is listed in the row beside this
@@ -643,17 +699,14 @@ print(json.dumps({'arrived': reaches(%r, 18081)}))
         host directory per installation, it crosses writable because the CLI
         keeps session state in it, and every child is told it is `HOME`.
 
-        So two children that run at once are two agents with one writable
-        directory between them. This starts both and has each write a file and
-        wait for the other's, which is the paper's "planted code disguised as
-        another agent's" in the smallest form that can be asserted: what one
-        wrote, the other read, while both were running.
-
-        Both are launched through a barrier in the launch call itself, after
-        each has passed `one_peer` and before either has attached, because the
-        boundary check refuses a second child that is already up -- that refusal
-        is the network half of this mode and ticket 85's subject, and this test
-        is about the home rather than about the network.
+        One child after the other rather than two at once, because ticket 85's
+        claim is what now decides that: a second launch inside the first's
+        window is refused, so two agents of one installation are never on the
+        Agent network together. That closes the network half of this mode and
+        leaves this half where it was. What one agent writes into the home, the
+        next agent reads and cannot tell from its own -- the paper's "planted
+        code disguised as another agent's" in the smallest form that can be
+        asserted.
 
         Ticket 86 is where the home is answered.
         """
@@ -663,75 +716,38 @@ print(json.dumps({'arrived': reaches(%r, 18081)}))
         # refused before anything starts.
         home.chmod(0o777)
         probe = fixtures.PROBE + """
-import sys, time
+import sys
 
-mine, theirs = sys.argv[1], sys.argv[2]
+mine = sys.argv[1]
 home = os.environ['HOME']
-started = time.time()
+found = sorted(os.listdir(home))
+read = {}
+for name in found:
+    with open(os.path.join(home, name)) as handle:
+        read[name] = handle.read()
+
 with open(os.path.join(home, mine), 'w') as handle:
     handle.write('the session state of ' + mine)
 
-read = ''
-deadline = time.monotonic() + 25
-while time.monotonic() < deadline:
-    try:
-        with open(os.path.join(home, theirs)) as handle:
-            read = handle.read()
-        break
-    except OSError:
-        time.sleep(0.1)
-
-print(json.dumps({
-    'home': home,
-    'read': read,
-    'listed': sorted(os.listdir(home)),
-    'started': started,
-    'ended': time.time(),
-}))
+print(json.dumps({'home': home, 'found': found, 'read': read}))
 """
-        # Neither child starts until both have passed the boundary check, so
-        # this is the same window ticket 85 names rather than a race this test
-        # would sometimes lose.
-        gate = threading.Barrier(2, timeout=60)
-        launch = isolation.subprocess.run
 
-        def paired(command, **keywords):
-            if len(command) > 1 and command[1] == "run":
-                gate.wait()
-            return launch(command, **keywords)
-
-        def child(mine: str, theirs: str):
-            return isolation.run(
+        def child(mine: str) -> dict:
+            result = isolation.run(
                 self.boundary(home=home),
-                ("python3", "-c", probe, mine, theirs),
+                ("python3", "-c", probe, mine),
                 timeout=60,
             )
-
-        with mock.patch.object(isolation.subprocess, "run", paired):
-            with futures.ThreadPoolExecutor(max_workers=2) as pool:
-                both = [
-                    pool.submit(child, "first", "second"),
-                    pool.submit(child, "second", "first"),
-                ]
-                results = [running.result() for running in both]
-
-        for result in results:
             self.assertEqual(0, result.returncode, result.stderr)
-        facts = [json.loads(result.stdout) for result in results]
+            return json.loads(result.stdout)
 
-        self.assertEqual(
-            ["the session state of second", "the session state of first"],
-            [seen["read"] for seen in facts],
-        )
-        for seen in facts:
-            self.assertEqual(isolation.HOME_DIR, seen["home"])
-            self.assertEqual(["first", "second"], seen["listed"])
-        # Both were going while it happened: each only stopped once it had the
-        # other's file, so the windows overlap rather than queue.
-        self.assertLess(
-            max(seen["started"] for seen in facts),
-            min(seen["ended"] for seen in facts),
-        )
+        first = child("first")
+        second = child("second")
+
+        self.assertEqual([isolation.HOME_DIR] * 2, [first["home"], second["home"]])
+        self.assertEqual(([], {}), (first["found"], first["read"]))
+        self.assertEqual(["first"], second["found"])
+        self.assertEqual({"first": "the session state of first"}, second["read"])
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that

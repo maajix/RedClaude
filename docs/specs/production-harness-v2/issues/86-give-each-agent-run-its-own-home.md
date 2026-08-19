@@ -2,16 +2,16 @@
 
 **What to build:** A writable home a child cannot share with another child.
 Today `RK_AGENT_HOME` is one host directory per installation, it crosses
-writable into every container, and every child is told it is `HOME`, so two
-children that run at once read and write each other's session state.
+writable into every container, and every child is told it is `HOME`, so what one
+child writes there is what the next child reads.
 
 **Blocked by:** nothing.
 
 **Status:** ready-for-agent
 
-- [ ] Two children that run at once do not see each other's files under `HOME`. Whether the home is a per-run directory the runtime makes, a tmpfs the child gets to itself, or a subdirectory of the configured one is this ticket's to decide.
+- [ ] No child sees another child's files under `HOME`. Ticket 85 made two children on one Agent network impossible, so the leak that is left is sequential -- what a run leaves is what the next run finds -- and that is the case to answer. Whether the home is a per-run directory the runtime makes, a tmpfs the child gets to itself, or a subdirectory of the configured one is this ticket's to decide.
 - [ ] Whatever a run writes there is either its own to keep or gone when it ends, stated either way. A home that silently accumulates every run's leftovers is the same shared directory with a slower failure.
-- [ ] `tests/test_isolation.py::AgentContainerIsolationTest::test_two_children_running_at_once_read_and_write_one_home` is rewritten as the statement of what now happens, or deleted with the reason. It exists to record the gap and should not outlive it.
+- [ ] `tests/test_isolation.py::AgentContainerIsolationTest::test_a_child_reads_what_the_child_before_it_left_in_one_home` is rewritten as the statement of what now happens, or deleted with the reason. It exists to record the gap and should not outlive it.
 - [ ] The CLI still finds its session state where it expects it. The home crosses writable because the application keeps state in it, so a per-run home that broke a resumed session would trade one failure for another.
 - [ ] `baseline/multiagent-modes.tsv` moves `turf_wars_workspace` off `reproduced` with the run that says so, or the row stays and says why the mode is still reachable.
 
@@ -38,15 +38,15 @@ row of that table that is not read-only -- and `container_environment` sets
 directory, one name, every run.
 
 Demonstrated in
-`test_two_children_running_at_once_read_and_write_one_home`: two children are
-launched through a barrier inside the launch call, each writes a file under
-`HOME` and waits for the other's, and each reads what the other wrote while both
-are still running. That is the paper's planted code in the smallest form this
-harness can be asked about, and it needs no privilege at all -- the two children
-are one unprivileged user writing one directory.
+`test_a_child_reads_what_the_child_before_it_left_in_one_home`: one child writes
+a file under `HOME` and exits, and the next child reads it back -- and reads it
+without knowing there was a child before it. That is the paper's planted code in
+the smallest form this harness can be asked about, and it needs no privilege at
+all: the two children are one unprivileged user writing one directory.
 
-The two children have to overlap for it to matter, which is ticket 85's
-condition as well: the roster caps concurrency per role and 073 caps it across
-roles, so it takes two roles claiming at once or two `rk run` processes on one
-machine. Unlike 85, the home does not need them to overlap to leak -- a run that
-finished an hour ago left its session state where the next child will find it.
+It was two children at once when the mode was measured, and ticket 85 closed
+that form -- the launch now holds an exclusive claim on the Agent network across
+the check and the child, so two children cannot overlap on one installation. The
+home does not need them to overlap: a run that finished an hour ago left its
+session state where the next child will find it, which is why this ticket stayed
+open when 85 closed.

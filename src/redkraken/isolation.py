@@ -28,6 +28,9 @@ the supervisor's memory it gets, unless something is counting.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
 import selectors
@@ -37,7 +40,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -101,6 +104,13 @@ TOOL_WORKSPACE = "/work"
 # three variables every other container behind the fence gets and is the whole
 # of how a process finds it.  Everything else here is the whole environment.
 TOOL_ENVIRONMENT = {"HOME": "/", "TMPDIR": TMPDIR, "LC_ALL": "C.UTF-8"}
+
+
+# Where this machine records that a launch onto an Agent network is in flight.
+# Per user rather than per machine: two operators on one host are two
+# installations with two networks, and a claim either could take would be one
+# operator refusing the other's launches for a reason the other cannot see.
+LOCKS = "rk2-agent-networks"
 
 
 class Unavailable(RuntimeError):
@@ -246,6 +256,25 @@ def run(
     if not certificate.is_file():
         raise Unavailable(f"the run trust root is not a readable file: {certificate}")
 
+    with held(container.network):
+        return _launched(container, command, source_environment, stdin, timeout, engine, certificate)
+
+
+def _launched(
+    container: AgentContainer,
+    command: tuple[str, ...],
+    source_environment: Mapping[str, str] | None,
+    stdin: str | None,
+    timeout: float,
+    engine: str,
+    certificate: Path,
+) -> subprocess.CompletedProcess[str]:
+    """The checked launch, inside the claim `run` holds on the network.
+
+    Split out for one reason: everything here reads or changes what is attached
+    to one Agent network, and a reader has to be able to see that all of it is
+    under the same claim rather than trace an indentation to find out.
+    """
     proxy_host, _ = proxy_peer(container.proxy_url)
     image_environment = _image_environment(engine, container.image)
     watched = sorted(set(image_environment) & set(_startup.WATCHED_ENV_VECTORS))
@@ -906,6 +935,73 @@ def empty_network(engine: str, network: str) -> None:
         raise Unavailable(
             "the Agent network already has peers: " + ", ".join(sorted(attached.values()))
         )
+
+
+@contextlib.contextmanager
+def held(network: str) -> Iterator[None]:
+    """Hold this machine's claim on one Agent network, or refuse to launch.
+
+    `one_peer` is a check-then-act. It reads the network and says the door is
+    alone on it, and the engine holds nothing at all between that read and the
+    `run` that follows -- so two launches inside each other's window both read a
+    clear network and both attach, and each child is then a peer of the other.
+    The internal network carries no route off itself and every route across it.
+
+    So the window is held here instead, and by the kernel rather than by a
+    convention: an exclusive `flock` on a file named after the network, taken
+    before the check and let go after the child is gone. Two `rk run` processes
+    are two open file descriptions on one inode, which is the case that has to
+    be answered -- a flag in this process's memory would be a claim the other
+    process cannot see, and the roster's concurrency caps are counted in a
+    database that knows nothing about which machine is launching.
+
+    Refused rather than queued. A launch that waited would hold a claimed Task
+    open for as long as the child in front of it runs, and would tell its caller
+    it had a boundary only afterwards; `one_peer` refuses a second child that is
+    already up, and this is the same answer given a moment earlier.
+
+    The file is a name and never a message: nothing is written into it, and the
+    claim is the lock rather than the contents, so a stale file from a killed
+    process claims nothing.
+    """
+    directory = _lock_directory()
+    # Named by digest rather than by the network itself: the name comes from the
+    # environment, and a name is not a filename until something has decided what
+    # `..` in it means.
+    claim = directory / (hashlib.sha256(network.encode("utf-8")).hexdigest()[:32] + ".lock")
+    handle = os.open(claim, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Unavailable(
+                f"another launch on this machine holds the Agent network: {network}"
+            ) from None
+        yield
+    finally:
+        os.close(handle)
+
+
+def _lock_directory() -> Path:
+    """The directory this user's network claims live in, made if it is absent.
+
+    `XDG_RUNTIME_DIR` when the machine has one, because it is already this
+    user's alone and is cleared when the session ends. The temporary directory
+    otherwise, under a name carrying the user id, which is where a claim between
+    two `rk run` processes of one installation can still be found.
+
+    A directory that is not this user's own is a directory somebody else can put
+    a file in, so it is refused rather than used.
+    """
+    base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    directory = base / f"{LOCKS}-{os.getuid()}"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    status = directory.lstat()
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+        raise Unavailable(f"the Agent network claims are not this user's own: {directory}")
+    if status.st_mode & 0o077:
+        directory.chmod(0o700)
+    return directory
 
 
 def one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) -> None:
