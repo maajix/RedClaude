@@ -124,6 +124,16 @@ HOMES = "rk2-agent-homes"
 #: the size, so what was pointed at is visible in the refusal.
 HOME_CEILING = 64 * 1024 * 1024
 
+#: The one thing under a home that a run does not get its own copy of. The CLI
+#: refreshes its own credential and writes the result where it found the old
+#: one, so a credential that only ever existed in a copy is a token refreshed
+#: into a directory about to be deleted -- and the run after the first expiry
+#: presenting one that has already been spent. It crosses as itself instead, out
+#: of the template and back into it, which is also the only way the supervisor
+#: never has to read it: the operator's token is the child's to use and nobody
+#: else's to copy.
+CREDENTIAL = ".claude/.credentials.json"
+
 
 class Unavailable(RuntimeError):
     """The configured engine, image or topology cannot provide isolation."""
@@ -180,7 +190,10 @@ class AgentContainer:
 
     The three host directories are what the runtime mounts inside it: the
     application the child runs, the SDK it runs the child with, and the home
-    the child's credential is resolved from.  Each is absent by default,
+    the child's credential is resolved from.  The home is a template rather
+    than the directory the child gets: `run` hands each run its own copy and
+    takes the copy away again, so the field names what a run starts from, not
+    what it writes to.  Each is absent by default,
     because absent is the contained value -- a container with no home mounted
     has no credential at all rather than somebody else's, and one with no SDK
     mounted refuses at the startup assertion rather than starting a session.
@@ -268,6 +281,7 @@ def run(
     if not certificate.is_file():
         raise Unavailable(f"the run trust root is not a readable file: {certificate}")
 
+    credential = seeded_credential(container.home)
     with held(container.network), own_home(container.home) as home:
         return _launched(
             replace(container, home=home),
@@ -277,6 +291,7 @@ def run(
             timeout,
             engine,
             certificate,
+            credential,
         )
 
 
@@ -288,6 +303,7 @@ def _launched(
     timeout: float,
     engine: str,
     certificate: Path,
+    credential: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """The checked launch, inside the claim `run` holds on the network.
 
@@ -306,7 +322,7 @@ def _launched(
 
     inherited = os.environ if source_environment is None else source_environment
     environment = container_environment(container, inherited)
-    mounts = _mounts(container, certificate)
+    mounts = _mounts(container, certificate, credential)
 
     name = f"rk2-agent-{uuid.uuid4().hex}"
     docker = [
@@ -798,7 +814,9 @@ def _supplied(container: AgentContainer) -> list[tuple[str, Path, bool, bool]]:
     ]
 
 
-def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
+def _mounts(
+    container: AgentContainer, certificate: Path, credential: Path | None = None
+) -> list[str]:
     """Everything the runtime puts inside the boundary, and nothing else.
 
     The trust root crosses as a file rather than as the directory holding it,
@@ -814,19 +832,47 @@ def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
     contained are checked here rather than assumed of the caller: no mount may
     carry the operator's own home, and the writable one has to be writable by
     the user the child actually runs as.
+
+    `credential` is the one file that crosses out of the template rather than
+    out of the copy.  The CLI writes its refreshed credential where it read the
+    old one, so a credential that lived only in the copy would be refreshed into
+    a directory this run is about to delete; and mounting it means the
+    supervisor never reads the operator's token to copy it, only names it.
     """
     arguments = ["--mount", f"type=bind,src={certificate},dst={CA_FILE},readonly"]
     for destination, host, readonly, _ in _supplied(container):
         source = host.resolve()
-        if not source.is_dir():
-            raise Unavailable(f"an Agent container mount is not a directory: {source}")
-        if _carries_operator_home(source):
-            raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
-        if not readonly and not writable_by_the_child(source):
-            raise Unavailable(f"an Agent container home the child cannot write: {source}")
+        _refuse_uncontained(source, readonly)
         mount = f"type=bind,src={source},dst={destination}"
         arguments.extend(("--mount", f"{mount},readonly" if readonly else mount))
+    if credential is not None and container.home is not None:
+        # Written in place or not at all: a file mounted over is a file nothing
+        # can be renamed onto, so a CLI that refreshes by replacing its
+        # credential fails inside the child rather than quietly refreshing into
+        # a copy this run is about to delete. Which means the child has to be
+        # able to write the file itself, and an installation where it cannot is
+        # one whose next token expiry ends it -- said now, once, with the path.
+        if not writable_by_the_child(credential, wanted=0o200):
+            raise Unavailable(f"an Agent credential the child cannot write: {credential}")
+        arguments.extend(("--mount", f"type=bind,src={credential},dst={HOME_DIR}/{CREDENTIAL}"))
     return arguments
+
+
+def _refuse_uncontained(source: Path, readonly: bool) -> None:
+    """Refuse a host directory this runtime will not put inside a boundary.
+
+    Asked twice of a home and once of everything else, in one place so the two
+    askers cannot drift apart: `own_home` asks it of the directory the operator
+    configured, before copying up to a ceiling's worth of bytes for a launch
+    that was never going to start, and `_mounts` asks it again of what is
+    actually about to be mounted, which for a home is the copy.
+    """
+    if not source.is_dir():
+        raise Unavailable(f"an Agent container mount is not a directory: {source}")
+    if _carries_operator_home(source):
+        raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
+    if not readonly and not writable_by_the_child(source):
+        raise Unavailable(f"an Agent container home the child cannot write: {source}")
 
 
 def _carries_operator_home(source: Path) -> bool:
@@ -842,19 +888,24 @@ def _carries_operator_home(source: Path) -> bool:
     return source == home or source in home.parents
 
 
-def writable_by_the_child(source: Path) -> bool:
-    """Whether the container's own unprivileged user could write this directory.
+def writable_by_the_child(source: Path, wanted: int = 0o300) -> bool:
+    """Whether the container's own unprivileged user could write this path.
 
-    Decided from the directory's ownership and mode rather than from
-    `os.access`, which would answer for the supervisor -- a different user, on
-    the machine that is not the one running the child.
+    Decided from the path's ownership and mode rather than from `os.access`,
+    which would answer for the supervisor -- a different user, on the machine
+    that is not the one running the child.
+
+    `wanted` is stated in the owner's bits and shifted for the two classes
+    below, because what "writable" means depends on what is being asked about:
+    a directory has to be enterable as well as written to, and a credential
+    file has no business being executable.
     """
     status = source.stat()
     if status.st_uid == UID:
-        return status.st_mode & 0o300 == 0o300
+        return status.st_mode & wanted == wanted
     if status.st_gid == GID:
-        return status.st_mode & 0o030 == 0o030
-    return status.st_mode & 0o003 == 0o003
+        return status.st_mode & (wanted >> 3) == wanted >> 3
+    return status.st_mode & (wanted >> 6) == wanted >> 6
 
 
 def engine_for(name: str) -> str:
@@ -1034,6 +1085,14 @@ def own_home(template: Path | None) -> Iterator[Path | None]:
     same leak, slower. Nothing here needs it kept: what a session resumes from
     is the capsule in the database, not a file in a home.
 
+    The credential is the exception, and it is not copied at all -- `_mounts`
+    puts the template's own file inside the run.  It has to survive: the CLI
+    refreshes its token and writes the new one where it read the old, so a
+    credential kept in the copy would be refreshed into a directory this run is
+    about to delete, leaving the template holding a token already spent for the
+    run after it.  Mounting it also means the file the operator authenticated
+    with is never read by this process, only named to the engine.
+
     `None` stays `None`. A container with no home mounted has no credential at
     all rather than somebody else's, which is the contained value.
     """
@@ -1042,10 +1101,7 @@ def own_home(template: Path | None) -> Iterator[Path | None]:
         return
 
     source = Path(template).resolve()
-    if not source.is_dir():
-        raise Unavailable(f"an Agent container home is not a directory: {source}")
-    if _carries_operator_home(source):
-        raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
+    _refuse_uncontained(source, readonly=False)
     measured = _measured(source)
     if measured > HOME_CEILING:
         raise Unavailable(
@@ -1053,19 +1109,86 @@ def own_home(template: Path | None) -> Iterator[Path | None]:
             f"(at least {measured} bytes against a {HOME_CEILING}-byte ceiling)"
         )
 
-    own = _private_directory(HOMES) / f"rk2-home-{uuid.uuid4().hex}"
+    homes = _private_directory(HOMES)
+    _sweep(homes)
+    own = homes / f"rk2-home-{uuid.uuid4().hex}"
     try:
         # Modes and links as they were: `_mounts` decides whether the child can
         # write its home from the mode it finds, so a copy that widened one
         # would answer a question the operator has already been asked.
-        shutil.copytree(source, own, symlinks=True)
+        shutil.copytree(source, own, symlinks=True, ignore=_not_the_credential(source))
     except (OSError, shutil.Error) as error:
         shutil.rmtree(own, ignore_errors=True)
         raise Unavailable(f"the Agent home could not be copied for this run: {source} ({error})")
+    # Held open under a lock for as long as the run has it, which is what makes
+    # `_sweep` able to tell a live copy from a dead one. `finally` does not run
+    # for a process that is killed, and what a killed run leaves here is not an
+    # inert file like a stale network claim -- it is a copy of a credential.
+    handle = os.open(own, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield own
     finally:
+        os.close(handle)
         shutil.rmtree(own, ignore_errors=True)
+
+
+def _sweep(homes: Path) -> None:
+    """Take away the per-run homes no live run is holding.
+
+    A run holds its own copy open under an exclusive lock, so a copy this can
+    take the lock on is a copy whose run is gone: killed, or killed with the
+    machine.  Swept when the next launch is about to make one, rather than by a
+    timer, because that is the moment something is looking at this directory
+    anyway and a credential copy nobody is using should not wait for a daemon
+    this harness does not run.
+
+    Nothing here refuses.  A leftover that cannot be opened or removed belongs
+    to a problem the operator can see for themselves, and a launch that failed
+    because it could not tidy up would be a boundary that stops working as the
+    disk fills.
+    """
+    for leftover in sorted(homes.glob("rk2-home-*")):
+        try:
+            handle = os.open(leftover, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            continue
+        finally:
+            os.close(handle)
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def _not_the_credential(source: Path) -> Callable[[str, list[str]], set[str]]:
+    """What `copytree` leaves behind: the credential, at the one path it lives.
+
+    By path and not by name.  A file called `.credentials.json` further down a
+    home is an ordinary file of the run's, and the reason this one is skipped is
+    not what it is called but that it is mounted out of the template instead.
+    """
+    holder = source / Path(CREDENTIAL).parent
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        name = Path(CREDENTIAL).name
+        return {name} if Path(directory) == holder and name in names else set()
+
+    return ignored
+
+
+def seeded_credential(template: Path | None) -> Path | None:
+    """The credential in a configured home, if the operator put one there.
+
+    A symlink is not one.  What this returns is mounted into the child writable,
+    and a link is a way of naming a file the operator did not mean to hand over
+    -- the same reason `_carries_operator_home` is asked of every mount.
+    """
+    if template is None:
+        return None
+    seeded = Path(template).resolve() / CREDENTIAL
+    return seeded if seeded.is_file() and not seeded.is_symlink() else None
 
 
 def _measured(source: Path) -> int:

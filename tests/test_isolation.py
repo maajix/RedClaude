@@ -137,6 +137,7 @@ except isolation.Unavailable as refusal:
         thing, and copying it once per Agent run is a cost nobody asked for."""
         template = Path(tempfile.mkdtemp(prefix="rk2-template-"))
         self.addCleanup(shutil.rmtree, template, ignore_errors=True)
+        template.chmod(0o777)
         with mock.patch.object(isolation, "HOME_CEILING", 1024):
             (template / "transcripts").write_bytes(b"x" * 2048)
             with self.assertRaisesRegex(isolation.Unavailable, "larger than one run may copy"):
@@ -150,6 +151,104 @@ except isolation.Unavailable as refusal:
         with self.assertRaisesRegex(isolation.Unavailable, "carries the operator's home"):
             with isolation.own_home(Path(os.path.expanduser("~"))):
                 pass
+
+    def seeded(self) -> Path:
+        """A template home holding a credential, as an operator's does."""
+        template = Path(tempfile.mkdtemp(prefix="rk2-template-"))
+        self.addCleanup(shutil.rmtree, template, ignore_errors=True)
+        template.chmod(0o777)
+        (template / ".claude").mkdir()
+        (template / ".claude").chmod(0o777)
+        credential = template / ".claude" / ".credentials.json"
+        credential.write_text('{"claudeAiOauth": {"accessToken": "seeded"}}', encoding="utf-8")
+        credential.chmod(0o666)
+        return template
+
+    def test_the_credential_crosses_out_of_the_template_and_not_out_of_the_copy(self):
+        """PH2-86 criterion 4: what the CLI refreshes has to survive the run.
+
+        The CLI writes its refreshed credential where it read the old one, so a
+        credential that lived in the copy would be refreshed into a directory
+        the run is about to delete -- and the run after the first expiry would
+        present a token already spent. It is the one thing not copied: the
+        template's own file is mounted at the path the CLI looks in, so a
+        refresh lands in the operator's home directly, and this process never
+        reads the token to copy it.
+        """
+        template = self.seeded()
+
+        with isolation.own_home(template) as home:
+            self.assertFalse((home / ".claude" / ".credentials.json").exists())
+            self.assertTrue((home / ".claude").is_dir())
+            mounts = isolation._mounts(
+                fixtures.boundary(home=home),
+                template / "authority.pem",
+                isolation.seeded_credential(template),
+            )
+
+        credential = template.resolve() / ".claude" / ".credentials.json"
+        self.assertIn(
+            f"type=bind,src={credential},dst={isolation.HOME_DIR}/.claude/.credentials.json",
+            mounts,
+        )
+        # Writable, because a mounted-over file is one nothing can be renamed
+        # onto: an in-place refresh is the only one that can work.
+        self.assertFalse(
+            any(item.endswith(",readonly") and str(credential) in item for item in mounts)
+        )
+
+    def test_a_credential_the_child_could_not_write_ends_the_launch_saying_so(self):
+        """An installation whose credential the child cannot write is one whose
+        next token expiry ends it. Said once, with the path, before launch."""
+        template = self.seeded()
+        (template / ".claude" / ".credentials.json").chmod(0o444)
+
+        with self.assertRaisesRegex(isolation.Unavailable, "credential the child cannot write"):
+            isolation._mounts(
+                fixtures.boundary(home=template),
+                template / "authority.pem",
+                isolation.seeded_credential(template),
+            )
+
+    def test_a_credentials_file_anywhere_else_under_a_home_is_the_run_s_own(self):
+        """The credential is left behind by path, not by name: a file called the
+        same thing further down a home is an ordinary file of the run's."""
+        template = self.seeded()
+        (template / "projects" / ".claude").mkdir(parents=True)
+        (template / "projects" / ".claude" / ".credentials.json").write_text("x", encoding="utf-8")
+
+        with isolation.own_home(template) as home:
+            self.assertTrue((home / "projects" / ".claude" / ".credentials.json").is_file())
+
+        self.assertIsNone(isolation.seeded_credential(None))
+
+    def test_the_home_a_killed_run_left_behind_is_taken_away_by_the_next_launch(self):
+        """`finally` does not run for a process that is killed, and what a killed
+        run leaves here is a copy of a credential rather than an inert file.
+
+        So a run holds its own copy open under a lock for as long as it has it,
+        and the next launch removes every copy nothing is holding -- which is
+        the difference between a leftover and a live run's home.
+        """
+        base = Path(tempfile.mkdtemp(prefix="rk2-homes-"))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        homes = base / f"{isolation.HOMES}-{os.getuid()}"
+        homes.mkdir(mode=0o700)
+        killed = homes / "rk2-home-deadbeef"
+        killed.mkdir()
+        (killed / ".credentials.json").write_text("what the killed run had", encoding="utf-8")
+        template = self.seeded()
+
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(base)}):
+            with isolation.own_home(template) as first:
+                self.assertFalse(killed.exists())
+                # And a copy a live run is holding is not a leftover: a second
+                # launch sweeping while the first is running leaves it alone.
+                with isolation.own_home(template) as second:
+                    self.assertTrue(first.is_dir())
+                    self.assertNotEqual(first, second)
+
+        self.assertEqual([], sorted(homes.glob("rk2-home-*")))
 
     def test_claims_kept_somewhere_that_is_not_this_user_s_own_are_refused(self):
         """The claims directory is where two `rk run` processes find each other.
@@ -841,6 +940,61 @@ print(json.dumps({'home': home, 'found': found, 'read': read}))
         # And the template is what the operator left, whatever the children did
         # inside their copies of it.
         self.assertEqual(["credential.json"], sorted(item.name for item in home.iterdir()))
+
+    def test_a_credential_the_child_refreshed_is_the_one_the_next_child_reads(self):
+        """PH2-86 criterion 4: the CLI's own state still survives where it lives.
+
+        A home that was entirely per-run would take the refreshed credential
+        with it: the CLI writes its new token where it read the old one, so the
+        run after the first expiry would present a token already spent, which is
+        one failure traded for another. The credential is the one thing not
+        copied -- the template's own file is mounted at the path the CLI reads
+        -- so a refresh inside the run is a refresh the operator keeps, while
+        everything else the child wrote still dies with its copy.
+        """
+        home = Path(tempfile.mkdtemp(prefix="rk2-home-", dir=self.root))
+        home.chmod(0o777)
+        (home / ".claude").mkdir()
+        (home / ".claude").chmod(0o777)
+        credential = home / ".claude" / ".credentials.json"
+        credential.write_text('{"accessToken": "seeded"}', encoding="utf-8")
+        credential.chmod(0o666)
+
+        probe = fixtures.PROBE + """
+import sys
+
+path = os.path.join(os.environ['HOME'], '.claude', '.credentials.json')
+with open(path) as handle:
+    read = handle.read()
+
+# In place, which is what a mounted-over file allows and all it allows.
+with open(path, 'w') as handle:
+    handle.write('{"accessToken": "refreshed by ' + sys.argv[1] + '"}')
+
+with open(os.path.join(os.environ['HOME'], 'session'), 'w') as handle:
+    handle.write('what this run did')
+
+print(json.dumps({'read': read}))
+"""
+
+        def child(mine: str) -> dict:
+            result = isolation.run(
+                self.boundary(home=home), ("python3", "-c", probe, mine), timeout=60
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            return json.loads(result.stdout)
+
+        first = child("first")
+        second = child("second")
+
+        self.assertEqual('{"accessToken": "seeded"}', first["read"])
+        # What the first run refreshed is what the second run resolved.
+        self.assertEqual('{"accessToken": "refreshed by first"}', second["read"])
+        self.assertEqual(
+            '{"accessToken": "refreshed by second"}', credential.read_text(encoding="utf-8")
+        )
+        # And nothing else a child wrote is in the operator's directory.
+        self.assertEqual([".claude"], sorted(item.name for item in home.iterdir()))
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that

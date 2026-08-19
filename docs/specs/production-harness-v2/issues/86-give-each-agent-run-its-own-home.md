@@ -79,3 +79,47 @@ operator set rather than by what the copy widened.
 one after the other, and the second finds what the operator seeded and nothing
 the first left. With ticket 85's claim on the network beside it, both halves of
 the turf-wars mode this harness could actually have are now closed.
+
+## What the review changed
+
+Three things, all found by the two-axis review of the first implementation.
+
+**The credential is not copied.** The spec axis was right that criterion 4 was
+argued around rather than answered: the CLI refreshes its own token and writes
+the new one where it read the old, so a credential living only in the copy is a
+token refreshed into a directory the run is about to delete, and the run after
+the first expiry presents one already spent. It is now the single path
+`copytree` skips, and `_mounts` puts the template's own file at
+`/run/redkraken-home/.claude/.credentials.json` instead. Three consequences,
+each stated where it bites: a refresh has to be written in place, because
+nothing can be renamed onto a mounted file -- measured, `mv` over one returns
+`EBUSY` -- so a CLI that replaces its credential fails visibly inside the child
+rather than quietly refreshing into a copy about to go; the file has to be
+writable by the contained user, which is now refused before launch with the path
+rather than diagnosed after an expiry; and this process never reads the
+operator's token at all, only names it to the engine.
+`test_a_credential_the_child_refreshed_is_the_one_the_next_child_reads` runs two
+real children and proves the second resolves what the first refreshed while the
+first's other writes are gone.
+
+**A killed run's copy does not outlive it.** The standards axis found that the
+copy was removed only in a `finally`, which does not run for a process that is
+killed -- and what is left behind is not an inert file like a stale network
+claim, it is a copy of a home. Each run now holds its copy open under an
+exclusive lock for as long as it has it, and `_sweep` removes every copy nothing
+is holding just before the next one is made. That is the same kernel-held claim
+ticket 85 uses, for the same reason: a lock nobody holds is a run that is gone.
+
+**The ceiling stays, and is this ticket's.** The spec axis called
+`HOME_CEILING` scope creep, since no criterion asks for a size limit. It is a
+bound on the mechanism this ticket introduces rather than a new feature: copying
+the home is a per-run cost that did not exist before, and a home pointed at an
+engagement's worth of transcripts would spend it on every Agent run. Kept, with
+the refusal naming the size.
+
+Two judgement calls the review raised were left as they are, on purpose. A
+symlink inside the template is copied as a symlink, so a link pointing outside
+it names a path that does not exist in the container's namespace and reads
+nothing; and the containment questions asked of the template before copying are
+asked again by `_mounts` of what is actually mounted, which is one check in one
+function called twice rather than two that could drift.

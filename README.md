@@ -92,7 +92,11 @@ value: `RK_AGENT_APPLICATION`, `RK_AGENT_SDK` and `RK_AGENT_HOME` name the
 application, the SDK and the home mounted inside a child. A container with no
 home mounted has no credential at all rather than somebody else's. The home is a
 template: each run is handed a copy of it, and the copy is removed when the run
-ends, so what one child writes is never what the next child reads.
+ends, so what one child writes is never what the next child reads. The one
+exception is `.claude/.credentials.json`, which is not copied but mounted from
+the home itself, because the CLI writes a refreshed token where it read the old
+one -- so it has to be a file the contained user can write, and a run that
+refreshes is a refresh the next run resolves.
 
 ### Satisfying them
 
