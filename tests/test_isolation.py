@@ -99,6 +99,58 @@ except isolation.Unavailable as refusal:
             with isolation.held(second):
                 pass
 
+    def test_a_run_gets_a_copy_of_the_home_and_the_copy_goes_when_it_does(self):
+        """PH2-86 criteria 1 and 2, without an engine: the copy and its removal.
+
+        The configured home is a template. A run is handed a copy of it with the
+        modes it had -- `_mounts` decides whether the child can write its home
+        from the mode it finds, so a copy that widened one would be answering a
+        question the operator has already been asked -- and the copy is gone
+        when the run is, which is the half that keeps a machine from filling up
+        with the leftovers of runs nobody remembers.
+        """
+        template = Path(tempfile.mkdtemp(prefix="rk2-template-"))
+        self.addCleanup(shutil.rmtree, template, ignore_errors=True)
+        template.chmod(0o777)
+        (template / "credential.json").write_text("seeded", encoding="utf-8")
+        (template / "credential.json").chmod(0o666)
+
+        with isolation.own_home(template) as home:
+            self.assertNotEqual(template.resolve(), home)
+            self.assertEqual("seeded", (home / "credential.json").read_text(encoding="utf-8"))
+            self.assertEqual(0o777, home.stat().st_mode & 0o777)
+            self.assertEqual(0o666, (home / "credential.json").stat().st_mode & 0o777)
+            # What the run writes lands in the copy and never in the template.
+            (home / "session").write_text("what this run did", encoding="utf-8")
+
+        self.assertFalse(home.exists())
+        self.assertEqual(["credential.json"], sorted(item.name for item in template.iterdir()))
+
+    def test_a_home_with_no_template_stays_the_absent_one(self):
+        """A container with no home mounted has no credential at all rather than
+        somebody else's, which is the contained value -- so nothing is made."""
+        with isolation.own_home(None) as home:
+            self.assertIsNone(home)
+
+    def test_a_home_too_large_to_copy_per_run_is_refused_before_anything_starts(self):
+        """A home the size of an engagement is a directory pointed at the wrong
+        thing, and copying it once per Agent run is a cost nobody asked for."""
+        template = Path(tempfile.mkdtemp(prefix="rk2-template-"))
+        self.addCleanup(shutil.rmtree, template, ignore_errors=True)
+        with mock.patch.object(isolation, "HOME_CEILING", 1024):
+            (template / "transcripts").write_bytes(b"x" * 2048)
+            with self.assertRaisesRegex(isolation.Unavailable, "larger than one run may copy"):
+                with isolation.own_home(template):
+                    pass
+
+    def test_the_operator_s_own_home_is_no_more_copyable_than_it_was_mountable(self):
+        """The refusal that already covered the mount covers the template: the
+        point of a home is that a credential is resolved from it, and a copy of
+        the operator's is the operator's credential in a container."""
+        with self.assertRaisesRegex(isolation.Unavailable, "carries the operator's home"):
+            with isolation.own_home(Path(os.path.expanduser("~"))):
+                pass
+
     def test_claims_kept_somewhere_that_is_not_this_user_s_own_are_refused(self):
         """The claims directory is where two `rk run` processes find each other.
 
@@ -723,31 +775,31 @@ print(json.dumps({
                     release.set()
                 self.assertEqual(0, first.result(timeout=120).returncode)
 
-    def test_a_child_reads_what_the_child_before_it_left_in_one_home(self):
-        """Ticket 80, criterion 5: the workspace half, measured rather than assumed.
+    def test_a_child_gets_the_seeded_home_and_not_the_last_child_s(self):
+        """PH2-86 criteria 1, 2 and 4: the home a child gets is its own.
 
-        What separates two children is real and is listed in the row beside this
-        one: read-only root, uid 65534, cap-drop ALL, no engine socket, and a
-        scratch tmpfs each. What is not separated is `RK_AGENT_HOME`. It is one
-        host directory per installation, it crosses writable because the CLI
-        keeps session state in it, and every child is told it is `HOME`.
+        `RK_AGENT_HOME` was one directory per installation, mounted writable
+        because the CLI resolves a credential from a home and keeps its state
+        beside it. So what one child wrote the next child read, and could not
+        tell from its own -- ticket 80's planted code, at no privilege.
 
-        One child after the other rather than two at once, because ticket 85's
-        claim is what now decides that: a second launch inside the first's
-        window is refused, so two agents of one installation are never on the
-        Agent network together. That closes the network half of this mode and
-        leaves this half where it was. What one agent writes into the home, the
-        next agent reads and cannot tell from its own -- the paper's "planted
-        code disguised as another agent's" in the smallest form that can be
-        asserted.
-
-        Ticket 86 is where the home is answered.
+        Two children, one after the other, because ticket 85's claim is what
+        decides that now: two of one installation are never on the Agent network
+        at once. The first is handed the template the operator seeded and writes
+        its session state; the second is handed the template again. What the
+        first wrote is not there, the credential the operator put there is, and
+        the template on the host is what it was before either ran -- the run's
+        writes went to a copy that no longer exists.
         """
         home = Path(tempfile.mkdtemp(prefix="rk2-home-", dir=self.root))
         # The mode the runtime demands of a home: the child is a user this
         # machine has no name for, so a directory only the operator can write is
         # refused before anything starts.
         home.chmod(0o777)
+        seeded = home / "credential.json"
+        seeded.write_text('{"the operator": "seeded this"}', encoding="utf-8")
+        seeded.chmod(0o666)
+
         probe = fixtures.PROBE + """
 import sys
 
@@ -778,9 +830,17 @@ print(json.dumps({'home': home, 'found': found, 'read': read}))
         second = child("second")
 
         self.assertEqual([isolation.HOME_DIR] * 2, [first["home"], second["home"]])
-        self.assertEqual(([], {}), (first["found"], first["read"]))
-        self.assertEqual(["first"], second["found"])
-        self.assertEqual({"first": "the session state of first"}, second["read"])
+        # Each was handed the same seeded home, and neither was handed the
+        # other's session state.
+        self.assertEqual(["credential.json"], first["found"])
+        self.assertEqual(["credential.json"], second["found"])
+        self.assertEqual(
+            {"credential.json": '{"the operator": "seeded this"}'},
+            second["read"],
+        )
+        # And the template is what the operator left, whatever the children did
+        # inside their copies of it.
+        self.assertEqual(["credential.json"], sorted(item.name for item in home.iterdir()))
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that

@@ -7,13 +7,13 @@ child writes there is what the next child reads.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] No child sees another child's files under `HOME`. Ticket 85 made two children on one Agent network impossible, so the leak that is left is sequential -- what a run leaves is what the next run finds -- and that is the case to answer. Whether the home is a per-run directory the runtime makes, a tmpfs the child gets to itself, or a subdirectory of the configured one is this ticket's to decide.
-- [ ] Whatever a run writes there is either its own to keep or gone when it ends, stated either way. A home that silently accumulates every run's leftovers is the same shared directory with a slower failure.
-- [ ] `tests/test_isolation.py::AgentContainerIsolationTest::test_a_child_reads_what_the_child_before_it_left_in_one_home` is rewritten as the statement of what now happens, or deleted with the reason. It exists to record the gap and should not outlive it.
-- [ ] The CLI still finds its session state where it expects it. The home crosses writable because the application keeps state in it, so a per-run home that broke a resumed session would trade one failure for another.
-- [ ] `baseline/multiagent-modes.tsv` moves `turf_wars_workspace` off `reproduced` with the run that says so, or the row stays and says why the mode is still reachable.
+- [x] No child sees another child's files under `HOME`. Ticket 85 made two children on one Agent network impossible, so the leak that is left is sequential -- what a run leaves is what the next run finds -- and that is the case to answer. Whether the home is a per-run directory the runtime makes, a tmpfs the child gets to itself, or a subdirectory of the configured one is this ticket's to decide.
+- [x] Whatever a run writes there is either its own to keep or gone when it ends, stated either way. A home that silently accumulates every run's leftovers is the same shared directory with a slower failure.
+- [x] `tests/test_isolation.py::AgentContainerIsolationTest::test_a_child_reads_what_the_child_before_it_left_in_one_home` is rewritten as the statement of what now happens, or deleted with the reason. It exists to record the gap and should not outlive it.
+- [x] The CLI still finds its session state where it expects it. The home crosses writable because the application keeps state in it, so a per-run home that broke a resumed session would trade one failure for another.
+- [x] `baseline/multiagent-modes.tsv` moves `turf_wars_workspace` off `reproduced` with the run that says so, or the row stays and says why the mode is still reachable.
 
 ## Why
 
@@ -50,3 +50,32 @@ the check and the child, so two children cannot overlap on one installation. The
 home does not need them to overlap: a run that finished an hour ago left its
 session state where the next child will find it, which is why this ticket stayed
 open when 85 closed.
+
+## What was built
+
+The configured home is now a template, and nothing mounts it. `isolation.own_home`
+copies it per run into a directory of this user's own, with the modes it had,
+mounts the copy at `HOME`, and removes the copy when the run ends. So the CLI
+finds the credential and the settings the operator seeded, exactly where it
+expects them, and what a run writes beside them is gone with the run.
+
+Gone rather than kept, of the two answers this ticket allowed. A per-run home
+that is kept is a directory growing without limit on a machine nobody watches,
+and session state that outlives its run is state the next run can be told is its
+own -- the same leak, slower. Nothing needs it kept: what a session resumes from
+is the capsule in the database rather than a file in a home.
+
+Copying is bounded. `HOME_CEILING` is 64 MiB, measured before anything is
+copied and refused with the size, because a home holding an engagement's worth
+of transcripts is a directory that has been pointed at the wrong thing and
+copying it once per Agent run would be a cost nobody asked for. The template is
+refused for the two reasons a mount already was -- it may not be the operator's
+own home, and the child has to be able to write what it is given -- and the copy
+keeps the template's modes so that the second of those is decided by what the
+operator set rather than by what the copy widened.
+
+`baseline/multiagent-modes.tsv` moves `turf_wars_workspace` to enforced, citing
+`test_a_child_gets_the_seeded_home_and_not_the_last_child_s`: two children run
+one after the other, and the second finds what the operator seeded and nothing
+the first left. With ticket 85's claim on the network beside it, both halves of
+the turf-wars mode this harness could actually have are now closed.

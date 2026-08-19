@@ -41,7 +41,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -111,6 +111,18 @@ TOOL_ENVIRONMENT = {"HOME": "/", "TMPDIR": TMPDIR, "LC_ALL": "C.UTF-8"}
 # installations with two networks, and a claim either could take would be one
 # operator refusing the other's launches for a reason the other cannot see.
 LOCKS = "rk2-agent-networks"
+
+#: Where the per-run homes are made, beside the claims and per user for the same
+#: reason: one operator's runs are not another operator's to read.
+HOMES = "rk2-agent-homes"
+
+#: How large a configured home may be before copying it per run stops being
+#: something a launch can afford. A home is a credential, a settings file and
+#: whatever the CLI keeps beside them; a home holding an engagement's worth of
+#: transcripts is a directory that has been pointed at the wrong thing, and
+#: copying it once per Agent run would be a cost nobody asked for. Refused with
+#: the size, so what was pointed at is visible in the refusal.
+HOME_CEILING = 64 * 1024 * 1024
 
 
 class Unavailable(RuntimeError):
@@ -256,8 +268,16 @@ def run(
     if not certificate.is_file():
         raise Unavailable(f"the run trust root is not a readable file: {certificate}")
 
-    with held(container.network):
-        return _launched(container, command, source_environment, stdin, timeout, engine, certificate)
+    with held(container.network), own_home(container.home) as home:
+        return _launched(
+            replace(container, home=home),
+            command,
+            source_environment,
+            stdin,
+            timeout,
+            engine,
+            certificate,
+        )
 
 
 def _launched(
@@ -786,7 +806,9 @@ def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
     Agent that can be intercepted and an Agent that can intercept is exactly
     one file.  The application and the SDK cross read-only, because a child
     that could write to them could choose what the next child is measured as.
-    The home is the one writable mount -- the CLI keeps session state in it.
+    The home is the one writable mount -- the CLI keeps session state in it --
+    and what is mounted is this run's copy of it rather than the directory the
+    operator configured, which `own_home` makes and takes away again.
 
     A caller names the host directories, so the two properties that make them
     contained are checked here rather than assumed of the caller: no mount may
@@ -964,7 +986,7 @@ def held(network: str) -> Iterator[None]:
     claim is the lock rather than the contents, so a stale file from a killed
     process claims nothing.
     """
-    directory = _lock_directory()
+    directory = _private_directory(LOCKS)
     # Named by digest rather than by the network itself: the name comes from the
     # environment, and a name is not a filename until something has decided what
     # `..` in it means.
@@ -989,26 +1011,106 @@ def held(network: str) -> Iterator[None]:
         os.close(handle)
 
 
-def _lock_directory() -> Path:
-    """The directory this user's network claims live in, made if it is absent.
+@contextlib.contextmanager
+def own_home(template: Path | None) -> Iterator[Path | None]:
+    """One run's own copy of the configured home, taken away when it ends.
+
+    `RK_AGENT_HOME` is one directory per installation and it crosses writable,
+    because the CLI resolves its credential from a home and keeps its state
+    beside it. That made it the one thing two children shared: what one wrote
+    the next read, and neither could tell it from its own -- the planted-code
+    half of ticket 80's turf wars, needing no privilege at all.
+
+    So the configured directory becomes a template that is never mounted. Each
+    run gets a copy of it with the modes it had, and the copy is what crosses
+    into the container. The CLI finds everything the operator seeded, at the
+    path it expects; what the run writes lands in the copy; and the copy is
+    removed when the run ends, so the template holds what the operator put there
+    however many runs later.
+
+    Gone rather than kept, of the two answers ticket 86 allows. A per-run home
+    that is kept grows without limit on a machine nobody is watching, and state
+    that outlives its run is state the next run can be told is its own -- the
+    same leak, slower. Nothing here needs it kept: what a session resumes from
+    is the capsule in the database, not a file in a home.
+
+    `None` stays `None`. A container with no home mounted has no credential at
+    all rather than somebody else's, which is the contained value.
+    """
+    if template is None:
+        yield None
+        return
+
+    source = Path(template).resolve()
+    if not source.is_dir():
+        raise Unavailable(f"an Agent container home is not a directory: {source}")
+    if _carries_operator_home(source):
+        raise Unavailable(f"an Agent container mount carries the operator's home: {source}")
+    measured = _measured(source)
+    if measured > HOME_CEILING:
+        raise Unavailable(
+            f"the Agent home is larger than one run may copy: {source} "
+            f"(at least {measured} bytes against a {HOME_CEILING}-byte ceiling)"
+        )
+
+    own = _private_directory(HOMES) / f"rk2-home-{uuid.uuid4().hex}"
+    try:
+        # Modes and links as they were: `_mounts` decides whether the child can
+        # write its home from the mode it finds, so a copy that widened one
+        # would answer a question the operator has already been asked.
+        shutil.copytree(source, own, symlinks=True)
+    except (OSError, shutil.Error) as error:
+        shutil.rmtree(own, ignore_errors=True)
+        raise Unavailable(f"the Agent home could not be copied for this run: {source} ({error})")
+    try:
+        yield own
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+
+
+def _measured(source: Path) -> int:
+    """What copying this home would move, in bytes, counting no link twice.
+
+    Links are measured as links and directories are not followed out of the
+    tree, because what is being asked is what this launch is about to copy. The
+    walk stops as soon as the answer is over the ceiling: a directory pointed at
+    something enormous is refused for being enormous, and counting all of it to
+    say so would be the cost the refusal exists to avoid.
+    """
+    total = 0
+    for directory, _, files in os.walk(source):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_size
+            except OSError:
+                continue
+            if total > HOME_CEILING:
+                return total
+    return total
+
+
+def _private_directory(purpose: str) -> Path:
+    """A directory of this user's own for `purpose`, made if it is absent.
 
     `XDG_RUNTIME_DIR` when the machine has one, because it is already this
     user's alone and is cleared when the session ends. The temporary directory
-    otherwise, under a name carrying the user id, which is where a claim between
-    two `rk run` processes of one installation can still be found.
+    otherwise, under a name carrying the user id, which is where the claim two
+    `rk run` processes of one installation take can still be found.
 
     A directory that is not this user's own is a directory somebody else can put
-    a file in, so it is refused rather than used.
+    a file in, so it is refused rather than used. That matters twice over: it is
+    where a claim says a network is held, and it is where the home a child gets
+    to write is made.
     """
     base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
-    directory = base / f"{LOCKS}-{os.getuid()}"
+    directory = base / f"{purpose}-{os.getuid()}"
     try:
         directory.mkdir(mode=0o700, exist_ok=True)
         status = directory.lstat()
     except OSError as error:
-        raise Unavailable(f"the Agent network claims have nowhere to live: {directory} ({error})")
+        raise Unavailable(f"the runtime's own directory has nowhere to live: {directory} ({error})")
     if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
-        raise Unavailable(f"the Agent network claims are not this user's own: {directory}")
+        raise Unavailable(f"the runtime's own directory is not this user's own: {directory}")
     if status.st_mode & 0o077:
         directory.chmod(0o700)
     return directory

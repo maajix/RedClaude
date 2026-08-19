@@ -90,7 +90,9 @@ whatever answers on that port.
 Three more are optional and absent by default, because absent is the contained
 value: `RK_AGENT_APPLICATION`, `RK_AGENT_SDK` and `RK_AGENT_HOME` name the
 application, the SDK and the home mounted inside a child. A container with no
-home mounted has no credential at all rather than somebody else's.
+home mounted has no credential at all rather than somebody else's. The home is a
+template: each run is handed a copy of it, and the copy is removed when the run
+ends, so what one child writes is never what the next child reads.
 
 ### Satisfying them
 
