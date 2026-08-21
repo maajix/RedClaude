@@ -4,15 +4,15 @@
 
 **Blocked by:** nothing. Ticket 31 built what this compares against and is resolved; ticket 87 owns the mechanism a rewritten Skill would run under and does not block reading one.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] What agent-browser actually is, is written down before it is judged: publisher, licence, version, distribution (npm, brew, or a binary), the protocol it drives, and whether the daemon is separable from the CLI.
-- [ ] The comparison against the slice this repo already has is a table of what each can do, not a preference.
-- [ ] The fence question is answered with evidence, not assumption: whether it honours `--proxy-server` and an SPKI pin, and whether the capability header the door reads can be put on the hop without a second shim.
-- [ ] The daemon question is answered: a process that outlives a command is answered against per-run containment, the Halt gate and the request budget, or the evaluation records that it cannot be and stops there.
-- [ ] The Skill text is read on its own merits and the parts worth keeping are quoted, so that "adopt the instructions, not the binary" is a decision with content behind it.
-- [ ] A decision is recorded — adopt, adopt the instructions only, adopt for one named job, or decline — with the reason, as an ADR under `docs/adr/` at `0005`. Declining is a result and closes this ticket.
-- [ ] No production code path depends on agent-browser unless the decision is adopt. A spike lives under `/tmp` or is deleted.
+- [x] What agent-browser actually is, is written down before it is judged: publisher, licence, version, distribution (npm, brew, or a binary), the protocol it drives, and whether the daemon is separable from the CLI.
+- [x] The comparison against the slice this repo already has is a table of what each can do, not a preference.
+- [x] The fence question is answered with evidence, not assumption: whether it honours `--proxy-server` and an SPKI pin, and whether the capability header the door reads can be put on the hop without a second shim.
+- [x] The daemon question is answered: a process that outlives a command is answered against per-run containment, the Halt gate and the request budget, or the evaluation records that it cannot be and stops there.
+- [x] The Skill text is read on its own merits and the parts worth keeping are quoted, so that "adopt the instructions, not the binary" is a decision with content behind it.
+- [x] A decision is recorded — adopt, adopt the instructions only, adopt for one named job, or decline — with the reason, as an ADR under `docs/adr/` at `0005`. Declining is a result and closes this ticket.
+- [x] No production code path depends on agent-browser unless the decision is adopt. A spike lives under `/tmp` or is deleted.
 
 ## Why this is asked
 
@@ -131,3 +131,27 @@ that nobody has to wonder again.
 
 The tracker numbers are append-only and other files cite them, so this sits at
 89 because 88 was the last one taken. Topically it belongs next to 31 and 77.
+
+## Comments
+Decided: decline the binary, keep the text. Recorded as
+`docs/adr/0005-agent-browser-is-not-adopted-but-its-skill-text-is-kept.md`.
+
+Two of the three hard questions went agent-browser's way. The fence holds --
+`--proxy` reaches Chromium as `--proxy-server=` and `--args` passes an SPKI pin
+through untouched -- and the daemon is confinable, because on Unix its
+rendezvous is a filesystem path in a directory we name and a container that goes
+away takes it with it. Question 3 is the one it fails, and it fails on the thing
+`check_browser_runs` exists for: its request log is session-scoped, our
+`browser_step_results.network_requests` is per step, so keeping the check would
+mean reconciling a number agent-browser produced against a number we produced.
+That is a second bookkeeper for egress reporting on itself.
+
+The text is the half worth having, and it is Apache-2.0, so a rewrite may carry
+it with the notice and a statement of change. Filed as ticket 91: the wait
+discipline, the enumerated untrusted-output channels, the symptom-cause-command
+troubleshooting shape, and "the right tool for the first visit and the wrong
+tool for the hundredth", written in our ten verbs and nobody else's.
+
+Nothing entered the tree, so criterion 7 is met by there being nothing to
+delete. The four spikes the research specified are only worth running if
+somebody reopens the decision.
