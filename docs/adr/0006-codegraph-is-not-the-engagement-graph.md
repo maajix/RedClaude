@@ -82,20 +82,57 @@ work; the graph engine is the cheap part, and this is the cheapest way to find
 out whether the engine's borrowed edge vocabulary says what an engagement means.
 
 The one job CodeGraph is unambiguously built for, target source, is declined
-separately and for its own reason. On a target's open-source repository it would
-win. On the case the harness actually meets -- a fetched JavaScript bundle -- it
-declines to answer: files over 1 MB are skipped by default, with "generated
-bundles, minified JS" named as the reason. `js_routes` was written for exactly
-that shape and reports a path only because a call to something that makes
-requests was given it as an argument, with the offset so the claim can be
-checked against the bytes. Its grounding rule is the thing a symbol table does
-not have. Putting CodeGraph inside the harness for that case would mean a new
-offline-tool row, a binary in the tool image, a wrapper to make a directory look
-like a declared filename, and an npm dependency tree beside an application whose
-`pyproject.toml` says `dependencies = []` and whose release gate fails if that
-ever stops being true -- to reach a case the operator can already reach by
-running `codegraph init` on a checkout, outside the harness, where it is doing
-what it was built for.
+separately and for its own reason, and that reason was measured rather than
+read. The section below has the numbers. What they say is that CodeGraph is
+excellent on a target's repository and blind on a target's bundle, and that the
+harness is the other way round -- so putting CodeGraph inside the harness would
+buy the case the harness does not meet and lose the case it does. It would also
+cost a new offline-tool row, a binary in the tool image, a wrapper to make a
+directory look like a declared filename, and an npm dependency tree beside an
+application whose `pyproject.toml` says `dependencies = []` and whose release
+gate fails if that ever stops being true -- to reach a case the operator can
+already reach by running `codegraph init` on a checkout, outside the harness,
+where it is doing what it was built for.
+
+## What the measurement found
+
+Ticket 90's sixth criterion asked for a measurement and not for a reading. It
+was run at `/tmp/cgspike` against CodeGraph 1.5.0 and against `js_parse`,
+`js_routes` and `extract_paths.py` as they stand. Token counts are
+`cl100k_base`. Four subjects, all fetched rather than invented.
+
+| Subject | CodeGraph | The harness |
+|---|---|---|
+| `@octokit/plugin-rest-endpoint-methods` 10.4.1 `dist-web/index.js`, 87,967 bytes, not minified, 917 endpoint strings over 591 distinct paths | 12 nodes. All 591 paths sit inside one node, `variable Endpoints`, lines 5-1992. `explore` cost 971 tokens and named 1 of 591. `query "repos"` returned nothing | `js_parse` 1 of 591 at 161 tokens; `js_routes` 0 at 84; `extract_paths` 0 at 23. The raw file is 22,864 |
+| `swagger-ui-dist` 5.11.0 `swagger-ui-bundle.js`, 1,400,489 bytes, minified | "No files found to index". 0 files, 0 nodes, 0 edges | `js_parse` found 149 path literals over 26 distinct paths and the source map reference `swagger-ui-bundle.js.map`, at 4,750 tokens against 448,239 for the raw file |
+| Three minified library bundles -- vue 3.4.21, react-dom 18.2.0, moment 2.30.1 with locales -- plus monaco `editor.main.js` at 3,469,378 bytes | 3 of 4 indexed, monaco refused. 850 nodes, 5,152 edges, of which 807 are `function`. Zero `route` nodes. Zero nodes whose name contains a slash. 820 of 847 symbol names are one or two characters and every node starts at line 1 | `js_parse` read all four, including the one CodeGraph refused: 78 path literals over 21 paths in monaco, 17 over 7 in react-dom, 6 over 5 in vue, 0 in moment |
+| `gothinkster/node-express-realworld-example-app`, 39 files | 20 `route` nodes, named `GET /articles/:slug/comments` and qualified `<file>::GET:/articles/:slug/comments`. 20 of 20 correct, and one of them -- `GET /` in `src/main.ts` -- is one the hand-written ground truth for this measurement missed. The route list costs 114 tokens; `explore` costs 1,899 and names 15 of 19; reading the four controllers and `main.ts` costs 2,694 | nothing to say. `js_routes` reads a client's call sites, not a server's registrations |
+
+The 1 MB refusal is exact and is not configurable: `MAX_FILE_SIZE = 1024 * 1024`
+in the packaged `extraction/index.js`, refused with `File exceeds max size`, and
+neither `codegraph init --help` nor `codegraph index --help` offers a flag.
+
+The row that decides it is the third one. The 1 MB skip was the reason the
+reading gave, and it is real, but it is not the reason that matters: a bundle
+*under* the limit is indexed and still says nothing. Every node is a minified
+identifier at line 1, there is no node kind for a string, and a path is a
+string. The `route` node kind that makes the fourth row work exists only where a
+routing framework's registration is in the source, which is the server's
+repository and never the client's bundle.
+
+The first row is the one that indicts both sides, and the harness's half of it
+is a defect this measurement found rather than a property of the problem. Those
+917 endpoints are written `"GET /orgs/{org}/actions/runners"`, one method and
+one path in one literal, and our two readers miss them for two different
+reasons. `jsscan.path_of` refuses any literal holding a space, so the method in
+front of the path is what stops it -- yet it accepts `/orgs/{org}/labels` on its
+own, and `_named_hole` spells a template hole `{id}`, so a braced segment is a
+shape it already emits. `extract_paths`'s `PATH` pattern refuses the same
+literal for the missing leading `/`, and would still refuse 522 of the 591 with
+the method stripped, because `{` is not in its character class and only `${...}`
+is. 68 of 591 would match. So the two readers disagree with each other about
+what a path is, and a client bundle that lists a target's whole API -- the best
+thing a hunt can find in a source Artifact -- yields one path.
 
 ## Consequences
 
@@ -127,10 +164,17 @@ what it was built for.
   verb traverses it. That is a packet section and a contract in a schema that
   already has `program_id`, RLS, per-record revisions and SQL-computed digests.
   It is not a second graph.
-- **The 1 MB skip is the reusable finding.** Any future code-intelligence tool
-  evaluated for bundle analysis will have the same problem: these tools are
-  built for repositories, and a minified bundle is the shape they are configured
-  to ignore. `js_parse` already reports `minified` for exactly this reason.
+- **The minified bundle is the reusable finding, and the 1 MB skip is only its
+  loud half.** Any future code-intelligence tool evaluated for bundle analysis
+  will have both problems: it will refuse the large ones outright, and it will
+  index the small ones into a symbol table with no node for a string. These
+  tools are built for repositories. `js_parse` already reports `minified` for
+  exactly this reason.
+- **Our own path extractor has a measured gap and it is now a ticket.** A route
+  template written `"GET /orgs/{org}"` is invisible to `extract_paths` twice
+  over: the literal does not start with `/`, and `{` is not in `PATH`'s
+  character class. Measured on a real client bundle that is 88 KB of nothing but
+  a target's API, the harness reports 1 path of 591. Ticket 92 owns it.
 - **Nothing was added to the tree, so nothing new can fail.** As with 0004, the
   decline half is recorded here rather than in code, which is the honest form
   for "we looked, and no"; the adopt half is a spike under `/tmp` until it earns

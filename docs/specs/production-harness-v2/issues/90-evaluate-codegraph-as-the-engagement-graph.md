@@ -11,7 +11,7 @@
 - [x] The comparison against what this harness already holds is a table of what each side can store and answer, not a preference. The other side of the table is `entities`, `relationships`, `artifact_references` and `mcp__rk2__get_attack_surface`.
 - [x] The scope question is answered: a CodeGraph index is one directory's index, and a Program is the root of everything this harness scopes. Whether an index can be Program-scoped, and what happens when two engagements share a domain, is answered rather than assumed.
 - [x] The containment question is answered: an index is a file on the runtime's disk and the child has no such file. Whether an Agent could read one, whether reading it would cross the door, and whether anything read out of it can become evidence with a Receipt behind it.
-- [ ] The one job CodeGraph is unambiguously built for is tested against the real case: **target source code** — a fetched JavaScript bundle, an open-source repository belonging to the target — indexed, and the routes found in it linked to a domain. Measured against what `js_routes`, `js_map` and `extract_paths.py` already answer, in facts found and in tokens read.
+- [x] The one job CodeGraph is unambiguously built for is tested against the real case: **target source code** — a fetched JavaScript bundle, an open-source repository belonging to the target — indexed, and the routes found in it linked to a domain. Measured against what `js_routes`, `js_map` and `extract_paths.py` already answer, in facts found and in tokens read.
 - [x] A decision is recorded — adopt, adopt for one named job, or decline — with the reason, as an ADR under `docs/adr/` at `0006`. Declining is a result and closes this ticket. (`0005` belongs to ticket 89.)
 - [x] No production code path depends on CodeGraph unless the decision is adopt. A spike lives under `/tmp` or is deleted.
 - [x] The separation is respected and said out loud: engagement files live in the engagement directory and the harness repository holds none of them. Nothing proposed here puts an engagement path, an index, or a generated projection of one inside this repository or inside anything this repository commits.
@@ -137,15 +137,38 @@ regenerable projection of `entities` and `relationships` into a module a parser
 can read, written under the engagement directory and never canonical. That is
 the spike the ADR gates the build on, and it is deliberately not a ticket yet.
 
-**Criterion 6 is not ticked and is not owed.** The measurement it asks for was
-not run, because the case the harness actually meets removes its subject:
-CodeGraph skips files over 1 MB by default and names "generated bundles,
-minified JS" as the reason, so a fetched bundle is the shape it is configured to
-ignore. The other half -- a target's open-source repository -- it would win, and
-the operator can already reach that by running `codegraph init` on a checkout
-outside the harness. Both are recorded in the ADR as a decline with a reason
-rather than as work somebody still has to do. Anyone who disagrees should reopen
-this criterion rather than assume it was forgotten.
+**Criterion 6 was run.** The spike is at `/tmp/cgspike`: CodeGraph 1.5.0 and
+`js_parse`, `js_routes` and `extract_paths.py` over four fetched subjects, token
+counts in `cl100k_base`. ADR 0006 carries the table. The short of it:
+
+- On a target's **repository** CodeGraph wins outright. 39 files of
+  `gothinkster/node-express-realworld-example-app` give 20 `route` nodes, 20 of
+  20 correct, and one of them -- `GET /` in `src/main.ts` -- is one this
+  measurement's own hand-written ground truth missed. The whole list costs 114
+  tokens against 2,694 to read the controllers.
+- On a target's **bundle** it is blind, and the 1 MB skip is only the loud half.
+  `swagger-ui-bundle.js` at 1,400,489 bytes gives "No files found to index", 0
+  nodes. But three real minified bundles *under* the limit index fine and still
+  say nothing: 850 nodes, 807 of them `function`, zero `route` nodes, zero node
+  names holding a slash, 820 of 847 names one or two characters, every node at
+  line 1. There is no node kind for a string, and a path is a string.
+- The limit is exact and not configurable: `MAX_FILE_SIZE = 1024 * 1024` in the
+  packaged `extraction/index.js`, and no flag on `init` or `index`.
+
+So the decision does not move, and now it is earned rather than assumed: the one
+job CodeGraph is built for is the repository, the harness meets the bundle, and
+the operator already reaches the repository case with `codegraph init` on a
+checkout outside the harness.
+
+**The measurement also found a defect in us, which is the part worth keeping.**
+`@octokit/plugin-rest-endpoint-methods` 10.4.1 is 88 KB of almost nothing but a
+target's API -- 917 endpoint strings over 591 distinct paths, written
+`"GET /orgs/{org}/actions/runners"`. CodeGraph reported one. So did we.
+`jsscan.path_of` refuses the literal for the space in front of the path, though
+it accepts `/orgs/{org}/labels` alone and its own `_named_hole` emits exactly
+that braced spelling; `extract_paths`'s `PATH` refuses it for the missing
+leading `/` and would still refuse 522 of 591 with the method stripped, because
+`{` is not in its class. Ticket 92 owns it.
 
 The separation held throughout: nothing under `~/engagements/` was read into this
 repository and nothing in this repository names a path under it.
