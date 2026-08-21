@@ -185,3 +185,13 @@
   reason no member moved.** Withdrawing the last non-anonymous Identity makes
   every chain whose first step needed a session unsound at once. That is the
   rule working, and it is also the loudest way this migration can go red.
+
+---
+
+**Correction, 2026-08-21.** The caller claim in "What is not covered" checks
+out: `build_kill_chain` and `read_kill_chain` are called by
+`tests/test_database.py` and by nothing in `src/`. `read_kill_chain` is granted
+to `rk2_human`, so a chain is a thing the operator is meant to be able to read
+and no operator command reads one. The deferral to an "orchestrator dispatch ticket" is what was wrong: no such ticket
+existed. Ticket 102 owns the Finding path these chains are composed from, and
+ticket 103 owns both verbs.

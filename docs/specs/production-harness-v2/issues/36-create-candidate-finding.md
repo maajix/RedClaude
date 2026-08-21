@@ -194,3 +194,14 @@ this ticket does with a second claim on one cell, and marking a duplicate is wha
 a ticket that can un-mark one would need; the index is partial over it either
 way, so the day a row is marked, the cell is free again and
 `check_finding_candidates` is what notices if two end up live on it.
+
+---
+
+**Correction, 2026-08-21.** This ticket makes no claim about who calls
+`open_finding`, and the answer is that nothing does. The function is defined at
+`20260815T120000Z__a_supported_claim_becomes_a_candidate.sql:758` and granted at
+`:917`, it holds the only `INSERT INTO findings` in the corpus (`:839`), and it
+has no caller in `src/redkraken/*.py` -- only eleven references in
+`tests/test_database.py`. No `F` label has ever been minted outside a test, so
+everything downstream of a Finding is unreachable in a real hunt. Ticket 102 now
+owns that gap and is the ticket that decides the shape of the caller.

@@ -192,3 +192,13 @@
   was seen to obtain it at one moment, under one scope version, with one
   Identity. Whether the same request would still work tomorrow is a question only
   another run could answer.
+
+---
+
+**Correction, 2026-08-21.** The caller claim in "What is not covered" checks
+out: `issue_pivot_stamp` is called by `tests/test_database.py` and by nothing in
+`src/`. What is not true is the deferral. The "orchestrator dispatch ticket"
+this section names, here and for 038's three verbs, did not exist in the tree
+when this ticket resolved. It is now ticket 102, which owns the Finding path
+itself, and ticket 103, which owns `issue_pivot_stamp` and the other verbs
+downstream of a Finding that still have no production caller.

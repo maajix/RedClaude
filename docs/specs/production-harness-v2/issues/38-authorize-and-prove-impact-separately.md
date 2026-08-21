@@ -171,3 +171,17 @@
   answer, and this ticket does not write one. A cleanup request that answered 500
   still counts as sent -- what stops that run is the supervisor reporting the
   cleanup `failed`, which is a report and not a measurement.
+
+---
+
+**Correction, 2026-08-21.** "What is not covered" says `open_impact_task`,
+`open_impact_replay` and `state_severity` "are called by the CLI and by the
+tests". Two thirds of that is false and was false when it was written.
+`open_impact_task` and `state_severity` appear nowhere in `src/redkraken/*.py`;
+their only references are in `tests/test_database.py`, three and six
+respectively. `open_impact_replay` is the one that checks out --
+`src/redkraken/replay.py:96` runs `SELECT open_impact_replay($1::uuid,
+$2::uuid, $3)` and `cli.py:2705` reaches it through `replay.run` with
+`verbs=replay.IMPACT`. The "orchestrator dispatch ticket" this section defers
+the model-facing verb to did not exist in the tree; it is now ticket 102, and
+ticket 103 owns the two verbs above that still have no caller.
