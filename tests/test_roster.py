@@ -250,6 +250,19 @@ class CompileTest(unittest.TestCase):
             with self.compiling():
                 roster._compile()
 
+    def test_a_bounded_string_is_constrained_and_needs_no_open_declaration(self):
+        # The mirror of the case above. `bounds` is one of the things
+        # `constrained` reads, so a string carrying one is a declared shape
+        # rather than free text and `OPEN_ARGUMENTS` has nothing to say about
+        # it -- which is the property a bounded string argument rests on.
+        contract = dataclasses.replace(
+            roster.CONTRACTS["mcp__rk2__pick_task"],
+            arguments={"task_label": roster.Argument("string", bounds=(1, 65536))},
+        )
+        self.assertTrue(contract.arguments["task_label"].constrained)
+        with mock.patch.dict(roster.CONTRACTS, {"mcp__rk2__pick_task": contract}):
+            roster._compile()
+
     def test_a_contract_that_writes_a_canonical_table_is_refused(self):
         # The rule that keeps promotion the runtime's. A tool reaching one of
         # these would be an agent writing canonical truth directly, and the
@@ -860,6 +873,17 @@ class GateTest(unittest.TestCase):
             roster._value_fault(roster.Argument("integer", bounds=(1, 200)), True)
         )
 
+    def test_a_bounded_string_is_refused_by_its_length_and_not_by_its_value(self):
+        # The gate measures a string by `len` whatever the served schema said,
+        # and that half was always right. It is asserted here because the
+        # schema now says `maxLength`: the two are one statement, and this is
+        # the sentence the served document was corrected to repeat.
+        bounded = roster.Argument("string", bounds=(1, 8))
+
+        self.assertIsNone(roster._value_fault(bounded, "a" * 8))
+        self.assertEqual("is outside 1-8", roster._value_fault(bounded, "a" * 9))
+        self.assertEqual("is outside 1-8", roster._value_fault(bounded, ""))
+
     def test_a_builtin_tool_is_not_argument_checked_against_a_contract_it_has_none_of(self):
         # True of the contract check and only of it: `CONTRACTS` is the set of
         # schemas this runtime serves, and `Task` is served by the CLI. The
@@ -1195,6 +1219,26 @@ class ContractSchemaTest(unittest.TestCase):
             set(),
             {name for name in artifact["properties"] if "hash" in name},
         )
+
+    def test_a_bounded_string_says_length_and_a_bounded_count_says_value(self):
+        # `minimum` and `maximum` are JSON Schema's number vocabulary, and on a
+        # string they name a rule that cannot apply to the value the pair is
+        # about to send. The gate refuses that value by its length, so a schema
+        # written in the number words would be the promise and the check asking
+        # two different questions of one declaration.
+        body = roster.Argument("string", bounds=(1, 65536)).schema()
+
+        self.assertEqual(1, body["minLength"])
+        self.assertEqual(65536, body["maxLength"])
+        self.assertNotIn("minimum", body)
+        self.assertNotIn("maximum", body)
+        # And the half that was always right, which is every bounded argument
+        # this roster ships: a `limit` is bounded by what it counts to.
+        limit = roster.CONTRACTS["mcp__rk2__get_attack_surface"].schema()["properties"]["limit"]
+
+        self.assertEqual(roster._PAGE, (limit["minimum"], limit["maximum"]))
+        self.assertNotIn("minLength", limit)
+        self.assertNotIn("maxLength", limit)
 
     def test_the_one_result_takes_every_element_list_the_spec_names(self):
         # Spec section 13: "proposed Entities, Relationships, Observations,

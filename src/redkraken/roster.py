@@ -370,7 +370,16 @@ class Argument:
         if self.pattern:
             body["pattern"] = self.pattern
         if self.bounds:
-            body["minimum"], body["maximum"] = self.bounds
+            low, high = self.bounds
+            if self.kind == "string":
+                # `minimum` and `maximum` are JSON Schema's number vocabulary
+                # and say nothing about a string. The gate measures a string by
+                # its length, so the schema has to bound the same thing in the
+                # words a validator reads, or the promise and the check are two
+                # different rules wearing one declaration.
+                body["minLength"], body["maxLength"] = low, high
+            else:
+                body["minimum"], body["maximum"] = low, high
         if self.items_pattern and self.kind == "object":
             # A pattern over an object's *keys*, which is what a header name is.
             body["propertyNames"] = {"pattern": self.items_pattern}
