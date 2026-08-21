@@ -224,21 +224,6 @@ PLANNING_STOPS = (
 )
 
 
-def _bounds(
-    tokens: int | None, subagents: int, turns: int, stops: tuple[str, ...]
-) -> packet_module.Bounds:
-    """What one run may spend, from the three parties that each bound part of it.
-
-    The token cap is the scheduler's reservation out of the Program's capacity,
-    the subagent cap is the weights row the scheduler ranked under, and the turn
-    count is the role's. They are gathered here rather than in `packet` because
-    the packet is compiled as `rk2_state`, which can see none of the three.
-    """
-    return packet_module.Bounds(
-        tokens=tokens, subagents=subagents, turns=turns, stop_conditions=stops
-    )
-
-
 #: The one outcome word no `scheduler.chose` row ever carries. `record_choice`
 #: writes five; this is the sixth, and it exists for the case where the write
 #: itself did not happen -- a session named a Task and the database refused the
@@ -1191,11 +1176,11 @@ class Slice:
             ledger,
             connection,
             program_id,
-            _bounds(
-                session.token_cap,
-                session.subagent_cap,
-                roster.ROLES[roster.ORCHESTRATOR].max_turns,
-                PLANNING_STOPS,
+            packet_module.Bounds(
+                tokens=session.token_cap,
+                subagents=session.subagent_cap,
+                turns=roster.ROLES[roster.ORCHESTRATOR].max_turns,
+                stop_conditions=PLANNING_STOPS,
             ),
         )
         if mission is None:
@@ -1502,7 +1487,12 @@ class Slice:
             ledger,
             connection,
             program_id,
-            _bounds(claimed.token_cap, claimed.subagent_cap, role.max_turns, MISSION_STOPS),
+            packet_module.Bounds(
+                tokens=claimed.token_cap,
+                subagents=claimed.subagent_cap,
+                turns=role.max_turns,
+                stop_conditions=MISSION_STOPS,
+            ),
         )
         if mission is None:
             return
@@ -1853,8 +1843,9 @@ class Slice:
         """What this session inherits, compiled because nothing else survives.
 
         On the runtime connection and not the agent one, unlike the packet: the
-        campaign, the budgets and the Task queue are not on the state read
-        surface, and a session choosing between Tasks is not reading inside one.
+        campaign, the budgets and the Tasks waiting to run are not on the state
+        read surface, and a session choosing between Tasks is not reading inside
+        one.
 
         A capsule that cannot be built is the choice not happening, like every
         other failure on this path: the pass keeps its Slate, `claim_task` walks

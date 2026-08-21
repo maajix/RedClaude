@@ -164,6 +164,12 @@ class Bounds:
     `None` is a ceiling nobody set, which is a different fact from a ceiling of
     zero: a Program that stated no token total reserved nothing, and what
     bounds that run is its turn count alone.
+
+    Three parties each bound part of one run and none of them is this module:
+    the token cap is the scheduler's reservation out of the Program's capacity,
+    the subagent cap is the weights row the scheduler ranked under, and the turn
+    count is the role's. `execution` gathers them and constructs this, because a
+    packet is compiled as `rk2_state`, which can read none of the three.
     """
 
     tokens: int | None = None

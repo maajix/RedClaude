@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -2152,6 +2153,33 @@ class ReconciliationTest(unittest.TestCase):
         # The claim still happened: recovering somebody else's work and doing
         # this run's own are two things, and only one of them failed.
         self.assertIn(execution.CLAIM, connection.statements)
+
+
+class VocabularyTest(unittest.TestCase):
+    """The words CONTEXT.md's Slate entry asks this module not to use.
+
+    Read out of the document rather than copied here, because a list written
+    twice is a list that can disagree with itself: the vocabulary of record is
+    CONTEXT.md and this case is only the place where `execution` is held to it.
+
+    `execution` and not every module, because this is where the Slate is walked,
+    offered, chosen from and claimed. A word for it that the vocabulary of
+    record avoids is a second name for the one thing an operator, an ADR and a
+    ledger row all have to be talking about at once.
+    """
+
+    def test_the_module_that_walks_the_slate_never_calls_it_a_queue(self):
+        root = Path(execution.__file__).resolve().parents[2]
+        entry = (root / "CONTEXT.md").read_text().split("**Slate**:", 1)[1]
+        avoided = [
+            word.strip().lower()
+            for word in entry.split("_Avoid_:", 1)[1].splitlines()[0].split(",")
+        ]
+        self.assertEqual(["queue", "candidates", "shortlist", "options"], avoided)
+        source = Path(execution.__file__).read_text().lower()
+        for word in avoided:
+            with self.subTest(word):
+                self.assertNotRegex(source, rf"\b{re.escape(word)}\b")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,17 @@
 -- Measured on that corpus, calling `offer_slate()` five times and taking the
 -- median: 477.6 ms as the schema ships, 10.0 ms with the clause below, 9.9 ms
 -- with `SET jit = off` on the session. The per-function clause reproduces the
--- session-wide number, which is what says the compilation was the whole cost.
+-- session-wide number, which is what says the compilation was the whole cost
+-- there.
+--
+-- Not the whole of the benchmark's number, and this file should not be read as
+-- claiming it is. That case measures a corpus of its own inside the shared
+-- database, and on the corpus alone it costs 186.2 ms both before this clause
+-- and after it, because a database that small never crosses `jit_above_cost` and
+-- never compiles anything. The composed run reports 1159.8 ms against a 1500 ms
+-- budget. What this file removes is a per-call cost that appears once an
+-- installation is large, which is a condition an operator reaches and a test
+-- database only borrows.
 --
 -- Off for this function and not for the database, because JIT is worth having
 -- where a query really does grind through rows -- `check_kill_chains()` over a

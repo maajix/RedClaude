@@ -10,7 +10,7 @@ runs ticket 84's campaign files.
 **Blocked by:** nothing. Ticket 84 grades what the binding yields; this is what
 the binding does not yield.
 
-**Status:** open
+**Status:** ready-for-agent
 
 - [ ] A fixture pair whose two variants differ in the TLS configuration they
       negotiate, not in the bytes they return, and whose `bb:classes` is
@@ -35,8 +35,10 @@ the binding does not yield.
 
 ## Why
 
-Found by ticket 64's final review, finding 5 of `a530b2e93b61130d8`: "Story
-178/187: one shipped Playbook can never be graded." Story 178 asks every
+Found by ticket 64's final review and recorded as
+`one-playbook-has-no-fixture-to-be-graded-against` in
+`baseline/final-review.tsv`: "Story 178/187: one shipped Playbook can never be
+graded." Story 178 asks every
 in-scope Playbook to be graded against fixtures it did not pick; 187 asks a
 verdict to follow from what was filed. For forty-nine of the fifty Playbooks
 ticket 84's campaign will produce one. For `playbooks/http-desync` it cannot,

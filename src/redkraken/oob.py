@@ -261,7 +261,7 @@ def _forbidden(root: Path, configuration: Path) -> str | None:
         return "it is the home directory"
     if (root / ".git").exists():
         return "it holds a .git, so it is a working tree rather than a publish root"
-    if root in configuration.parents:
+    if configuration.parent == root or root in configuration.parents:
         return f"the configuration {configuration.name} is inside it"
     return None
 

@@ -147,6 +147,10 @@ class Store:
         sha256 = digest(data)
         path = path_for(self.root, sha256)
         if path.exists():
+            # The verification, and it is a statement rather than an assignment
+            # because what it returns is bytes this caller already holds:
+            # `load` reads the filed copy back and raises `Corrupt` when it no
+            # longer hashes to the name it is filed under.
             self.load(sha256)
             return sha256, False
         path.parent.mkdir(parents=True, exist_ok=True)

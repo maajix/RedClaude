@@ -397,8 +397,7 @@ def _assert_isolation(ledger: Ledger, environment: Mapping[str, str]) -> None:
         )
         return
     try:
-        host, _ = isolation.proxy_peer(container.proxy_url)
-        isolation.one_peer(engine, container.network, container.proxy_container, host)
+        isolation.peered(engine, container)
     except isolation.Unavailable as error:
         ledger.fail(
             "agent_boundary",

@@ -490,9 +490,11 @@ def stage(
     that would run one over stored Artifacts is `mcp__rk2__run_skill_script`,
     which ticket 87 owes -- and `references/` is maintainer material this system
     has no tool to open. The module docstring says so, and staging either would
-    put files in a child's directory that nothing in its frame can reach. The bytes written are the compiled skill's own `source`, which is
-    what `sha256` digests and what a Task records, so the text a child reads and
-    the digest an installation reports are one object and not two copies.
+    put files in a child's directory that nothing in its frame can reach.
+
+    The bytes written are the compiled skill's own `source`, which is what
+    `sha256` digests and what a Task records, so the text a child reads and the
+    digest an installation reports are one object and not two copies.
 
     `corpus` is a parameter for the reason `compile_corpus`' root is: a test
     can stage a corpus it wrote. Nothing in the running system passes one.

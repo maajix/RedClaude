@@ -300,16 +300,30 @@ class Session:
         }
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
+    def _origin(self, url: str) -> Origin | None:
+        """The configured Origin this URL is under, or none."""
+        return next((item for item in self.origins if item.matches(url)), None)
+
+    def _cookie(self, url: str) -> str:
+        """The `Cookie` line this Identity's jar would put on a request to `url`.
+
+        One walk and not two. `inject` puts this on the wire and `secrets`
+        splits it into the values that must never come back, and those two are
+        the same claim about the same jar: written twice they can drift, and the
+        way they drift is a credential the proxy sends and does not redact.
+        """
+        request = _Request(url)
+        self.jar.add_cookie_header(request)
+        return request.get_header("Cookie") or ""
+
     def inject(self, url: str, headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the wire headers after this Identity owns its credential fields."""
-        origin = next((item for item in self.origins if item.matches(url)), None)
+        origin = self._origin(url)
         static = origin.headers if origin is not None else ()
         owned = {name.lower() for name, _ in static} | {"cookie"}
         answer = [(name, value) for name, value in headers if name.lower() not in owned]
         answer.extend(static)
-        request = _Request(url)
-        self.jar.add_cookie_header(request)
-        cookie = request.get_header("Cookie")
+        cookie = self._cookie(url)
         if cookie:
             answer.append(("Cookie", cookie))
         return answer
@@ -324,16 +338,14 @@ class Session:
         token are each split for the same reason: `sid=abc` reflected as `abc`
         is the same secret arriving under a different spelling.
         """
-        origin = next((item for item in self.origins if item.matches(url)), None)
+        origin = self._origin(url)
         values = []
         for _, value in origin.headers if origin is not None else ():
             values.append(value)
             scheme, _, token = value.partition(" ")
             if scheme and token and " " not in token:
                 values.append(token)
-        request = _Request(url)
-        self.jar.add_cookie_header(request)
-        for crumb in (request.get_header("Cookie") or "").split(";"):
+        for crumb in self._cookie(url).split(";"):
             _, _, value = crumb.partition("=")
             values.append(value.strip())
         return tuple(dict.fromkeys(value for value in values if value.strip()))
@@ -349,7 +361,7 @@ class Session:
 
     def client_certificate(self, url: str) -> ClientCertificate | None:
         """Return the upstream TLS credential only for its exact HTTPS origin."""
-        origin = next((item for item in self.origins if item.matches(url)), None)
+        origin = self._origin(url)
         return origin.client_certificate if origin is not None else None
 
 def seal_session(

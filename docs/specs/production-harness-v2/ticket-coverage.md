@@ -27,13 +27,13 @@ this table when the two differ.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 84, numbered continuously 01–84 |
-| Ticket status | 79 `resolved`, 5 `ready-for-agent`, 0 untriaged |
-| Acceptance criteria | 481 total, 437 ticked |
-| Blocking edges | 158 exact title-and-number references |
+| Ticket files | 88, numbered continuously 01–88 |
+| Ticket status | 84 `resolved`, 3 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
+| Acceptance criteria | 503 total, 468 ticked |
+| Blocking edges | 158 exact title-and-number references, measured over 01–84 |
 | Dependency graph | Acyclic |
-| Open frontier | 79, 80, 84 -- everything blocking them is resolved; 64 waits on the first two |
-| Release reachability | Every ticket except the open 79, 80 and 84 has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought |
+| Open frontier | 65, 84, 87, 88 -- everything blocking them is resolved |
+| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 and 88 were opened by ticket 64's review after that graph was drawn and are not on it |
 | Unticked criteria on resolved tickets | 11, each naming ticket 84, which grades the corpus over the route 78 built |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
@@ -97,10 +97,10 @@ runs, which cost a real Agent run apiece and can come back `fail`.
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–63, 66–78, 81–83 |
-| Unblocked and open | 79, 80, 84 |
-| Blocked and open | 64, by the two research tickets; 65, by the final review in 64 |
-| Criteria ticked | 437 of 481 |
+| Resolved | 01–64, 66–83, 85, 86 |
+| Unblocked and open | 65, 84, 87, 88 |
+| Blocked and open | none |
+| Criteria ticked | 468 of 503 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -305,10 +305,10 @@ schema work or catalogue files.
 
 ## Verdict
 
-**PASS at ticket-plan level**, re-confirmed at 83 tickets. The approved
+**PASS at ticket-plan level**, re-confirmed at 88 tickets. The approved
 dependency graph covers the complete production Spec, the complete planned v1
-knowledge migration and an end-to-end first-hunt release outcome. Seventy-seven
-tickets are resolved; what is left is the final review in 64, the first-hunt
-release outcome in 65 it blocks, and four open research tickets. Implementation
+knowledge migration and an end-to-end first-hunt release outcome. Eighty-four
+tickets are resolved; what is left is the first-hunt release outcome in 65, the
+corpus grading in 84, and the two tickets 64's own review opened, 87 and 88. Implementation
 evidence for every story is no longer a promise in this file -- it is a table the
 release gate's neighbour reads, and nothing in this file substitutes for it.

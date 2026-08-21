@@ -311,14 +311,13 @@ def _launched(
     to one Agent network, and a reader has to be able to see that all of it is
     under the same claim rather than trace an indentation to find out.
     """
-    proxy_host, _ = proxy_peer(container.proxy_url)
     image_environment = _image_environment(engine, container.image)
     watched = sorted(set(image_environment) & set(_startup.WATCHED_ENV_VECTORS))
     if watched:
         raise Unavailable(
             "the Agent image declares watched credential vectors: " + ", ".join(watched)
         )
-    one_peer(engine, container.network, container.proxy_container, proxy_host)
+    peered(engine, container)
 
     inherited = os.environ if source_environment is None else source_environment
     environment = container_environment(container, inherited)
@@ -1253,6 +1252,20 @@ def _private_directory(purpose: str) -> Path:
     if status.st_mode & 0o077:
         directory.chmod(0o700)
     return directory
+
+
+def peered(engine: str, container: AgentContainer) -> None:
+    """Assert the boundary a container describes, without starting anything in it.
+
+    `run` makes this assertion on the way to a launch and `doctor` makes it on
+    its own, and both were making it by the same two calls in the same order.
+    They are one call because they are one claim: an operator asking whether the
+    boundary holds is asking what the next launch will find, and a diagnostic
+    that read the description its own way could agree with a machine the launch
+    will refuse.
+    """
+    host, _ = proxy_peer(container.proxy_url)
+    one_peer(engine, container.network, container.proxy_container, host)
 
 
 def one_peer(engine: str, network: str, proxy_container: str, proxy_host: str) -> None:

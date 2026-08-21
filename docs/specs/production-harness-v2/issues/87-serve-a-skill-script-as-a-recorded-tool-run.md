@@ -8,7 +8,7 @@ that ever runs a Skill script is `skill.check` in CI.
 
 **Blocked by:** nothing.
 
-**Status:** open
+**Status:** ready-for-agent
 
 - [ ] A child holding a Skill can run that Skill's script and read back what it
       printed, or the harness says plainly and in one place that it cannot.
@@ -32,7 +32,8 @@ that ever runs a Skill script is `skill.check` in CI.
 
 ## Why
 
-Found by ticket 64's final review, finding 6 of `a530b2e93b61130d8`: "Story
+Found by ticket 64's final review and recorded as
+`skill-script-declared-and-unserved` in `baseline/final-review.tsv`: "Story
 169/170: Skill scripts are unrunnable at run time." Story 169 asks for
 "deterministic Skill logic placed in scripts with runnable checks, so that
 prompts are not used for work code can perform". The corpus has the scripts and
