@@ -73,7 +73,7 @@ class AuditGateTest(unittest.TestCase):
             "  stories                230   decisions 19  testing 24  scope 9"
             "  notes 6  regressions 7\n"
             "  verification           216   tests 211  gates 5  owed 1\n"
-            "  tickets                 93   resolved 90  audited 63  deferred criteria 11\n"
+            "  tickets                130   resolved 94  audited 63  deferred criteria 11\n"
             "  area: runtime          144   anchors 1\n"
             "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
@@ -436,8 +436,8 @@ class AuditCitationTest(AuditCase):
 
     def test_a_requirement_implemented_by_a_ticket_nobody_wrote_is_refused(self):
         self.assertEqual(
-            [f"{STORY}: names ticket 99, which the tracker does not hold"],
-            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="99"))),
+            [f"{STORY}: names ticket 999, which the tracker does not hold"],
+            check_audit.citation_errors(self.altered(rows=self.rows_with(STORY, tickets="999"))),
         )
 
     def test_a_requirement_nothing_checks_is_release_blocking(self):
@@ -489,9 +489,9 @@ class AuditCitationTest(AuditCase):
 
     def test_evidence_owed_by_nobody_is_refused(self):
         self.assertEqual(
-            [f"{OWED}: owed:99 names a ticket the tracker does not hold"],
+            [f"{OWED}: owed:999 names a ticket the tracker does not hold"],
             check_audit.citation_errors(
-                self.altered(rows=self.rows_with(OWED, tickets="20", verification="owed:99"))
+                self.altered(rows=self.rows_with(OWED, tickets="20", verification="owed:999"))
             ),
         )
 
@@ -631,11 +631,11 @@ class AuditGraphTest(AuditCase):
         # Detaching a ticket from its blockers also detaches everything above it
         # from the release, so this reading is asked for the edge it is about.
         self.assertEqual(
-            ["ticket 20: blocked by 99, which does not exist"],
+            ["ticket 20: blocked by 999, which does not exist"],
             [
                 error
                 for error in check_audit.graph_errors(
-                    self.altered(tickets=self.tickets_with(20, blockers=(99,)))
+                    self.altered(tickets=self.tickets_with(20, blockers=(999,)))
                 )
                 if "does not exist" in error
             ],

@@ -523,6 +523,14 @@ def production_files(
     A root and a classified path can name the same tree -- `src` is both -- so
     the targets are deduplicated before anything is walked; two checks reporting
     the same file twice would read as two problems.
+
+    A build artefact is not code this repository ships, so it is not read.
+    `__pycache__` was always skipped for that reason and `*.egg-info` is the same
+    kind of thing arriving by a different route: an editable install writes a
+    `PKG-INFO` there listing the dependencies of everything resolved into the
+    environment, and this boundary reads a dependency name as a forbidden one.
+    Both are ignored by git, which is the honest test of whether a path is
+    something this tree wrote or something a tool left behind.
     """
     targets = dict.fromkeys([*production_roots, *production_paths])
     for relative_target in targets:
@@ -531,7 +539,9 @@ def production_files(
             continue
         paths = [root] if root.is_file() or root.is_symlink() else sorted(root.rglob("*"))
         for path in paths:
-            if "__pycache__" not in path.parts:
+            if not any(
+                part == "__pycache__" or part.endswith(".egg-info") for part in path.parts
+            ):
                 yield path
 
 
