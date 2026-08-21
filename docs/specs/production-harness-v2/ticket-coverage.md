@@ -1,7 +1,8 @@
 # Production harness v2 — ticket coverage audit
 
-Status: ticket-plan coverage complete; implementation complete except the final
-review, the release outcome and four open research tickets
+Status: ticket-plan coverage complete; implementation complete except the release
+outcome, the corpus grading, the two tickets the final review opened and one
+research ticket
 
 This audit answers whether the approved ticket plan covers the production Spec
 and ends in a runnable first-hunt release candidate. Coverage is a property of
@@ -17,9 +18,11 @@ the one that is right.
 
 ## Structural validation
 
-Re-measured 2026-08-18, after tickets 76–80 were raised by implementation reviews
-and research, 81–83 by authorised live validation, and 84 by ticket 78 building
-the route eleven deferred criteria were waiting on, all triaged into the graph.
+Re-measured 2026-08-21, after tickets 76–80 were raised by implementation reviews
+and research, 81–83 by authorised live validation, 84 by ticket 78 building the
+route eleven deferred criteria were waiting on, 87 and 88 by ticket 64's final
+review, and 89 by an operator question about an external browser tool, all
+triaged into the graph.
 The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
 the audit gate parses. Numbers written here are a snapshot of that reading on the
 date above, not a second source for it -- re-run the gate rather than trusting
@@ -27,13 +30,13 @@ this table when the two differ.
 
 | Check | Result |
 | --- | --- |
-| Ticket files | 88, numbered continuously 01–88 |
-| Ticket status | 84 `resolved`, 3 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
-| Acceptance criteria | 503 total, 468 ticked |
+| Ticket files | 89, numbered continuously 01–89 |
+| Ticket status | 84 `resolved`, 4 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
+| Acceptance criteria | 510 total, 468 ticked |
 | Blocking edges | 158 exact title-and-number references, measured over 01–84 |
 | Dependency graph | Acyclic |
-| Open frontier | 65, 84, 87, 88 -- everything blocking them is resolved |
-| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 and 88 were opened by ticket 64's review after that graph was drawn and are not on it |
+| Open frontier | 65, 84, 87, 88, 89 -- everything blocking them is resolved |
+| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 and 88 were opened by ticket 64's review and 89 by an operator question, all after that graph was drawn, and none of the three is on it |
 | Unticked criteria on resolved tickets | 11, each naming ticket 84, which grades the corpus over the route 78 built |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
@@ -98,9 +101,9 @@ runs, which cost a real Agent run apiece and can come back `fail`.
 | Measure | Value |
 | --- | --- |
 | Resolved | 01–64, 66–83, 85, 86 |
-| Unblocked and open | 65, 84, 87, 88 |
+| Unblocked and open | 65, 84, 87, 88, 89 |
 | Blocked and open | none |
-| Criteria ticked | 468 of 503 |
+| Criteria ticked | 468 of 510 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -305,10 +308,11 @@ schema work or catalogue files.
 
 ## Verdict
 
-**PASS at ticket-plan level**, re-confirmed at 88 tickets. The approved
+**PASS at ticket-plan level**, re-confirmed at 89 tickets. The approved
 dependency graph covers the complete production Spec, the complete planned v1
 knowledge migration and an end-to-end first-hunt release outcome. Eighty-four
 tickets are resolved; what is left is the first-hunt release outcome in 65, the
-corpus grading in 84, and the two tickets 64's own review opened, 87 and 88. Implementation
+corpus grading in 84, the two tickets 64's own review opened, 87 and 88, and the
+browser-tool evaluation in 89. Implementation
 evidence for every story is no longer a promise in this file -- it is a table the
 release gate's neighbour reads, and nothing in this file substitutes for it.
