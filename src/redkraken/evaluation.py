@@ -64,13 +64,14 @@ named above are untouched, and both still refuse.
 from __future__ import annotations
 
 import contextlib
+import tempfile
 import threading
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from redkraken import config, execution, fixture, isolation, migrate, pg, program
+from redkraken import config, execution, fixture, isolation, migrate, pg, program, tls
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 
 
@@ -156,7 +157,7 @@ ENVELOPE = "SELECT cost_reference_tokens FROM scheduler_weights WHERE active"
 #: count off. `playbook_test_verdict` counts a repeat whichever route filed it,
 #: which is right for a verdict -- a run is a run -- and wrong for this number:
 #: the loopback route opens a Program and attempts nothing in it, so a corpus
-#: with 16200 loopback rows against it would report a campaign that owes nothing
+#: with 16500 loopback rows against it would report a campaign that owes nothing
 #: and has measured nothing. What is stated is what the campaign *this machine*
 #: would run still has to do.
 #:
@@ -222,11 +223,22 @@ class Served:
     It does carry the host, because on the door route that is not a constant
     and it is the value the fixture address row is written from. What answered
     and what was recorded have to be one address or the Receipt is fiction.
+
+    It carries the scheme for the same reason and it is stated rather than
+    defaulted. Almost every fixture in this corpus is cleartext, so a default
+    would be right almost every time -- and the one it would be wrong about is
+    the one whose whole ground truth is its handshake, recorded as though there
+    had not been one.
     """
 
     variant: str
     host: str
     port: int
+    #: `http` or `https`, decided by whether the fixture's `app.py` configures a
+    #: handshake. Nothing else reads it: it is what the scope document and the
+    #: fixture address row are written from, and those two have to agree with
+    #: what the socket actually did.
+    scheme: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,22 +329,67 @@ def served(one: fixture.Fixture, variant: str, host: str = HOST) -> Iterator[Ser
     argument, because a bind that answered somewhere else has to be visible: the
     fixture address recorded for the door is this address, and the Receipt is
     pinned to it.
+
+    A fixture whose `app.py` also defines `tls(variant, context)` is served over
+    TLS instead, and that second entry point exists because one class cannot be
+    graded without it. 025 records `transport.tls_configuration` as `probe_only`
+    over `tls_version`, `cipher` and `alpn`; not one of the three is a thing a
+    request handler can write, so a corpus of handlers behind cleartext is a
+    corpus that can never hold a positive for it.
+
+    The certificate is minted here rather than by the fixture, and the split is
+    the same one the fixture format already makes between ground truth and
+    application. Who the target *is* changes every run -- a fresh authority in a
+    directory that dies with the context manager, a leaf naming the origin this
+    evaluator chose -- and is nobody's business but the evaluator's. What the
+    target *negotiates* is the fixture's whole subject, so the context is handed
+    over to be configured before a byte crosses it.
+
+    The authority is this run's and nothing outside this call is given its root,
+    so a client that reaches the fixture cannot verify the chain. That is
+    correct rather than unfortunate: `receipts.transport_citable` is generated
+    from `wire_chain_verified` and `wire_hostname_verified`, so an exchange with
+    this fixture is recorded as the unverified one it is, and the citable
+    measurement the class actually needs is a lane this module does not have.
     """
-    handler = _application(one).get("handler")
+    namespace = _application(one)
+    handler = namespace.get("handler")
     if not callable(handler):
         raise fixture.FixtureError(
             "value_malformed", one.name, "app.py does not define handler(variant)"
         )
+    configure = namespace.get("tls")
+    if configure is not None and not callable(configure):
+        raise fixture.FixtureError(
+            "value_malformed", one.name, "app.py defines tls as something other than a function"
+        )
     server = ThreadingHTTPServer((host, 0), handler(variant))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        bound = server.server_address
-        yield Served(variant=variant, host=str(bound[0]), port=int(bound[1]))
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+    with contextlib.ExitStack() as stack:
+        scheme = "http"
+        if configure is not None:
+            directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="rk2-fixture-tls-")
+            )
+            # The listening socket, wrapped after the bind, so the address the
+            # caller is told about is the one the kernel already gave out. The
+            # handshake then happens inside `accept`, which is where a fixture
+            # that refuses a client's protocol floor refuses it -- and refusing
+            # there is the point of this pair rather than a fault in it.
+            context = tls.authority(Path(directory)).context(origin(one))
+            configure(variant, context)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            scheme = "https"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            bound = server.server_address
+            yield Served(
+                variant=variant, host=str(bound[0]), port=int(bound[1]), scheme=scheme
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 def configuration(directory: Path, slug: str, one: fixture.Fixture, where: Served) -> Path:
@@ -371,7 +428,7 @@ def configuration(directory: Path, slug: str, one: fixture.Fixture, where: Serve
         "[[scope.include]]\n"
         f'host = "{origin(one)}"\n'
         f"ports = [{where.port}]\n"
-        'protocols = ["http"]\n'
+        f'protocols = ["{where.scheme}"]\n'
         'paths = ["/"]\n'
         f"{identities}",
         encoding="utf-8",
@@ -455,7 +512,13 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
             try:
                 connection.execute(
                     OPEN_FIXTURE_ADDRESS,
-                    (program_id, "http", origin(subject.fixture), where.port, where.host),
+                    (
+                        program_id,
+                        where.scheme,
+                        origin(subject.fixture),
+                        where.port,
+                        where.host,
+                    ),
                 )
             except pg.DatabaseError as error:
                 # The database holds every rule about what a fixture address
@@ -742,11 +805,32 @@ def _repeat(
     """One repeat: every variant opened and worked, then counted."""
     programs: dict[str, str] = {}
     for variant in subject.variants:
-        with served(subject.fixture, variant, subject.route.host) as where:
-            path = configuration(workspace, subject.slug(variant, index), subject.fixture, where)
-            result = program.run(
-                settings, path, corpus=subject.corpus, execute=_graded_work(subject, variant, where)
+        try:
+            with served(subject.fixture, variant, subject.route.host) as where:
+                path = configuration(
+                    workspace, subject.slug(variant, index), subject.fixture, where
+                )
+                result = program.run(
+                    settings,
+                    path,
+                    corpus=subject.corpus,
+                    execute=_graded_work(subject, variant, where),
+                )
+        except tls.Unusable as unusable:
+            # A fixture that configures its own handshake needs an authority to
+            # configure, and `tls.authority` is the same call `proxy`, `browser`
+            # and `doctor` each translate into a refusal of their own. This is
+            # this module's translation: a machine with no `openssl` cannot bind
+            # this fixture, and saying so once is worth more than a traceback
+            # from inside a context manager three frames down.
+            ledger.fail(
+                "repeat",
+                f"repeat {index} of {subject.fixture.name} ({variant}) serves its own "
+                f"handshake, so it needs certificate material, and {unusable}",
+                code=INVALID_CONFIGURATION,
+                source=f"fixture:{subject.fixture.name}",
             )
+            return None
         ledger.assertions.extend(result.assertions)
         if result.violations or not result.facts.get("program_id"):
             ledger.refuse(

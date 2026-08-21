@@ -38788,17 +38788,6 @@ class PlaybookEvaluationTest(DatabaseCase):
 
     SHIPPED = "playbooks/object-ownership/playbook.md"
 
-    #: The one Playbook in the catalogue whose output class no own-pair fixture
-    #: declares, so its verdict stops at the first `untested` clause rather than
-    #: the last. 056 shipped it that way deliberately:
-    #: `transport.tls_configuration` is settled by a measurement the proxy takes
-    #: on a lane it does not intercept, so grading it needs a target serving two
-    #: TLS configurations to that lane rather than a handler a fixture can write.
-    #: Ticket 88 owns that fixture and the half of `evaluation.served` that
-    #: could serve it; until it lands, ticket 84's campaign files no verdict
-    #: for this Playbook however many runs it spends.
-    UNGRADED = "playbooks/http-desync/playbook.md"
-
     #: The pair whose ground truth contains the Playbook's declared class, and
     #: the pair whose ground truth contains a class no authorization Playbook
     #: declares. The binding derives `in` and `out` from exactly that.
@@ -39905,23 +39894,24 @@ class PlaybookEvaluationTest(DatabaseCase):
         # fully tested at its current text and the rest have never been run.
         # That second half is a known gap and not a regression: a Playbook ships
         # `draft`, an evaluation is a run against every fixture in the binding,
-        # and until somebody spends it the check says so once per Playbook. One
-        # of them says it differently -- `UNGRADED` has no own pair to be run
-        # against at all, so it never reaches the clause about runs. Any other
-        # row here is the regression.
+        # and until somebody spends it the check says so once per Playbook.
+        #
+        # Every Playbook says it the same way, and that is what ticket 88
+        # changed. `playbooks/http-desync` used to say it differently: its only
+        # output class was declared by no own-pair fixture, so its verdict
+        # stopped at the first `untested` clause and it never reached the clause
+        # about runs. `tls-configuration-pair` declares that class now, so the
+        # Playbook is bound like the other forty-nine and is waiting on runs
+        # rather than on a fixture. A row here that reads differently from the
+        # rest is the regression that statement used to hide.
         self.assertEqual(
             [
                 (
                     "warning",
                     "draft_playbook_untestable",
                     f"{one.path} -> "
-                    + (
-                        "no own-pair fixture declares a class this playbook"
-                        " declares as an output"
-                        if one.path == self.UNGRADED
-                        else f"{len(fixture.FIXTURES)} fixture(s) in the binding"
-                        " have no run at this text"
-                    ),
+                    f"{len(fixture.FIXTURES)} fixture(s) in the binding"
+                    " have no run at this text",
                 )
                 for one in sorted(playbook.PLAYBOOKS.values(), key=lambda one: one.path)
                 if one.path != self.SHIPPED
@@ -40005,9 +39995,14 @@ class PlaybookEvaluationTest(DatabaseCase):
         program = self.programs[self.OWN, "vulnerable"]
         for name, arguments, expected in (
             (
+                # Two schemes and no more, since ticket 88: a fixture whose
+                # `app.py` defines `tls(variant, context)` is served over
+                # `https` and every other fixture is served over `http`. A
+                # third spelling is still a claim about a listener nothing
+                # starts, and this is the case that says so.
                 "protocol",
-                (program, "https", HOST, 80, self.FIXTURE_ADDRESS),
-                "a fixture is served over http, not https",
+                (program, "ftp", HOST, 80, self.FIXTURE_ADDRESS),
+                "a fixture is served over http or https, not ftp",
             ),
             (
                 "port",
@@ -40780,7 +40775,9 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
             route=evaluation.Route(name=evaluation.LOOPBACK, host=evaluation.HOST),
         )
         already = self.reports[self.OWN].facts["runs"][0]["programs"]["vulnerable"]
-        where = evaluation.Served(variant="vulnerable", host=evaluation.HOST, port=44321)
+        where = evaluation.Served(
+            variant="vulnerable", host=evaluation.HOST, port=44321, scheme="http"
+        )
         ledger = Ledger()
         try:
             with self.connection.transaction():

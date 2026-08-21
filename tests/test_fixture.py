@@ -15,8 +15,10 @@ one the production configuration reader accepts.
 
 import http.client
 import json
+import ssl
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
 from redkraken import config, document, evaluation, fixture, isolation, scope
 from redkraken.outcome import Ledger
@@ -286,7 +288,12 @@ class Serving(unittest.TestCase):
     def get(self, where: evaluation.Served, path: str = "/notes/2") -> tuple[int, bytes]:
         connection = http.client.HTTPConnection(where.host, where.port, timeout=5)
         try:
-            connection.request("GET", path)
+            # `Connection: close`, so the server closes first. The fixture
+            # speaks HTTP/1.1 and would otherwise sit in `readline` until this
+            # client hangs up, and a TLS socket closed without a `close_notify`
+            # raises `ConnectionResetError` inside the handler thread -- a
+            # traceback printed into the suite output about nothing.
+            connection.request("GET", path, headers={"Connection": "close"})
             answer = connection.getresponse()
             return answer.status, answer.read()
         finally:
@@ -353,9 +360,144 @@ class Serving(unittest.TestCase):
         with evaluation.served(one_fixture, "vulnerable", "127.0.0.2") as where:
             self.assertEqual("127.0.0.2", where.host)
             self.assertEqual((200, b"vulnerable"), self.get(where))
-            elsewhere = evaluation.Served(variant="vulnerable", host="127.0.0.1", port=where.port)
+            elsewhere = evaluation.Served(
+                variant="vulnerable", host="127.0.0.1", port=where.port, scheme="http"
+            )
             with self.assertRaises(OSError):
                 self.get(elsewhere)
+
+
+class ServingOverTls(unittest.TestCase):
+    """`evaluation.served` when the fixture configures its own handshake.
+
+    The shipped pair rather than a written one, deliberately. Every other case
+    in this file builds its corpus on disk so the violation can exist somewhere
+    the real corpus is not; there is no violation here, and what is under test
+    is that the one fixture whose ground truth is a handshake actually gets one.
+    A hand-written stand-in would prove that `served` can wrap a socket and
+    would prove nothing about the corpus.
+    """
+
+    NAME = "tls-configuration-pair"
+    SUBJECT = "/app"
+
+    def client(self) -> ssl.SSLContext:
+        """A client that verifies nothing, because there is nothing to verify.
+
+        `served` mints a fresh authority per call into a directory it deletes,
+        and hands nobody the root. That is the design rather than a shortcut --
+        `receipts.transport_citable` is generated from the two verification
+        columns, so an exchange with this fixture is recorded as unverified,
+        which is what it is.
+        """
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    class Answer(NamedTuple):
+        """One exchange with the fixture, from both sides of the wrapped socket.
+
+        `version` is above the answer rather than in it, and that is the whole
+        subject of this pair: the two halves agree on `status`, `body` and
+        `advertised`, and the field they differ in is the one no handler wrote.
+        """
+
+        status: int
+        body: bytes
+        advertised: str | None
+        version: str
+
+    def read(self, where: evaluation.Served, path: str) -> "ServingOverTls.Answer":
+        connection = http.client.HTTPSConnection(
+            where.host, where.port, timeout=5, context=self.client()
+        )
+        try:
+            # `Connection: close`, so the server closes first. The fixture
+            # speaks HTTP/1.1 and would otherwise sit in `readline` until this
+            # client hangs up, and a TLS socket closed without a `close_notify`
+            # raises `ConnectionResetError` inside the handler thread -- a
+            # traceback printed into the suite output about nothing.
+            connection.request("GET", path, headers={"Connection": "close"})
+            answer = connection.getresponse()
+            body = answer.read()
+            # Asked of the socket rather than of the response, and asserted
+            # rather than rendered: `version()` answers `None` on a socket that
+            # never completed a handshake, and `str(None)` is a string that
+            # compares like any other and would let a failed negotiation pass
+            # for a measurement.
+            negotiated = connection.sock.version()
+            self.assertIsNotNone(negotiated)
+            return self.Answer(
+                status=answer.status,
+                body=body,
+                advertised=answer.getheader("Strict-Transport-Security"),
+                version=str(negotiated),
+            )
+        finally:
+            connection.close()
+
+    def test_the_fixture_that_configures_a_handshake_is_served_over_one(self):
+        one_fixture = fixture.FIXTURES[self.NAME]
+        for variant in evaluation.PAIR:
+            with self.subTest(variant=variant):
+                with evaluation.served(one_fixture, variant) as where:
+                    self.assertEqual("https", where.scheme)
+                    self.assertEqual(200, self.read(where, self.SUBJECT).status)
+
+    def test_every_other_fixture_is_still_served_over_cleartext(self):
+        # The scheme is a property of the fixture and not a mode the evaluator
+        # is put into. One fixture in the corpus has a handshake; the rest are
+        # the corpus this ticket did not change.
+        for name, one_fixture in fixture.FIXTURES.items():
+            if name == self.NAME:
+                continue
+            with self.subTest(name=name):
+                with evaluation.served(one_fixture, "vulnerable") as where:
+                    self.assertEqual("http", where.scheme)
+
+    def test_the_two_halves_differ_in_the_handshake_and_in_nothing_else(self):
+        # The whole of this pair, as one assertion. `transport.tls_configuration`
+        # is settled over `tls_version`, `cipher` and `alpn`, so a pair whose
+        # halves also differed in a byte would let a reading establish the class
+        # from the wrong evidence -- and one whose halves agreed on the version
+        # would not be a pair at all.
+        one_fixture = fixture.FIXTURES[self.NAME]
+        answers = {}
+        for variant in evaluation.PAIR:
+            with evaluation.served(one_fixture, variant) as where:
+                answers[variant] = self.read(where, self.SUBJECT)
+
+        self.assertEqual("TLSv1.2", answers["vulnerable"].version)
+        self.assertEqual("TLSv1.3", answers["secure"].version)
+        self.assertEqual(answers["vulnerable"][:3], answers["secure"][:3])
+
+    def test_the_advertisement_is_the_same_on_both_halves(self):
+        # The header is what makes the weaker handshake a finding rather than a
+        # preference, so it has to be identical: a pair that advertised
+        # differently would be positive for `transport.header_policy` instead.
+        one_fixture = fixture.FIXTURES[self.NAME]
+        said = {}
+        for variant in evaluation.PAIR:
+            with evaluation.served(one_fixture, variant) as where:
+                said[variant] = self.read(where, self.SUBJECT).advertised
+
+        self.assertEqual(said["vulnerable"], said["secure"])
+        self.assertIn("preload", str(said["vulnerable"]))
+
+    def test_an_application_whose_tls_is_not_callable_is_refused(self):
+        # The same refusal `handler` gets, for the same reason: a fixture that
+        # declared a handshake and did not supply one would be served over
+        # cleartext and graded as though it had negotiated something.
+        root = corpus(
+            object_ownership=(frontmatter(FIELDS) + BODY, APPLICATION + "tls = 3\n")
+        )
+        one_fixture = fixture.compile_corpus(root)["object-ownership"]
+        with self.assertRaises(fixture.FixtureError) as refused:
+            with evaluation.served(one_fixture, "vulnerable"):
+                pass
+
+        self.assertEqual("value_malformed", refused.exception.code)
 
 
 class Routing(unittest.TestCase):
@@ -397,7 +539,9 @@ class Configuration(unittest.TestCase):
     """The Program document each repeat is opened under."""
 
     def written(self, one_fixture: fixture.Fixture, slug: str = "eval-selftest") -> Path:
-        where = evaluation.Served(variant="vulnerable", host=evaluation.HOST, port=44321)
+        where = evaluation.Served(
+            variant="vulnerable", host=evaluation.HOST, port=44321, scheme="http"
+        )
         return evaluation.configuration(scratch(), slug, one_fixture, where)
 
     def test_the_document_is_one_the_production_reader_accepts(self):

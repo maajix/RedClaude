@@ -71,9 +71,14 @@ NETWORK_MODULES = frozenset(
         "aiohttp",
     }
 )
-#: The two of those a listener needs. A fixture app serves and never dials, and
-#: this is the difference between the two.
-LISTENER_MODULES = frozenset({"http.server", "socketserver"})
+#: The three of those a listener needs. A fixture app serves and never dials, and
+#: this is the difference between the two. `ssl` is here from ticket 88 and is
+#: the one that needs a reason: it cannot open a connection -- it wraps a socket
+#: something else already has -- and a fixture whose ground truth is its TLS
+#: configuration has to name `ssl.TLSVersion` to state what it terminates at.
+#: The modules that actually dial are still refused, so a fixture holding this
+#: one and nothing else can serve a handshake and still reach nobody.
+LISTENER_MODULES = frozenset({"http.server", "socketserver", "ssl"})
 #: Where the target applications live inside the package.
 FIXTURE_DIRECTORY = "fixtures"
 #: The one statement that files a Receipt, spelled as it would be spelled in

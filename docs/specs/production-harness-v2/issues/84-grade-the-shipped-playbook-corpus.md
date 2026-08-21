@@ -42,13 +42,13 @@ reads the two things the verdict reads -- `playbook_fixture_binding` and
 `playbook_test_policy` -- discounts every repeat already filed at the text a
 Playbook ships, and reports what the corpus still owes:
 
-    50 Playbook(s) against 54 bound fixture(s) each, 0 of the required
+    50 Playbook(s) against 55 bound fixture(s) each, 0 of the required
     repeat(s) already filed at the text they ship
-    16200 Agent run(s) still owed, reserving 3240000000 token(s) against
+    16500 Agent run(s) still owed, reserving 3300000000 token(s) against
     the 200000-token envelope one run is ranked against
 
-Sixteen thousand two hundred, because the binding is total: every one of the 54
-fixtures is bound to every one of the 50 Playbooks, `required_repeats` is 3, and
+Sixteen thousand five hundred, because the binding is total: every one of the
+55 fixtures is bound to every one of the 50 Playbooks, `required_repeats` is 3, and
 every fixture in this catalogue is an `own_pair`, so one repeat is two Programs
 -- the vulnerable half and the control. Nothing in that number is an estimate.
 The token figure is the reservation those runs imply at
@@ -58,7 +58,7 @@ scarce in; no price is invented, because dollars are not a column here.
 The command also states the route, and that is the part that decides whether the
 spend buys a measurement. `rk playbook evaluate` on a machine describing no
 Agent boundary opens each Program and attempts nothing in it, so a corpus graded
-that way files 16200 honest zeroes. The campaign therefore needs a machine with
+that way files 16500 honest zeroes. The campaign therefore needs a machine with
 the boundary ticket 78 built -- an agent image, an internal network, a door and
 its certificate -- and an Agent credential to spend.
 
@@ -69,10 +69,27 @@ boxes are one run of the surface that now exists, and the eleven deferred
 criteria across tickets 46 and 49 through 57 are waiting on its result rather
 than on anything else being built.
 
+## What one Playbook in the fifty will grade, before anybody spends on it
+
+Ticket 88 gave `playbooks/http-desync` the own pair it had never had, so it is
+now bound like the other forty-nine and this campaign will file runs for it.
+What those runs return is worth knowing in advance: `tls-configuration-pair`
+serves the same bytes under the same advertisement on both halves, and the field
+they differ in is the negotiated TLS version, which an Agent behind the
+interception proxy cannot observe. So that Playbook reaches clause 4 of
+`playbook_test_verdict` and grades `fail` -- `median discriminating finding < 1`
+-- rather than `pass`, and it will do that however many runs this campaign
+spends on it.
+
+The lane that would change the answer is ticket 93, the unintercepted transport
+measurement. This ticket is not blocked on it: forty-nine Playbooks are graded
+on evidence their Agent can actually take, and the fiftieth grades honestly on
+the evidence available. It is recorded here so the spend is decided knowing it.
+
 ## The decision on spend
 
 Delegated to the agent and taken here, so the ticket says what it is waiting
-for rather than waiting for it to be decided again. **The full 16200-run
+for rather than waiting for it to be decided again. **The full 16500-run
 campaign is not what to buy.** What to buy is a slice of it at full binding and
 shipped repeats, and the end-to-end question the campaign does not answer goes
 to a real engagement instead.
@@ -100,10 +117,10 @@ So the only honest lever is **which Playbooks are graded**, each one whole.
 
 ### What a slice costs, and what it buys
 
-One Playbook graded fully is 54 bound fixtures x 3 repeats x 2 Programs per
-own-pair repeat = **324 Agent runs**, reserving 64800000 tokens against the
+One Playbook graded fully is 55 bound fixtures x 3 repeats x 2 Programs per
+own-pair repeat = **330 Agent runs**, reserving 66000000 tokens against the
 same 200000-token envelope `rk playbook cost` reports the whole campaign
-against. Ten Playbooks is 3240 runs and a fifth of the campaign; each of the
+against. Ten Playbooks is 3300 runs and a fifth of the campaign; each of the
 ten gets a verdict that can actually promote it to `stable` at its own `p_sha`,
 and the other forty stay `draft` with `check_playbook_tests` saying so every
 run, which is the state the harness already models honestly.
