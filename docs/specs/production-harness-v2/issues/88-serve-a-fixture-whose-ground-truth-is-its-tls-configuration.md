@@ -19,7 +19,7 @@ the binding does not yield.
       `ThreadingHTTPServer((host, 0), handler(variant))` -- every fixture in the
       corpus is graded over cleartext, which is the one thing this class cannot
       be graded over.
-- [ ] The measurement reaches the fixture on the lane whose receipt is
+- [x] The measurement reaches the fixture on the lane whose receipt is
       admissible for the question. The Playbook's whole subject is that an
       ordinary reading through the interception proxy describes the proxy's own
       door; a fixture graded through that door grades the door. **Deferred:**
@@ -31,7 +31,10 @@ the binding does not yield.
       at all, so every receipt in this harness carries 021's default of
       `target_traffic` and every reading of this fixture still goes through the
       door. Ticket 93 builds that writer and decides the trust anchor a fixture
-      measurement verifies against.
+      measurement verifies against. **Closed by ticket 93:** the writer is
+      `record_transport_measurement`, the anchor is the evaluator's per-run
+      authority for the Program it was minted for, and both halves of this pair
+      are now measured on that lane and told apart by their Receipts.
 - [x] `playbook_fixture_binding` gives `playbooks/http-desync` a non-empty
       in-pair side, and `playbook_test_verdict` reaches a clause past
       `untested` for it.

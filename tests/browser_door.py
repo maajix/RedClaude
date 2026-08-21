@@ -49,7 +49,7 @@ LISTENING = "listening"
 ADDRESS = "93.184.216.34"
 
 
-def connector(host, port, timeout, protocol, address, client_certificate):
+def connector(host, port, timeout, protocol, address, client_certificate, *, anchor=None):
     """The door's outbound side, verifying the authority the fixture issued from."""
     context = ssl.create_default_context(cafile=os.environ["RK_DOOR_TARGET_CA"])
     if client_certificate is not None:

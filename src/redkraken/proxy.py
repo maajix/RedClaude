@@ -91,6 +91,7 @@ from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources.abc import Traversable
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import SplitResult, quote, urljoin, urlsplit
 
 from redkraken import build, config, identity, migrate, pg, program, scope, seal, tls, vault
@@ -440,10 +441,21 @@ class FixtureAddress:
     not this process's opinion of it. A door that filled in `fixture` for itself
     would be describing its own behaviour on a row an auditor reads as a
     description of the policy.
+
+    The third is the anchor, and it comes from the same row for the same reason.
+    A fixture's certificate is signed by an authority `rk playbook evaluate`
+    minted for this Program alone, so the only party that can say which authority
+    that is, is the one holding the row -- and a door that picked a trust anchor
+    for itself would be deciding what counts as a verified target.
     """
 
     address: str
     scope_class: str
+    #: The PEM certificate a transport measurement of this fixture is verified
+    #: against, and `None` for a cleartext one. Used at no other address and for
+    #: no other Program: it reaches `connect` only on the probe dialled at this
+    #: row's own host and port.
+    trust_anchor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -965,7 +977,7 @@ AUTHORIZE_ADDRESS = (
 #: door that decided for itself which targets are synthetic could call anything
 #: one.
 FIXTURE_ADDRESS = (
-    "SELECT address, scope_class"
+    "SELECT address, scope_class, trust_anchor"
     "  FROM authorize_fixture_address($1, $2, $3, $4::integer)"
 )
 
@@ -1017,6 +1029,12 @@ WIRE_KEYING = (
 #: Answers with the Receipt's label rather than its row id, because a label is
 #: the only name the agent reading this refusal can look up.
 BLOCKED = "SELECT write_blocked_receipt($1::uuid, $2::jsonb, $3)"
+
+#: Ticket 93. The one write the door makes about a handshake nobody but the door
+#: took, and it opens the runtime Tool run the row is attributed to as well --
+#: `rk2_proxy` holds EXECUTE on writers and no DML, so the provenance of a probe
+#: is minted by the same function that files it or the probe has none.
+MEASUREMENT = "SELECT record_transport_measurement($1, $2::jsonb)"
 
 #: The third decision, and the only one that is not about this request alone. It
 #: takes the capability rather than the Program for the same reason the address
@@ -1193,7 +1211,12 @@ class Fence:
                 raise _refusal(error, request.host) from error
         if not rows:
             return None
-        return FixtureAddress(address=str(rows[0][0]), scope_class=str(rows[0][1]))
+        anchor = rows[0][2]
+        return FixtureAddress(
+            address=str(rows[0][0]),
+            scope_class=str(rows[0][1]),
+            trust_anchor=None if anchor is None else str(anchor),
+        )
 
     def authorize_address(
         self, program_id: str, capability: str, request: scope.Request, address: str
@@ -1370,6 +1393,31 @@ class Fence:
             except pg.DatabaseError as error:
                 raise Refused("receipt write refused", str(error)) from error
         return as_object(answer)
+
+    def measurement(self, program_id: str, capability: str, receipt: dict) -> str:
+        """File one handshake this door took on its own behalf, and name it.
+
+        The narrowest of the writes here: no artifacts, no seals and no Identity,
+        because a probe sends no request and reads no body. What it carries is
+        the wire side of a handshake and where it was taken, and everything
+        citability turns on -- the purpose, the Lane, the decision, the
+        interception -- is assigned by the function rather than sent to it.
+
+        A refusal is raised like any other so that the caller can decide what it
+        costs, and the caller decides it costs nothing: an exchange that was
+        served is served whether or not the door managed to also measure the
+        target.
+        """
+        with self._lock:
+            self._bind(program_id)
+            try:
+                return str(
+                    self.connection.execute(
+                        MEASUREMENT, (capability, json.dumps(receipt))
+                    ).scalar()
+                )
+            except pg.DatabaseError as error:
+                raise Refused("measurement write refused", str(error)) from error
 
     def reads(self, program_id: str, capability: str, sha256: str) -> bool:
         """Whether the Agent of this capability's Program can already read these bytes.
@@ -1615,10 +1663,28 @@ class Fence:
 
 
 Resolver = Callable[[str, int], tuple[str, ...]]
-Connector = Callable[
-    [str, int, float, str, str, identity.ClientCertificate | None],
-    "tuple[http.client.HTTPConnection, Handshake | None]",
-]
+
+
+class Connector(Protocol):
+    """How this door opens a socket towards a target.
+
+    A protocol rather than a `Callable` alias because of the last argument: the
+    trust anchor is keyword-only, so that the ordinary dial reads exactly as it
+    did and the one call that measures a fixture says at the call site which
+    authority it is measuring against.
+    """
+
+    def __call__(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        protocol: str,
+        address: str,
+        client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
+    ) -> tuple[http.client.HTTPConnection, Handshake | None]: ...
 
 
 def resolve(host: str, port: int) -> tuple[str, ...]:
@@ -1873,6 +1939,8 @@ def connect(
     protocol: str,
     address: str,
     client_certificate: identity.ClientCertificate | None,
+    *,
+    anchor: str | None = None,
 ) -> tuple[http.client.HTTPConnection, Handshake | None]:
     """Open the connection to the address this request was pinned to.
 
@@ -1912,6 +1980,15 @@ def connect(
     protocol the target will not speak, a reset, a timeout -- is the target
     being unreachable, and dialling it again without verification would answer
     a question nobody asked.
+
+    `anchor` replaces the system store, and only one caller passes one: the probe
+    that measures an evaluation's fixture, with the authority the database holds
+    for that one Program. It is a replacement rather than an addition, because a
+    context carrying both would let a fixture's authority vouch for a public name
+    and the system's roots vouch for a fixture -- and because the door has no
+    business trusting the evaluator's authority for anything except the address
+    the evaluator recorded. Everything else arrives here with no anchor and is
+    verified exactly as it was.
     """
     if protocol != "https":
         raw = socket.create_connection((address, port), timeout=timeout)
@@ -1919,7 +1996,7 @@ def connect(
         connection.sock = raw
         return connection, None
 
-    context = ssl.create_default_context()
+    context = ssl.create_default_context(cadata=anchor)
     # Told to the target because it is true: everything above this speaks
     # HTTP/1.1 and nothing here can read a frame of anything else. Unset, the
     # two sides of an intercepted exchange disagreed about ALPN on every row --
@@ -2010,6 +2087,17 @@ class Server(ThreadingHTTPServer):
         #: wire-only credential headers.  Without it those responses fail
         #: closed; ordinary one-view exchanges do not need key material.
         self.root_secret = root_secret
+        #: Which targets this door has already taken a transport measurement of,
+        #: as `(program, host, port)`. Here rather than in the database, and it
+        #: is what bounds the cost: a measurement is a second handshake with the
+        #: target, so one per target for as long as this door is up is the
+        #: difference between measuring a target and hammering it. A door that
+        #: restarts measures again, which is the honest reading of a set held in
+        #: a process -- what it records is what this door saw.
+        self.measured: set[tuple[str, str, int]] = set()
+        #: And the lock over it. Every request is its own thread, so two requests
+        #: to one target that arrive together would otherwise both measure it.
+        self.measured_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2039,6 +2127,13 @@ class Handler(BaseHTTPRequestHandler):
     #: tunnel, and a handshake carried over would put one target's certificate on
     #: another target's Receipt.
     wire: Handshake | None = None
+
+    #: The authority a measurement of this request's target is verified against,
+    #: when the target is an evaluation's fixture and the database handed one
+    #: over. Reset per request with the two above and for their reason: an anchor
+    #: carried over would be this door offering one fixture's authority for
+    #: another target's handshake.
+    anchor: str | None = None
 
     #: The budget slot this request holds, and the Program it was taken under.
     #: On the instance rather than passed down, because what gives it back is not
@@ -2104,6 +2199,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.contacted = False
         self.wire = None
+        self.anchor = None
         self.slot = None
         self.slot_program = program_id
         try:
@@ -2357,6 +2453,10 @@ class Handler(BaseHTTPRequestHandler):
             authorization.program_id, capability, request
         )
         if fixture is not None:
+            # Kept for the probe and for nothing else. The exchange below is the
+            # agent's, and the agent's view of this fixture stays what it is: a
+            # leaf this door forged, on a chain the agent cannot check.
+            self.anchor = fixture.trust_anchor
             return (
                 replace(authorization, scope_class=fixture.scope_class),
                 (fixture.address,),
@@ -2466,6 +2566,116 @@ class Handler(BaseHTTPRequestHandler):
             self.server.fence.release(self.slot_program, slot, self.contacted)
         except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
             self.log_error("no release for %s: %s", slot, error)
+
+    def _measure(
+        self,
+        authorization: Authorization,
+        capability: str,
+        request: scope.Request,
+        addresses: tuple[str, ...],
+    ) -> None:
+        """Take this door's own handshake with the target, once, and file it.
+
+        Ticket 93. Everything above this method describes an exchange the agent
+        asked for, and every TLS fact on that row is doubled for the reason 025
+        records: the agent's side is the door's certificate, and the door's side
+        is on a socket carrying somebody else's request. This is the other kind
+        of connection -- opened by this process, for this process, with nothing
+        downstream -- and it is the only kind `receipts.transport_citable` will
+        ever be true of.
+
+        The order is the order of the request that triggered it, and that is what
+        makes it the same lane rather than a second one. The scope decision has
+        already been made and is not made again: this dials the address that
+        decision pinned, for the Program it was made for, and refuses to run at
+        all for a class a measurement may not be filed under. What it does ask
+        for again is budget, because a handshake is egress: it takes its own slot
+        from the same per-target concurrency and the same token bucket the
+        exchange took one from, and a Program with none left is not measured now.
+
+        Nothing here may change what the caller was told. It runs after the
+        answer has been written, every failure is logged and swallowed, and a
+        target that could not be measured gives its claim back so that a later
+        request tries again -- an exchange that was served stays served whether
+        or not the door also managed to measure the target it served from.
+        """
+        if request.protocol != "https" or self.server.fence is None:
+            return
+        # The two classes 025's shape constraint admits. An `egress_support` host
+        # is somewhere the harness talks to on its own business rather than a
+        # target under test, and a measurement of one would be a claim nobody
+        # asked for filed against a Program's budget.
+        if authorization.scope_class not in ("target", "fixture"):
+            return
+
+        target = (authorization.program_id, request.host, request.port)
+        with self.server.measured_lock:
+            if target in self.server.measured:
+                return
+            self.server.measured.add(target)
+
+        address = addresses[0]
+        slot: Reservation | None = None
+        filed = False
+        try:
+            slot = self.server.fence.reserve(authorization.program_id, capability, request)
+            if not slot.granted:
+                return
+            arrival = datetime.now(timezone.utc)
+            connection, wire = self.server.connector(
+                request.host,
+                request.port,
+                self.server.target_timeout,
+                request.protocol,
+                address,
+                # No Identity. A measurement is about what the target's transport
+                # is, which it is before anybody authenticates, and offering a
+                # leased credential to open a socket nobody sends a request on
+                # would spend an Identity on a question it cannot answer.
+                None,
+                anchor=self.anchor,
+            )
+            connection.close()
+            if wire is None:
+                return
+            self.server.fence.measurement(
+                authorization.program_id,
+                capability,
+                {
+                    "reason": f"transport measured as {authorization.scope_class}"
+                    f" under scope version {authorization.scope_version}",
+                    "scheme": request.protocol,
+                    "host": request.host,
+                    "port": request.port,
+                    "pinned_ips": pinned_ips((address,)),
+                    "ts_arrival": arrival.isoformat(),
+                    "ts_egress": datetime.now(timezone.utc).isoformat(),
+                    "scope_class": authorization.scope_class,
+                    "notes": _notes(None, wire),
+                    # The wire side alone, which is the whole of what this row
+                    # is: `transport` writes no agent columns when there is no
+                    # agent handshake, and there was none.
+                    **transport(None, wire),
+                },
+            )
+            filed = True
+        except (
+            Refused,
+            OSError,
+            http.client.HTTPException,
+            pg.DatabaseError,
+            pg.ConnectionError_,
+        ) as error:
+            self.log_error("no measurement for %s:%s: %s", request.host, request.port, error)
+        finally:
+            if not filed:
+                with self.server.measured_lock:
+                    self.server.measured.discard(target)
+            if slot is not None and slot.granted and slot.id is not None:
+                try:
+                    self.server.fence.release(authorization.program_id, slot.id, True)
+                except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+                    self.log_error("no release for measurement %s: %s", slot.id, error)
 
     def _forward(
         self,
@@ -2919,6 +3129,11 @@ class Handler(BaseHTTPRequestHandler):
             receipt=label,
             reason=agent_reason,
         )
+        # After the answer, deliberately. The measurement is a second handshake
+        # with the same target, and making the caller wait for it would put the
+        # cost of an audit record on the latency of every exchange with a target
+        # this door has not met before.
+        self._measure(authorization, capability, request, addresses)
 
     def _refuse(
         self,

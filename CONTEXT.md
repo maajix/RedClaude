@@ -706,9 +706,12 @@ event (an Event is the redacted audit record, and an arrival raises one)
 **Lane**:
 Which party caused a request: `agent` (a subagent acted), `replay` (the runtime
 re-executed a test), or `proxy_internal` (the proxy acted as a client of the
-target on its own behalf). Only the first two can back an observation, and every
+target on its own behalf). The first two can back an observation, and every
 standing rule about egress reads both of them: a rule that named `agent` alone
-would be a rule a replay's requests are invisible to.
+would be a rule a replay's requests are invisible to. The third backs one only
+when it is the door's own transport measurement -- a handshake this process took
+with the target itself, which is the one reading about a target's transport that
+does not describe the door -- and backs nothing otherwise.
 _Avoid_: Channel, source, origin (an origin is who put a Surface row there,
 which is a different question about a different record)
 

@@ -8014,6 +8014,8 @@ class ProxyEgressTest(DatabaseCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """Every authorised name reaches the one target this machine is running.
 
@@ -9736,7 +9738,8 @@ class ProxyEgressTest(DatabaseCase):
             ("127.0.0.1", 0),
             fence=fence,
             store=Store(self.root),
-            connector=lambda host, port, timeout, protocol, address, client_certificate: (
+            connector=lambda host, port, timeout, protocol, address, client_certificate,
+            *, anchor=None: (
                 http.client.HTTPConnection("127.0.0.1", closed, timeout=timeout),
                 None,
             ),
@@ -11286,6 +11289,8 @@ class ExecutionSliceTest(DatabaseCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The one authorised name reaches the one target this machine is running.
 
@@ -28615,6 +28620,8 @@ class LiveDoorFixture:
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The one target this machine is running, whatever name was authorised."""
         return http.client.HTTPConnection(
@@ -39939,10 +39946,18 @@ class PlaybookEvaluationTest(DatabaseCase):
             "host": HOST,
             "port": 80,
             "address": self.FIXTURE_ADDRESS,
+            "trust_anchor": None,
         } | overrides
         self.connection.execute(
-            "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)",
-            (program, stated["protocol"], stated["host"], stated["port"], stated["address"]),
+            "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5, $6)",
+            (
+                program,
+                stated["protocol"],
+                stated["host"],
+                stated["port"],
+                stated["address"],
+                stated["trust_anchor"],
+            ),
         )
 
     def recorded(self) -> list[tuple[str, ...]]:
@@ -39983,7 +39998,7 @@ class PlaybookEvaluationTest(DatabaseCase):
                 self.assertIn(
                     "fixture_addresses_address_is_one_private_host",
                     self.refusal_in_place(
-                        "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3)",
+                        "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3, NULL)",
                         (self.programs[self.OWN, "vulnerable"], HOST, address),
                     ),
                 )
@@ -40024,7 +40039,7 @@ class PlaybookEvaluationTest(DatabaseCase):
                 self.assertIn(
                     expected,
                     self.refusal_in_place(
-                        "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)",
+                        "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5, NULL)",
                         arguments,
                     ),
                 )
@@ -40043,7 +40058,7 @@ class PlaybookEvaluationTest(DatabaseCase):
             self.assertIn(
                 "is not marked as an evaluation",
                 self.refusal_in_place(
-                    "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3)",
+                    "SELECT open_fixture_address($1::uuid, 'http', $2, 80, $3, NULL)",
                     (self.programs[self.OWN, "vulnerable"], HOST, self.FIXTURE_ADDRESS),
                 ),
             )
@@ -40272,6 +40287,469 @@ class PlaybookEvaluationTest(DatabaseCase):
                 [],
                 [item for item in self.problems() if item[1] == "test_run_reached_nothing"],
             )
+
+    # -- PH2-93: the measurement lane, and the anchor it is verified against ---
+
+    #: The one fixture in the corpus whose ground truth is its handshake, and so
+    #: the only one served over TLS at all. Ticket 88 shipped it; this section is
+    #: what makes a measurement of it admissible.
+    TLS_PAIR = "tls-configuration-pair"
+
+    #: A certificate-shaped text for the cases that are about the rule rather
+    #: than about a handshake. The real one is minted by `evaluation.served` and
+    #: used in the last case here, which is the one that dials.
+    STATED_ANCHOR = "-----BEGIN CERTIFICATE-----\nc2VsZnRlc3Q=\n-----END CERTIFICATE-----\n"
+
+    def measure(self, capability: str, **overrides) -> str:
+        """`record_transport_measurement` as the door calls it, fields moved.
+
+        The default is a handshake that verified, because that is the row the
+        whole of 025 was built for and has never held: everything else here is a
+        case about one field of it being different.
+        """
+        stated = {
+            "reason": "transport measured as target under scope version 1",
+            "scheme": "https",
+            "host": HOST,
+            "port": 443,
+            "scope_class": "target",
+            "wire_tls_version": "TLSv1.3",
+            "wire_cipher": "TLS_AES_128_GCM_SHA256",
+            "wire_alpn": "http/1.1",
+            "wire_sni": HOST,
+            "wire_chain_verified": True,
+            "wire_hostname_verified": True,
+        } | overrides
+        return str(
+            self.connection.execute(
+                "SELECT record_transport_measurement($1, $2::jsonb)",
+                (capability, json.dumps(stated)),
+            ).scalar()
+        )
+
+    def measured_row(self, label: str, program: str) -> dict[str, str]:
+        """The one measurement Receipt, and the Tool run it was attributed to.
+
+        Keyed on the Program as well as the label, because a label is unique
+        within a Program and the pair below files one out of each half.
+        """
+        row = self.connection.execute(
+            "SELECT r.purpose, r.lane, r.decision, r.intercepted::text,"
+            "       r.transport_citable::text, r.scope_class, r.wire_tls_version,"
+            "       t.tool, t.transport, t.status,"
+            "       (t.tool_use_id IS NULL)::text, (t.agent_run_id IS NULL)::text"
+            "  FROM receipts r JOIN tool_runs t ON t.id = r.tool_run_id"
+            " WHERE r.label = $1 AND r.program_id = $2::uuid",
+            (label, program),
+        ).rows[0]
+        return dict(
+            zip(
+                (
+                    "purpose", "lane", "decision", "intercepted", "citable",
+                    "scope_class", "tls_version", "tool", "transport", "status",
+                    "unhooked", "unattended",
+                ),
+                (str(field) for field in row),
+                strict=True,
+            )
+        )
+
+    def test_a_measurement_is_filed_on_a_runtime_tool_run_of_its_own(self):
+        # Criterion 1 and criterion 3. Nothing in this tree had ever written
+        # `purpose = 'transport_measurement'`, so `transport_citable` -- the
+        # column the whole of 025 turns on -- had never been true of any row.
+        # The Tool run is the other half: a probe filed under the agent's own
+        # Tool run would be evidence against a party attributed to that party.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+
+            reading = self.measured_row(self.measure(capability), program)
+
+            self.assertEqual("transport_measurement", reading["purpose"])
+            self.assertEqual("proxy_internal", reading["lane"])
+            self.assertEqual("allowed", reading["decision"])
+            self.assertEqual("false", reading["intercepted"])
+            self.assertEqual("true", reading["citable"])
+            # 025's comment, as rows: `transport = 'runtime'` with no
+            # `tool_use_id`, and no Agent run either, because no agent asked.
+            self.assertEqual("rk2.transport_measurement", reading["tool"])
+            self.assertEqual("runtime", reading["transport"])
+            self.assertEqual("success", reading["status"])
+            self.assertEqual("true", reading["unhooked"])
+            self.assertEqual("true", reading["unattended"])
+
+    def test_the_probe_is_not_filed_under_the_tool_run_that_caused_it(self):
+        # The distinction the case above asserts the shape of. The capability
+        # belongs to an agent's Tool run; the Receipt names a different one.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+
+            label = self.measure(capability)
+
+            self.assertEqual(
+                [("rk2.transport_measurement", "mcp__rk2__net_request")],
+                [
+                    tuple(str(field) for field in row)
+                    for row in self.connection.execute(
+                        # The holder is found by the capability it was issued,
+                        # not by its name: an agent asks over the same Tool more
+                        # than once in a Program and any of those would match.
+                        "SELECT probe.tool, holder.tool FROM receipts r"
+                        "  JOIN tool_runs probe ON probe.id = r.tool_run_id"
+                        "  JOIN tool_runs holder ON holder.program_id = r.program_id"
+                        "   AND holder.egress_token_sha256"
+                        "     = encode(digest($2, 'sha256'), 'hex')"
+                        " WHERE r.label = $1",
+                        (label, capability),
+                    ).rows
+                ],
+            )
+
+    def test_a_handshake_that_did_not_verify_is_filed_and_is_not_citable(self):
+        # Criterion 3's other half, and the reason citability is generated: the
+        # door reports what it saw and the column decides what that is worth. A
+        # target whose chain or whose name did not check out is recorded exactly
+        # as fully as one that did.
+        for field in ("wire_chain_verified", "wire_hostname_verified"):
+            with self.subTest(field=field), self.scratch():
+                program = self.programs[self.OWN, "vulnerable"]
+                capability = self.as_the_door(program)
+
+                reading = self.measured_row(
+                    self.measure(capability, **{field: False}), program
+                )
+
+                self.assertEqual("transport_measurement", reading["purpose"])
+                self.assertEqual("false", reading["citable"])
+
+    def test_a_measurement_of_a_fixture_is_writable_and_of_a_support_host_is_not(self):
+        # 025 wrote `scope_class = 'target'` before `fixture` existed. Grading
+        # the one class that can only be settled by a measurement is what the
+        # fixture is for, so the class is admitted -- and the three the clause
+        # excluded before are still excluded.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+
+            self.assertEqual(
+                "true",
+                self.measured_row(
+                    self.measure(capability, scope_class="fixture"), program
+                )["citable"],
+            )
+
+        with self.scratch():
+            capability = self.as_the_door(self.programs[self.OWN, "vulnerable"])
+
+            self.assertIn(
+                "receipts_transport_measurement_shape",
+                self.refusal_in_place(
+                    "SELECT record_transport_measurement($1, $2::jsonb)",
+                    (
+                        capability,
+                        json.dumps(
+                            {
+                                "reason": "transport measured as egress_support",
+                                "scheme": "https",
+                                "host": HOST,
+                                "port": 443,
+                                "scope_class": "egress_support",
+                                "wire_tls_version": "TLSv1.3",
+                                "wire_chain_verified": True,
+                                "wire_hostname_verified": True,
+                            }
+                        ),
+                    ),
+                ),
+            )
+
+    def test_the_agent_side_of_a_measurement_is_dropped_rather_than_believed(self):
+        # A door that sent an agent handshake along with a probe is describing a
+        # socket that had nobody on the other end of it. The writer clears the
+        # columns rather than refusing, so a door with a bug files an honest row
+        # instead of failing an exchange that already happened.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+
+            label = self.measure(
+                capability,
+                agent_tls_version="TLSv1.3",
+                agent_cipher="TLS_AES_256_GCM_SHA384",
+            )
+
+            self.assertEqual(
+                [(None, None)],
+                [
+                    tuple(row)
+                    for row in self.connection.execute(
+                        "SELECT agent_tls_version, agent_cipher FROM receipts"
+                        " WHERE label = $1 AND program_id = $2::uuid",
+                        (label, program),
+                    ).rows
+                ],
+            )
+
+    def test_an_https_fixture_address_carries_the_authority_its_handshake_needs(self):
+        # Criterion 4, as the row that holds the answer. The anchor is scoped to
+        # one Program by this table's primary key, handed back for that
+        # Program's own host and port, and purged with the evaluation.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            self.open_endpoint(
+                program, protocol="https", port=443, trust_anchor=self.STATED_ANCHOR
+            )
+            capability = self.as_the_door(program)
+
+            self.assertEqual(
+                [(self.FIXTURE_ADDRESS, "fixture", self.STATED_ANCHOR)],
+                [
+                    tuple(str(field) for field in row)
+                    for row in self.connection.execute(
+                        "SELECT address, scope_class, trust_anchor"
+                        "  FROM authorize_fixture_address($1, 'https', $2, 443)",
+                        (capability, HOST),
+                    ).rows
+                ],
+            )
+
+    def test_an_anchor_and_a_scheme_are_recorded_together_or_not_at_all(self):
+        # Both directions. An https fixture with no anchor can never produce a
+        # citable measurement, and an http one with an anchor is an anchor for a
+        # handshake that does not happen -- which is the kind of row that is
+        # later read as permission for something else.
+        for name, overrides in (
+            ("https with no anchor", {"protocol": "https", "port": 443}),
+            ("http with an anchor", {"trust_anchor": self.STATED_ANCHOR}),
+        ):
+            with self.subTest(case=name), self.scratch():
+                stated = {
+                    "protocol": "http",
+                    "host": HOST,
+                    "port": 80,
+                    "address": self.FIXTURE_ADDRESS,
+                    "trust_anchor": None,
+                } | overrides
+
+                self.assertIn(
+                    "an https fixture address carries the authority its handshake is"
+                    " measured against",
+                    self.refusal_in_place(
+                        "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5, $6)",
+                        (
+                            self.programs[self.OWN, "vulnerable"],
+                            stated["protocol"],
+                            stated["host"],
+                            stated["port"],
+                            stated["address"],
+                            stated["trust_anchor"],
+                        ),
+                    ),
+                )
+
+    def test_a_signing_key_is_not_an_anchor(self):
+        # The evaluator holds both halves of the authority. This column takes
+        # the one that is handed out.
+        with self.scratch():
+            self.assertIn(
+                "fixture_addresses_anchor_is_a_certificate",
+                self.refusal_in_place(
+                    "SELECT open_fixture_address($1::uuid, 'https', $2, 443, $3, $4)",
+                    (
+                        self.programs[self.OWN, "vulnerable"],
+                        HOST,
+                        self.FIXTURE_ADDRESS,
+                        "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n"
+                        "-----BEGIN PRIVATE KEY-----\ny\n-----END PRIVATE KEY-----\n",
+                    ),
+                ),
+            )
+
+    def receipt_of(self, label: str, program: str) -> str:
+        """The Receipt a measurement was filed as, within one Program."""
+        return str(
+            self.connection.execute(
+                "SELECT id::text FROM receipts WHERE label = $1 AND program_id = $2::uuid",
+                (label, program),
+            ).scalar()
+        )
+
+    def transport_claim(self, receipt: str, *, asserted: dict) -> str:
+        """One supported claim on the probe-only class, from one Receipt.
+
+        Assumes an open `scratch()`. Returns the refusal, or the empty string
+        when every row went in: what these two cases are about is which of the
+        three guards 025 installed stops which Receipt.
+        """
+        surface = self.surface[self.OWN, "vulnerable"]
+        hypothesis = str(
+            self.connection.execute(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement, status) VALUES ($1::uuid, $2::uuid, 'transport.tls_configuration',"
+                " $3, 'supported') RETURNING id::text",
+                (
+                    surface["program"],
+                    surface["subject"],
+                    "the target negotiates a protocol version below what it advertises",
+                ),
+            ).scalar()
+        )
+        try:
+            observation = str(
+                self.connection.execute(
+                    "INSERT INTO observations (program_id, subject_entity_id, kind, summary,"
+                    " provenance_kind, receipt_id, metadata) VALUES ($1::uuid, $2::uuid,"
+                    " 'transport_parameters_observed', $3, 'receipt', $4::uuid, $5::jsonb)"
+                    " RETURNING id::text",
+                    (
+                        surface["program"],
+                        surface["subject"],
+                        "what the target negotiated with this door",
+                        receipt,
+                        json.dumps({"transport": asserted}),
+                    ),
+                ).scalar()
+            )
+            self.connection.execute(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id, polarity, role)"
+                " VALUES ($1::uuid, $2::uuid, 'supports', 'variant')",
+                (hypothesis, observation),
+            )
+        except pg.DatabaseError as error:
+            return error.primary or str(error)
+        return ""
+
+    def test_a_transport_claim_stands_on_a_measurement(self):
+        # Criterion 6's first half, and the first time it has been reachable:
+        # `transport.tls_configuration` is `probe_only` over three fields, every
+        # supporting row on a probe-only class needs a `transport_citable`
+        # Receipt, and until this ticket no Receipt was one.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+            label = self.measure(capability)
+            measured = self.receipt_of(label, program)
+
+            self.assertEqual(
+                "", self.transport_claim(measured, asserted={"tls_version": "TLSv1.3"})
+            )
+
+    def test_a_transport_claim_does_not_stand_on_the_exchange_that_caused_it(self):
+        # Criterion 6's other half. The Receipt of the agent's own exchange
+        # carries TLS columns too, and every one of them describes this door.
+        # 025 built the refusal; this is the case that proves it is load-bearing
+        # rather than latent, because there is now something it can be wrong
+        # about.
+        with self.scratch():
+            refusal = self.transport_claim(
+                self.surface[self.OWN, "vulnerable"]["receipt"],
+                asserted={"tls_version": "TLSv1.3"},
+            )
+
+            self.assertIn("transport observation refused", refusal)
+            self.assertIn("Its TLS parameters are the proxy", refusal)
+
+    def test_the_door_s_own_housekeeping_still_backs_nothing(self):
+        # The other side of narrowing 007's decision 15. What that decision was
+        # written for -- a Receipt of the door talking to itself -- is still
+        # refused, and it is refused for being uncitable rather than for the
+        # Lane alone.
+        with self.scratch():
+            surface = self.surface[self.OWN, "vulnerable"]
+            housekeeping = str(
+                self.connection.execute(
+                    "INSERT INTO receipts (program_id, lane, decision, reason,"
+                    " ts_arrival, scope_class, scope_version, host)"
+                    " VALUES ($1::uuid, 'proxy_internal', 'allowed', 'a csrf token',"
+                    " now(), 'target', 1, $2) RETURNING id::text",
+                    (surface["program"], HOST),
+                ).scalar()
+            )
+
+            self.assertIn(
+                "is lane proxy_internal and cannot back an observation",
+                self.transport_claim(housekeeping, asserted={"tls_version": "TLSv1.3"}),
+            )
+
+    def test_a_measurement_settles_only_the_fields_the_class_may_assert(self):
+        # The field restriction, over a Receipt that is citable: a certificate
+        # fingerprint is a claim about `transport.certificate_trust`, and this
+        # class may not make it however good the Receipt behind it is.
+        with self.scratch():
+            program = self.programs[self.OWN, "vulnerable"]
+            capability = self.as_the_door(program)
+            label = self.measure(capability, wire_cert_sha256="a" * 64)
+            measured = self.receipt_of(label, program)
+
+            self.assertIn(
+                "may assert only",
+                self.transport_claim(measured, asserted={"cert_sha256": "a" * 64}),
+            )
+
+    def test_the_two_halves_of_the_tls_pair_are_told_apart_by_their_receipts(self):
+        # Criterion 5, end to end and with no container in it: both halves of the
+        # shipped pair served, each dialled by the code the door dials with,
+        # against the authority the evaluator minted for it, and each filed.
+        #
+        # What the pair differs in is the handshake and nothing else, so the two
+        # Receipts have to be what tells them apart -- and the advertisement is
+        # read back over the same connection to show that the bytes agree while
+        # the transport does not. A Playbook reading the response alone would
+        # find one target twice.
+        one = fixture.FIXTURES[self.TLS_PAIR]
+        negotiated: dict[str, str] = {}
+        advertised: dict[str, str] = {}
+        with self.scratch():
+            for variant in evaluation.PAIR:
+                with evaluation.served(one, variant) as where:
+                    self.assertEqual("https", where.scheme)
+                    self.assertIsNotNone(where.trust_anchor)
+                    connection, wire = proxy.connect(
+                        evaluation.origin(one),
+                        where.port,
+                        5.0,
+                        "https",
+                        where.host,
+                        None,
+                        anchor=where.trust_anchor,
+                    )
+                    try:
+                        connection.request("GET", "/app")
+                        answer = connection.getresponse()
+                        answer.read()
+                        advertised[variant] = str(
+                            answer.headers.get("Strict-Transport-Security")
+                        )
+                    finally:
+                        connection.close()
+                # Criterion 4, proved rather than stated: the anchor is what
+                # makes a fixture's chain verify at all, and both columns
+                # `transport_citable` reads are true because of it.
+                self.assertTrue(wire.chain_verified, wire.defect)
+                self.assertTrue(wire.hostname_verified, wire.defect)
+                program = self.programs[self.TLS_PAIR, variant]
+                capability = self.as_the_door(program)
+                negotiated[variant] = self.measured_row(
+                    self.measure(
+                        capability,
+                        host=evaluation.origin(one),
+                        port=where.port,
+                        scope_class="fixture",
+                        wire_tls_version=wire.tls_version,
+                        wire_cipher=wire.cipher,
+                        wire_alpn=wire.alpn,
+                        wire_sni=wire.sni,
+                        wire_chain_verified=wire.chain_verified,
+                        wire_hostname_verified=wire.hostname_verified,
+                    ),
+                    program,
+                )["tls_version"]
+
+        self.assertEqual({"vulnerable": "TLSv1.2", "secure": "TLSv1.3"}, negotiated)
+        self.assertEqual(advertised["vulnerable"], advertised["secure"])
+        self.assertIn("preload", advertised["secure"])
 
 
 class PlaybookEvaluationCommandTest(DatabaseCase):
@@ -43963,6 +44441,8 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The one authorised name reaches the one target this machine is running."""
         return http.client.HTTPConnection(

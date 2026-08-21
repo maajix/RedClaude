@@ -131,7 +131,9 @@ DOMAIN = "localhost"
 #: control for that run, not a run of its own.
 PAIR = ("vulnerable", "secure")
 
-OPEN_FIXTURE_ADDRESS = "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5)"
+OPEN_FIXTURE_ADDRESS = (
+    "SELECT open_fixture_address($1::uuid, $2, $3, $4::integer, $5, $6)"
+)
 PLAYBOOK = "SELECT id::text, source_sha256 FROM playbooks WHERE path = $1"
 REPEATS = "SELECT required_repeats FROM playbook_test_policy WHERE id = 1"
 MARK = (
@@ -239,6 +241,13 @@ class Served:
     #: fixture address row are written from, and those two have to agree with
     #: what the socket actually did.
     scheme: str
+    #: The PEM certificate of the authority this call minted, for an https
+    #: fixture, and `None` for every other one. Ticket 93: it is the one anchor
+    #: the door verifies this fixture's handshake against, and it is carried on
+    #: this record rather than left in the directory because the directory is
+    #: deleted when the block ends. It is the certificate alone -- the key stays
+    #: where `tls.authority` put it and is handed to nobody.
+    trust_anchor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,12 +354,14 @@ def served(one: fixture.Fixture, variant: str, host: str = HOST) -> Iterator[Ser
     target *negotiates* is the fixture's whole subject, so the context is handed
     over to be configured before a byte crosses it.
 
-    The authority is this run's and nothing outside this call is given its root,
-    so a client that reaches the fixture cannot verify the chain. That is
-    correct rather than unfortunate: `receipts.transport_citable` is generated
-    from `wire_chain_verified` and `wire_hostname_verified`, so an exchange with
-    this fixture is recorded as the unverified one it is, and the citable
-    measurement the class actually needs is a lane this module does not have.
+    The authority is this run's, and its certificate is yielded with the address
+    because ticket 93 needs one party to have it: the door, measuring this one
+    fixture, for this one Program. `open_fixture_address` stores it beside the
+    address, `authorize_fixture_address` hands it back for that Program's own
+    host and port, and it is purged with the evaluation. Nobody else is given
+    it, and nobody at all is given the key -- so a client that reaches this
+    fixture without going through that row still cannot verify the chain, which
+    is what `tests/test_fixture.py` reads it as.
     """
     namespace = _application(one)
     handler = namespace.get("handler")
@@ -366,6 +377,7 @@ def served(one: fixture.Fixture, variant: str, host: str = HOST) -> Iterator[Ser
     server = ThreadingHTTPServer((host, 0), handler(variant))
     with contextlib.ExitStack() as stack:
         scheme = "http"
+        anchor: str | None = None
         if configure is not None:
             directory = stack.enter_context(
                 tempfile.TemporaryDirectory(prefix="rk2-fixture-tls-")
@@ -375,16 +387,25 @@ def served(one: fixture.Fixture, variant: str, host: str = HOST) -> Iterator[Ser
             # handshake then happens inside `accept`, which is where a fixture
             # that refuses a client's protocol floor refuses it -- and refusing
             # there is the point of this pair rather than a fault in it.
-            context = tls.authority(Path(directory)).context(origin(one))
+            minted = tls.authority(Path(directory))
+            context = minted.context(origin(one))
             configure(variant, context)
             server.socket = context.wrap_socket(server.socket, server_side=True)
             scheme = "https"
+            # Read here rather than pointed at, because the directory above is
+            # deleted when this block ends and a path that outlives the file it
+            # names is worse than no answer.
+            anchor = minted.certificate.read_text()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             bound = server.server_address
             yield Served(
-                variant=variant, host=str(bound[0]), port=int(bound[1]), scheme=scheme
+                variant=variant,
+                host=str(bound[0]),
+                port=int(bound[1]),
+                scheme=scheme,
+                trust_anchor=anchor,
             )
         finally:
             server.shutdown()
@@ -518,6 +539,7 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
                         origin(subject.fixture),
                         where.port,
                         where.host,
+                        where.trust_anchor,
                     ),
                 )
             except pg.DatabaseError as error:

@@ -91,6 +91,28 @@ ADDRESS_ERROR = (
 )
 
 
+#: The certificate an evaluation hands the door for its own Program, as a text.
+#: The bytes are not parsed anywhere the stubbed connector goes; what is under
+#: test here is which dial carries it.
+ANCHOR = "-----BEGIN CERTIFICATE-----\nZml4dHVyZQ==\n-----END CERTIFICATE-----\n"
+
+#: What the door's own probe negotiated, and the only handshake in this file
+#: that is nobody's exchange. `chain_verified` and `hostname_verified` are true
+#: because the anchor above is what the socket was verified against.
+PROBED = proxy.Handshake(
+    tls_version="TLSv1.3",
+    cipher="TLS_AES_128_GCM_SHA256",
+    alpn="http/1.1",
+    sni="target.example.test",
+    cert_sha256="c" * 64,
+    cert_issuer="commonName=RedKraken run authority",
+    cert_subject="commonName=target.example.test",
+    cert_not_after=None,
+    chain_verified=True,
+    hostname_verified=True,
+)
+
+
 def message(pairs: list[tuple[str, str]]) -> Message:
     """One header container in the shape `BaseHTTPRequestHandler` produces."""
     headers = Message()
@@ -218,6 +240,12 @@ class Stub:
         #: make every Identity test in this file the collision case.
         self.readable: set[str] = set()
         self.asked_reads: list[tuple] = []
+        #: What the door filed on its own measurement lane, ticket 93, and what
+        #: that writer answered with. Recorded rather than run: the row it makes
+        #: is a `SECURITY DEFINER` function's, and what it writes is asserted
+        #: where the database is.
+        self.measurements: list[tuple] = []
+        self.measurement_fails: Exception | None = None
 
     def authorize(
         self, program_id: str, capability: str, method: str, request: scope.Request
@@ -288,6 +316,18 @@ class Stub:
 
     def release(self, program_id: str, reservation: str, contacted: bool) -> None:
         self.released.append((program_id, reservation, contacted))
+
+    def measurement(self, program_id: str, capability: str, receipt: dict) -> str:
+        """The probe's own Receipt, filed under a Tool run the writer makes.
+
+        It can be told to fail, because a measurement that could not be written
+        is the one case the door has to survive silently: the exchange it came
+        after was already answered.
+        """
+        self.measurements.append((program_id, capability, receipt))
+        if self.measurement_fails is not None:
+            raise self.measurement_fails
+        return "rcpt_measured"
 
     def allowed_receipt(
         self,
@@ -915,6 +955,12 @@ class RollbackTest(unittest.TestCase):
     """
 
     def discards(self) -> list[ast.Call]:
+        """Every `store.discard`, and only those.
+
+        The receiver is part of what is being looked for: `discard` is also how
+        a plain set drops a member, and ticket 93's measurement claim is dropped
+        that way, on an object that has nothing to do with the Store.
+        """
         tree = ast.parse(Path(proxy.__file__).read_text())
         return [
             node
@@ -922,6 +968,8 @@ class RollbackTest(unittest.TestCase):
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "discard"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "store"
         ]
 
     def test_a_refused_exchange_discards_only_what_it_sealed(self):
@@ -976,6 +1024,11 @@ class ExchangeTest(unittest.TestCase):
         self.resolved: list[tuple[str, int]] = []
         self.dialled: list[tuple[str, int, str, str]] = []
         self.client_certificates: list[identity.ClientCertificate | None] = []
+        #: Ticket 93's probe dials, and what the socket under them negotiated.
+        #: An anchor is what tells a probe apart from an exchange here: it is
+        #: the only dial the door puts one on.
+        self.probed: list[tuple[str, int, str, str]] = []
+        self.handshake = PROBED
         self.server = proxy.listen(
             ("127.0.0.1", 0),
             fence=self.fence,
@@ -1007,6 +1060,8 @@ class ExchangeTest(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The fixture, wherever the name pointed, and a record of both.
 
@@ -1016,6 +1071,12 @@ class ExchangeTest(unittest.TestCase):
         """
         self.dialled.append((host, port, protocol, address))
         self.client_certificates.append(client_certificate)
+        if anchor is not None:
+            self.probed.append((host, port, address, anchor))
+            return (
+                http.client.HTTPConnection("127.0.0.1", self.target_port, timeout=timeout),
+                self.handshake,
+            )
         mtls = getattr(self, "mtls", None)
         if protocol == "https" and mtls is not None:
             target, server_authority = mtls
@@ -1228,6 +1289,134 @@ class ExchangeTest(unittest.TestCase):
         self.through("http://target.example.test/v1/notes").read()
 
         self.assertEqual("egress_support", self.fence.allowed[0]["receipt"]["scope_class"])
+
+    # -- PH2-93: the door's own handshake, taken on the request's lane ---------
+
+    def graded(self, scope_class: str = "fixture", anchor: str | None = ANCHOR) -> None:
+        """One Program whose target is a fixture the evaluator minted a CA for."""
+        self.fence.recorded_fixture = proxy.FixtureAddress(
+            address="10.9.0.7", scope_class=scope_class, trust_anchor=anchor
+        )
+
+    def probes(self, count: int = 1) -> list[tuple]:
+        """The measurements the door filed, waited for rather than sampled.
+
+        `_measure` runs after the answer has been written, for the reason it
+        exists: a probe may not change what the caller was told. So a client
+        that has read its body has not necessarily seen the row yet, and the
+        wait is bounded so a probe that never comes fails as an empty list.
+        """
+        deadline = time.monotonic() + 5
+        while len(self.fence.measurements) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.fence.measurements
+
+    def test_the_door_measures_the_target_it_just_served_an_exchange_from(self):
+        # Criterion 2, as the one call it comes down to: the probe dials the
+        # address the scope decision pinned, for the Program that decision was
+        # made for, carrying the anchor that Program's fixture was recorded with
+        # and no Identity at all.
+        self.graded()
+
+        response = self.through("https://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(200, response.status)
+        [(program, capability, receipt)] = self.probes()
+        self.assertEqual(PROGRAM_ID, program)
+        self.assertEqual(CAPABILITY, capability)
+        self.assertEqual(
+            [("target.example.test", 443, "10.9.0.7", ANCHOR)], self.probed
+        )
+        self.assertEqual([None, None], self.client_certificates)
+        # The wire side alone, which is what makes the row citable: no agent
+        # handshake, because there was no agent on this socket.
+        self.assertEqual("TLSv1.3", receipt["wire_tls_version"])
+        self.assertTrue(receipt["wire_chain_verified"])
+        self.assertTrue(receipt["wire_hostname_verified"])
+        self.assertNotIn("agent_tls_version", receipt)
+        self.assertEqual("fixture", receipt["scope_class"])
+        self.assertEqual("10.9.0.7", receipt["pinned_ips"])
+
+    def test_the_probe_takes_a_budget_slot_of_its_own_and_gives_it_back(self):
+        # 025's "one egress path survives", as arithmetic: a handshake is egress,
+        # so it is reserved for and released like the exchange it followed. A
+        # probe that dialled outside the budget would be a second lane wearing
+        # the first one's name.
+        self.graded()
+
+        self.through("https://target.example.test/v1/notes").read()
+
+        self.probes()
+        self.assertEqual(2, len(self.fence.reserved))
+        self.assertEqual([(PROGRAM_ID, SLOT, True)] * 2, self.refunds(2))
+
+    def test_a_program_with_no_budget_left_is_not_measured(self):
+        # The refusal the reservation above can come back with. The exchange is
+        # refused by the same slot, so what this asserts is that the probe asked
+        # and stopped -- it dialled nothing and filed nothing.
+        self.graded()
+        self.fence.slot = proxy.Reservation(
+            id=None,
+            granted=False,
+            reason="rate_limited",
+            retry_at=None,
+            target="target.example.test",
+        )
+
+        self.through("https://target.example.test/v1/notes").read()
+
+        self.assertEqual([], self.probed)
+        self.assertEqual([], self.fence.measurements)
+
+    def test_one_target_is_measured_once_however_often_it_is_asked_for(self):
+        # The transport of a target is a property of the target rather than of
+        # the request, so a Program that fetched forty pages would file forty
+        # identical Receipts and spend forty slots for the one fact.
+        self.graded()
+
+        self.through("https://target.example.test/v1/notes").read()
+        self.probes()
+        self.through("https://target.example.test/v1/orders").read()
+        self.through("https://target.example.test/v1/orders").read()
+
+        self.assertEqual(1, len(self.fence.measurements))
+        self.assertEqual(1, len(self.probed))
+
+    def test_a_measurement_that_failed_leaves_the_target_to_be_measured_again(self):
+        # The claim is given back, so a probe that could not be written is not a
+        # target that is never measured. The first request answers as it would
+        # have anyway, which is the whole promise of this method.
+        self.graded()
+        self.fence.measurement_fails = proxy.Refused("measurement write refused", "23514")
+
+        first = self.through("https://target.example.test/v1/notes")
+        first.read()
+        self.probes()
+        self.fence.measurement_fails = None
+        second = self.through("https://target.example.test/v1/notes")
+        second.read()
+
+        self.assertEqual(200, first.status)
+        self.assertEqual(200, second.status)
+        self.assertEqual(2, len(self.probes(2)))
+
+    def test_nothing_is_measured_on_a_cleartext_hop_or_for_a_support_host(self):
+        # The two skips, and neither is an optimisation. An http target has no
+        # handshake to describe, and `egress_support` is a host the harness talks
+        # to on its own business: 025's shape constraint refuses a measurement of
+        # one, so a door that dialled it would spend a slot to be refused.
+        self.graded()
+        self.through("http://target.example.test/v1/notes").read()
+
+        self.graded(scope_class="egress_support")
+        self.through("https://target.example.test/v1/notes").read()
+
+        self.assertEqual([], self.probed)
+        self.assertEqual([], self.fence.measurements)
+        # Both exchanges happened. What was skipped is the probe and nothing
+        # else, which a run that refused these requests would also satisfy.
+        self.assertEqual(2, len(self.fence.allowed))
 
     def test_a_request_that_was_never_in_scope_is_not_asked_about_a_fixture(self):
         # The order the fixture address is asked in, from the other end: a capability
@@ -2247,6 +2436,8 @@ class Redirected(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         self.dialled.append(address)
         return (
@@ -2482,6 +2673,8 @@ class TunnelTest(unittest.TestCase):
         protocol: str,
         address: str,
         client_certificate: identity.ClientCertificate | None,
+        *,
+        anchor: str | None = None,
     ) -> tuple[http.client.HTTPConnection, proxy.Handshake | None]:
         """The door's outbound side, verifying the target it was sent to.
 
