@@ -1198,6 +1198,134 @@ class ExchangeTest(unittest.TestCase):
         # A length this client did not measure is a length nothing may state.
         self.assertNotIn("99", [value for name, value in arrived if name == "content-length"])
 
+    def targets_headers(self, *headers: tuple[str, str]) -> None:
+        """What the target answers with, for the length of one test."""
+        handler = self.target.RequestHandlerClass
+        previous = handler.response_headers
+        handler.response_headers = headers
+        self.addCleanup(setattr, handler, "response_headers", previous)
+
+    def test_the_targets_response_headers_are_what_the_caller_reads(self):
+        # The bytes were always in this process and always in the transcript the
+        # Receipt names; what no caller could do was read one. Every cache
+        # reading there is -- `Age`, `X-Cache`, `Vary`, `Cache-Control` -- is
+        # this one assertion, which is why the ticket is a handler and not a
+        # lane.
+        self.targets_headers(
+            ("Cache-Control", "max-age=60"),
+            ("Age", "31"),
+            ("X-Cache", "HIT"),
+            ("Vary", "Accept-Encoding"),
+            ("Vary", "Cookie"),
+        )
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+        )
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual("R1", answer.receipt)
+        read = [(name.lower(), value) for name, value in answer.headers]
+        self.assertIn(("cache-control", "max-age=60"), read)
+        self.assertIn(("age", "31"), read)
+        self.assertIn(("x-cache", "HIT"), read)
+        self.assertIn(("content-type", "application/json"), read)
+        # Both of them, in the order the target sent them. A target that
+        # answered with two `Vary` lines said two things, and the mapping this
+        # is not would have kept one of them.
+        self.assertEqual(
+            [("vary", "Accept-Encoding"), ("vary", "Cookie")],
+            [pair for pair in read if pair[0] == "vary"],
+        )
+        # One `Date`, and it is the fixture's fixed one. A cache reading is
+        # arithmetic on this header against `Age`, so a door that stamped its
+        # own next to the target's would hand the child two and no way to tell
+        # which clock either came from.
+        self.assertEqual(
+            ["Thu, 01 Jan 2026 00:00:00 GMT"],
+            [value for name, value in read if name == "date"],
+        )
+
+    def test_the_doors_own_statements_are_not_among_the_targets_headers(self):
+        # `RECEIPT`, `DECISION` and `DETAIL` are this fence talking about the
+        # exchange, and they are already named fields. A caller that found them
+        # in the header list would read the door's behaviour believing it was
+        # reading the target's -- and the refusal is the case that has all
+        # three, so it is the one asserted.
+        self.fence.out_of_scope.add("admin.example.test")
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://admin.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+        )
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(proxy.REFUSED, answer.decision)
+        self.assertEqual("capability refused", answer.detail)
+        self.assertIsNotNone(answer.receipt)
+        read = {name.lower() for name, _ in answer.headers}
+        self.assertEqual(
+            frozenset(),
+            read & {proxy.RECEIPT.lower(), proxy.DECISION.lower(), proxy.DETAIL.lower()},
+        )
+        # The whole of it: this fence said everything on that hop, so a refusal
+        # carries no target header because it reached no target.
+        self.assertEqual(set(), read)
+
+    def test_nothing_describing_the_doors_own_hop_is_read_as_the_targets_answer(self):
+        # `Content-Length` is the length this process measured of the body it
+        # re-sent and `Connection: close` is what this hop chose, so neither is
+        # the target's answer to the request. The target's own framing is in the
+        # sealed wire Artifact, byte for byte, which is where an auditor reads
+        # it and why nothing is lost by leaving it out here.
+        self.targets_headers(("Connection", "keep-alive"), ("X-Cache", "MISS"))
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+        )
+
+        read = {name.lower() for name, _ in answer.headers}
+        self.assertIn("x-cache", read)
+        self.assertEqual(frozenset(), read & proxy.HOP_BY_HOP)
+
+    def test_no_credential_the_target_issued_is_read_back_as_a_header(self):
+        # The six names the agent view already drops, asserted from the side
+        # that reads them rather than from the side that removes them:
+        # `response_for_agent` is the one place that rule lives, and this is the
+        # test that it still reaches the caller's hop.
+        marker = "rk2-target-issued-6d1a4c"
+        self.targets_headers(
+            *((name, f"{marker}-{name}") for name in sorted(proxy.WIRE_RESPONSE_HEADERS))
+        )
+        # Removing a name makes the agent view differ from the wire view, and a
+        # difference this door cannot seal is one it refuses rather than files.
+        self.server.root_secret = seal.Root("test-only-root", b"h" * seal.KEY_BYTES)
+        self.addCleanup(setattr, self.server, "root_secret", None)
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+        )
+
+        self.assertEqual(200, answer.status)
+        read = {name.lower() for name, _ in answer.headers}
+        self.assertEqual(frozenset(), read & proxy.WIRE_RESPONSE_HEADERS)
+        self.assertNotIn(marker, str(answer.headers))
+        # And the exchange still holds them where a citation reaches them: the
+        # wire view is sealed and the Receipt names it, so a reading about a
+        # cookie cites the Receipt it would have cited anyway.
+        self.assertIsNotNone(self.fence.allowed[0]["receipt"]["response_wire_sha"])
+
     def test_a_session_that_went_away_is_answered_and_said_out_loud(self):
         # Every guard in the fence names `pg.DatabaseError`, and
         # `pg.ConnectionError_` is its sibling rather than its subclass, so a

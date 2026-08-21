@@ -3252,9 +3252,21 @@ class Handler(BaseHTTPRequestHandler):
         detail: str | None = None,
         reason: str | None = None,
     ) -> None:
-        """One answer to the caller, with the Receipt's name on it when there is one."""
+        """One answer to the caller, with the Receipt's name on it when there is one.
+
+        `send_response_only` and not `send_response`, which is the same choice
+        the CONNECT above makes and now for a second reason. The difference
+        between them is that `send_response` stamps a `Server` and a `Date` of
+        this door's own, and the caller reads the header list of this hop as
+        what the target answered with. A target that sent its own `Date` -- and
+        a cache reading is arithmetic on exactly that one -- would arrive with
+        two, one of them this process's clock, and nothing on the hop tells them
+        apart. So the door says nothing here it is not asked to say: what it has
+        to state about the exchange it states under its own prefix, where the
+        name itself says whose statement it is.
+        """
         self.close_connection = True
-        self.send_response(status, reason)
+        self.send_response_only(status, reason)
         for name, value in headers or []:
             if not describes_this_hop(name):
                 self.send_header(name, value)
@@ -3583,6 +3595,12 @@ class Answer:
     means no bytes reached the target. Branching on the status alone would make
     a target's own refusal close a Tool run as denied and a fence refusal close
     one as success, which is the same mistake in both directions.
+
+    `headers` is the other half of what the target said, next to the body that
+    was already here. Pairs in the order they arrived rather than a mapping,
+    because a target that answered with two `Vary` lines said two things and a
+    mapping keeps one of them -- the reason `_header` below reads the first of
+    several rather than joining them into a value nobody sent.
     """
 
     status: int
@@ -3590,16 +3608,46 @@ class Answer:
     receipt: str | None
     decision: str | None
     detail: str | None
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 def _answered(answer: http.client.HTTPResponse) -> Answer:
-    """Read one response into the four facts the runtime decides on."""
+    """Read one response into the facts the runtime decides on and the caller reads.
+
+    The named fields are the decision and `headers` is the reading, and the
+    same predicate that keeps an internal name off a wire is what keeps the two
+    apart. `RECEIPT`, `DECISION` and `DETAIL` are read into their own fields and
+    then left out of the list: they are this door's statements about the
+    exchange rather than anything a target said, and a caller that found them
+    among the target's headers would be reading the fence's behaviour while
+    believing it was reading the target's.
+
+    Hop-by-hop names are left out for the neighbouring reason. `Content-Length`
+    is the length this process measured of the body it re-sent, and
+    `Connection: close` is what this hop chose; both describe the door's answer
+    to this client and not the target's answer to the request. What the target
+    framed its own answer with is in the sealed wire Artifact the Receipt names,
+    byte for byte, which is where an auditor who needs that reads it.
+
+    Nothing here filters for credential material, and that absence is
+    deliberate. `response_for_agent` has already removed the six
+    `WIRE_RESPONSE_HEADERS` and `project_identity_response` has already removed
+    a leased Identity's own renderings, both before the door answered, so those
+    names are absent from this hop by construction. A second filter here would
+    be a second place that rule lives, and a rule with two places is one that
+    can be changed in one of them.
+    """
     return Answer(
         status=answer.status,
         body=answer.read(CEILING + 1),
         receipt=answer.headers.get(RECEIPT),
         decision=answer.headers.get(DECISION),
         detail=answer.headers.get(DETAIL),
+        headers=tuple(
+            (name, value)
+            for name, value in answer.headers.items()
+            if not describes_this_hop(name)
+        ),
     )
 
 

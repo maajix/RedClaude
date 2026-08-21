@@ -97,6 +97,19 @@ REFUSAL = "startup_refusal"
 #: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
 
+#: How much of one response's header list a child may read. The body has had a
+#: ceiling since it was first answered and a header list without one is the same
+#: hole a second time: it is a document the target wrote, arriving in a model's
+#: context, at whatever length the target chose, and a target that would rather
+#: fill this run's context than be measured by it needs only to answer with a
+#: thousand headers. The same 4096 bytes the body gets, because the two are the
+#: same kind of bound on the same kind of reading -- and it is more than an
+#: honest response spends on headers, so what it cuts is the answer that was
+#: already unusual. Nothing is lost when it cuts: the exact list of every
+#: exchange is in the sealed wire Artifact the Receipt already names, which is
+#: where a reading that needs all of it goes.
+HEADERS_EXCERPT = 4096
+
 #: Why a request tool call reached no target. Tokens rather than prose, for the
 #: same reason the door's decision header is a token: the model reads one of
 #: these and the runtime reads the same one out of the transcript, and a reason
@@ -482,9 +495,12 @@ DESCRIPTIONS = {
     "http_request": (
         "Send one HTTP request to a target through the capability proxy, which "
         "decides it against this Program's scope and writes the Receipt and the "
-        "response Artifact. Answers the status, the Receipt label to cite and a "
-        "bounded excerpt of the body; a refusal names the door's decision rather "
-        "than pretending the request happened."
+        "response Artifact. Answers the status, the Receipt label to cite, the "
+        "target's response headers and a bounded excerpt of the body; both the "
+        "headers and the body are bounded excerpts of the transcript that Receipt "
+        "names, so an Observation about a header cites that same Receipt. Headers "
+        "carrying credentials the target issued are not among them. A refusal "
+        "names the door's decision rather than pretending the request happened."
     ),
     # The element lists stay open -- `roster.OPEN_ARGUMENTS` says why -- so this
     # sentence is the only place a child is told which fields promotion reads
@@ -688,6 +704,11 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
     The headers go through as the caller wrote them, minus the ones that
     describe a hop: `proxy.spend` drops those, because the capability and the
     Program on this request are the runtime's to state and not the child's.
+    What comes back is the target's own, bounded the way the body is and for
+    the same reason. It is the reading and not the record: a child that files
+    an Observation about a header cites the Receipt it would have cited anyway,
+    because the transcript that Receipt names holds every header of the
+    exchange exactly and this list is an excerpt of it.
     """
     try:
         listener = proxy.peer(door.proxy_url)
@@ -723,6 +744,7 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
         return {"served": False, "reason": UNUSABLE_TARGET, "detail": str(error)}
 
     body = answer.body[: packet.DEFAULT_EXCERPT]
+    headers, cut = _readable(answer.headers)
     return {
         "served": answer.decision is None,
         "status": answer.status,
@@ -731,8 +753,42 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
         "detail": answer.detail,
         "byte_size": len(answer.body),
         "truncated": len(answer.body) > len(body),
+        "headers": headers,
+        "headers_truncated": cut,
         "body": body.decode("utf-8", "replace"),
     }
+
+
+def _readable(headers: Sequence[tuple[str, str]]) -> tuple[list[tuple[str, str]], bool]:
+    """The target's response headers as the child reads them, and whether cut.
+
+    What arrives is already the Agent's view of the exchange: the door removed
+    the material a target issues as a credential, the door's own three
+    statements about the exchange are named fields rather than headers, and
+    nothing describing either hop is among these. So the only judgement left
+    here is how much of it one exchange may spend, and `HEADERS_EXCERPT` above
+    says why there has to be one at all.
+
+    Measured as the list would be written -- name, colon, space, value, newline
+    -- because what the ceiling is protecting is a length in a model's context
+    and not a number of headers, and a count has no relation to what a header
+    costs to read. Whole pairs, and the first one that does not fit ends the
+    list, so a child reads a header the target sent rather than the front half
+    of one and concludes something about the half it got.
+
+    The flag is the point of stopping rather than a decoration on it. A cut
+    list that did not say so is a list a model would read as the whole answer,
+    and "this target sends no `Cache-Control`" is exactly the false reading
+    that would follow.
+    """
+    kept: list[tuple[str, str]] = []
+    spent = 0
+    for name, value in headers:
+        spent += len(name) + len(value) + len(": \n")
+        if spent > HEADERS_EXCERPT:
+            return kept, True
+        kept.append((name, value))
+    return kept, False
 
 
 def stated(bounds: packet.Bounds) -> str:

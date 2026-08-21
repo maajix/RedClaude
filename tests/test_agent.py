@@ -1334,6 +1334,16 @@ class RequestToolTest(unittest.TestCase):
         surface.open()
         return offered["http_request"]
 
+    def offering(self, stack, submission):
+        """Every tool this run serves, for the one test that spans two of them."""
+        surface = _launch.Surface()
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface, packet.Reader(packet.Packet()), submission, self.door
+        )
+        surface.open()
+        return offered
+
     def answer(self, packaged_tool, arguments: dict) -> dict:
         wire = asyncio.run(packaged_tool.handler(arguments))
         return json.loads(wire["content"][0]["text"])
@@ -1450,6 +1460,94 @@ class RequestToolTest(unittest.TestCase):
         self.assertEqual(packet.DEFAULT_EXCERPT, len(answer["body"]))
         self.assertEqual(len(long), answer["byte_size"])
         self.assertTrue(answer["truncated"])
+
+    def test_the_headers_the_target_answered_with_are_what_the_child_reads(self):
+        # The loss this ticket closes was one dict wide: the door put these on
+        # the hop and the handler returned everything except them, so a child
+        # could read a body a target wrote and nothing the target said about it.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(
+                answer=proxy.Answer(
+                    200,
+                    b"hello",
+                    "RC1",
+                    None,
+                    None,
+                    (("Cache-Control", "max-age=60"), ("Vary", "Accept-Encoding")),
+                )
+            ):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        self.assertEqual(
+            [["Cache-Control", "max-age=60"], ["Vary", "Accept-Encoding"]],
+            answer["headers"],
+        )
+        self.assertFalse(answer["headers_truncated"])
+
+    def test_a_header_list_larger_than_the_excerpt_is_cut_and_says_it_was(self):
+        # The body's ceiling, applied to the other half of the same document. A
+        # target that would rather fill this run's context than be measured by
+        # it needs only to answer with a thousand headers, and a cut list that
+        # did not say it was cut is one a model reads as the whole answer.
+        sent = tuple((f"X-Pad-{index:03d}", "v" * 100) for index in range(200))
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending(
+                answer=proxy.Answer(200, b"hello", "RC1", None, None, sent)
+            ):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/"})
+
+        read = [tuple(pair) for pair in answer["headers"]]
+        self.assertTrue(answer["headers_truncated"])
+        self.assertLess(len(read), len(sent))
+        # Whole pairs, in order, so a child reads a header the target sent
+        # rather than the front half of one.
+        self.assertEqual(list(sent[: len(read)]), read)
+        self.assertLessEqual(
+            sum(len(name) + len(value) + 3 for name, value in read),
+            _launch.HEADERS_EXCERPT,
+        )
+
+    def test_a_header_the_child_read_becomes_an_observation_citing_its_receipt(self):
+        # `header_policy_observed` has been evidential with provenance
+        # `{receipt,tool_run}` since 018, and until now no agent-reachable
+        # surface carried a header at all -- so the kind was a claim whose
+        # provenance record did not hold the fact. Both halves are one test
+        # because the criterion is that they meet: the header is read off the
+        # tool result and the Observation cites the Receipt that same result
+        # named. Nothing new is cited, and nothing needed to be: the transcript
+        # that Receipt names has held every header of every exchange all along.
+        submission = _launch.Submission()
+        with contextlib.ExitStack() as stack:
+            offered = self.offering(stack, submission)
+            with self.spending(
+                answer=proxy.Answer(
+                    200, b"hello", "RC1", None, None, (("X-Frame-Options", "DENY"),)
+                )
+            ):
+                exchange = self.answer(
+                    offered["http_request"], {"method": "GET", "url": "http://x.test/"}
+                )
+            [(name, value)] = [tuple(pair) for pair in exchange["headers"]]
+            filed = self.answer(
+                offered["submit_mission_result"],
+                {
+                    "observations": [
+                        {
+                            "kind": "header_policy_observed",
+                            "summary": f"{name}: {value}",
+                            "receipt_label": exchange["receipt"],
+                        }
+                    ]
+                },
+            )
+
+        self.assertTrue(filed["accepted"])
+        [observation] = submission.result["observations"]
+        self.assertEqual("header_policy_observed", observation["kind"])
+        self.assertEqual("X-Frame-Options: DENY", observation["summary"])
+        self.assertEqual("RC1", observation["receipt_label"])
 
     def test_bytes_that_are_not_text_are_replaced_rather_than_raised(self):
         with contextlib.ExitStack() as stack:
