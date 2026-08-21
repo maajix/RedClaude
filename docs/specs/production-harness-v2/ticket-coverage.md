@@ -39,7 +39,7 @@ this table when the two differ.
 | --- | --- |
 | Ticket files | 92, numbered continuously 01–92 |
 | Ticket status | 87 `resolved`, 4 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
-| Acceptance criteria | 535 total, 490 ticked |
+| Acceptance criteria | 536 total, 490 ticked |
 | Blocking edges | 163 exact title-and-number references, measured over 01–92 |
 | Dependency graph | Acyclic |
 | Open frontier | 65, 84, 88, 91, 92 -- everything blocking them is resolved |
@@ -110,7 +110,7 @@ runs, which cost a real Agent run apiece and can come back `fail`.
 | Resolved | 01–64, 66–83, 85–87, 89–90 |
 | Unblocked and open | 65, 84, 88, 91, 92 |
 | Blocked and open | none |
-| Criteria ticked | 490 of 535 |
+| Criteria ticked | 490 of 536 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
