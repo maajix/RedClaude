@@ -787,17 +787,21 @@ class GateTest(unittest.TestCase):
             )
 
         self.assertIsNone(
-            hunter.decide(hunting("mcp__rk2__run_tool", tool="ffuf", argv=["-u", "https://x"]))
+            hunter.decide(
+                hunting("mcp__rk2__run_tool", tool="jq", arguments={"filter": ".", "input": "A1"})
+            )
         )
         for one_call in (
             # A binary the roster did not enumerate.
-            hunting("mcp__rk2__run_tool", tool="bash", argv=[]),
+            hunting("mcp__rk2__run_tool", tool="bash", arguments={}),
             # A required argument that is not there.
-            hunting("mcp__rk2__run_tool", tool="ffuf"),
+            hunting("mcp__rk2__run_tool", tool="jq"),
             # An argument no contract declares.
-            hunting("mcp__rk2__run_tool", tool="ffuf", argv=[], shell=True),
+            hunting("mcp__rk2__run_tool", tool="jq", arguments={}, shell=True),
             # A value of the wrong shape.
-            hunting("mcp__rk2__run_tool", tool="ffuf", argv="-u https://x"),
+            hunting("mcp__rk2__run_tool", tool="jq", arguments="filter ."),
+            # A key that is not a name any registry row could carry.
+            hunting("mcp__rk2__run_tool", tool="jq", arguments={"Filter": "."}),
             # A string that does not match the pattern its argument declares.
             hunting("mcp__rk2__http_request", method="GET", url="file:///etc/passwd"),
             # A string that is not a label the database has ever issued -- and

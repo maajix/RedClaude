@@ -887,6 +887,13 @@ class Slice:
     #: machine that names no store still offers, claims and runs, and its
     #: packet says `not_staged` for every Artifact instead of quoting one.
     artifacts: Path | None = None
+    #: The image the registered tools are in, for the runs a child asks for
+    #: while it is going. Optional for the same reason and with the same
+    #: consequence: a machine that names none still runs, and both tool-run
+    #: tools answer that there is nothing to run one with. It needs the store
+    #: as well -- a run whose output could not be filed is a run that leaves no
+    #: evidence -- so neither on its own serves anything.
+    tools: isolation.ToolContainer | None = None
 
     def attempt(self, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
         """Reconcile, offer, claim, run, promote, close. Once, and closed either way.
@@ -1517,7 +1524,12 @@ class Slice:
             try:
                 with self._heartbeat(ledger, connection, claimed, facts):
                     result = self._child(
-                        ledger, claimed, selected, mission, door, lifetime, program_id
+                        ledger, claimed, selected, mission, door, lifetime, program_id,
+                        # Read only where there is something to open a
+                        # connection for. A machine that describes no tool
+                        # image serves no tool call, so the settings are not a
+                        # thing this pass needs to have.
+                        connection.settings if self.serves_tools else None,
                     )
             except agent.StartupRefusal as refusal:
                 # Before the `RuntimeError` arm, which it is one of: a machine
@@ -2027,6 +2039,7 @@ class Slice:
         door: agent.Egress,
         lifetime: float,
         program_id: str,
+        runtime: pg.Settings | None,
     ) -> agent.AgentRunResult | None:
         """The one child, started inside the boundary with the one capability.
 
@@ -2036,6 +2049,12 @@ class Slice:
         that thread is safe is that nothing else touches it until the thread is
         joined. So the refusal is left to leave here as an exception, and the
         caller closes it a line later, on the other side of that join.
+
+        `runtime` is the same connection's settings and travels for exactly that
+        reason. A tool run the child asks for is opened, performed and filed by
+        the supervisor while the child waits, which is a second writer -- so it
+        opens a connection of its own from these rather than sharing the one the
+        heartbeat has.
         """
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
@@ -2049,6 +2068,13 @@ class Slice:
             timeout=timeout,
             subagent_cap=claimed.subagent_cap,
             token_cap=claimed.token_cap,
+            tooling=(
+                None
+                if runtime is None or self.tools is None or self.artifacts is None
+                else agent.Tooling(
+                    container=self.tools, root=self.artifacts, runtime=runtime
+                )
+            ),
         )
         try:
             result = self.launch(request)
@@ -2066,6 +2092,16 @@ class Slice:
             f"after {result.answers} answer(s), {result.mission_attempts} submission(s)",
         )
         return result
+
+    @property
+    def serves_tools(self) -> bool:
+        """Whether a child's tool call can be answered on this machine at all.
+
+        Both parts or neither: an image with nowhere to file what a run produced
+        is a run that could start and could not be kept, so a machine holding
+        one of them serves the same nothing as a machine holding neither.
+        """
+        return self.tools is not None and self.artifacts is not None
 
     def _refused(
         self,

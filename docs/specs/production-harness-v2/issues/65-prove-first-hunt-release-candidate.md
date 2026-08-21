@@ -2,7 +2,7 @@
 
 **What to build:** Demonstrate from a fresh installation that RedKraken v2 can conduct a safe, complete synthetic bug-bounty hunt and leave the operator with a validated configuration and procedure for the first authorized live Program.
 
-**Blocked by:** 64 — Run and remediate the final code review.
+**Blocked by:** 64 — Run and remediate the final code review; 87 — Serve a Skill script as a recorded Tool run.
 
 **Status:** ready-for-agent
 

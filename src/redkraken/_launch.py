@@ -42,11 +42,12 @@ import json
 import os
 import ssl
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import NoReturn
 
-from redkraken import agent, capsule, packet, proxy, roster, scope, tls
+from redkraken import agent, capsule, isolation, packet, proxy, roster, scope, tls
 
 
 try:
@@ -103,6 +104,13 @@ ANSWER = 1500
 NO_CAPABILITY = "no_capability"
 UNUSABLE_TARGET = "unusable_target"
 DOOR_UNREACHABLE = "door_unreachable"
+
+#: And why a tool call reached no supervisor. The other three are about a run
+#: that had no capability to spend; this one is about a run whose installation
+#: described no tool image and no store, which is the same kind of fact and the
+#: same kind of answer -- a refusal the model can read, rather than a tool that
+#: is missing and cannot be asked about.
+NO_TOOLING = "no_tooling"
 
 
 class Closed(RuntimeError):
@@ -344,6 +352,76 @@ class Judgement:
         }
 
 
+class Channel:
+    """The child's half of the pipe it was launched on, used as a question.
+
+    Everything else this module serves is answered from the job document,
+    because the container's one network reaches the capability proxy and a
+    handler cannot fetch what the runtime did not send.  A tool run cannot be:
+    it starts a second container and writes a row, and this process has neither
+    a container runtime nor a database.  So it is asked for, on the two file
+    descriptors the launch already has -- one object out under `rk2_call`, one
+    object back under `rk2_answer`, one line each.
+
+    The lock is not about speed.  Two calls in flight would put two questions on
+    one pipe and take the answers in whatever order they arrived, so one call
+    holds the pipe until its own answer comes back, and the `id` on both halves
+    is what makes that checkable rather than assumed.  The read is blocking, so
+    every caller reaches it through a thread: the handlers are on an event loop,
+    and a supervisor taking twenty seconds to run a tool would otherwise stall
+    every other thing the session has in flight.
+
+    A closed pipe is answered, not raised.  If the supervisor is gone there is
+    nothing left to ask and nothing this side can do about it -- but a handler
+    that raised would end the turn with a traceback, and a handler that answers
+    a refusal lets the model do something else with what is left of the run.
+    """
+
+    def __init__(self, out=None, source=None) -> None:
+        self._out = sys.stdout if out is None else out
+        self._in = sys.stdin if source is None else source
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def call(self, verb: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        """Ask for one thing and wait for the answer to that thing.
+
+        The verb is written last so it is the verb: the arguments are a model's,
+        and a call carrying a `verb` of its own must not be able to become a
+        call to something else.  The gate refuses an argument no contract
+        declares long before this and that is the check; this is one line that
+        makes it not the only one.
+        """
+        with self._lock:
+            self._calls += 1
+            identifier = self._calls
+            frame = {isolation.CALL: {**dict(arguments), "verb": verb}, "id": identifier}
+            self._out.write(json.dumps(frame) + "\n")
+            self._out.flush()
+            while True:
+                line = self._in.readline()
+                if not line:
+                    return {
+                        "served": False,
+                        "reason": isolation.UNANSWERED,
+                        "detail": "the supervisor closed the channel",
+                    }
+                try:
+                    document = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(document, dict) or document.get("id") != identifier:
+                    continue
+                answered = document.get(isolation.ANSWER)
+                if isinstance(answered, Mapping):
+                    return answered
+                return {
+                    "served": False,
+                    "reason": isolation.UNANSWERED,
+                    "detail": "the supervisor answered with no document",
+                }
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -430,6 +508,22 @@ DESCRIPTIONS = {
         "type with src_ref or src_label and dst_ref or dst_label, and containment "
         "is never one of them."
     ),
+    "run_tool": (
+        "Run one registered offline tool over Artifacts this Program already holds, "
+        "and get back the Tool Run label to cite, what it exited with and the first "
+        "few kilobytes of what it printed. Name each argument the tool declares; an "
+        "argument that takes an Artifact takes its label, never its hash. The whole "
+        "output is filed as an Artifact of this Program -- the excerpt here is proof "
+        "of what ran, not the place to read a large answer."
+    ),
+    "run_skill_script": (
+        "Run one script that ships with a Skill you hold, over Artifacts this Program "
+        "already holds. Name the Skill, the script's filename, and each argument the "
+        "script declares by the label of the Artifact it reads. The script is handed "
+        "each Artifact whole -- nothing is truncated on the way in -- and what comes "
+        "back is the Tool Run label to cite, what it exited with and the first few "
+        "kilobytes of what it printed, with the whole of it filed as an Artifact."
+    ),
 }
 
 
@@ -440,8 +534,9 @@ def server(
     door: agent.Egress | None = None,
     choice: Choice | None = None,
     judgement: Judgement | None = None,
+    channel: Channel | None = None,
 ):
-    """Five reads, one request, one proposal, one choice and one judgement.
+    """Five reads, one request, two tool runs, one proposal, one choice, one judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -473,6 +568,8 @@ def server(
     judging = Judgement() if judgement is None else judgement
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
     tools.append(_request(surface, door))
+    tools.append(_tool_run(surface, channel, "run_tool"))
+    tools.append(_tool_run(surface, channel, "run_skill_script"))
     tools.append(_propose(surface, submission))
     tools.append(_slate(surface, picking))
     tools.append(_pick(surface, picking))
@@ -534,6 +631,46 @@ def _request(surface: Surface, door: agent.Egress | None):
                 str(given.get("url") or ""),
                 str(given.get("method") or "GET"),
                 _headers(given.get("headers")),
+            )
+        )
+
+    return handler
+
+
+def _tool_run(surface: Surface, channel: Channel | None, name: str):
+    """One registered program, run by the supervisor and reported back here.
+
+    Both tool-run tools are this function, because they differ in exactly one
+    thing: which registered row a child names, and by what.  What happens to the
+    call is the same either way -- it crosses the channel unchanged, the
+    supervisor opens the run, starts the container and files what it produced,
+    and what comes back is the answer to the call that was made.
+
+    Nothing here decides whether the run may happen.  The roster refused every
+    call that does not fit its contract before this handler was reached, and
+    `open_offline_tool_run` decides the call that actually arrives against the
+    registry, the Program's Halt state and the role's permission.  This
+    handler's whole job is to carry one to the other, including a refusal, which
+    is reported as a refusal rather than as a tool that failed.
+
+    On a thread for `_request`'s reason: the exchange is blocking and the caller
+    is an event loop.
+    """
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        if channel is None:
+            return _content(
+                {
+                    "served": False,
+                    "reason": NO_TOOLING,
+                    "detail": "this run was started with no tool image; nothing was run",
+                }
+            )
+        return _content(
+            await asyncio.to_thread(
+                channel.call, f"mcp__{agent.SERVER}__{name}", dict(arguments or {})
             )
         )
 
@@ -893,6 +1030,13 @@ async def run(
     # but a validator's. An empty one serves no packet and latches no answer,
     # which is the honest state for a session nobody gave a Finding.
     judgement = Judgement(_judged(job.get("judgement")))
+    # Nothing, when the job says the supervisor is not answering. A run whose
+    # installation described no tool image still serves both tool-run tools --
+    # the allowlist is the role's, not the job's -- and they answer that there
+    # is nothing to run one with. Read off the job rather than tried, because
+    # the way to find out by trying is to write into a pipe nobody is reading
+    # and wait there until the run's deadline.
+    channel = Channel() if job.get("tooling") else None
     # Nothing, when there is no SDK to build it from, and nothing when there is
     # no role to build it for. An options value is a description of what one
     # SDK version would do for one role, so an absent SDK and an unknown role
@@ -905,7 +1049,7 @@ async def run(
         else options_for(
             job,
             runtime,
-            server(surface, reader, submission, door, choice, judgement),
+            server(surface, reader, submission, door, choice, judgement, channel),
             launch,
             gate,
         )
@@ -1129,8 +1273,13 @@ async def _close(messages) -> None:
 
 
 def main(stream=None) -> int:
-    """The child entry point: one job in, one result or one refusal out."""
-    job = json.loads((stream or sys.stdin).read())
+    """The child entry point: one job in, one result or one refusal out.
+
+    One line rather than a stream read to its end. A job with a tool channel in
+    it leaves the pipe open for the whole run, so reading to the end of standard
+    input would be reading until the supervisor gives up on this process.
+    """
+    job = json.loads((stream or sys.stdin).readline())
     runtime = runtime_facts()
     try:
         result = asyncio.run(run(job, runtime=runtime))

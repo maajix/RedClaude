@@ -571,7 +571,12 @@ def _label(*prefixes: str) -> str:
 #: `assign_entity_label` keys the prefix off the row's type. There is no single
 #: prefix that means "entity", which is why this is built rather than written.
 _ENTITY_LABEL = _label(*(LABEL_PREFIXES[kind] for kind in ENTITY_TYPES))
-_HASH = "^[0-9a-f]{64}$"
+
+#: What one declared argument of one registered tool is called, which is
+#: `offline_tool_arguments.name`'s own check constraint. A name outside it is a
+#: name the registry has no row for, and refusing it here means a tool call the
+#: gate passed is a tool call the registry can at least look up.
+_ARGUMENT_NAME = "^[a-z][a-z0-9_]{0,31}$"
 
 #: The largest page a bounded read may be asked for. The handler bounds the
 #: response by serialized bytes as well, so this is the coarse half of the
@@ -767,14 +772,28 @@ CONTRACTS: dict[str, Contract] = {
         arguments={
             # An enum, because an open binary name is an unbounded set of
             # programs, and an unbounded set on a tool that starts a process is
-            # the arbitrary process creation this surface does not have.
+            # the arbitrary process creation this surface does not have. The
+            # members are the registry's own `offline_tools` names -- the ones
+            # that are a binary rather than a Skill script, which is the other
+            # tool below -- because the call is opened by
+            # `open_offline_tool_run` and a name this enum admitted and the
+            # registry did not would be a refusal one layer too late.
             "tool": Argument(
                 "string",
                 required=True,
-                enum=("ffuf", "nuclei", "sqlmap", "jq", "httpx", "katana"),
+                enum=("jq", "js_map", "js_parse", "js_routes"),
             ),
-            "argv": Argument("array", required=True, items_pattern="^[^\\x00]{0,512}$"),
-            "input_artifact_hashes": Argument("array", items_pattern=_HASH),
+            # Named, not free. `offline_tool_arguments` declares every argument
+            # of every registered tool -- its position, its flag, whether it
+            # takes an Artifact or a literal, and what a literal may match --
+            # and an argv would be a second, weaker statement of the same thing
+            # that the registry would then have to take apart again.
+            "arguments": Argument(
+                "object",
+                required=True,
+                items_pattern=_ARGUMENT_NAME,
+                values_pattern="^[^\\x00]{0,512}$",
+            ),
         },
     ),
     "mcp__rk2__run_skill_script": Contract(
@@ -784,7 +803,12 @@ CONTRACTS: dict[str, Contract] = {
         arguments={
             "skill_name": Argument("string", required=True, pattern="^[a-z0-9][a-z0-9-]{0,63}$"),
             "script": Argument("string", required=True, pattern="^[a-z0-9_.-]{1,64}$"),
-            "input_artifact_hashes": Argument("array", items_pattern=_HASH),
+            "arguments": Argument(
+                "object",
+                required=True,
+                items_pattern=_ARGUMENT_NAME,
+                values_pattern="^[^\\x00]{0,512}$",
+            ),
         },
     ),
     "mcp__rk2__get_validation_packet": Contract(
@@ -827,6 +851,13 @@ CONTRACTS: dict[str, Contract] = {
 RUN_TOOL = "mcp__rk2__run_tool"
 RUN_TOOL_GROUP = CONTRACTS[RUN_TOOL].group
 RUN_TOOL_NAMES: tuple[str, ...] = CONTRACTS[RUN_TOOL].arguments["tool"].enum
+
+#: The other half of that group: the registered program a child names by the
+#: Skill it holds and the script in it rather than by the registry's own name
+#: for the row. Spelled here beside `RUN_TOOL` because the supervisor's handler
+#: dispatches on the pair, and a verb spelled in the handler would be a second
+#: place this surface is named.
+RUN_SKILL_SCRIPT = "mcp__rk2__run_skill_script"
 
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool

@@ -57,7 +57,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from redkraken import artifact, config, isolation, migrate, pg, program
+from redkraken import artifact, config, isolation, migrate, pg, program, skill
 from redkraken.outcome import (
     INTEGRITY_FAILED,
     INVALID_CONFIGURATION,
@@ -75,6 +75,8 @@ __all__ = [
     "IMAGE_VARIABLE",
     "RUN",
     "run",
+    "script",
+    "serve",
 ]
 
 
@@ -100,9 +102,13 @@ FACTS = ("program_id", "program_slug", "tool_run", "outputs")
 REGISTERED = (
     "SELECT executable, to_json(version_argv)::text, timeout_seconds, memory_mb,"
     "       cpu_quota, pids_limit, max_output_bytes, analyser,"
-    "       CASE WHEN analyser IS NOT NULL THEN rk2_offline_analyser_path(analyser) END"
+    "       CASE WHEN analyser IS NOT NULL THEN rk2_offline_analyser_path(analyser) END,"
+    "       skill, input_delivery"
     "  FROM rk2_offline_tool($1)"
 )
+
+#: The registry row one Skill script is, by the pair a child names it with.
+SCRIPT = "SELECT rk2_skill_script($1, $2)"
 
 #: The directory a harness-shipped analyser is read from. Beside this module,
 #: because that is what it is: a tool whose program the registry names but does
@@ -110,6 +116,12 @@ REGISTERED = (
 #: The registry says which file, and this side says what is in it -- so a row
 #: can name an analyser only if the harness that reads the row also shipped it.
 ANALYSERS = Path(__file__).parent
+
+#: The `offline_tools.input_delivery` value this module branches on. The other
+#: one is `argv`, which needs no name here because it is what every path that
+#: does not take this one already does: a path under `/input` per input
+#: Artifact. This one is `skill.envelope` on standard input instead.
+ON_STDIN = "stdin"
 
 #: Which Program this connection is, for the session's lifetime. The verbs read
 #: it rather than taking a Program, so that a runtime holding one connection open
@@ -139,6 +151,22 @@ NAME = (
     "INSERT INTO tool_run_paths (program_id, tool_run_id, sha256, path)"
     " VALUES ($1::uuid, $2::uuid, $3, $4)"
 )
+
+#: Who a run opened for a running child is attributed to. The command that is
+#: actually executing, which is the Agent run: `rk tool run` would name a
+#: command nobody typed, and the verb the child called is on the run's own row
+#: already.
+SERVED_BY = "rk agent run"
+
+#: Why a call a child made was not served, in tokens rather than in prose, for
+#: the reason `_launch`'s request refusals are tokens: the model reads one of
+#: these and so does whatever later looks at the transcript, and a reason
+#: reworded would silently change what either concluded. Three, because there
+#: are three moments a call can stop at: before the registry admits the tool,
+#: at the call the registry decides, and at the run itself.
+UNREGISTERED_TOOL = "unregistered_tool"
+REFUSED_CALL = "refused_call"
+RUN_FAILED = "run_failed"
 
 #: The key an analyser's answer names its request paths under. One key across
 #: all three questions, so this side never has to know which document shape it
@@ -294,13 +322,25 @@ def run(
                 ledger, answers, connection, plan, f"an input Artifact cannot be read: {error}",
                 name="integrity", code=INTEGRITY_FAILED, source="artifact_store",
             )
+        except skill.NotText as error:
+            # The bytes are here and they hash to their own name; what they are
+            # not is something the envelope can carry. That is a call pointed at
+            # the wrong Artifact rather than a store that has lost anything, so
+            # it is reported as the invalid call it is.
+            return _abandon(
+                ledger, answers, connection, plan, str(error),
+                name="call", code=INVALID_CONFIGURATION, source=f"offline_tool:{plan['tool']}",
+            )
         except isolation.Unavailable as error:
             return _abandon(
                 ledger, answers, connection, plan, str(error),
                 name="run", code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}",
             )
         except BaseException as error:
-            _closing(connection, plan, f"the supervisor could not run the tool: {error!r}")
+            _closing(
+                connection, plan, f"the supervisor could not run the tool: {error!r}",
+                actor=f"rk {RUN}",
+            )
             raise
 
         status, detail, stopped = _verdict(answer, plan)
@@ -329,7 +369,10 @@ def run(
                     )
                 )
         except BaseException as error:
-            _closing(connection, plan, f"the output could not be filed: {error!r}")
+            _closing(
+                connection, plan, f"the output could not be filed: {error!r}",
+                actor=f"rk {RUN}",
+            )
             raise
 
     answers.tool_run.update(status=closed["status"], exit_code=closed["exit_code"], detail=detail)
@@ -370,6 +413,156 @@ def run(
     return _report(ledger, answers)
 
 
+def serve(
+    connection: pg.Connection,
+    root: Path,
+    container: isolation.ToolContainer,
+    *,
+    program_id: str,
+    agent_run_id: str,
+    offline_tool: str,
+    arguments: Mapping[str, str],
+    excerpt: int,
+) -> dict:
+    """Open, run, file and close one registered tool run for a child mid-run.
+
+    The same four steps `run` takes, in the same order, on a connection somebody
+    else is holding.  It is not `run` with the reporting taken out: `run` is a
+    command, and half of it is resolving a Program from a configuration file, an
+    image from an environment variable and an Agent run from a label -- every
+    one of which a supervisor that has already started a child is holding
+    already.  What the two share is the half that must not exist twice, which is
+    the registry lookup, the version probe, the open, the run, the filing and
+    the close.
+
+    What comes back is an answer for a model, so it is bounded.  The labels of
+    what was filed and an `excerpt`-byte head of what the run printed: the whole
+    output is an Artifact in the store, and the way to see more of it than fits
+    here is to analyse that Artifact rather than to read it into a context.
+
+    A refusal is answered rather than raised.  A child that asked for a tool the
+    registry does not admit has made a call that failed, which is a thing it can
+    read and do something else about; an exception out of here would reach it as
+    the supervisor failing, which is a different fact and not this one.
+    """
+    keep = Store(Path(root))
+    connection.execute(BIND, (program_id,))
+    try:
+        registered = _registered(connection, offline_tool)
+        version = _version(container, registered)
+    except pg.DatabaseError as error:
+        return _unserved(UNREGISTERED_TOOL, f"the registry refused {offline_tool}: {_said(error)}")
+    except _NotShipped as error:
+        return _unserved(UNREGISTERED_TOOL, str(error))
+    except isolation.Unavailable as error:
+        return _unserved(UNREGISTERED_TOOL, str(error))
+    analyser = registered["analyser"]
+
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (SERVED_BY,))
+            plan = json.loads(
+                str(
+                    connection.execute(
+                        OPEN,
+                        (
+                            agent_run_id,
+                            offline_tool,
+                            version,
+                            json.dumps(dict(arguments)),
+                            analyser.sha256 if analyser else None,
+                        ),
+                    ).scalar()
+                )
+            )
+    except pg.DatabaseError as error:
+        return _unserved(REFUSED_CALL, f"the registry refused this call: {_said(error)}")
+
+    # From here the row is open and committed, so every way out of this closes
+    # it, for `run`'s reason: an open row left behind is the one state
+    # `check_offline_tools` cannot tell from a supervisor that died.
+    try:
+        answer = _perform(container, keep, plan, analyser)
+    except (Missing, Corrupt, skill.NotText, isolation.Unavailable) as error:
+        _closing(connection, plan, str(error), actor=SERVED_BY)
+        return _unserved(RUN_FAILED, str(error), tool_run=plan["tool_run"])
+    except BaseException as error:
+        _closing(
+            connection, plan, f"the supervisor could not run the tool: {error!r}",
+            actor=SERVED_BY,
+        )
+        raise
+
+    status, detail, _ = _verdict(answer, plan)
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (SERVED_BY,))
+            outputs = []
+            for produced in _streams(answer, plan):
+                filed = _keep_stream(connection, keep, program_id, plan, produced)
+                if produced.stream == "stdout":
+                    _named(connection, program_id, plan, analyser, produced, filed["sha256"])
+                outputs.append(filed)
+            closed = json.loads(
+                str(
+                    connection.execute(
+                        CLOSE, (plan["tool_run_id"], status, answer.exit_code, detail)
+                    ).scalar()
+                )
+            )
+    except BaseException as error:
+        _closing(
+            connection, plan, f"the output could not be filed: {error!r}",
+            actor=SERVED_BY,
+        )
+        raise
+
+    head = answer.stdout.data[:excerpt]
+    return {
+        "served": closed["status"] == "success",
+        "tool_run": plan["tool_run"],
+        "tool": plan["tool"],
+        "version": plan["version"],
+        "status": closed["status"],
+        "exit_code": closed["exit_code"],
+        "detail": detail,
+        "outputs": [
+            {name: item[name] for name in ("stream", "output_name", "kind", "label", "byte_size")}
+            for item in outputs
+        ],
+        "stdout": head.decode("utf-8", "replace"),
+        "truncated": answer.stdout.truncated or len(answer.stdout.data) > len(head),
+    }
+
+
+def _unserved(reason: str, detail: str, tool_run: str | None = None) -> dict:
+    """One refusal, in the shape every other refusal a child reads is in.
+
+    The run label is carried when there is one, because the two cases are not
+    the same fact: a call the registry never admitted left no row, and a run
+    that opened and then failed left one that says so and can be cited.
+    """
+    answer = {"served": False, "reason": reason, "detail": detail}
+    if tool_run is not None:
+        answer["tool_run"] = tool_run
+    return answer
+
+
+def script(connection: pg.Connection, skill_name: str, name: str) -> str | None:
+    """Which registered tool one Skill script is, or nothing if it is not one.
+
+    Two names in and one name out, because that is the whole of the mapping a
+    child is allowed to make: it names a Skill it holds and a script in it, and
+    the registry answers which of its own rows that pair is.  A child that could
+    name the row directly could name any row, which is the difference between a
+    Skill script and the enumerated binary beside it.
+    """
+    try:
+        return str(connection.execute(SCRIPT, (skill_name, name)).scalar())
+    except pg.DatabaseError:
+        return None
+
+
 @dataclass
 class _Answers:
     """What the command has established so far, in report terms."""
@@ -395,12 +588,20 @@ def _report(ledger: Ledger, answers: _Answers) -> Report:
 def _registered(connection: pg.Connection, tool: str) -> dict:
     """The registry row for one enabled tool, or the registry's own refusal."""
     (
-        executable, version_argv, timeout, memory, cpu, pids, output, analyser, analyser_path
+        executable, version_argv, timeout, memory, cpu, pids, output, analyser, analyser_path,
+        skill_name, delivery,
     ) = connection.execute(REGISTERED, (tool,)).rows[0]
     return {
         "executable": str(executable),
-        "version_argv": [str(item) for item in json.loads(str(version_argv))],
-        "analyser": _analyser(analyser, analyser_path),
+        # None for a Skill script, which is asked no version question: its
+        # version is the digest of the bytes this side read, and `_version`
+        # answers from the analyser rather than from a container.
+        "version_argv": (
+            None if version_argv is None
+            else [str(item) for item in json.loads(str(version_argv))]
+        ),
+        "analyser": _analyser(analyser, analyser_path, skill_name),
+        "input_delivery": str(delivery),
         "ceilings": isolation.Ceilings(
             timeout_seconds=float(timeout),
             memory_mb=int(memory),
@@ -430,7 +631,7 @@ class _Analyser:
     sha256: str
 
 
-def _analyser(analyser: object, analyser_path: object) -> _Analyser | None:
+def _analyser(analyser: object, analyser_path: object, skill_name: object) -> _Analyser | None:
     """The analyser this tool's registry row names, read off this harness's disk.
 
     A registry row can name an analyser but cannot hold one, so the name and the
@@ -442,11 +643,17 @@ def _analyser(analyser: object, analyser_path: object) -> _Analyser | None:
     The name is taken apart rather than joined: the registry's pattern already
     admits only a bare `*.py`, and reading a path out of a table into an open
     would make that pattern the only thing between a row and any file this
-    process can read.
+    process can read. `skill_name` is taken apart the same way and for the same
+    reason -- it is a directory under the Skill corpus and never a path -- which
+    is the whole of the difference between an analyser beside this module and a
+    Skill script: two known roots, and a bare filename under one of them.
     """
     if analyser is None:
         return None
-    source = ANALYSERS / Path(str(analyser)).name
+    root = ANALYSERS if skill_name is None else (
+        skill.CORPUS / Path(str(skill_name)).name / skill.SCRIPT_DIR
+    )
+    source = root / Path(str(analyser)).name
     try:
         body = source.read_bytes()
     except OSError as error:
@@ -484,8 +691,17 @@ def _version(container: isolation.ToolContainer, registered: Mapping[str, object
     What comes back is one line and is not interpreted here. `open_offline_tool_run`
     holds it against the registry's pattern, which is where the decision belongs
     -- this is the half that cannot lie about what is installed.
+
+    A Skill script is asked nothing, and its registry row says so by declaring
+    no `version_argv`. The version of a program this harness ships is the digest
+    of the bytes this process just read, which is already on the run as
+    `analyser_sha256`: a container round trip could only ever agree with it, and
+    a `--version` flag would be an argument on a program whose whole contract is
+    that it takes none.
     """
     analyser = registered["analyser"]
+    if registered["version_argv"] is None:
+        return analyser.sha256
     answer = isolation.run_tool(
         container,
         (
@@ -521,7 +737,16 @@ def _perform(
     is mounted where the plan already says it is -- `argv` was built around that
     path before the row was written -- and under the hash on the row, so what
     ran and what the run claims ran are the same bytes or the run is a fault.
+
+    A plan that delivers on `stdin` mounts none of them. Its inputs are the
+    envelope, in the order the plan lists them, which is the order the registry
+    put them in -- and they are the *whole* Artifact, because the store is what
+    this side reads and the excerpt the model saw never enters here. The digest
+    in the envelope is of the text it carries, so an Artifact that arrived
+    short would say so on its face.
     """
+    bodies = [keep.load(item["sha256"]) for item in plan["inputs"]]
+    on_stdin = str(plan["input_delivery"]) == ON_STDIN
     return isolation.run_tool(
         container,
         [str(item) for item in plan["argv"]],
@@ -534,10 +759,15 @@ def _perform(
         ),
         inputs={
             **_staged(analyser),
-            **{item["path"]: keep.load(item["sha256"]) for item in plan["inputs"]},
+            **(
+                {}
+                if on_stdin
+                else {item["path"]: body for item, body in zip(plan["inputs"], bodies)}
+            ),
         },
         outputs=[item["name"] for item in plan["outputs"]],
         network=str(plan["network"]),
+        stdin=skill.envelope(bodies).encode("utf-8") if on_stdin else None,
     )
 
 
@@ -702,7 +932,9 @@ def _abandon(
     return _report(ledger, answers)
 
 
-def _closing(connection: pg.Connection, plan: Mapping[str, object], detail: str) -> None:
+def _closing(
+    connection: pg.Connection, plan: Mapping[str, object], detail: str, *, actor: str
+) -> None:
     """Close an open run on the way out of a failure this command did not name.
 
     Best effort, and deliberately silent when it fails: the caller is already
@@ -710,10 +942,14 @@ def _closing(connection: pg.Connection, plan: Mapping[str, object], detail: str)
     that has just dropped is exactly the case where the close cannot land. What
     it buys when it does land is the same thing `_abandon` buys -- a row that
     reads as a run that failed rather than as a supervisor that disappeared.
+
+    The actor is the caller's, because the row is a receipt and a receipt says
+    who wrote it. A run a child asked for that closed under the command's name
+    would read as an operator's, which is the one thing this row is for.
     """
     try:
         with connection.transaction():
-            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
+            connection.execute("SELECT set_actor('runtime', $1)", (actor,))
             connection.execute(CLOSE, (plan["tool_run_id"], "error", None, detail))
     except (pg.ConnectionError_, pg.DatabaseError, OSError):
         return

@@ -2001,6 +2001,14 @@ CONTROLS = (
         "ALTER TABLE tasks DISABLE TRIGGER tasks_completion_needs_promotion",
     ),
     Control(
+        # PH2-87: a role that may run a Skill script without holding the Skill.
+        # The verb refuses such a run, so what this writes is the registry state
+        # that would turn every one of those runs into a refusal nobody asked
+        # for -- which is the thing the check exists to find before it happens.
+        "standing:skill_scripts",
+        "INSERT INTO offline_tool_roles (tool, role) VALUES ('compare_responses', 'recon')",
+    ),
+    Control(
         # A registered tool no role may run. The registry is the allowlist, and
         # an entry nothing can reach is an entry that reads as one and is not --
         # so the falsification is a row with no `offline_tool_roles` beside it.
@@ -22867,6 +22875,84 @@ def offline_reference(
     )
 
 
+class SkillScriptRegistryTest(DatabaseCase):
+    """PH2-87 criteria 1 and 5: a Skill script is a registry row like any other.
+
+    Everything here is read: the registry says which scripts this installation
+    admits, and this checks that what it says is what the harness ships, what
+    the roster offers and what the runtime would run. A Skill script is not a
+    second kind of thing beside an offline tool -- it is an `offline_tools` row
+    with two more columns on it -- and these are the statements that make that
+    true rather than merely intended.
+    """
+
+    settings_for = "runtime"
+
+    def scripts(self) -> list[tuple]:
+        return self.connection.execute(
+            "SELECT tool, skill, analyser, input_delivery, version_argv"
+            "  FROM offline_tools WHERE skill IS NOT NULL ORDER BY tool"
+        ).rows
+
+    def test_every_registered_skill_script_is_one_this_installation_can_run(self):
+        # Five readings, and none of them may be reading anything: a script
+        # whose role does not hold its Skill, an envelope tool taking a literal
+        # or declaring an output, a script the corpus does not carry, and a run
+        # whose recorded version is not the digest of the bytes that ran.
+        self.assertEqual((), self.connection.execute("SELECT * FROM check_skill_scripts()").rows)
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT count(*) FROM standing_checks WHERE name = 'skill_scripts'"
+            ).scalar(),
+        )
+
+    def test_a_script_is_named_by_the_skill_that_holds_it_and_its_filename(self):
+        # The pair is the whole of what a child may name. A child that could
+        # name the registry's own row for it could name any row, which is the
+        # difference between a Skill script and the enumerated binary beside it.
+        self.assertEqual(
+            "compare_responses",
+            self.connection.execute(
+                "SELECT rk2_skill_script('compare-responses', 'compare.py')"
+            ).scalar(),
+        )
+        self.assertIn(
+            "no registered script jq",
+            refusal_message(
+                self.connection, "SELECT rk2_skill_script('compare-responses', 'jq')"
+            ),
+        )
+
+    def test_a_skill_script_is_asked_no_version_and_is_fed_its_inputs_whole(self):
+        # No version argv, because a script's version is the digest of the bytes
+        # the runtime read off its own disk -- there is no `--version` to ask.
+        # And `stdin`, because the envelope carries each Artifact entire, which
+        # is what an argv of paths under `/input` could not promise.
+        rows = self.scripts()
+
+        self.assertTrue(rows)
+        for tool_name, skill_name, analyser, delivery, version_argv in rows:
+            with self.subTest(tool=tool_name):
+                self.assertIsNone(version_argv)
+                self.assertEqual("stdin", delivery)
+                self.assertTrue((skill.CORPUS / skill_name / skill.SCRIPT_DIR / analyser).exists())
+
+    def test_the_tools_run_tool_offers_are_the_registry_rows_that_are_not_scripts(self):
+        # The roster's enum and the registry are two statements of one set, and
+        # a name the enum admitted and the registry did not would be a refusal
+        # one layer too late -- a call the gate passed and `open_offline_tool_run`
+        # then turned into a run that never opened.
+        registered = [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT tool FROM offline_tools WHERE skill IS NULL AND enabled ORDER BY tool"
+            ).rows
+        ]
+
+        self.assertEqual(registered, sorted(roster.RUN_TOOL_NAMES))
+
+
 class OfflineToolRunTest(DatabaseCase):
     """PH2-30 criteria 1, 3, 5 and 6, as the database decides them.
 
@@ -23611,6 +23697,11 @@ class OfflineToolCommandTest(DatabaseCase):
                 name="rkgrep", label=cls.labels["small"], more={"pattern": "absent"}
             ),
         }
+        cls.served = {
+            "success": cls.serve(name="rkcat", label=cls.labels["small"]),
+            "unknown": cls.serve(name="nmap", label=cls.labels["small"]),
+            "unreadable": cls.serve(name="rkcat", label=cls.labels["missing"]),
+        }
 
     @classmethod
     def tearDownClass(cls):
@@ -23663,6 +23754,30 @@ class OfflineToolCommandTest(DatabaseCase):
             arguments={"input": label, **(more or {})},
         )
 
+    #: Short enough that the run above overruns it, because the bound is the
+    #: claim: what a child reads back is an excerpt and the whole of it is an
+    #: Artifact, and a test whose output fitted would not say which.
+    EXCERPT = 8
+
+    @classmethod
+    def serve(cls, *, name: str, label: str, more: dict[str, str] | None = None) -> dict:
+        """The same run, asked for mid-flight by a child rather than by an operator.
+
+        `tool.serve` is handed what a supervisor already holds -- a connection,
+        a Program, an Agent run and an image -- because that is the difference
+        between the two entry points. Everything after that is the same code.
+        """
+        return tool.serve(
+            cls.connection,
+            cls.root,
+            isolation.ToolContainer(image=AGENT_IMAGE),
+            program_id=cls.program_id,
+            agent_run_id=cls.recon,
+            offline_tool=name,
+            arguments={"input": label, **(more or {})},
+            excerpt=cls.EXCERPT,
+        )
+
     @classmethod
     def named(cls, agent_run: str) -> str:
         """What an operator calls an agent run on the command line."""
@@ -23703,6 +23818,62 @@ class OfflineToolCommandTest(DatabaseCase):
 
     def said(self, answer: Report) -> str:
         return " ".join(item.detail for item in answer.violations)
+
+    # -- PH2-87 criterion 2: the same receipt, asked for by a child -------------
+
+    def test_a_run_a_child_asked_for_leaves_the_receipt_an_operator_s_leaves(self):
+        # The child holds no database and writes nothing, so the row is the
+        # only thing that says the run happened -- and it has to be the same
+        # row, in the same table, that `rk tool run` closes. An act that
+        # recorded nothing would not be an act this harness admits.
+        answer = self.served["success"]
+
+        self.assertTrue(answer["served"])
+        self.assertEqual(("success", 0), (answer["status"], answer["exit_code"]))
+        status, exit_code, version = self.recorded(answer["tool_run"])
+        self.assertEqual(("success", 0), (str(status), int(exit_code)))
+        self.assertEqual(answer["version"], str(version))
+
+        # Both streams filed and the bytes really in the store, as above.
+        stderr, stdout = self.linked(answer["tool_run"])
+        self.assertEqual(["stderr", "stdout"], [stderr[0], stdout[0]])
+        self.assertEqual(OFFLINE_INPUT, Store(self.root).load(stdout[2]))
+        self.assertEqual(
+            [("stderr", 0), ("stdout", len(OFFLINE_INPUT))],
+            sorted((one["stream"], one["byte_size"]) for one in answer["outputs"]),
+        )
+
+    def test_what_the_child_reads_back_is_an_excerpt_that_says_it_is_one(self):
+        # A context is not a place to put a tool's output. What comes back is a
+        # head of it and the label of the whole, so the way to see more is to
+        # analyse the Artifact rather than to read it into the turn.
+        answer = self.served["success"]
+
+        self.assertEqual(OFFLINE_INPUT[: self.EXCERPT].decode(), answer["stdout"])
+        self.assertTrue(answer["truncated"])
+
+    def test_a_tool_the_registry_does_not_admit_is_refused_without_a_row(self):
+        # Refused rather than raised: a child that named a tool it may not use
+        # has made a call that failed, which it can read and do something else
+        # about. An exception would reach it as the supervisor failing, which
+        # is a different fact.
+        answer = self.served["unknown"]
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(tool.UNREGISTERED_TOOL, answer["reason"])
+        self.assertNotIn("tool_run", answer)
+
+    def test_a_run_that_could_not_start_still_closes_the_row_it_opened(self):
+        # The row is opened and committed before the input is read, so a failure
+        # after that has to leave a row that says so. An open row left behind is
+        # the one state `check_offline_tools` cannot tell from a supervisor that
+        # died mid-run.
+        answer = self.served["unreadable"]
+
+        self.assertFalse(answer["served"])
+        self.assertEqual(tool.RUN_FAILED, answer["reason"])
+        status, _, _ = self.recorded(answer["tool_run"])
+        self.assertEqual("error", str(status))
 
     # -- criteria 2, 3 and 4 ---------------------------------------------------
 
@@ -43355,6 +43526,7 @@ class Contained:
         outputs=(),
         network: str = "none",
         scratch_mb: int = 16,
+        stdin: bytes | None = None,
     ) -> isolation.ToolProcess:
         command = tuple(str(item) for item in argv)
         self.calls.append(command)
@@ -43362,7 +43534,7 @@ class Contained:
             return self.version(command)
         if command == browser.ARGV:
             return self.mission(dict(inputs or {}))
-        return self.filtered(dict(inputs or {}))
+        return self.filtered(dict(inputs or {}), stdin)
 
     # -- what each kind of child answers ---------------------------------------
 
@@ -43372,15 +43544,18 @@ class Contained:
             raise isolation.Unavailable(f"no campaign image holds {argv[0]}")
         return _said(said.encode())
 
-    def filtered(self, inputs: dict) -> isolation.ToolProcess:
+    def filtered(self, inputs: dict, stdin: bytes | None = None) -> isolation.ToolProcess:
         """What the offline tool printed: the bytes it was handed.
 
         The filter is `.`, so the identity is the honest answer -- and it is the
         answer the assertions want, because what the campaign compares at the
         end is whether the Artifact the run produced is the same one on both
         sides, not whether this stand-in can parse JSON.
+
+        A row the registry feeds on `stdin` mounts nothing, so the bytes it was
+        handed are on the other stream and the same answer is read off that.
         """
-        return _said(b"".join(inputs.values()))
+        return _said(stdin if stdin is not None else b"".join(inputs.values()))
 
     def mission(self, inputs: dict) -> isolation.ToolProcess:
         """One navigation and one capture, with the navigation really made.

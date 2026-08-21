@@ -1641,6 +1641,32 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual(BOUNDARY.proxy_url, door.proxy_url)
         self.assertEqual(isolation.CA_FILE, door.certificate)
 
+    def test_a_machine_naming_a_tool_image_and_a_store_can_answer_a_tool_call(self):
+        # PH2-87. Both parts, because a run whose output could not be filed is a
+        # run that leaves no evidence -- and the settings rather than this
+        # connection, because the heartbeat is beating on this one.
+        connection = Recorder()
+        connection.settings = STATE
+        image = isolation.ToolContainer(image="rk2-tool")
+        launcher = Launcher()
+        with compiled():
+            attempt(connection, launcher, tools=image, artifacts=Path("/store"))
+
+        tooling = launcher.only.tooling
+        assert tooling is not None
+        self.assertIs(image, tooling.container)
+        self.assertEqual(Path("/store"), tooling.root)
+        self.assertIs(STATE, tooling.runtime)
+
+    def test_a_machine_naming_only_one_of_them_answers_no_tool_call(self):
+        # And the settings are never read, because there is nothing to open a
+        # connection for -- which is what lets a slice with no store run at all.
+        launcher = Launcher()
+        with compiled():
+            attempt(Recorder(), launcher, artifacts=Path("/store"))
+
+        self.assertIsNone(launcher.only.tooling)
+
     def test_the_child_runs_as_the_role_the_scheduler_chose(self):
         launcher = Launcher()
         with compiled():

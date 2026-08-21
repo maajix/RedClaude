@@ -434,6 +434,156 @@ except isolation.Unavailable as refusal:
         self.assertIn(f"type=bind,src={private},dst={isolation.SDK},readonly", mounts)
 
 
+PUMPED = """
+import json, sys
+
+job = json.loads(sys.stdin.readline())
+print("this line is not a call")
+sys.stderr.write("the child said something on the other stream\\n")
+answers = []
+for index, verb in enumerate(job["ask"], start=1):
+    sys.stdout.write(json.dumps({"rk2_call": {"verb": verb}, "id": index}) + "\\n")
+    sys.stdout.flush()
+    answers.append(json.loads(sys.stdin.readline()))
+print(json.dumps({"answers": answers}))
+"""
+
+#: A child that says more on its other stream than a pipe holds, and says it
+#: after asking for something and before reading the answer.
+NOISY = """
+import json, sys
+
+job = json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({"rk2_call": {"verb": "one"}, "id": 1}) + "\\n")
+sys.stdout.flush()
+sys.stderr.write("n" * (256 * 1024))
+sys.stderr.flush()
+answer = json.loads(sys.stdin.readline())
+print(json.dumps({"answers": [answer]}))
+"""
+
+
+class PumpTest(unittest.TestCase):
+    """PH2-87: the launch pipe used both ways, without a container.
+
+    `_pumped` is handed a whole argv and starts it, so a plain interpreter
+    stands in for the engine here.  What is under test is not what Docker does
+    with the arguments -- the tests above cover that -- but the one thing this
+    ticket added: a child that asks for something mid-run gets an answer, and
+    the caller still reads the result document out of what is left.
+    """
+
+    def pumped(self, job, answer, *, script=PUMPED, timeout=30.0):
+        return isolation._pumped(
+            [sys.executable, "-c", script],
+            host_environment={"PATH": os.environ.get("PATH", "")},
+            stdin=json.dumps(job) + "\n",
+            timeout=timeout,
+            answer=answer,
+            engine="docker",
+            name="rk2-agent-that-is-never-started",
+        )
+
+    def test_a_call_is_answered_and_never_reaches_the_caller(self):
+        asked = []
+
+        def answer(call):
+            asked.append(dict(call))
+            return {"served": True, "for": call["verb"]}
+
+        child = self.pumped({"ask": ["one", "two"]}, answer)
+
+        self.assertEqual(0, child.returncode)
+        self.assertEqual([{"verb": "one"}, {"verb": "two"}], asked)
+        # The frames are gone from the output and the ordinary lines are not.
+        self.assertNotIn(isolation.CALL, child.stdout)
+        self.assertIn("this line is not a call", child.stdout)
+        self.assertIn("the child said something", child.stderr)
+        # And the result document is still the last one, which is what the
+        # supervisor reads a run's answer out of.
+        result = json.loads(child.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            [{"served": True, "for": "one"}, {"served": True, "for": "two"}],
+            [one[isolation.ANSWER] for one in result["answers"]],
+        )
+        self.assertEqual([1, 2], [one["id"] for one in result["answers"]])
+
+    def test_a_handler_that_fails_answers_that_it_failed(self):
+        # The child is owed a line whatever happens on this side. Without one
+        # it waits on the pipe until the run's deadline, and what the operator
+        # would read is a timeout rather than the failure that caused it.
+        def answer(call):
+            raise RuntimeError("the supervisor could not do that")
+
+        child = self.pumped({"ask": ["one"]}, answer)
+
+        result = json.loads(child.stdout.strip().splitlines()[-1])
+        served = result["answers"][0][isolation.ANSWER]
+        self.assertFalse(served["served"])
+        self.assertEqual(isolation.UNANSWERED, served["reason"])
+        self.assertIn("could not do that", served["detail"])
+
+    def test_an_answer_larger_than_a_pipe_does_not_stop_the_run(self):
+        # A pipe holds about sixty-four kilobytes and an answer carrying an
+        # excerpt is routinely larger. Written inline it would block the loop
+        # that is holding the run to its deadline.
+        body = "x" * (512 * 1024)
+
+        child = self.pumped({"ask": ["one"]}, lambda call: {"body": body})
+
+        result = json.loads(child.stdout.strip().splitlines()[-1])
+        self.assertEqual(body, result["answers"][0][isolation.ANSWER]["body"])
+
+    def test_a_child_is_still_read_while_the_call_it_made_is_being_served(self):
+        # A pipe holds about sixty-four kilobytes. Served on the loop that reads
+        # the child, a call would stop that loop for as long as the tool behind
+        # it takes -- and a child that keeps talking meanwhile fills its pipe
+        # and stops, waiting on a supervisor that is waiting on the tool.
+        def answer(call):
+            time.sleep(0.5)
+            return {"served": True}
+
+        child = self.pumped({}, answer, script=NOISY)
+
+        self.assertEqual(0, child.returncode)
+        self.assertEqual(256 * 1024, len(child.stderr))
+        result = json.loads(child.stdout.strip().splitlines()[-1])
+        self.assertEqual({"served": True}, result["answers"][0][isolation.ANSWER])
+
+    def test_the_deadline_still_falls_while_a_call_is_being_served(self):
+        # The same loop is what holds the run to its deadline, so a call served
+        # on it would let the container run for the whole of that tool's own
+        # ceiling past the ceiling this run was started under.
+        taken = []
+
+        def answer(call):
+            time.sleep(3.0)
+            return {}
+
+        with mock.patch.object(
+            isolation, "remove", side_effect=lambda *given: taken.append(time.monotonic())
+        ):
+            started = time.monotonic()
+            with self.assertRaises(isolation.Unavailable):
+                self.pumped({"ask": ["one"]}, answer, timeout=0.5)
+
+        # Taken away when its time was up, not when the call came back.
+        self.assertLess(taken[0] - started, 2.0)
+
+    def test_a_child_that_never_answers_is_taken_away_at_its_deadline(self):
+        removed = []
+        waiting = "import time\ntime.sleep(300)\n"
+
+        with mock.patch.object(
+            isolation, "remove", side_effect=lambda *given: removed.append(given[1])
+        ):
+            with self.assertRaises(isolation.Unavailable) as refused:
+                self.pumped({"ask": []}, lambda call: {}, script=waiting, timeout=0.5)
+
+        self.assertIn("exceeded its 0.5s runtime", str(refused.exception))
+        self.assertEqual(["rk2-agent-that-is-never-started"], removed)
+
+
 class ToolPlanTest(unittest.TestCase):
     """PH2-30: what a tool plan may say, decided before an engine is asked.
 

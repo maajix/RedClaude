@@ -68,7 +68,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -156,6 +156,49 @@ class SkillError(document.DocumentError):
     """One reason the skill corpus does not compile, in the words a test names it by."""
 
 
+class NotText(ValueError):
+    """Bytes a script was to read as text, and they are not text.
+
+    Its own class because the caller's answer to it is not the caller's answer
+    to a missing Artifact: the bytes are here, they hash to their own name, and
+    what they are not is something this envelope can carry. A run refused for
+    this reason is a Skill script pointed at an image or an archive, which is a
+    mistake in the call rather than a fault in the store.
+    """
+
+
+def envelope(bodies: Iterable[bytes]) -> str:
+    """The stdin envelope a Skill script reads, defined here and nowhere else.
+
+    One object with an `artifacts` array, each entry carrying the Artifact's
+    `sha256` and its `text`, in the order the call named them. Both the checks
+    that run in CI and the Tool run that serves `mcp__rk2__run_skill_script`
+    build it here, because a shape written twice is a shape that can disagree
+    with itself, and the way it would disagree is a script whose declared cases
+    pass over one document while a hunt feeds it another.
+
+    The digest is of the text and not of the call, which is what makes the
+    envelope its own statement that nothing was cut off. The packet stages an
+    excerpt for the model to read; a script reads the Artifact, and an Artifact
+    that arrived as a prefix would hash to the prefix. A script that cares can
+    check it, and a reader of a Finding can check it afterwards.
+
+    Bytes that are not UTF-8 are refused rather than replaced. A replacement
+    character is a byte this envelope invented, and every answer downstream of
+    it would be a deterministic transform over something that was never stored.
+    """
+    artifacts = []
+    for body in bodies:
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise NotText(
+                f"{digest(body)} is not UTF-8 and a Skill script reads text: {error}"
+            ) from None
+        artifacts.append({"sha256": digest(body), "text": text})
+    return json.dumps({"artifacts": artifacts}, sort_keys=True)
+
+
 @dataclass(frozen=True, slots=True)
 class Dependency:
     """One file a skill owns, as the version manifest records it."""
@@ -181,23 +224,14 @@ class Case:
     stdout: Any
 
     def payload(self) -> str:
-        """The stdin envelope a checked script reads, defined here and nowhere else.
+        """This case's inputs as the envelope a script reads.
 
-        `mcp__rk2__run_skill_script` has a contract in `roster` and no handler
-        in any launch -- ticket 87 owes that channel -- so this is the only
-        executable statement of the shape, which is why the checks run against
-        it: whatever serves that tool later has to produce this, and a script
-        that reads something else fails here first.
+        Synthetic bytes rather than an Artifact's, and the same function either
+        way: a check that built the envelope itself would be a check of a shape
+        nothing serves, and the reason the checks are worth running is that the
+        shape is the one a run produces.
         """
-        return json.dumps(
-            {
-                "artifacts": [
-                    {"sha256": digest(text.encode("utf-8")), "text": text}
-                    for text in self.artifacts
-                ]
-            },
-            sort_keys=True,
-        )
+        return envelope(text.encode("utf-8") for text in self.artifacts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,11 +520,13 @@ def stage(
     gave it.
 
     `SKILL.md` and nothing else. The instructions are what a model loads;
-    `scripts/` is run here, by `check`, and by nothing during a run -- the tool
-    that would run one over stored Artifacts is `mcp__rk2__run_skill_script`,
-    which ticket 87 owes -- and `references/` is maintainer material this system
-    has no tool to open. The module docstring says so, and staging either would
-    put files in a child's directory that nothing in its frame can reach.
+    `scripts/` is never staged into a child's directory, because a child does
+    not run one -- it asks for one. `mcp__rk2__run_skill_script` names the Skill
+    and the file, and the supervisor runs the registered row that pair resolves
+    to, off its own disk, in a container of its own. And `references/` is
+    maintainer material this system has no tool to open. The module docstring
+    says so, and staging either would put files in a child's directory that
+    nothing in its frame can reach.
 
     The bytes written are the compiled skill's own `source`, which is what
     `sha256` digests and what a Task records, so the text a child reads and the

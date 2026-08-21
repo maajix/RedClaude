@@ -33,11 +33,13 @@ import fcntl
 import hashlib
 import json
 import os
+import queue
 import selectors
 import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -133,6 +135,28 @@ HOME_CEILING = 64 * 1024 * 1024
 #: never has to read it: the operator's token is the child's to use and nobody
 #: else's to copy.
 CREDENTIAL = ".claude/.credentials.json"
+
+
+#: How a child asks the supervisor to do something while it is still running,
+#: and how the supervisor answers. One line each on the pipes the launch already
+#: has, because the child has no second route: its network reaches the capability
+#: proxy and nothing else, and a listener the supervisor opened on that network
+#: would be a second peer on the one network whose whole claim is that there is
+#: not one.
+#:
+#: A reserved key rather than a separate stream. The child writes documents on
+#: standard output already and the supervisor reads the last of them as the
+#: result, so a frame has to be something that reading can tell apart -- and a
+#: key nothing else uses is a cheaper statement of that than a second file
+#: descriptor a container runtime would have to be asked to forward.
+CALL = "rk2_call"
+ANSWER = "rk2_answer"
+
+#: What a child is told when the supervisor's own handler failed. The handler
+#: owns its refusals and says why; this is the answer for the case where it
+#: could not produce one at all, and it exists because a child left waiting on a
+#: line that never comes is a run that hangs until its deadline.
+UNANSWERED = "supervisor_failed"
 
 
 class Unavailable(RuntimeError):
@@ -257,6 +281,7 @@ def run(
     source_environment: Mapping[str, str] | None = None,
     stdin: str | None = None,
     timeout: float = 30.0,
+    answer: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``argv`` in a verified one-peer Agent container.
 
@@ -267,6 +292,20 @@ def run(
     ``stdin`` is written to the child rather than passed as arguments.  What a
     child is told to do is not a thing to put where every process on the
     machine can read it, and not a thing to size against ``ARG_MAX``.
+
+    ``answer`` makes that pipe two-way.  Without one the launch is what it has
+    always been: the job goes in, the pipe closes, and what comes back is read
+    when the child has finished.  With one, the pipe stays open and the child's
+    output is read as it arrives: a line carrying ``CALL`` is handed to this
+    callable and what it returns goes back as ``ANSWER``, and every other line
+    is kept, so the caller still reads the result document out of the whole.
+
+    This is the only route by which a running child reaches anything that can
+    act, and it is deliberately a callable held by the supervisor rather than a
+    service the child can address.  The supervisor decides what the call means,
+    holds the database connection that records it, and is the side that may
+    start a process -- none of which the child can do, and none of which this
+    module knows anything about.
     """
     if isinstance(argv, (str, bytes)):
         raise Unavailable("an Agent container argv must be a sequence, not one string")
@@ -292,6 +331,7 @@ def run(
             engine,
             certificate,
             credential,
+            answer,
         )
 
 
@@ -304,6 +344,7 @@ def _launched(
     engine: str,
     certificate: Path,
     credential: Path | None = None,
+    answer: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """The checked launch, inside the claim `run` holds on the network.
 
@@ -346,13 +387,23 @@ def _launched(
         "256",
         *mounts,
     ]
-    if stdin is not None:
+    if stdin is not None or answer is not None:
         docker.append("--interactive")
     for key, value in sorted(environment.items()):
         docker.extend(("--env", f"{key}={value}"))
     docker.extend((container.image, *command))
 
     host_environment = {"PATH": os.environ.get("PATH", "")}
+    if answer is not None:
+        return _pumped(
+            docker,
+            host_environment=host_environment,
+            stdin=stdin,
+            timeout=timeout,
+            answer=answer,
+            engine=engine,
+            name=name,
+        )
     try:
         return subprocess.run(
             docker,
@@ -366,6 +417,227 @@ def _launched(
     except subprocess.TimeoutExpired as error:
         remove(engine, name, host_environment)
         raise Unavailable(f"the Agent container exceeded its {timeout:g}s runtime") from error
+
+
+def _pumped(
+    docker: Sequence[str],
+    *,
+    host_environment: Mapping[str, str],
+    stdin: str | None,
+    timeout: float,
+    answer: Callable[[Mapping[str, object]], Mapping[str, object]],
+    engine: str,
+    name: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run the child with its input held open, answering what it asks for.
+
+    `subprocess.run` cannot do this.  It writes the whole input, closes the
+    pipe and reads both streams to the end, which is the right shape for a child
+    that is handed a job and says one thing back -- and the wrong one for a
+    child that has to ask for something part way through, because the question
+    arrives on a stream nothing is reading yet and the answer would go into a
+    pipe that is already closed.
+
+    So both streams are read while the child runs.  A line of standard output
+    carrying a call is handed to `answer` and does not reach the caller; every
+    other line is kept, and what the caller reads back is the output it has
+    always read with the frames taken out of it.
+
+    Neither the answering nor the writing happens here.  This loop is what holds
+    the run to its deadline and what keeps both of the child's streams draining,
+    so anything that could take a while -- serving a call, or a write larger
+    than a pipe -- is a thread, and this loop keeps reading while it runs.
+    """
+    process = subprocess.Popen(
+        list(docker),
+        env=dict(host_environment),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    posts: queue.Queue[bytes | None] = queue.Queue()
+    calls: queue.Queue[Mapping[str, object] | None] = queue.Queue()
+    writer = threading.Thread(target=_posting, args=(process.stdin, posts), daemon=True)
+    writer.start()
+    server = threading.Thread(target=_serving, args=(calls, posts, answer), daemon=True)
+    server.start()
+    if stdin is not None:
+        posts.put(stdin.encode("utf-8"))
+
+    selector = selectors.DefaultSelector()
+    for stream, handle in (("stdout", process.stdout), ("stderr", process.stderr)):
+        selector.register(handle, selectors.EVENT_READ, stream)
+    kept = {"stdout": bytearray(), "stderr": bytearray()}
+    unread = bytearray()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in selector.select(min(remaining, 0.25)):
+                chunk = key.fileobj.read1(65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stderr":
+                    kept["stderr"].extend(chunk)
+                    continue
+                unread.extend(chunk)
+                # Cut forward through the buffer rather than rebuild it once per
+                # line.  A chunk of many short lines would otherwise copy what
+                # is left of it for every newline in it.
+                cut = 0
+                while (end := unread.find(b"\n", cut)) >= 0:
+                    line = bytes(unread[cut:end])
+                    cut = end + 1
+                    call = _framed(line)
+                    if call is None:
+                        kept["stdout"].extend(line + b"\n")
+                    else:
+                        calls.put(call)
+                del unread[:cut]
+    except BaseException:
+        # Whatever went wrong in here, the container is still running and this
+        # is the only thing left that knows its name.
+        _halt(process, engine, name, host_environment)
+        raise
+    finally:
+        selector.close()
+        calls.put(None)
+        posts.put(None)
+        for handle in (process.stdout, process.stderr):
+            with contextlib.suppress(OSError):
+                handle.close()
+    # A last line the child left without a newline is still output.
+    kept["stdout"].extend(unread)
+
+    overran = timed_out
+    if timed_out:
+        _halt(process, engine, name, host_environment)
+    else:
+        try:
+            process.wait(timeout=max(deadline - time.monotonic(), 10.0))
+        except subprocess.TimeoutExpired:
+            _halt(process, engine, name, host_environment)
+            overran = True
+
+    # A call still in flight holds the connection the caller is about to close,
+    # and the child that would have read its answer has already stopped.  So it
+    # is waited for, and only briefly: the thread is a daemon and `_served`
+    # swallows what a handler meeting a closing connection raises.
+    server.join(timeout=10.0)
+
+    if overran:
+        raise Unavailable(f"the Agent container exceeded its {timeout:g}s runtime")
+    return subprocess.CompletedProcess(
+        args=list(docker),
+        returncode=process.returncode,
+        # Replaced rather than refused.  A stray byte in a child's output is a
+        # thing the caller reads and reports; it is not a reason for the
+        # supervisor to raise a decoding error in place of the run's result.
+        stdout=bytes(kept["stdout"]).decode("utf-8", "replace"),
+        stderr=bytes(kept["stderr"]).decode("utf-8", "replace"),
+    )
+
+
+def _framed(line: bytes) -> Mapping[str, object] | None:
+    """The call this line of a child's output carries, if it carries one.
+
+    Anything that is not one object with a `CALL` object in it is output: a
+    child prints documents for its own reasons and the supervisor is not
+    entitled to read them as requests.  Nothing is reported here, because a line
+    that fails to parse is not an error -- it is a line.
+    """
+    if CALL.encode("utf-8") not in line:
+        return None
+    try:
+        document = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get(CALL), dict):
+        return None
+    return document
+
+
+def _served(call: Mapping[str, object], answer: Callable[..., Mapping[str, object]]) -> bytes:
+    """One answer line for one call, whatever the handler does.
+
+    The handler owns its refusals and states them; this catches what it could
+    not state at all.  A supervisor that let a handler's failure out of here
+    would leave the child waiting on a line that is never coming, and the run
+    would end at its deadline rather than with an answer -- so the failure is
+    turned into the answer that it failed.
+    """
+    try:
+        served: Mapping[str, object] = answer(call[CALL])
+    except Exception as error:  # noqa: BLE001 - the child is owed a line, always
+        served = {"served": False, "reason": UNANSWERED, "detail": str(error)}
+    document = {ANSWER: served, "id": call.get("id")}
+    return json.dumps(document, sort_keys=True).encode("utf-8") + b"\n"
+
+
+def _serving(
+    calls: queue.Queue[Mapping[str, object] | None],
+    posts: queue.Queue[bytes | None],
+    answer: Callable[[Mapping[str, object]], Mapping[str, object]],
+) -> None:
+    """Answer what a child asks for, off the loop that is timing the run.
+
+    A call is a second container and a database transaction, and it takes as
+    long as the tool it names is allowed to.  Served on the pump loop, that is
+    the whole of it: for that time nothing reads the child's standard error, so
+    a chatty child fills its pipe and stops, and the deadline the loop exists to
+    hold the run to is not looked at until the tool returns.
+
+    One thread and not one per call, because the calls arrive faster than they
+    are served only if the child asked twice without waiting -- and the handler
+    behind this holds one database connection, which two calls at once would be
+    using at once.
+    """
+    while True:
+        call = calls.get()
+        if call is None:
+            break
+        posts.put(_served(call, answer))
+
+
+def _posting(handle, posts: queue.Queue[bytes | None]) -> None:
+    """Put what the supervisor has for a child into it, until there is no more.
+
+    The same failure and the same silence as `_write`: the reader being gone is
+    the run's answer to report, not this thread's, and the sentinel is how the
+    pump says the pipe may close now rather than closing it under a child that
+    is still reading.
+    """
+    while True:
+        document = posts.get()
+        if document is None:
+            break
+        try:
+            handle.write(document)
+            handle.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            break
+    with contextlib.suppress(OSError):
+        handle.close()
+
+
+def _halt(process: subprocess.Popen, engine: str, name: str, environment: Mapping[str, str]) -> None:
+    """Stop a run that will not finish, and leave nothing of it behind.
+
+    The client first and then the container, for the reason `_bounded` gives: a
+    removal asked for while the attached client still holds the stream waits on
+    a reader that has stopped reading.  Reaped before the caller goes on, so a
+    supervisor that starts another run is not also holding this one as a zombie.
+    """
+    process.kill()
+    remove(engine, name, environment)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=10.0)
 
 
 @dataclass(frozen=True)
@@ -441,6 +713,7 @@ def run_tool(
     outputs: Sequence[str] = (),
     network: str = "none",
     scratch_mb: int = 16,
+    stdin: bytes | None = None,
 ) -> ToolProcess:
     """Run one registry-described tool, bounded, and read back what it produced.
 
@@ -455,6 +728,13 @@ def run_tool(
     Both staging directories live under a private one this process owns, which
     is what makes it safe for the mount itself to be readable by the nameless
     user the child runs as.
+
+    ``stdin`` is the second way a tool is fed, and the registry says which one a
+    row uses.  A mount is a path the argv has to name, so a program that reads
+    one document and takes no arguments cannot be given one that way -- and a
+    tool that takes no arguments is the strongest form of a tool that cannot be
+    made to address the filesystem.  What is written is closed afterwards, so a
+    program that reads to end of file sees one.
 
     Nothing about the result is decided after the fact.  Bytes past the output
     bound and time past the deadline both end the run where they happen, and
@@ -542,6 +822,8 @@ def run_tool(
             "--workdir",
             TOOL_WORKSPACE if workspace is not None else "/",
         ]
+        if stdin is not None:
+            docker.append("--interactive")
         for mount in mounts:
             docker.extend(("--mount", mount))
         for key, value in sorted(environment.items()):
@@ -551,7 +833,7 @@ def run_tool(
         process = subprocess.Popen(
             docker,
             env=host_environment,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -560,6 +842,7 @@ def run_tool(
                 process,
                 ceilings,
                 stop=lambda: remove(engine, name, host_environment),
+                stdin=stdin,
             )
         if answer.timed_out or answer.overflowed:
             # The process is gone and whatever it wrote is a fragment, but the
@@ -621,7 +904,11 @@ def _staged(staging: Path, inputs: Mapping[str, bytes], outputs: Sequence[str]) 
 
 
 def _bounded(
-    process: subprocess.Popen[bytes], ceilings: Ceilings, *, stop: Callable[[], None]
+    process: subprocess.Popen[bytes],
+    ceilings: Ceilings,
+    *,
+    stop: Callable[[], None],
+    stdin: bytes | None = None,
 ) -> ToolProcess:
     """Read both streams while the process runs, holding it to time and to size.
 
@@ -631,7 +918,20 @@ def _bounded(
     the supervisor waits.  So the reads are incremental, everything past the
     bound is counted and dropped, and the first breach of either takes the
     container away rather than waiting to see what the exit code turns out to be.
+
+    The write goes on a thread of its own, and that is not an optimisation.  A
+    pipe holds about sixty-four kilobytes; an envelope carrying an Artifact is
+    routinely larger.  Writing it inline would block this loop before the tool
+    had read any of it, and the tool's own output would then fill the pipe this
+    loop had stopped reading -- two processes each waiting for the other, under
+    a deadline neither is checking.  On a thread the reads keep running, and a
+    write to a program that exited early is the broken pipe it is rather than an
+    exception out of the supervisor.
     """
+    if stdin is not None:
+        writer = threading.Thread(target=_write, args=(process.stdin, stdin), daemon=True)
+        writer.start()
+
     selector = selectors.DefaultSelector()
     streams = {"stdout": process.stdout, "stderr": process.stderr}
     kept = {name: bytearray() for name in streams}
@@ -684,6 +984,25 @@ def _bounded(
         timed_out=timed_out,
         overflowed=overflowed,
     )
+
+
+def _write(handle, data: bytes) -> None:
+    """Put one document into a child's standard input and close it.
+
+    Every failure here is the same failure -- the reader is gone -- and it is
+    not this side's to report: what became of the run is the exit code, the
+    streams and the deadline the caller is already holding it to.  A supervisor
+    that raised out of a writer thread would replace that answer with a
+    traceback about a pipe.
+    """
+    try:
+        handle.write(data)
+        handle.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            handle.close()
 
 
 def _produced(

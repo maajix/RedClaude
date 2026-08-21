@@ -20,9 +20,10 @@ Name the variable before running anything, and name the Receipt of each side.
 ## 2. Difference the stored bytes, not your memory of them
 
 Call `mcp__rk2__run_skill_script` with `skill_name` `compare-responses`, `script`
-`compare.py`, and `input_artifact_hashes` set to the two agent-view Artifact
-hashes, baseline first. The script takes the Artifacts and nothing else, and it
-answers the same way every time it is run:
+`compare.py`, and `arguments` set to `{"first": ..., "second": ...}`, where each
+value is the Artifact label the packet gave you and `first` is the baseline. The
+script takes the two Artifacts and nothing else, and it answers the same way
+every time it is run:
 
 ```json
 {"identical": false, "lengths": [31, 30], "line_counts": [3, 3],

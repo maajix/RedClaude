@@ -399,6 +399,26 @@ class Checks(unittest.TestCase):
             [{"sha256": skill.digest(b"first"), "text": "first"}], payload["artifacts"]
         )
 
+    def test_a_run_and_a_check_read_the_same_envelope(self):
+        # PH2-87: a Skill script is run twice -- once by `check_all` in CI and
+        # once by a tool run during a mission -- and the two have to hand it the
+        # same document, or a script that passes its checks is a script the
+        # runtime cannot use. One function builds it, and this is that.
+        self.assertEqual(
+            skill.Case(("first", "second"), None).payload(),
+            skill.envelope([b"first", b"second"]),
+        )
+
+    def test_bytes_that_are_not_text_are_refused_rather_than_replaced(self):
+        # The envelope's digest is the digest of the text it carries, which is
+        # what proves the script read the whole Artifact. A replacement
+        # character would be a byte this envelope invented, under a hash the
+        # bytes it invented do not have.
+        with self.assertRaises(skill.NotText) as refused:
+            skill.envelope([b"\xff\xfe not utf-8"])
+
+        self.assertIn(skill.digest(b"\xff\xfe not utf-8"), str(refused.exception))
+
 
 class Version(unittest.TestCase):
     """Criterion 1 and criterion 5: what a version is, and what moves it."""

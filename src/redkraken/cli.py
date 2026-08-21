@@ -2258,10 +2258,19 @@ def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | N
     # claims and runs; its packet says `not_staged` for every Artifact rather
     # than quoting one, which is the same answer it gives for an Artifact whose
     # bytes are elsewhere.
+    #
+    # Nor is the tool image, and for the reason `rk tool run` offers rather than
+    # requires one: a machine that has not described where the registered tools
+    # are still runs every child, and the two tool-run tools answer that there
+    # is nothing to run one with. The door is this boundary, because a tool that
+    # declares the proxy adapter is put on the Agent topology and there is no
+    # second one to put it on.
+    image = tool.image_from_environment()
     return execution.Slice(
         boundary=boundary,
         state=agent,
         artifacts=artifact.root_from_environment(arguments.artifacts),
+        tools=None if image is None else isolation.ToolContainer(image=image, door=boundary),
     )
 
 

@@ -35,12 +35,12 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import _startup, capsule as capsule_module, isolation
-from redkraken import packet as packet_module, pg, roster, skill
+from redkraken import packet as packet_module, pg, roster, skill, tool as tool_module
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -123,10 +123,21 @@ SERVER_VERSION = "0.1.0"
 #:
 #: `validate.judge` joins them with 037 and is the one group served to a role
 #: that holds nothing else. Both of its tools answer out of the job document
-#: rather than out of a connection, for the reason every other served tool does:
-#: the container's one network reaches the capability proxy, so a packet the
-#: runtime did not send is a packet no handler can fetch.
-SERVED_GROUPS = ("state.read", "state.propose", "net.request", "validate.judge")
+#: rather than out of a connection, for the reason most served tools do: the
+#: container's one network reaches the capability proxy, so a packet the runtime
+#: did not send is a packet no handler can fetch.
+#:
+#: `exec.tool_run` is the exception to that last sentence and 087's whole
+#: subject. Its two tools cannot be answered out of the job, because what they
+#: do is start a second container and write a row; so they are answered back
+#: across the pipe the child already has, by the supervisor, which is the side
+#: holding the connection. Served unconditionally for `net.request`'s reason: a
+#: supervisor with nothing to serve them with answers a refusal, and an
+#: allowlist that varied with the job is an allowlist the assertion cannot check
+#: against the roster.
+SERVED_GROUPS = (
+    "state.read", "state.propose", "net.request", "validate.judge", "exec.tool_run",
+)
 
 #: The one group served in part, and exactly which of its members. `sched.pick`
 #: is five tools built by four tickets: the two here are the Slate the
@@ -196,6 +207,17 @@ SETTINGS_UNREADABLE = "settings_unreadable"
 AUTH_SOURCE_UNEXPECTED = "auth_source_unexpected"
 INIT_UNCORROBORATED = "init_uncorroborated"
 UNVERIFIABLE = "unverifiable"
+
+#: Why a call a child made across the tool channel was answered rather than
+#: acted on. `unknown_call` is a verb this supervisor does not serve, which the
+#: roster refuses before the call is ever made and which is stated here anyway
+#: because the channel is a pipe and a pipe carries whatever is written to it.
+#: `unreachable_state` is a database the supervisor could not reach. Both are
+#: refusals rather than raises, for the channel's whole reason: a child left
+#: waiting on a line that never comes ends at its deadline rather than with an
+#: answer it could act on.
+UNKNOWN_CALL = "unknown_call"
+UNREACHABLE_STATE = "unreachable_state"
 
 #: How one refusal is made durable: the Program this session speaks for, and the
 #: one call that closes the run. Everything the cleanup does -- the run, its
@@ -321,6 +343,39 @@ class Egress:
 
 
 @dataclass(frozen=True, slots=True)
+class Tooling:
+    """What the supervisor needs to run a registered tool for a child.
+
+    The other half of `Egress`, and the same argument.  A child cannot start a
+    container and cannot write a row, so a tool call it makes is a thing the
+    supervisor does on its behalf -- and these are the values the supervisor
+    needs to do it that no other field of the request carries: which image holds
+    the registered executables, where the Artifact store is, and how to reach
+    the database.
+
+    A door is not here.  A tool that declares the proxy adapter is put on the
+    Agent topology by `isolation.ToolContainer`, and which of them may is the
+    registry's `network` column rather than a caller's argument, so the value
+    travels inside the container description where the registry's decision is
+    already read.
+
+    The connection settings rather than a connection, and that is the third
+    part. The caller's own connection is being beaten on by a heartbeat thread
+    for as long as the child runs, and two writers interleaved on one connection
+    is two half-statements; so what travels is how to open a second one, and the
+    answer opens it the first time a child actually asks for something.
+
+    All three or none, which is why this is a record rather than three optional
+    fields on the request: an image with nowhere to file what a run produced is
+    a run that could start and could not be kept.
+    """
+
+    container: isolation.ToolContainer
+    root: Path
+    runtime: pg.Settings
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRunRequest:
     """One Agent run, described completely enough to be started.
 
@@ -389,6 +444,16 @@ class AgentRunRequest:
     executing a Task rather than choosing one, and a run with none has an empty
     Slate, which is the honest answer for a worker nobody offered a choice.
 
+    `tooling` is the one field that does not travel to the child at all, and it
+    is 087's. Where `egress` hands over a capability the child spends itself,
+    this stays on the supervisor's side: a tool run is a container to start and a
+    row to write, and the child has neither a Docker socket nor a database. So
+    the job carries a flag saying whether the channel is open, the child calls
+    across it, and the supervisor does the work on a connection of its own.
+    None means the two tool-run tools are still served -- the
+    roster decides that, not the job -- and answer a refusal, which is the
+    honest answer for a run this installation described no tool image for.
+
     `judgement` is 037's document and travels for the same reason again, with
     one difference worth stating: it is not a bounded projection of a larger
     thing the child could otherwise reach. It is the whole world a validator
@@ -411,6 +476,7 @@ class AgentRunRequest:
     token_cap: int | None = None
     capsule: capsule_module.Capsule | None = None
     judgement: Mapping[str, object] | None = None
+    tooling: Tooling | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +600,7 @@ def agent_run(
     """
     global _LATCH
     program_id = _recording_program(request, connection)
+    serving = _serving(request)
     try:
         if _LATCH is not None:
             raise Latched.of(_LATCH)
@@ -548,8 +615,14 @@ def agent_run(
             "token_cap": request.token_cap,
             "capsule": (request.capsule or capsule_module.Capsule()).as_dict(),
             "judgement": None if request.judgement is None else dict(request.judgement),
+            # A flag rather than a block, because there is nothing in it for the
+            # child: the image, the store and the connection are all on this
+            # side. What the child needs to know is whether asking will be
+            # answered, and a child that asked into a pipe nobody was reading
+            # would wait there until the run's own deadline.
+            "tooling": serving is not None,
         }
-        return _spawn(request, job)
+        return _spawn(request, job, serving)
     except StartupRefusal as refusal:
         # Latched first. The cleanup talks to a database, and a database that
         # is unreachable must not be the reason this process goes on to start
@@ -566,6 +639,11 @@ def agent_run(
                 # machine may not start one, and would exit as something else.
                 raise refusal from failure
         raise
+    finally:
+        # Whatever the run did, the connection it may have opened is this
+        # function's to close: the caller was never given one to close.
+        if serving is not None:
+            serving.close()
 
 
 def close_refusal(
@@ -1012,18 +1090,27 @@ def _read_settings(path: Path, kind: str) -> tuple[dict | None, dict | None]:
     return {"kind": kind, "path": str(path), "document": document}, None
 
 
-def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResult:
+def _spawn(
+    request: AgentRunRequest,
+    job: Mapping[str, object],
+    serving: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
+) -> AgentRunResult:
     """Run the child in its boundary, and read back its result or its refusal.
 
     `-P` because the child's import path is the runtime's statement about which
     application and which SDK this launch is measured against, and a working
     directory on that path is a second answer to a question that has one.
+
+    The job ends in a newline because the child reads one line rather than a
+    stream to its end: with `serving` the pipe stays open for the run's whole
+    length, and a read to the end of it would be a read that never returns.
     """
     child = isolation.run(
         request.container,
         (isolation.INTERPRETER, "-P", "-m", CHILD),
-        stdin=json.dumps(job),
+        stdin=json.dumps(job) + "\n",
         timeout=request.timeout,
+        answer=serving,
     )
     refusal = _refusal(child.stderr)
     if refusal is not None:
@@ -1069,6 +1156,93 @@ def _spawn(request: AgentRunRequest, job: Mapping[str, object]) -> AgentRunResul
         ),
         verdict_attempts=int(result.get("verdict_attempts") or 0),
     )
+
+
+def _serving(request: AgentRunRequest) -> "_Tools | None":
+    """What answers this run's tool calls, or nothing if nothing can.
+
+    Two things have to be true together and neither is the child's to know: this
+    installation described a tool image, a store and a connection, and the run
+    belongs to a Program. Nothing when either is missing, which is what closes
+    the channel -- and the child is told the channel is closed rather than left
+    to find out by asking into a pipe nobody is reading.
+    """
+    if request.tooling is None or request.program_id is None:
+        return None
+    return _Tools(request.tooling, request.program_id, request.agent_run_id)
+
+
+class _Tools:
+    """One child's tool calls, answered on a connection of this object's own.
+
+    The dispatch is on the verb and it is closed. The roster has already refused
+    every call that does not fit its contract, so what arrives here is a
+    well-formed call to one of two tools; anything else is a child that has
+    started making things up, and it is answered rather than executed.
+
+    The connection is opened at the first call and not before. Most runs ask for
+    no tool at all, and a connection held open through every one of them would
+    be one connection per child for a thing most children never do.
+    """
+
+    def __init__(self, tooling: Tooling, program_id: str, agent_run_id: str) -> None:
+        self._tooling = tooling
+        self._program_id = program_id
+        self._agent_run_id = agent_run_id
+        self._connection: pg.Connection | None = None
+
+    def __call__(self, call: Mapping[str, object]) -> Mapping[str, object]:
+        verb = str(call.get("verb") or "")
+        if verb not in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT):
+            return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
+        try:
+            connection = self._open()
+        except (pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+
+        if verb == roster.RUN_TOOL:
+            named: str | None = str(call.get("tool") or "")
+        else:
+            # The registry resolves the pair, because the pair is the whole of
+            # what a child may name: a Skill it holds and a script in it. A
+            # script this harness has no enabled row for is the same refusal as
+            # an unknown tool, in the same words.
+            named = tool_module.script(
+                connection, str(call.get("skill_name") or ""), str(call.get("script") or "")
+            )
+            if named is None:
+                return {
+                    "served": False,
+                    "reason": tool_module.UNREGISTERED_TOOL,
+                    "detail": f"{call.get('skill_name')}/{call.get('script')} "
+                              "is not a Skill script this harness runs",
+                }
+        given = call.get("arguments")
+        return tool_module.serve(
+            connection,
+            self._tooling.root,
+            self._tooling.container,
+            program_id=self._program_id,
+            agent_run_id=self._agent_run_id,
+            offline_tool=named,
+            arguments=(
+                {str(name): str(value) for name, value in given.items()}
+                if isinstance(given, Mapping)
+                else {}
+            ),
+            excerpt=packet_module.DEFAULT_EXCERPT,
+        )
+
+    def _open(self) -> pg.Connection:
+        if self._connection is None:
+            self._connection = pg.connect(self._tooling.runtime)
+        return self._connection
+
+    def close(self) -> None:
+        """Give back what a call opened, whether or not anything opened it."""
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
 
 
 def _refusal(stderr: str) -> StartupRefusal | None:

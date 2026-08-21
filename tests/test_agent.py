@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, document, isolation, packet, proxy
+from redkraken import _launch, _startup, agent, document, isolation, packet, pg, proxy
 from redkraken import roster, skill, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
@@ -150,7 +150,7 @@ raised = []
 refusing = sys.argv[1] == "present"
 
 
-def spawn(request, job):
+def spawn(request, job, serving=None):
     spawned.append(request.agent_run_id)
     if refusing:
         raise agent.StartupRefusal(
@@ -961,16 +961,16 @@ class ServedToolTest(unittest.TestCase):
 
         self.assertEqual(sorted(agent.BARE.values()), sorted(offered))
 
-    def test_the_contracts_no_launch_serves_are_the_five_the_runtime_answers_for(self):
+    def test_the_contracts_no_launch_serves_are_the_three_the_runtime_answers_for(self):
         """The declared surface is wider than the served one, and by how much.
 
-        Four of these are a decision rather than a gap: the runtime asks for a
-        validation, files a report, parks a Tool run for a human and runs an
-        offline tool, each on its own connection, so the model-facing contract
-        is a name the roster keeps for the risk rules and the allowlists rather
-        than a handler anybody built. `run_skill_script` is the one nothing
-        answers -- a Skill's scripts run under `skill.check` in CI and nowhere
-        during a run -- and ticket 87 owes it. Pinned as a list because a sixth
+        Three, and each is a decision rather than a gap: the runtime asks for a
+        validation, files a report and parks a Tool run for a human, each on its
+        own connection, so the model-facing contract is a name the roster keeps
+        for the risk rules and the allowlists rather than a handler anybody
+        built. The two that used to be here are ticket 87's: a tool run is now
+        asked of the supervisor across the pipe the child was launched on, so
+        both are served like everything else. Pinned as a list because a fourth
         entry appearing here is a tool some role holds and no child can call.
         """
         self.assertEqual(
@@ -978,8 +978,6 @@ class ServedToolTest(unittest.TestCase):
                 "mcp__rk2__park_for_human",
                 "mcp__rk2__request_report",
                 "mcp__rk2__request_validation",
-                "mcp__rk2__run_skill_script",
-                "mcp__rk2__run_tool",
             ],
             sorted(set(roster.CONTRACTS) - set(agent.SERVED)),
         )
@@ -1153,6 +1151,159 @@ class ServedToolTest(unittest.TestCase):
             self.answer(offered["get_receipts"], {"receipt_labels": ["R1"]})
 
         self.assertEqual(["get_hypotheses", "get_receipts"], surface.served)
+
+
+class ToolChannelTest(unittest.TestCase):
+    """PH2-87: the one thing a child asks for rather than being given.
+
+    Two halves and they are tested apart, because they run in different
+    processes: the child's is one call out and one answer back on the pipe it
+    was launched on, and the supervisor's is which of its own verbs that call
+    was.
+    """
+
+    def channel(self, *answers: str):
+        out = io.StringIO()
+        return _launch.Channel(out, io.StringIO("".join(answers)), ), out
+
+    def answer(self, identifier, document) -> str:
+        return json.dumps({isolation.ANSWER: document, "id": identifier}) + "\n"
+
+    def test_a_call_goes_out_as_one_frame_and_its_answer_comes_back(self):
+        channel, out = self.channel(self.answer(1, {"served": True, "tool_run": "T1"}))
+
+        served = channel.call("mcp__rk2__run_tool", {"tool": "jq", "arguments": {"filter": "."}})
+
+        self.assertEqual({"served": True, "tool_run": "T1"}, served)
+        frame = json.loads(out.getvalue())
+        self.assertEqual(1, frame["id"])
+        self.assertEqual(
+            {"tool": "jq", "arguments": {"filter": "."}, "verb": "mcp__rk2__run_tool"},
+            frame[isolation.CALL],
+        )
+
+    def test_an_argument_named_verb_cannot_become_the_verb(self):
+        # The gate refuses an argument no contract declares long before this,
+        # so reaching it takes a broken gate. What must not follow from a
+        # broken gate is a call to a different tool than the one that was made.
+        channel, out = self.channel(self.answer(1, {}))
+
+        channel.call("mcp__rk2__run_skill_script", {"verb": "mcp__rk2__run_tool"})
+
+        self.assertEqual(
+            "mcp__rk2__run_skill_script", json.loads(out.getvalue())[isolation.CALL]["verb"]
+        )
+
+    def test_an_answer_to_another_call_is_not_read_as_this_one(self):
+        channel, _ = self.channel(
+            self.answer(9, {"served": True, "tool_run": "T9"}),
+            "this line is not a document\n",
+            self.answer(1, {"served": True, "tool_run": "T1"}),
+        )
+
+        self.assertEqual({"served": True, "tool_run": "T1"}, channel.call("v", {}))
+
+    def test_a_supervisor_that_stopped_answering_is_a_refusal_and_not_a_wait(self):
+        channel, _ = self.channel()
+
+        served = channel.call("mcp__rk2__run_tool", {})
+
+        self.assertEqual({"served": False, "reason": isolation.UNANSWERED, "detail": mock.ANY},
+                         {**served, "detail": mock.ANY})
+
+    def test_a_run_with_no_tool_image_is_served_both_tools_and_refuses_them(self):
+        # The allowlist is the role's, not the job's: a launch that served these
+        # conditionally would be a launch the startup assertion could not check
+        # against the roster.
+        surface = _launch.Surface()
+        with packaged() as offered:
+            _launch.server(surface, packet.Reader(packet.Packet()), _launch.Submission())
+        surface.open()
+
+        for name in ("run_tool", "run_skill_script"):
+            with self.subTest(tool=name):
+                wire = asyncio.run(offered[name].handler({}))
+                served = json.loads(wire["content"][0]["text"])
+                self.assertFalse(served["served"])
+                self.assertEqual(_launch.NO_TOOLING, served["reason"])
+
+    def tooling(self):
+        return agent.Tooling(
+            container=isolation.ToolContainer(image="rk2-tool"),
+            root=Path("/store"),
+            runtime=pg.settings_from_url("postgres://rk2_runtime@127.0.0.1:1/rk2"),
+        )
+
+    def serving(self, **overrides):
+        request = agent.AgentRunRequest(
+            agent_run_id=str(uuid.uuid4()),
+            objective="find something",
+            container=isolation.AgentContainer(
+                image="rk2-agent",
+                network="rk2-net",
+                proxy_container="rk2-proxy",
+                proxy_url="http://rk2-proxy:8080",
+                certificate=Path("/run/redkraken-ca.pem"),
+            ),
+            role="web_hunter",
+            program_id=str(uuid.uuid4()),
+            **overrides,
+        )
+        return request, agent._serving(request)
+
+    def test_a_request_with_no_tooling_opens_no_channel(self):
+        # And the job says so, because the way to find out by asking is to
+        # write into a pipe nobody is reading.
+        _, serving = self.serving()
+
+        self.assertIsNone(serving)
+
+    def test_a_verb_the_supervisor_does_not_serve_is_answered_rather_than_run(self):
+        # Refused before a connection is opened, because there is nothing to
+        # open one for: the roster refuses an undeclared tool before the call is
+        # made, and this is what the channel does with a line that got past it.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+
+        with mock.patch.object(agent.pg, "connect", side_effect=AssertionError("connected")):
+            served = serving({"verb": "mcp__rk2__rm_rf", "arguments": {}})
+
+        self.assertEqual(
+            {"served": False, "reason": agent.UNKNOWN_CALL, "detail": mock.ANY},
+            {**served, "detail": mock.ANY},
+        )
+
+    def test_a_database_that_cannot_be_reached_is_a_refusal_and_not_a_raise(self):
+        # A child left waiting on a line that never comes ends at its deadline
+        # rather than with something it could act on.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+
+        served = serving({"verb": roster.RUN_TOOL, "tool": "jq", "arguments": {}})
+
+        self.assertEqual(agent.UNREACHABLE_STATE, served["reason"])
+        self.assertFalse(served["served"])
+
+    def test_a_skill_script_the_registry_does_not_hold_is_answered_as_unregistered(self):
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+
+        with (
+            mock.patch.object(agent.pg, "connect", return_value=mock.Mock()),
+            mock.patch.object(agent.tool_module, "script", return_value=None),
+        ):
+            served = serving(
+                {
+                    "verb": roster.RUN_SKILL_SCRIPT,
+                    "skill_name": "analyse-source",
+                    "script": "nothing_ships_this.py",
+                    "arguments": {},
+                }
+            )
+        serving.close()
+
+        self.assertEqual(agent.tool_module.UNREGISTERED_TOOL, served["reason"])
+        self.assertIn("nothing_ships_this.py", served["detail"])
 
 
 class RequestToolTest(unittest.TestCase):
@@ -2558,7 +2709,7 @@ class RecordingTest(unittest.TestCase):
         # -- and the only way it reaches the child is on the job.
         written = {}
         spawn = mock.patch.object(
-            agent, "_spawn", side_effect=lambda request, job: written.update(job)
+            agent, "_spawn", side_effect=lambda request, job, serving=None: written.update(job)
         )
 
         with unlatched(), spawn:
