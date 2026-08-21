@@ -509,6 +509,7 @@ class Corpus(unittest.TestCase):
                 "analyse-source/extract_paths.py#1",
                 "analyse-source/extract_paths.py#2",
                 "analyse-source/extract_paths.py#3",
+                "analyse-source/extract_paths.py#4",
                 "compare-responses/compare.py#1",
                 "compare-responses/compare.py#2",
             ),

@@ -2,7 +2,7 @@
 
 Status: ticket-plan coverage complete; implementation complete except the release
 outcome, the corpus grading, one of the two tickets the final review opened, and
-the Skill rewrite and the path-reader fix the two resolved research tickets filed
+the Skill rewrite the resolved browser-tool research filed
 
 This audit answers whether the approved ticket plan covers the production Spec
 and ends in a runnable first-hunt release candidate. Coverage is a property of
@@ -29,7 +29,7 @@ and 91 by ticket 89's own reading, and after 89 and 90 both resolved into
 declines recorded as ADR 0005 and ADR 0006 and were given ticket 65 as their
 blocker for the same reason 87 was -- and once more after ticket 90's own
 measurement filed 92 against a defect it found in this repository's path
-readers.
+readers, and once more after 92 was built and given ticket 65 as its blocker.
 The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
 the audit gate parses. Numbers written here are a snapshot of that reading on the
 date above, not a second source for it -- re-run the gate rather than trusting
@@ -38,12 +38,12 @@ this table when the two differ.
 | Check | Result |
 | --- | --- |
 | Ticket files | 92, numbered continuously 01–92 |
-| Ticket status | 87 `resolved`, 4 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
-| Acceptance criteria | 536 total, 490 ticked |
-| Blocking edges | 163 exact title-and-number references, measured over 01–92 |
+| Ticket status | 88 `resolved`, 3 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
+| Acceptance criteria | 537 total, 499 ticked |
+| Blocking edges | 164 exact title-and-number references, measured over 01–92 |
 | Dependency graph | Acyclic |
-| Open frontier | 65, 84, 88, 91, 92 -- everything blocking them is resolved |
-| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 was opened by ticket 64's review after that graph was drawn and is on it now, because a resolved ticket the release does not rest on is the one thing the audit's fourth reading refuses; 89 and 90 were opened by operator questions and joined the path the same way when they resolved; 88, 91 and 92 are not on it while they are open |
+| Open frontier | 65, 84, 88, 91 -- everything blocking them is resolved |
+| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 was opened by ticket 64's review after that graph was drawn and is on it now, because a resolved ticket the release does not rest on is the one thing the audit's fourth reading refuses; 89 and 90 were opened by operator questions and joined the path the same way when they resolved, and 92 followed them there when ticket 90's measurement filed it; 88 and 91 are not on it while they are open |
 | Unticked criteria on resolved tickets | 11, each naming ticket 84, which grades the corpus over the route 78 built |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
@@ -317,10 +317,10 @@ schema work or catalogue files.
 
 **PASS at ticket-plan level**, re-confirmed at 92 tickets. The approved
 dependency graph covers the complete production Spec, the complete planned v1
-knowledge migration and an end-to-end first-hunt release outcome. Eighty-seven
+knowledge migration and an end-to-end first-hunt release outcome. Eighty-eight
 tickets are resolved; what is left is the first-hunt release outcome in 65, the
 corpus grading in 84, the second of the two tickets 64's own review opened, 88,
-the Skill rewrite in 91 that the resolved browser-tool evaluation in 89 earned,
-and the path-reader fix in 92 that ticket 90's measurement found. Implementation
+and the Skill rewrite in 91 that the resolved browser-tool evaluation in 89
+earned. Implementation
 evidence for every story is no longer a promise in this file -- it is a table the
 release gate's neighbour reads, and nothing in this file substitutes for it.

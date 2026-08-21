@@ -2,7 +2,7 @@
 
 **What to build:** Demonstrate from a fresh installation that RedKraken v2 can conduct a safe, complete synthetic bug-bounty hunt and leave the operator with a validated configuration and procedure for the first authorized live Program.
 
-**Blocked by:** 64 — Run and remediate the final code review; 87 — Serve a Skill script as a recorded Tool run; 89 — Evaluate the agent-browser Skill set against the browser slice; 90 — Evaluate CodeGraph as the engagement graph.
+**Blocked by:** 64 — Run and remediate the final code review; 87 — Serve a Skill script as a recorded Tool run; 89 — Evaluate the agent-browser Skill set against the browser slice; 90 — Evaluate CodeGraph as the engagement graph; 92 — Read a method-prefixed route template out of a source Artifact.
 
 **Status:** ready-for-agent
 

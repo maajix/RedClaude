@@ -2067,7 +2067,7 @@ CONTROLS = (
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
         "                          offline_tool, tool_version, finished_at)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
-        "                'js_parse', 'rk2-jsscan 1', now());"
+        "                'js_parse', 'rk2-jsscan 2', now());"
         " END $ctl$",
     ),
     Control(
@@ -2093,7 +2093,7 @@ CONTROLS = (
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
         "                          offline_tool, tool_version, analyser_sha256)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'running', 'runtime',"
-        f"                'js_parse', 'rk2-jsscan 1', {repeat('b')})"
+        f"                'js_parse', 'rk2-jsscan 2', {repeat('b')})"
         "     RETURNING id INTO t;"
         "   INSERT INTO artifacts (sha256, byte_size, visibility) VALUES"
         f"        ({repeat('c')}, 1, 'agent_visible') ON CONFLICT DO NOTHING;"
@@ -24182,7 +24182,7 @@ class SourceCitationTest(DatabaseCase):
         return (
             cls.run_id,
             name,
-            "rk2-jsscan 1",
+            "rk2-jsscan 2",
             json.dumps(arguments),
             cls.analyser if hash_ == "" else hash_,
         )
@@ -24916,7 +24916,7 @@ class JsAnalystCommandTest(DatabaseCase):
         printed = self.printed(answer)
 
         self.assertTrue(answer.ok, answer.violations)
-        self.assertEqual(("js_parse", "rk2-jsscan 1"), (printed["tool"], printed["analyser"]))
+        self.assertEqual(("js_parse", "rk2-jsscan 2"), (printed["tool"], printed["analyser"]))
         # The analyser names the bytes it read, and they are the bytes the row
         # says it was given: the two halves of the citation, agreeing.
         self.assertEqual(artifact.digest(SOURCE_BUNDLE), printed["source_sha256"])

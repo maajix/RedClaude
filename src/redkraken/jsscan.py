@@ -51,8 +51,10 @@ from dataclasses import dataclass
 #: against it, so this is the contract of the output below rather than a build
 #: number: a change to what these documents mean is a change here. `paths` is
 #: part of that contract: an answer that names request paths names them there,
-#: and the runtime files them against the run.
-VERSION = "rk2-jsscan 1"
+#: and the runtime files them against the run. Version 2 added the `method` a
+#: literal names in front of its own path, and narrowed `paths` to what
+#: `groundable` admits -- see both below.
+VERSION = "rk2-jsscan 2"
 
 #: The one file `js_map` may write, and it is the name the registry declares as
 #: a declared output. Bare, because the workspace is where the runtime mounts it
@@ -75,6 +77,25 @@ METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")
 #: as is reported beside every route, because "which of these it was" is the
 #: reader's question and not this file's to answer.
 REQUESTERS = ("fetch", "request", "ajax", "open", *(name.lower() for name in METHODS))
+
+#: One literal that names its own method in front of its own path, which is how
+#: a generated API client writes a whole surface down: `"GET /orgs/{org}"`. The
+#: methods are named rather than matched and the space is exactly one, because
+#: the rule underneath is that a literal holding a space is prose rather than a
+#: route -- this admits one shape through that rule and nothing else.
+#:
+#: `skills/analyse-source/scripts/extract_paths.py` carries the same pattern and
+#: cannot import this one; `tests/test_jsscan.py` holds the two in step.
+VERB = re.compile(r"^(%s) (/.*)\Z" % "|".join(METHODS))
+
+#: The RFC 6570 operators that open something which is not part of the path:
+#: `{?name}` and `{&name}` are its form-style query and `{#name}` its fragment.
+#: `skills/analyse-source/scripts/extract_paths.py` carries the same tuple and
+#: cannot import this one; `tests/test_jsscan.py` holds the two in step.
+#: Read out of that RFC's `operator` rule rather than recalled: `op-level2` is
+#: `"+" / "#"` and `op-level3` is `"." / "/" / ";" / "?" / "&"`, and everything
+#: in them that is not here expands inside the path.
+CUTS = ("?", "&", "#")
 
 #: Property names an options object gives a method under. `type` is jQuery's
 #: spelling and `method` is everyone else's.
@@ -362,6 +383,70 @@ def _regex(text: str, index: int, out: list[Token]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def groundable(path: str) -> bool:
+    """Whether `rk2_clean_path` would take this, which is whether it can ground.
+
+    The acceptor lives in
+    `migrations/20260813T090000Z__a_recon_run_becomes_typed_surface.sql` and is
+    restated here because an analyser runs in a container with no database. It
+    matters more than it looks: `paths` is what `tool.serve` files into
+    `tool_run_paths`, and `rk2_source_citation` cleans a proposed route and a
+    stored one before comparing them. A stored path the acceptor refuses cleans
+    to nothing, so it matches nobody -- and an analyst who proposes the route
+    this run actually found is dropped `path_not_in_output` by the run that
+    found it, which is the worst shape a wrong answer can take here.
+
+    `skills/analyse-source/scripts/extract_paths.py` carries the same rule and
+    cannot import this one; `tests/test_jsscan.py` holds the two in step.
+    """
+    if not path or not path.startswith("/") or "//" in path:
+        return False
+    if any(mark in path for mark in "?#%") or any(char.isspace() for char in path):
+        return False
+    return not ("/./" in path or "/../" in path or path.endswith(("/.", "/..")))
+
+
+def path_half(value: str) -> str:
+    """The path half of one literal: everything before its query starts.
+
+    Depth-aware, because a URI template writes its query expansion inside the
+    braces. `/packages/{name}/restore{?token}` is RFC 6570 for a route that
+    takes a `token` parameter, and cutting at the bare `?` would leave
+    `/packages/{name}/restore{`, which is not a path anybody wrote and is the
+    shape a naive cut produces on every generated client. The operator only
+    opens a query where the template is not already inside one, so the cut is
+    made at depth zero and nowhere else -- `/x/{a{?b}}` cut on the inner brace
+    would leave `/x/{a`, which is dangling and grounds.
+
+    Three of that RFC's operators open something that is not the path, and they
+    are `CUTS`: `?` and `&` are its form-style query, `#` its fragment. The
+    others -- `+` from `op-level2`, and `.`, `/` and `;` from `op-level3` --
+    expand inside the path and are kept, and `op-reserve` is left undefined by
+    the RFC and is not guessed at here. A `?` or a `#` outside braces opens a
+    query or a fragment the ordinary way.
+
+    `skills/analyse-source/scripts/extract_paths.py` carries the same rule and
+    cannot import this one; `tests/test_jsscan.py` holds the two in step.
+    """
+    depth = 0
+    for index, char in enumerate(value):
+        if char == "{":
+            if depth == 0 and value[index + 1:index + 2] in CUTS:
+                return value[:index]
+            depth += 1
+        elif char == "}":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and char in "?#":
+            return value[:index]
+    return value
+
+
+def verb_of(value: str) -> str | None:
+    """The method one literal names in front of its own path, if it names one."""
+    match = VERB.match(value)
+    return match.group(1) if match is not None and path_of(value) is not None else None
+
+
 def path_of(value: str) -> str | None:
     """The route one string literal describes, or nothing.
 
@@ -369,7 +454,14 @@ def path_of(value: str) -> str | None:
     The query and the fragment are cut because they are not part of a route --
     `rk2_clean_path` refuses a path carrying either, and a tool that emitted
     one would be proposing something the schema will not take.
+
+    A method in front of the path is cut for the opposite reason: it is a fact
+    worth keeping, `verb_of` keeps it, and the schema stores a route rather
+    than a sentence.
     """
+    match = VERB.match(value)
+    if match is not None:
+        value = match.group(2)
     if not value or "\n" in value or " " in value:
         return None
     if value.startswith("//"):
@@ -382,11 +474,14 @@ def path_of(value: str) -> str | None:
         value = rest[cut:] if cut >= 0 else "/"
     if not value.startswith("/"):
         return None
-    for mark in ("?", "#"):
-        cut = value.find(mark)
-        if cut >= 0:
-            value = value[:cut]
-    return value or "/"
+    cut = path_half(value)
+    # A brace the cut or the source left open is not a template hole, and
+    # `extract_paths.PATH` refuses the same shape by construction. Refused here
+    # rather than filtered later, because `/a{b` is `groundable` and would be
+    # filed as a path this run found.
+    if cut.count("{") != cut.count("}"):
+        return None
+    return cut or "/"
 
 
 def _named_hole(source: str) -> str:
@@ -416,6 +511,15 @@ def route_of(token: Token) -> str | None:
         return path_of(token.value)
     if token.kind == "template":
         return template_of(token)
+    return None
+
+
+def method_of(token: Token) -> str | None:
+    """The method this token names in front of its own route, if it names one."""
+    if token.kind == "string":
+        return verb_of(token.value)
+    if token.kind == "template":
+        return verb_of(template_source(token))
     return None
 
 
@@ -653,8 +757,13 @@ def _named_paths(paths: Iterable[str]) -> list[str]:
     against what this analysis actually said. A recorder that read
     `path_literals` from one subcommand and `routes` from another would be a
     second place those shapes live, and the shape is this file's to change.
+
+    Filtered by `groundable`, which is the whole reason this key is separate
+    from the detail beside it: a path the schema will not store is still a fact
+    about the file and is reported there, and putting it here would file a row
+    that can never be matched to the analyst who reads it.
     """
-    return sorted({path for path in paths if path})
+    return sorted({path for path in paths if path and groundable(path)})
 
 
 def parse(raw: bytes, text: str) -> dict:
@@ -680,6 +789,11 @@ def parse(raw: bytes, text: str) -> dict:
                 "offset": token.start,
                 "line": line_of(starts, token.start),
                 "kind": token.kind,
+                # The verb this literal named in front of its own path, or
+                # nothing. A generated client writes its whole surface as
+                # `"GET /orgs/{org}"`, and which verb it said is a fact about
+                # the endpoint that no call site here will repeat.
+                "method": method_of(token),
                 # The whole of criterion 6 in one boolean. A path that is in the
                 # file and that nothing requests is reported as exactly that,
                 # rather than left out -- an analyst has to be able to see the
