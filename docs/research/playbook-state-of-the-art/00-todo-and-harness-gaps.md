@@ -115,17 +115,27 @@ failure is an environment artefact or a real regression on `main`.
 
 ## E. Ordered TODO
 
-Harness first, by the operator's decision.
+Harness first, by the operator's decision. This list is now tickets 94 through
+101 in `docs/specs/production-harness-v2/issues/`, in dependency order:
 
-1. Establish the capability matrix: for every technique the eight research files
-   propose, what the agent must be able to send, observe or hold. Then cut it
-   against what `roster.py` actually offers.
-2. Request body for `mcp__rk2__http_request`, with whatever the receipt,
-   redaction and store rules require -- and the `identity_slot` question
-   settled, since 29 playbooks reference a field that does not exist.
-3. Out-of-band observation. `src/redkraken/oob.py` exists; what the research
-   asks for is evidence keyed to an interaction we did not initiate, with a
-   positive control so that silence means something.
-4. The remaining capability gaps the matrix turns up, as their own tickets.
-5. Vocabulary migration for the missing property classes.
-6. Only then: rewrite the playbooks, and add the ones that have no home.
+* **95** — A bounded string argument must say maxLength. The prerequisite bug
+  found while designing the request contract.
+* **94** — Hand the response headers to the caller. Capability B, 18 techniques,
+  and the cheapest of them.
+* **96** — Carry a request body. Capability A, 61 of 131 techniques, blocked by
+  95.
+* **97** — Settle what an Identity slot is. The 29 playbooks that name a field
+  that does not exist, and the runtime that hardcodes it empty.
+* **98** — Let a playbook step reach the out-of-band channel. Capability F, 14
+  techniques; tickets 14 and 69 shipped the recording half.
+* **99** — Let a playbook step drive the browser. Capabilities D and E, 22 plus
+  19 techniques.
+* **100** — Extend the vocabulary the corpus is missing. Capability L, 8
+  techniques, and it lands after the capability work rather than before it.
+* **101** — Rewrite the playbook corpus on the capabilities that now exist.
+  Blocked by all seven above, and the ticket they exist for. Ticket 65 is
+  blocked by it, so every one of them is on a path to the release candidate.
+
+Section C0 above and `09-capability-matrix.md` carry the corrected counts those
+tickets are written against; where this file and the matrix disagreed, the
+tickets record the reading that was checked against the source.
