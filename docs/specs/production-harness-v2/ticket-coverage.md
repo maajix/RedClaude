@@ -1,8 +1,7 @@
 # Production harness v2 — ticket coverage audit
 
 Status: ticket-plan coverage complete; implementation complete except the release
-outcome, the corpus grading, one of the two tickets the final review opened, and
-the Skill rewrite the resolved browser-tool research filed
+outcome, the corpus grading, and one of the two tickets the final review opened
 
 This audit answers whether the approved ticket plan covers the production Spec
 and ends in a runnable first-hunt release candidate. Coverage is a property of
@@ -29,7 +28,8 @@ and 91 by ticket 89's own reading, and after 89 and 90 both resolved into
 declines recorded as ADR 0005 and ADR 0006 and were given ticket 65 as their
 blocker for the same reason 87 was -- and once more after ticket 90's own
 measurement filed 92 against a defect it found in this repository's path
-readers, and once more after 92 was built and given ticket 65 as its blocker.
+readers, and once more after 92 and 91 were built and given ticket 65 as their
+blocker.
 The reading is `tools/check_audit.py`'s: the same statuses, blockers and criteria
 the audit gate parses. Numbers written here are a snapshot of that reading on the
 date above, not a second source for it -- re-run the gate rather than trusting
@@ -38,12 +38,12 @@ this table when the two differ.
 | Check | Result |
 | --- | --- |
 | Ticket files | 92, numbered continuously 01–92 |
-| Ticket status | 88 `resolved`, 3 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
-| Acceptance criteria | 537 total, 499 ticked |
-| Blocking edges | 164 exact title-and-number references, measured over 01–92 |
+| Ticket status | 89 `resolved`, 2 `ready-for-agent`, 1 `ready-for-human`, 0 untriaged |
+| Acceptance criteria | 537 total, 508 ticked |
+| Blocking edges | 165 exact title-and-number references, measured over 01–92 |
 | Dependency graph | Acyclic |
-| Open frontier | 65, 84, 88, 91 -- everything blocking them is resolved |
-| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 was opened by ticket 64's review after that graph was drawn and is on it now, because a resolved ticket the release does not rest on is the one thing the audit's fourth reading refuses; 89 and 90 were opened by operator questions and joined the path the same way when they resolved, and 92 followed them there when ticket 90's measurement filed it; 88 and 91 are not on it while they are open |
+| Open frontier | 65, 84, 88 -- everything blocking them is resolved |
+| Release reachability | Every ticket has a dependency path to ticket 65, which is what ticket 64 naming them as blockers bought; 87 was opened by ticket 64's review after that graph was drawn and is on it now, because a resolved ticket the release does not rest on is the one thing the audit's fourth reading refuses; 89 and 90 were opened by operator questions and joined the path the same way when they resolved, and 92 followed them there when ticket 90's measurement filed it and 91 followed when ticket 89's reading earned it; 88 is not on it while it is open |
 | Unticked criteria on resolved tickets | 11, each naming ticket 84, which grades the corpus over the route 78 built |
 | Absolute machine paths in ticket instructions | 0 -- the one in ticket 68 records an install that happened |
 
@@ -53,9 +53,9 @@ restored it. Tickets 67–76 and 81–83 spent longer in that position: raised b
 the plan while it ran, resolved green, and named by nothing downstream, so they
 were finished work the release did not rest on. Ticket 63's fourth reading is
 what made that visible and refuses it, and ticket 64 now lists all thirteen,
-which is also what its own first criterion asks for. The three that remain outside
-the graph -- 79, 80 and 84 -- are outside it because they are open: the
-reading is about work that is finished and attached to nothing.
+which is also what its own first criterion asks for. The one that remains outside
+the graph -- 84 -- is outside it because it is open: the reading is about work
+that is finished and attached to nothing.
 
 Tickets 71–73 are drift the ticket-18 review found between the compiled roster
 and the scheduler that will read it: the model and effort a claimed run records,
@@ -97,20 +97,20 @@ modes against this roster, and 81 through 83 from authorised live validation
 against a real target -- a Program whose stored ceilings contradict each other
 and could not be repaired, the door having no shipped way to run as the Agent
 network's one peer, and no way to reach a claimed Task through that surface. 76
-through 78 and 81 through 83 are resolved and now hang off ticket 64, and 79, 80
-and 84 are open. Ticket 84 is what the eleven criteria across tickets 46 and 49
-through 57 now name: 78 built the route from the Agent to a fixture through the
-door and graded one Playbook over it, so what is left is the corpus's own graded
-runs, which cost a real Agent run apiece and can come back `fail`.
+through 83 are resolved and now hang off ticket 64, and 84 is open. Ticket 84 is
+what the eleven criteria across tickets 46 and 49 through 57 now name: 78 built
+the route from the Agent to a fixture through the door and graded one Playbook
+over it, so what is left is the corpus's own graded runs, which cost a real Agent
+run apiece and can come back `fail`.
 
 ## Implementation progress
 
 | Measure | Value |
 | --- | --- |
-| Resolved | 01–64, 66–83, 85–87, 89–90 |
-| Unblocked and open | 65, 84, 88, 91, 92 |
+| Resolved | 01–64, 66–83, 85–87, 89–92 |
+| Unblocked and open | 65, 84, 88 |
 | Blocked and open | none |
-| Criteria ticked | 490 of 536 |
+| Criteria ticked | 508 of 537 |
 
 What that covers is the foundation and the egress spine: installable runtime and
 diagnostics, the migration corpus and its integrity gate, Program isolation and
@@ -317,10 +317,9 @@ schema work or catalogue files.
 
 **PASS at ticket-plan level**, re-confirmed at 92 tickets. The approved
 dependency graph covers the complete production Spec, the complete planned v1
-knowledge migration and an end-to-end first-hunt release outcome. Eighty-eight
+knowledge migration and an end-to-end first-hunt release outcome. Eighty-nine
 tickets are resolved; what is left is the first-hunt release outcome in 65, the
-corpus grading in 84, the second of the two tickets 64's own review opened, 88,
-and the Skill rewrite in 91 that the resolved browser-tool evaluation in 89
-earned. Implementation
-evidence for every story is no longer a promise in this file -- it is a table the
-release gate's neighbour reads, and nothing in this file substitutes for it.
+corpus grading in 84, and the second of the two tickets 64's own review opened,
+88. Implementation evidence for every story is no longer a promise in this file
+-- it is a table the release gate's neighbour reads, and nothing in this file
+substitutes for it.
