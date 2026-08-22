@@ -544,6 +544,60 @@ class Proposal:
         return answered
 
 
+class Correlator:
+    """The out-of-band names this run has asked the runtime to mint for it.
+
+    The other verb on this surface whose answer arrives while the run is still
+    going, and the only one whose result leaves the installation. A correlator
+    is a name that gets planted in somebody else's system -- in a webhook URL,
+    an XML entity, a hostname a parser will resolve -- and comes back as a
+    request nobody here made. So what is asked for is not the name: it is the
+    address to embed, and the name inside it is the runtime's.
+
+    Nothing is counted here, unlike `Proposal`. A refused mint costs the Program
+    no row and leaves nothing behind -- `request_callback_correlator` refuses
+    before `mint_callback_correlator` is reached -- and the two things a ceiling
+    would be protecting are already held elsewhere: the lifetime is fixed in the
+    verb, and the channel is the Program's one declared channel whether this run
+    asks once or twenty times.
+
+    Asking is blocking, because it is the same pipe a tool run goes down, so
+    every caller reaches this through a thread for the reason `Channel` gives.
+    """
+
+    def __init__(self, channel: Channel | None = None) -> None:
+        self._channel = channel
+        self.attempts = 0
+
+    def ask(self, arguments: Mapping[str, object]) -> dict:
+        """Carry one correlator request to the runtime, or say why it was not carried.
+
+        The two declared fields and nothing beside them, for `Proposal.ask`'s
+        reason: which Agent run is asking and which Program it belongs to were
+        both decided when this run was opened, and the correlator itself is
+        minted on the other side of this pipe.
+        """
+        self.attempts += 1
+        if self._channel is None:
+            return {
+                "served": False,
+                "reason": NO_TOOLING,
+                "attempts": self.attempts,
+                "detail": (
+                    "this run was started with no supervisor to ask; nothing was minted"
+                ),
+            }
+        return dict(
+            self._channel.call(
+                f"mcp__{agent.SERVER}__mint_callback",
+                {
+                    "channel": str(arguments.get("channel") or ""),
+                    "subject_label": str(arguments.get("subject_label") or ""),
+                },
+            )
+        )
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -665,6 +719,21 @@ DESCRIPTIONS = {
         "evidence is not worth re-sending. This run may have three proposals refused "
         "and no more, after which the tool stops carrying them."
     ),
+    "mint_callback": (
+        "Ask the runtime for an out-of-band correlator: a name this Program controls "
+        "that you plant in the target and that reports back when something fetches or "
+        "resolves it. Name the channel this Program declared and the Entity the canary "
+        "is a question about. What comes back is the address to embed and the id of the "
+        "correlator behind it.\n\n"
+        "You do not choose the name, how long it lives, or which channel it is on. A "
+        "correlator is planted in somebody else's system and outlives your run, so those "
+        "are the runtime's. A Program declares one out-of-band channel and this tool "
+        "mints on that one; if you name a different one it tells you which one is real. "
+        "Embed the address exactly as given -- a URL you shortened or a hostname you "
+        "rebuilt is a name the listener will not admit. When an arrival comes in it "
+        "becomes an Observation you can cite by its callback_label; no arrival is not a "
+        "refutation on its own."
+    ),
     "run_skill_script": (
         "Run one script that ships with a Skill you hold, over Artifacts this Program "
         "already holds. Name the Skill, the script's filename, and each argument the "
@@ -685,8 +754,9 @@ def server(
     judgement: Judgement | None = None,
     channel: Channel | None = None,
     proposal: Proposal | None = None,
+    correlator: Correlator | None = None,
 ):
-    """Five reads, a request, two tool runs, a result, a Finding, a choice, a judgement.
+    """Five reads, a request, two tool runs, a result, a Finding, a canary, a choice, a judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -721,12 +791,16 @@ def server(
     # this process has no database, and what it can do is ask the side that has
     # one. A run with no supervisor gets a `Proposal` that says so.
     proposing = Proposal(channel) if proposal is None else proposal
+    # And the same for the out-of-band ask, which goes down the same pipe to the
+    # same party for the same reason.
+    minting = Correlator(channel) if correlator is None else correlator
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
     tools.append(_request(surface, door))
     tools.append(_tool_run(surface, channel, "run_tool"))
     tools.append(_tool_run(surface, channel, "run_skill_script"))
     tools.append(_propose(surface, submission))
     tools.append(_finding(surface, proposing))
+    tools.append(_callback(surface, minting))
     tools.append(_slate(surface, picking))
     tools.append(_pick(surface, picking))
     tools.append(_packet(surface, judging))
@@ -1104,6 +1178,34 @@ def _finding(surface: Surface, proposal: Proposal):
     async def handler(arguments: dict) -> dict:
         surface.serve(name)
         return _content(await asyncio.to_thread(proposal.ask, dict(arguments or {})))
+
+    return handler
+
+
+def _callback(surface: Surface, correlator: Correlator):
+    """The one name this run may ask the runtime to publish on its behalf.
+
+    Everything else on this surface either reads what the runtime already wrote
+    or asks it to write something down. This asks it to put a name somewhere the
+    target can reach and to start listening for it, which is the only verb here
+    whose effect is outside this installation -- and the reason the two things
+    that make it durable, the name and its lifetime, are not arguments.
+
+    A refusal comes back as a refusal. `request_callback_correlator` answers in
+    sentences about the Program's own configuration -- no channel declared, two
+    declared, nothing bound, no Entity by that label -- and every one of them is
+    something the run can either act on or report. An exception would leave the
+    child with a tool that failed and leave nobody with the reason.
+
+    On a thread for `_tool_run`'s reason: the pipe is blocking and the caller is
+    an event loop.
+    """
+    name = "mint_callback"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(await asyncio.to_thread(correlator.ask, dict(arguments or {})))
 
     return handler
 

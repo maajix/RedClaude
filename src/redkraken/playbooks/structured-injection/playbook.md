@@ -41,8 +41,9 @@ Complete this step with the endpoint, the field, and the sink.
 
 ## 2. Send the ordinary request, the structural probe and its inert twin
 
-Three requests under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set. The field carries:
+Three requests through `mcp__rk2__http_request`, all three as whichever Identity
+the Task was opened under -- the step does not choose it and there is no argument
+for it, which is also what keeps the three comparable. The field carries:
 
 * the ordinary request: a value of the shape the route documents, carrying
   nothing structural at all

@@ -45,8 +45,9 @@ the verdict is `inconclusive`. Say which of those it was.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, and store the response. Then send it again, unchanged.
+Send the request through `mcp__rk2__http_request` and store the response. Then
+send it again, unchanged. Both go out as whichever Identity the Task was opened
+under: the step does not choose it and there is no argument for it.
 
 Two identical requests, because a route that returns a different set of fields on
 each call -- a partial cache, a feature flag sampled per request, an envelope

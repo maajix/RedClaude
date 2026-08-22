@@ -31,14 +31,18 @@ them pointed at a host the Program itself controls.
 Before anything is sent, write down two names, and this reading may use no
 others:
 
-* the Program's configured callback host, and a second label under it, so that
-  the two arms resolve to two places whose answers differ from each other
-* or, where the Program declares one, a target it owns and has marked as a
-  controlled fetch destination
+* the Program's declared out-of-band channel. Call `mcp__rk2__mint_callback`
+  with the channel name and this endpoint's label, and embed the address it
+  returns exactly as given. That address is one hostname and it gives this
+  reading one of its two names, never both: the publisher behind a channel
+  serves a single host, so there is no second label under it to vary
+* a target the Program owns and has marked as a controlled fetch destination
 
 Both must serve a distinct, marked document, so a response can say which one was
-reached. If the Program has neither, this Playbook cannot read the route and says
-so. It does not substitute a host that merely looks harmless.
+reached. If the Program declares only one of the two, this Playbook has one name
+and its two arms have nothing to differ by, so it cannot read the route and says
+so. It does not substitute a host that merely looks harmless, and it does not
+invent a second name beneath the channel.
 
 Then read the parameter from the state view, and read what the route is allowed
 to fetch: the vendor, the manual host, the image origin, whatever an ordinary
@@ -46,9 +50,10 @@ request names. That allowed host is what the arms will put in front of the `@`.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, with the parameter carrying an ordinary, allowed URL. Then
-send it again, unchanged.
+Send the request through `mcp__rk2__http_request`, with the parameter carrying an
+ordinary, allowed URL. Then send it again, unchanged. Both go out as whichever
+Identity the Task was opened under: the step does not choose it and there is no
+argument for it.
 
 Two identical requests, for the reason every comparison here starts with two.
 Record what the route does with a URL it accepts: whether the fetched document

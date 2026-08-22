@@ -55,9 +55,10 @@ ceiling.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, with the parameter naming a document the route is meant to
-serve. Then send it again, unchanged.
+Send the request through `mcp__rk2__http_request`, with the parameter naming a
+document the route is meant to serve. Then send it again, unchanged. Both go out
+as whichever Identity the Task was opened under: the step does not choose it and
+there is no argument for it.
 
 Two identical requests, for the reason every comparison in this corpus starts
 with two: a differential measured against a baseline nobody checked is noise with

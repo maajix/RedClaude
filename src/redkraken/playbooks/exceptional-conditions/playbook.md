@@ -40,16 +40,17 @@ Complete this step with the endpoint, the parameter, its type and its rule.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, with the parameter carrying an ordinary value the route
-accepts. Then send it again, unchanged.
+Send the request through `mcp__rk2__http_request`, with the parameter carrying an
+ordinary value the route accepts. Then send it again, unchanged. Both go out as
+whichever Identity the Task was opened under: the step does not choose it and
+there is no argument for it.
 
-Where the subject takes no session at all, send both without `identity_slot` and
-say so in the record. Nothing in this reading is about who asked -- the arms
-differ in one parameter value and the claim is about what the route says when it
-is surprised -- so a route that answers everybody is a route this reading can
-still difference. What it may not do is mix the two: every request in every step
-below carries the same standing as the baseline did.
+Where the subject takes no session at all, this reading belongs in a Task opened
+with no Identity, and the record says so. Nothing in this reading is about who
+asked -- the arms differ in one parameter value and the claim is about what the
+route says when it is surprised -- so a route that answers everybody is a route
+this reading can still difference. What it may not do is mix the two: every
+request in every step below carries the same standing as the baseline did.
 
 Two identical requests, because everything after this compares failures against
 each other and against this. A route that carries a request id, a timestamp or a

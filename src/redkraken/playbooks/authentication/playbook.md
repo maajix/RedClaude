@@ -29,10 +29,12 @@ signature -- is answering a question it never asked.
 
 ## 1. Lease the credential rather than reading it
 
-The correct credential is an Identity slot. Follow `use-identity`: name the
-label in `identity_slot` and let the proxy attach it. Nothing in this Playbook
-prints, echoes or copies the secret, and a step that needed the plaintext would
-be a step that put a Program's account into a transcript.
+The correct credential is an Identity slot. Follow `use-identity`: the run acts
+as whichever Identity the Task was opened under -- the step does not choose it
+and there is no argument for it -- and the proxy attaches the credential.
+Nothing in this Playbook prints, echoes or copies the secret, and a step that
+needed the plaintext would be a step that put a Program's account into a
+transcript.
 
 If no slot holds a working credential for this endpoint, stop. Every reading
 below is a comparison against a request that is known to succeed, and without

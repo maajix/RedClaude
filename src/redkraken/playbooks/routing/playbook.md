@@ -27,10 +27,12 @@ to come later in the screens.
 
 ## 1. Walk the flow once, in order
 
-Complete the flow the way the interface does, through `identity_slot`, storing
-every answer. This is the control and it is a `state_change`: it says what the
-sequence is, what each step does to the state, and what the final step's success
-looks like when it was earned.
+Complete the flow the way the interface does, storing every answer. The whole
+walk runs as whichever Identity the Task was opened under; the step does not
+choose it and there is no argument for it, so the flow is walked once by one
+caller rather than assembled from several. This is the control and it is a
+`state_change`: it says what the sequence is, what each step does to the state,
+and what the final step's success looks like when it was earned.
 
 A run that has not walked the flow does not know which steps exist and cannot
 say a step was skipped. It can only say a route answered.

@@ -43,9 +43,10 @@ Complete this step with the endpoint, one field, and the store.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, the chosen field carrying an ordinary string. Then send it
-again, unchanged.
+Send the request through `mcp__rk2__http_request`, the chosen field carrying an
+ordinary string. Then send it again, unchanged. Both go out as whichever Identity
+the Task was opened under: the step does not choose it and there is no argument
+for it.
 
 Two identical requests, for the reason every reading in this category sends two:
 a route whose response carries a timestamp or an id is not byte-stable, and the

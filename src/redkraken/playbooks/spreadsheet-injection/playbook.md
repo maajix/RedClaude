@@ -46,8 +46,9 @@ Complete this step with the two routes, the field, and the grant.
 
 ## 2. Write two records, and label them
 
-Two requests under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set:
+Two requests through `mcp__rk2__http_request`, both as whichever Identity the
+Task was opened under -- the step does not choose it and there is no argument for
+it:
 
 * the variant: a value beginning with a formula character, followed by a marker
   that is unique to this reading

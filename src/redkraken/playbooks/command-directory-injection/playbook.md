@@ -38,9 +38,10 @@ Complete this step with the endpoint, the file parameter, and the grant.
 
 ## 2. Establish the baseline, and measure what normal costs
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, uploading a small, valid file with an ordinary name. Send it
-several times.
+Send the request through `mcp__rk2__http_request`, uploading a small, valid file
+with an ordinary name. Send it several times. Every one of them goes out as
+whichever Identity the Task was opened under: the step does not choose it and
+there is no argument for it.
 
 This measures two things the reading needs. First, that the route works and what
 it answers. Second, and more important, how long it takes and how much that

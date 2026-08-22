@@ -45,10 +45,11 @@ Complete this step with the endpoint, one parameter, and the framework.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, the parameter carrying a value the interface offers -- a
-column the page's own sort control uses, a field the documentation lists. Then
-send it again, unchanged.
+Send the request through `mcp__rk2__http_request`, the parameter carrying a value
+the interface offers -- a column the page's own sort control uses, a field the
+documentation lists. Then send it again, unchanged. Both go out as whichever
+Identity the Task was opened under: the step does not choose it and there is no
+argument for it.
 
 The offered value matters. It establishes that the parameter works, which the
 later refutation needs: a parameter that is ignored entirely produces the same

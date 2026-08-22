@@ -1273,6 +1273,58 @@ class ToolChannelTest(unittest.TestCase):
             {**served, "detail": mock.ANY},
         )
 
+    def test_the_supervisor_mints_the_correlator_the_child_asked_for(self):
+        # PH2-98. Three things at once, because they are one property: the verb
+        # is dispatched rather than refused, the two declared fields cross
+        # unchanged, and the correlator is generated HERE. A child that could
+        # choose the name could plant one it had already read somewhere, and a
+        # correlator is only attributable because nothing outside this process
+        # and the payload it goes into has ever seen it.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = json.dumps(
+            {"outcome": "minted", "address": "https://oob.example/9f2c1a/"}
+        )
+
+        with mock.patch.object(agent.pg, "connect", return_value=connection):
+            served = serving(
+                {
+                    "verb": roster.MINT_CALLBACK,
+                    "arguments": {"channel": "oob", "subject_label": "EP4"},
+                }
+            )
+
+        self.assertEqual({"outcome": "minted", "address": "https://oob.example/9f2c1a/"}, served)
+        statement, parameters = connection.execute.call_args_list[-1].args
+        self.assertEqual(agent.MINT_CALLBACK, statement)
+        channel, correlator, subject, _ = parameters
+        self.assertEqual(("oob", "EP4"), (channel, subject))
+        self.assertRegex(correlator, r"^[0-9a-f]{32}$")
+
+    def test_a_child_cannot_name_the_correlator_it_is_about_to_plant(self):
+        # The closed schema refuses an undeclared argument long before this, so
+        # reaching it takes a broken gate. What must not follow from a broken
+        # gate is the runtime publishing a name the child chose.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = json.dumps({"outcome": "minted"})
+
+        with mock.patch.object(agent.pg, "connect", return_value=connection):
+            serving(
+                {
+                    "verb": roster.MINT_CALLBACK,
+                    "arguments": {
+                        "channel": "oob",
+                        "subject_label": "EP4",
+                        "correlator": "deadbeef",
+                    },
+                }
+            )
+
+        self.assertNotIn("deadbeef", connection.execute.call_args_list[-1].args[1])
+
     def test_a_database_that_cannot_be_reached_is_a_refusal_and_not_a_raise(self):
         # A child left waiting on a line that never comes ends at its deadline
         # rather than with something it could act on.
@@ -1502,6 +1554,129 @@ class FindingProposalTest(unittest.TestCase):
             self.answer(offering, self.proposal())
 
         self.assertEqual(["propose_finding"], surface.served)
+
+
+class CallbackCorrelatorTest(unittest.TestCase):
+    """PH2-98: the one name a run asks the runtime to publish on its behalf.
+
+    Everything here is about the ask, like the Finding proposal above it: that
+    the request crosses as the two fields it declares and nothing else, that
+    whatever the runtime answered is what the model reads, and that a run with
+    no supervisor says so rather than writing into a pipe nobody reads. Nothing
+    here asserts anything about whether the correlator should have been minted
+    -- that is `request_callback_correlator`, on rows this process cannot
+    reach.
+    """
+
+    def minting(self, stack, *answers):
+        surface = _launch.Surface()
+        supervisor = Supervisor(*answers)
+        correlator = _launch.Correlator(supervisor)
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface,
+            packet.Reader(packet.Packet()),
+            _launch.Submission(),
+            correlator=correlator,
+        )
+        surface.open()
+        return surface, offered["mint_callback"], correlator, supervisor
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        return json.loads(wire["content"][0]["text"])
+
+    def request(self, **overrides) -> dict:
+        return {"channel": "oob", "subject_label": "EP4", **overrides}
+
+    def test_the_request_crosses_as_the_two_fields_it_declares(self):
+        # And nothing beside them. The correlator itself is not here, because it
+        # is minted on the other side of this pipe; the Agent run is not here,
+        # because a child that named its own run would be naming which run an
+        # arrival gets attributed to.
+        out = io.StringIO()
+        answered = json.dumps(
+            {isolation.ANSWER: {"outcome": "minted", "correlator_id": "x"}, "id": 1}
+        )
+        channel = _launch.Channel(out, io.StringIO(answered + "\n"))
+
+        served = _launch.Correlator(channel).ask(self.request())
+
+        self.assertEqual({"outcome": "minted", "correlator_id": "x"}, served)
+        self.assertEqual(
+            {**self.request(), "verb": "mcp__rk2__mint_callback"},
+            json.loads(out.getvalue())[isolation.CALL],
+        )
+
+    def test_what_the_runtime_answered_is_what_the_model_reads(self):
+        # Including the address, which is the whole point of the call: a handler
+        # that summarised the answer would be deciding which part of a name the
+        # model is allowed to embed.
+        minted = {
+            "outcome": "minted",
+            "correlator_id": "0198c0de-0000-7000-8000-000000000001",
+            "address": "https://oob.example/9f2c1a/",
+            "channel": "oob",
+            "kind": "http",
+            "placement": "path",
+            "subject_label": "EP4",
+            "expires_at": "2026-09-28 01:00:00+00",
+        }
+        with contextlib.ExitStack() as stack:
+            _, offering, _, _ = self.minting(stack, minted)
+
+            self.assertEqual(minted, self.answer(offering, self.request()))
+
+    def test_a_refusal_is_reported_as_a_refusal_and_not_raised(self):
+        # Every refusal the verb can answer with is about this Program's own
+        # configuration -- no channel declared, two declared, nothing bound --
+        # which is something the run can either act on or report. An exception
+        # would leave the child with a tool that failed and nobody with why.
+        refusal = {
+            "outcome": "refused",
+            "refusal": "prod is not this Program's out-of-band channel; it declares oob",
+        }
+        with contextlib.ExitStack() as stack:
+            _, offering, _, _ = self.minting(stack, refusal)
+
+            self.assertEqual(refusal, self.answer(offering, self.request(channel="prod")))
+
+    def test_nothing_is_charged_for_a_mint_however_it_ended(self):
+        # Unlike a Finding proposal, which has a ceiling because a refused one
+        # costs the Program an audit row. A refused mint reaches no table at
+        # all, so counting refusals here would bound a run for asking a question
+        # about its own configuration.
+        with contextlib.ExitStack() as stack:
+            _, offering, correlator, _ = self.minting(
+                stack,
+                {"outcome": "refused", "refusal": "nothing is bound"},
+                {"outcome": "minted", "correlator_id": "x"},
+            )
+
+            for _ in range(2):
+                self.answer(offering, self.request())
+
+        self.assertEqual(2, correlator.attempts)
+        self.assertFalse(hasattr(correlator, "refused"))
+
+    def test_a_run_with_no_supervisor_says_so_and_mints_nothing(self):
+        surface = _launch.Surface()
+        with packaged() as offered:
+            _launch.server(surface, packet.Reader(packet.Packet()), _launch.Submission())
+        surface.open()
+
+        served = self.answer(offered["mint_callback"], self.request())
+
+        self.assertFalse(served["served"])
+        self.assertEqual(_launch.NO_TOOLING, served["reason"])
+
+    def test_the_call_is_on_the_surfaces_record_however_it_ended(self):
+        with contextlib.ExitStack() as stack:
+            surface, offering, _, _ = self.minting(stack, {"outcome": "refused"})
+
+            self.answer(offering, self.request())
+
+        self.assertEqual(["mint_callback"], surface.served)
 
 
 class RequestToolTest(unittest.TestCase):

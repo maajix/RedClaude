@@ -47,20 +47,24 @@ the framing and not the answer, and will report every refusal as a success.
 
 ## 3. Establish the baseline and the control
 
-Send the call as label A through `mcp__rk2__http_request`, with `identity_slot`
-set and the request body the recorded surface holds for this method. That is the
+Send the call through `mcp__rk2__http_request` with the request body the recorded
+surface holds for this method. It goes out as whichever Identity the Task was
+opened under -- the step does not choose it and there is no argument for it -- so
+label A's half of this reading is the Task opened under label A. That is the
 baseline: what the method answers a caller it is for.
 
-Send a method label B's own client calls, as label B. That is the control, and
-it is what tells an enforced boundary apart from a credential the server never
-accepted. Follow `use-identity`: a gRPC deployment that carries the token in
-metadata rather than in a cookie will silently treat a missing header as
-anonymous.
+A reading that needs two Identities is two Tasks. Label B's half is a second
+Task opened under label B, and its first call is a method label B's own client
+calls. That is the control, and it is what tells an enforced boundary apart from
+a credential the server never accepted. The differential is made by comparing
+the Receipts the two Tasks produced. Follow `use-identity`: a gRPC deployment
+that carries the token in metadata rather than in a cookie will silently treat a
+missing header as anonymous.
 
 ## 4. Send the variant
 
-Label A's call, unchanged, as label B. One variable: the Identity. Same method,
-same message bytes, same content type.
+Label A's call, unchanged, sent from label B's Task. One variable: the Identity
+that Task was opened under. Same method, same message bytes, same content type.
 
 Do not reach for a method neither Identity calls. That is a second question --
 whether the method exists for anyone -- and mixing it in makes an

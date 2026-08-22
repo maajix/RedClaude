@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, capsule as capsule_module, isolation
+from redkraken import _startup, callback, capsule as capsule_module, isolation
 from redkraken import packet as packet_module, pg, roster, skill, tool as tool_module
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
@@ -234,6 +235,15 @@ CLOSE = "SELECT close_startup_refusal($1::uuid, $2, $3, $4, $5::jsonb)"
 #: no caller anywhere. The Agent run is this side's to fill in, because a child
 #: naming its own provenance is a child naming which run it would like to be.
 PROPOSE = "SELECT propose_finding($1, $2, $3, $4::uuid)"
+
+#: The correlator a child asks for and this supervisor mints. The plaintext is
+#: generated here and digested there -- `mint_callback_correlator` stores the
+#: SHA-256 and keeps the name nowhere -- so this process and whatever payload
+#: the child embeds it in are the only two places it exists. `secrets` rather
+#: than anything the child can influence, and `callback.CORRELATOR_BYTES` rather
+#: than a second number, because a correlator that is one DNS label is a rule
+#: the callback module already states.
+MINT_CALLBACK = "SELECT request_callback_correlator($1, $2, $3, $4::uuid)"
 
 
 class StartupRefusal(RuntimeError):
@@ -1185,13 +1195,15 @@ class _Tools:
 
     The dispatch is on the verb and it is closed. The roster has already refused
     every call that does not fit its contract, so what arrives here is a
-    well-formed call to one of three tools; anything else is a child that has
+    well-formed call to one of four tools; anything else is a child that has
     started making things up, and it is answered rather than executed.
 
-    Two of the three start a container and the third writes a row, and they are
-    answered here for the same reason: this is the side holding a connection.
-    A child's one network reaches the capability proxy, so a proposal it could
-    file itself would be a proposal filed by the party the row is about.
+    Two of the four start a container and the other two write a row, and they
+    are answered here for the same reason: this is the side holding a
+    connection. A child's one network reaches the capability proxy, so a
+    proposal it could file itself would be a proposal filed by the party the row
+    is about -- and a correlator it could mint itself would be a name the
+    runtime never saw published.
 
     The connection is opened at the first call and not before. Most runs ask for
     no tool at all, and a connection held open through every one of them would
@@ -1206,7 +1218,12 @@ class _Tools:
 
     def __call__(self, call: Mapping[str, object]) -> Mapping[str, object]:
         verb = str(call.get("verb") or "")
-        if verb not in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT, roster.PROPOSE_FINDING):
+        if verb not in (
+            roster.RUN_TOOL,
+            roster.RUN_SKILL_SCRIPT,
+            roster.PROPOSE_FINDING,
+            roster.MINT_CALLBACK,
+        ):
             return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
         try:
             connection = self._open()
@@ -1215,6 +1232,9 @@ class _Tools:
 
         if verb == roster.PROPOSE_FINDING:
             return self._propose(connection, call.get("arguments"))
+
+        if verb == roster.MINT_CALLBACK:
+            return self._callback(connection, call.get("arguments"))
 
         if verb == roster.RUN_TOOL:
             named: str | None = str(call.get("tool") or "")
@@ -1277,6 +1297,47 @@ class _Tools:
                     str(arguments.get("hypothesis_label") or ""),
                     str(arguments.get("vulnerability_class") or ""),
                     str(arguments.get("title") or ""),
+                    self._agent_run_id,
+                ),
+            ).scalar()
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        document = json.loads(str(answered))
+        return document if isinstance(document, Mapping) else {}
+
+    def _callback(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Mint one out-of-band correlator for this run and answer the address.
+
+        The correlator is generated here rather than asked for or read back,
+        which is the one thing this method does that the database could not do
+        for itself. It is 128 bits of `secrets` in hex, which is a single DNS
+        label with room to spare and is the shape `mint_callback_correlator`
+        insists on; it is passed down, digested there and stored nowhere; and
+        the only copy that survives this call is the address in the answer.
+        There is no second chance to read it, which is the property a
+        capability has and is here for the opposite reason -- not because a
+        canary is dangerous to keep, but because a stored one is one more place
+        a name the target can see could be learned from.
+
+        Which Agent run is asking is this side's to fill in, like the Program
+        bound on the connection: a child that named its own run would be naming
+        which run it would like an arrival attributed to.
+
+        A refusal comes back as a refusal, in `_propose`'s words and for its
+        reason. What is raised rather than answered is the database being
+        unreachable, which is not a verdict on the request at all.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        try:
+            connection.execute(BIND, (self._program_id,))
+            answered = connection.execute(
+                MINT_CALLBACK,
+                (
+                    str(arguments.get("channel") or ""),
+                    secrets.token_hex(callback.CORRELATOR_BYTES),
+                    str(arguments.get("subject_label") or ""),
                     self._agent_run_id,
                 ),
             ).scalar()

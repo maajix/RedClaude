@@ -471,6 +471,42 @@ class SurfaceTest(unittest.TestCase):
         self.assertTrue(re.compile(declared.pattern).match("idor"))
         self.assertFalse(re.compile(declared.pattern).match("Idor"))
 
+    def test_a_correlator_is_asked_for_and_the_name_in_it_is_not_an_argument(self):
+        """PH2-98: the three things about a canary a model does not decide.
+
+        The name, because a correlator is only attributable while nothing
+        outside the runtime and the payload has seen it; the lifetime, because a
+        name planted in somebody else's system outlives the run that planted it;
+        and the channel, because a Program declares one and the verb refuses to
+        pick between two. What is left is the two names the child can already
+        read off its own packet.
+        """
+        request = roster.CONTRACTS["mcp__rk2__mint_callback"]
+
+        self.assertEqual(roster.REQUEST, request.direction)
+        self.assertEqual(("callback_correlators",), request.writes)
+        self.assertEqual({"channel", "subject_label"}, set(request.arguments))
+        for name in ("correlator", "lifetime", "expires_at", "address"):
+            with self.subTest(argument=name):
+                self.assertNotIn(name, request.arguments)
+                self.assertNotIn(name, request.schema()["properties"])
+        for name, declared in request.arguments.items():
+            with self.subTest(argument=name):
+                self.assertTrue(declared.required)
+                self.assertTrue(declared.constrained)
+                self.assertFalse(declared.free_text)
+
+    def test_the_channel_argument_is_the_shape_a_channel_name_can_have(self):
+        # `program_callback_channels.name`'s own check constraint, restated so
+        # that a name no channel could carry is refused by the closed schema
+        # rather than by a query that finds nothing.
+        declared = roster.CONTRACTS["mcp__rk2__mint_callback"].arguments["channel"]
+
+        self.assertTrue(re.compile(declared.pattern).match("oob"))
+        self.assertFalse(re.compile(declared.pattern).match("OOB"))
+        self.assertFalse(re.compile(declared.pattern).match("-oob"))
+        self.assertFalse(re.compile(declared.pattern).match("oob.example"))
+
     def test_nothing_on_the_validators_surface_takes_free_text(self):
         for name in roster.TOOL_GROUPS["validate.judge"]:
             for argument, declared in roster.CONTRACTS[name].arguments.items():
@@ -523,6 +559,25 @@ class AuthorityTest(unittest.TestCase):
 
         self.assertEqual({"recon", "web_hunter", "js_analyst"}, asking)
         for name in sorted(asking):
+            with self.subTest(role=name):
+                self.assertTrue(roster.ROLES[name].executes_tasks)
+                self.assertNotIn("sched.pick", roster.ROLES[name].tool_groups)
+
+    def test_only_a_role_that_hunts_may_plant_a_correlator(self):
+        """PH2-98: the same partition, for the out-of-band half of it.
+
+        A canary is planted by the party that is sending requests at the target,
+        which is why the mint is in `state.propose` beside the Finding ask
+        rather than in `sched.pick`. The orchestrator never touches a target and
+        the validator judges what somebody else found, so neither is the party.
+        """
+        minting = {
+            name for name, role in roster.ROLES.items()
+            if "mcp__rk2__mint_callback" in role.tools
+        }
+
+        self.assertEqual({"recon", "web_hunter", "js_analyst"}, minting)
+        for name in sorted(minting):
             with self.subTest(role=name):
                 self.assertTrue(roster.ROLES[name].executes_tasks)
                 self.assertNotIn("sched.pick", roster.ROLES[name].tool_groups)
@@ -941,8 +996,10 @@ class GateTest(unittest.TestCase):
                 url="https://x",
                 body={"note": "hello"},
             ),
-            # And the identity that is still withheld, for the reason that did
-            # not change: the runtime chose it before the child started.
+            # And the identity, which ticket 97 settled is not withheld pending
+            # a decision but refused as a rule: the slot is a property of the
+            # Tool run the runtime opened, and there is nothing at call time for
+            # an argument to change.
             hunting(
                 "mcp__rk2__http_request",
                 method="GET",
@@ -1381,6 +1438,23 @@ class ContractSchemaTest(unittest.TestCase):
                         )
                     )
                 )
+
+    def test_no_tool_on_this_surface_declares_an_identity(self):
+        """Ticket 97's settlement, asked of the whole surface rather than of one tool.
+
+        The decision is that `identity_slot` is a property of the Tool run and
+        never an argument, and the name is in no forbidden list, so the only
+        thing standing between a later ticket and declaring one is that
+        decision. Written here so the decision has somewhere to fail.
+
+        Every contract and not just the request tool. `run_tool` and
+        `run_skill_script` open Tool runs of their own, and a slot declared on
+        either of them would be the same mistake reached by another door.
+        """
+        for tool, contract in roster.CONTRACTS.items():
+            with self.subTest(tool=tool):
+                self.assertNotIn("identity_slot", contract.arguments)
+                self.assertNotIn("identity_slot", contract.schema()["properties"])
 
     def test_the_one_result_takes_every_element_list_the_spec_names(self):
         # Spec section 13: "proposed Entities, Relationships, Observations,

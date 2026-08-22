@@ -29,9 +29,9 @@ valid.
 ## 1. Get a token the target handed out, not one a slot is holding
 
 Every variant below is one token with one edit, so this Playbook needs the bytes,
-and there is one place they may come from: a route the run drove itself with no
-`identity_slot` -- an issuance, refresh or exchange endpoint the target answers
-for a caller who has not leased anything. That token is material the target
+and there is one place they may come from: a route the run drove itself from a Task
+opened with no Identity -- an issuance, refresh or exchange endpoint the target
+answers for a caller who has not leased anything. That token is material the target
 published, and editing it is a statement about the target.
 
 A token that exists only inside a leased Identity is not available and is not to

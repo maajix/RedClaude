@@ -41,8 +41,9 @@ Complete this step with the endpoint, the parameter, the sink, and the engine.
 
 ## 2. Send the probe and its twin
 
-Two requests under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set. The parameter carries:
+Two requests through `mcp__rk2__http_request`, both as whichever Identity the
+Task was opened under -- the step does not choose it and there is no argument for
+it, which is also what keeps the pair comparable. The parameter carries:
 
 * the variant: an arithmetic expression in the engine's delimiters whose result
   is a different string from the expression itself

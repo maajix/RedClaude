@@ -39,9 +39,10 @@ is higher, and record the document.
 
 ## 2. Establish the control: the Identity is working
 
-Send the request once under the Identity through `mcp__rk2__http_request` with
-`identity_slot` set, and confirm the response is the authenticated one -- not a
-redirect to a login, not an anonymous view of the same route.
+Send the request once through `mcp__rk2__http_request` and confirm the response
+is the authenticated one -- not a redirect to a login, not an anonymous view of
+the same route. The call goes out as whichever Identity the Task was opened
+under: the step does not choose it and there is no argument for it.
 
 This is the control, and without it the whole sequence is unreadable. A run of
 identical `401`s is invariant, and invariance is what this Playbook reads as

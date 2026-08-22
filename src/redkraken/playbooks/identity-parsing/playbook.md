@@ -29,9 +29,9 @@ the application acted on is inside what the signature covered.
 ## 1. Get one real assertion, from the route that mints it
 
 Every variant below is one signed document with one edit, so this Playbook needs
-the document. Drive the issuer's own assertion route once, with no
-`identity_slot`, using the federated account the Program provisioned for this
-engagement. What comes back was minted for us, for this relying party, and it is
+the document. Drive the issuer's own assertion route once from a Task
+opened with no Identity, using the federated account the Program provisioned for
+this engagement. What comes back was minted for us, for this relying party, and it is
 the only material this Playbook works from.
 
 An assertion that exists only inside a leased Identity's exchange is not
@@ -85,8 +85,9 @@ Run `compare-responses` over each variant's answer and the two ends of the
 scale, and read *who* the session belongs to rather than whether one exists.
 Follow the answer with one read of the identity route carrying the session the
 variant produced -- that session is the consumer's answer to us and not a lease,
-so it is sent without `identity_slot` -- because a `302` to a dashboard is not a
-statement about which account is behind it.
+so it is carried in the request headers of a Task opened with no Identity --
+because a `302` to a dashboard is not a statement about which account is behind
+it.
 
 ## 6. Propose the claim, and say what would refute it
 

@@ -48,8 +48,9 @@ Complete this step with the platform, the application's route and the five names
 
 ## 2. Establish the baseline, twice
 
-Send the application's own route under the leased Identity through
-`mcp__rk2__http_request` with `identity_slot` set. Then send it again, unchanged.
+Send the application's own route through `mcp__rk2__http_request`. Then send it
+again, unchanged. Both go out as whichever Identity the Task was opened under:
+the step does not choose it and there is no argument for it.
 
 Two identical requests, because everything after this is a comparison against
 this one. A route that carries a request id, a cursor or a rendered timestamp is
@@ -63,7 +64,10 @@ least likely to be a coincidence -- a slug, a reference, a title -- rather than
 
 ## 3. Ask the application's route with nothing presented
 
-One request: the same route, same everything, without `identity_slot`.
+One request: the same route, same everything, from a Task opened with no
+Identity. The half of this comparison that presents nothing is a Task opened
+under no Identity at all, not a call that left a field out, and what is
+differenced is the two Receipts.
 
 This is the check the reading is about. It has to refuse. A route that answers
 the same records to a caller holding nothing is not a parallel-route question at

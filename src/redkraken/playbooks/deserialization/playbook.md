@@ -67,9 +67,10 @@ ceiling.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, carrying a blob the client itself produced, unedited. Then
-send it again, unchanged.
+Send the request through `mcp__rk2__http_request`, carrying a blob the client
+itself produced, unedited. Then send it again, unchanged. Both go out as whichever
+Identity the Task was opened under: the step does not choose it and there is no
+argument for it.
 
 Two identical requests, because everything after this is a comparison and the
 comparison has to know what "the same response" looks like here. A route that

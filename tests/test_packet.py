@@ -330,6 +330,19 @@ class CompileTest(unittest.TestCase):
         fields.update(overrides)
         return Recorder(**fields)
 
+    def test_an_evidence_edge_names_all_three_provenance_records(self):
+        """PH2-98: the projection is the last place a citation can be lost.
+
+        `v_evidence` names the record behind an Observation, and an out-of-band
+        arrival is the third kind of record it can be. A projection that named
+        the Receipt and the Tool run and not the arrival would hand a child the
+        word `callback` and two nulls -- evidence it is told exists and cannot
+        cite -- which is exactly the hole the view had before ticket 98.
+        """
+        for column in ("receipt_label", "tool_run_label", "callback_label"):
+            with self.subTest(column=column):
+                self.assertIn(f"'{column}', ev.{column}", packet.EVIDENCE)
+
     def test_the_compiled_packet_carries_every_section_and_the_program_revision(self):
         compiled = packet.compile(self.connection())
 

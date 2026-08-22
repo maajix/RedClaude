@@ -37,10 +37,11 @@ and the route that states the authoritative total.
 
 ## 2. Record the pristine total
 
-Read the cart, order or account through `identity_slot`, before anything is
-sent, and store the answer. Everything below is measured against this. A run
-that starts by writing has nothing to compare its total to and is reporting a
-number rather than a change.
+Read the cart, order or account before anything is sent, and store the answer.
+The read runs as whichever Identity the Task was opened under; the step does not
+choose it and there is no argument for it. Everything below is measured against
+this. A run that starts by writing has nothing to compare its total to and is
+reporting a number rather than a change.
 
 `pristine_surface` is the baseline for this reason, and it is also why this
 Playbook is never scheduled beside one that writes: two writers and the total is

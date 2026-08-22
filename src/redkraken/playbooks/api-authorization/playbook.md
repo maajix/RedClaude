@@ -53,8 +53,12 @@ statement about two changes.
 
 ## 3. Send the three controls
 
-All three go through `mcp__rk2__http_request` with `identity_slot` set. Same
-route, same method, same body shape; one thing moves per call.
+All three go through `mcp__rk2__http_request`. Same route, same method, same body
+shape; one thing moves per call. None of them chooses who makes it: a call goes
+out as whichever Identity its Task was opened under and there is no argument for
+it. So the two label A controls belong to this Task, the foreign-owner control is
+a second Task opened under label B, and the comparison cites the Receipts both
+produced.
 
 * **the owner control.** The operation on label A's object in the state that
   still admits it. It succeeds, and that is what says the route works, the

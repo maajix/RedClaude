@@ -27,8 +27,10 @@ whether an answer shaped by one caller can be handed to another.
 
 ## 1. Establish that the answer depends on the caller
 
-Read the route twice: once through `identity_slot`, once with nothing presented.
-Store both.
+Read the route twice: once as the Task's own Identity, once with nothing
+presented. A call goes out as whichever Identity its Task was opened under and
+there is no argument for it, so the half that presents nothing is a second Task
+opened with no Identity. Store both, and difference them by their Receipts.
 
 That is the control and it is a `response_differential`. If the two answers are
 the same, there is nothing here to leak, whatever the cache does, and the reading
@@ -58,9 +60,9 @@ silently measuring the wrong thing.
 
 ## 3. Store the authenticated answer
 
-Request the unique path through `identity_slot`. Read the response and the cache
-headers it came with: `Cache-Control`, `Age`, `Vary`, `Expires`, and whatever
-`X-Cache`, `CF-Cache-Status` or equivalent the front end publishes.
+Request the unique path in the Task opened under the Identity. Read the response
+and the cache headers it came with: `Cache-Control`, `Age`, `Vary`, `Expires`,
+and whatever `X-Cache`, `CF-Cache-Status` or equivalent the front end publishes.
 
 `Vary` is the target's own statement about the key. A `Vary: Cookie` or a
 `Cache-Control: private` on this response is the target saying it already thought

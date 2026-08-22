@@ -33,11 +33,13 @@ The subject is a state-changing endpoint with a parameter the recorded surface
 types as a URL. Read which parameter that is from the surface rather than
 guessing it from the field name.
 
-Ask the runtime for a correlator for this subject. The host it names is a
-channel this Program declared, and the correlator is what ties an arrival back
-to this one call. A URL pointing anywhere else -- a public interaction service,
-a host you control personally -- is out of scope and produces nothing this
-system can file.
+Call `mcp__rk2__mint_callback` with the channel this Program declared and this
+endpoint's label. What comes back is the address to embed and the id of the
+correlator behind it; the correlator is what ties an arrival back to this one
+call, and it is minted by the runtime rather than chosen here. Embed the address
+exactly as it was returned. A URL pointing anywhere else -- a public interaction
+service, a host you control personally, an address you shortened or rebuilt --
+is out of scope and produces nothing this system can file.
 
 ## 2. Establish the control: something the server cannot fetch
 

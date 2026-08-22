@@ -27,8 +27,9 @@ to a browser that arrived from somewhere else.
 
 ## 1. Read the document the form lives on
 
-`GET` the page that carries the form, through `identity_slot`, and record the
-response headers whole. Three of them answer the framing question and they do not
+`GET` the page that carries the form, as whichever Identity the Task was opened
+under -- the step does not choose it and there is no argument for it -- and record
+the response headers whole. Three of them answer the framing question and they do not
 agree with each other by construction:
 
 * `Content-Security-Policy`, and specifically a `frame-ancestors` directive

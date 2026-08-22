@@ -26,19 +26,21 @@ that answered a moment ago still answer?
 
 ## 1. Keep the probe in the slot
 
-Follow `use-identity`: name the label in `identity_slot` and let the proxy hold
-the session. This Playbook never reads the cookie or the bearer, and it does not
-need to. A call through a slot is already a request no browser took part in, so
-a session that still answers one after the client was told to forget it is
-exactly the reading this Playbook is after: the server side does not care what
-the browser deleted.
+Follow `use-identity`: the run acts as whichever Identity the Task was opened
+under -- the step does not choose it and there is no argument for it -- and the
+proxy holds the session. This Playbook never reads the cookie or the bearer, and
+it does not need to. A call through a slot is already a request no browser took
+part in, so a session that still answers one after the client was told to forget
+it is exactly the reading this Playbook is after: the server side does not care
+what the browser deleted.
 
 Send one authenticated read through the label and store the answer. That is the
 probe, and the same request is what every step below repeats.
 
 ## 2. Establish what refusal looks like
 
-Send the same read with no `identity_slot` at all. Store that answer.
+The unauthenticated half of the differential is a Task opened with no Identity.
+Send the same read there and store that answer.
 
 This is the control, and it is a `credential_effect`: it says the route reaches
 an authentication decision and refuses something. A route that answers `200` to

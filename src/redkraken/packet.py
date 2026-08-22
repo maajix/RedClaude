@@ -546,7 +546,13 @@ EVIDENCE = (
     "           'summary', ev.summary,"
     "           'provenance_kind', ev.provenance_kind,"
     "           'receipt_label', ev.receipt_label,"
-    "           'tool_run_label', ev.tool_run_label)) AS built(rec)"
+    "           'tool_run_label', ev.tool_run_label,"
+    # The third provenance label, and the reason this list is spelled out rather
+    # than being `ev.*`. An Observation whose provenance is an out-of-band
+    # arrival used to reach a child as the word `callback` and two nulls; ticket
+    # 98 gave the view a name for the arrival, and a projection that named the
+    # other two and not this one would have kept the hole one layer further in.
+    "           'callback_label', ev.callback_label)) AS built(rec)"
     " ORDER BY revision DESC, ev.observation_label, ev.hypothesis_label NULLS LAST,"
     "          ev.finding_label NULLS LAST"
     " LIMIT $1"

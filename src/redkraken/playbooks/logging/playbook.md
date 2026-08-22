@@ -42,8 +42,10 @@ Complete this step with the route and the two Identity slots.
 
 ## 2. Establish the baseline, twice
 
-Send the view under the reading Identity through `mcp__rk2__http_request` with
-`identity_slot` set. Then send it again, unchanged.
+Send the view through `mcp__rk2__http_request`. Then send it again, unchanged.
+Both go out as whichever Identity the Task was opened under -- the step does not
+choose it and there is no argument for it -- and that Identity is the one this
+Playbook calls the reading Identity.
 
 Two identical requests, because everything below compares against this one and
 because an activity view is the most likely route on a target to differ between
@@ -52,8 +54,9 @@ it. Record what moved. Whatever moved for that reason is not evidence.
 
 ## 3. Have the second Identity send one marked read
 
-One request, under the other `identity_slot`: an ordinary read the second
-Identity is entitled to make, carrying one unique marker in one query parameter
+One request from a second Task, opened under the other Identity: an ordinary read
+the second Identity is entitled to make, carrying one unique marker in one query
+parameter
 -- `rk-probe-<task>` and nothing else.
 
 A read rather than a write, and an ordinary route rather than an interesting one.
@@ -67,7 +70,7 @@ control character and no markup. Step 7 says why.
 
 ## 4. Read the view under the reading Identity
 
-One request: the view again, under the first `identity_slot`, unchanged from
+One request in the reading Identity's own Task: the view again, unchanged from
 step 2.
 
 Then search the body for the marker from step 3, and for the second Identity's
@@ -76,7 +79,9 @@ in.
 
 ## 5. Read the view under the second Identity, as the control
 
-One request: the same view under the second `identity_slot`.
+One request in the second Identity's Task: the same view. A reading that needs
+two Identities is two Tasks, and steps 2 to 5 are differenced across the Receipts
+the two of them produced.
 
 This is the control and it is what makes a negative mean something. The marker
 has to be here. A view that does not carry the second Identity's own marked

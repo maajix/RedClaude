@@ -45,14 +45,19 @@ is equally well explained by a session that was never valid, a route that
 rejects everything, or a rate limit -- and none of those is an authorization
 answer. The control is what makes the variant mean anything.
 
-Both exchanges go through `mcp__rk2__http_request` with `identity_slot` set.
-Hold URL, method, headers and body shape constant; the Identity is the only
-thing that moves.
+Both exchanges go through `mcp__rk2__http_request`, and neither chooses who makes
+it: a call goes out as whichever Identity its Task was opened under and there is
+no argument for it. A reading that needs two Identities is two Tasks -- label A's
+baseline in the Task opened under label A, label B's control and the variant
+below in the Task opened under label B -- and the differential is made by
+comparing the Receipts they produced. Hold URL, method, headers and body shape
+constant; the Identity the Task was opened under is the only thing that moves.
 
 ## 3. Send the variant
 
-Send label A's request, unchanged, as label B. One variable: the session. Not
-the object identifier, not the method, not a header.
+Send label A's request, unchanged, from label B's Task. One variable: the
+Identity that Task was opened under. Not the object identifier, not the method,
+not a header.
 
 If the identifier has to be re-encoded to travel under a different session, the
 comparison has two variables and the answer is about neither. Stop and record

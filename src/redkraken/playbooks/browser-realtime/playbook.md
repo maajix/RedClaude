@@ -25,9 +25,12 @@ The question is whether the name is checked against the caller, or only parsed.
 
 ## 1. Fix the channel names, and whose they are
 
-Two Identities and one channel each. Establish both sessions through
-`identity_slot`, hold them, and record the channel name each one is entitled to
-and where in the handshake the name goes.
+Two Identities and one channel each, which here is two Tasks: a run acts as
+whichever Identity its Task was opened under, the step does not choose it and
+there is no argument for it. Establish each session in its own Task, hold it, and
+record the channel name that Identity is entitled to and where in the handshake
+the name goes. The claim below is made by comparing what the two Tasks'
+Receipts hold.
 
 A reading with one Identity cannot make this claim. A channel name that the
 second Identity was also entitled to is a name that proves nothing, so the name

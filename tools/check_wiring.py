@@ -293,30 +293,14 @@ OWED_GAPS: dict[str, str] = {
     "W9 graphql rate_limiting.resource_cost": "owed:101",
     "W9 http-desync transport.certificate_trust": "owed:101",
 
-    # W10. The corpus instructs an identity on a request that carries none, a
-    # browser mission through a tool that runs no browser, and an analysis of
-    # bytes the same body just told the model to fetch.
+    # W10. The corpus instructs a browser mission through a tool that runs no
+    # browser, and an analysis of bytes the same body just told the model to
+    # fetch. The third reading this register carried -- an identity on a request
+    # that carries none -- is gone: ticket 97 settled that `identity_slot` is a
+    # property of the Tool run rather than an argument and rewrote the twenty
+    # bodies that instructed one, so the twenty rows that owed it are removed
+    # rather than re-pointed.
     "W10 browser-evidence": "owed:99",
-    "W10 api identity_slot": "owed:97",
-    "W10 api-authorization identity_slot": "owed:97",
-    "W10 cms identity_slot": "owed:97",
-    "W10 command-directory-injection identity_slot": "owed:97",
-    "W10 deserialization identity_slot": "owed:97",
-    "W10 exceptional-conditions identity_slot": "owed:97",
-    "W10 file-resolution identity_slot": "owed:97",
-    "W10 graphql identity_slot": "owed:97",
-    "W10 grpc identity_slot": "owed:97",
-    "W10 information-disclosure identity_slot": "owed:97",
-    "W10 logging identity_slot": "owed:97",
-    "W10 nosql-injection identity_slot": "owed:97",
-    "W10 object-ownership identity_slot": "owed:97",
-    "W10 orm identity_slot": "owed:97",
-    "W10 spreadsheet-injection identity_slot": "owed:97",
-    "W10 sql-injection identity_slot": "owed:97",
-    "W10 ssrf-url-routing identity_slot": "owed:97",
-    "W10 ssti identity_slot": "owed:97",
-    "W10 structured-injection identity_slot": "owed:97",
-    "W10 use-identity identity_slot": "owed:97",
     "W10 api fetch-then-analyse": "owed:106",
     "W10 api-authorization fetch-then-analyse": "owed:106",
     "W10 attack-surface fetch-then-analyse": "owed:106",

@@ -25,9 +25,12 @@ The question is not where the value ended up. It is where the target put it.
 
 ## 1. Establish the session the way the target intends
 
-Authenticate through `identity_slot` and read the subject route. Store the whole
-exchange: the request that authenticated, every `Set-Cookie` it produced, and the
-response body.
+Read the subject route as the Task's own Identity. The run acts as whichever
+Identity the Task was opened under -- the step does not choose it and there is no
+argument for it -- so a Task opened under no Identity is the wrong Task for this
+reading and is returned rather than worked around. Store the whole exchange: the
+request that authenticated, every `Set-Cookie` it produced, and the response
+body.
 
 That is the control and it is a `credential_effect`: the session, held as the
 target hands it out, reaches the route. Without it, a later failure is equally

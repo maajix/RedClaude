@@ -43,9 +43,10 @@ Complete this step with the endpoint, the one parameter, and the engine.
 
 ## 2. Establish the baseline, twice
 
-Send the request under the leased Identity through `mcp__rk2__http_request` with
-`identity_slot` set, with the parameter carrying an ordinary value. Then send it
-again, unchanged.
+Send the request through `mcp__rk2__http_request`, with the parameter carrying an
+ordinary value. Then send it again, unchanged. Both go out as whichever Identity
+the Task was opened under: the step does not choose it and there is no argument
+for it.
 
 Two identical requests, because the comparison later has to know what "the same
 response" looks like on this route. A page carrying a CSRF token, a request id,

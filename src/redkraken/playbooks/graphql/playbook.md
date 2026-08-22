@@ -39,20 +39,24 @@ reads, and a mutation sent twice is two writes.
 
 ## 2. Establish the baseline and the control
 
-Send the selection as label A through `mcp__rk2__http_request` with
-`identity_slot` set. That is the baseline: the full document, for the caller it
-belongs to.
+Send the selection through `mcp__rk2__http_request`. It goes out as whichever
+Identity the Task was opened under -- the step does not choose it and there is no
+argument for it -- so label A's baseline is the Task opened under label A: the
+full document, for the caller it belongs to.
 
-Send label B's own equivalent selection as label B. That is the control, and it
-is what tells a refusal apart from a session that was never valid. Follow
-`use-identity` for both; a GraphQL endpoint that answers `200` with an
+A reading that needs two Identities is two Tasks. Label B's half is a second Task
+opened under label B, sending label B's own equivalent selection. That is the
+control, and it is what tells a refusal apart from a session that was never
+valid, and the differential is made by comparing the two Tasks' Receipts. Follow
+`use-identity` in both; a GraphQL endpoint that answers `200` with an
 `errors` array to an unauthenticated caller is exactly the shape that reads as
 success to anything counting statuses.
 
 ## 3. Send the variant
 
-Label A's selection, unchanged, as label B. One variable: the session. Same
-operation name, same variables, same document.
+Label A's selection, unchanged, sent from label B's Task. One variable: the
+Identity that Task was opened under. Same operation name, same variables, same
+document.
 
 If the selection has to be edited to be accepted under label B -- a different
 identifier in a variable, a field removed -- then two things moved and the

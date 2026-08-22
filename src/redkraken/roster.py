@@ -528,7 +528,19 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     # to the party that did the hunting, and `_check_authority` keeps the two
     # groups off the same role -- so a role that proposes a Finding is never
     # also the role that schedules the work the Finding would justify.
-    "state.propose": ("mcp__rk2__submit_mission_result", "mcp__rk2__propose_finding"),
+    #
+    # The third member is the out-of-band half of the same authority. A
+    # correlator is state the run does not write -- `mint_callback_correlator`
+    # writes it, under the runtime's role, against a channel the operator
+    # declared -- and what the model contributes is which subject it is about.
+    # It is here rather than in `net.request` because the door is not involved:
+    # the correlator travels out inside a request the model composes, and the
+    # arrival comes back to a listener that is nobody's tool call.
+    "state.propose": (
+        "mcp__rk2__submit_mission_result",
+        "mcp__rk2__propose_finding",
+        "mcp__rk2__mint_callback",
+    ),
     # Scheduling as the orchestrator sees it, which is not scheduling as the
     # runtime does it. "The runtime decides what may be chosen; the orchestrator
     # decides which; the runtime commits the claim" -- so the model reads a
@@ -629,7 +641,19 @@ CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_evidence": Contract(
         "state.read",
         READ,
-        reads=("v_evidence", "hypothesis_evidence", "finding_evidence", "observations"),
+        # `callback_interactions` joined the list with ticket 98's
+        # `callback_label`: an arrival is now named on this view like a Receipt
+        # and a Tool run are, so the table it is named out of is a table this
+        # read reaches. What the read reaches of it is the label and nothing
+        # else -- `observed_host` carries the correlator, and the table's own
+        # comment is where that is said.
+        reads=(
+            "v_evidence",
+            "hypothesis_evidence",
+            "finding_evidence",
+            "observations",
+            "callback_interactions",
+        ),
         arguments={
             "hypothesis_label": Argument("string", pattern=_label("H")),
             "finding_label": Argument("string", pattern=_label("F")),
@@ -740,6 +764,41 @@ CONTRACTS: dict[str, Contract] = {
             "title": Argument("string", required=True, bounds=(1, 200)),
         },
     ),
+    # The name a step plants in somebody else's system, and the one verb on this
+    # surface whose evidence arrives without anybody here having asked for it.
+    # Every other Observation is a request this installation made and a Receipt
+    # the door wrote for it; an out-of-band interaction is a request the TARGET
+    # made, at a name we published, and the only thing tying it back to a
+    # Program is the correlator that travelled out in a payload.
+    #
+    # A request rather than a read, because it mints: `callback_correlators`
+    # gains a row, keyed to the live scope version and to the Tool run this
+    # child's egress goes out on, and that row is what will admit an arrival
+    # later. Two arguments and both of them are names the child can already
+    # read -- the channel the Program declared and the Entity the canary is
+    # about -- because everything else about a correlator is the channel's
+    # business and not the model's. The runtime mints the correlator itself,
+    # the runtime decides how long it lives, and the Program's one declared
+    # channel is the only one it may be minted on. A correlator planted in
+    # somebody else's system is a durable artefact whose lifetime we do not
+    # control, so the parts a model could get wrong are the parts it is not
+    # given.
+    "mcp__rk2__mint_callback": Contract(
+        "state.propose",
+        REQUEST,
+        writes=("callback_correlators",),
+        arguments={
+            # `program_callback_channels.name`'s own check constraint, restated
+            # so that a name no channel could ever carry is refused by the
+            # schema rather than by a query that finds nothing.
+            "channel": Argument("string", required=True, pattern="^[a-z0-9][a-z0-9-]{0,62}$"),
+            # Any Entity label, because a correlator's subject is whatever the
+            # canary is a question about -- the endpoint that fetches, the
+            # parameter that was reflected, the application that parsed. The
+            # database re-asks that the Entity is this Program's.
+            "subject_label": Argument("string", required=True, pattern=_ENTITY_LABEL),
+        },
+    ),
     "mcp__rk2__get_slate": Contract(
         "sched.pick", READ, reads=("tasks", "task_slate")
     ),
@@ -792,6 +851,18 @@ CONTRACTS: dict[str, Contract] = {
             "question": Argument("string", free_text=True),
         },
     ),
+    # The name a model calls this by and the name the runtime opens the Tool run
+    # under are two different names, and every per-call risk rule is written
+    # against the second. This surface serves `mcp__rk2__http_request`;
+    # `execution._authorize` opens the run under `proxy.TOOL`, which is
+    # `mcp__rk2__net_request`, and `call_risk_rules` names that one in all three
+    # of `net_unsafe_method`, `net_host_out_of_scope` and
+    # `net_borrowed_identity`. A ticket that opened a Tool run per agent call
+    # under the served name would silently stop all three firing, and nothing
+    # would fail while it did: the static floor still covers the served name
+    # through the `mcp__rk2__*` glob, so the run would keep its class and only
+    # the escalations would go quiet. Ticket 97 records the hazard here, where a
+    # reader meets the served name, rather than leaving it to be rediscovered.
     "mcp__rk2__http_request": Contract(
         "net.request",
         ACT,
@@ -845,12 +916,49 @@ CONTRACTS: dict[str, Contract] = {
             # arrives and re-measures the bytes it forwards, so an argument for
             # it would be a promise the door drops.
             "body": Argument("string", bounds=(0, 65536)),
-            # No identity, and that half of the withheld pair is unchanged. The
-            # runtime opens the Tool run with the identity already chosen and
-            # the capability already minted, so an identity named at call time
-            # would be naming a decision that has been taken. A declared
-            # argument the runtime drops is a promise the schema cannot keep,
-            # and the honest form of "not yet" is not to declare it.
+            # No identity, and ticket 97 makes that a settled rule rather than
+            # the "not yet" it used to be: `identity_slot` is a property of the
+            # Tool run, never an argument, and this contract goes on refusing
+            # it. The refusal is the ordinary one -- the schema is closed and
+            # `_argument_fault` answers "takes no argument named
+            # 'identity_slot'" -- so nothing here has to be spelled to make it
+            # hold. What is spelled is why declaring one would be wrong, since
+            # the name is in no forbidden list and only a written decision
+            # stands between a later ticket and adding it.
+            #
+            # The door has no parameter to receive one.
+            # `resolve_egress_identity(p_capability)` takes the capability and
+            # reads the slot out of `tool_runs.args` for the run that
+            # capability resolves to; `authorize_identity_egress_request` takes
+            # the capability, the method, the address and whether there is a
+            # body, and nothing else. And the door could not record one either:
+            # `rk2_proxy` holds no privilege of any kind on `tool_runs`, whose
+            # INSERT and UPDATE belong to `rk2_owner` and `rk2_runtime` alone.
+            # A slot arriving at call time would have nowhere to go.
+            #
+            # Above that, it is the field a human already answered about.
+            # `gate_tool_call` and `current_request_digest` each take a Tool run
+            # id and nothing else, and the digest an approval is keyed on is
+            # `canonical_request(tr.tool, tr.args, ...)`. The same request with
+            # the slot empty is `constrained` under the static floor; with a
+            # slot named it is `approval_required` under
+            # `call_risk_rules:net_borrowed_identity`, asking
+            # `credential_needed`. A slot named after that row was written moves
+            # neither the class nor the key, so the argument's whole effect
+            # would be a model acting as a real account holder outside the
+            # answer a person gave.
+            #
+            # And one Tool run is many exchanges. `receipts.tool_run_id` is a
+            # plain foreign key with no unique index over it, and subresources
+            # and redirects share one capability by design, so every Receipt
+            # under a run resolves the same slot. An argument would be a
+            # per-call answer to a question the row answers once.
+            #
+            # The field is broken in the other direction, and that defect is not
+            # this roster's to fix: `execution._authorize` opens every egress
+            # Tool run with the slot hardcoded empty, so no agent-issued request
+            # carries an Identity at all. Declaring an argument here would not
+            # move it one step closer to carrying one.
         },
     ),
     "mcp__rk2__run_tool": Contract(
@@ -953,6 +1061,11 @@ RUN_SKILL_SCRIPT = "mcp__rk2__run_skill_script"
 #: the wiring audit's worst finding, so the name the supervisor matches on is
 #: taken from the roster that declares it rather than typed a second time.
 PROPOSE_FINDING = "mcp__rk2__propose_finding"
+
+#: And the fourth, spelled here for the same reason as the three above: the
+#: supervisor dispatches on the verb, and a verb typed into the dispatch would
+#: be this surface named in a second place.
+MINT_CALLBACK = "mcp__rk2__mint_callback"
 
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
