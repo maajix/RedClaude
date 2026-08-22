@@ -89,13 +89,20 @@ class WiringGateTest(unittest.TestCase):
                     len({gap.key for gap in self.gaps if gap.check == code}),
                 )
 
-    def test_every_register_row_names_an_open_ticket(self):
-        for key, owed in check_wiring.OWED_GAPS.items():
+    def test_every_register_row_names_a_ticket_in_the_state_its_spelling_claims(self):
+        # The two spellings are opposites about the ticket. `owed:NN` is a debt
+        # and a resolved ticket cannot owe one; `decided:NN` cites an argument
+        # and an open ticket has not finished having it. Read off the register
+        # rather than written out, so a new row of either kind is checked
+        # without this case being touched.
+        for key, row in check_wiring.OWED_GAPS.items():
             with self.subTest(row=key):
-                number = check_wiring.TICKET.match(owed)
-                self.assertIsNotNone(number)
+                owed = check_wiring.TICKET.match(row)
+                decided = check_wiring.DECIDED_TICKET.match(row)
+                self.assertTrue(owed or decided, row)
+                number = owed or decided
                 ticket = self.wiring.tickets[int(number.group(1))]
-                self.assertFalse(ticket.resolved)
+                self.assertEqual(bool(decided), ticket.resolved)
 
     def test_the_report_does_not_move_between_runs(self):
         self.assertEqual(self.report, check_wiring.check())
@@ -213,6 +220,56 @@ class WiringRegisterTest(unittest.TestCase):
             [
                 f"register: {key} names owed:103, which is resolved, and the gap is still here"
                 for key in owed
+            ],
+            errors,
+        )
+
+    def test_a_decision_citing_an_open_ticket_is_refused(self):
+        # The `decided` half of the same rule. Ticket 138 is resolved and is the
+        # one row that carries the spelling; reopening it under the fixture has
+        # to make the row an error, or the register would be excusing a gap on
+        # an argument nobody had finished.
+        ticket = self.wiring.tickets[138]
+        tickets = {**self.wiring.tickets, 138: dataclasses.replace(ticket, status="ready-for-agent")}
+        decided = sorted(
+            key for key, row in check_wiring.OWED_GAPS.items() if row == "decided:138"
+        )
+        self.assertTrue(decided, "ticket 138 carries no decided row for this fixture to use")
+
+        errors = check_wiring.register_errors(self.gaps, tickets)
+
+        self.assertEqual(
+            [
+                f"register: {key} names decided:138, which is not resolved,"
+                " so the decision it cites has not been made"
+                for key in decided
+            ],
+            errors,
+        )
+
+    def test_a_decision_that_outlived_its_gap_is_refused(self):
+        # A `decided` row is held to the gap exactly as an `owed` row is. The
+        # spelling changes what is claimed about the ticket and nothing about
+        # the absence, because a row excusing a gap that has been filled would
+        # go on excusing the next one to appear under the same name.
+        gaps = [gap for gap in self.gaps if gap.key != "W3 find_in_database"]
+
+        errors = check_wiring.register_errors(gaps, self.wiring.tickets)
+
+        self.assertIn(
+            "register: W3 find_in_database names decided:138 and this tree has no such gap;"
+            " remove the row",
+            errors,
+        )
+
+    def test_a_row_spelled_neither_way_is_refused(self):
+        with mock.patch.dict(check_wiring.OWED_GAPS, {"W3 open_impact_task": "ticket:105"}):
+            errors = check_wiring.register_errors(self.gaps, self.wiring.tickets)
+
+        self.assertEqual(
+            [
+                "register: W3 open_impact_task is recorded as 'ticket:105',"
+                " which is neither an owed:NN nor a decided:NN row"
             ],
             errors,
         )

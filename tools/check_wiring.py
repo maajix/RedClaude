@@ -77,13 +77,25 @@ does not hold, why it does not hold it, and the compile refuses an unclassified
 one. `check_audit`'s `owed:NN` names, for a requirement whose work is not
 finished, the open ticket that owes the verification.
 
-This file takes the second spelling. A gap is either wired or `owed:NN`, and
-`OWED` below is the whole of the second kind. Both directions fail: a gap this
-gate finds and the register does not hold is a defect, and a register row that no
-longer corresponds to a gap is equally a defect, because it is the gate excusing
-something that is fine and it would go on excusing a regression back into it. A
-row naming a ticket that has been resolved fails for the same reason it does in
-`check_audit`: work that is finished cannot owe anything.
+This file takes the second spelling. A gap is either wired, `owed:NN` or
+`decided:NN`, and `OWED_GAPS` below is the whole of the last two. Both
+directions fail: a gap this gate finds and the register does not hold is a
+defect, and a register row that no longer corresponds to a gap is equally a
+defect, because it is the gate excusing something that is fine and it would go
+on excusing a regression back into it. An `owed` row naming a ticket that has
+been resolved fails for the same reason it does in `check_audit`: work that is
+finished cannot owe anything.
+
+`decided:NN` is the answer to a gap that is not work. Some verbs are reached
+from a terminal by a human or asserted against by the suite, and both are
+callers this gate cannot see; W3 asks "does anything execute this" and gets the
+honest answer "nothing this gate can read", which is a finding rather than a
+defect. Writing that as `owed` would be promising a caller nobody intends to
+build. So the row names the resolved ticket that read the verb and recorded
+why, and the ticket number is the pointer to the argument. The rule inverts
+with the spelling: a `decided` row must name a ticket that *is* resolved, since
+a decision still under discussion is not one. Ticket 138 is the first of these,
+for `find_in_database`.
 
 `runtime_verb_surface` is deliberately not that register. It is catalogue-seeded
 -- `20260909T000000Z__the_runtime_holds_what_the_surface_declares.sql:169-173`
@@ -127,6 +139,16 @@ SKILLS = PACKAGE / "skills"
 #: a reader who knows one register knows this one.
 OWED = "owed:"
 TICKET = re.compile(r"^owed:(\d+)$")
+
+#: The second spelling, and the only other one. `owed:NN` says an open ticket
+#: still has to do the work; `decided:NN` says a resolved ticket read the gap
+#: and recorded that there is nothing to do. The two are exact opposites about
+#: the ticket -- an `owed` row naming a resolved ticket is a lie, and a
+#: `decided` row naming an open one is a decision still being argued -- and
+#: identical about the gap: both require it to be present, so neither can go on
+#: excusing an absence that has been filled.
+DECIDED = "decided:"
+DECIDED_TICKET = re.compile(r"^decided:(\d+)$")
 
 #: The role whose surface these audits are about. A verb granted only to an
 #: operator role is reached from a terminal by a human, and this gate cannot see
@@ -202,10 +224,14 @@ OWED_GAPS: dict[str, str] = {
     "W3 evidence_profile_browser_run_evidence": "owed:120",
     "W3 evidence_profile_identity_differential": "owed:120",
     "W3 evidence_profile_successful_tool_run": "owed:120",
-    # The cross-table secret sweep. The plan cut no ticket naming this verb, and
-    # this gate is how that was found out; it is recorded against the ticket that
-    # builds the redaction verifier, whose output is what a sweep would feed.
-    "W3 find_in_database": "owed:138",
+    # The cross-table secret sweep, and the one row in this register that is a
+    # decision rather than a debt. Ticket 138 read it: seven callers in
+    # `tests/test_database.py` and none in `src/`, which is what it is for. The
+    # verb answers about what the *calling* role may read
+    # (`20260814T020000Z:791-798`), so a fixed runtime caller would be the one
+    # thing it must not have, and a sweep of every column of every table is an
+    # operator's command after an incident rather than something a run does.
+    "W3 find_in_database": "decided:138",
 
     # W4. Every relation the migrations put on the agent's own read surface that
     # no Contract reaches, plus the catalogue-seeded remainder that only a
@@ -1779,21 +1805,34 @@ def register_errors(gaps: list[Gap], tickets: dict[int, Ticket]) -> list[str]:
         for key, gap in sorted(found.items())
         if key not in OWED_GAPS
     ]
-    for key, owed in sorted(OWED_GAPS.items()):
-        number = TICKET.match(owed)
+    for key, row in sorted(OWED_GAPS.items()):
+        number = TICKET.match(row) or DECIDED_TICKET.match(row)
         if number is None:
-            errors.append(f"register: {key} is recorded as {owed!r}, which is not an {OWED}NN row")
+            errors.append(
+                f"register: {key} is recorded as {row!r},"
+                f" which is neither an {OWED}NN nor a {DECIDED}NN row"
+            )
             continue
+        decided = row.startswith(DECIDED)
         ticket = tickets.get(int(number.group(1)))
         if ticket is None:
-            errors.append(f"register: {key} names {owed} and the tracker holds no such ticket")
-        elif ticket.resolved and key in found:
+            errors.append(f"register: {key} names {row} and the tracker holds no such ticket")
+        elif decided and not ticket.resolved:
+            # A decision that is still open is not a decision. The row would be
+            # excusing the gap on the strength of an argument nobody has
+            # finished having, which is the same hole an `owed` row naming a
+            # resolved ticket leaves, entered from the other side.
             errors.append(
-                f"register: {key} names {owed}, which is resolved, and the gap is still here"
+                f"register: {key} names {row}, which is not resolved,"
+                " so the decision it cites has not been made"
+            )
+        elif not decided and ticket.resolved and key in found:
+            errors.append(
+                f"register: {key} names {row}, which is resolved, and the gap is still here"
             )
         if key not in found:
             errors.append(
-                f"register: {key} names {owed} and this tree has no such gap; remove the row"
+                f"register: {key} names {row} and this tree has no such gap; remove the row"
             )
     return errors
 
