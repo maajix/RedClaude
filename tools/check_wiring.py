@@ -196,9 +196,6 @@ OWED_GAPS: dict[str, str] = {
     "W3 rk2_chain_edges": "owed:103",
     "W3 rk2_chain_problem": "owed:103",
     "W3 rk2_chain_reached": "owed:103",
-    # The negative-knowledge projection, reachable only through the view ticket
-    # 114 is giving a reader.
-    "W3 rk2_hypothesis_negative": "owed:114",
     # The four evidence profiles dispatch off a Task column nothing writes, which
     # is the whole of ticket 120.
     "W3 evidence_profile_allowed_receipt_only": "owed:120",
@@ -269,13 +266,10 @@ OWED_GAPS: dict[str, str] = {
     "W6 eval_runs": "owed:126",
     "W6 hypothesis_embeddings": "owed:127",
     "W6 observation_embeddings": "owed:127",
-    "W6 hypothesis_retest_triggers": "owed:114",
     "W6 interception_cas": "owed:124",
     "W6 program_known_issues": "owed:125",
     "W6 redaction_failure": "owed:125",
     "W6 report_queue": "owed:105",
-    "W6 v_negative_knowledge": "owed:114",
-    "W6 v_surface_deltas": "owed:114",
 
     # W7. The one open contradiction, and the standing check that would have to
     # find the next one. Ticket 116 narrows the two triggers that refuse the one

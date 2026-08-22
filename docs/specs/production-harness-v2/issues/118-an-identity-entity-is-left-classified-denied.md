@@ -27,7 +27,7 @@ Identity Entity with a raw INSERT, so that an Entity with no address comes out
       takes its unchanged-policy early return at `:847-865`, which is reachable
       for a Program whose configuration is byte-identical and whose identity
       rows are missing.
-- [ ] The consequence is asserted, not just the column. `chain_soundness` reads
+- [x] The consequence is asserted, not just the column. `chain_soundness` reads
       exactly this column at
       `20260818T000000Z__a_chain_is_composed_and_stays_sound.sql:721-729` --
       `WHERE cs.chain_id = p_chain AND e.scope_class = 'denied'` -- and returns

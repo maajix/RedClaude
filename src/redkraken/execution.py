@@ -362,6 +362,50 @@ SWEEP_STALE = "SELECT mark_stale_selections()"
 #: Task's status for itself and declines to write while it is still open.
 SETTLE_SELECTION = "SELECT settle_playbook_selections($1::uuid)"
 
+#: The retest lane's two writes, in the order they have to happen in. 007 gave a
+#: settled claim a watch row and never wrote one; 034 gave a kept refutation a
+#: relevance rule and reads the watch rows beside it. Arming first is what keeps
+#: the two from colliding: a watch is stamped with the Application's fingerprint
+#: as it stands now, so a watch armed in this transaction compares equal in the
+#: refresh that follows it and cannot fire on the pass that created it.
+ARM_WATCHES = "SELECT arm_retest_watches()"
+REFRESH_NEGATIVES = "SELECT refresh_negative_knowledge()"
+
+#: What the lane is holding, as the operator's own view renders it. `standing`
+#: is computed per row by `rk2_negative_standing`, so `due` here is the same
+#: word `rk state` would show and not a second opinion assembled out of columns.
+#: Named by Program because the view is: `rk2_runtime` reads every Program on
+#: the machine, and a pass that reported another hunt's refutations would be
+#: reporting them under this hunt's name.
+DUE_RETESTS = (
+    "SELECT hypothesis, hypothesis_status, subject, property_class, application,"
+    "       reason, retest"
+    "  FROM v_negative_knowledge"
+    " WHERE standing = 'due'"
+    "   AND program = (SELECT p.slug FROM programs p WHERE p.id = $1::uuid)"
+    " ORDER BY settled_at, hypothesis"
+    " LIMIT $2"
+)
+
+#: And what moved, which is the other half of the same sentence: a refutation
+#: made due names the delta that did it, and this is the delta with its subject
+#: and the classes it puts back in question. Newest first, because a pass report
+#: is read for what has just happened.
+SURFACE_MOVES = (
+    "SELECT application, kind, subject, subject_key, property_classes,"
+    "       detected_at::text"
+    "  FROM v_surface_deltas"
+    " WHERE program = (SELECT p.slug FROM programs p WHERE p.id = $1::uuid)"
+    " ORDER BY detected_at DESC, subject_key"
+    " LIMIT $2"
+)
+
+#: How many rows of each the pass report carries. A hunt accumulates refutations
+#: and deltas for as long as it runs, and a report that grew with the Program
+#: would be a report nobody finishes reading; the counts the two verbs answer
+#: with are unbounded and say how much is behind the list.
+RETEST_ROWS = 20
+
 #: The Tool run the capability is minted against. `proxy.OPEN_TOOL_RUN` cannot
 #: be reused: `authorize_tool_run` requires a Tool run's Task to match its Agent
 #: run's, and the proxy's own row carries no Task because the command that opens
@@ -930,6 +974,7 @@ class Slice:
         facts = {
             "reconciliation": None,
             "staleness": None,
+            "retests": None,
             "slate": [],
             "choice": None,
             "task": None,
@@ -962,6 +1007,7 @@ class Slice:
         """The pass itself, written into `facts` because every step of it stops."""
         facts["reconciliation"] = self._reconcile(ledger, connection)
         facts["staleness"] = self._stale(ledger, connection)
+        facts["retests"] = self._retests(ledger, connection, program_id)
 
         offered = self._offer(ledger, connection)
         if offered is None:
@@ -1113,6 +1159,76 @@ class Slice:
             f"{marked} live selection(s) had their Playbook expire under them",
         )
         return {"marked": marked}
+
+    def _retests(
+        self, ledger: Ledger, connection: pg.Connection, program_id: str
+    ) -> dict | None:
+        """What the Surface moving has put back in question, before anything is offered.
+
+        The third sweep, beside the reconciliation and the staleness stamp, and
+        here for the reason both of those are: it is a walk over what earlier
+        passes left standing, and the offer immediately below is its first
+        reader. A claim this lane reopens goes back to `testable`, which is what
+        stops `cancel_reason_for` abandoning its Task as `answered` and what
+        lets `novelty_for` score it above zero -- so a lane run after the ranking
+        would put every retest one whole pass late, and a lane run after the
+        claim would put it a pass late forever.
+
+        Two writes and then a read of what they did, in one transaction because
+        the read is only true of the transaction that wrote it. Arming is first
+        for the reason `ARM_WATCHES` states: a watch carries the fingerprint it
+        was armed at, so one armed here compares equal in the refresh below and
+        waits for the Surface to move, which is what a watch is.
+
+        Reported and never fatal, like the two sweeps beside it. A Program whose
+        retest lane will not run is a Program that repeats work it has already
+        done, which is expensive and is not a reason to refuse to do any.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                armed = proxy.as_object(connection.execute(ARM_WATCHES).scalar())
+                refreshed = proxy.as_object(
+                    connection.execute(REFRESH_NEGATIVES).scalar()
+                )
+                due = [
+                    _due_retest(row)
+                    for row in connection.execute(
+                        DUE_RETESTS, (program_id, RETEST_ROWS)
+                    ).rows
+                ]
+                moved = [
+                    _surface_move(row)
+                    for row in connection.execute(
+                        SURFACE_MOVES, (program_id, RETEST_ROWS)
+                    ).rows
+                ]
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "retests",
+                f"the retest lane could not be run: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        answer = {
+            "armed": int(armed.get("armed") or 0),
+            "watching": int(armed.get("watching") or 0),
+            "unwatched": int(armed.get("unwatched") or 0),
+            "due": int(refreshed.get("due") or 0),
+            "by_reason": refreshed.get("by_reason") or {},
+            "reopened": int(refreshed.get("reopened") or 0),
+            "watches_fired": int(refreshed.get("watches_fired") or 0),
+            "negative_knowledge": due,
+            "surface_deltas": moved,
+        }
+        ledger.hold(
+            "retests",
+            f"{answer['armed']} claim(s) newly watched and {answer['watching']} "
+            f"watching; {answer['due']} refutation(s) became due and "
+            f"{answer['reopened']} claim(s) went back to testable",
+        )
+        return answer
 
     def _offer(self, ledger: Ledger, connection: pg.Connection) -> list[dict] | None:
         """One scheduler pass: rank, advance the quota, offer.
@@ -2538,4 +2654,43 @@ def _slate_entry(row: Mapping[str, object]) -> dict:
         "factors": json.loads(str(row["factors"])),
         "entitled": row["entitled"],
         "expires_at": row["expires_at"],
+    }
+
+
+def _due_retest(row: Sequence[object]) -> dict:
+    """One refutation the lane has made due, as `v_negative_knowledge` renders it.
+
+    Positionally, because the view is what names the columns and this reads them
+    back in the order `DUE_RETESTS` asks for them. `retest` is a jsonb object the
+    view assembles -- what made the record due, which delta did it and whether
+    the claim went back to `testable` -- and it is parsed here for the reason the
+    Slate's `factors` is: a report that handed on the server's text would hand a
+    reader something they have to parse a second time.
+    """
+    return {
+        "hypothesis": row[0],
+        "hypothesis_status": row[1],
+        "subject": row[2],
+        "property_class": row[3],
+        "application": row[4],
+        "reason": row[5],
+        "retest": json.loads(str(row[6])) if row[6] is not None else None,
+    }
+
+
+def _surface_move(row: Sequence[object]) -> dict:
+    """One recorded Surface delta, as `v_surface_deltas` renders it.
+
+    `subject` is null where the delta's key names no single row -- a removed
+    element, or a key two rows answer to -- and it is passed through as null
+    rather than filled in, because 022 records the disappearance and reading it
+    as a subject would be a guess.
+    """
+    return {
+        "application": row[0],
+        "kind": row[1],
+        "subject": row[2],
+        "subject_key": row[3],
+        "property_classes": json.loads(str(row[4])),
+        "detected_at": row[5],
     }

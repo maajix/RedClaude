@@ -11407,6 +11407,20 @@ DECIDED = {
     #: whole because a reconciliation that recovered something here would mean
     #: one of the two Programs had a lapsed Lease the other did not.
     "reconciliation": None,
+    #: Nothing, and the empty tuple is the entry rather than an omission. 121's
+    #: sweep is over `playbooks`, which is program-global: whichever of the two
+    #: Programs runs first writes every expiry there is and the second finds
+    #: them already written, so the count is a fact about the order these two
+    #: passes happened in and not a decision either of them made.
+    "staleness": (),
+    #: Ticket 114's lane, at its counts. Every one of them is per Program --
+    #: `arm_retest_watches` and `refresh_negative_knowledge` both walk
+    #: `rk2_program_required()` -- so two Programs seeded alike must arm the
+    #: same watches and make the same records due. The two lists behind them are
+    #: left out: `v_surface_deltas` carries `detected_at`, which is when a
+    #: fingerprint was computed and therefore which pass ran first.
+    "retests": ("armed", "watching", "unwatched", "due", "by_reason",
+                "reopened", "watches_fired"),
     #: `beats` and the `identities` the last beat saw are how long the child
     #: took divided by the interval, which is this machine's load and not a
     #: decision. `every` is, and so is either way it can stop.
@@ -11425,6 +11439,11 @@ DECIDED = {
     #: identifier at all, so two Programs seeded alike must run under exactly
     #: the same Playbooks -- which is the decision this section is.
     "playbooks": None,
+    #: What those Playbooks turned out to have produced, without the Task
+    #: label, for the reason `closure` leaves it out: the label is asserted
+    #: where the Task is, and repeating it here would make one difference read
+    #: as two.
+    "selections": ("task_status", "settled", "produced", "exhausted"),
     "packet": ("sections",),
     "tool_run": ("label", "decision"),
     "receipt": None,
@@ -16823,6 +16842,382 @@ class NegativeKnowledgeTest(DatabaseCase):
 
         self.assertEqual(1, int(registered[0]))
         self.assertEqual([], list(problems))
+
+
+#: Ticket 114's own Program. Its own and not a phase of the case above, because
+#: `arm_retest_watches` walks every claim of the Program it is bound to, and
+#: that case places six refutations in an order its own assertions are about.
+RETEST_SLUG = "selftest-retest"
+
+#: The six Property classes this ticket deliberately leaves unmapped, and why
+#: each one is not a mapping question. Written here as the ticket writes them,
+#: so that a seventh arriving is a failure with a name rather than a count that
+#: moved.
+UNMAPPED = (
+    "authentication.recovery_flow",
+    "rate_limiting.per_origin",
+    "rate_limiting.resource_cost",
+    "transport.certificate_trust",
+    "transport.datagram_transport",
+    "transport.request_framing",
+)
+
+
+class RetestWatchTest(DatabaseCase):
+    """PH2-114: the retest lane acquires an input, a mapping and a reader.
+
+    034 built the half that walks kept refutations, and 007 built the half that
+    watches a claim nothing refuted: a row per claim per Application, stamped
+    with the fingerprint it came to rest at, fired when the fingerprint moves.
+    Four functions read those rows and nothing had ever written one, so half the
+    lane was decidable only by a test that wrote a row by hand.
+
+    The two halves are deliberately disjoint and the fixture is built to show
+    it. One Application, four claims on it: `supported` and `inconclusive`,
+    which are the two statuses a watch is for; `refuted`, which is the record
+    lane's and must not acquire one; and a claim on an Identity, which belongs
+    to no Application and is therefore a question this Program cannot re-ask.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = write(SCOPED.replace('name = "matrix-web"', f'name = "{RETEST_SLUG}"'))
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+
+        cls.app = cls.application()
+        cls.first = cls.compute()
+        route = cls.route("GET /notes")
+        cls.supported = cls.claim(route, "injection.query_operator", "supported")
+        cls.inconclusive = cls.claim(route, "injection.query_field", "inconclusive")
+        cls.refuted = cls.claim(route, "authorization.function_access", "refuted")
+        # A claim whose subject belongs to no Application. `rk2_application_of`
+        # answers null for an Identity by design -- "the honest answer rather
+        # than a default" -- so there is nothing for a watch to compare against.
+        cls.loose = cls.claim(
+            cls.identity(), "authentication.factor_enforcement", "supported"
+        )
+
+        cls.armed = cls.arm()
+        cls.again = cls.arm()
+        cls.watches = cls.written()
+
+        # The Surface moves, by a kind that maps to no class any of these four
+        # claims is about: if a claim reopens, the watch is what reopened it.
+        cls.as_owner(
+            "UPDATE technologies SET version = '1.27.0' WHERE entity_id = $1::uuid",
+            (cls.technology(),),
+        )
+        cls.second = cls.compute()
+        cls.refreshed = proxy.as_object(
+            cls.scalar("SELECT refresh_negative_knowledge()")
+        )
+        cls.after = cls.statuses()
+        cls.fired = cls.written()
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (RETEST_SLUG,)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()):
+        """One statement as the role that owns the rows, with the Program bound.
+
+        Bound because everything this fixture calls asks `rk2_program_required`
+        which Program it is in: the fingerprint, the arming and the refresh.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            return cls.connection.execute(sql, parameters)
+
+    @classmethod
+    def scalar(cls, sql: str, parameters: tuple = ()) -> object:
+        return cls.as_owner(sql, parameters).scalar()
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT add_entity($1::uuid, $2, '', 'host', 'kept.example.com',"
+                " NULL, $3, 'observed')::text",
+                (cls.program_id, kind, dedup),
+            )
+        )
+
+    @classmethod
+    def application(cls) -> str:
+        """One Application with one route and one technology under it.
+
+        The smallest shape the projection has anything to say about: a route so
+        that a claim has a subject inside the Application, and a technology so
+        that there is something to move that no claim here is about.
+        """
+        base = "http://kept.example.com"
+        application = cls.entity("application", base)
+        cls.as_owner(
+            "INSERT INTO applications (entity_id, base_url, kind)"
+            " VALUES ($1::uuid, $2, 'web')",
+            (application, base),
+        )
+        endpoint = cls.entity("endpoint", f"{base}GET /notes")
+        cls.as_owner(
+            "INSERT INTO endpoints (entity_id, application_id, method, path_template,"
+            " auth_required) VALUES ($1::uuid, $2::uuid, 'GET', '/notes', true)",
+            (endpoint, application),
+        )
+        technology = cls.entity("technology", f"{base}#nginx")
+        cls.as_owner(
+            "INSERT INTO technologies (entity_id, name, version)"
+            " VALUES ($1::uuid, 'nginx', '1.24.0')",
+            (technology,),
+        )
+        cls.as_owner(
+            "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id, type)"
+            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
+            (cls.program_id, application, technology),
+        )
+        return application
+
+    @classmethod
+    def identity(cls) -> str:
+        who = cls.entity("identity", "identity:member")
+        cls.as_owner(
+            "INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
+            " VALUES ($1::uuid, 'member', 'user', 'slot://identity/member')",
+            (who,),
+        )
+        return who
+
+    @classmethod
+    def compute(cls) -> dict:
+        return proxy.as_object(
+            cls.scalar("SELECT compute_surface_fingerprint($1::uuid)", (cls.app,))
+        )
+
+    @classmethod
+    def route(cls, key: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT entity_id::text FROM rk2_surface_reach($1::uuid) WHERE key = $2",
+                (cls.app, key),
+            )
+        )
+
+    @classmethod
+    def technology(cls) -> str:
+        return str(
+            cls.scalar(
+                "SELECT t.entity_id::text FROM technologies t"
+                "  JOIN relationships r ON r.dst_entity_id = t.entity_id"
+                " WHERE r.src_entity_id = $1::uuid AND r.type = 'runs'",
+                (cls.app,),
+            )
+        )
+
+    @classmethod
+    def claim(cls, subject: str, property_class: str, status: str) -> str:
+        """One Hypothesis already at rest, inserted at the status it rests at.
+
+        The status is what the lane reads, and the door a claim came through is
+        not: `arm_retest_watches` asks `hypotheses.status` and nothing else, so
+        a fixture that walked each of these through a Test would be testing the
+        transition machine a second time.
+        """
+        return str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id, property_class,"
+                " statement, status) VALUES ($1::uuid, $2::uuid, $3, $4, $5)"
+                " RETURNING id::text",
+                (cls.program_id, subject, property_class, f"a {status} claim", status),
+            )
+        )
+
+    @classmethod
+    def arm(cls) -> dict:
+        return proxy.as_object(cls.scalar("SELECT arm_retest_watches()"))
+
+    @classmethod
+    def written(cls) -> list[tuple]:
+        """Every watch row of this Program, as the four readers see one."""
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), row[3] is not None)
+            for row in cls.as_owner(
+                "SELECT h.label, x.kind, x.fingerprint, x.fired_at"
+                "  FROM hypothesis_retest_triggers x"
+                "  JOIN hypotheses h ON h.id = x.hypothesis_id"
+                " WHERE x.program_id = $1::uuid AND x.watched_entity_id = $2::uuid"
+                " ORDER BY h.label",
+                (cls.program_id, cls.app),
+            ).rows
+        ]
+
+    @classmethod
+    def statuses(cls) -> dict:
+        return {
+            str(row[0]): str(row[1])
+            for row in cls.as_owner(
+                "SELECT id::text, status FROM hypotheses WHERE program_id = $1::uuid",
+                (cls.program_id,),
+            ).rows
+        }
+
+    # -- criterion 3: the table acquires a writer -----------------------------
+
+    def test_a_settled_claim_is_watched_at_the_fingerprint_it_settled_under(self):
+        # Two rows, not four. The comparison the four readers make is against
+        # the value stamped here, so a watch armed at anything but the current
+        # fingerprint would fire on the pass that created it.
+        self.assertEqual(
+            [(self.label(self.supported), "response_fingerprint_changed",
+              self.first["fingerprint"], False),
+             (self.label(self.inconclusive), "response_fingerprint_changed",
+              self.first["fingerprint"], False)],
+            self.watches,
+        )
+        self.assertEqual(
+            {"armed": 2, "watching": 2, "unwatched": 1}, self.armed
+        )
+
+    def test_arming_again_writes_nothing(self):
+        # `ON CONFLICT DO NOTHING` on 007's own unique key, which is what makes
+        # this safe to call at the top of every pass for as long as a hunt runs.
+        self.assertEqual({"armed": 0, "watching": 2, "unwatched": 1}, self.again)
+
+    def test_a_refuted_claim_gets_no_watch_and_keeps_its_record(self):
+        # The two lanes are disjoint on purpose. A refutation is made due by a
+        # delta of a class the mapping says bears on it; a watch fires on any
+        # change to the Application at all, and arming one here would put the
+        # coarse answer in front of the precise one.
+        watched = [label for label, _, _, _ in self.watches]
+
+        self.assertNotIn(self.label(self.refuted), watched)
+        [kept] = self.connection.execute(
+            "SELECT count(*) FROM negative_knowledge WHERE hypothesis_id = $1::uuid",
+            (self.refuted,),
+        ).rows
+        self.assertEqual(1, int(kept[0]))
+
+    def test_a_claim_on_no_application_is_counted_and_not_watched(self):
+        # `rk2_application_of` answers null for an Identity, and a watch on
+        # nothing is a row `refresh_negative_knowledge` would count as
+        # unwatchable forever. Reported instead: this Program holds one claim
+        # that has come to rest and that nothing will ever re-ask.
+        self.assertEqual(1, self.armed["unwatched"])
+        self.assertNotIn(self.label(self.loose), [label for label, *_ in self.watches])
+
+    def test_the_watch_fires_when_the_surface_it_watches_moves(self):
+        # The whole point of the input, end to end: the technology moved, the
+        # fingerprint moved with it, and two claims nothing had refuted went
+        # back to `testable` through 007's own transition.
+        self.assertEqual(2, int(self.refreshed["watches_fired"]))
+        self.assertEqual("testable", self.after[self.supported])
+        self.assertEqual("testable", self.after[self.inconclusive])
+        self.assertEqual(
+            [(self.label(self.supported), "response_fingerprint_changed",
+              self.second["fingerprint"], True),
+             (self.label(self.inconclusive), "response_fingerprint_changed",
+              self.second["fingerprint"], True)],
+            self.fired,
+        )
+
+    def test_the_claim_on_no_application_did_not_move(self):
+        # Nothing watches it, so nothing reopened it. That is the cost the
+        # count above reports rather than hides.
+        self.assertEqual("supported", self.after[self.loose])
+
+    # -- criterion 1: the mapping covers every class a Playbook emits ---------
+
+    def test_every_emitted_property_class_is_reachable_from_a_delta(self):
+        # `rk2_negative_relevant_deltas` inner-joins the mapping, so a class
+        # with no row is a class no delta can put back in question -- silently,
+        # because an empty join reads exactly like a Surface that never moved.
+        unmapped = self.connection.execute(
+            "SELECT p.id FROM property_classes p"
+            " WHERE NOT EXISTS (SELECT 1 FROM surface_delta_property_classes m"
+            "                    WHERE m.property_class_id = p.id)"
+            " ORDER BY p.id"
+        ).rows
+
+        self.assertEqual(list(UNMAPPED), [str(row[0]) for row in unmapped])
+        emitted = self.connection.execute(
+            "SELECT p.id FROM property_classes p"
+            " WHERE EXISTS (SELECT 1 FROM playbook_outputs o"
+            "                WHERE o.property_class = p.id)"
+            "   AND NOT EXISTS (SELECT 1 FROM surface_delta_property_classes m"
+            "                    WHERE m.property_class_id = p.id)"
+        ).rows
+        self.assertEqual([], list(emitted))
+
+    def test_a_removal_still_puts_no_class_back_in_question(self):
+        # 022 decided removals map to nothing and this ticket adds fifty rows
+        # through the same join. The decision is worth re-asserting after them.
+        mapped = self.connection.execute(
+            "SELECT count(*) FROM surface_delta_property_classes m"
+            "  JOIN surface_delta_kinds k ON k.kind = m.kind"
+            " WHERE k.change = 'removed'"
+        ).rows
+
+        self.assertEqual(0, int(mapped[0][0]))
+
+    # -- criterion 4: the two views say which Program they are about ----------
+
+    def test_both_views_name_their_program_by_its_slug(self):
+        # `rk2_runtime` reads every Program on the machine, and neither view
+        # carries an identifier: without this column a runtime reading either
+        # one has no way to tell one hunt's refutations from another's.
+        [named] = self.connection.execute(
+            "SELECT v.program, v.hypothesis_status, v.property_class"
+            "  FROM v_negative_knowledge v"
+            "  JOIN hypotheses h ON h.label = v.hypothesis AND h.program_id = $1::uuid"
+            " WHERE h.id = $2::uuid",
+            (self.program_id, self.refuted),
+        ).rows
+
+        self.assertEqual(RETEST_SLUG, str(named[0]))
+        self.assertEqual("authorization.function_access", str(named[2]))
+        moved = self.connection.execute(
+            "SELECT program, kind, property_classes::text FROM v_surface_deltas"
+            " WHERE program = $1 ORDER BY kind",
+            (RETEST_SLUG,),
+        ).rows
+        self.assertEqual(
+            {"technology_changed"}, {str(row[1]) for row in moved}
+        )
+
+    def test_the_role_the_views_are_granted_to_can_still_read_them(self):
+        # A `DROP VIEW` takes the grant with it, so the file that rebuilt these
+        # two had one way to leave the reader it was written for locked out.
+        [granted] = self.connection.execute(
+            "SELECT has_table_privilege('rk2_runtime', 'v_negative_knowledge', 'SELECT'),"
+            "       has_table_privilege('rk2_runtime', 'v_surface_deltas', 'SELECT')"
+        ).rows
+
+        self.assertEqual((True, True), (bool(granted[0]), bool(granted[1])))
+
+    def label(self, hypothesis: str) -> str:
+        return str(
+            self.connection.execute(
+                "SELECT label FROM hypotheses WHERE id = $1::uuid", (hypothesis,)
+            ).scalar()
+        )
 
 
 #: The Programs the slate case opens. One per scenario, because a slate is a
@@ -34870,6 +35265,89 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
 
     def test_the_standing_check_holds_over_every_pass_this_case_ran(self):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
+
+
+IDENTITY_SUBJECT_SLUG = "selftest-chain-identity"
+
+
+class IdentitySubjectChainTest(ChainFixture, DatabaseCase):
+    """Ticket 118 criterion 3: a chain composed on an Identity Entity is sound.
+
+    118 moved an Identity Entity out of `denied`, and this is the consequence it
+    was moved for. `rk2_chain_unsoundness`'s scope arm refuses a chain any of
+    whose step subjects is classed `denied`
+    (`20260818T000000Z__a_chain_is_composed_and_stays_sound.sql:721-729`), and it
+    reads the class rather than `NOT in_scope` precisely so that a subject with
+    no address at all -- an identity slot, a technology fingerprint -- is not the
+    reason a chain reports itself unsound. An Entity left at the column default
+    defeated that reasoning, because it is not addressable and it sat in the one
+    class the arm does refuse.
+
+    The arrangement is 40's cut to the smallest sound shape it admits. Two
+    pivots compose into a line, and the only thing separating this case from
+    that one is which Entity the head member is about: the Program's own
+    `member` slot, which is the row `program._project_identities` writes and the
+    one 118 projects.
+    """
+
+    slug = IDENTITY_SUBJECT_SLUG
+
+    ANONYMOUS = "SELECT rk2_anonymous_identity($1::uuid)"
+    CLASSED = ("SELECT type, scope_class, scope_reason FROM entities"
+               " WHERE id = $1::uuid")
+
+    #: Two claims on two subjects, for 040's reason: `finding_signature` is the
+    #: vulnerability class and the subject's dedup key, so two Findings about one
+    #: subject would each be held by 034's `duplicate` gate -- and that gate is
+    #: an arm of `rk2_chain_unsoundness` too, so the chain would come back
+    #: unsound for a reason this case is not about.
+    CLAIM = "the anonymous slot is handed a session that outlives the sign-out"
+    OTHER = "the orders API hands out more than the order when it answers"
+
+    #: The two pivots, as `(name, route, provides, requires, member)`. Two is the
+    #: shortest chain 040 admits, and the head of the line is the member whose
+    #: subject is the Identity Entity, so the arm under test is asked about the
+    #: row this case is about rather than about the other one.
+    PIVOTS = (
+        ("reach", "31/note", "other_account_data", ["authenticated_session"], "first"),
+        ("token", "32/token", "credential_material", ["other_account_data"], "second"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.provisioned_identity(cls.HERE)
+        # The Entity 118 is about, made the way the machine makes it. Its class
+        # is read here and not after the projection below, because the whole of
+        # 118's first criterion is that the row is right when it is created --
+        # a projection of the Program afterwards would correct it either way and
+        # would make this case an assertion about that call instead.
+        cls.identity = committed(cls.connection, cls.ANONYMOUS, (cls.program_id,))
+        cls.classified = tuple(
+            str(field) for field in cls.rows_of(cls.CLASSED, (cls.identity,))[0]
+        )
+
+        cls.member = {"first": cls.validated(cls.CLAIM, cls.identity),
+                      "second": cls.validated(cls.OTHER)}
+        # For 040's reason, and for the other subject only: `offline_entity`
+        # inserts a row nothing has classified, and a subject that has never
+        # been classified is not the same fact as one the policy denies.
+        cls.project_the_scope()
+        for name, route, provides, requires, member in cls.PIVOTS:
+            cls.stamped(name, cls.member[member], route, provides, requires, cls.HERE)
+
+        cls.chain = cls.build(cls.members("reach", "token"))
+        cls.sound = cls.read(cls.chain["chain"])
+
+    def test_the_identity_entity_is_classified_as_it_is_created(self):
+        self.assertEqual(
+            ("identity", "not_addressable", "not_addressable"), self.classified
+        )
+
+    def test_a_chain_whose_subject_is_an_identity_entity_is_sound(self):
+        self.assertEqual(self.identity, str(self.member["first"]["subject"]))
+        self.assertIsNone(self.sound["unsound"])
+        self.assertTrue(self.sound["sound"])
 
 
 REPORT_SLUG = "selftest-report"

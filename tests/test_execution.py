@@ -327,6 +327,28 @@ class Recorder:
                 "exhausted": 0,
             },
         )
+        # What the retest lane found. The default is the quiet answer a Program
+        # gives on most passes: every settled claim is already watched, nothing
+        # was armed, and the Surface has not moved since, so no refutation
+        # became due. A test that wants the lane to have done something says so.
+        self.arming = answers.get(
+            "arming", {"armed": 0, "watching": 2, "unwatched": 0}
+        )
+        self.refreshed = answers.get(
+            "refreshed",
+            {
+                "due": 0,
+                "by_reason": {},
+                "reopened": 0,
+                "watches_fired": 0,
+                "watches_unwatchable": 0,
+            },
+        )
+        # The two view reads, as rows in the column order the statements ask
+        # for. Empty by default for the same reason the two answers above are
+        # zero: a lane that made nothing due has nothing to show.
+        self.due_retests = list(answers.get("due_retests", ()))
+        self.surface_moves = list(answers.get("surface_moves", ()))
         # An idle reconciliation: nothing had lapsed, and the one Task this
         # recorder's slate is about is this run's own to claim.
         self.reconciliation = answers.get(
@@ -494,6 +516,14 @@ class Recorder:
             return list(self.selections)
         if sql == execution.SWEEP_STALE:
             return [(self.marked,)]
+        if sql == execution.ARM_WATCHES:
+            return [(json.dumps(self.arming),)]
+        if sql == execution.REFRESH_NEGATIVES:
+            return [(json.dumps(self.refreshed),)]
+        if sql == execution.DUE_RETESTS:
+            return list(self.due_retests)
+        if sql == execution.SURFACE_MOVES:
+            return list(self.surface_moves)
         if sql == execution.SETTLE_SELECTION:
             return [(json.dumps(self.settlement),)]
         if sql == execution.OPEN_TOOL_RUN:
@@ -2407,6 +2437,191 @@ class ReconciliationTest(unittest.TestCase):
         # The claim still happened: recovering somebody else's work and doing
         # this run's own are two things, and only one of them failed.
         self.assertIn(execution.CLAIM, connection.statements)
+
+
+class RetestLaneTest(unittest.TestCase):
+    """Ticket 114: the lane that notices the ground moved, and says so.
+
+    Three connections were missing and this is the runtime end of all three: the
+    watch rows nothing had ever written, the refresh that turns a moved Surface
+    into work, and the read of the two views that had a grant and no reader. The
+    order is what most of this asserts, because every one of those three is only
+    correct in front of something else.
+    """
+
+    #: One refutation the lane made due and one delta that did it, in the
+    #: column order the two statements ask for. The jsonb columns arrive as the
+    #: text the server sent, which is what the module parses.
+    DUE = (
+        "HY4",
+        "testable",
+        "EN9",
+        "injection.query_operator",
+        "EN1",
+        "the control was refused",
+        json.dumps({"reason": "surface_delta", "delta_kind": "parameter_added",
+                    "subject_key": "GET /notes#query:sort", "reopened": True,
+                    "became_due_at": "2026-08-22T06:00:00Z"}),
+    )
+    MOVED = (
+        "EN1",
+        "parameter_added",
+        "EN9",
+        "GET /notes#query:sort",
+        json.dumps(["injection.query_field", "injection.query_operator"]),
+        "2026-08-22 06:00:00+00",
+    )
+
+    def test_the_lane_runs_before_the_slate_is_ranked(self):
+        # A claim this lane reopens is a Task `cancel_reason_for` stops
+        # abandoning and `novelty_for` stops scoring at zero. Behind the ranking
+        # it would be a whole pass late, every pass.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        statements = connection.statements
+        self.assertLess(
+            statements.index(execution.ARM_WATCHES), statements.index(execution.RANK)
+        )
+        self.assertLess(
+            statements.index(execution.REFRESH_NEGATIVES),
+            statements.index(execution.RANK),
+        )
+
+    def test_a_watch_is_armed_before_the_refresh_that_would_fire_it(self):
+        # And in the same transaction, which is the other half of the same
+        # decision: the arming stamps the fingerprint the refresh compares
+        # against, so a watch armed on this pass compares equal and waits for
+        # the Surface to move rather than firing on the pass that created it.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        statements = connection.statements
+        armed = statements.index(execution.ARM_WATCHES)
+        refreshed = statements.index(execution.REFRESH_NEGATIVES)
+        self.assertLess(armed, refreshed)
+        self.assertEqual("BEGIN", statements[armed - 2])
+        self.assertNotIn("COMMIT", statements[armed:refreshed])
+
+    def test_both_views_are_read_for_the_program_this_pass_is_bound_to(self):
+        # `rk2_runtime` reads every Program on the machine -- the policy on
+        # every table under these two views is `USING (true)` -- so the Program
+        # is the statement's to say. Neither view carries an identifier, so it
+        # is said the way a `v_` read says everything: by the slug.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertEqual(
+            [(PROGRAM, execution.RETEST_ROWS)], connection.sent(execution.DUE_RETESTS)
+        )
+        self.assertEqual(
+            [(PROGRAM, execution.RETEST_ROWS)], connection.sent(execution.SURFACE_MOVES)
+        )
+
+    def test_the_read_is_of_what_the_two_writes_just_did(self):
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        statements = connection.statements
+        self.assertLess(
+            statements.index(execution.REFRESH_NEGATIVES),
+            statements.index(execution.DUE_RETESTS),
+        )
+        self.assertNotIn(
+            "COMMIT",
+            statements[
+                statements.index(execution.ARM_WATCHES) : statements.index(
+                    execution.SURFACE_MOVES
+                )
+            ],
+        )
+
+    def test_what_became_due_and_what_moved_are_both_reported(self):
+        connection = Recorder(
+            arming={"armed": 2, "watching": 5, "unwatched": 1},
+            refreshed={
+                "due": 1,
+                "by_reason": {"surface_delta": 1},
+                "reopened": 1,
+                "watches_fired": 0,
+                "watches_unwatchable": 1,
+            },
+            due_retests=[self.DUE],
+            surface_moves=[self.MOVED],
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+
+        lane = facts["retests"]
+        self.assertEqual((2, 5, 1), (lane["armed"], lane["watching"], lane["unwatched"]))
+        self.assertEqual({"surface_delta": 1}, lane["by_reason"])
+        [due] = lane["negative_knowledge"]
+        self.assertEqual("HY4", due["hypothesis"])
+        self.assertEqual("injection.query_operator", due["property_class"])
+        # Parsed, not handed on as the server's text: a reader that had to
+        # parse it a second time is a reader deciding what it means.
+        self.assertEqual("parameter_added", due["retest"]["delta_kind"])
+        [moved] = lane["surface_deltas"]
+        self.assertEqual(
+            ["injection.query_field", "injection.query_operator"],
+            moved["property_classes"],
+        )
+        held = [step for step in ledger.assertions if step.name == "retests"]
+        self.assertEqual(1, len(held))
+        self.assertIn("2 claim(s) newly watched", held[0].detail)
+        self.assertIn("1 refutation(s) became due", held[0].detail)
+
+    def test_a_delta_whose_key_names_no_row_keeps_its_null_subject(self):
+        # 022 records a removal with its key and no subject on purpose, and
+        # filling one in here would be this module guessing what vanished.
+        connection = Recorder(surface_moves=[("EN1", "endpoint_removed", None,
+                                              "DELETE /notes", "[]",
+                                              "2026-08-22 06:00:00+00")])
+        with compiled():
+            _, facts = attempt(connection)
+        [moved] = facts["retests"]["surface_deltas"]
+        self.assertIsNone(moved["subject"])
+        self.assertEqual([], moved["property_classes"])
+
+    def test_the_lane_runs_on_a_pass_that_has_nothing_to_offer(self):
+        # It is a sweep over what earlier passes settled, not a step of running
+        # a Task. A Program with an empty Slate is exactly the Program whose
+        # claims have all come to rest, which is the one with most to re-ask.
+        connection = Recorder(slate=0)
+        with compiled():
+            _, facts = attempt(connection)
+        self.assertNotIn(execution.CLAIM, connection.statements)
+        self.assertEqual(0, facts["retests"]["due"])
+
+    def test_a_lane_that_fails_does_not_stop_the_pass(self):
+        connection = Recorder(
+            raises={execution.ARM_WATCHES: database_error("deadlock detected")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIsNone(facts["retests"])
+        self.assertEqual(
+            ["retests"], [step.name for step in ledger.assertions if not step.ok]
+        )
+        # Repeating work already done is expensive and is not a reason to
+        # refuse to do any.
+        self.assertIn(execution.CLAIM, connection.statements)
+
+    def test_a_read_that_fails_leaves_the_writes_it_would_have_reported(self):
+        # One transaction, so a view that will not answer rolls the arming back
+        # with it. The next pass arms again -- the verb is idempotent -- and the
+        # alternative is a report that says a claim was watched when the rows
+        # saying so were never committed.
+        connection = Recorder(
+            raises={execution.DUE_RETESTS: database_error("permission denied")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIsNone(facts["retests"])
+        self.assertIn("ROLLBACK", connection.statements)
+        self.assertEqual(
+            ["retests"], [step.name for step in ledger.assertions if not step.ok]
+        )
 
 
 class VocabularyTest(unittest.TestCase):
