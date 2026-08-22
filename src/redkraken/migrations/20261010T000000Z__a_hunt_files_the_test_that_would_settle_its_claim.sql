@@ -4,7 +4,7 @@
 --
 -- `tests` has two `INSERT` statements in this corpus and neither is reachable
 -- from a hunt. 20260816T000000Z's `open_impact_task` takes a Finding, which is
--- downstream of the thing a Test exists to reach; 20260927T000000Z's is a
+-- downstream of the thing a Test exists to reach; 20261018T000000Z's is a
 -- standing-check fixture. `open_test_replay` takes a Test that already exists,
 -- so `rk test` cannot author one either, and the nineteen Contracts the roster
 -- served before this file wrote no `tests` row between them.

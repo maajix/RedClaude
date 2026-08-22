@@ -5,7 +5,7 @@ is graded on whether it cited support rather than on where it wrote the citation
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] **The measurement is in the ticket.** `rk2hunt14`, 2026-08-22. Two recon
       runs, three claims proposed, all three dropped:
@@ -46,20 +46,20 @@ is graded on whether it cited support rather than on where it wrote the citation
       No code changed between the two runs. The failure is a coin flip that has
       been in this contract since it was written.
 
-- [ ] **An edge inside a claim counts as an edge naming that claim.** The
+- [x] **An edge inside a claim counts as an edge naming that claim.** The
       element carries no `hypothesis_ref` because the claim it belongs to is
       the one it is written in. Lifting it is reading what the child meant.
 
-- [ ] **An explicit reference still wins.** An edge that names a
+- [x] **An explicit reference still wins.** An edge that names a
       `hypothesis_ref` or a `hypothesis_label` of its own is left alone, even
       nested: the child said which claim, and this must not overwrite it.
 
-- [ ] **A lifted edge is refused under its own name.** `element_path` is what a
+- [x] **A lifted edge is refused under its own name.** `element_path` is what a
       drop is reported and de-duplicated by, so a lifted edge reports as
       `hypotheses[i].evidence[j]` rather than borrowing a top-level ordinal
       that belongs to a different element.
 
-- [ ] **The contract says where the edge goes.** Both the mission text and the
+- [x] **The contract says where the edge goes.** Both the mission text and the
       tool description say "give each one at least one evidence edge naming
       it", and neither says at which level. That sentence is why a model
       reasonably nests it.
@@ -69,3 +69,29 @@ key is refused at the schema would tell the child at once -- and would cost the
 whole call, which is the failure `roster.py`'s contract comment is written to
 avoid: a run that cannot get its result accepted files nothing at all. One
 badly placed key would throw away every Observation of that run.
+
+## How it was paid
+
+`src/redkraken/migrations/20261017T000000Z__an_evidence_edge_is_read_where_the_child_wrote_it.sql`
+rewrites `rk2_promote_hypotheses`. Pass 2 now walks the top-level `evidence`
+array and the `evidence` array of every claim as one ordered stream. A nested
+edge is given the `hypothesis_ref` of the claim it was written in, unless it
+already carries a `hypothesis_ref` or a `hypothesis_label`, and it is reported
+under `hypotheses[i].evidence[j]`.
+
+The contract text said the opposite of what the schema does -- "a claim carrying
+an evidence field of its own is refused as you send it", which nothing refuses,
+because `roster._ELEMENTS["hypotheses"]` does not close the element. Both places
+that said it now say both placements are read:
+`src/redkraken/_launch.py` (the `submit_mission_result` description) and
+`execution.Claimed.objective`.
+
+Measured by `tests.test_database.HypothesisPromotionTest`, which promotes a
+fifth result into a third Program: two claims whose only edges are nested, one
+of them naming the other claim explicitly, and one nested edge citing an
+Observation the result does not carry.
+
+```
+Ran 46 tests in 32.698s
+OK
+```

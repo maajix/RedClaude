@@ -79,7 +79,7 @@ case it was written for, do not lift it. The prose in 20260923T000000Z at
 ## What was built
 
 One migration,
-`src/redkraken/migrations/20260927T000000Z__a_probe_only_claim_becomes_a_finding.sql`,
+`src/redkraken/migrations/20261018T000000Z__a_probe_only_claim_becomes_a_finding.sql`,
 and nothing else. Both guards keep 20260815T120000Z's body and gain one clause:
 a Receipt whose `transport_citable` is true is no longer refused. The rest of
 each rule is left exactly where it was, and that is the one place this ticket
@@ -186,7 +186,7 @@ are three.
 
 ## Why this is not resolved yet (2026-08-22)
 
-A draft migration, `20260927T000000Z__a_probe_only_claim_becomes_a_finding.sql`,
+A draft migration, `20261018T000000Z__a_probe_only_claim_becomes_a_finding.sql`,
 is written and sits UNCOMMITTED in the working tree. It was never verified
 against a database: the agent that wrote it stopped before its run finished.
 So no criterion is ticked here, because a ticked box in a committed ticket file

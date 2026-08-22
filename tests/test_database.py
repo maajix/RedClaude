@@ -12975,6 +12975,14 @@ CLAIM_SLUG = "selftest-claim"
 #: rather than a second claim about the same thing.
 OWNERSHIP = "authorization.object_ownership"
 
+#: Two more, for ticket 155's claims alone. The lift is about where an edge was
+#: written and not about which claim it lands on, so the two claims that measure
+#: it need keys of their own: promoted onto `OWNERSHIP` they would converge onto
+#: the claim the rest of this case is about and the measurement would be of the
+#: convergence instead.
+NESTED_LIFTED = "authorization.function_access"
+NESTED_NAMED = "authorization.tenant_isolation"
+
 #: The two evidential Observation kinds cited here, and 018's rule they carry:
 #: both take Receipt provenance and nothing else. `DISCOVERED` is the third one,
 #: which is evidence of nothing and is cited on purpose.
@@ -13010,6 +13018,11 @@ class HypothesisPromotionTest(DatabaseCase):
     to cite, the claim itself, the same claim from a second run, and a result in
     which every element is wrong in a different way.
 
+    A fifth is promoted into a third Program, for ticket 155: a result whose
+    edges are written inside the claims they belong to. It is a Program of its
+    own because the readings above are of a Program that holds exactly one
+    Hypothesis, and this result files two more.
+
     This case commits, and purges what it wrote at the end.
     """
 
@@ -13019,7 +13032,7 @@ class HypothesisPromotionTest(DatabaseCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.identifiers = {}
-        for name in ("main", "other"):
+        for name in ("main", "other", "nested"):
             # `UNSEEDED` rather than `SCOPED`: `labels` below reads the Entities
             # this Program holds one of per type, and an Application the
             # configuration recorded when it opened would hide the one this
@@ -13031,7 +13044,9 @@ class HypothesisPromotionTest(DatabaseCase):
             opened = program.run(cls.harness.runtime, path)
             assert opened.ok, (name, opened.violations)
             cls.identifiers[name] = opened.facts["program_id"]
-        cls.seeded = {name: cls._populate(name) for name in ("main", "other")}
+        cls.seeded = {
+            name: cls._populate(name) for name in ("main", "other", "nested")
+        }
 
         # The Surface and the evidence, in the state a recon run and a first
         # pass over it leave them: a route, a second Identity beside the
@@ -13039,7 +13054,12 @@ class HypothesisPromotionTest(DatabaseCase):
         # and one not.
         cls.promote("main", cls.recon("main"))
         cls.promote("other", cls.recon("other"))
+        cls.promote("nested", cls.recon("nested"))
         cls.held = cls.labels("main")
+        # Ticket 155's own Program and its own Surface. Separate because
+        # `labels` reads the Hypothesis of a Program that holds exactly one,
+        # and the two claims below would make `main` a Program holding three.
+        cls.nested_held = cls.labels("nested")
 
         # The claim: one Hypothesis about the route, held for one Identity,
         # standing on a differential this same result promoted and a control the
@@ -13058,6 +13078,16 @@ class HypothesisPromotionTest(DatabaseCase):
         cls.foreign = cls.unheld("main", "other")
 
         cls.refusals, cls.refused = cls.promote("main", cls.wrong())
+        # Ticket 155, in the third Program.
+        cls.inside, cls.lifted = cls.promote("nested", cls.nested())
+        cls.lifted_drops = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in cls.connection.execute(
+                "SELECT element_path, reason, cited FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid",
+                (cls.inside.proposal_id,),
+            ).rows
+        }
         cls.dropped = {
             str(row[0]): (str(row[1]), str(row[2]))
             for row in cls.connection.execute(
@@ -13234,6 +13264,62 @@ class HypothesisPromotionTest(DatabaseCase):
             "evidence": [
                 {"hypothesis_ref": "same", "observation_ref": "second",
                  "polarity": "supports", "role": "baseline"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def nested(cls) -> dict:
+        """Ticket 155: two claims that write their edges inside themselves.
+
+        `rk2hunt14` filed three claims this shape and lost all three, because
+        pass 2 read `payload -> 'evidence'` and nothing else. Both claims here
+        have no top-level evidence list at all, so a promotion that has not been
+        taught to look inside promotes neither.
+
+        The first claim names nothing: the edge is written in it, and that is
+        the naming. The second claim's edge names the first by `hypothesis_ref`,
+        so it is the first that gains the edge and the second that is left
+        standing on nothing -- which is the whole of "an explicit reference
+        still wins", asked in the one place where the two answers differ.
+
+        One Observation per surviving edge, so that the second claim's rollback
+        takes nothing the first claim rests on. A third edge names an
+        Observation this result does not carry, which is how a nested edge is
+        made to fail under a path of its own.
+        """
+        return {
+            "observations": [
+                {"ref": "n_lift", "kind": DIFFERENTIAL,
+                 "subject_label": cls.nested_held["endpoint"],
+                 "summary": "the route answered for a caller outside the tenant",
+                 "receipt_label": cls.seeded["nested"]["receipt"]},
+                {"ref": "n_named", "kind": DIFFERENTIAL,
+                 "subject_label": cls.nested_held["endpoint"],
+                 "summary": "the same answer arrived under a second tenant",
+                 "receipt_label": cls.seeded["nested"]["receipt"]},
+            ],
+            "hypotheses": [
+                {"ref": "inside", "subject_label": cls.nested_held["endpoint"],
+                 "property_class": NESTED_LIFTED,
+                 "identity_a_label": cls.nested_held["identity_member"],
+                 "statement": "the function runs for a caller the tenant does not hold",
+                 "rationale": rationale("the handler reads no tenant from the caller"),
+                 "evidence": [
+                     {"observation_ref": "n_lift",
+                      "polarity": "supports", "role": "baseline"},
+                     {"observation_ref": "n_absent",
+                      "polarity": "supports", "role": "context"},
+                 ]},
+                {"ref": "elsewhere", "subject_label": cls.nested_held["endpoint"],
+                 "property_class": NESTED_NAMED,
+                 "identity_a_label": cls.nested_held["identity_member"],
+                 "statement": "the tenant boundary is not read on this route",
+                 "rationale": rationale("the tenant is taken from the request"),
+                 "evidence": [
+                     {"hypothesis_ref": "inside", "observation_ref": "n_named",
+                      "polarity": "supports", "role": "variant"},
+                 ]},
             ],
             "completion_claim": {"status": "partial"},
         }
@@ -13919,6 +14005,66 @@ class HypothesisPromotionTest(DatabaseCase):
         ).rows
 
         self.assertEqual((0, ""), (int(row[0]), str(row[1])))
+
+    # -- ticket 155: an edge written inside its claim -------------------------
+
+    def test_an_edge_inside_a_claim_counts_as_an_edge_naming_that_claim(self):
+        # The measurement `rk2hunt14` took, as a test: a result whose only
+        # edges are nested promotes the claim they were written in. The
+        # top-level list is empty, so a promotion reading only that list
+        # promotes nothing and this is the assertion that goes red.
+        self.assertNotIn("evidence", self.nested())
+        [label] = [
+            name for name in self.lifted["hypotheses"]
+            if self.claim_class(name) == NESTED_LIFTED
+        ]
+
+        [row] = self.connection.execute(
+            "SELECT count(*) FROM hypothesis_evidence he"
+            "  JOIN hypotheses h ON h.id = he.hypothesis_id"
+            " WHERE h.label = $1 AND h.program_id = $2::uuid",
+            (label, self.identifiers["nested"]),
+        ).rows
+
+        # The lifted edge, and the one the second claim addressed to this one.
+        self.assertEqual(2, int(row[0]))
+
+    def test_an_explicit_reference_still_wins(self):
+        # The second claim wrote its edge inside itself and named the first
+        # claim in it. The lift must not overwrite that: the edge belongs to
+        # the claim the child named, which leaves the second one standing on
+        # nothing and rolled back for it.
+        self.assertNotIn(
+            NESTED_NAMED,
+            [self.claim_class(name) for name in self.lifted["hypotheses"]],
+        )
+
+        self.assertEqual(
+            ("no_support", "no evidence edge in this result supports it"),
+            self.lifted_drops["hypotheses[1]"],
+        )
+
+    def test_a_lifted_edge_is_refused_under_its_own_name(self):
+        # `element_path` is what a drop is de-duplicated by, so a nested edge
+        # reports where it was written. Borrowing `evidence[0]` -- a top-level
+        # ordinal belonging to an element this result does not even carry --
+        # would silence the next drop that landed there.
+        self.assertIn("hypotheses[0].evidence[1]", self.lifted_drops)
+        reason, cited = self.lifted_drops["hypotheses[0].evidence[1]"]
+
+        self.assertEqual("no_such_label", reason)
+        self.assertEqual("n_absent", cited)
+        self.assertNotIn("evidence[0]", self.lifted_drops)
+
+    def claim_class(self, label: str) -> str:
+        """The Property class of one promoted claim of the third Program."""
+        return str(
+            self.connection.execute(
+                "SELECT property_class FROM hypotheses"
+                " WHERE label = $1 AND program_id = $2::uuid",
+                (label, self.identifiers["nested"]),
+            ).scalar()
+        )
 
 #: The two Programs the wave case opens. One is the wave; the second is here to
 #: be absent from the first one's numbers, because what came back is a count for

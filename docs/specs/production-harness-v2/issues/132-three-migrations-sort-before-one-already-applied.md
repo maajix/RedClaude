@@ -22,7 +22,7 @@ the corpus tail, not the first.
       `20260929T020000Z__an_identity_class_is_declared_and_service_is_not_one.sql`
       and `20260929T030000Z__a_range_is_scope_and_a_tier_never_was.sql` all
       landed after it and all sort below it. A fourth,
-      `20260927T000000Z__a_probe_only_claim_becomes_a_finding.sql`, is a draft
+      `20261018T000000Z__a_probe_only_claim_becomes_a_finding.sql`, is a draft
       for ticket 116 and is not committed; whoever finishes 116 should give it a
       timestamp above the tail rather than the one it has.
 - [ ] The reason this was not caught is written down. Every gate and every test
