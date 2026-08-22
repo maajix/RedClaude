@@ -50,7 +50,7 @@ reachable from what is already in the tree.
       using it; the schema is served closed (`roster.py:412-421`) and the gate
       re-checks the same statement afterwards (`roster.py:1393-1395`), so every
       call written to that instruction is denied by name.
-- [ ] The defect in the other direction is fixed or is carried by a named
+- [x] The defect in the other direction is fixed or is carried by a named
       ticket. The runtime opens every egress Tool run with the slot hardcoded
       empty -- `"identity_slot": ""` at `execution.py:1940`, inside the
       `json.dumps` at `execution.py:1936-1942` -- so today no agent-issued
@@ -71,7 +71,9 @@ reachable from what is already in the tree.
       slot, so "the slot the hypothesis was paired against" names two things and
       the run can spend one. Which of the two a Tool run is opened under is the
       undecided part, and it is a decision about the scheduler, not about this
-      contract. A ticket for it needs writing.
+      contract. **Ticket 131 now carries it**, which is what this criterion's
+      "or is carried by a named ticket" admits, so the criterion is met by the
+      second of its two arms rather than the first.
 - [x] The naming hazard the area exposes is written down where it would be read.
       The served tool is `mcp__rk2__http_request` (`roster.py:738`) and the Tool
       run is opened under `proxy.TOOL`, which is `mcp__rk2__net_request`
