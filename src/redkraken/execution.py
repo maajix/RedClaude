@@ -39,7 +39,7 @@ from pathlib import Path
 
 from redkraken import agent, capsule as capsule_module, isolation, migrate
 from redkraken import packet as packet_module, pg, playbook as playbook_module
-from redkraken import program, proposal, proxy, roster, state as state_module, store
+from redkraken import program, proposal, proxy, replay as replay_module, roster, state as state_module, store
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
 
 
@@ -96,10 +96,16 @@ CLAIMED = tuple(name for name in REQUIRED if name != CERTIFICATE) + tuple(
 #: What the child is told the Task is, in one sentence per kind. A kind with no
 #: sentence here is not refused: the fallback names the kind and the subject,
 #: which is the honest description of a Task nobody has written prose for yet.
+#: The one kind this runtime performs itself. Named because two places read it
+#: -- the dispatch branch and the roster agreement below -- and a kind spelled
+#: out at each is a kind that can be renamed in one place out of two.
+PERFORM = "perform"
+
 MISSIONS = {
     "recon": "Map what this target exposes.",
     "hunt": "Look for one exploitable weakness in this target.",
     "analyze": "Read what this target returned and say what it implies.",
+    "perform": "Perform the Test that was written to settle this claim.",
     "validate": "Decide whether what was claimed about this target holds.",
     "report": "Write up what has been established about this target.",
 }
@@ -290,13 +296,16 @@ STARTED = (
     " END,"
     " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active),"
     " (SELECT br.tokens FROM budget_reservations br"
-    "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL)"
+    "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL),"
+    " h.label, ts.label"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
     " LEFT JOIN applications ap ON ap.entity_id = e.id"
+    " LEFT JOIN hypotheses h ON h.id = t.hypothesis_id AND h.program_id = t.program_id"
+    " LEFT JOIN tests ts ON ts.id = t.test_id AND ts.program_id = t.program_id"
     " WHERE ar.label = $1 AND ar.program_id = $2::uuid"
 )
 
@@ -697,6 +706,8 @@ class Claimed:
     url: str | None
     subagent_cap: int
     token_cap: int | None
+    hypothesis_label: str | None = None
+    test_label: str | None = None
 
     @classmethod
     def from_row(cls, row) -> Claimed:
@@ -715,6 +726,19 @@ class Claimed:
             url=None if row[11] is None else str(row[11]),
             subagent_cap=int(row[12]),
             token_cap=None if row[13] is None else int(row[13]),
+            # Absent for every kind but `hunt`, and absent for a hunt only if
+            # something other than `derive_hypothesis_hunts` minted it: that
+            # derivation writes `tasks.hypothesis_id` on every row it creates,
+            # which is why the label is a join here and not a second lookup.
+            hypothesis_label=(
+                None if len(row) < 15 or row[14] is None else str(row[14])
+            ),
+            # Present for a `perform` Task and nothing else. `derive_test_performances`
+            # writes `tasks.test_id` on every row it creates, and the label is
+            # what `replay.run` takes: it resolves a Test by name inside its own
+            # transaction, so handing it the id would be handing it a value it
+            # would look the name up from anyway.
+            test_label=(None if len(row) < 16 or row[15] is None else str(row[15])),
         )
 
     def objective(self, playbooks: Sequence[playbook_module.Projection]) -> str:
@@ -725,6 +749,18 @@ class Claimed:
         rule is stated because it is the rule promotion applies -- an
         Observation citing no Receipt is dropped, and a child that learns that
         from the drop has already spent the attempt.
+
+        The claim paragraph is here rather than in the tool description because
+        a description says what the argument accepts and a Mission says what the
+        run owes. Six live hunts on 2026-08-22 filed 47 Observations and no
+        Hypothesis at all, which was not the model declining to think: this
+        method asked for one observation per thing established and named nothing
+        else, so nothing else came back, and every mechanism downstream of a
+        claim stayed cold for want of an input nobody requested. It is bounded in
+        the same breath it is asked for, because the failure mode of asking is a
+        run that manufactures claims its one answer cannot carry, and a claim
+        with no surviving supporting edge is rolled back whole -- taking the
+        Observations attached to it with it.
 
         The Playbooks come last and in full, because they are the longest part
         and the instructions above are what the run is graded on. An empty
@@ -743,8 +779,38 @@ class Claimed:
             "Then call mcp__rk2__submit_mission_result once, with one observation per "
             "thing you actually established, each citing the Receipt the request "
             "answered with. Nothing you write becomes canonical until the runtime "
-            "promotes it, and it promotes only what cites a Receipt from this run."
+            "promotes it, and it promotes only what cites a Receipt from this run.\n\n"
+            "An Observation is what the answer showed. A Hypothesis is what you "
+            "think is wrong with this subject and how somebody could show you "
+            "were not. File one wherever this answer grounds one, and file none "
+            "where it does not. A claim carries a property_class, a statement, a "
+            "rationale answering mechanism, expectation and falsifier, and at "
+            "least one evidence edge naming an Observation of this run that "
+            "supports it. The edge goes in the top-level evidence list and names "
+            "the claim by hypothesis_ref -- a claim carrying an evidence field of "
+            "its own is refused as you send it. A claim whose supporting edges do "
+            "not survive is rolled back and takes those Observations with it. "
+            "Do not say what state a "
+            "claim is in. The runtime grades it, and a claim that states its own "
+            "grade is refused for saying so."
         )
+        if self.kind == "hunt" and self.hypothesis_label is not None:
+            prompt = (
+                f"{prompt}\n\n"
+                f"This Task exists to settle one claim: {self.hypothesis_label}. "
+                "Read it with the state tools -- its statement says what is "
+                "believed wrong and its rationale says what would show it was "
+                "not. If this run can demonstrate the weakness it names, say so "
+                "and cite the Receipt that shows it. If it cannot, and one "
+                "request often cannot, call mcp__rk2__propose_test once with the "
+                f"plan that would: name {self.hypothesis_label}, and give the "
+                "actions a baseline, a variant and a control. A hunt that files "
+                "neither leaves the claim exactly where it found it.\n\n"
+                "Call mcp__rk2__propose_test before mcp__rk2__submit_mission_result, "
+                "not after. Submitting is an ending -- it is the first of the stop "
+                "conditions above -- so a plan authored after it is a plan this run "
+                "never files."
+            )
         if not playbooks:
             return prompt
         selected = "\n\n".join(one.text() for one in playbooks)
@@ -955,6 +1021,21 @@ class Slice:
     #: as well -- a run whose output could not be filed is a run that leaves no
     #: evidence -- so neither on its own serves anything.
     tools: isolation.ToolContainer | None = None
+    #: The Program configuration, for the one kind this runtime performs itself.
+    #: `replay.run` loads it to resolve the Program and to bind the schema
+    #: revision the Test was authored under, so a machine that names none can
+    #: claim a `perform` Task and will refuse it with that as the reason.
+    #: Optional for the same reason the store and the image are: every other
+    #: kind runs without it.
+    configuration: Path | None = None
+    #: Where the door is, as this machine sees it. A second address for the one
+    #: door and not a second door: `boundary.proxy_url` is the child's, a
+    #: container name on the Agent network, and the runtime is not on that
+    #: network. Ticket 153. Given rather than derived, because rewriting the
+    #: child's host to a loopback one would be a guess about a port mapping this
+    #: process did not make. Optional like the rest: only `perform` spends a
+    #: capability from here, and it refuses by name when this is absent.
+    proxy_url: str | None = None
 
     def attempt(self, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
         """Reconcile, offer, claim, run, promote, close. Once, and closed either way.
@@ -986,6 +1067,7 @@ class Slice:
             "heartbeat": None,
             "tool_run": None,
             "receipt": None,
+            "replay": None,
             "proposal": None,
             "promotion": None,
             "closure": None,
@@ -1613,6 +1695,13 @@ class Slice:
         """
         if not self._dispatchable(ledger, claimed, chosen):
             return
+        # Before every check below it, because none of them is about this kind.
+        # A `perform` Task is not dispatched: there is no packet, no capability
+        # minted here, no Playbook and no child, because a replay walks a
+        # specification a hunt already authored and the runtime is what walks it.
+        if claimed.kind == PERFORM:
+            self._replay(ledger, connection, claimed, facts)
+            return
         if claimed.url is None:
             ledger.fail(
                 "target",
@@ -1697,11 +1786,14 @@ class Slice:
                 with self._heartbeat(ledger, connection, claimed, facts):
                     result = self._child(
                         ledger, claimed, selected, mission, door, lifetime, program_id,
-                        # Read only where there is something to open a
-                        # connection for. A machine that describes no tool
-                        # image serves no tool call, so the settings are not a
-                        # thing this pass needs to have.
-                        connection.settings if self.serves_tools else None,
+                        # Always, now. This used to read the settings only where
+                        # a tool image was described, on the argument that a
+                        # machine serving no tool call needs no connection --
+                        # true when the supervisor answered only tool calls, and
+                        # false since it began answering `propose_test`,
+                        # `propose_finding` and `mint_callback`, which are rows
+                        # rather than containers.
+                        connection.settings,
                     )
             except agent.StartupRefusal as refusal:
                 # Before the `RuntimeError` arm, which it is one of: a machine
@@ -1734,6 +1826,15 @@ class Slice:
             facts["agent_run"]["stop_reason"] = stopped_as(result.stop_reason)
             facts["agent_run"]["input_tokens"] = result.input_tokens
             facts["agent_run"]["output_tokens"] = result.output_tokens
+            # Which verbs the child actually reached for, and which it was
+            # refused. The launcher has collected both since ticket 86 and
+            # nothing has ever read them: `AgentRunResult.as_dict` has no
+            # caller, so a run that was served a tool and never called it looked
+            # from here exactly like a run that called it and was denied. That
+            # is the difference between a prompt to rewrite and a permission to
+            # fix, and it cost this engagement two live hunts to tell apart.
+            facts["agent_run"]["tools_called"] = sorted(set(result.tools_served))
+            facts["agent_run"]["denials"] = [dict(one) for one in result.denials]
             outcome = self._exchange(ledger, connection, program_id, tool_run_id, facts)
             self._promote(ledger, connection, program_id, claimed, result, facts)
         finally:
@@ -1743,6 +1844,94 @@ class Slice:
             # what the request did, and the Receipt above is what it knows it
             # from.
             self._close(ledger, connection, claimed, facts["tool_run"], outcome)
+
+
+    def _replay(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        claimed: Claimed,
+        facts: dict,
+    ) -> None:
+        """Perform the Test this Task names, inside the run the claim opened.
+
+        Ticket 152. `replay.run` has been the performer since ticket 35 and its
+        only caller was `rk test replay`, which an operator cannot use after the
+        fact: a replay is attributed to an Agent run that has not ended, and by
+        the time a person can type the command every run this harness opened has
+        ended. The claim is what fixes that -- it opens a run, and this is called
+        inside it -- so the Task is the caller the lane always needed.
+
+        A second connection, opened by `replay.run` out of the same settings.
+        Held to be safe here and nowhere else in this method: nothing above this
+        line leaves a transaction open on the runtime's own connection, so the
+        `FOR UPDATE` the replay takes on the claim cannot be waiting on a lock
+        this process is holding. Sharing the connection instead would mean
+        threading one through a module whose every path opens and closes its own,
+        which is a larger change to the performer than the caller is worth.
+
+        The Task's ending is the Test run, not this report. A Test that ran and
+        settled nothing reports `inconclusive` and fails -- correctly, because
+        somebody has to run it again -- while the Task that performed it is done:
+        it did the work it was minted for, and `task_result_accepted` reads the
+        `test_runs` row rather than the verdict in it.
+        """
+        run = facts["agent_run"]
+        if claimed.test_label is None:
+            ledger.fail(
+                "replay",
+                f"{claimed.task_label} is a {PERFORM} Task naming no Test; "
+                "only `derive_test_performances` mints one, and it writes the "
+                "Test on every row it creates",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            run["stop_reason"] = "error"
+            return
+        if self.configuration is None:
+            ledger.fail(
+                "replay",
+                f"{claimed.test_label} cannot be performed: this machine names no "
+                "Program configuration, and the replay resolves the Program from one",
+                code=INVALID_CONFIGURATION,
+                source="argument:--config",
+            )
+            run["stop_reason"] = "error"
+            return
+        if self.proxy_url is None:
+            ledger.fail(
+                "replay",
+                f"{claimed.test_label} cannot be performed: this machine names no "
+                f"door of its own; ${proxy.PROXY_URL} is the runtime's address for "
+                f"the door that ${PROXY_URL} names for a child",
+                code=INVALID_CONFIGURATION,
+                source=f"environment:{proxy.PROXY_URL}",
+            )
+            run["stop_reason"] = "error"
+            return
+
+        performed = replay_module.run(
+            connection.settings,
+            self.configuration,
+            agent_run=claimed.agent_run_label,
+            test=claimed.test_label,
+            identity_slot=None,
+            proxy_url=self.proxy_url,
+            ca_file=self.boundary.certificate,
+        )
+        facts["replay"] = performed.as_dict()
+        # Carried whole rather than summarised. The replay keeps its own ledger
+        # because it is an operator command in its own right, and a pass that
+        # reported only "it failed" would be hiding the one document that says
+        # which precondition, which action or which assertion it was.
+        ledger.assertions.extend(performed.assertions)
+        ledger.violations.extend(performed.violations)
+        # `test_run` is written by `close_test_replay` in the transaction that
+        # settles the claim, so its presence is the whole question: a replay
+        # that opened and died leaves a Tool run and no Test run, which is this
+        # attempt spent and the Task correctly not done.
+        settled = performed.facts.get("test_run") is not None
+        run["stop_reason"] = "completed" if settled else "error"
 
     def _dispatchable(
         self, ledger: Ledger, claimed: Claimed, chosen: Chosen | None
@@ -2248,9 +2437,19 @@ class Slice:
             timeout=timeout,
             subagent_cap=claimed.subagent_cap,
             token_cap=claimed.token_cap,
+            # The connection alone is enough. Until 2026-08-22 this also
+            # required a tool image and an Artifact store, which was the same
+            # statement back when the supervisor answered only the two tool-run
+            # verbs. It now answers `propose_test`, `propose_finding` and
+            # `mint_callback` as well, and those need a database and nothing
+            # else -- so an installation that named no image had no channel, and
+            # every Test and every Finding a child ever proposed was answered
+            # `no_tooling` by a supervisor that was never built. The image and
+            # the store travel as they are, and `_Tools` refuses the two verbs
+            # that need them.
             tooling=(
                 None
-                if runtime is None or self.tools is None or self.artifacts is None
+                if runtime is None
                 else agent.Tooling(
                     container=self.tools,
                     root=self.artifacts,
@@ -2469,10 +2668,18 @@ class Slice:
             )
             return
         observations = list(promotion.get("observations") or ())
+        # The Tasks the promotion opened out of this result's suggestions, read
+        # back rather than decided here: 142 puts that walk beside the other
+        # five in SQL, and what this side owes is a report. Named in the pass so
+        # that "the run suggested nothing" and "everything it suggested was
+        # refused" do not read the same way to an operator, which is what they
+        # did for the whole of the six hunts that stopped after two recon Tasks.
+        opened = list(promotion.get("tasks") or ())
         facts["promotion"] = {
             "status": promotion.get("status"),
             "repeated": bool(promotion.get("repeated")),
             "observations": observations,
+            "tasks": opened,
             "refused": int(promotion.get("refused") or 0),
         }
         facts["fingerprint"] = {
@@ -2482,7 +2689,8 @@ class Slice:
         ledger.hold(
             "promotion",
             f"{staged.label} is {promotion.get('status')}: {len(observations)} "
-            f"Observation(s) canonical, {promotion.get('refused')} refused",
+            f"Observation(s) canonical, {len(opened)} Task(s) opened, "
+            f"{promotion.get('refused')} refused",
         )
         ledger.hold(
             "fingerprint",

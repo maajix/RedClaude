@@ -131,6 +131,18 @@ NO_TOOLING = "no_tooling"
 #: is the reason rather than silence or an exception.
 SPENT_PROPOSALS = "proposals_spent"
 
+#: And why a Test specification was not carried, which is the same fact about
+#: the other verb that asks the runtime to write a row and gets its answer back
+#: while the run is still going.
+SPENT_SPECIFICATIONS = "specifications_spent"
+
+#: The five parts of a Test specification, in the order `rk2_test_spec_problem`
+#: reads them. Held here because the handler sends all five whether or not the
+#: model named all five: a part left out and a part sent empty have to reach the
+#: database as the same document, or two runs that meant the same plan would
+#: author two Tests with two digests -- and the digest is the Test's identity.
+SPECIFICATION_PARTS = ("preconditions", "setup", "actions", "assertions", "cleanup")
+
 #: What `open_finding` calls the outcome of a proposal it would not open a
 #: Finding from. Held here because it is the word this side counts on, and a
 #: word spelled out at the counting site would be a second statement of the
@@ -155,6 +167,33 @@ REFUSED = "refused"
 #: both held. Counting a merge against this ceiling would make the run that
 #: found the most into the run that is cut off first.
 REFUSED_PROPOSALS = 3
+
+#: And how many refused specifications, which is a different number derived the
+#: same way. `propose_finding`'s three is "one more than the number of mistakes
+#: that are correctable", and the count there is two out of eight arms because
+#: six of them are about evidence the run cannot change by asking again.
+#:
+#: Here almost every refusal is correctable, so the number is bounded from the
+#: other end -- by how many times a converging run can be told something it did
+#: not already know. `rk2_test_spec_problem` answers with the *first* problem it
+#: finds and walks the specification in a fixed order: the key set, then the
+#: preconditions, the setup and cleanup, the actions, the assertions. A run
+#: fixing one refusal at a time therefore learns at most one thing per pass over
+#: that walk, and six is one more than the five parts it can learn something
+#: about. A seventh refusal is a run being told about a part it has already been
+#: told about, which is a run repeating itself rather than converging.
+#:
+#: Two of the refusals it can get are not about the specification at all -- the
+#: label names no claim, and the claim is not `testable` -- and they are counted
+#: with the rest, because the run cannot act on either and a ceiling that
+#: excused them would let a run spend its whole context re-sending a plan for a
+#: claim that is not waiting for one.
+#:
+#: A `created` or `existing` outcome is not counted, for `REFUSED_PROPOSALS`'
+#: reason: what a ceiling on successes would bound is how much work one run may
+#: plan, and `tests_hypothesis_id_spec_sha256_key` already bounds the only way a
+#: run could repeat itself successfully.
+REFUSED_SPECIFICATIONS = 6
 
 
 class Closed(RuntimeError):
@@ -544,6 +583,92 @@ class Proposal:
         return answered
 
 
+class Specification:
+    """The Tests this run asked the runtime to author, and the refusals it has left.
+
+    `Proposal` above is the same shape one step later in the same chain, and the
+    reason both exist is that neither can be reached from the other: a Finding
+    rests on a `supported` claim, a claim reaches `supported` only through a Test
+    run, and a Test run replays a `tests` row. Before ticket 141 nothing an Agent
+    run could call wrote that row -- the two `INSERT INTO tests` in the corpus
+    take a Finding or seed a standing-check fixture -- so a Program with a
+    perfectly good testable claim could not reach a Finding by any route.
+
+    Asked and answered while the run is still going, for `Proposal`'s reason and
+    with more riding on it. `rk2_test_spec_problem` is thirty rules about the
+    shape of a plan, and every one of them is something the model that wrote the
+    plan can fix. It is a function rather than a CHECK precisely so that the
+    sentence naming the broken rule can be carried back to whoever wrote the
+    specification, and this object is the last link in that carry: it hands the
+    answer through unchanged, including a refusal, which is reported as a
+    refusal and not as a tool that failed.
+
+    What it decides is when to stop asking, and `REFUSED_SPECIFICATIONS` is
+    where. That is a bound on this run's own context and not a second opinion
+    about the plan.
+
+    Asking is blocking, because it is the same pipe a tool run goes down, so
+    every caller reaches this through a thread for the reason `Channel` gives.
+    """
+
+    def __init__(self, channel: Channel | None = None) -> None:
+        self._channel = channel
+        self.attempts = 0
+        self.refused = 0
+
+    def ask(self, arguments: Mapping[str, object]) -> dict:
+        """Carry one specification to the runtime, or say why it was not carried.
+
+        The claim's label and the five parts, and nothing beside them. Which
+        Agent run and which Program this belongs to are the supervisor's to fill
+        in, for `Proposal.ask`'s reason; the digest that will be this Test's
+        identity is the database's, because a caller that supplied one would be
+        a caller whose arithmetic the identity depends on.
+
+        Every part is sent whether or not the model named it. A missing key and
+        an empty array have to reach `rk2_test_spec_digest` as the same
+        document, or two runs that planned the same thing would author two Tests
+        -- and `tests` is immutable, so a second digest is a second Test rather
+        than a correction of the first.
+        """
+        self.attempts += 1
+        if self.refused >= REFUSED_SPECIFICATIONS:
+            return {
+                "served": False,
+                "reason": SPENT_SPECIFICATIONS,
+                "attempts": self.attempts,
+                "refused": self.refused,
+                "detail": (
+                    f"{self.refused} specifications of this run were refused, which is "
+                    "all it may spend; this one was not carried to the runtime"
+                ),
+            }
+        if self._channel is None:
+            return {
+                "served": False,
+                "reason": NO_TOOLING,
+                "attempts": self.attempts,
+                "detail": (
+                    "this run was started with no supervisor to ask; nothing was authored"
+                ),
+            }
+        carried: dict[str, object] = {
+            "hypothesis_label": str(arguments.get("hypothesis_label") or "")
+        }
+        for part in SPECIFICATION_PARTS:
+            given = arguments.get(part)
+            carried[part] = list(given) if isinstance(given, (list, tuple)) else []
+        answered = dict(
+            self._channel.call(f"mcp__{agent.SERVER}__propose_test", carried)
+        )
+        # Only the database's own word for it counts, for the reason `Proposal`
+        # gives: a supervisor that could not be reached has not refused a
+        # specification, because nobody read one.
+        if answered.get("outcome") == REFUSED:
+            self.refused += 1
+        return answered
+
+
 class Correlator:
     """The out-of-band names this run has asked the runtime to mint for it.
 
@@ -901,7 +1026,23 @@ DESCRIPTIONS = {
         "those are the runtime's answer, and an element that states one is refused "
         "even when it states the answer the runtime would have written. A "
         "hypothesis with no surviving supporting evidence is rolled back, so give "
-        "each one at least one evidence edge naming it.\n\n"
+        "each one at least one evidence edge naming it. The edge goes in the "
+        "top-level evidence list and names the claim by hypothesis_ref; a claim "
+        "carrying an evidence field of its own is refused as you send it.\n\n"
+        "A suggested task asks the runtime to open one, and carries a kind, a "
+        "subject by subject_ref or subject_label, and a rationale saying why it "
+        "is worth a run. Only recon is opened: hunt and validate are opened "
+        "against a hypothesis and a finding, which this element has no field to "
+        "name, and the roles that execute analyze and report cannot make the one "
+        "target request a dispatched task serves. The subject must be an "
+        "application or an endpoint, because those are the only two that carry an "
+        "address to send a request to -- name the application under a domain "
+        "rather than the domain. A subject the live scope no longer admits as a "
+        "target is refused, so is one this Program already holds a live task for, "
+        "and so is every suggestion made once this Program holds as many live "
+        "tasks as the slate the orchestrator is offered -- that last one is about "
+        "the moment rather than about your suggestion, so a subject still worth "
+        "mapping is worth naming again in a later run.\n\n"
         "A word outside a set this schema declares is refused as you send it, and "
         "you can correct it and send again. A mistake the schema cannot see -- a "
         "parent of the wrong type, a relationship pointing the wrong way, a kind "
@@ -932,6 +1073,37 @@ DESCRIPTIONS = {
         "your proposal rather than about the evidence, so a refusal about the "
         "evidence is not worth re-sending. This run may have three proposals refused "
         "and no more, after which the tool stops carrying them."
+    ),
+    "propose_test": (
+        "Ask the runtime to author the Test that would settle one Hypothesis of this "
+        "Program that has reached testable. A Test is an immutable plan the runtime "
+        "will replay through the door itself: name the claim by its label and state "
+        "the plan in its five parts -- preconditions, setup, actions, assertions and "
+        "cleanup. What comes back is the Test's label and the digest that is its "
+        "identity, and the replay is a separate step that happens after your run.\n\n"
+        "The actions are the point. Between three and thirty-two of them, each "
+        "numbered by its own position, each a request, and at least one carrying each "
+        "of the three roles: a baseline that shows how the target behaves normally, a "
+        "variant that differs in the one way your claim is about, and a control that "
+        "shows the target would not have differed anyway. A plan with no control is a "
+        "plan that cannot tell your claim from a coincidence, and it is refused.\n\n"
+        "An assertion is a comparison this runtime can evaluate for itself over what "
+        "the door recorded. Give each one an identifier -- that is how a failure is "
+        "reported back later -- and name the action it is about. status_equals also "
+        "states a status; the other three name a second action to compare against and "
+        "state no status. Preconditions are prose under a typed word, for a person "
+        "reading the plan; the runtime decides scope, risk, the identity lease and the "
+        "budget itself when the replay opens, so a precondition is not a way to ask "
+        "for any of them. Setup and cleanup are requests the run makes and no "
+        "assertion may name.\n\n"
+        "The runtime decides. A refusal comes back as one sentence naming exactly "
+        "which rule the plan broke and where -- the action, the assertion or the part "
+        "-- so a refusal is worth reading and correcting rather than re-sending. A "
+        "claim that is not testable is not something you can fix by asking again. "
+        "Sending a plan this claim already holds answers with the Test that is already "
+        "there rather than making a second one, because a Test is its plan and running "
+        "one twice is what a second replay is for. This run may have six "
+        "specifications refused and no more, after which the tool stops carrying them."
     ),
     "mint_callback": (
         "Ask the runtime for an out-of-band correlator: a name this Program controls "
@@ -968,11 +1140,12 @@ def server(
     judgement: Judgement | None = None,
     channel: Channel | None = None,
     proposal: Proposal | None = None,
+    specification: Specification | None = None,
     correlator: Correlator | None = None,
     transcripts: Transcripts | None = None,
     refresh: Refresh | None = None,
 ):
-    """Six reads, a request, two tool runs, a result, a Finding, a canary, a choice, a judgement.
+    """Six reads, a request, two tool runs, a result, a Test, a Finding, a canary, a choice, a judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -1007,6 +1180,9 @@ def server(
     # this process has no database, and what it can do is ask the side that has
     # one. A run with no supervisor gets a `Proposal` that says so.
     proposing = Proposal(channel) if proposal is None else proposal
+    # And the same for the ask one step earlier in the same chain: the Test that
+    # would settle the claim a Finding would rest on.
+    authoring = Specification(channel) if specification is None else specification
     # And the same for the out-of-band ask, which goes down the same pipe to the
     # same party for the same reason.
     minting = Correlator(channel) if correlator is None else correlator
@@ -1029,6 +1205,7 @@ def server(
     tools.append(_tool_run(surface, channel, "run_skill_script"))
     tools.append(_propose(surface, submission))
     tools.append(_finding(surface, proposing))
+    tools.append(_specification(surface, authoring))
     tools.append(_callback(surface, minting))
     tools.append(_slate(surface, picking))
     tools.append(_pick(surface, picking))
@@ -1470,6 +1647,39 @@ def _finding(surface: Surface, proposal: Proposal):
     async def handler(arguments: dict) -> dict:
         surface.serve(name)
         return _content(await asyncio.to_thread(proposal.ask, dict(arguments or {})))
+
+    return handler
+
+
+def _specification(surface: Surface, specification: Specification):
+    """The one plan this run may ask the runtime to store as a Test.
+
+    Asked rather than staged, which is what separates it from
+    `submit_mission_result`. A mission result is a claim about what already
+    happened and the runtime promotes it after the run has ended, where a
+    dropped element leaves a `proposal_drops` row nobody is left to read. A
+    specification is a plan for something that has not happened yet, and the
+    whole reason for answering it now is that its refusal is actionable: thirty
+    shape rules, every one of them something the run that wrote the plan can
+    correct and send again inside the same turn budget.
+
+    Nothing here decides whether the Test may be stored. `rk2_test_spec_problem`
+    is the rule and `propose_test` is what applies it, against a claim's status
+    the runtime wrote; this handler carries the plan to them and reports what
+    came back, including a refusal, which is reported as a refusal rather than
+    as a tool that failed. That is not a stylistic choice here -- the sentence is
+    the whole product of the call, and an exception would deliver the failure
+    without it.
+
+    On a thread for `_tool_run`'s reason: the pipe is blocking and the caller is
+    an event loop.
+    """
+    name = "propose_test"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(await asyncio.to_thread(specification.ask, dict(arguments or {})))
 
     return handler
 

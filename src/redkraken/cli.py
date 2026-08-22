@@ -2138,7 +2138,7 @@ def _run(arguments: argparse.Namespace) -> int:
     mistake, and defaulting past one would start a child somewhere nobody chose.
     """
     ledger = Ledger()
-    slice_ = _slice(ledger, arguments)
+    slice_ = _slice(ledger, arguments, arguments.config)
     if ledger.violations:
         return _render(report(program.COMMAND, ledger))
     return _with_settings(
@@ -2246,8 +2246,19 @@ def _boundary(ledger: Ledger) -> isolation.AgentContainer | None:
     return boundary
 
 
-def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | None:
-    """The execution slice this machine is configured for, or nothing."""
+def _slice(
+    ledger: Ledger,
+    arguments: argparse.Namespace,
+    configuration: Path | None = None,
+) -> execution.Slice | None:
+    """The execution slice this machine is configured for, or nothing.
+
+    The configuration is a parameter and not read off `arguments`, because only
+    one of the two callers has one: `rk run` names a Program file and
+    `rk playbook evaluate` names a workspace and a fixture. A slice built
+    without it claims a `perform` Task and refuses it by name, which is the
+    honest answer -- the replay resolves the Program from that file.
+    """
     boundary = _boundary(ledger)
     if boundary is None:
         return None
@@ -2271,6 +2282,12 @@ def _slice(ledger: Ledger, arguments: argparse.Namespace) -> execution.Slice | N
         state=agent,
         artifacts=artifact.root_from_environment(arguments.artifacts),
         tools=None if image is None else isolation.ToolContainer(image=image, door=boundary),
+        configuration=configuration,
+        # Read and not refused, for the reason the store and the image are not
+        # refused: this is the address one kind needs, and a machine with no
+        # `perform` Task to claim is fully configured without it. The refusal
+        # belongs where the capability would be spent, and says so there.
+        proxy_url=os.environ.get(PROXY.variable),
     )
 
 

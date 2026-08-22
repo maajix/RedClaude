@@ -1288,10 +1288,16 @@ class ToolChannelTest(unittest.TestCase):
         )
 
         with mock.patch.object(agent.pg, "connect", return_value=connection):
+            # Flat, because that is what `Channel.call` writes: the arguments
+            # sit beside the verb and not under a key. This test sent a nested
+            # envelope until 2026-08-22 and was the only caller that ever did,
+            # which is what let `call.get("arguments")` stay in the dispatcher
+            # while every real call reached this handler with nothing in it.
             served = serving(
                 {
                     "verb": roster.MINT_CALLBACK,
-                    "arguments": {"channel": "oob", "subject_label": "EP4"},
+                    "channel": "oob",
+                    "subject_label": "EP4",
                 }
             )
 
@@ -1301,6 +1307,47 @@ class ToolChannelTest(unittest.TestCase):
         channel, correlator, subject, _ = parameters
         self.assertEqual(("oob", "EP4"), (channel, subject))
         self.assertRegex(correlator, r"^[0-9a-f]{32}$")
+
+    def test_the_supervisor_carries_the_specification_the_child_authored(self):
+        # Ticket 141 built `propose_test` and the Contract in front of it. The
+        # dispatch arm is what makes the pair a tool rather than two halves, and
+        # without it the verb answers `unknown_call`. What this asserts is the
+        # part the handler decides: the label goes across on its own, everything
+        # else in the frame becomes the specification, and the verb itself is
+        # not a part of it -- `rk2_test_spec_problem` refuses a key it has no
+        # part for, so a `verb` left in would be a refusal about this side's
+        # envelope rather than about the child's plan.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = json.dumps(
+            {"outcome": "created", "test": "TS1"}
+        )
+
+        with mock.patch.object(agent.pg, "connect", return_value=connection):
+            served = serving(
+                {
+                    "verb": roster.PROPOSE_TEST,
+                    "hypothesis_label": "H3",
+                    "preconditions": [],
+                    "actions": [{"ordinal": 1, "role": "baseline"}],
+                    "assertions": [{"kind": "status_equals"}],
+                }
+            )
+
+        self.assertEqual({"outcome": "created", "test": "TS1"}, served)
+        statement, parameters = connection.execute.call_args_list[-1].args
+        self.assertEqual(agent.PROPOSE_TEST, statement)
+        label, document, _ = parameters
+        self.assertEqual("H3", label)
+        self.assertEqual(
+            {
+                "preconditions": [],
+                "actions": [{"ordinal": 1, "role": "baseline"}],
+                "assertions": [{"kind": "status_equals"}],
+            },
+            json.loads(document),
+        )
 
     def test_a_child_cannot_name_the_correlator_it_is_about_to_plant(self):
         # The closed schema refuses an undeclared argument long before this, so

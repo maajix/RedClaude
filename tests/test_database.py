@@ -19690,7 +19690,7 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
     def components(cls, name: str) -> dict[str, tuple]:
         """Every ranked component of every pending Task, by label."""
         rows = cls.as_owner(
-            "SELECT label, priority, direct_value, unlock_value, estimated_cost,"
+            "SELECT label, kind, priority, direct_value, unlock_value, estimated_cost,"
             "       estimated_time, safety_cost, novelty, confidence_of_execution,"
             "       ranked_weights_version"
             "  FROM tasks WHERE program_id = $1::uuid AND status = 'pending'"
@@ -20165,10 +20165,14 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
         # Every waiting Task is in the credit, and the sum is theirs -- not the
         # 1.0 ceiling, which at a high enough worth would saturate at two and
         # make "unblocks three paths" indistinguishable from "unblocks one".
+        # By kind, not by "everything that is not one of the two recon Tasks":
+        # since 140 the pass also derives a hunt Task for each of the three
+        # claims `blocked_on` minted, and those are pending, unscored and no
+        # part of this claim.
         waiting = [
             float(str(row["direct_value"]))
             for label, row in self.unlock_components.items()
-            if label not in self.unlock
+            if label not in self.unlock and str(row["kind"]) == "analyze"
         ]
         self.assertEqual(3, len(waiting))
         self.assertAlmostEqual(
@@ -35297,6 +35301,376 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
         self.assertEqual([], [tuple(str(field) for field in row) for row in self.problems])
 
 
+HYPOTHESIS_HUNT_SLUG = "selftest-hunt-derivation"
+
+
+class ClaimFixture:
+    """One Program, one subject, one claim, and one pass over them.
+
+    Shared by the two cases that are about the loop between recon and a
+    Finding: ticket 140 opens it by grading a claim into a hunt Task, and
+    ticket 152 closes it by turning the Test that hunt authored into work.
+    Both need exactly this arrangement to exist before their own question can
+    be asked, and an arrangement written twice is two fixtures that agree until
+    one of them is edited.
+    """
+
+    # -- what a claim is made of ----------------------------------------------
+
+    @classmethod
+    def grounds(cls, name: str) -> tuple[str, str]:
+        """One subject on the Surface and one Receipt an Observation may cite.
+
+        The smallest arrangement the triggers accept, and the same one the
+        scheduler fixture builds for its `analyze` scenario: a running, allowed
+        tool run under an open agent run and no Task, so no Lease is in play,
+        and a Receipt carrying both halves of 021's biconditional.
+        """
+        program_id = cls.identifiers[name]
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            subject = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)",
+                    (program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (subject, BASE_URL),
+            )
+            # The bytes the Receipt's `response_agent_sha` points at. Content
+            # addressed and program-global, so it is written once and found by
+            # every Program after the first.
+            cls.connection.execute(
+                "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
+                " VALUES ($1, 9, 'text/plain', 'agent_visible')"
+                " ON CONFLICT (sha256) DO NOTHING",
+                (ANALYZED_SHA,),
+            )
+            served = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, role, runs_as, model,"
+                    " effort, mission_packet) VALUES ($1::uuid, 'orchestrator',"
+                    " 'session', 'operator', 'low', '{}'::jsonb) RETURNING id::text",
+                    (program_id,),
+                ).scalar()
+            )
+            capability = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, tool, args,"
+                    " status, transport, decision, egress_token_sha256,"
+                    " egress_token_expires_at) VALUES ($1::uuid, $2::uuid,"
+                    " 'mcp__rk2__net_request', '{}'::jsonb, 'running', 'runtime',"
+                    " 'allow', $3, clock_timestamp() + interval '1 hour')"
+                    " RETURNING id::text",
+                    (program_id, served, "f" * 64),
+                ).scalar()
+            )
+            receipt = str(
+                cls.connection.execute(
+                    "INSERT INTO receipts (program_id, tool_run_id, lane, decision,"
+                    " reason, ts_arrival, response_agent_sha, scope_class,"
+                    " scope_version) VALUES ($1::uuid, $2::uuid, 'agent', 'allowed',"
+                    " 'seeded', now(), $3, 'target',"
+                    " (SELECT max(version) FROM program_scope_versions"
+                    "   WHERE program_id = $1::uuid)) RETURNING id::text",
+                    (program_id, capability, ANALYZED_SHA),
+                ).scalar()
+            )
+        return subject, receipt
+
+    @classmethod
+    def claim(
+        cls,
+        name: str,
+        subject: str,
+        receipt: str,
+        label: str,
+        property_class: str,
+        *,
+        falsifier: str = "a header that says otherwise",
+        supported: bool = True,
+        observed: str = "header_policy_observed",
+    ) -> str:
+        """One proposed claim, and what the derivation will read off it.
+
+        `status` is left to default: what is under test is that something moves
+        it, and a fixture that moved it would be testing itself. The parameters
+        are the four rules `rk2_gradable_claims` asks about that a fixture can
+        arrange -- the property class, whether the rationale is whole, whether
+        anything supports it, and which kind of Observation does.
+        """
+        program_id = cls.identifiers[name]
+        hypothesis = str(
+            cls.scalar(
+                "INSERT INTO hypotheses (program_id, subject_entity_id,"
+                " property_class, statement, rationale)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb) RETURNING id::text",
+                (
+                    program_id,
+                    subject,
+                    property_class,
+                    f"a claim {label}",
+                    json.dumps(
+                        {
+                            "mechanism": "what would make it so",
+                            "expectation": "what the answer would look like",
+                            "falsifier": falsifier,
+                        }
+                    ),
+                ),
+            )
+        )
+        if supported:
+            observation = str(
+                cls.scalar(
+                    "INSERT INTO observations (program_id, subject_entity_id, kind,"
+                    " summary, provenance_kind, receipt_id)"
+                    " VALUES ($1::uuid, $2::uuid, $3, $4, 'receipt', $5::uuid)"
+                    " RETURNING id::text",
+                    (program_id, subject, observed, f"what {label} rests on", receipt),
+                )
+            )
+            cls.as_owner(
+                "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id,"
+                " polarity, role) VALUES ($1::uuid, $2::uuid, 'supports', 'baseline')",
+                (hypothesis, observation),
+            )
+        return hypothesis
+
+    @classmethod
+    def pass_over(cls, name: str) -> dict:
+        """One ranking pass on that Program, as the runtime runs it."""
+        cls.bind(name)
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(cls.runtime.execute("SELECT rank_pass('runtime')").scalar())
+            )
+
+    @classmethod
+    def claims_by_status(cls, name: str) -> dict[str, str]:
+        """Every claim of that Program, by the statement it was written with."""
+        rows = cls.as_owner(
+            "SELECT statement, status FROM hypotheses WHERE program_id = $1::uuid",
+            (cls.identifiers[name],),
+        ).dicts()
+        return {str(row["statement"]): str(row["status"]) for row in rows}
+
+    @classmethod
+    def hunts(cls, name: str) -> list[tuple[str, str, str]]:
+        """The hunt Tasks of that Program, with what each one is blocked on."""
+        rows = cls.as_owner(
+            "SELECT t.label, t.status, coalesce(ready_for(t.*), 'ready') AS blocked"
+            "  FROM tasks t WHERE t.program_id = $1::uuid AND t.kind = 'hunt'"
+            " ORDER BY t.created_at, t.id",
+            (cls.identifiers[name],),
+        ).dicts()
+        return [
+            (str(row["label"]), str(row["status"]), str(row["blocked"])) for row in rows
+        ]
+
+
+
+class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
+    """Ticket 140: a promoted claim is graded, and the grade becomes work.
+
+    Two statements in the corpus created a Task of kind `hunt` before this one,
+    and both of them are downstream of a Finding. A Finding is opened from a
+    claim at `supported`, a claim reaches `supported` through a Test, and a Test
+    is what a hunt Task runs, so every entrance to the loop was inside it. Six
+    live hunts on 2026-08-22 ended after the two recon Tasks a Program opens for
+    itself, every time.
+
+    A derivation with nothing to derive from returns zero and looks correct,
+    which is how the gap survived four wiring audits. So each Program here is
+    one arranged reason for the answer, and the answers have to differ: one
+    claim that should become work, four that should not and say which rule
+    stopped them, and a ceiling that defers rather than drops.
+
+    Everything runs in `setUpClass` because a pass only means anything against
+    the rows the pass before it left. This case commits, and purges what it
+    wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in ("derives", "refuses", "capped"):
+            # `UNSEEDED` rather than `SCOPED` for the reason the two scheduler
+            # cases above give: 083 opens a recon Task against every exact
+            # inclusion, and "the Tasks are what this derivation made" would
+            # stop being a statement about this derivation.
+            path = write(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{HYPOTHESIS_HUNT_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_derives()
+        cls.arrange_refuses()
+        cls.arrange_capped()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1",
+                (f"{HYPOTHESIS_HUNT_SLUG}-%",),
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_derives(cls):
+        """One whole claim, two passes, and the Task that must appear once."""
+        subject, receipt = cls.grounds("derives")
+        cls.claim("derives", subject, receipt, "worth hunting", "transport.header_policy")
+        cls.first_pass = cls.pass_over("derives")
+        cls.after_first = cls.hunts("derives")
+        cls.second_pass = cls.pass_over("derives")
+        cls.after_second = cls.hunts("derives")
+        cls.derived_status = cls.claims_by_status("derives")
+
+    @classmethod
+    def arrange_refuses(cls):
+        """Two claims, each broken in exactly one of the ways the rules name.
+
+        Neither transport class is staged, and finding out why is worth more
+        than the case would have been. A fenced Program cannot hold either row:
+        `transport_hypothesis_guard` refuses an `unmakeable` claim at INSERT --
+        *"mitmproxy PARSES and RE-SERIALISES every request"* -- and a
+        `probe_only` claim can exist but can never be supported, because
+        `transport_evidence_guard` demands a `transport_parameters_observed`
+        Observation and `transport_observation_guard` refuses one citing an
+        intercepted agent-lane Receipt, which is every Receipt this Program has.
+
+        So `rk2_gradable_claims`' makeability arm refuses nothing that reaches
+        it *today*, and it is not therefore dead. Ticket 93 takes the
+        unintercepted transport measurement; the moment a Program holds one, a
+        `probe_only` claim can carry real support, and the arm is what keeps it
+        out of a hunt Task and in the probe lane where a `probe_only` claim
+        belongs. Left in, and left untested here rather than tested against a
+        row the runtime cannot hold.
+        """
+        subject, receipt = cls.grounds("refuses")
+        cls.claim(
+            "refuses", subject, receipt, "nothing supports", "injection.path",
+            supported=False,
+        )
+        cls.claim(
+            "refuses", subject, receipt, "no falsifier", "injection.command",
+            falsifier="",
+        )
+        # And one beside them that is whole, so a pass that graded nothing at
+        # all would fail here rather than pass by refusing everything.
+        cls.claim(
+            "refuses", subject, receipt, "whole beside the broken",
+            "transport.header_policy",
+        )
+        cls.refusing_pass = cls.pass_over("refuses")
+        cls.refused_status = cls.claims_by_status("refuses")
+        cls.refused_hunts = cls.hunts("refuses")
+
+    @classmethod
+    def arrange_capped(cls):
+        """Three whole claims under a ceiling of one, and three passes.
+
+        The active weights row is global, so the version is restored in a
+        `finally` for the reason 026's case gives: a scenario that left its own
+        ceiling behind would bound every case after it, in this file and in
+        every other.
+        """
+        subject, receipt = cls.grounds("capped")
+        for label, property_class in (
+            ("first in", "transport.header_policy"),
+            ("second in", "injection.path"),
+            ("third in", "injection.command"),
+        ):
+            cls.claim("capped", subject, receipt, label, property_class)
+
+        before = int(
+            str(cls.as_owner("SELECT version FROM scheduler_weights WHERE active").scalar())
+        )
+        try:
+            cls.operator('SELECT version_scheduler_weights(\'{"max_hunts_derived_per_pass": 1}\'::jsonb)')
+            cls.capped_passes = [cls.pass_over("capped") for _ in range(4)]
+            cls.capped_hunts = cls.hunts("capped")
+        finally:
+            # Two statements, because `scheduler_weights_one_active` is a unique
+            # index over the active row and one UPDATE flipping two rows trips
+            # it halfway through. Deactivate, then activate.
+            cls.as_owner("UPDATE scheduler_weights SET active = false WHERE active")
+            cls.as_owner(
+                "UPDATE scheduler_weights SET active = true WHERE version = $1::integer",
+                (str(before),),
+            )
+
+    # -- what the passes had to do --------------------------------------------
+
+    def test_a_whole_claim_is_graded_testable_by_the_pass(self):
+        """Nothing in the corpus wrote `proposed -> testable` before this one."""
+        self.assertEqual(1, self.first_pass["claims_graded"])
+        self.assertEqual({"a claim worth hunting": "testable"}, self.derived_status)
+
+    def test_the_graded_claim_becomes_a_hunt_task_the_scheduler_will_run(self):
+        self.assertEqual(1, self.first_pass["hunts_derived"])
+        self.assertEqual(1, len(self.after_first))
+        label, status, blocked = self.after_first[0]
+        self.assertEqual(("pending", "ready"), (status, blocked))
+        self.assertTrue(label)
+
+    def test_the_second_pass_does_not_derive_the_same_task_again(self):
+        """Deriving it again because the answer was disappointing is a loop."""
+        self.assertEqual(0, self.second_pass["claims_graded"])
+        self.assertEqual(0, self.second_pass["hunts_derived"])
+        self.assertEqual(self.after_first, self.after_second)
+
+    def test_a_claim_no_test_could_settle_stays_proposed(self):
+        self.assertEqual(
+            {
+                "a claim nothing supports": "proposed",
+                "a claim no falsifier": "proposed",
+                "a claim whole beside the broken": "testable",
+            },
+            self.refused_status,
+        )
+
+    def test_only_the_whole_claim_of_the_three_became_work(self):
+        self.assertEqual(1, self.refusing_pass["claims_graded"])
+        self.assertEqual(1, self.refusing_pass["hunts_derived"])
+        self.assertEqual(1, len(self.refused_hunts))
+
+    def test_the_ceiling_defers_the_rest_rather_than_dropping_them(self):
+        """Three claims, one Task a pass, and a fourth pass with nothing left."""
+        self.assertEqual(
+            [(3, 1, 2), (0, 1, 1), (0, 1, 0), (0, 0, 0)],
+            [
+                (one["claims_graded"], one["hunts_derived"], one["hunts_deferred"])
+                for one in self.capped_passes
+            ],
+        )
+        self.assertEqual(3, len(self.capped_hunts))
+        self.assertEqual(
+            [("pending", "ready")] * 3,
+            [(status, blocked) for _, status, blocked in self.capped_hunts],
+        )
+
+
 IDENTITY_SUBJECT_SLUG = "selftest-chain-identity"
 
 
@@ -47168,3 +47542,539 @@ class SurfaceBenchmarkTest(ReportFixture, DatabaseCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+TEST_PERFORMANCE_SLUG = "selftest-performance-derivation"
+
+
+class TestPerformanceTest(ClaimFixture, SchedulerFixture, DatabaseCase):
+    """Ticket 152: an authored Test becomes the work that performs it.
+
+    `replay.run` has been the performer since ticket 35 and had one caller,
+    `rk test replay`. An operator cannot use it after the fact: a replay is
+    attributed to an Agent run that has not ended, and by the time a person can
+    type the command every run the harness opened has ended. So two live
+    Programs reached four Tests each with `test_replays = 0`, every claim stayed
+    `testable`, and nothing downstream of a claim -- Finding, validation,
+    report -- could begin.
+
+    A derivation with nothing to derive from returns zero and looks correct,
+    which is how ticket 140's gap survived four audits. So each Program here is
+    one arranged reason for the answer: a Test that must become work, three
+    that must not and say which rule stopped them, and a ceiling that defers.
+
+    Everything runs in `setUpClass` because a pass only means anything against
+    the rows the pass before it left. This case commits, and purges what it
+    wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        for name in ("derives", "refuses", "capped"):
+            path = write(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{TEST_PERFORMANCE_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_derives()
+        cls.arrange_refuses()
+        cls.arrange_capped()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1",
+                (f"{TEST_PERFORMANCE_SLUG}-%",),
+            )
+        super().tearDownClass()
+
+    # -- what a Test is made of ------------------------------------------------
+
+    @staticmethod
+    def specification(*, impact: str | None = None) -> str:
+        """The smallest specification `rk2_test_spec_problem` admits.
+
+        Three actions in the three roles, because a Test that compares nothing
+        is not a Test, and one assertion, because a walk with nothing to check
+        settles nothing. Written out rather than borrowed from a live Program:
+        what this case is about is the derivation, and a spec that drifted with
+        somebody else's fixture would move this case with it.
+        """
+        spec: dict = {
+            # `tests_spec_shape_check` requires every part, and the scope
+            # precondition is the one a detection Test always holds: the
+            # subject is a target of the live scope or there is nothing to
+            # send.
+            "preconditions": [
+                {"kind": "scope_holds",
+                 "detail": "the application is a target of the live scope"}
+            ],
+            "setup": [],
+            "actions": [
+                {"ordinal": 1, "kind": "request", "role": "baseline",
+                 "method": "GET", "url": BASE_URL + "/"},
+                {"ordinal": 2, "kind": "request", "role": "variant",
+                 "method": "GET", "url": BASE_URL + "/probe"},
+                {"ordinal": 3, "kind": "request", "role": "control",
+                 "method": "GET", "url": BASE_URL + "/"},
+            ],
+            "cleanup": [],
+            "assertions": [
+                {"id": "control-reproduces-baseline", "kind": "body_equals",
+                 "action": 3, "against": 1},
+            ],
+        }
+        if impact is not None:
+            # The four keys `rk2_test_impact_problem` requires, and an
+            # after-state that names an action an assertion already reads --
+            # otherwise the state is fetched and never checked, which the same
+            # rule refuses by name.
+            spec["impact"] = {
+                "class": impact,
+                "effect": "reads one record the Identity may not read",
+                "cleanup": "nothing is written, so there is nothing to undo",
+                "after_state": 3,
+            }
+            # And the requests that undo it, which the same rule requires of an
+            # impact Test. A setup or cleanup request carries a method and a URL
+            # and nothing else -- it has no role and no ordinal, because it is
+            # not one of the three the assertions compare.
+            spec["cleanup"] = [{"method": "GET", "url": BASE_URL + "/"}]
+        return json.dumps(spec)
+
+    @classmethod
+    def authored(cls, name: str, hypothesis: str, *, impact: str | None = None) -> str:
+        """One Test on file against that claim, as a hunt would have left it.
+
+        The digest is computed by the function the CHECK compares against, so
+        the row is admitted for the reason a real one is rather than because a
+        fixture guessed the same number.
+        """
+        return str(
+            cls.as_owner(
+                "INSERT INTO tests (program_id, hypothesis_id, spec, spec_sha256,"
+                " impact_class) VALUES ($1::uuid, $2::uuid, $3::jsonb,"
+                " rk2_test_spec_digest($3::jsonb), $4) RETURNING id::text",
+                (cls.identifiers[name], hypothesis, cls.specification(impact=impact),
+                 impact),
+            ).scalar()
+        )
+
+    @classmethod
+    def replayed(cls, name: str, test: str) -> None:
+        """A Test somebody already performed, in the two rows that say so."""
+        program_id = cls.identifiers[name]
+        served = str(
+            cls.as_owner(
+                "INSERT INTO agent_runs (program_id, role, runs_as, model, effort,"
+                " mission_packet) VALUES ($1::uuid, 'orchestrator', 'session',"
+                " 'operator', 'low', '{}'::jsonb) RETURNING id::text",
+                (program_id,),
+            ).scalar()
+        )
+        tool_run = str(
+            cls.as_owner(
+                "INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status,"
+                " transport) VALUES ($1::uuid, $2::uuid, 'mcp__rk2__net_request',"
+                " '{}'::jsonb, 'running', 'runtime') RETURNING id::text",
+                (program_id, served),
+            ).scalar()
+        )
+        cls.as_owner(
+            "INSERT INTO test_replays (tool_run_id, program_id, test_id, spec_sha256)"
+            " SELECT $1::uuid, $2::uuid, t.id, t.spec_sha256 FROM tests t"
+            "  WHERE t.id = $3::uuid",
+            (tool_run, program_id, test),
+        )
+
+    @classmethod
+    def performances(cls, name: str) -> list[tuple[str, str, str]]:
+        """The `perform` Tasks of that Program, with what each one is blocked on."""
+        rows = cls.as_owner(
+            "SELECT t.label, t.status, coalesce(ready_for(t.*), 'ready') AS blocked"
+            "  FROM tasks t WHERE t.program_id = $1::uuid AND t.kind = 'perform'"
+            " ORDER BY t.created_at, t.id",
+            (cls.identifiers[name],),
+        ).dicts()
+        return [
+            (str(row["label"]), str(row["status"]), str(row["blocked"])) for row in rows
+        ]
+
+    @classmethod
+    def named_test(cls, name: str) -> list[str]:
+        """The Test each `perform` Task of that Program names."""
+        rows = cls.as_owner(
+            "SELECT ts.label FROM tasks t JOIN tests ts ON ts.id = t.test_id"
+            " WHERE t.program_id = $1::uuid AND t.kind = 'perform'"
+            " ORDER BY t.created_at, t.id",
+            (cls.identifiers[name],),
+        ).dicts()
+        return [str(row["label"]) for row in rows]
+
+    @classmethod
+    def standing(cls, name: str) -> list[tuple[str, str, str]]:
+        """What the scheduler says about each `perform` Task, factor and verdict.
+
+        `performances` asks `ready_for`, which is only the second of the two
+        questions `claimable_for` puts. This asks the whole of it, plus the
+        factor the first question turns on, because the two failures 152 shipped
+        with were invisible to `ready_for`: it called both Tasks ready while
+        `cancel_reason_for` was cancelling them.
+        """
+        rows = cls.as_owner(
+            "SELECT t.label, novelty_for(t.*)::text AS novelty,"
+            "       coalesce(claimable_for(t.*, w.*), 'claimable') AS verdict"
+            "  FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'perform'"
+            " ORDER BY t.created_at, t.id",
+            (cls.identifiers[name],),
+        ).dicts()
+        return [
+            (str(row["label"]), str(row["novelty"]), str(row["verdict"]))
+            for row in rows
+        ]
+
+    @classmethod
+    def graded(cls, name: str, label: str, property_class: str) -> str:
+        """One whole claim, graded testable by a pass rather than by a fixture."""
+        subject, receipt = cls.grounds(name)
+        hypothesis = cls.claim(name, subject, receipt, label, property_class)
+        cls.pass_over(name)
+        return hypothesis
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_derives(cls):
+        """One Test on file, two passes, and the Task that must appear once."""
+        hypothesis = cls.graded("derives", "worth performing", "transport.header_policy")
+        cls.derived_test = cls.authored("derives", hypothesis)
+        cls.first_pass = cls.pass_over("derives")
+        cls.after_first = cls.performances("derives")
+        cls.first_named = cls.named_test("derives")
+        cls.second_pass = cls.pass_over("derives")
+        cls.after_second = cls.performances("derives")
+        cls.second_standing = cls.standing("derives")
+
+    @classmethod
+    def arrange_refuses(cls):
+        """Two Tests the frontier must not name, and one beside them it must.
+
+        An impact Test is refused because `open_test_replay` refuses one by
+        name -- it settles no claim, needs an operator grant and is opened by
+        the other verb -- so a `perform` Task naming one would be a Task whose
+        first statement is a refusal.
+
+        A Test somebody already performed is refused for the reason the hunt
+        frontier gives: a Task that ran is an answer, and deriving it again is
+        a loop.
+        """
+        subject, receipt = cls.grounds("refuses")
+        claims = [
+            cls.claim("refuses", subject, receipt, one, kind)
+            for one, kind in (
+                ("behind an impact test", "transport.header_policy"),
+                ("behind a performed test", "injection.path"),
+                ("behind a fresh test", "injection.command"),
+            )
+        ]
+        cls.pass_over("refuses")
+        cls.authored("refuses", claims[0], impact="read_other_data")
+        performed = cls.authored("refuses", claims[1])
+        cls.replayed("refuses", performed)
+        cls.authored("refuses", claims[2])
+
+        cls.refusing_pass = cls.pass_over("refuses")
+        cls.refused_performances = cls.performances("refuses")
+        cls.refused_named = cls.named_test("refuses")
+
+    @classmethod
+    def arrange_capped(cls):
+        """Three Tests under a ceiling of one, and four passes.
+
+        The active weights row is global, so the version is restored in a
+        `finally` for the reason 026's case gives: a scenario that left its own
+        ceiling behind would bound every case after it.
+        """
+        subject, receipt = cls.grounds("capped")
+        claims = [
+            cls.claim("capped", subject, receipt, one, kind)
+            for one, kind in (
+                ("first in", "transport.header_policy"),
+                ("second in", "injection.path"),
+                ("third in", "injection.command"),
+            )
+        ]
+        cls.pass_over("capped")
+        for one in claims:
+            cls.authored("capped", one)
+
+        before = int(
+            str(cls.as_owner("SELECT version FROM scheduler_weights WHERE active").scalar())
+        )
+        try:
+            cls.operator(
+                "SELECT version_scheduler_weights("
+                "'{\"max_performances_derived_per_pass\": 1}'::jsonb)"
+            )
+            cls.capped_passes = [cls.pass_over("capped") for _ in range(4)]
+            cls.capped_performances = cls.performances("capped")
+        finally:
+            cls.as_owner("UPDATE scheduler_weights SET active = false WHERE active")
+            cls.as_owner(
+                "UPDATE scheduler_weights SET active = true WHERE version = $1::integer",
+                (str(before),),
+            )
+
+    # -- what the passes had to do --------------------------------------------
+
+    def test_an_authored_test_becomes_the_task_that_performs_it(self):
+        """Nothing in the corpus created a `perform` Task before this one."""
+        self.assertEqual(1, self.first_pass["performances_derived"])
+        self.assertEqual(1, len(self.after_first))
+        label, status, blocked = self.after_first[0]
+        self.assertEqual(("pending", "ready"), (status, blocked))
+        self.assertTrue(label)
+
+    def test_the_task_names_the_test_it_was_derived_from(self):
+        """The whole point of the column: a Task that acts on one row names it."""
+        named = str(
+            self.as_owner(
+                "SELECT label FROM tests WHERE id = $1::uuid", (self.derived_test,)
+            ).scalar()
+        )
+        self.assertEqual([named], self.first_named)
+
+    def test_the_second_pass_does_not_derive_the_same_task_again(self):
+        self.assertEqual(0, self.second_pass["performances_derived"])
+        self.assertEqual(self.after_first, self.after_second)
+
+    def test_the_derived_task_survives_the_pass_that_follows_it(self):
+        """The defect 152 shipped with, in the one word that named it.
+
+        `novelty_for` answers per kind and had five arms. A `perform` Task fell
+        past all of them to the closing `RETURN 0`, `cancel_reason_for` ends
+        with the general rule -- nothing left to learn is nothing worth running
+        -- and so the pass after the deriving one abandoned the Task as
+        `answered` with zero attempts, while `rank_candidates` refused the one
+        that was still pending with the same word. `rk2hunt13` measured both
+        live: T5 abandoned, T6 pending, ready and unclaimable, and the lap that
+        should have performed a Test reported `nothing_to_execute`.
+
+        A Test nobody has walked is the whole of what is not yet known about
+        it, so the novelty is 1 and the verdict is that it may be claimed.
+        """
+        self.assertEqual(
+            [("1", "claimable")],
+            [(novelty, verdict) for _, novelty, verdict in self.second_standing],
+        )
+
+    def test_an_impact_test_and_a_performed_one_are_not_derived(self):
+        self.assertEqual(1, self.refusing_pass["performances_derived"])
+        self.assertEqual(1, len(self.refused_performances))
+
+    def test_the_one_that_was_derived_is_the_fresh_detection_test(self):
+        fresh = str(
+            self.as_owner(
+                "SELECT ts.label FROM tests ts JOIN hypotheses h ON h.id = ts.hypothesis_id"
+                " WHERE ts.program_id = $1::uuid AND ts.impact_class IS NULL"
+                "   AND h.statement = 'a claim behind a fresh test'",
+                (self.identifiers["refuses"],),
+            ).scalar()
+        )
+        self.assertEqual([fresh], self.refused_named)
+
+    def test_the_ceiling_defers_the_rest_rather_than_dropping_them(self):
+        """Three Tests, one Task a pass, and a fourth pass with nothing left."""
+        self.assertEqual(
+            [(1, 2), (1, 1), (1, 0), (0, 0)],
+            [
+                (one["performances_derived"], one["performances_deferred"])
+                for one in self.capped_passes
+            ],
+        )
+        self.assertEqual(3, len(self.capped_performances))
+        self.assertEqual(
+            [("pending", "ready")] * 3,
+            [(status, blocked) for _, status, blocked in self.capped_performances],
+        )
+
+
+SCOPED_SPECIFICATION_SLUG = "selftest-specification-scope"
+
+
+class ScopedSpecificationTest(ClaimFixture, SchedulerFixture, DatabaseCase):
+    """Ticket 154: a Test is authored inside the scope it will run in.
+
+    `rk2_replay_plan` walks every request a Test would make and refuses the run
+    when one of them falls outside the Program's scope. `propose_test` did not,
+    so the two disagreed about whether a row may exist: one admitted the Test
+    and the other refused to act on it, and the disagreement was found by the
+    Task that claimed the Test -- a pass later, and a run too late to write a
+    second specification.
+
+    `rk2hunt13` measured it. Both hunts authored a Test carrying `http://`
+    actions against a Program that admits https on 443 and nothing else, both
+    proposals recorded `created`, and the first `perform` Task to reach
+    `replay.run` came back with `the Test reaches outside the current scope`.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        path = write(
+            UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                'name = "matrix-web"', f'name = "{SCOPED_SPECIFICATION_SLUG}"'
+            )
+        )
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.identifiers = {"scope": opened.facts["program_id"]}
+
+        subject, receipt = cls.grounds("scope")
+        claim = cls.claim(
+            "scope", subject, receipt, "worth testing", "transport.header_policy"
+        )
+        cls.pass_over("scope")
+        cls.label = str(
+            cls.as_owner(
+                "SELECT label FROM hypotheses WHERE id = $1::uuid", (claim,)
+            ).scalar()
+        )
+
+        cls.inside = cls.proposes(BASE_URL)
+        cls.outside = cls.proposes("https://admin.example.com")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (SCOPED_SPECIFICATION_SLUG,)
+            )
+        super().tearDownClass()
+
+    @staticmethod
+    def specification(base: str) -> str:
+        """The smallest specification the shape rule admits, on one host.
+
+        The same three roles and one assertion `TestPerformanceTest` uses, so
+        that the only thing that differs between the two proposals below is
+        where the requests go.
+        """
+        return json.dumps(
+            {
+                "preconditions": [
+                    {"kind": "scope_holds",
+                     "detail": "the application is a target of the live scope"}
+                ],
+                "setup": [],
+                "actions": [
+                    {"ordinal": 1, "kind": "request", "role": "baseline",
+                     "method": "GET", "url": base + "/"},
+                    {"ordinal": 2, "kind": "request", "role": "variant",
+                     "method": "GET", "url": base + "/probe"},
+                    {"ordinal": 3, "kind": "request", "role": "control",
+                     "method": "GET", "url": base + "/"},
+                ],
+                "cleanup": [],
+                "assertions": [
+                    {"id": "control-reproduces-baseline", "kind": "body_equals",
+                     "action": 3, "against": 1},
+                ],
+            }
+        )
+
+    @classmethod
+    def proposes(cls, base: str) -> dict:
+        """One specification offered the way a hunt offers one."""
+        cls.bind("scope")
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(
+                    cls.runtime.execute(
+                        "SELECT propose_test($1, $2::jsonb, NULL)",
+                        (cls.label, cls.specification(base)),
+                    ).scalar()
+                )
+            )
+
+    @classmethod
+    def stored(cls) -> list[str]:
+        """Every Test of that Program, in the order they were written."""
+        rows = cls.as_owner(
+            "SELECT label FROM tests WHERE program_id = $1::uuid ORDER BY created_at",
+            (cls.identifiers["scope"],),
+        ).dicts()
+        return [str(row["label"]) for row in rows]
+
+    @classmethod
+    def proposals(cls) -> list[tuple[str, str]]:
+        """What the audit table recorded for each attempt."""
+        rows = cls.as_owner(
+            "SELECT outcome, coalesce(refusal, '') AS refusal FROM test_proposals"
+            " WHERE program_id = $1::uuid ORDER BY at, id",
+            (cls.identifiers["scope"],),
+        ).dicts()
+        return [(str(row["outcome"]), str(row["refusal"])) for row in rows]
+
+    def test_a_specification_inside_the_scope_is_written(self):
+        self.assertEqual("created", self.inside["outcome"])
+
+    def test_a_specification_the_door_would_refuse_is_refused_to_its_author(self):
+        self.assertEqual("refused", self.outside["outcome"])
+        self.assertEqual(
+            "the Test reaches outside the current scope: https://admin.example.com/",
+            self.outside["refusal"],
+        )
+
+    def test_the_refused_specification_is_not_a_test_row(self):
+        # One Test, the one that may be performed. A row here is a row the
+        # derivation would open a `perform` Task against.
+        self.assertEqual([self.inside["test"]], self.stored())
+
+    def test_both_attempts_are_on_the_record(self):
+        # The refusal is a fact about a run, not an absence. `test_proposals`
+        # is what an operator reads to see what a hunt tried to author.
+        self.assertEqual(
+            [
+                ("created", ""),
+                ("refused",
+                 "the Test reaches outside the current scope: "
+                 "https://admin.example.com/"),
+            ],
+            self.proposals(),
+        )
+
+    def test_the_claim_is_left_exactly_as_it_was(self):
+        # Nothing about the claim was decided by the refusal, so it is still
+        # testable and a second specification may still be written for it.
+        self.assertEqual(
+            "testable",
+            str(
+                self.as_owner(
+                    "SELECT status FROM hypotheses WHERE program_id = $1::uuid"
+                    "   AND label = $2",
+                    (self.identifiers["scope"], self.label),
+                ).scalar()
+            ),
+        )

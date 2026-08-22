@@ -1275,6 +1275,18 @@ class SchemaAgreementTest(unittest.TestCase):
         r"max_concurrent_subagents smallint NOT NULL DEFAULT (?P<cap>\d+)"
     )
 
+    #: A role added after 019 was applied, which is the only shape a seventh
+    #: can have: 019 has a recorded checksum, so the row cannot be written into
+    #: it, and by the time a later migration runs the model, effort and skill
+    #: columns exist -- so the row states all nine at once rather than being
+    #: inserted here and updated there. Ticket 152's `performer` is the first.
+    LATER_ROWS = re.compile(
+        r"\('(?P<role>\w+)', '(?P<runs_as>\w+)', "
+        r"ARRAY\['(?P<invocable_by>\w+)'\]::text\[\], "
+        r"(?P<executes_tasks>true|false), (?P<max_concurrent>\d+), (?P<clamp>true|false),\s*"
+        r"'(?P<model>[\w.-]+)', '(?P<effort>\w+)', (?P<loads_skills>true|false)\)"
+    )
+
     @classmethod
     def setUpClass(cls):
         migrations = ROOT / "src" / "redkraken" / "migrations"
@@ -1282,6 +1294,41 @@ class SchemaAgreementTest(unittest.TestCase):
         cls.model_and_effort_sql = (
             migrations / "20260813T200000Z__a_role_runs_at_the_rosters_model_and_effort.sql"
         ).read_text(encoding="utf-8")
+        #: Every migration after 019. The roster's statement in the schema is the
+        #: whole corpus and not one file, and reading only the file the first six
+        #: are in is how a seventh role could be added to this module and to the
+        #: database and still be reported as missing from both.
+        cls.later = [
+            path.read_text(encoding="utf-8")
+            for path in sorted(migrations.glob("*.sql"))
+            if path.name != "0019_role_kinds.sql"
+        ]
+
+    def added_rows(self, pattern: re.Pattern) -> list[re.Match]:
+        """Every row a later migration adds, wherever in the corpus it is."""
+        found = []
+        for text in self.later:
+            start = 0
+            while True:
+                where = text.find("INSERT INTO roles", start)
+                if where < 0:
+                    break
+                found += list(pattern.finditer(text[where : text.index(";", where)]))
+                start = text.index(";", where)
+        return found
+
+    def added_mappings(self) -> list[re.Match]:
+        """Every role/kind pair a later migration adds."""
+        found = []
+        for text in self.later:
+            start = 0
+            while True:
+                where = text.find("INSERT INTO role_task_kinds", start)
+                if where < 0:
+                    break
+                found += list(self.KINDS.finditer(text[where : text.index(";", where)]))
+                start = text.index(";", where)
+        return found
 
     def statement(self, prefix: str, sql: str | None = None) -> str:
         text = self.sql if sql is None else sql
@@ -1289,7 +1336,10 @@ class SchemaAgreementTest(unittest.TestCase):
         return text[start : text.index(";", start)]
 
     def test_every_role_row_the_schema_carries_is_this_rosters_row(self):
-        rows = self.ROWS.finditer(self.statement("INSERT INTO roles"))
+        rows = [
+            *self.ROWS.finditer(self.statement("INSERT INTO roles")),
+            *self.added_rows(self.LATER_ROWS),
+        ]
         stated = {}
         for row in rows:
             role = roster.ROLES[row["role"]]
@@ -1320,9 +1370,16 @@ class SchemaAgreementTest(unittest.TestCase):
         # them one statement: a roster edit the migration does not follow fails
         # here rather than in a claim nobody is watching.
         stated = {}
-        for row in self.MODEL_AND_EFFORT.finditer(
-            self.statement("UPDATE roles r SET", self.model_and_effort_sql)
-        ):
+        for row in [
+            *self.MODEL_AND_EFFORT.finditer(
+                self.statement("UPDATE roles r SET", self.model_and_effort_sql)
+            ),
+            # A role added after PH2-71 states its model and effort in the row
+            # that creates it, because by then the two columns exist and are
+            # NOT NULL. One vocabulary, two spellings, and this is where they
+            # are read as one.
+            *self.added_rows(self.LATER_ROWS),
+        ]:
             role = roster.ROLES[row["role"]]
             stated[row["role"]] = (row["model"], row["effort"])
             with self.subTest(role=row["role"]):
@@ -1350,7 +1407,10 @@ class SchemaAgreementTest(unittest.TestCase):
     def test_the_task_kind_mapping_is_the_schemas(self):
         mapped = {
             row["kind"]: row["role"]
-            for row in self.KINDS.finditer(self.statement("INSERT INTO role_task_kinds"))
+            for row in [
+                *self.KINDS.finditer(self.statement("INSERT INTO role_task_kinds")),
+                *self.added_mappings(),
+            ]
         }
         owned = {
             kind: name for name, role in roster.ROLES.items() for kind in role.task_kinds
@@ -1449,6 +1509,19 @@ class ContractSchemaTest(unittest.TestCase):
         self.assertEqual(roster._PAGE, (limit["minimum"], limit["maximum"]))
         self.assertNotIn("minLength", limit)
         self.assertNotIn("maxLength", limit)
+
+    def test_a_bounded_list_says_how_many_items_it_takes(self):
+        # The third measure and the same rule as the two above. `minimum` on an
+        # array names a property of a number, and every validator ignores it --
+        # so a Test's "between three and thirty-two actions" written that way
+        # would be a promise the pair never checks, in front of a gate that
+        # refuses on it. `_value_fault` measures an array by `len`, so the
+        # schema says the same thing in the word a validator reads.
+        actions = roster.CONTRACTS["mcp__rk2__propose_test"].schema()["properties"]["actions"]
+
+        self.assertEqual((3, 32), (actions["minItems"], actions["maxItems"]))
+        self.assertNotIn("minimum", actions)
+        self.assertNotIn("minLength", actions)
 
     def test_a_request_may_declare_a_body_and_it_is_a_bounded_string(self):
         """Ticket 96's first criterion, read off the document the pair is served.
@@ -1733,6 +1806,50 @@ class VocabularyAgreementTest(unittest.TestCase):
                         break
         return rows
 
+    @classmethod
+    def returned(cls, function: str) -> tuple[str, ...]:
+        """The array literal one no-argument `rk2_test_*()` function returns.
+
+        A third extraction beside `constraint` and `seeded`, because these
+        vocabularies are declared a third way and had to be. `rk2_test_spec_problem`
+        is an IMMUTABLE function, so the words it checks against cannot be rows in
+        a table it would have to select from, and they are not a CHECK on a column
+        either because the thing they constrain is a key inside a jsonb document.
+        They are `SELECT ARRAY[...]` bodies, and this reads them where they are
+        written.
+
+        The bracket is closed by a scan for `]` rather than by `balanced`, which
+        counts parentheses. Every one of these bodies is a flat list of string
+        literals with no bracket inside it, and a body that stopped being one
+        would come back short and fail, which is the safe direction.
+        """
+        found: tuple[str, ...] = ()
+        for text in cls.migrations:
+            for created in re.finditer(rf"CREATE FUNCTION {function}\(\)", text):
+                body = text[created.end() : text.index("$fn$;", created.end())]
+                opened = body.index("ARRAY[")
+                found = tuple(cls.LITERAL.findall(body[opened : body.index("]", opened)]))
+        return found
+
+    @classmethod
+    def methods(cls) -> tuple[str, ...]:
+        """The methods `rk2_test_request_problem` will store a request under.
+
+        Not an `ARRAY` body like the four above. This one is written inline as
+        the `NOT IN` list of the guard that refuses everything else, because the
+        function that reads the vocabulary is the function that refuses on it.
+        So it is read where it is written, anchored on the statement.
+        """
+        found: tuple[str, ...] = ()
+        for text in cls.migrations:
+            for created in re.finditer(r"CREATE FUNCTION rk2_test_request_problem\(", text):
+                body = text[created.end() : text.index("$fn$;", created.end())]
+                listed = body.index("NOT IN")
+                found = tuple(
+                    cls.LITERAL.findall(cls.balanced(body, body.index("(", listed)))
+                )
+        return found
+
     def test_the_entity_vocabularies_are_the_columns_the_corpus_checks(self):
         for constant, table, column in (
             (roster.ENTITY_TYPES, "entities", "type"),
@@ -1799,11 +1916,40 @@ class VocabularyAgreementTest(unittest.TestCase):
             with self.subTest(property_class=identifier):
                 self.assertEqual(family, identifier.split(".")[0])
 
+    def test_the_test_specification_vocabularies_are_the_ones_the_corpus_declares(self):
+        # The four the shape rule reads out of its own helpers, and the one it
+        # writes inline. `propose_test` serves all five as enums, so a word this
+        # roster offered and `rk2_test_spec_problem` did not know would be a
+        # specification refused by a sentence after the model had already been
+        # told the word was allowed.
+        for constant, function in (
+            (roster.TEST_ACTION_ROLES, "rk2_test_roles"),
+            (roster.TEST_PRECONDITION_KINDS, "rk2_test_precondition_kinds"),
+            (roster.TEST_ASSERTION_KINDS, "rk2_test_assertion_kinds"),
+        ):
+            with self.subTest(function=function):
+                declared = self.returned(function)
+                self.assertTrue(declared, f"{function} declares no vocabulary")
+                self.assertEqual(set(constant), set(declared))
+        self.assertEqual(set(roster.TEST_REQUEST_METHODS), set(self.methods()))
+        # And the one word an action's `kind` may be. Not a vocabulary function,
+        # because 035 states it as a literal comparison -- so this is read as the
+        # literal it is, and a corpus that widened it without widening the roster
+        # would leave the model unable to say the new word.
+        self.assertEqual(("request",), roster.TEST_ACTION_KINDS)
+        self.assertTrue(
+            any(
+                "<> 'request' THEN" in text
+                for text in self.migrations
+            ),
+            "no migration states the one kind of action a Test performs",
+        )
+
     def test_every_element_field_the_schema_closes_names_a_corpus_vocabulary(self):
-        # The wiring itself, so that a seventh element list or a fifth entity
-        # field cannot be added with a tuple nothing above measures. Every enum
-        # the served schema carries under `items` is one of the constants those
-        # tests hold to the corpus, and no other.
+        # The wiring itself, so that a seventh element list, a fifth entity field
+        # or a later Contract's element cannot be added with a tuple nothing
+        # above measures. Every enum any served schema carries under `items` is
+        # one of the constants those tests hold to the corpus, and no other.
         held = {
             roster.ENTITY_TYPES,
             roster.APPLICATION_KINDS,
@@ -1816,19 +1962,77 @@ class VocabularyAgreementTest(unittest.TestCase):
             roster.EVIDENCE_POLARITIES,
             roster.EVIDENCE_ROLES,
             roster.TASK_KINDS,
+            roster.TEST_PRECONDITION_KINDS,
+            roster.TEST_ACTION_ROLES,
+            roster.TEST_ACTION_KINDS,
+            roster.TEST_ASSERTION_KINDS,
+            roster.TEST_REQUEST_METHODS,
         }
-        contract = roster.CONTRACTS["mcp__rk2__submit_mission_result"]
 
+        # Only the fields that close a vocabulary. An element field may instead
+        # be bounded -- an ordinal, a status, the length of a url -- and a bound
+        # is not a word list for this test to hold to the corpus.
         declared = [
-            (name, field, shape)
+            (tool, name, field, shape)
+            for tool, contract in roster.CONTRACTS.items()
             for name, argument in contract.arguments.items()
             if argument.element is not None
             for field, shape in argument.element.items()
+            if shape.enum
         ]
         self.assertTrue(declared)
-        for name, field, shape in declared:
-            with self.subTest(element=f"{name}[].{field}"):
+        for tool, name, field, shape in declared:
+            with self.subTest(element=f"{tool}.{name}[].{field}"):
                 self.assertIn(shape.enum, held)
+
+    def test_a_claims_rationale_is_the_three_fields_the_column_admits(self):
+        """Ticket 144: four claims were dropped for writing one paragraph here.
+
+        `rk2hunt6` on 2026-08-22 was the first hunt in this tree where a model
+        proposed a Hypothesis at all, and all four it proposed were dropped
+        `malformed_field` citing "rationale is not an object". Every part was
+        answered and answered well; the three were in one string because the
+        served schema said `rationale` was a field and did not say it was three.
+
+        So the keys are held to `rk2_rationale_keys()`, which is the same value
+        `hypotheses_rationale_shape` checks the column against -- a fourth key
+        added there and not here is a part a run cannot send, and a key dropped
+        there and not here is a whole claim refused at the door for a field the
+        column no longer takes.
+        """
+        declared = self.returned("rk2_rationale_keys")
+        self.assertTrue(declared, "rk2_rationale_keys declares no vocabulary")
+        self.assertEqual(set(roster.RATIONALE_KEYS), set(declared))
+
+        rationale = roster._ELEMENTS["hypotheses"]["rationale"]
+        self.assertEqual("object", rationale.kind)
+        self.assertEqual(set(declared), set(rationale.element or {}))
+        # `type: object` is what the drop was about, so the rendered subschema
+        # is asserted rather than the constant behind it.
+        self.assertEqual(
+            {
+                "type": "object",
+                "properties": {
+                    key: {"type": "string", "minLength": 1, "maxLength": 2000}
+                    for key in declared
+                },
+            },
+            rationale.schema(),
+        )
+
+    def test_the_gate_refuses_a_rationale_the_column_would_refuse(self):
+        """The gate's half of the same promise, checked the way it is served."""
+        rationale = roster._ELEMENTS["hypotheses"]["rationale"]
+        whole = {key: "a sentence" for key in roster.RATIONALE_KEYS}
+
+        self.assertIsNone(roster._value_fault(rationale, whole))
+        self.assertEqual(
+            "is not object", roster._value_fault(rationale, "one paragraph")
+        )
+        self.assertEqual(
+            "carries 'falsifier', which is outside 1-2000",
+            roster._value_fault(rationale, {**whole, "falsifier": ""}),
+        )
 
 
 def agent_read() -> str:

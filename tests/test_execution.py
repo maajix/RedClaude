@@ -36,6 +36,7 @@ from redkraken import (
     roster,
     store,
 )
+from redkraken import outcome as outcome_module
 from redkraken.outcome import Ledger
 from tests import fixtures
 
@@ -121,6 +122,8 @@ def started_row(**overrides) -> tuple:
         subject.url,
         subject.subagent_cap,
         subject.token_cap,
+        subject.hypothesis_label,
+        subject.test_label,
     )
 
 
@@ -239,6 +242,11 @@ class Recorder:
 
     def __init__(self, **answers):
         self.calls: list[tuple[str, tuple]] = []
+        # A real connection always has these, and the slice now reads them on
+        # every attempt rather than only where a tool image was described: the
+        # supervisor answers `propose_test` and `propose_finding`, which need a
+        # database whether or not this machine can start a tool container.
+        self.settings = pg.settings_from_url("postgres://rk2_runtime@127.0.0.1:1/rk2")
         self.slate = answers.get("slate", 1)
         self.claim = answers.get("claim", "AR7")
         # The Task-less run one choice is made in, and the two ceilings the
@@ -953,6 +961,63 @@ class ObjectiveTest(unittest.TestCase):
         self.assertIn("mcp__rk2__http_request", text)
         self.assertIn("mcp__rk2__submit_mission_result", text)
         self.assertIn("Receipt", text)
+
+    def test_the_objective_asks_for_the_claim_the_run_is_entitled_to_file(self):
+        """Six hunts filed no Hypothesis because nothing asked for one."""
+        text = claimed().objective(())
+        self.assertIn("Hypothesis", text)
+        self.assertIn("property_class", text)
+        for answered in ("mechanism", "expectation", "falsifier"):
+            self.assertIn(answered, text)
+        self.assertIn("evidence edge", text)
+
+    def test_the_objective_bounds_the_claim_it_asks_for(self):
+        """Asking without bounding buys claims the one answer cannot carry."""
+        text = claimed().objective(())
+        self.assertIn("file none", text)
+        self.assertIn("rolled back", text)
+        self.assertIn("Do not say what state a claim is in", text)
+
+    def test_the_claim_is_asked_for_after_what_the_run_owes_back(self):
+        text = claimed().objective(())
+        self.assertLess(
+            text.index("mcp__rk2__submit_mission_result"), text.index("A Hypothesis is")
+        )
+
+    def test_a_hunt_is_told_which_claim_it_was_minted_to_settle(self):
+        """Two hunts ran in `rk2hunt7` and filed no Test, because nothing asked.
+
+        The tool was served -- `web_hunter` holds `state.propose` -- and the
+        claim was in the packet. What was missing was the sentence naming it.
+        """
+        text = claimed(kind="hunt", hypothesis_label="H1").objective(())
+        self.assertIn("H1", text)
+        self.assertIn("mcp__rk2__propose_test", text)
+        for part in ("baseline", "variant", "control"):
+            self.assertIn(part, text)
+
+    def test_the_test_is_asked_for_before_the_ending_that_files_everything(self):
+        """`rk2hunt8`'s hunt was told to file a Test and submitted instead.
+
+        `MISSION_STOPS` tells every child that submitting the mission result is
+        the only ending that files anything, so a run that submits first never
+        reaches the call. Naming the tool was not enough; the order is the
+        instruction.
+        """
+        text = claimed(kind="hunt", hypothesis_label="H1").objective(())
+        self.assertIn(
+            "mcp__rk2__propose_test before mcp__rk2__submit_mission_result", text
+        )
+
+    def test_a_hunt_that_names_no_claim_is_told_nothing_about_one(self):
+        """A Task minted by something other than the derivation carries no id."""
+        text = claimed(kind="hunt").objective(())
+        self.assertNotIn("mcp__rk2__propose_test", text)
+
+    def test_only_a_hunt_is_asked_for_the_test(self):
+        """A recon Task with a claim attached is still not the run that settles it."""
+        text = claimed(hypothesis_label="H1").objective(())
+        self.assertNotIn("mcp__rk2__propose_test", text)
 
     def test_a_kind_nobody_wrote_prose_for_is_described_rather_than_refused(self):
         self.assertIn("Carry out this exotic Task", claimed(kind="exotic").objective(()))
@@ -1916,14 +1981,33 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual(Path("/store"), tooling.root)
         self.assertIs(STATE, tooling.runtime)
 
-    def test_a_machine_naming_only_one_of_them_answers_no_tool_call(self):
-        # And the settings are never read, because there is nothing to open a
-        # connection for -- which is what lets a slice with no store run at all.
+    def test_a_machine_naming_only_one_of_them_still_reaches_the_runtime(self):
+        """The channel is the database, not the image.
+
+        Until 2026-08-22 a machine naming no tool image was given no `Tooling`
+        at all, so `propose_test`, `propose_finding` and `mint_callback` were
+        answered `no_tooling` by a supervisor that was never built. Four live
+        hunts filed no Test for that reason and nothing recorded it.
+        """
         launcher = Launcher()
         with compiled():
             attempt(Recorder(), launcher, artifacts=Path("/store"))
 
-        self.assertIsNone(launcher.only.tooling)
+        tooling = launcher.only.tooling
+        assert tooling is not None
+        self.assertIsNone(tooling.container)
+        self.assertIsNotNone(tooling.runtime)
+
+    def test_a_supervisor_with_no_image_refuses_the_two_verbs_that_need_one(self):
+        """And only those two: the other three write rows."""
+        tools = agent._Tools(
+            agent.Tooling(runtime=STATE), PROGRAM, RUN
+        )
+        for verb in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT):
+            with self.subTest(verb=verb):
+                answered = tools({"verb": verb})
+                self.assertFalse(answered["served"])
+                self.assertEqual(agent.NO_TOOL_IMAGE, answered["reason"])
 
     def test_the_child_runs_as_the_role_the_scheduler_chose(self):
         launcher = Launcher()
@@ -2053,6 +2137,223 @@ class AttemptTest(unittest.TestCase):
             _, facts = attempt(connection, Launcher(answer=result(stop_reason="end_turn")))
         self.assertEqual("completed", facts["agent_run"]["stop_reason"])
         self.assertEqual([(RUN, "completed", 1200, 300)], connection.finished())
+
+    def test_the_verbs_the_child_reached_for_are_recorded_beside_its_tokens(self):
+        """`AgentRunResult.as_dict` has no caller, so nothing read either list.
+
+        A run served a tool and never calling it looked identical to a run
+        calling it and being denied. Two live hunts were spent telling those
+        apart by hand.
+        """
+        connection = Recorder()
+        answer = result(
+            tools_served=("mcp__rk2__http_request", "mcp__rk2__http_request"),
+            denials=({"tool": "mcp__rk2__propose_test", "reason": "not served"},),
+        )
+        with compiled():
+            _, facts = attempt(connection, Launcher(answer=answer))
+        self.assertEqual(["mcp__rk2__http_request"], facts["agent_run"]["tools_called"])
+        self.assertEqual(
+            [{"tool": "mcp__rk2__propose_test", "reason": "not served"}],
+            facts["agent_run"]["denials"],
+        )
+
+
+class PerformTest(unittest.TestCase):
+    """Ticket 152: the one kind the runtime walks itself.
+
+    A `perform` Task carries a Test that a hunt authored in an earlier pass.
+    Nothing about it is a dispatch: there is no packet, no Playbook, no
+    capability minted by this module and no child, because `replay.run` mints
+    its own inside the transaction that opens the Tool run. What this case
+    fixes is the seam -- that the claim reaches the performer at all, that it
+    reaches it with the right two names, and that what comes back settles the
+    attempt the way the Test run says it should.
+
+    `replay.run` itself is not under test here. It has been the performer since
+    ticket 35 and `tests.test_database` covers the verbs it calls; the defect
+    ticket 152 names is that nothing ever called it.
+    """
+
+    #: What a replay that reached a verdict answers with. `test_run` present is
+    #: the whole of the question this module asks of it: the row is written by
+    #: `close_test_replay` inside the transaction that settles the claim, so a
+    #: replay that opened and died has a Tool run and no Test run.
+    SETTLED = {"test_run": {"label": "TR1", "outcome": "supports"}}
+
+    #: The door as the runtime sees it, which is not how a child sees it.
+    #: Ticket 153: `BOUNDARY.proxy_url` is a container name on the Agent network
+    #: and this process is not on that network, so the two are different strings
+    #: for one door and the performer is given this one.
+    DOOR = "http://127.0.0.1:18080"
+
+    def performing(self, answer=None, **overrides):
+        """One attempt on a `perform` Task, with the replay stubbed out."""
+        connection = Recorder(
+            started=(
+                started_row(
+                    kind="perform",
+                    role="performer",
+                    test_label="TST1",
+                    hypothesis_label="H1",
+                    **overrides,
+                ),
+            )
+        )
+        launcher = Launcher()
+        performed = outcome_module.Report(
+            "test replay", facts=dict(self.SETTLED if answer is None else answer)
+        )
+        with compiled():
+            with mock.patch.object(
+                execution.replay_module, "run", return_value=performed
+            ) as run:
+                ledger, facts = attempt(
+                    connection,
+                    launcher,
+                    configuration=Path("/tmp/program.toml"),
+                    proxy_url=self.DOOR,
+                )
+        return connection, launcher, ledger, facts, run
+
+    def test_the_runtime_performs_it_and_starts_no_child(self):
+        connection, launcher, ledger, facts, run = self.performing()
+
+        self.assertEqual(1, run.call_count)
+        self.assertEqual([], launcher.requests)
+        self.assertEqual([], ledger.violations)
+        # No capability either. The replay opens its own Tool run and mints its
+        # own, so one minted here would be an authorisation nobody spends.
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+
+    def test_the_performer_is_given_the_run_it_is_attributed_to_and_the_test(self):
+        # The two names ticket 152 exists to supply. The Agent run is the one
+        # the claim just opened and has not ended, which is the condition
+        # `rk2_replay_subject` refuses an operator's replay for.
+        _, _, _, _, run = self.performing()
+        _, configuration = run.call_args.args
+
+        self.assertEqual(Path("/tmp/program.toml"), configuration)
+        self.assertEqual("AR7", run.call_args.kwargs["agent_run"])
+        self.assertEqual("TST1", run.call_args.kwargs["test"])
+
+    def test_a_replay_that_filed_a_test_run_closes_the_attempt_as_completed(self):
+        connection, _, _, facts, _ = self.performing()
+
+        self.assertEqual("completed", facts["agent_run"]["stop_reason"])
+        self.assertEqual(1, len(connection.finished()))
+
+    def test_a_replay_that_filed_nothing_closes_the_attempt_as_error(self):
+        # The Tool run exists and the Test run does not, which is a replay that
+        # opened and died. The attempt is spent and the Task is not done.
+        _, _, _, facts, _ = self.performing(answer={"test_run": None})
+
+        self.assertEqual("error", facts["agent_run"]["stop_reason"])
+
+    def test_what_the_replay_reported_is_carried_into_the_pass(self):
+        _, _, _, facts, _ = self.performing()
+
+        self.assertEqual("TR1", facts["replay"]["test_run"]["label"])
+
+    def test_a_refused_replay_carries_its_violations_into_the_pass(self):
+        connection = Recorder(
+            started=(started_row(kind="perform", role="performer", test_label="TST1"),)
+        )
+        refused = outcome_module.Report(
+            "test replay",
+            violations=(
+                outcome_module.Violation(
+                    code="invalid_configuration",
+                    source="argument:--test",
+                    detail="the registry refused this replay",
+                ),
+            ),
+            facts={"test_run": None},
+        )
+        with compiled():
+            with mock.patch.object(
+                execution.replay_module, "run", return_value=refused
+            ):
+                ledger, facts = attempt(
+                    connection,
+                    Launcher(),
+                    configuration=Path("/tmp/program.toml"),
+                    proxy_url=self.DOOR,
+                )
+
+        self.assertEqual(
+            ["the registry refused this replay"],
+            [violation.detail for violation in ledger.violations],
+        )
+        self.assertEqual("error", facts["agent_run"]["stop_reason"])
+
+    def test_the_capability_is_sent_to_this_machine_and_not_to_the_agent_network(self):
+        """Ticket 153, measured live before it was fixed.
+
+        The first lap that ever claimed a `perform` Task chose T6, opened AR10
+        and refused at the replay's first statement: `rk2hunt-door is not a
+        loopback address`. `proxy.endpoint` was right -- the capability rides
+        one hop in the clear -- and the boundary's URL is the child's, a
+        container name on a network the runtime is not attached to.
+        """
+        _, _, _, _, run = self.performing()
+
+        self.assertEqual(self.DOOR, run.call_args.kwargs["proxy_url"])
+        self.assertNotEqual(BOUNDARY.proxy_url, run.call_args.kwargs["proxy_url"])
+
+    def test_a_machine_naming_no_door_of_its_own_refuses_by_name(self):
+        # The second input the performer needs that a dispatch does not. A
+        # dispatch hands the child's URL to the child and never spends a
+        # capability itself, so a machine can run every other kind without this.
+        connection = Recorder(
+            started=(started_row(kind="perform", role="performer", test_label="TST1"),)
+        )
+        with compiled():
+            with mock.patch.object(execution.replay_module, "run") as run:
+                ledger, facts = attempt(
+                    connection, Launcher(), configuration=Path("/tmp/program.toml")
+                )
+
+        self.assertEqual(0, run.call_count)
+        self.assertEqual(
+            ["environment:RK_PROXY_URL"], [one.source for one in ledger.violations]
+        )
+        self.assertEqual("error", facts["agent_run"]["stop_reason"])
+        self.assertEqual(1, len(connection.finished()))
+
+    def test_a_machine_naming_no_configuration_refuses_by_name(self):
+        # The one input the performer needs that a dispatch does not, so the
+        # refusal says which: a machine that offers, claims and runs every other
+        # kind cannot resolve a Program from a file it was never given.
+        connection = Recorder(
+            started=(started_row(kind="perform", role="performer", test_label="TST1"),)
+        )
+        with compiled():
+            with mock.patch.object(execution.replay_module, "run") as run:
+                ledger, facts = attempt(connection, Launcher())
+
+        self.assertEqual(0, run.call_count)
+        self.assertEqual(["argument:--config"], [one.source for one in ledger.violations])
+        self.assertEqual(1, len(connection.finished()))
+
+    def test_a_perform_task_naming_no_test_refuses_by_name(self):
+        connection = Recorder(
+            started=(started_row(kind="perform", role="performer", test_label=None),)
+        )
+        with compiled():
+            with mock.patch.object(execution.replay_module, "run") as run:
+                ledger, _ = attempt(
+                    connection, Launcher(), configuration=Path("/tmp/program.toml")
+                )
+
+        self.assertEqual(0, run.call_count)
+        self.assertEqual(["database"], [one.source for one in ledger.violations])
+
+    def test_the_kind_is_the_one_the_roster_gives_the_performer(self):
+        # Two statements of one word, held equal: the branch keys on it and the
+        # roster maps it, and a rename in one is a Task dispatched to a child.
+        self.assertEqual("performer", roster.ROLE_FOR_KIND[execution.PERFORM])
+        self.assertTrue(roster.ROLES["performer"].rendered)
 
 
 class RefusalTest(unittest.TestCase):

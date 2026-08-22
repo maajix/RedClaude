@@ -1,4 +1,4 @@
-"""The six roles, what each may call, and the gate that decides one call.
+"""The seven roles, what each may call, and the gate that decides one call.
 
 This module is the roster. It states, in one place, every property that
 distinguishes one role from another -- how it runs, who may start it, which
@@ -76,7 +76,7 @@ VALIDATOR = "validator"
 
 #: The task-kind vocabulary of migration 0019. Held here so the compile can
 #: check the mapping is total and injective without a database.
-TASK_KINDS = ("recon", "hunt", "analyze", "validate", "report")
+TASK_KINDS = ("recon", "hunt", "analyze", "perform", "validate", "report")
 
 #: The delegation tool, and the older name of the same tool. The pair announces
 #: `Task` in its init frame and has been observed to spell the same tool `Agent`
@@ -367,6 +367,57 @@ PROPERTY_CLASSES = (
 EVIDENCE_POLARITIES = ("supports", "refutes")
 EVIDENCE_ROLES = ("baseline", "variant", "control", "context")
 
+#: The three parts of a claim's rationale, from `rk2_rationale_keys()`, which
+#: `hypotheses_rationale_shape` checks the column against. Named here because
+#: the column is `jsonb` and every other field of a `hypotheses` element is
+#: text: a run told only that a rationale answers mechanism, expectation and
+#: falsifier writes all three into one paragraph, which is what `rk2hunt6`
+#: measured on 2026-08-22 -- four claims filed, four dropped `malformed_field`
+#: citing "rationale is not an object", and nine evidence edges dropped behind
+#: them for citing a claim that no longer existed.
+RATIONALE_KEYS = ("mechanism", "expectation", "falsifier")
+
+#: The vocabularies a Test specification is written in, from the `rk2_test_*`
+#: functions in `20260815T000000Z__a_test_runs_through_the_replay_lane.sql`.
+#: Functions rather than seeded rows or a CHECK list, because the shape rule is
+#: itself a function and a CHECK cannot read a table -- so the corpus test reads
+#: these out of the function bodies. The drift two statements of one vocabulary
+#: can develop is the same drift wherever the first one is written down.
+#:
+#: `TEST_ACTION_ROLES` is three words where `EVIDENCE_ROLES` is four, and the
+#: word that is missing is why both exist. `context` is evidence that arrived
+#: alongside the answer; an action exists to settle the question, so
+#: `rk2_test_roles` admits no context action and a specification stating one is
+#: refused for it.
+TEST_PRECONDITION_KINDS = (
+    "scope_holds",
+    "risk_accepted",
+    "identity_leased",
+    "budget_allows",
+    "target_state",
+)
+TEST_ACTION_ROLES = ("baseline", "variant", "control")
+TEST_ASSERTION_KINDS = (
+    "status_equals",
+    "status_differs",
+    "body_equals",
+    "body_differs",
+)
+
+#: The one kind of action this runtime performs. A vocabulary of one word rather
+#: than a constant, for ticket 35's stated reason: `kind` is on every action so
+#: that the set widens in one place on the day an offline tool can be performed
+#: under a Tool run that already exists.
+TEST_ACTION_KINDS = ("request",)
+
+#: What a request inside a specification may be, from `rk2_test_request_problem`.
+#: The same seven `mcp__rk2__http_request` offers, stated a second time on
+#: purpose: that enum is what the door will send, this one is what the
+#: specification checker will store, and they are two authorities that agree
+#: today rather than one authority read twice. The corpus test holds this tuple
+#: to the checker and not to the other enum.
+TEST_REQUEST_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
+
 #: Names for the runtime's own choice of tenant. Every canonical table is
 #: program-scoped and the program is bound in the handler from runtime
 #: configuration, so an argument that named one would be the agent choosing
@@ -523,6 +574,17 @@ class Argument:
     #: these the element lists, and because `items_pattern` already spends the
     #: other word on an array of labels.
     element: Mapping[str, "Argument"] | None = None
+    #: Field names an element of this array may not carry, refused by the schema
+    #: rather than by promotion. The element object stays open -- it has a dozen
+    #: honest fields and only a handful are named here -- so this is the way to
+    #: say that one particular key belongs somewhere else. Ticket 155: a run put
+    #: its evidence edges inside the claims they support, the promotion reads
+    #: the top-level `evidence` list and nothing else, and every claim of that
+    #: run was dropped for having no support, after the run had ended and where
+    #: it could not be told. One place is the whole of the fix: a key that has
+    #: another home is refused as it is sent, which the model sees as a rejected
+    #: call it can correct and re-send inside the same run.
+    refuses: tuple[str, ...] = ()
 
     @property
     def constrained(self) -> bool:
@@ -557,6 +619,14 @@ class Argument:
                 # words a validator reads, or the promise and the check are two
                 # different rules wearing one declaration.
                 body["minLength"], body["maxLength"] = low, high
+            elif self.kind == "array":
+                # And the same sentence about an array, which `_value_fault`
+                # also measures by `len`. A Test states between three and
+                # thirty-two actions; written as `minimum` that rule would be a
+                # number vocabulary applied to a list, which every validator
+                # ignores -- so the pair would serve a promise it never checks
+                # and the gate would refuse a call the schema said was fine.
+                body["minItems"], body["maxItems"] = low, high
             else:
                 body["minimum"], body["maximum"] = low, high
         if self.items_pattern and self.kind == "object":
@@ -589,11 +659,28 @@ class Argument:
             # value reaching promotion is a `proposal_drops` row written after
             # the run has ended, taking every later element that pointed at the
             # dropped one with it.
-            body["items"] = {
-                "properties": {
-                    name: shape.schema() for name, shape in self.element.items()
-                }
-            }
+            named = {name: shape.schema() for name, shape in self.element.items()}
+            # `items` is JSON Schema's word for what is in a list and says
+            # nothing about an object, so an object-shaped argument declares its
+            # fields directly. The one that exists is a claim's `rationale`,
+            # whose column is `jsonb` where every other field of that element is
+            # text -- and `type: object` comes from `kind` above, which is the
+            # half that stops a paragraph being sent where three fields belong.
+            if self.kind == "object":
+                body["properties"] = named
+            else:
+                body["items"] = {"properties": named}
+        if self.refuses:
+            # `not` over `required` rather than `additionalProperties: false` or
+            # a boolean subschema: the element has to stay open, and this is the
+            # spelling every validator in the draft handles. It says the one
+            # thing meant -- an element of this list does not carry these names
+            # -- and says nothing about the fields it does carry.
+            refusal = {"not": {"required": sorted(self.refuses)}}
+            if self.kind == "object":
+                body.update(refusal)
+            else:
+                body["items"] = {**body.get("items", {}), **refusal}
         return body
 
 
@@ -748,10 +835,19 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     # It is here rather than in `net.request` because the door is not involved:
     # the correlator travels out inside a request the model composes, and the
     # arrival comes back to a listener that is nobody's tool call.
+    #
+    # The fourth member is the same authority as the second, one step earlier in
+    # the same chain. A Finding rests on a supported claim; a claim reaches
+    # `supported` only through a Test run; and a Test run replays a `tests` row
+    # nothing this surface could write. So the role that holds a testable claim
+    # asks for the specification the same way it asks for the Finding -- the
+    # runtime decides, out of rows the runtime wrote -- and the two asks sit in
+    # one group because they are one role's account of one piece of work.
     "state.propose": (
         "mcp__rk2__submit_mission_result",
         "mcp__rk2__propose_finding",
         "mcp__rk2__mint_callback",
+        "mcp__rk2__propose_test",
     ),
     # Scheduling as the orchestrator sees it, which is not scheduling as the
     # runtime does it. "The runtime decides what may be chosen; the orchestrator
@@ -857,7 +953,23 @@ _ELEMENTS: dict[str, Mapping[str, Argument]] = {
     },
     "relationships": {"type": Argument("string", enum=RELATIONSHIP_TYPES)},
     "observations": {"kind": Argument("string", enum=tuple(OBSERVATION_KINDS))},
-    "hypotheses": {"property_class": Argument("string", enum=PROPERTY_CLASSES)},
+    "hypotheses": {
+        "property_class": Argument("string", enum=PROPERTY_CLASSES),
+        # The one field in this table whose column is not text. `type: object`
+        # is the half that matters: a run that writes a paragraph here has its
+        # whole claim dropped after the run has ended, where a schema refuses
+        # the call while the run is still there to correct it.
+        # Each part is bounded rather than left open, and the lower bound is
+        # the load-bearing half: `rk2_gradable_claims` will not grade a claim
+        # whose mechanism, expectation or falsifier is empty, so a part sent
+        # empty is a claim that promotes and then sits at `proposed` forever.
+        "rationale": Argument(
+            "object",
+            element={
+                key: Argument("string", bounds=(1, 2000)) for key in RATIONALE_KEYS
+            },
+        ),
+    },
     "evidence": {
         "polarity": Argument("string", enum=EVIDENCE_POLARITIES),
         "role": Argument("string", enum=EVIDENCE_ROLES),
@@ -1051,7 +1163,9 @@ CONTRACTS: dict[str, Contract] = {
                 "array", free_text=True, element=_ELEMENTS["relationships"]
             ),
             "hypotheses": Argument(
-                "array", free_text=True, element=_ELEMENTS["hypotheses"]
+                "array", free_text=True, element=_ELEMENTS["hypotheses"],
+                # An edge lives in `evidence` and nowhere else. Ticket 155.
+                refuses=("evidence",),
             ),
             "evidence": Argument("array", free_text=True, element=_ELEMENTS["evidence"]),
             "suggested_tasks": Argument(
@@ -1101,6 +1215,134 @@ CONTRACTS: dict[str, Contract] = {
             # so what is stated about it is how long it may be and nothing else.
             # A shape would be this roster deciding how a finding is written up.
             "title": Argument("string", required=True, bounds=(1, 200)),
+        },
+    ),
+    # The row the tool above rests on, and the reason it is a tool at all.
+    #
+    # THE SHAPE DECISION, AND THE ONE IT WAS TAKEN AGAINST. Ticket 141 named two
+    # candidates: this -- the model that holds the claim authors the
+    # specification through a Contract shaped like `propose_finding` -- or the
+    # runtime derives one from the Playbook the Task was selected under. The
+    # second is not available. `playbook_selections` has never held a row in this
+    # tree (ticket 101), so a derivation-only answer ships a producer nothing
+    # exercises, which is the defect this ticket is about rather than a fix for
+    # it. The two are not exclusive: a derivation can be added later and will
+    # write the same rows through the same verb, because what decides whether a
+    # `tests` row exists is `propose_test` and not its caller.
+    #
+    # WHY THIS IS AN ASK AND NOT A WRITE. `tests` is in `CANONICAL`, so
+    # `_check_contracts` refuses any contract naming it in `writes` -- which is
+    # the rule that decides this shape rather than one it works around, exactly
+    # as it decided `propose_finding`'s. What this writes is `test_proposals`,
+    # the audit row beside `tests`, and `propose_test` decides whether a Test
+    # comes of it. A specification is a program this harness will execute against
+    # somebody else's system, so "the agent wrote it" and "the runtime stored it"
+    # have to be two events with a decision between them.
+    #
+    # WHY THE PARTS ARE ARGUMENTS RATHER THAN ONE OBJECT. A single `spec` object
+    # would be one free-text argument -- there is no `element` for an object --
+    # and `OPEN_ARGUMENTS` would have to say why the most consequential document
+    # on this surface is the one the roster describes least. Five arrays name the
+    # five parts `rk2_test_spec_problem` closes, so a sixth part is refused by
+    # `additionalProperties: false` before it reaches the sentence that would
+    # refuse it, and each part's closed vocabulary is served as an enum the CLI
+    # checks before `PreToolUse` runs.
+    #
+    # Five and not seven. A stored specification may also carry `impact` and
+    # `pivot`, and neither is an argument here, because neither is a plan: an
+    # impact block is what an operator's grant is measured against (ticket 38
+    # authorizes impact before it is proved) and a pivot block claims a
+    # capability out of `capabilities` (ticket 39). A model that could write
+    # either would be a model authorizing its own impact and minting its own
+    # capability, which is the same class of thing as writing `tests` directly.
+    #
+    # AND WHY ONLY THE VOCABULARIES ARE SERVED. Everything else the shape rule
+    # says -- that a url is absolute and canonical, that an action is numbered by
+    # its position, that no two assertions share an identifier, that a Test
+    # carries all three roles -- stays where the sentence is. This is the
+    # opposite of the trade `submit_mission_result` makes and it is the same
+    # reasoning: there, a rule the schema cannot see costs one element in a
+    # `proposal_drops` row written after the run ended, so refusing early is
+    # worth a retry. Here the answer arrives while the run is still going and
+    # names which of the thirty rules broke, which is strictly more than a
+    # rejected call quoting a regex can say. A word from a closed list is the one
+    # thing a model cannot derive from a refusal it has not had yet, so that is
+    # the half the schema carries.
+    "mcp__rk2__propose_test": Contract(
+        "state.propose",
+        REQUEST,
+        writes=("test_proposals",),
+        arguments={
+            "hypothesis_label": Argument("string", required=True, pattern=_label("H")),
+            # Not required, and empty is a specification that states no
+            # precondition rather than one that forgot to. The shape rule admits
+            # an empty array in every part and the handler sends `[]` for a part
+            # left out, so "absent" and "empty" are one thing here and the digest
+            # cannot depend on which spelling a model used.
+            "preconditions": Argument(
+                "array",
+                bounds=(0, 16),
+                element={
+                    "kind": Argument("string", enum=TEST_PRECONDITION_KINDS),
+                    # A precondition is prose under a typed word, so the length
+                    # is the whole of what is stated about the prose.
+                    "detail": Argument("string", bounds=(1, 500)),
+                },
+            ),
+            "setup": Argument(
+                "array",
+                bounds=(0, 16),
+                element={
+                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
+                    # The url's length and not its shape. `rk2_test_request_problem`
+                    # answers a relative url, a lower-case method, a path that
+                    # resolves elsewhere and a `%2e` in four different sentences,
+                    # each naming the position it found the fault in, and a
+                    # pattern here would replace all four with a rejected call.
+                    # A length is the one rule whose sentence adds nothing.
+                    "url": Argument("string", bounds=(1, 2000)),
+                },
+            ),
+            "actions": Argument(
+                "array",
+                required=True,
+                bounds=(3, 32),
+                element={
+                    # Carried by the model and checked against its position,
+                    # because a plan read in one order and numbered in another is
+                    # a plan whose assertions point at requests nobody planned.
+                    "ordinal": Argument("integer", bounds=(1, 32)),
+                    "role": Argument("string", enum=TEST_ACTION_ROLES),
+                    "kind": Argument("string", enum=TEST_ACTION_KINDS),
+                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
+                    "url": Argument("string", bounds=(1, 2000)),
+                },
+            ),
+            "assertions": Argument(
+                "array",
+                required=True,
+                bounds=(1, 32),
+                element={
+                    # 035's spelling, restated here for the reason
+                    # `submit_verdict.failed_assertion_ids` restates it: a
+                    # validator names a failed assertion by this identifier, so
+                    # an identifier a Test could be authored with and a verdict
+                    # could not name would be a failure nobody can report.
+                    "id": Argument("string", pattern="^[a-z][a-z0-9-]{2,62}$"),
+                    "kind": Argument("string", enum=TEST_ASSERTION_KINDS),
+                    "action": Argument("integer", bounds=(1, 32)),
+                    "against": Argument("integer", bounds=(1, 32)),
+                    "status": Argument("integer", bounds=(100, 599)),
+                },
+            ),
+            "cleanup": Argument(
+                "array",
+                bounds=(0, 16),
+                element={
+                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
+                    "url": Argument("string", bounds=(1, 2000)),
+                },
+            ),
         },
     ),
     # The name a step plants in somebody else's system, and the one verb on this
@@ -1408,6 +1650,12 @@ RUN_SKILL_SCRIPT = "mcp__rk2__run_skill_script"
 #: taken from the roster that declares it rather than typed a second time.
 PROPOSE_FINDING = "mcp__rk2__propose_finding"
 
+#: The verb one step earlier in the same chain, spelled here for the same
+#: reason. The supervisor dispatches on it, and a `tests` row is what the
+#: proposal above ultimately rests on: without this one there is no Test to run,
+#: no run to settle the claim, and nothing for `open_finding` to be asked about.
+PROPOSE_TEST = "mcp__rk2__propose_test"
+
 #: And the fourth, spelled here for the same reason as the three above: the
 #: supervisor dispatches on the verb, and a verb typed into the dispatch would
 #: be this surface named in a second place.
@@ -1530,6 +1778,21 @@ ROLES: dict[str, Role] = {
         # A Skill is technique. The validator judges, so it holds no Skill tool
         # and the corpus names it in no `bb:roles` line.
         tool_groups=("validate.judge",),
+        max_concurrent=1,
+    ),
+    "performer": Role(
+        name="performer",
+        runs_as=RENDERER,
+        invocable_by=(RUNTIME,),
+        task_kinds=("perform",),
+        # Not an agent either, and for a stronger reason than the reporter's:
+        # a replay walks a specification a hunt already authored, action by
+        # action, and the one thing it must not do is decide. Ticket 152.
+        model=None,
+        effort=None,
+        max_turns=0,
+        builtin_tools=(),
+        tool_groups=(),
         max_concurrent=1,
     ),
     "reporter": Role(
@@ -2010,6 +2273,18 @@ def _value_fault(argument: Argument, value: Any) -> str | None:
                 fault = _value_fault(shape, one[member])
                 if fault is not None:
                     return f"carries {member!r}, which {fault}"
+    if argument.element is not None and isinstance(value, Mapping):
+        # The same half again for an object that names its fields, which is a
+        # claim's `rationale` and nothing else today. A field left out is passed
+        # over here as it is above: the subschema does not require it and the
+        # grading is what refuses a claim missing one, at a point where refusing
+        # it costs that claim rather than the whole submission.
+        for member, shape in argument.element.items():
+            if member not in value:
+                continue
+            fault = _value_fault(shape, value[member])
+            if fault is not None:
+                return f"carries {member!r}, which {fault}"
     return None
 
 
@@ -2344,7 +2619,17 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
         raise RosterError(f"{tool}: no contract may declare {name}")
     if argument.kind not in KINDS:
         raise RosterError(f"{tool}.{name}: {argument.kind} is not a value shape")
-    if argument.free_text == argument.constrained:
+    # An object that names its fields is constrained by naming them, and that
+    # is not what `constrained` counts. `constrained` is about the *value* an
+    # argument carries, which is why `element` on an array stays orthogonal to
+    # `free_text` -- an open list is open about what it carries whether or not
+    # one field of it is drawn from a vocabulary. An object element is the one
+    # place the two meet: a claim's `rationale` has no vocabulary of its own and
+    # is not open either, and what binds it is the three fields it is made of.
+    constrained = argument.constrained or (
+        argument.kind == "object" and argument.element is not None
+    )
+    if argument.free_text == constrained:
         raise RosterError(f"{tool}.{name}: is either constrained or declared unconstrained")
     if argument.free_text and name not in OPEN_ARGUMENTS.get(tool, ()):
         raise RosterError(f"{tool}.{name}: an unconstrained argument states why it is one")
@@ -2361,8 +2646,8 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
     if argument.bounds is not None and argument.bounds[0] > argument.bounds[1]:
         raise RosterError(f"{tool}.{name}: bounds are the wrong way round")
     if argument.element is not None:
-        if argument.kind != "array":
-            raise RosterError(f"{tool}.{name}: only an array has elements")
+        if argument.kind not in ("array", "object"):
+            raise RosterError(f"{tool}.{name}: only an array or an object has elements")
         if argument.items_pattern is not None:
             raise RosterError(f"{tool}.{name}: an array of labels has no element fields")
         # Each field checked as the argument it is, which is what makes the

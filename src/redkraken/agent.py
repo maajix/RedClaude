@@ -220,6 +220,11 @@ UNVERIFIABLE = "unverifiable"
 #: answer it could act on.
 UNKNOWN_CALL = "unknown_call"
 UNREACHABLE_STATE = "unreachable_state"
+#: A supervisor that can write a row and cannot start a container. Its own
+#: word rather than `_launch.NO_TOOLING`, because they are different states:
+#: that one is a run with no supervisor at all, this one is a supervisor an
+#: installation gave no tool image.
+NO_TOOL_IMAGE = "no_tool_image"
 
 #: The one thing crossing this channel that is not a tool a model can call. Every
 #: other verb here is a `roster.CONTRACTS` name because a child asked for it by
@@ -246,6 +251,13 @@ CLOSE = "SELECT close_startup_refusal($1::uuid, $2, $3, $4, $5::jsonb)"
 #: no caller anywhere. The Agent run is this side's to fill in, because a child
 #: naming its own provenance is a child naming which run it would like to be.
 PROPOSE = "SELECT propose_finding($1, $2, $3, $4::uuid)"
+
+#: The specification a child authors and this supervisor carries. `propose_test`
+#: resolves the Hypothesis label to the claim, puts the document through
+#: `rk2_test_spec_problem` and writes the `tests` row a replay runs -- the first
+#: writer of that table any Agent run can reach. The Agent run is this side's to
+#: fill in, for the reason it is on `PROPOSE` above.
+PROPOSE_TEST = "SELECT propose_test($1, $2::jsonb, $3::uuid)"
 
 #: The correlator a child asks for and this supervisor mints. The plaintext is
 #: generated here and digested there -- `mint_callback_correlator` stores the
@@ -419,9 +431,16 @@ class Tooling:
     is two half-statements; so what travels is how to open a second one, and the
     answer opens it the first time a child actually asks for something.
 
-    All three or none, which is why this is a record rather than three optional
-    fields on the request: an image with nowhere to file what a run produced is
-    a run that could start and could not be kept.
+    The image and the store are both or neither: an image with nowhere to file
+    what a run produced is a run that could start and could not be kept. What
+    they are no longer is required. When this record carried only the two
+    tool-run verbs that was the same statement as "or none"; it now carries
+    `propose_test`, `propose_finding` and `mint_callback`, which need a database
+    and nothing else, and coupling them to a tool image meant an installation
+    that named none could file neither a Test nor a Finding -- silently, since
+    the child is answered `no_tooling` and the runtime records nothing. Measured
+    across `rk2hunt7` through `rk2hunt10`: every hunt that called `propose_test`
+    was answered by a channel that was never built.
 
     `state` is the fourth and it is optional, which is the one asymmetry here.
     It is how the agent-scoped role is reached, and it exists because ticket
@@ -433,9 +452,9 @@ class Tooling:
     into a run that could not start at all.
     """
 
-    container: isolation.ToolContainer
-    root: Path
     runtime: pg.Settings
+    container: isolation.ToolContainer | None = None
+    root: Path | None = None
     state: pg.Settings | None = None
 
 
@@ -1283,6 +1302,7 @@ class _Tools:
             roster.RUN_TOOL,
             roster.RUN_SKILL_SCRIPT,
             roster.PROPOSE_FINDING,
+            roster.PROPOSE_TEST,
             roster.MINT_CALLBACK,
             roster.REFRESH_PACKET,
             NAME_TRANSCRIPTS,
@@ -1304,16 +1324,40 @@ class _Tools:
         if verb == roster.REFRESH_PACKET:
             return self._refresh(call)
 
+        # The two verbs that need an image, before the connection rather than
+        # after it: a machine with no image cannot serve them however well the
+        # database answers, and opening a connection to say so would be a
+        # connection opened for a refusal. The other three need the database and
+        # not the image, which is the whole point of the split.
+        if verb in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT) and (
+            self._tooling.container is None or self._tooling.root is None
+        ):
+            return {
+                "served": False,
+                "reason": NO_TOOL_IMAGE,
+                "detail": "this installation describes no tool image and no Artifact "
+                          "store, so there is nothing to run a registered tool with",
+            }
+
         try:
             connection = self._open()
         except (pg.ConnectionError_, OSError) as error:
             return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
 
+        # The frame, not a field of it, for the reason written four paragraphs
+        # up and contradicted here until 2026-08-22: `Channel.call` writes the
+        # arguments beside the verb, so `call.get("arguments")` was None on
+        # every real call and every Finding a child has ever proposed reached
+        # `propose_finding` as three empty strings. Only `tests/test_agent.py`
+        # ever sent a nested envelope, which is why nothing went red.
         if verb == roster.PROPOSE_FINDING:
-            return self._propose(connection, call.get("arguments"))
+            return self._propose(connection, call)
+
+        if verb == roster.PROPOSE_TEST:
+            return self._specify(connection, call)
 
         if verb == roster.MINT_CALLBACK:
-            return self._callback(connection, call.get("arguments"))
+            return self._callback(connection, call)
 
         if verb == NAME_TRANSCRIPTS:
             return self._transcripts(connection, call)
@@ -1379,6 +1423,48 @@ class _Tools:
                     str(arguments.get("hypothesis_label") or ""),
                     str(arguments.get("vulnerability_class") or ""),
                     str(arguments.get("title") or ""),
+                    self._agent_run_id,
+                ),
+            ).scalar()
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        document = json.loads(str(answered))
+        return document if isinstance(document, Mapping) else {}
+
+    def _specify(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one Test specification to the runtime and answer what it said.
+
+        Everything in the frame except the verb and the label, rather than a
+        list of part names held here. `rk2_test_spec_problem` refuses a key it
+        has no part for, by name, and it is the authority on which parts exist:
+        a copy of that list on this side would be a second statement of the
+        shape rule, free to drift the day a part is added.
+
+        Key order does not reach the digest. `rk2_test_spec_digest` is taken
+        over the `jsonb` rendering, whose keys are stored sorted, so two
+        submissions of one specification collide on
+        `tests_hypothesis_id_spec_sha256_key` however the child spelled them.
+
+        A refusal comes back as a refusal, for the reason `_propose` gives: the
+        sentence saying which of the thirty shape rules was broken is the whole
+        product of the call, and an exception would leave the child with a tool
+        that failed and nobody with the reason.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        specification = {
+            str(name): value
+            for name, value in arguments.items()
+            if name not in ("verb", "hypothesis_label")
+        }
+        try:
+            connection.execute(BIND, (self._program_id,))
+            answered = connection.execute(
+                PROPOSE_TEST,
+                (
+                    str(arguments.get("hypothesis_label") or ""),
+                    json.dumps(specification),
                     self._agent_run_id,
                 ),
             ).scalar()

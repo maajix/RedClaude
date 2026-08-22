@@ -82,6 +82,17 @@ EGRESS = "rk2-egress"
 #: there is no spelling of "this machine" that resolves.
 GATEWAY = "host.docker.internal"
 
+#: The interface the listener is published on, and the only one.  Ticket 153:
+#: a child reaches the door by container name over the Agent network and this
+#: machine cannot, so every host-side verb that spends a capability -- `rk proxy
+#: request`, `rk test replay`, and the `perform` lane that dispatches a replay --
+#: had no address to name.  `proxy.endpoint` sends a capability to a loopback
+#: address and nothing else, which is what decides this value: the one hop the
+#: capability rides in the clear is defended by that hop staying on this machine,
+#: and a listener published on every interface would be one reachable from the
+#: egress network the door's second attachment is on.
+PUBLISHED = "127.0.0.1"
+
 #: How long a door gets to bind and reach its database before it is given up on,
 #: and how often that is asked.  Generous because the first start of an authority
 #: forks `openssl` twice on a cold page cache.
@@ -463,6 +474,7 @@ def _run(
         inside[seal.KEY_VARIABLE] = KEY_FILE
         mounts.append(f"type=bind,src={key},dst={KEY_FILE},readonly")
 
+    listening = proxy.peer(container.proxy_url)[1]
     arguments = [
         *isolation.hardened(container.proxy_container, ephemeral=False),
         "--detach",
@@ -470,6 +482,8 @@ def _run(
         egress,
         "--add-host",
         f"{GATEWAY}:host-gateway",
+        "--publish",
+        f"{PUBLISHED}:{listening}:{listening}",
         "--tmpfs",
         f"{isolation.TMPDIR}:rw,nosuid,nodev,noexec,size=64m,mode=1777",
     ]
