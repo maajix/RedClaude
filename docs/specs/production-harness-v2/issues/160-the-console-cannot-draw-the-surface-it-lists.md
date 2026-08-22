@@ -45,10 +45,19 @@ hunt databases and is what this ticket is asking to be made permanent.
       is not in `observations.summary` — that column is empty in every database
       this tree has produced — it is in the proposal the row was promoted from,
       reachable through `metadata ->> 'proposal'` and `metadata ->> 'element'`.
+- [ ] **A label in a card is a way to the thing it names.** A card says
+      `APP2`, `R3`, `AR6`, `PR2`, `TST1` and `H1`, and every one of those is a
+      row this installation holds. Hovering a label shows a short tooltip of
+      what it is — for an Entity its type and its address, for a Receipt the
+      exchange, for a run its role — and clicking it opens that node's card.
+      The labels are already unique inside a Program, so the link is a lookup
+      and not a new query per word. Back to the card that was open before,
+      because a graph is walked and a dead end is a reload.
 - [ ] **Checked by something that would go red.** `tests/test_ui.py`: the graph
       route answers with the relaxed policy and every other route still answers
       with `POLICY`; the reads are Program-scoped; a request for a sealed
-      artifact digest is refused.
+      artifact digest is refused; a label naming a row resolves to that row's id
+      and a label naming nothing is inert rather than a broken link.
 
 ## Why
 
