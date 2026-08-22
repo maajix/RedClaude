@@ -205,3 +205,5 @@ has no caller in `src/redkraken/*.py` -- only eleven references in
 `tests/test_database.py`. No `F` label has ever been minted outside a test, so
 everything downstream of a Finding is unreachable in a real hunt. Ticket 102 now
 owns that gap and is the ticket that decides the shape of the caller.
+
+**Correction closed, 2026-08-22.** Ticket 102 gave `open_finding` its caller. `propose_finding` resolves a Hypothesis label to the claim and to the run whose Receipt the runtime cited when it settled it, and `agent._Tools.__call__` calls that verb for a child that asked. The `F` label this ticket describes is now reachable outside a test.

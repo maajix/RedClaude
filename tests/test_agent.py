@@ -1306,6 +1306,204 @@ class ToolChannelTest(unittest.TestCase):
         self.assertIn("nothing_ships_this.py", served["detail"])
 
 
+class Supervisor:
+    """A runtime that answers a script and remembers what it was asked for.
+
+    Stands in for the side of the pipe that holds a database, because that is
+    the whole of what it is here: `open_finding` decides a proposal out of rows
+    the child cannot see, and what is being asserted on this side is what was
+    carried, what came back and what the run was charged for.
+    """
+
+    def __init__(self, *answers) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, verb: str, arguments) -> dict:
+        self.calls.append((verb, dict(arguments)))
+        return self.answers.pop(0) if self.answers else {}
+
+
+class FindingProposalTest(unittest.TestCase):
+    """PH2-102: the one claim a run asks the runtime to write a Finding from.
+
+    The model asks and the runtime writes, so everything here is about the ask:
+    that the proposal crosses as the three fields it declares, that what came
+    back is what the model reads whichever of the three outcomes it was, and
+    that a run which keeps being refused stops being carried. Nothing here
+    asserts anything about whether the Finding should have been opened -- that
+    is `rk2_finding_refusal`'s eight arms, on rows this process cannot reach,
+    and a second opinion about them on this side is exactly what the ticket
+    refuses to build.
+    """
+
+    def proposing(self, stack, *answers):
+        surface = _launch.Surface()
+        supervisor = Supervisor(*answers)
+        proposal = _launch.Proposal(supervisor)
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface,
+            packet.Reader(packet.Packet()),
+            _launch.Submission(),
+            proposal=proposal,
+        )
+        surface.open()
+        return surface, offered["propose_finding"], proposal, supervisor
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        return json.loads(wire["content"][0]["text"])
+
+    def proposal(self, **overrides) -> dict:
+        return {
+            "hypothesis_label": "H7",
+            "vulnerability_class": "idor",
+            "title": "The order endpoint resolves the object from the request",
+            **overrides,
+        }
+
+    def test_a_proposal_crosses_as_one_frame_carrying_what_it_declares(self):
+        # And nothing beside it. Which Program and which Agent run this belongs
+        # to are settled on the other side of the pipe, so a child that named
+        # either would be naming its own provenance.
+        out = io.StringIO()
+        answered = json.dumps(
+            {isolation.ANSWER: {"outcome": "created", "finding": "F1"}, "id": 1}
+        )
+        channel = _launch.Channel(out, io.StringIO(answered + "\n"))
+
+        served = _launch.Proposal(channel).ask(self.proposal())
+
+        self.assertEqual({"outcome": "created", "finding": "F1"}, served)
+        self.assertEqual(
+            {**self.proposal(), "verb": "mcp__rk2__propose_finding"},
+            json.loads(out.getvalue())[isolation.CALL],
+        )
+
+    def test_what_the_runtime_answered_is_what_the_model_reads(self):
+        # The document `open_finding` returns, carried through unchanged. A
+        # handler that summarised it would be deciding which of the facts the
+        # database stated the model is allowed to act on.
+        opened = {
+            "outcome": "created",
+            "finding": "F3",
+            "hypothesis": "H7",
+            "class": "idor",
+            "evidence_added": 4,
+            "demonstrated": {"read": True},
+        }
+        with contextlib.ExitStack() as stack:
+            _, offering, _, _ = self.proposing(stack, opened)
+
+            self.assertEqual(opened, self.answer(offering, self.proposal()))
+
+    def test_a_refusal_is_reported_as_a_refusal_and_not_raised(self):
+        # Ticket 36's sixth criterion, kept on this side: the guard answers with
+        # a sentence so that the caller can file what it hears, and a caller
+        # that turned it into an exception would throw that away.
+        refusal = {
+            "outcome": "refused",
+            "refusal": "hypothesis H7 is testable, and a Finding rests on a supported claim",
+        }
+        with contextlib.ExitStack() as stack:
+            _, offering, _, _ = self.proposing(stack, refusal)
+
+            self.assertEqual(refusal, self.answer(offering, self.proposal()))
+
+    def test_a_refused_proposal_is_charged_and_a_created_or_merged_one_is_not(self):
+        # The whole of the ceiling's rule, in one run: what it bounds is a loop
+        # filling `finding_proposals` with attempts nobody wanted, and a merge
+        # is the opposite of that -- a second claim landing on a cell a Finding
+        # is already open on, which is a run that got it right twice.
+        with contextlib.ExitStack() as stack:
+            _, offering, proposal, _ = self.proposing(
+                stack,
+                {"outcome": "refused", "refusal": "H7 is not a Hypothesis of this Program"},
+                {"outcome": "created", "finding": "F1"},
+                {"outcome": "merged", "finding": "F1"},
+            )
+
+            for _ in range(3):
+                self.answer(offering, self.proposal())
+
+        self.assertEqual(3, proposal.attempts)
+        self.assertEqual(1, proposal.refused)
+
+    def test_the_ceiling_answers_a_token_and_carries_nothing(self):
+        # Not a raise and not a silence. The model is told what it spent and
+        # that this one was not asked, which is the only answer it can do
+        # anything with; the supervisor is never asked at all, which is the
+        # point of a ceiling on this side rather than on the other one.
+        refused = {"outcome": "refused", "refusal": "no"}
+        with contextlib.ExitStack() as stack:
+            _, offering, proposal, supervisor = self.proposing(
+                stack, *[refused] * _launch.REFUSED_PROPOSALS
+            )
+
+            for _ in range(_launch.REFUSED_PROPOSALS):
+                self.answer(offering, self.proposal())
+            stopped = self.answer(offering, self.proposal())
+
+        self.assertEqual(_launch.REFUSED_PROPOSALS, len(supervisor.calls))
+        self.assertFalse(stopped["served"])
+        self.assertEqual(_launch.SPENT_PROPOSALS, stopped["reason"])
+        self.assertEqual(_launch.REFUSED_PROPOSALS, stopped["refused"])
+        self.assertEqual(_launch.REFUSED_PROPOSALS + 1, stopped["attempts"])
+        self.assertEqual(_launch.REFUSED_PROPOSALS, proposal.refused)
+
+    def test_the_ceiling_is_this_runs_and_not_this_processs(self):
+        # One Agent run, one count. A second run starting with the refusals of
+        # the run before it would be a ceiling on the harness rather than on the
+        # loop it exists to stop.
+        spent = _launch.Proposal(Supervisor())
+        spent.refused = _launch.REFUSED_PROPOSALS
+
+        self.assertEqual(_launch.SPENT_PROPOSALS, spent.ask(self.proposal())["reason"])
+        self.assertEqual(0, _launch.Proposal(Supervisor()).refused)
+
+    def test_a_run_with_no_supervisor_says_so_and_proposes_nothing(self):
+        # The allowlist is the role's and not the job's, so the tool is built
+        # for every run -- and a run whose installation described no store and
+        # no connection answers that rather than writing into a pipe nobody is
+        # reading.
+        surface = _launch.Surface()
+        with packaged() as offered:
+            _launch.server(surface, packet.Reader(packet.Packet()), _launch.Submission())
+        surface.open()
+
+        served = self.answer(offered["propose_finding"], self.proposal())
+
+        self.assertFalse(served["served"])
+        self.assertEqual(_launch.NO_TOOLING, served["reason"])
+
+    def test_a_supervisor_that_answered_nothing_is_not_a_refused_proposal(self):
+        # A ceiling on refusals is a ceiling on what the run got wrong. A
+        # supervisor that could not be reached, or that would not serve the
+        # verb, is the runtime's own trouble, and charging the run for it would
+        # cut off a hunter for something it did not do.
+        with contextlib.ExitStack() as stack:
+            _, offering, proposal, _ = self.proposing(
+                stack,
+                {"served": False, "reason": agent.UNKNOWN_CALL, "detail": "not served"},
+                {"served": False, "reason": isolation.UNANSWERED, "detail": "closed"},
+            )
+
+            for _ in range(2):
+                self.answer(offering, self.proposal())
+
+        self.assertEqual(2, proposal.attempts)
+        self.assertEqual(0, proposal.refused)
+
+    def test_the_call_is_on_the_surfaces_record_however_it_ended(self):
+        with contextlib.ExitStack() as stack:
+            surface, offering, _, _ = self.proposing(stack, {"outcome": "refused"})
+
+            self.answer(offering, self.proposal())
+
+        self.assertEqual(["propose_finding"], surface.served)
+
+
 class RequestToolTest(unittest.TestCase):
     """The one call that leaves the boundary, and every way it does not.
 

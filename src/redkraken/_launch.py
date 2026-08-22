@@ -125,6 +125,37 @@ DOOR_UNREACHABLE = "door_unreachable"
 #: is missing and cannot be asked about.
 NO_TOOLING = "no_tooling"
 
+#: And why a Finding proposal was not carried to the runtime at all. The same
+#: kind of token as the three above, because it is the same kind of fact: the
+#: run asked for something the runtime will not do for it, and the honest answer
+#: is the reason rather than silence or an exception.
+SPENT_PROPOSALS = "proposals_spent"
+
+#: What `open_finding` calls the outcome of a proposal it would not open a
+#: Finding from. Held here because it is the word this side counts on, and a
+#: word spelled out at the counting site would be a second statement of the
+#: database's own vocabulary that could come to disagree with it.
+REFUSED = "refused"
+
+#: How many refused proposals one Agent run may make before the tool stops
+#: carrying them. Three, and the number comes from the refusal itself rather
+#: than from taste: `rk2_finding_refusal` is eight arms deep and exactly two of
+#: them are about the proposal rather than about the evidence behind it -- the
+#: word is not in the vocabulary, and the title is empty. Those two are the only
+#: refusals a child can do anything about by asking again, so three attempts is
+#: one more than the number of mistakes that are correctable, and a fourth
+#: refusal is a run repeating itself.
+#:
+#: Refused attempts are what is counted, and created and merged ones are not,
+#: because they are different acts. A refusal costs the Program a
+#: `finding_proposals` row and the run a turn's worth of its own context and
+#: leaves nothing behind that anybody wanted; a merge is a second claim landing
+#: on a cell that already holds a Finding, which is a hunter that got it right
+#: twice, and it is the outcome that says two independent claims about one cell
+#: both held. Counting a merge against this ceiling would make the run that
+#: found the most into the run that is cut off first.
+REFUSED_PROPOSALS = 3
+
 
 class Closed(RuntimeError):
     """A tool was called while the runtime's tool surface was not open."""
@@ -435,6 +466,84 @@ class Channel:
                 }
 
 
+class Proposal:
+    """The Findings this run asked for, and the refusals it has left to spend.
+
+    The one request an executing role makes that is answered while it is still
+    running, and the difference from a pick or a verdict is the reason it is:
+    those two are preferences the runtime re-decides afterwards, and this is a
+    question about rows that already exist and already settle it. `open_finding`
+    reads the claim, the run that settled it and the transition between them,
+    all three written by the runtime, and answers `created`, `merged` or
+    `refused` with the sentence saying why. Nothing this object holds could
+    make that answer come out differently, which is why it asks rather than
+    deciding.
+
+    What it does decide is how many times it will ask. A refused proposal costs
+    the Program an audit row and the run a turn of its own context, and a model
+    that has convinced itself will spend the whole run on the same claim -- so
+    the count of refusals is kept here and `REFUSED_PROPOSALS` is where asking
+    stops. A created or merged proposal is not counted, because it is not the
+    thing being bounded: what a ceiling on successes would bound is how much
+    one run may find.
+
+    Asking is blocking, because it is the same pipe a tool run goes down, so
+    every caller reaches this through a thread for the reason `Channel` gives.
+    """
+
+    def __init__(self, channel: Channel | None = None) -> None:
+        self._channel = channel
+        self.attempts = 0
+        self.refused = 0
+
+    def ask(self, arguments: Mapping[str, object]) -> dict:
+        """Carry one proposal to the runtime, or say why it was not carried.
+
+        The three declared fields and nothing beside them. Which Agent run and
+        which Program this proposal belongs to are the supervisor's to fill in:
+        both are decisions that were taken when this run was opened, and a
+        child that named either would be naming its own provenance.
+        """
+        self.attempts += 1
+        if self.refused >= REFUSED_PROPOSALS:
+            return {
+                "served": False,
+                "reason": SPENT_PROPOSALS,
+                "attempts": self.attempts,
+                "refused": self.refused,
+                "detail": (
+                    f"{self.refused} proposals of this run were refused, which is all it "
+                    "may spend; this one was not carried to the runtime"
+                ),
+            }
+        if self._channel is None:
+            return {
+                "served": False,
+                "reason": NO_TOOLING,
+                "attempts": self.attempts,
+                "detail": (
+                    "this run was started with no supervisor to ask; nothing was proposed"
+                ),
+            }
+        answered = dict(
+            self._channel.call(
+                f"mcp__{agent.SERVER}__propose_finding",
+                {
+                    "hypothesis_label": str(arguments.get("hypothesis_label") or ""),
+                    "vulnerability_class": str(arguments.get("vulnerability_class") or ""),
+                    "title": str(arguments.get("title") or ""),
+                },
+            )
+        )
+        # Only the database's own word for it counts. A supervisor that could
+        # not be reached, or that would not serve the verb, has not refused a
+        # proposal -- nobody looked at it -- and charging the run for that would
+        # spend a ceiling on the runtime's own trouble.
+        if answered.get("outcome") == REFUSED:
+            self.refused += 1
+        return answered
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -540,6 +649,22 @@ DESCRIPTIONS = {
         "output is filed as an Artifact of this Program -- the excerpt here is proof "
         "of what ran, not the place to read a large answer."
     ),
+    "propose_finding": (
+        "Ask the runtime to open a Finding from one Hypothesis of this Program that "
+        "has reached supported. Name the claim by its label, a vulnerability class "
+        "from this harness's vocabulary, and a title a person will read. You do not "
+        "name the run that settled the claim: the claim names it, and no other run "
+        "would be accepted.\n\n"
+        "The runtime decides. It reads the claim, the replay that settled it and the "
+        "transition between them -- rows it wrote itself, none of which you can "
+        "change by asking again -- and answers created, merged or refused. Merged "
+        "means a Finding is already open on this cell and your claim was added to "
+        "it, which is a result and not a rejection. Refused comes back as one "
+        "sentence saying what is wrong; only two of the things it can say are about "
+        "your proposal rather than about the evidence, so a refusal about the "
+        "evidence is not worth re-sending. This run may have three proposals refused "
+        "and no more, after which the tool stops carrying them."
+    ),
     "run_skill_script": (
         "Run one script that ships with a Skill you hold, over Artifacts this Program "
         "already holds. Name the Skill, the script's filename, and each argument the "
@@ -559,8 +684,9 @@ def server(
     choice: Choice | None = None,
     judgement: Judgement | None = None,
     channel: Channel | None = None,
+    proposal: Proposal | None = None,
 ):
-    """Five reads, one request, two tool runs, one proposal, one choice, one judgement.
+    """Five reads, a request, two tool runs, a result, a Finding, a choice, a judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -590,11 +716,17 @@ def server(
     }
     picking = Choice() if choice is None else choice
     judging = Judgement() if judgement is None else judgement
+    # Built from the same channel the tool runs go down when the caller does not
+    # hand one over, because it is the same question asked of the same party:
+    # this process has no database, and what it can do is ask the side that has
+    # one. A run with no supervisor gets a `Proposal` that says so.
+    proposing = Proposal(channel) if proposal is None else proposal
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
     tools.append(_request(surface, door))
     tools.append(_tool_run(surface, channel, "run_tool"))
     tools.append(_tool_run(surface, channel, "run_skill_script"))
     tools.append(_propose(surface, submission))
+    tools.append(_finding(surface, proposing))
     tools.append(_slate(surface, picking))
     tools.append(_pick(surface, picking))
     tools.append(_packet(surface, judging))
@@ -942,6 +1074,36 @@ def _judge(surface: Surface, judgement: Judgement):
     async def handler(arguments: dict) -> dict:
         surface.serve(name)
         return _content(judgement.judge(dict(arguments or {})))
+
+    return handler
+
+
+def _finding(surface: Surface, proposal: Proposal):
+    """The one claim this run may ask the runtime to write a Finding from.
+
+    Asked rather than held, which is the difference from every other request on
+    this surface. A pick and a verdict are answered after the run because the
+    runtime has to re-decide them against state that moved while the model was
+    thinking; a Finding proposal is answered now because the rows it turns on
+    have already settled and the run can do something with the answer -- go and
+    demonstrate the next claim, or stop repeating this one.
+
+    Nothing here decides whether the Finding may be opened. `rk2_finding_refusal`
+    is eight rules about rows the runtime itself wrote, and this handler carries
+    the proposal to it and reports what came back, including a refusal, which is
+    reported as a refusal rather than as a tool that failed. The one thing this
+    side decides is when it stops asking, which is a bound on this run's own
+    context and not a second opinion about the claim.
+
+    On a thread for `_tool_run`'s reason: the pipe is blocking and the caller is
+    an event loop.
+    """
+    name = "propose_finding"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(await asyncio.to_thread(proposal.ask, dict(arguments or {})))
 
     return handler
 

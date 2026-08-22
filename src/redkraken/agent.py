@@ -227,6 +227,14 @@ UNREACHABLE_STATE = "unreachable_state"
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 CLOSE = "SELECT close_startup_refusal($1::uuid, $2, $3, $4, $5::jsonb)"
 
+#: The proposal a child makes and this supervisor carries. `propose_finding`
+#: resolves the Hypothesis label to the claim and to the run whose Receipt the
+#: runtime cited when it settled that claim, then calls `open_finding` -- which
+#: until ticket 102 held the only `INSERT INTO findings` in the corpus and had
+#: no caller anywhere. The Agent run is this side's to fill in, because a child
+#: naming its own provenance is a child naming which run it would like to be.
+PROPOSE = "SELECT propose_finding($1, $2, $3, $4::uuid)"
+
 
 class StartupRefusal(RuntimeError):
     """The runtime would not start, or would not keep, this Agent run.
@@ -1177,8 +1185,13 @@ class _Tools:
 
     The dispatch is on the verb and it is closed. The roster has already refused
     every call that does not fit its contract, so what arrives here is a
-    well-formed call to one of two tools; anything else is a child that has
+    well-formed call to one of three tools; anything else is a child that has
     started making things up, and it is answered rather than executed.
+
+    Two of the three start a container and the third writes a row, and they are
+    answered here for the same reason: this is the side holding a connection.
+    A child's one network reaches the capability proxy, so a proposal it could
+    file itself would be a proposal filed by the party the row is about.
 
     The connection is opened at the first call and not before. Most runs ask for
     no tool at all, and a connection held open through every one of them would
@@ -1193,12 +1206,15 @@ class _Tools:
 
     def __call__(self, call: Mapping[str, object]) -> Mapping[str, object]:
         verb = str(call.get("verb") or "")
-        if verb not in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT):
+        if verb not in (roster.RUN_TOOL, roster.RUN_SKILL_SCRIPT, roster.PROPOSE_FINDING):
             return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
         try:
             connection = self._open()
         except (pg.ConnectionError_, OSError) as error:
             return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+
+        if verb == roster.PROPOSE_FINDING:
+            return self._propose(connection, call.get("arguments"))
 
         if verb == roster.RUN_TOOL:
             named: str | None = str(call.get("tool") or "")
@@ -1232,6 +1248,42 @@ class _Tools:
             ),
             excerpt=packet_module.DEFAULT_EXCERPT,
         )
+
+    def _propose(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one Finding proposal to the runtime and answer what it said.
+
+        The three declared arguments and nothing else, because the two fields
+        that matter most are not the child's to name: the Program is bound on
+        the connection so that a runtime holding one connection open cannot be
+        asked to open a Finding against another Program, and the Agent run is
+        the one this object was built for.
+
+        A refusal comes back as a refusal and not as an exception.
+        `rk2_finding_refusal` answers with the sentence saying why, and that
+        sentence is the record ticket 36 built; turning it into an exception
+        would leave the child with a tool that failed and leave nobody with the
+        reason. What is raised rather than answered is the database being
+        unreachable or refusing the statement outright, which is not a verdict
+        on the proposal at all and is reported as the state it is.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        try:
+            connection.execute(BIND, (self._program_id,))
+            answered = connection.execute(
+                PROPOSE,
+                (
+                    str(arguments.get("hypothesis_label") or ""),
+                    str(arguments.get("vulnerability_class") or ""),
+                    str(arguments.get("title") or ""),
+                    self._agent_run_id,
+                ),
+            ).scalar()
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        document = json.loads(str(answered))
+        return document if isinstance(document, Mapping) else {}
 
     def _open(self) -> pg.Connection:
         if self._connection is None:

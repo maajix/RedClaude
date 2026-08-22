@@ -423,6 +423,54 @@ class SurfaceTest(unittest.TestCase):
                     f"{name} promotes its own proposals",
                 )
 
+    def test_a_finding_is_asked_for_because_it_may_not_be_written(self):
+        """PH2-102: the rule that decided the shape of this tool.
+
+        `findings` is canonical, the compile refuses a contract that names one,
+        and the test above proves it does. So the strongest thing this surface
+        can do about a Finding is ask -- and what the ask leaves behind is the
+        audit row `open_finding` writes whether it opened one or refused.
+        """
+        request = roster.CONTRACTS["mcp__rk2__propose_finding"]
+
+        self.assertEqual(roster.REQUEST, request.direction)
+        self.assertEqual(("finding_proposals",), request.writes)
+        self.assertNotIn("findings", request.writes)
+        self.assertIn("findings", roster.CANONICAL)
+        self.assertNotIn("finding_proposals", roster.CANONICAL)
+
+    def test_a_proposal_names_the_run_that_settled_the_claim_by_naming_the_claim(self):
+        """The three fields, and the reason the fourth is not one of them.
+
+        `test_runs` carries no label and a packet publishes no Test, so a run
+        argument would be a field no child could fill. It is not needed: the
+        transition from `testing` to `supported` cites one Receipt and that
+        Receipt belongs to one run, so the claim names the run.
+        """
+        request = roster.CONTRACTS["mcp__rk2__propose_finding"]
+
+        self.assertEqual(
+            {"hypothesis_label", "vulnerability_class", "title"}, set(request.arguments)
+        )
+        self.assertNotIn("test_runs", roster.LABEL_PREFIXES)
+        for name, declared in request.arguments.items():
+            with self.subTest(argument=name):
+                self.assertTrue(declared.required)
+                self.assertTrue(declared.constrained)
+                self.assertFalse(declared.free_text)
+
+    def test_the_vulnerability_word_is_the_tables_and_not_a_copy_of_the_table(self):
+        # An enum here would be a second copy of `vulnerability_classes` that
+        # goes stale the first time a migration adds a row. The eighth arm of
+        # `rk2_finding_refusal` answers an unknown class by naming it, which is
+        # the vocabulary refusing out of the table that declares it.
+        declared = roster.CONTRACTS["mcp__rk2__propose_finding"].arguments["vulnerability_class"]
+
+        self.assertEqual((), declared.enum)
+        self.assertTrue(declared.pattern)
+        self.assertTrue(re.compile(declared.pattern).match("idor"))
+        self.assertFalse(re.compile(declared.pattern).match("Idor"))
+
     def test_nothing_on_the_validators_surface_takes_free_text(self):
         for name in roster.TOOL_GROUPS["validate.judge"]:
             for argument, declared in roster.CONTRACTS[name].arguments.items():
@@ -457,6 +505,27 @@ class AuthorityTest(unittest.TestCase):
         # because the only channel into it takes one label.
         request = roster.CONTRACTS["mcp__rk2__request_validation"]
         self.assertEqual({"finding_label"}, set(request.arguments))
+
+    def test_only_a_role_that_hunts_may_ask_for_a_finding(self):
+        """PH2-102: who decides that something is worth reporting.
+
+        The party that did the hunting, which is why the request is in
+        `state.propose` and not in `sched.pick`. The orchestrator never touches
+        a target and the validator judges a Finding somebody else opened, so
+        neither is the party -- and `_check_authority` already keeps the two
+        groups off one role, so a role that asks for a Finding is never the role
+        that schedules the work the Finding would justify.
+        """
+        asking = {
+            name for name, role in roster.ROLES.items()
+            if "mcp__rk2__propose_finding" in role.tools
+        }
+
+        self.assertEqual({"recon", "web_hunter", "js_analyst"}, asking)
+        for name in sorted(asking):
+            with self.subTest(role=name):
+                self.assertTrue(roster.ROLES[name].executes_tasks)
+                self.assertNotIn("sched.pick", roster.ROLES[name].tool_groups)
 
     def test_the_reporter_runs_no_model(self):
         reporter = roster.ROLES["reporter"]

@@ -178,11 +178,11 @@ OWED_GAPS: dict[str, str] = {
 
     # W3. The Finding lifecycle, from the verb that creates a Finding to the one
     # that composes a chain, is granted to the runtime and called by nothing.
-    # Ticket 102 owns the dispatch that calls `open_finding`; ticket 103 owns the
-    # six verbs downstream of it, and the helpers each of those is the only
-    # caller of come with it.
-    "W3 open_finding": "owed:102",
-    "W3 rk2_finding_refusal": "owed:102",
+    # Ticket 102 has taken the first two rows off this list: `propose_finding`
+    # calls `open_finding`, `open_finding` calls `rk2_finding_refusal`, and the
+    # supervisor calls `propose_finding` -- so reachability now runs from a
+    # Python call site to both. Ticket 103 owns the six verbs downstream of it,
+    # and the helpers each of those is the only caller of come with it.
     "W3 open_impact_task": "owed:103",
     "W3 state_severity": "owed:103",
     "W3 apply_computed_cvss": "owed:103",

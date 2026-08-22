@@ -192,28 +192,37 @@ class WiringRegisterTest(unittest.TestCase):
         # The rule `check_audit` writes for its own `owed:NN` rows, in the place
         # it costs the most: work that was called finished while the gap it was
         # meant to close is still measurable.
-        ticket = self.wiring.tickets[102]
+        #
+        # Ticket 103 stands in for the rule, and the two rows this fixture used
+        # to name are why it has to: ticket 102 gave `open_finding` its caller,
+        # so those gaps are gone and a fixture over a closed gap asserts
+        # nothing. The keys are read off the register rather than written out,
+        # because the next ticket to close its own rows would otherwise break
+        # this test instead of being caught by the gate.
+        ticket = self.wiring.tickets[103]
         tickets = {
             **self.wiring.tickets,
-            102: dataclasses.replace(ticket, status=check_audit.RESOLVED),
+            103: dataclasses.replace(ticket, status=check_audit.RESOLVED),
         }
+        owed = sorted(key for key, row in check_wiring.OWED_GAPS.items() if row == "owed:103")
+        self.assertTrue(owed, "ticket 103 owes no register row for this fixture to use")
 
         errors = check_wiring.register_errors(self.gaps, tickets)
 
         self.assertEqual(
             [
-                f"register: {key} names owed:102, which is resolved, and the gap is still here"
-                for key in ("W3 open_finding", "W3 rk2_finding_refusal")
+                f"register: {key} names owed:103, which is resolved, and the gap is still here"
+                for key in owed
             ],
             errors,
         )
 
     def test_a_row_naming_no_ticket_at_all_is_refused(self):
-        with mock.patch.dict(check_wiring.OWED_GAPS, {"W3 open_finding": "owed:9999"}):
+        with mock.patch.dict(check_wiring.OWED_GAPS, {"W3 open_impact_task": "owed:9999"}):
             errors = check_wiring.register_errors(self.gaps, self.wiring.tickets)
 
         self.assertEqual(
-            ["register: W3 open_finding names owed:9999 and the tracker holds no such ticket"],
+            ["register: W3 open_impact_task names owed:9999 and the tracker holds no such ticket"],
             errors,
         )
 

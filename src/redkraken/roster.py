@@ -521,7 +521,14 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "mcp__rk2__get_receipts",
         "mcp__rk2__get_artifact",
     ),
-    "state.propose": ("mcp__rk2__submit_mission_result",),
+    # What a role that executes work may say about state it is not allowed to
+    # write. The first member is the whole of one run's reading; the second is
+    # the one claim that reading can amount to. Both are here rather than in
+    # `sched.pick` because deciding that something is worth reporting belongs
+    # to the party that did the hunting, and `_check_authority` keeps the two
+    # groups off the same role -- so a role that proposes a Finding is never
+    # also the role that schedules the work the Finding would justify.
+    "state.propose": ("mcp__rk2__submit_mission_result", "mcp__rk2__propose_finding"),
     # Scheduling as the orchestrator sees it, which is not scheduling as the
     # runtime does it. "The runtime decides what may be chosen; the orchestrator
     # decides which; the runtime commits the claim" -- so the model reads a
@@ -690,6 +697,47 @@ CONTRACTS: dict[str, Contract] = {
             "completion_claim": Argument(
                 "object", required=True, items_pattern="^(status|note)$"
             ),
+        },
+    ),
+    # The one thing a hunting role may ask the runtime to write down about what
+    # its work amounted to, and the reason it is an ask. `findings` is a
+    # canonical table, so no contract may name it in `writes` and the compile
+    # refuses one that does -- which is the rule that decides the shape of this
+    # tool rather than a rule it has to work around. The child says which claim
+    # it believes is a Finding; `open_finding` decides whether it is, out of
+    # rows the runtime itself wrote, and answers what it decided.
+    #
+    # Three arguments and not four. The proposal names a claim, a class and a
+    # title, and it does not name the run that settled the claim, because there
+    # is no name for one: `test_runs` carries no label and a packet publishes
+    # Entities, Hypotheses, evidence edges, Receipts and Artifacts and no Test
+    # at all, so a run argument would be a field no child could fill. Nothing
+    # is given up by leaving it out. The settling run is pinned by the claim --
+    # the transition from `testing` to `supported` cites one Receipt and that
+    # Receipt belongs to one run -- so naming the Hypothesis names the run, and
+    # a proposal that named any other run would be refused for naming it.
+    "mcp__rk2__propose_finding": Contract(
+        "state.propose",
+        REQUEST,
+        writes=("finding_proposals",),
+        arguments={
+            "hypothesis_label": Argument("string", required=True, pattern=_label("H")),
+            # A pattern rather than an enum, which is the opposite of the choice
+            # `run_tool` makes about its own binaries and is right for the same
+            # reason that one is. A binary is a program this harness starts and
+            # the closed list is the authority; a vulnerability class is a word
+            # from a seeded table that later tickets add rows to, and an enum
+            # here would be a second copy of that table which goes stale the
+            # first time somebody extends it. The eighth arm of
+            # `rk2_finding_refusal` answers an unknown class by naming it, so
+            # the vocabulary refuses out of the table that declares it.
+            "vulnerability_class": Argument(
+                "string", required=True, pattern="^[a-z][a-z0-9_]{2,63}$"
+            ),
+            # The one field on a Finding that a person reads and no rule reads,
+            # so what is stated about it is how long it may be and nothing else.
+            # A shape would be this roster deciding how a finding is written up.
+            "title": Argument("string", required=True, bounds=(1, 200)),
         },
     ),
     "mcp__rk2__get_slate": Contract(
@@ -898,6 +946,13 @@ RUN_TOOL_NAMES: tuple[str, ...] = CONTRACTS[RUN_TOOL].arguments["tool"].enum
 #: dispatches on the pair, and a verb spelled in the handler would be a second
 #: place this surface is named.
 RUN_SKILL_SCRIPT = "mcp__rk2__run_skill_script"
+
+#: The third verb the supervisor answers across that same pipe, and the only one
+#: of the three that writes rather than runs. Spelled here for `RUN_TOOL`'s
+#: reason and for one more: it is the tool whose absence from that dispatch was
+#: the wiring audit's worst finding, so the name the supervisor matches on is
+#: taken from the roster that declares it rather than typed a second time.
+PROPOSE_FINDING = "mcp__rk2__propose_finding"
 
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
