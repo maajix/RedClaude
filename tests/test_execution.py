@@ -307,6 +307,26 @@ class Recorder:
             answers.get("selections", [(SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256,
                                         SELECTED_PLAYBOOK.version)])
         )
+        # How many live selections the sweep found their Playbook had expired
+        # under. Zero is the ordinary pass; a catalogue that moved under a
+        # running mission is what a case says otherwise to see.
+        self.marked = answers.get("marked", 0)
+        # What `settle_playbook_selections` made of the Task once it was
+        # closed. The default agrees with `closure`: a Task that reached `done`
+        # under one kept Playbook, and that Playbook produced. `settled` false
+        # is the other real answer -- a Task on its way back onto the Slate --
+        # and it is the recorder's business to say which, because the verb
+        # reads the Task's own status rather than anything the runtime sends.
+        self.settlement = answers.get(
+            "settlement",
+            {
+                "task": "T1",
+                "task_status": "done",
+                "settled": True,
+                "produced": 1,
+                "exhausted": 0,
+            },
+        )
         # An idle reconciliation: nothing had lapsed, and the one Task this
         # recorder's slate is about is this run's own to claim.
         self.reconciliation = answers.get(
@@ -472,6 +492,10 @@ class Recorder:
             return [(len(self.selections),)]
         if sql == execution.SELECTED:
             return list(self.selections)
+        if sql == execution.SWEEP_STALE:
+            return [(self.marked,)]
+        if sql == execution.SETTLE_SELECTION:
+            return [(json.dumps(self.settlement),)]
         if sql == execution.OPEN_TOOL_RUN:
             return [(TOOL_RUN, "TR9")]
         if sql == proxy.AUTHORIZE_TOOL_RUN:
@@ -1609,6 +1633,151 @@ class PlaybookSelectionTest(unittest.TestCase):
             ledger, _ = attempt(connection)
         self.assertEqual(execution.INVALID_CONFIGURATION, ledger.violations[0].code)
         self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+
+
+class PlaybookOutcomeTest(unittest.TestCase):
+    """The far end of the funnel: what a selection turned out to have been worth.
+
+    Ticket 121. `playbook_selections.outcome` has had three values and a default
+    of `running` since 027 and no writer at all, so `exhausted` -- the only
+    memory the selection has, and the reason `playbook_candidates` drops a
+    Playbook it has already run against a subject -- was a word the schema could
+    describe and nothing could reach. `mark_stale_selections` was in the same
+    state one column over: the sweep existed and nobody ran it.
+    """
+
+    def details(self, ledger: Ledger) -> str:
+        return " ".join(item.detail for item in ledger.assertions)
+
+    def test_the_staleness_sweep_runs_before_anything_is_offered(self):
+        # 027 evaluates staleness at selection and never again inside a run, so
+        # the sweep has to have happened by the time this pass picks: a stamp
+        # written afterwards would describe a Playbook this pass had just
+        # chosen under.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertLess(
+            connection.position(execution.SWEEP_STALE),
+            connection.position(execution.OFFER),
+        )
+
+    def test_a_pass_that_claims_nothing_still_sweeps(self):
+        # The sweep is over what other passes left in flight, so it is not the
+        # claim's to depend on. A machine whose slate is empty is exactly the
+        # one with nothing else to do about a catalogue that moved.
+        connection = Recorder(slate=0)
+        with compiled():
+            _, facts = attempt(connection)
+        self.assertEqual({"marked": 0}, facts["staleness"])
+        self.assertNotIn(execution.CLAIM, connection.statements)
+
+    def test_a_playbook_that_expired_under_a_live_mission_is_said_out_loud(self):
+        connection = Recorder(marked=2)
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual({"marked": 2}, facts["staleness"])
+        self.assertIn(
+            "2 live selection(s) had their Playbook expire under them",
+            self.details(ledger),
+        )
+
+    def test_a_sweep_the_database_refused_does_not_stop_the_pass(self):
+        # Housekeeping over somebody else's rows, like the reconciliation above
+        # it: nothing downstream acts on `went_stale_at`, so a sweep that could
+        # not be written is a report an operator loses and not work this pass
+        # has to abandon.
+        connection = Recorder(
+            raises={execution.SWEEP_STALE: database_error("could not update")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIsNone(facts["staleness"])
+        self.assertEqual(execution.INTEGRITY_FAILED, ledger.violations[0].code)
+        self.assertIn(execution.RECORD_SELECTION, connection.statements)
+
+    def test_the_selection_is_settled_after_the_attempt_has_been_closed(self):
+        # `finish_task_attempt` is what decides whether the Task is done,
+        # abandoned or back on the Slate, and the settlement turns on that word.
+        # Asking before it, or inside its transaction, would be asking a
+        # question whose answer was still being written.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertLess(
+            connection.closing(), connection.position(execution.SETTLE_SELECTION)
+        )
+
+    def test_the_settlement_is_told_the_task_and_nothing_else(self):
+        # The Program, the subject and the Playbook's classes are all on rows
+        # the Task already names. A caller that could name them could settle a
+        # selection belonging to a run it was not closing.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertEqual([(TASK,)], connection.sent(execution.SETTLE_SELECTION))
+
+    def test_what_is_exhausted_on_this_subject_is_reported(self):
+        connection = Recorder(
+            settlement={
+                "task": "T1",
+                "task_status": "abandoned",
+                "settled": True,
+                "produced": 0,
+                "exhausted": 3,
+            }
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual(3, facts["selections"]["exhausted"])
+        self.assertIn(
+            "0 Playbook(s) produced and 3 are exhausted on this subject",
+            self.details(ledger),
+        )
+
+    def test_a_task_going_back_onto_the_slate_leaves_its_selection_open(self):
+        # The retry runs under the rows this attempt recorded -- the selection
+        # is unique on (task, playbook), so there is no second set to record --
+        # and a Playbook retired here would be retired in front of the run that
+        # was about to use it properly.
+        connection = Recorder(
+            settlement={
+                "task": "T1",
+                "task_status": "pending",
+                "settled": False,
+                "produced": 0,
+                "exhausted": 0,
+            }
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIs(False, facts["selections"]["settled"])
+        self.assertIn("may be run again", self.details(ledger))
+
+    def test_an_attempt_that_never_started_still_settles_what_it_held(self):
+        # In the closing `finally` beside the attempt's own, because the
+        # outcome is a fact about the Task rather than about how far this
+        # runtime got with it. The verb declines to write for a Task still on
+        # the Slate, which is what this one will be.
+        connection = Recorder(started=(started_row(subject_type="hypothesis", url=None),))
+        with compiled():
+            attempt(connection)
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+        self.assertEqual([(TASK,)], connection.sent(execution.SETTLE_SELECTION))
+
+    def test_a_settlement_the_database_refused_leaves_the_closing_alone(self):
+        # Its own transaction, after the closing, for exactly this: a
+        # settlement that could not be written must not roll back the one call
+        # that closed the runs, released the Leases and settled the Task.
+        connection = Recorder(
+            raises={execution.SETTLE_SELECTION: database_error("no such task")}
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertIsNone(facts["selections"])
+        self.assertEqual(1, len(connection.finished()))
+        self.assertEqual(execution.INTEGRITY_FAILED, ledger.violations[0].code)
+        self.assertEqual("database", ledger.violations[0].source)
 
 
 class AttemptTest(unittest.TestCase):

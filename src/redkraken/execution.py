@@ -345,6 +345,23 @@ SELECTED = (
     " ORDER BY s.rank"
 )
 
+#: The staleness sweep, which 027 wrote and nothing has ever run. Staleness is
+#: evaluated at selection and never again inside a run, so what this writes is a
+#: record rather than an eviction: a live selection whose Playbook expired under
+#: it gets the stamp, the mission goes on reading the text it was handed, and
+#: `check_playbook_integrity` is where the stamp is read back out. Without a
+#: caller that warning asks for a row nothing could produce.
+SWEEP_STALE = "SELECT mark_stale_selections()"
+
+#: What the selection turned out to have been worth, asked once the Task it was
+#: made for is settled rather than once this attempt is over. The two are
+#: different questions: an attempt that promoted nothing hands a Task with
+#: attempts left back onto the Slate, and the retry runs under these same rows,
+#: so a settlement charged per attempt would retire a Playbook against a subject
+#: on the strength of a container that failed to start. The verb reads the
+#: Task's status for itself and declines to write while it is still open.
+SETTLE_SELECTION = "SELECT settle_playbook_selections($1::uuid)"
+
 #: The Tool run the capability is minted against. `proxy.OPEN_TOOL_RUN` cannot
 #: be reused: `authorize_tool_run` requires a Tool run's Task to match its Agent
 #: run's, and the proxy's own row carries no Task because the command that opens
@@ -912,12 +929,14 @@ class Slice:
         """
         facts = {
             "reconciliation": None,
+            "staleness": None,
             "slate": [],
             "choice": None,
             "task": None,
             "agent_run": None,
             "target": None,
             "playbooks": None,
+            "selections": None,
             "packet": None,
             "heartbeat": None,
             "tool_run": None,
@@ -942,6 +961,7 @@ class Slice:
     ) -> None:
         """The pass itself, written into `facts` because every step of it stops."""
         facts["reconciliation"] = self._reconcile(ledger, connection)
+        facts["staleness"] = self._stale(ledger, connection)
 
         offered = self._offer(ledger, connection)
         if offered is None:
@@ -983,6 +1003,7 @@ class Slice:
             self._run(ledger, connection, program_id, claimed, chosen, facts)
         finally:
             facts["closure"] = self._finish(ledger, connection, claimed, facts)
+            facts["selections"] = self._settle(ledger, connection, claimed)
 
     def _rotate(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
         """Close the campaign if this pass spent the last of it.
@@ -1057,6 +1078,41 @@ class Slice:
             f"{answer.get('tasks_left_to_live_owners')} left to the runs still holding them",
         )
         return answer
+
+    def _stale(self, ledger: Ledger, connection: pg.Connection) -> dict | None:
+        """Which live selections lost the Playbook under them, before anything is offered.
+
+        Beside the reconciliation and for the same reason it is there: this is a
+        sweep over what other passes left in flight, and the selection this pass
+        is about to make should be made against a catalogue whose expiries have
+        already been written down. Not narrowed to the Program this pass is
+        bound to, because the catalogue is not: `playbooks` is a program-global
+        table, so a review date that has passed has passed for every hunt at
+        once, and a sweep that only ever reached the Program somebody happened
+        to run would leave the rest to whichever pass came next.
+
+        Reported and never fatal. Nothing acts on `went_stale_at`: selection
+        drops an expired Playbook on its own, and what the stamp buys is an
+        operator being told that a live mission is running on a text the
+        catalogue has stopped standing behind.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                marked = int(connection.execute(SWEEP_STALE).scalar() or 0)
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "staleness",
+                f"live Playbook selections could not be swept for staleness: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        ledger.hold(
+            "staleness",
+            f"{marked} live selection(s) had their Playbook expire under them",
+        )
+        return {"marked": marked}
 
     def _offer(self, ledger: Ledger, connection: pg.Connection) -> list[dict] | None:
         """One scheduler pass: rank, advance the quota, offer.
@@ -2371,6 +2427,56 @@ class Slice:
             f"tool run(s) and {closure.get('leases_released')} lease(s) closed",
         )
         return closure
+
+    def _settle(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed
+    ) -> dict | None:
+        """What the Playbooks this Task ran under produced, once the Task is settled.
+
+        After the closing and in a transaction of its own, because it is a read
+        of what the closing decided. `finish_task_attempt` is what says whether
+        the Task is done, abandoned or back on the Slate, and this settlement
+        turns on that word rather than on the runtime's opinion of how the
+        attempt went -- so it cannot share the transaction that is still
+        deciding it. Sharing one would also put a settlement failure in front of
+        the closing, which is the one call an attempt must not lose.
+
+        A Task back on the Slate is answered and not written: it will be run
+        again under these same rows, and a Playbook retired for a container that
+        would not start is retired for the rest of the hunt. A settled Task gets
+        `produced` on every kept Playbook that declares a class this subject now
+        carries a hypothesis on and `exhausted` on the rest, and `exhausted` is
+        the half worth having -- it is the only memory the next selection has
+        that this Playbook has already been tried against this subject.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                settled = proxy.as_object(
+                    connection.execute(SETTLE_SELECTION, (claimed.task_id,)).scalar()
+                )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "selections",
+                f"what {claimed.task_label} ran under could not be settled: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        if settled.get("settled"):
+            ledger.hold(
+                "selections",
+                f"{claimed.task_label} is {settled.get('task_status')}: "
+                f"{settled.get('produced')} Playbook(s) produced and "
+                f"{settled.get('exhausted')} are exhausted on this subject",
+            )
+        else:
+            ledger.hold(
+                "selections",
+                f"{claimed.task_label} is {settled.get('task_status')} and may be run "
+                "again; its Playbook selection stays open",
+            )
+        return settled
 
 
 def _actor(connection: pg.Connection) -> None:
