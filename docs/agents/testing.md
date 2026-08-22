@@ -45,7 +45,7 @@ If the change touches schema, verbs or grants, add the covering
 `tests/test_database.py` classes to the same command, under the lock:
 
 ```
-export RK_TEST_SUPERUSER_URL="postgres://postgres:rk2test@127.0.0.1:55433/postgres"
+export RK_TEST_SUPERUSER_URL="postgres://postgres:...@127.0.0.1:5432/postgres"
 export RK_TEST_DATABASE=<a name nobody else is using>
 flock -w 3600 /tmp/rk2-db.lock uv run python -m unittest \
   tests.test_database.CleanCreationTest tests.test_database.<YourClass> -q

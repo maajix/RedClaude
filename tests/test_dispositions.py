@@ -235,16 +235,23 @@ class DispositionRowTest(unittest.TestCase):
         )
 
     def test_an_unwritten_ticket_is_not_a_verification(self):
-        policy = {**self.policy, "migration_tickets": [*self.policy["migration_tickets"], "99"]}
+        # A number no issue file carries. It has to be above every ticket this
+        # tracker holds rather than merely absent today: 99 was unwritten when
+        # this case was first put here and became a real ticket five days
+        # later, which turned the case red for a reason it was not testing.
+        # Three digits, because `check_dispositions.TICKET` admits two or three
+        # and a four-digit number is not a ticket citation at all -- it would
+        # fail one check earlier, on the replacement, and test nothing.
+        policy = {**self.policy, "migration_tickets": [*self.policy["migration_tickets"], "999"]}
         found, _ = check_dispositions.row_error(
-            broken(replacement="role:nobody", verification="ticket:99"),
+            broken(replacement="role:nobody", verification="ticket:999"),
             "agent_definition",
             self.names,
             ROOT,
             policy,
         )
 
-        self.assertEqual(".claude/agents/web-vuln-hunter.md: ticket:99 is not a ticket", found)
+        self.assertEqual(".claude/agents/web-vuln-hunter.md: ticket:999 is not a ticket", found)
 
     def test_a_ticket_with_no_status_is_not_an_open_ticket(self):
         # An issue file with no `Status:` line is unlabelled, not open. Reading
