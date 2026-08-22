@@ -26,7 +26,7 @@ withholding what it already knows.
       nothing yet writes the `interception_cas` row that name would point at."
       Once a CA row exists, those four columns are filled and
       `receipts.interception_ca_id` points at it.
-- [ ] The consequence that is currently invisible is named: this is not a silent
+- [x] The consequence that is currently invisible is named: this is not a silent
       gap, it is a documented one that costs a column family. The harness knows
       the leaf it forged, cannot attribute it, and therefore records nothing --
       so `check_transport_claims`'s `unattributed_forged_leaf` arm
@@ -34,7 +34,7 @@ withholding what it already knows.
       never fires, not because no leaf is unattributed but because no leaf is
       recorded. Its `expired_ca_still_current` arm (`:2443-2447`) is empty for
       the same reason.
-- [ ] Who writes the row is the decision this ticket settles. The lifecycle in
+- [x] Who writes the row is the decision this ticket settles. The lifecycle in
       the schema is engagement-bounded and operator-shaped: a `secret_ref` in
       ticket 15's format, a ninety-day maximum lifetime, one current CA per
       Program, and retire-then-supersede rotation. That is an operator command
@@ -45,7 +45,7 @@ withholding what it already knows.
       `secret_ref` deliberately excluded -- `check_transport_claims` asserts
       that exclusion at `20260815T000000Z...:2472-2475`. Filling the table makes
       nine of those ten real, and the tenth stays excluded.
-- [ ] `20260923T000000Z__the_runtime_takes_its_own_transport_measurement.sql:406`
+- [x] `20260923T000000Z__the_runtime_takes_its_own_transport_measurement.sql:406`
       is left as it is and the ticket says why: a measurement Receipt sets
       `interception_ca_id := NULL` on purpose, because an unintercepted
       measurement has no forging key to name.
@@ -165,3 +165,96 @@ carrying a reference at all for door-held CAs, and the exclusion still stands as
 written -- a column that may name a secret store for some rows must stay off the
 surface for all of them. Nothing in the read surface needs to change; nine of the
 ten columns simply stop being NULL.
+
+## What was built, 2026-08-22
+
+The decision above, in the two places it can be written from without the two
+files this ticket's remaining criteria are owed to.
+
+**The registry can be written to.**
+`src/redkraken/migrations/20261007T000000Z__a_run_registers_the_authority_it_is_intercepted_under.sql`
+widens `interception_cas_secret_ref_shape` to `^(op://|kek:|door:)`, re-issues
+`secret_ref`'s `COMMENT ON` in the same file for the G8 rule, registers a `CA`
+label prefix, and adds `register_interception_ca(uuid, text, text, timestamptz,
+timestamptz)` — idempotent for the CA that is already current, retire-then-issue
+for a different one, writing `door:no-reference` for a key the door holds and no
+store references. It is `REVOKE ALL ... FROM PUBLIC`, `GRANT EXECUTE ... TO
+rk2_runtime` with the matching `runtime_verb_surface` row, and asserted not to be
+executable by `rk2_proxy`: the party that holds the signing key must not also be
+the party that describes it. The lifecycle — two registrations of one SPKI being
+one row, a rotation retiring and superseding in that order, one current CA per
+Program, `door:` still refusing key material — is asserted in the file's second
+`DO $$` block against a Program the block rolls back.
+
+**The certificate can be read into a row.**
+`src/redkraken/tls.py` gains `HELD`, `REGISTER`, `Registration` and
+`registration(certificate)`: one `openssl x509` invocation yields subject,
+`notBefore`, `notAfter` and the SHA-256 of the DER subject public key info, and
+it needs the certificate and nothing else — which is the property that puts the
+write on the runtime rather than on the door. `spki_sha256` is the **root's** key,
+not the `leaf-key.pem` that `Authority.pin` hashes; `tests/test_tls.py`
+`RegistrationTest` asserts they differ, that the reader works on a copy of
+`ca.pem` alone in a directory, and that the subject is the long-attribute-name
+spelling `proxy._name` produces on the other side of a handshake.
+
+Two line references in the decision above moved when that code landed and are
+kept as they were written: `Authority.pin` is now `tls.py:243-260` and
+`tls.authority` is now `tls.py:328-375`. The rest -- `tls.py:55-57`, `:58`,
+`:150-151` -- still point where they did.
+
+### What is still owed, and to which line
+
+Three criteria are unticked and none of them is undecided — each is a call in a
+file this agent was not given.
+
+**Criterion 1, the caller.** The verb exists and `rk2_runtime` holds it; nothing
+executes it. The call belongs in **`src/redkraken/execution.py`, in
+`Slice.attempt`, immediately after `connection.execute(proxy.BIND,
+(program_id,))` at `execution.py:993`** — that statement is the point a Program
+first has a door to intercept with, it is reached by `rk run` and by `rk playbook
+evaluate` alike, and `Slice` already holds all three of the things the write
+needs: `self.boundary.certificate` (which is `$RK_PROXY_CA_FILE`, set by
+`execution.boundary` at `execution.py:515`), a runtime `connection`, and
+`program_id`. What is needed is one statement:
+
+```python
+connection.execute(
+    tls.REGISTER, tls.registration(self.boundary.certificate).arguments(program_id)
+)
+```
+
+**Criterion 2, the four columns.** `proxy.transport` (`src/redkraken/proxy.py:1966`)
+returns the Receipt's transport facts and its docstring at `proxy.py:1981-1986`
+still says `agent_cert_*` stays null because nothing writes the
+`interception_cas` row. Once criterion 1's call is in, that paragraph is stale:
+`transport` should carry `agent.cert_sha256`, `agent.cert_issuer`,
+`agent.cert_subject` and `agent.cert_not_after` through, and the Receipt writer
+should set `interception_ca_id` to the id `register_interception_ca` returned for
+this Program. `receipts_intercepted_leaf_names_ca` (`0025:154-157`) is what makes
+the two halves one change: a leaf without a CA is unwritable, and a CA without a
+leaf is merely unused.
+
+**Criterion 5, the read surface.** Nothing in the surface has to move — the
+decision's closing note settles that, and the migration says so under WHAT IS
+DELIBERATELY NOT HERE — but "nine of those ten columns stop being NULL" is an
+observation about a filled table, so it is not tickable until criterion 1's call
+lands.
+
+### Two things for whoever finishes it
+
+`tools/check_wiring.py` has one row to delete: **`"W6 interception_cas":
+"owed:124"`** at `check_wiring.py:271`. The gap is measurably gone —
+`register_interception_ca` inserts into the table, so `catalogue.inserted_by_function`
+covers it — and the gate now fails with `register: W6 interception_cas names
+owed:124 and this tree has no such gap; remove the row`.
+
+`tests/test_database.py` owes one class. The migration's `DO $$` blocks cover
+what a migration can roll back on its own; what they cannot reach is the row the
+whole ticket is for, because a `receipts` insert needs a scope version, a policy
+digest and a live authorized capability before `receipts_intercepted_leaf_names_ca`
+is even evaluated. A test should assert, against a Program with a registered CA
+and a real capability, that an intercepted Receipt carrying all four
+`agent_cert_*` columns and `interception_ca_id` is accepted; that the same
+Receipt with `interception_ca_id` NULL is refused by
+`receipts_intercepted_leaf_names_ca`; and that `check_transport_claims` reports
+`unattributed_forged_leaf` for the second and nothing for the first.

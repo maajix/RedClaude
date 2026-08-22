@@ -31,10 +31,18 @@ is a handshake rather than a comparison of strings. `SSL_CERT_FILE` names a file
 and the hashed directory beside it is looked up independently, so an environment
 that set only the file would hand a child this run's root *and* leave every root
 the system installed exactly as trusted as it was.
+
+`registration` is the reading that lets a forged leaf be attributed, and what is
+tested about it is what it does *not* need. The four facts an `interception_cas`
+row carries all come out of the certificate, so the reader works on a copy of
+`ca.pem` sitting alone in a directory -- which is the property that puts the
+write on the runtime rather than on the door that holds the key.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import socket
 import ssl
@@ -42,6 +50,7 @@ import stat
 import subprocess
 import threading
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -222,6 +231,116 @@ class AuthorityTest(unittest.TestCase):
 
         with self.assertRaises(tls.Unusable):
             tls.authority(occupied)
+
+
+class RegistrationTest(unittest.TestCase):
+    """What `interception_cas` is told about the authority a run intercepts under.
+
+    Ticket 124. The row is written by the runtime and the key is held by the
+    door, so the property every test here is about is that `registration` reads
+    the *public* half and could not read anything else: the side that registers
+    the authority is deliberately not the side that can forge with it, and a
+    reader that needed the key would put the write back on the door.
+    """
+
+    def setUp(self):
+        self.made = tls.authority(scratch() / "ca")
+
+    def test_a_registration_is_read_from_a_certificate_with_no_key_beside_it(self):
+        # The certificate alone, in a directory that holds nothing else --
+        # which is what a child is handed and what the runtime verifies
+        # against. A reader that needed the key would raise here.
+        elsewhere = scratch() / "handed-out.pem"
+        elsewhere.write_bytes(self.made.certificate.read_bytes())
+
+        read = tls.registration(elsewhere)
+
+        self.assertEqual(tls.registration(self.made.certificate), read)
+        self.assertEqual([elsewhere], sorted(elsewhere.parent.iterdir()))
+
+    def test_the_digest_is_the_root_key_and_not_the_key_leaves_are_signed_over(self):
+        # The two keys live in one directory and neither is the other. `pin` is
+        # the key every leaf is signed *over*; `spki_sha256` is the key every
+        # leaf is signed *by*, and a row carrying the first would attribute a
+        # forged leaf to something that never signed one.
+        printed = subprocess.run(
+            ["openssl", "x509", "-in", str(self.made.certificate), "-noout", "-pubkey"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        der = subprocess.run(
+            ["openssl", "pkey", "-pubin", "-outform", "DER"],
+            input=printed,
+            capture_output=True,
+            check=True,
+        ).stdout
+
+        read = tls.registration(self.made.certificate)
+
+        self.assertEqual(hashlib.sha256(der).hexdigest(), read.spki_sha256)
+        self.assertNotEqual(base64.b64decode(self.made.pin()).hex(), read.spki_sha256)
+
+    def test_the_subject_is_the_spelling_the_other_side_of_the_handshake_records(self):
+        # `interception_cas.subject` and the `agent_cert_issuer` of a leaf this
+        # root signed have to be one string rather than two renderings of one
+        # name, and the door's side is OpenSSL's long attribute names joined by
+        # `, ` -- so `CN=` here would be a second vocabulary.
+        read = tls.registration(self.made.certificate)
+
+        self.assertEqual("commonName=redKraken run authority", read.subject)
+        self.assertNotIn("PRIVATE KEY", read.subject)
+
+    def test_the_window_is_the_certificates_own_and_is_dated_the_way_a_column_reads(self):
+        # `iso_8601` rather than openssl's default, which is a month name a
+        # server parses by its own `DateStyle` rather than by the standard.
+        read = tls.registration(self.made.certificate)
+
+        opened = datetime.strptime(read.not_before, "%Y-%m-%d %H:%M:%SZ")
+        closes = datetime.strptime(read.not_after, "%Y-%m-%d %H:%M:%SZ")
+        self.assertEqual(timedelta(days=tls.DAYS), closes - opened)
+
+    def test_the_arguments_are_the_parameters_the_statement_names_in_order(self):
+        program = "3f2c1d4e-0000-7000-8000-000000000001"
+        read = tls.registration(self.made.certificate)
+
+        arguments = read.arguments(program)
+
+        self.assertEqual(tls.REGISTER.count("$"), len(arguments))
+        self.assertEqual(
+            (program, read.subject, read.spki_sha256, read.not_before, read.not_after),
+            arguments,
+        )
+
+    def test_the_reference_a_door_held_authority_writes_names_no_store(self):
+        # The third form is not a reference. A `kek:` or an `op://` here would
+        # be a claim that this key is recoverable from a secret store, and the
+        # key is a file in a directory that dies with the run.
+        self.assertTrue(tls.HELD.startswith("door:"))
+        self.assertNotIn("op://", tls.HELD)
+        self.assertNotIn("kek:", tls.HELD)
+        self.assertNotIn("PRIVATE KEY", tls.HELD)
+
+    def test_a_file_that_is_not_a_certificate_registers_nothing(self):
+        junk = scratch() / "not-a-certificate.pem"
+        junk.write_text("-----BEGIN CERTIFICATE-----\nnope\n", encoding="utf-8")
+
+        with self.assertRaises(tls.Unusable):
+            tls.registration(junk)
+
+    def test_a_certificate_that_printed_no_public_key_registers_nothing(self):
+        # The half `openssl` cannot fail to print and this reader must not
+        # assume it printed: a digest is the one of the four facts that has no
+        # honest fallback, so a reading missing it is refused rather than
+        # completed with an empty one.
+        without = (
+            "subject=commonName=redKraken run authority\n"
+            "notBefore=2026-08-22 09:35:58Z\n"
+            "notAfter=2026-08-29 09:35:58Z\n"
+        ).encode("utf-8")
+
+        with mock.patch.object(tls, "_run", return_value=without):
+            with self.assertRaises(tls.Unusable):
+                tls.registration(self.made.certificate)
 
 
 class EnvironmentTest(unittest.TestCase):

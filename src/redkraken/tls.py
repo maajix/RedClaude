@@ -150,6 +150,41 @@ LEAF_EXTENSIONS = (
 CERTIFICATE_NAME = "ca.pem"
 KEY_NAME = "ca-key.pem"
 
+#: What a run writes where `interception_cas.secret_ref` would name a secret
+#: store. A third form beside ticket 15's `op://` and `kek:`, admitted by
+#: `20261007T000000Z`, and the only honest one for the authority this module
+#: makes: the key is a file in a directory the door owns, it is handed to
+#: nobody, and no reference to it exists anywhere -- so a `kek:` here would be a
+#: claim that the key is recoverable from the secret store, which is the exact
+#: lie that shape rule was written to stop.
+HELD = "door:no-reference"
+
+#: How a run records the authority its flows are intercepted under. Written here
+#: rather than where it is executed, for the reason `proxy.BIND` is: the module
+#: that knows what an authority is owns the sentence, and the runtime's pass
+#: owns when it is said.
+REGISTER = (
+    "SELECT register_interception_ca($1::uuid, $2, $3, $4::timestamptz, $5::timestamptz)"
+)
+
+#: How the subject is printed for that row. OpenSSL's long attribute names with
+#: `, ` between them, which is the spelling `proxy._name` produces from the same
+#: certificate on the other side of a handshake -- so `interception_cas.subject`
+#: and the `receipts.agent_cert_issuer` of a leaf this root signed are one
+#: string rather than two renderings of one name.
+NAME_FORMAT = "sep_comma_plus_space,lname,utf8"
+
+#: And how its two dates are. `iso_8601` because the values are going into
+#: `timestamptz` columns, and openssl's default -- `Aug 22 09:18:27 2026 GMT` --
+#: is a month name a server parses by its own `DateStyle` rather than by the
+#: standard.
+DATE_FORMAT = "iso_8601"
+
+#: The block `openssl x509 -pubkey` prints the subject public key info in. The
+#: body between the two lines is the DER, base64'd, so decoding it here is one
+#: fork rather than two and needs nothing but the certificate.
+PUBLIC_KEY = ("-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----")
+
 
 class Unusable(Exception):
     """This directory cannot hold an authority, or this host cannot be certified."""
@@ -336,6 +371,76 @@ def authority(directory: Path | str) -> Authority:
     )
     _own(key)
     return made
+
+
+@dataclass(frozen=True, slots=True)
+class Registration:
+    """One authority as `interception_cas` records it, in the row's own order.
+
+    Four facts and no fifth, because four is what the public half answers. The
+    label is the database's to mint, the Program is the caller's, and the
+    `secret_ref` is `HELD` for every authority this module makes -- so nothing
+    here is a thing the writer had to be told, which is what keeps the write off
+    the side that holds the key.
+    """
+
+    subject: str
+    spki_sha256: str
+    not_before: str
+    not_after: str
+
+    def arguments(self, program_id: str) -> tuple[str, ...]:
+        """`REGISTER`'s parameters, for the one Program being intercepted."""
+        return (program_id, self.subject, self.spki_sha256, self.not_before, self.not_after)
+
+
+def registration(certificate: Path | str) -> Registration:
+    """What the row that attributes a forged leaf says, read off the certificate.
+
+    The certificate and never the key, which is the whole reason this is safe on
+    a run-start path: the side that registers the authority is not the side that
+    can forge with it, and this function would work just as well against the
+    file a child was handed.
+
+    One `openssl` invocation for all four, because the four are one reading of
+    one file and two forks would be two chances for them to disagree about which
+    certificate is in the directory.
+
+    Not `pin`, which is a different key. `pin` hashes `leaf-key.pem`, the one key
+    every leaf this authority issues is signed *over*; `spki_sha256` is the
+    root's own, the key every leaf is signed *by*. They live in the same
+    directory and neither is the other.
+    """
+    printed = _run(
+        [
+            OPENSSL, "x509", "-noout",
+            "-in", str(certificate),
+            "-subject", "-startdate", "-enddate", "-pubkey",
+            "-nameopt", NAME_FORMAT,
+            "-dateopt", DATE_FORMAT,
+        ]
+    ).decode("utf-8", "replace")
+    # Split at the key block before anything is read as `name=value`: the body
+    # of a PEM block is base64, and base64 ends in `=`.
+    head, marker, key = printed.partition(PUBLIC_KEY[0])
+    said = dict(
+        line.split("=", 1) for line in head.splitlines() if "=" in line
+    )
+    subject = said.get("subject", "").strip()
+    not_before = said.get("notBefore", "").strip()
+    not_after = said.get("notAfter", "").strip()
+    if not marker or not (subject and not_before and not_after):
+        raise Unusable(
+            f"{certificate} is not a certificate an authority can be registered from"
+        )
+    return Registration(
+        subject=subject,
+        spki_sha256=hashlib.sha256(
+            base64.b64decode("".join(key.split(PUBLIC_KEY[1])[0].split()))
+        ).hexdigest(),
+        not_before=not_before,
+        not_after=not_after,
+    )
 
 
 def trust(certificate: Path | str) -> ssl.SSLContext:

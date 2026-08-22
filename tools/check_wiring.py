@@ -259,7 +259,6 @@ OWED_GAPS: dict[str, str] = {
     # owed here.
     "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
-    "W6 interception_cas": "owed:124",
     "W6 report_queue": "owed:105",
 
     # W7. The one open contradiction, and the standing check that would have to
