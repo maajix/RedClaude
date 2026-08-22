@@ -25,11 +25,20 @@ in the same body becomes nothing, and both are surface an operator needs.
       `same_as` do work a normaliser should have done. Normalise on the way in:
       E.164 where the country is known, digits otherwise, with the spelling that
       was actually seen kept beside it.
-- [ ] **The parser is the runtime's, beside the one that already reads
-      Endpoints.** A body is parsed for routes today. This is the same body,
-      the same pass and the same Receipt, so it is one more thing that parser
-      extracts rather than a second walk over the same bytes, and provenance
-      stays `receipt`.
+- [ ] **The reader is an offline tool a child runs, not a runtime parser.**
+      Nothing in the runtime parses a body: Entities arrive as `new_entities`
+      in a child's proposal. The shape to copy is `src/redkraken/jsscan.py` —
+      staged into `/input`, run by the container's own interpreter, registered
+      as `offline_tools.analyser`, importing nothing outside the standard
+      library — which already pulls "every path-shaped literal" out of a source
+      Artifact. This is the same job on an HTML Artifact, so it is a sibling
+      tool and the Playbook that tells a child when to reach for it.
+- [ ] **The scripts the page loads are named, and are candidates themselves.**
+      An HTML body carries `<script src=...>`, `<link>` and inline blocks, and
+      each named source is an Artifact this harness can fetch and hand to
+      `jsscan`. Today the analyser exists and nothing enumerates what to point
+      it at. Listing them is most of the value of reading the body at all — the
+      contacts are the easy half.
 - [ ] **Scope decides whether it is kept, not the parser.** A body can name a
       mailbox at a domain nobody put in scope — a supplier, a CMS vendor, a
       person. Those are somebody else's, and a harness that files them has
@@ -42,9 +51,9 @@ in the same body becomes nothing, and both are surface an operator needs.
 
 ## Why
 
-Recon reads a body and keeps what it has a table for. `endpoints` has one, so
-`/kontakt` survives. `applications` has one, so the base URL survives. A
-mailbox in the footer has none, so it is read, understood, mentioned in a
+A child reads a body and proposes what it has a word for. `endpoints` is a word,
+so `/kontakt` survives. `applications` is a word, so the base URL survives. A
+mailbox in the footer is not, so it is read, understood, mentioned in a
 sentence, and thrown away with the sentence.
 
 That is a real loss for the work this harness does. An e-mail address is the
@@ -54,7 +63,9 @@ things a person doing this by hand writes down.
 
 The graph made it visible: opening the apex Application and reading the response
 beside the claim shows the contact block in the HTML, lit or not, and the panel
-next to it lists nothing of the kind.
+next to it lists nothing of the kind. Reading it there is not the answer,
+though — a display that finds something the surface does not hold is a display
+that has to be read by a person every time.
 
 ## Notes
 
