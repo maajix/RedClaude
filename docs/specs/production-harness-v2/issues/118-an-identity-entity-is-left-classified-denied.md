@@ -156,19 +156,23 @@ what is true of the six writers instead -- each states its own scope selector an
 projects for itself. Routing them through `add_entity` is not this ticket's, and
 the ticket says so.
 
-## What criterion 3 is owed
+## How criterion 3 was paid, one ticket later
 
-The consequence is asserted at the class and not at the chain. The migration
-refuses to finish while any Entity with no address is left in `denied`, which is
-the one class `rk2_chain_unsoundness` arm (e) refuses
+The consequence is asserted twice, at the class and at the chain, and the second
+half arrived with ticket 114 because that is when `tests/test_database.py` came
+free. The migration refuses to finish while any Entity with no address is left
+in `denied`, which is the one class `rk2_chain_unsoundness` arm (e) refuses
 (`20260818T000000Z...:721-729`), so an Identity subject can no longer be the
-reason a chain reports itself unsound. What is not here is the case the criterion
-asks for in those words: a composed chain with an Identity subject, asserted
-sound. That case needs `ChainFixture` and everything under it, which lives in
-`tests/test_database.py` -- a file this agent does not own -- and there is no
-second module in this repository that reaches a server. It is owed to whoever
-next opens that file, beside `PivotStampFixture`, and it is one assertion once
-the fixture is in hand.
+reason a chain reports itself unsound. `IdentitySubjectChainTest`
+(`tests/test_database.py:35270-35352`) states the same thing the other way
+round: it mints the Entity through `rk2_anonymous_identity()`, reads its
+classification before any Program-wide projection can correct it, validates a
+Finding on it, stamps two pivots, composes them with `build_kill_chain` and
+reads the chain back -- `unsound is None`, `sound is True`.
+
+The class is read before the projection on purpose. A `refresh_scope_projection`
+call would put the row right either way, and a test that let it run first would
+be asserting that call rather than asserting this ticket.
 
 ## What it is asserted with
 
