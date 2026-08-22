@@ -164,9 +164,19 @@ class Store:
 
         The store holds Agent-visible artifacts as themselves and credential-
         bearing ones only as sealed envelopes filed under the envelope's hash,
-        so a hit on a plaintext hash is the same fact as "the Agent may read
-        these bytes" -- which is what the proxy asks before deciding whether
-        withholding a wire view would withhold anything at all.
+        so a hit on a plaintext hash is the fact that those bytes are on this
+        filesystem -- and only that. It is not what the proxy asks: whether an
+        Agent may read an Artifact is a fact about a grant rather than about a
+        file, and the proxy asks the database for it through `proxy.READS`,
+        which selects `program_reads_artifact`.
+
+        So nothing in production calls this, and it is here on purpose: it is
+        the one way to state the *negative*, which `load` can only raise.
+        `tests/test_database.py` asks it of an import that redacted a secret and
+        of one that refused bytes no longer hashing to the name they arrived
+        under; absence is the whole claim in both, and a test spelling it
+        `path_for(...).exists()` would assert the filing scheme rather than ask
+        the store.
         """
         return path_for(self.root, sha256).exists()
 

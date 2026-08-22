@@ -419,6 +419,17 @@ def _assert_catalogue(ledger: Ledger, corpora: tuple[Corpus, ...]) -> None:
     runtime reads at the moment it needs one: an installation whose Playbook
     names a Skill nobody ships refuses at selection time, on the run that needed
     it. This is where an operator finds that out instead.
+
+    Compiled rather than *run*, which is a decision and not an oversight. A
+    Skill's scripts declare synthetic cases and `skill.check_all` would execute
+    them -- two processes and a temporary directory per case -- and `rk doctor`
+    promises neither: `tests/test_cli.py`'s `ContainmentTest` runs the command
+    under an audit hook and asserts it raises no subprocess, no network and no
+    write event at all. A readiness check an operator cannot run beside a live
+    Program is one they will not run. So the declared cases are the gate this
+    repo passes before it ships a corpus and never the installation's after.
+    `Corpus` is a name and a compile function for the same reason: this loop is
+    not allowed to know which of the three is the skills.
     """
     for name, compile_corpus in corpora:
         try:

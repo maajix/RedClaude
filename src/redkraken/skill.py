@@ -475,7 +475,16 @@ def check(skill: Skill, script: Script, case: Case) -> None:
 
 
 def check_all(skills: Mapping[str, Skill] | None = None) -> tuple[str, ...]:
-    """Every declared case in the corpus, and what was run, so a caller can count."""
+    """Every declared case in the corpus, and what was run, so the suite can count.
+
+    The suite is the only caller, and deliberately: `test_skill`'s
+    `test_every_declared_check_in_the_shipped_corpus_passes` runs the shipped
+    corpus and nothing on an installation does. The one other candidate was
+    `doctor.diagnose`, refused there and for the reason written there -- running
+    a case spawns processes and writes a directory, and `rk doctor` promises to
+    do neither. So a script whose declared answer stops holding is caught before
+    a corpus ships, rather than on the machine that received it.
+    """
     ran = []
     for skill in (skills if skills is not None else SKILLS).values():
         for script in skill.scripts.values():
