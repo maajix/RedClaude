@@ -598,6 +598,154 @@ class Correlator:
         )
 
 
+class Transcripts:
+    """What the exchange the door just filed is called, in Artifact labels.
+
+    The one thing on this side that asks the supervisor for something the model
+    did not ask for. Every other use of the pipe carries a call a child made;
+    this one finishes the answer to one. The door writes two Artifacts and a
+    Receipt in a single transaction and hands back the Receipt label alone, so
+    at the moment `_spend` has an answer the labels for the bytes already exist
+    -- and there is no route from inside the container to the row that holds
+    them, because the container's one network reaches the door and the door is
+    not a database.
+
+    Nothing is counted and nothing is refused, unlike `Proposal`. There is no
+    ceiling to spend: an exchange that was allowed to happen has already paid
+    for whatever this reads, and refusing to name the bytes of an exchange the
+    run just made would be withholding the answer to a call that succeeded.
+
+    A run with no supervisor gets no labels and says so by carrying none. That
+    is the same run that could send the request in the first place -- the door
+    is a separate thing from the pipe -- so the exchange still happens and the
+    Receipt label still comes back; what is missing is the handle to the bytes,
+    which is what every run had before this ticket.
+
+    Asking is blocking, because it is the same pipe a tool run goes down, so
+    every caller reaches this through a thread for the reason `Channel` gives.
+    `_spend` is already on one.
+    """
+
+    def __init__(self, channel: Channel | None = None) -> None:
+        self._channel = channel
+
+    def names(self, receipt: str) -> Mapping[str, object]:
+        """The labels for one Receipt, or nothing that could be mistaken for them.
+
+        An empty mapping for every case that is not an answer -- no supervisor,
+        no Receipt to ask about -- because the caller merges what comes back
+        into the answer a model reads, and the honest form of "not named" is a
+        key that is not there rather than a label that is null for a reason
+        nobody can tell apart from the other reasons a label is null.
+        """
+        if self._channel is None or not receipt:
+            return {}
+        return dict(self._channel.call(agent.NAME_TRANSCRIPTS, {"receipt": receipt}))
+
+
+class Refresh:
+    """The rows this run has made since it started, asked for by name.
+
+    The read that is not answered from the packet, and the only one. Everything
+    else on this surface answers out of the document the child was launched
+    with, which was compiled before the container started -- so a Receipt label
+    an exchange handed back five seconds ago resolves to `not_staged`, and an
+    Artifact label from a tool run resolves to `no_such_artifact`. Not because
+    the rows are missing: because the photograph is older than the rows.
+
+    Scoped and bounded, and both are the measurement rather than caution. One
+    run of the `authentication` Playbook mints 78 labels whose rows weigh 33,974
+    bytes -- more than the 32,768 a whole packet is held to -- so a refresh that
+    answered "everything I have made" could not have been honoured at any
+    ceiling. It answers the labels it is given, `packet.REFRESH_BYTES` bounds
+    what one answer weighs, and what did not fit comes back as `packet_bound`,
+    which is the word the bounded reads already use for the same fact.
+
+    A run with no supervisor gets a refusal and keeps its packet. That is the
+    same run that could read the packet in the first place, so nothing it had
+    is taken away; what it cannot do is learn about a row written since.
+
+    Asking is blocking, because it is the same pipe a tool run goes down, so
+    every caller reaches this through a thread for the reason `Channel` gives.
+    """
+
+    def __init__(self, reader: packet.Reader, channel: Channel | None = None) -> None:
+        self._reader = reader
+        self._channel = channel
+
+    def ask(self, arguments: Mapping[str, object]) -> dict:
+        """Carry one refresh to the runtime and fold what comes back into the packet.
+
+        The folding happens here rather than in the handler because it is the
+        half of this verb that is not a question: the supervisor answers rows,
+        and what makes those rows part of what this child reads is an assignment
+        on this side. A handler that answered without folding would give the
+        model the rows once and leave `get_receipts` saying they do not exist.
+
+        The three arrays and nothing beside them. Which Program these labels
+        belong to was decided when this run was opened, and a child that named
+        it would be naming whose Receipt it would like to read.
+        """
+        asked = {
+            section: _labels(arguments.get(wire))
+            for wire, section in packet.REFRESH_ARGUMENTS.items()
+        }
+        if self._channel is None:
+            return {
+                "served": False,
+                "reason": NO_TOOLING,
+                "detail": (
+                    "this run was started with no supervisor to ask; the packet it "
+                    "was launched with is unchanged"
+                ),
+            }
+        answered = dict(
+            self._channel.call(
+                roster.REFRESH_PACKET,
+                {
+                    wire: asked[section]
+                    for wire, section in packet.REFRESH_ARGUMENTS.items()
+                },
+            )
+        )
+        fragment = answered.get("packet")
+        if not isinstance(fragment, Mapping):
+            # Every refusal the supervisor can make -- no state connection, a
+            # database it could not reach, a connection that is not the agent's
+            # -- arrives in this shape and is passed on rather than translated.
+            # A run told "unreachable_state" can try again or do something else;
+            # a run handed an empty refresh would conclude the rows are not
+            # there.
+            return answered
+        try:
+            document = packet.Packet.from_dict(fragment)
+        except packet.PacketError as error:
+            # `from_dict` is the only validation this side can perform -- it has
+            # nothing to compare against -- so it is also the only place a
+            # document the child cannot index into can be caught. Answered
+            # rather than raised, because a refresh that raised would take down
+            # the tool call and leave the run with neither the rows nor a reason.
+            return {
+                "served": False,
+                "reason": isolation.UNANSWERED,
+                "detail": f"the refresh came back as something this run cannot read: {error}",
+            }
+        return self._reader.refresh(document, asked, answered.get("held") or {})
+
+
+def _labels(given: object) -> list[str]:
+    """One array of labels as strings, or nothing at all.
+
+    The closed schema refuses anything that is not an array of the right shape
+    long before this, and that is the check. This is the line that keeps a
+    broken gate from turning one string into a request for each of its
+    characters.
+    """
+    if not isinstance(given, (list, tuple)):
+        return []
+    return [str(one) for one in given if str(one)]
+
+
 #: What each served tool tells the model it is for. One sentence each, and each
 #: one says the bound out loud: a description that promised the whole Program
 #: would be a description of a tool this runtime does not have.
@@ -625,6 +773,20 @@ DESCRIPTIONS = {
         "that Artifact -- its metadata and, where its head was staged as text, a byte "
         "range of it. The hash is reported, never asked for. Whole large Artifacts "
         "are analysed by a tool run, not read into this context."
+    ),
+    "refresh_packet": (
+        "Pull rows written since this run started into the packet the other reads "
+        "answer from, by label. Name the Receipt, Artifact or Tool Run labels a tool "
+        "handed you -- an exchange's request_artifact and response_artifact, a tool "
+        "run's label -- and they become readable by get_receipts and get_artifact. "
+        "Labels only: there is no way to ask for everything, because one run of a "
+        "Playbook makes more rows than a packet may weigh.\n\n"
+        "What you already hold is never taken away; a refresh adds. A label whose "
+        "row this Program does not hold comes back as an omission marker rather than "
+        "as an error, and if what you asked for weighs more than one refresh may "
+        "carry, the rest comes back marked packet_bound and can be asked for again "
+        "in smaller pieces. Reading past the excerpt of a large Artifact is still a "
+        "tool run and not a read."
     ),
     "get_slate": (
         "List the Tasks this decision may choose between: their kind, subject, "
@@ -664,6 +826,14 @@ DESCRIPTIONS = {
         "names, so an Observation about a header cites that same Receipt. Headers "
         "carrying credentials the target issued are not among them. A refusal "
         "names the door's decision rather than pretending the request happened.\n\n"
+        "It also answers request_artifact and response_artifact: the labels of the "
+        "two transcripts this exchange filed, the request one and the response one. "
+        "Those are the whole bytes, not the excerpt above, and they are what you "
+        "hand to a tool run that takes an artifact -- to parse a bundle, to query a "
+        "JSON body, to difference two answers you fetched. Reading past the excerpt "
+        "is a tool run and not a read: the read tools answer from the packet this "
+        "run was started with, and a label minted after that will not be in it. A "
+        "refused exchange files no transcript, so neither label is there.\n\n"
         "A body is the bytes you want sent after the headers, spelled exactly, "
         "with their Content-Type given as a header. Do not set Content-Length: "
         "the door measures the bytes it forwards and states that number itself, "
@@ -755,8 +925,10 @@ def server(
     channel: Channel | None = None,
     proposal: Proposal | None = None,
     correlator: Correlator | None = None,
+    transcripts: Transcripts | None = None,
+    refresh: Refresh | None = None,
 ):
-    """Five reads, a request, two tool runs, a result, a Finding, a canary, a choice, a judgement.
+    """Six reads, a request, two tool runs, a result, a Finding, a canary, a choice, a judgement.
 
     Every handler goes through `surface.serve` first, which refuses while the
     surface is not open. That is ticket 16's property and it is load-bearing
@@ -794,8 +966,21 @@ def server(
     # And the same for the out-of-band ask, which goes down the same pipe to the
     # same party for the same reason.
     minting = Correlator(channel) if correlator is None else correlator
+    # And the same again for the labels an exchange filed, which goes down the
+    # pipe to the same party -- except that this one is not a tool and no model
+    # asks for it. It rides with the request handler because it is part of that
+    # handler's answer.
+    naming = Transcripts(channel) if transcripts is None else transcripts
+    # And once more for the sixth read, which is the only one that is not a
+    # method on `reader`: the five above answer out of a document this process
+    # already holds, and this one is about rows that did not exist when that
+    # document was compiled. So it goes down the pipe like a tool run and comes
+    # back as rows, and `Refresh` is what puts those rows into the document the
+    # other five read.
+    refreshing = Refresh(reader, channel) if refresh is None else refresh
     tools = [_read(surface, name, answer) for name, answer in reads.items()]
-    tools.append(_request(surface, door))
+    tools.append(_refresh(surface, refreshing))
+    tools.append(_request(surface, door, naming))
     tools.append(_tool_run(surface, channel, "run_tool"))
     tools.append(_tool_run(surface, channel, "run_skill_script"))
     tools.append(_propose(surface, submission))
@@ -827,7 +1012,7 @@ def _read(surface: Surface, name: str, answer):
     return handler
 
 
-def _request(surface: Surface, door: agent.Egress | None):
+def _request(surface: Surface, door: agent.Egress | None, transcripts: Transcripts):
     """The one call that leaves the boundary, spent through the door or refused.
 
     Blocking work on a thread, because the request is a socket and the caller is
@@ -862,8 +1047,32 @@ def _request(surface: Surface, door: agent.Egress | None):
                 str(given.get("method") or "GET"),
                 _headers(given.get("headers")),
                 _body(given.get("body")),
+                transcripts,
             )
         )
+
+    return handler
+
+
+def _refresh(surface: Surface, refreshing: Refresh):
+    """The one read that is answered by the runtime rather than by the packet.
+
+    It is wired here beside the five that `_read` serves rather than inside
+    `_read` because it does not have their shape: they call a method on a reader
+    this process holds, and this one crosses the pipe, so it is blocking and
+    goes on a thread for `_tool_run`'s reason.
+
+    `surface.serve` first, as everywhere: a refresh answered before init would
+    hand rows to a child whose authentication this runtime had not corroborated
+    -- and unlike the other five, these are rows the packet did not already
+    contain, so it would be handing over something init was the gate for.
+    """
+    name = "refresh_packet"
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        return _content(await asyncio.to_thread(refreshing.ask, dict(arguments or {})))
 
     return handler
 
@@ -914,6 +1123,7 @@ def _spend(
     method: str,
     headers: Mapping[str, str],
     body: bytes = b"",
+    transcripts: Transcripts | None = None,
 ) -> dict:
     """One exchange through the door, as the four facts a model can act on.
 
@@ -921,6 +1131,17 @@ def _spend(
     an Observation the runtime will promote has to cite a Receipt, and the way
     to say more about the body than fits here is to analyse the Artifact the
     door already wrote rather than to read it into this context.
+
+    Which is what the two Artifact labels are for, and why they are here rather
+    than in a second tool. "Analyse the Artifact the door already wrote" was a
+    sentence with no argument behind it: `jq`, `js_parse`, `js_map`, `js_routes`
+    and both Skill scripts each take an `artifact` kind, and an exchange handed
+    back nothing that could be passed to one. The rows existed the whole time --
+    `hold_receipt_transcripts()` writes a holding for each agent-visible
+    transcript in the Receipt's own transaction -- so this names them rather
+    than making them. Two labels and not a pair, because which half is which is
+    part of the answer: `compare_responses` takes a `first` and a `second`, and
+    an unordered pair would push that decision onto a model.
 
     The headers go through as the caller wrote them, minus the ones that
     describe a hop: `proxy.spend` drops those, because the capability and the
@@ -983,6 +1204,33 @@ def _spend(
         "headers": headers,
         "headers_truncated": cut,
         "body": excerpt.decode("utf-8", "replace"),
+        **_transcripts(transcripts, answer.receipt),
+    }
+
+
+def _transcripts(transcripts: Transcripts | None, receipt: str | None) -> dict:
+    """The two Artifact labels for this exchange, or no keys at all.
+
+    Merged rather than nested, because they are facts about the same exchange as
+    the Receipt label beside them and a model reading one reads the other in the
+    same breath. Only the two: what the supervisor answers with also carries the
+    Receipt label back, which is the label that was sent to it, and echoing an
+    argument into an answer is one more thing that can disagree with itself.
+
+    A label that is not there is left out rather than written as null. Three
+    different things produce a null here -- a run with no supervisor, a blocked
+    exchange whose Receipt names no transcript, a database that could not be
+    reached -- and a model cannot tell them apart from the value. What it can
+    tell is that there is no label, which is the only part it can act on, and
+    the answer says exactly that by carrying no key.
+    """
+    if transcripts is None:
+        return {}
+    named = transcripts.names(receipt or "")
+    return {
+        key: str(named[key])
+        for key in ("request_artifact", "response_artifact")
+        if named.get(key)
     }
 
 

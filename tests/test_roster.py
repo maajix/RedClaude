@@ -507,6 +507,69 @@ class SurfaceTest(unittest.TestCase):
         self.assertFalse(re.compile(declared.pattern).match("-oob"))
         self.assertFalse(re.compile(declared.pattern).match("oob.example"))
 
+    def test_an_exchange_declares_the_rows_the_labels_it_answers_come_off(self):
+        """PH2-106: the ticket that changed the answer and not the declaration.
+
+        The two Artifact labels an exchange hands back are `artifact_refs` rows
+        that `register_proxy_artifacts` and `hold_receipt_transcripts()` were
+        already writing under this contract, in the Receipt's own transaction.
+        So the declaration is the same one it was, and the test is here because
+        the temptation the ticket had to refuse is visible from here: a label in
+        the answer looks like something a caller should be able to ask for, and
+        an argument for one would be an argument to a tool that fetches.
+        """
+        exchange = roster.CONTRACTS["mcp__rk2__http_request"]
+
+        self.assertEqual(("receipts", "artifacts", "artifact_refs"), exchange.writes)
+        self.assertEqual({"method", "url", "headers", "body"}, set(exchange.arguments))
+        for name in ("artifact_label", "request_artifact", "response_artifact"):
+            with self.subTest(argument=name):
+                self.assertNotIn(name, exchange.schema()["properties"])
+
+    def test_the_refresh_takes_the_three_kinds_of_label_a_run_mints(self):
+        """PH2-107: the read that is asked by label because it cannot be asked otherwise.
+
+        Three arrays and no fourth, and the reason is arithmetic rather than
+        taste: the rows one `authentication` run mints weigh 33,974 bytes against
+        a 32,768-byte packet ceiling, so "everything I have made" was never a
+        question this could answer. What a child may name is what the runtime
+        already told it about.
+
+        `TR` and not `T` for the third one. `T` is a Task label and this reads
+        the `tool_run` kind of `v_records`, so a pattern that admitted a Task
+        label would let a child ask that kind for a name it never carries.
+        """
+        refresh = roster.CONTRACTS[roster.REFRESH_PACKET]
+
+        self.assertEqual(roster.READ, refresh.direction)
+        self.assertEqual((), refresh.writes)
+        self.assertEqual(
+            {"receipt_labels", "artifact_labels", "tool_run_labels"},
+            set(refresh.arguments),
+        )
+        for argument, holds, refuses in (
+            ("receipt_labels", "R7", "TR7"),
+            ("artifact_labels", "AF7", "A7"),
+            ("tool_run_labels", "TR7", "T7"),
+        ):
+            with self.subTest(argument=argument):
+                pattern = re.compile(refresh.arguments[argument].items_pattern)
+                self.assertRegex(holds, pattern)
+                self.assertNotRegex(refuses, pattern)
+
+    def test_the_refresh_is_the_read_authority_and_not_a_new_one(self):
+        # It reads the same Program's rows through the same views under the same
+        # role as the five reads beside it. A group of its own would have said
+        # that reading a row minted five seconds ago is a different kind of
+        # permission from reading one minted five minutes ago.
+        holding = [
+            name for name, tools in roster.TOOL_GROUPS.items()
+            if roster.REFRESH_PACKET in tools
+        ]
+
+        self.assertEqual(["state.read"], holding)
+        self.assertEqual("state.read", roster.CONTRACTS[roster.REFRESH_PACKET].group)
+
     def test_nothing_on_the_validators_surface_takes_free_text(self):
         for name in roster.TOOL_GROUPS["validate.judge"]:
             for argument, declared in roster.CONTRACTS[name].arguments.items():

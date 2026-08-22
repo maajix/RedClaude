@@ -41,7 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from redkraken import _startup, callback, capsule as capsule_module, isolation
-from redkraken import packet as packet_module, pg, roster, skill, tool as tool_module
+from redkraken import packet as packet_module, pg, roster, skill
+from redkraken import state as state_module, store, tool as tool_module
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
 
 
@@ -220,6 +221,16 @@ UNVERIFIABLE = "unverifiable"
 UNKNOWN_CALL = "unknown_call"
 UNREACHABLE_STATE = "unreachable_state"
 
+#: The one thing crossing this channel that is not a tool a model can call. Every
+#: other verb here is a `roster.CONTRACTS` name because a child asked for it by
+#: name; this one completes the answer to a call the child already made, and no
+#: model chooses to make it -- so it is spelled here, beside the dispatch that
+#: reads it, rather than in the roster, which is the list of what a model may
+#: say. The `mcp__rk2__` prefix is deliberately absent for the same reason: a
+#: name in that shape is a tool, and the startup assertion compares that list to
+#: the roster's.
+NAME_TRANSCRIPTS = "rk2__name_transcripts"
+
 #: How one refusal is made durable: the Program this session speaks for, and the
 #: one call that closes the run. Everything the cleanup does -- the run, its
 #: Task, the session binding, the Identity Leases and the Event -- happens
@@ -244,6 +255,31 @@ PROPOSE = "SELECT propose_finding($1, $2, $3, $4::uuid)"
 #: than a second number, because a correlator that is one DNS label is a rule
 #: the callback module already states.
 MINT_CALLBACK = "SELECT request_callback_correlator($1, $2, $3, $4::uuid)"
+
+#: The two Artifact labels for one exchange, asked for by the Receipt label the
+#: door already handed the child. `hold_receipt_transcripts()` wrote them in the
+#: same transaction as the Receipt, so nothing is minted here and nothing waits:
+#: what this asks is which labels those rows got. It is scoped inside the verb
+#: rather than here, because `rk2_runtime`'s row level security is `USING (true)`
+#: and a Receipt label is a small integer that exists under most Programs.
+TRANSCRIPTS = "SELECT receipt_transcript_labels($1)"
+
+#: The second thing crossing this channel that is not a `roster.CONTRACTS` call
+#: made by a model -- except that this one is, and the difference is worth the
+#: sentence. `refresh_packet` is a tool a child asks for by name, so it is
+#: spelled in the roster like the other four; what is unusual is that it is a
+#: read, and every other read is answered inside the container out of the
+#: document the child was launched with. This one crosses because the rows it is
+#: about were written after that document was compiled.
+#:
+#: Read as `rk2_state` rather than as `rk2_runtime`, on a connection of its own.
+#: `v_records` is granted to `rk2_state` alone, and that is not an accident to
+#: work around: `rk2_state`'s policies are `USING (program_id = rk2_program())`,
+#: so which Program's rows a refresh can see is decided by row level security
+#: rather than by a predicate this module remembers to write. The runtime
+#: connection the other four arms hold sees every Program and scopes inside each
+#: verb; a refresh answering whole rows is not a place to rely on remembering.
+REFRESH_READ_ONLY = "SET TRANSACTION READ ONLY"
 
 
 class StartupRefusal(RuntimeError):
@@ -386,11 +422,21 @@ class Tooling:
     All three or none, which is why this is a record rather than three optional
     fields on the request: an image with nowhere to file what a run produced is
     a run that could start and could not be kept.
+
+    `state` is the fourth and it is optional, which is the one asymmetry here.
+    It is how the agent-scoped role is reached, and it exists because ticket
+    107's refresh reads `v_records`, which is granted to `rk2_state` alone and
+    is scoped by row level security rather than by a predicate. Optional because
+    a caller that does not pass it still gets every other tool: a run with no
+    state settings can act, and what it cannot do is read back a row it wrote
+    after it started. Making it required would have turned a missing setting
+    into a run that could not start at all.
     """
 
     container: isolation.ToolContainer
     root: Path
     runtime: pg.Settings
+    state: pg.Settings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1195,8 +1241,9 @@ class _Tools:
 
     The dispatch is on the verb and it is closed. The roster has already refused
     every call that does not fit its contract, so what arrives here is a
-    well-formed call to one of four tools; anything else is a child that has
-    started making things up, and it is answered rather than executed.
+    well-formed call to one of four tools, or the one ask that is not a tool;
+    anything else is a child that has started making things up, and it is
+    answered rather than executed.
 
     Two of the four start a container and the other two write a row, and they
     are answered here for the same reason: this is the side holding a
@@ -1204,6 +1251,20 @@ class _Tools:
     proposal it could file itself would be a proposal filed by the party the row
     is about -- and a correlator it could mint itself would be a name the
     runtime never saw published.
+
+    The fifth is a read and no model asks for it. An exchange through the door
+    files two Artifacts and a Receipt in one transaction and answers the child
+    with the Receipt label alone, so the labels for the bytes exist and are
+    unreachable from inside the container. That is the same asymmetry as the
+    other four -- the rows are here and the child is not -- and it is answered
+    the same way.
+
+    The sixth is a read a model does ask for, and it is the only arm here that
+    does not run on this object's connection. `refresh_packet` hands back whole
+    rows, and the role whose row level security decides which Program a row
+    belongs to is `rk2_state`, not the `rk2_runtime` the other five hold. So it
+    opens its own connection as that role, and every scoping question about it
+    is answered by the server rather than by this module.
 
     The connection is opened at the first call and not before. Most runs ask for
     no tool at all, and a connection held open through every one of them would
@@ -1223,8 +1284,26 @@ class _Tools:
             roster.RUN_SKILL_SCRIPT,
             roster.PROPOSE_FINDING,
             roster.MINT_CALLBACK,
+            roster.REFRESH_PACKET,
+            NAME_TRANSCRIPTS,
         ):
             return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
+
+        # Before the runtime connection rather than after it, because this is
+        # the one verb here that never touches it. Opening one to answer a
+        # refresh would be a connection opened for nothing, and on the failure
+        # path it would be a refusal about a role the answer does not involve.
+        #
+        # The call itself rather than a field of it, because that is the frame
+        # this side is handed. `Channel.call` writes `{**arguments, "verb": verb}`
+        # and `isolation` passes that object straight through, so a contract's
+        # arguments arrive beside the verb rather than under a key. `run_tool`
+        # looks like the exception and is not: `arguments` is a declared
+        # argument of that contract -- the arguments of the program being run --
+        # and not the envelope this one would be read out of.
+        if verb == roster.REFRESH_PACKET:
+            return self._refresh(call)
+
         try:
             connection = self._open()
         except (pg.ConnectionError_, OSError) as error:
@@ -1235,6 +1314,9 @@ class _Tools:
 
         if verb == roster.MINT_CALLBACK:
             return self._callback(connection, call.get("arguments"))
+
+        if verb == NAME_TRANSCRIPTS:
+            return self._transcripts(connection, call)
 
         if verb == roster.RUN_TOOL:
             named: str | None = str(call.get("tool") or "")
@@ -1346,6 +1428,154 @@ class _Tools:
         document = json.loads(str(answered))
         return document if isinstance(document, Mapping) else {}
 
+    def _transcripts(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Name the two Artifacts one exchange filed, for the Receipt it filed them under.
+
+        The one arm here that mints nothing and decides nothing. The rows were
+        written by `hold_receipt_transcripts()` in the same transaction as the
+        Receipt, before the door had even answered the child, so this is a read
+        of something already true -- which is why it costs the run nothing and
+        why there is no refusal for it to make.
+
+        One argument, and it is a label the child was just handed rather than
+        one it composed. The Program is this side's, like everywhere else on
+        this dispatch: a child naming the Program a Receipt label belongs to
+        would be a child choosing which Program's exchange to read.
+
+        What is raised rather than answered is the database being unreachable,
+        in `_propose`'s words and for its reason -- and a run that gets that
+        answer still holds its Receipt label, which is what it held before this
+        ticket existed.
+
+        The whole frame is read rather than an `arguments` field of it, because
+        that is what the channel sends: `Channel.call` writes the arguments
+        beside the verb, not under a key, and `isolation` hands this side that
+        object unchanged.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        try:
+            connection.execute(BIND, (self._program_id,))
+            answered = connection.execute(
+                TRANSCRIPTS, (str(arguments.get("receipt") or ""),)
+            ).scalar()
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        document = json.loads(str(answered))
+        return document if isinstance(document, Mapping) else {}
+
+    def _refresh(self, given: object) -> Mapping[str, object]:
+        """Read back the rows this run has minted since it started, by label.
+
+        The answer to the defect ticket 107 names: a packet is compiled before
+        the container starts, so every label the runtime hands a child while it
+        runs -- an exchange's two Artifacts, a tool run's row and its streams --
+        resolves to `not_staged` against the document the child is reading. The
+        rows are here and the child is not, which is this dispatch's whole
+        subject; what is different is that the answer is rows rather than a
+        verdict.
+
+        As `rk2_state`, on a connection opened for this call and closed with it.
+        Not cached like the runtime one, and the reason is the transaction: the
+        Program is bound with `set_config(..., true)`, which lasts exactly one
+        transaction, and the read is `SET TRANSACTION READ ONLY`. A connection
+        kept between calls would have to re-establish both every time anyway,
+        and would spend the run holding a second connection open for something
+        most runs do once.
+
+        `assert_agent_connection` before anything is read, and it is not
+        ceremony. It establishes that this connection cannot read the Program
+        registry, which is what makes an absent label and another Program's
+        label indistinguishable from here -- and a refresh answers by label, so
+        that is precisely the distinction a child must not be able to draw.
+
+        Which Program is this side's, as everywhere on this dispatch. There is
+        no argument for it and there could not be: a child naming the Program
+        whose Receipts it would like refreshed is a child choosing whose rows to
+        read.
+
+        The limits are the module's defaults rather than the configured weights
+        row, and that is deliberate rather than an omission. What `limits` still
+        decides here is the excerpt ceiling -- how much of an Artifact's head may
+        be staged -- and `execution._packet_limits` reads only the byte and token
+        columns, leaving the excerpt at that same default. Reading the row would
+        make no difference to the one field that matters and would need the
+        runtime connection this arm does not open.
+
+        A refusal comes back as a refusal, in `_propose`'s words and for its
+        reason: a run told it could not be refreshed still holds everything its
+        packet was compiled with.
+
+        The whole frame is read rather than an `arguments` field of it, for
+        `_transcripts`' reason: the channel writes a contract's arguments beside
+        the verb, and `verb` is not one of the three names read out of it.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        if self._tooling.state is None:
+            return {
+                "served": False,
+                "reason": UNREACHABLE_STATE,
+                "detail": "this run was started with no agent-scoped connection; "
+                          "the packet it was launched with is unchanged",
+            }
+        named = {
+            section: arguments.get(wire) or []
+            for wire, section in packet_module.REFRESH_ARGUMENTS.items()
+        }
+        ledger = Ledger()
+        try:
+            session = pg.connect(self._tooling.state)
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        try:
+            with session:
+                if not state_module.assert_agent_connection(ledger, session):
+                    return {
+                        "served": False,
+                        "reason": UNREACHABLE_STATE,
+                        "detail": _refused(ledger),
+                    }
+                with session.transaction():
+                    session.execute(REFRESH_READ_ONLY)
+                    if not state_module.bind_agent_session(
+                        ledger, session, self._program_id
+                    ):
+                        return {
+                            "served": False,
+                            "reason": UNREACHABLE_STATE,
+                            "detail": _refused(ledger),
+                        }
+                    fragment, held = packet_module.refresh(
+                        session, named, load=self._excerpts()
+                    )
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        return {"packet": fragment.as_dict(), "held": held}
+
+    def _excerpts(self) -> Callable[[str], bytes | None]:
+        """How a refresh reads the head of an Artifact it just staged a row for.
+
+        The store is content-addressed and this is the side that may address it
+        that way; the child has no route to it at all, which is why a head
+        travels inside the answer or not at all.
+
+        Every failure answers `None` rather than raising, for
+        `execution._excerpt_loader`'s reason: a hash the store does not hold and
+        a hash whose bytes no longer match it are both "this Artifact has no
+        readable head here", and a refresh that raised on one would lose every
+        other row in the same answer over a single missing file.
+        """
+        keep = store.Store(self._tooling.root)
+
+        def load(sha256: str) -> bytes | None:
+            try:
+                return keep.load(sha256)
+            except (store.Missing, store.Corrupt, OSError):
+                return None
+
+        return load
+
     def _open(self) -> pg.Connection:
         if self._connection is None:
             self._connection = pg.connect(self._tooling.runtime)
@@ -1356,6 +1586,18 @@ class _Tools:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+
+def _refused(ledger: Ledger) -> str:
+    """Why an assertion on the agent connection said no, in one sentence.
+
+    The shared assertions report into a `Ledger` because their other callers are
+    operator commands that print one. This dispatch answers a child rather than
+    an operator, and a child can act on a sentence: the alternative was a second
+    copy of "is this really the agent connection", which `state` says in as many
+    words is the thing not to have.
+    """
+    return "; ".join(violation.detail for violation in ledger.violations)
 
 
 def _refusal(stderr: str) -> StartupRefusal | None:

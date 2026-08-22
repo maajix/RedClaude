@@ -39,14 +39,44 @@ from redkraken import pg
 
 #: The sections a packet carries, in the order a reader meets them. One per
 #: state read tool except `get_artifact`, which reads the same `artifacts`
-#: section `get_receipts` cites into.
-SECTIONS = ("surface", "hypotheses", "evidence", "receipts", "artifacts")
+#: section `get_receipts` cites into -- and `tool_runs`, which is the one
+#: section no read tool answers from yet. Ticket 107 put it here because a
+#: refresh has to have somewhere to put a `tool_run` label the run just minted,
+#: and a label folded into a section that does not exist is a label folded into
+#: nothing; ticket 129 is what gives the section a verb of its own.
+SECTIONS = ("surface", "hypotheses", "evidence", "receipts", "artifacts", "tool_runs")
 
-#: The three sections that are a projection of `v_records`, and the kind each
+#: The four sections that are a projection of `v_records`, and the kind each
 #: one selects. The other two are shapes no single kind has: an evidence edge is
 #: an edge rather than a record, and an Artifact is a reference to bytes the
 #: store holds under a hash rather than a canonical row.
-RECORD_KINDS = {"surface": "entity", "hypotheses": "hypothesis", "receipts": "receipt"}
+RECORD_KINDS = {
+    "surface": "entity",
+    "hypotheses": "hypothesis",
+    "receipts": "receipt",
+    "tool_runs": "tool_run",
+}
+
+#: The sections a refresh may be asked for, and nothing else. Three, not six.
+#: An Entity, a Hypothesis and an evidence edge become canonical through the
+#: runtime's promotion step, which reads this run's submitted result after the
+#: container has stopped -- so a run cannot mint one while it is going and has
+#: nothing to ask about. These three it mints by acting: an exchange writes a
+#: Receipt and two Artifacts, a tool run writes a `tool_runs` row and at least
+#: two more Artifacts.
+REFRESHABLE = ("receipts", "artifacts", "tool_runs")
+
+#: Which array of labels asks about which section. The roster declares the three
+#: argument names a child may write and `REFRESHABLE` names the three sections a
+#: refresh reads, and this is the single place the two are tied together: the
+#: supervisor turns wire names into sections to query, and the child turns the
+#: answer back into the sections it reads. Two copies of that correspondence
+#: would be two answers on the day a fourth section becomes refreshable.
+REFRESH_ARGUMENTS = {
+    "receipt_labels": "receipts",
+    "artifact_labels": "artifacts",
+    "tool_run_labels": "tool_runs",
+}
 
 #: How many bytes of a serialized packet one token is worth. Four is the usual
 #: English-text approximation and it is an approximation here too: the ceiling
@@ -59,6 +89,23 @@ DEFAULT_BYTES = 65536
 DEFAULT_TOKENS = 8192
 DEFAULT_EXCERPT = 4096
 DEFAULT_PAGE = 25
+
+#: What one refresh may spend, and why it is not what a packet may spend.
+#:
+#: A packet's ceiling is paid once, before the container starts, and it buys the
+#: whole of what a run begins knowing. A refresh is paid again every time a run
+#: asks, so a refresh held to the packet's own ceiling would be a run that could
+#: spend its whole read surface a second time, and a third, by asking twice more.
+#:
+#: It is also the number that makes the scoping real rather than decorative. One
+#: run of the `authentication` Playbook mints 78 labels -- ten exchanges at one
+#: Receipt and two Artifacts each, sixteen tool runs at one `tool_runs` row and
+#: two Artifacts each -- and those rows weigh 10 x 1,367 + 16 x 1,269 = 33,974
+#: bytes in this module's own encoder, which is already over the 32,768 a whole
+#: packet gets. A refresh that could answer "everything I have minted" was never
+#: expressible at any ceiling, which is why the verb takes labels; this is the
+#: bound on what one answer to those labels may weigh.
+REFRESH_BYTES = 8192
 
 #: How many times a document over its ceiling is re-fitted before it is refused.
 #: Each pass subtracts the excess the last one measured, and dropping rows drops
@@ -589,6 +636,40 @@ ARTIFACTS = (
 
 ARTIFACT_COUNT = "SELECT count(*) FROM v_artifacts"
 
+#: The same two reads, asked by name instead of by rank. A refresh is the only
+#: caller: `RECORDS` and `ARTIFACTS` order by staleness and cut at a row count,
+#: which is what you want when the question is "what does this Program hold",
+#: and these order by nothing but the name asked for, which is what you want
+#: when the question is "what is this label now". No `LIMIT`, because the array
+#: is the limit -- the roster bounds it, and a caller that named a thousand
+#: labels would be bounded by the byte ceiling the same as one that named three.
+#:
+#: The array crosses as `pg.quote_array`, which is the only shape this client
+#: sends one in: `pg._encode` writes every non-bytes parameter with `str`, so a
+#: Python list arrives as `['R7', 'R9']` and the server refuses it as a
+#: malformed array literal. Measured against a real server rather than reasoned
+#: about, because a fake connection accepts either and says nothing.
+NAMED_RECORDS = (
+    "SELECT label, revision, digest, record"
+    "  FROM v_records WHERE kind = $1 AND label = ANY($2) ORDER BY label"
+)
+
+NAMED_ARTIFACTS = (
+    "SELECT va.label,"
+    "       encode(sha256(convert_to(rec::text, 'utf8')), 'hex') AS digest,"
+    "       rec AS record"
+    "  FROM v_artifacts va"
+    "  CROSS JOIN LATERAL (SELECT jsonb_build_object("
+    "           'kind', 'artifact',"
+    "           'label', va.label,"
+    "           'artifact_kind', va.kind,"
+    "           'sha256', va.sha256,"
+    "           'byte_size', va.byte_size,"
+    "           'content_type', va.content_type,"
+    "           'created_at', va.created_at)) AS built(rec)"
+    " WHERE va.label = ANY($1) ORDER BY va.label"
+)
+
 
 def compile(
     connection: pg.Connection,
@@ -645,6 +726,179 @@ def compile(
         )
 
     return compacted(staged, limits, build)
+
+
+def refresh(
+    connection: pg.Connection,
+    named: Mapping[str, Sequence[str]],
+    *,
+    limits: Limits | None = None,
+    load: Callable[[str], bytes | None] | None = None,
+) -> tuple[Packet, dict[str, list[str]]]:
+    """The rows behind the labels a child named, as they are now.
+
+    The other half of `compile`, and it exists because `compile` runs once. A
+    packet is a photograph taken before the container starts, and the act tools
+    mint rows into the database it was taken of: an exchange writes a Receipt
+    and two Artifacts, a tool run writes a `tool_runs` row and the Artifacts its
+    streams became. Every one of those is a label the runtime hands the child
+    and the child cannot read back, which is the whole defect ticket 107 names.
+
+    Scoped, and scoped is not a nicety. The labels one run mints weigh more than
+    the packet's entire ceiling -- `REFRESH_BYTES` carries the arithmetic -- so
+    "give me everything I have made" is not a question this could answer
+    honestly at any ceiling. What it answers is the labels it was given, which
+    is the same handle `Reader.receipts` and `Reader.artifact` already take.
+
+    Bounded on top of that, because a scoped ask is still an ask a model writes:
+    twenty labels is a legal call. Rows that do not fit are dropped by `fit`,
+    the same policy the compile uses, and the `total` each section carries is
+    what the Program held for those names -- so `Reader._page` reports the
+    subtraction as `packet_bound` afterwards, in the words it already uses,
+    rather than in a second vocabulary invented here.
+
+    Two things come back and not one. The fragment is what fitted; the second
+    is which of the asked-for labels this Program holds at all, measured before
+    the fit. The child cannot recover the second from the first and the
+    difference is the whole of criterion 4: a label that exists and did not fit
+    must not be reported as a label that does not exist, because one of those
+    two is fixed by asking for fewer and the other is not.
+
+    The connection is the whole scope, for `compile`'s reason: `rk2_state` sees
+    one Program's rows because row level security says so, and a refresh that
+    took a Program would be a second opinion about which one.
+    """
+    limits = limits or Limits()
+    inner = replace(
+        limits, byte_limit=REFRESH_BYTES, token_limit=REFRESH_BYTES // BYTES_PER_TOKEN
+    )
+    heads = _cached(load)
+    staged: dict[str, Section] = {}
+    for section in REFRESHABLE:
+        wanted = _asked(named.get(section))
+        if section == "artifacts":
+            staged[section] = _named_artifacts(connection, wanted)
+        else:
+            staged[section] = _named_records(
+                connection, section, RECORD_KINDS[section], wanted
+            )
+    revision = int(connection.execute(REVISION).rows[0][0])
+
+    def build(kept: Mapping[str, Section]) -> Packet:
+        """One candidate fragment: the named rows as fitted, then whatever heads fit.
+
+        The heads go last and take only the room the rows left, for the reason
+        `compile` gives -- an Artifact whose row was dropped to make space for
+        somebody else's head is one the child cannot ask about at all -- and
+        with the same excerpt ceiling, because a refresh that staged more of an
+        Artifact than the compile would have is a way to read a whole body 4 KB
+        at a time by asking for it twice.
+        """
+        bare = Packet(revision=revision, limits=limits, sections=dict(kept))
+        return replace(
+            bare,
+            excerpts=_excerpts(
+                kept["artifacts"],
+                limits.excerpt,
+                heads,
+                room=inner.byte_ceiling - bare.document_bytes,
+            ),
+        )
+
+    held = {
+        name: [row.label for row in section.rows] for name, section in staged.items()
+    }
+    return build(bound(staged, byte_limit=inner.byte_ceiling, order=REFRESHABLE)), held
+
+
+def merged(held: Packet, fragment: Packet) -> Packet:
+    """The packet a child reads, with the refreshed rows folded into it.
+
+    An assignment rather than a rebuild, which is what makes the refresh cheap
+    on this side: `Reader.packet` is a plain attribute holding a frozen
+    dataclass, so what a refresh costs the child is one `replace`.
+
+    A refreshed row replaces the staged one of the same label and goes to the
+    front, because it is the newer statement about the same thing and `_page`
+    answers from the front. Two copies of one label would be two revisions of
+    one row in one section, and a reader comparing revisions would find both.
+
+    `total` grows by the rows that were not there before and by nothing else.
+    That number is what the Program holds, and it is what every omission marker
+    subtracts from: counting a refreshed row that was already staged would make
+    `_page` report a `packet_bound` for a row it is holding.
+    """
+    sections = dict(held.sections)
+    for name, refreshed in fragment.sections.items():
+        if not refreshed.rows:
+            continue
+        staged = held.section(name)
+        arrived = {row.label for row in refreshed.rows}
+        kept = [row for row in staged.rows if row.label not in arrived]
+        sections[name] = Section(
+            name=name,
+            total=staged.total + len(arrived - {row.label for row in staged.rows}),
+            rows=tuple(refreshed.rows) + tuple(kept),
+        )
+    return replace(
+        held,
+        revision=max(held.revision, fragment.revision),
+        sections=sections,
+        excerpts={**held.excerpts, **fragment.excerpts},
+    )
+
+
+def _asked(labels: object) -> list[str]:
+    """The labels one section was asked for, deduplicated and in the order given."""
+    if not isinstance(labels, (list, tuple)):
+        return []
+    return list(dict.fromkeys(str(label) for label in labels if str(label)))
+
+
+def _named_records(
+    connection: pg.Connection, name: str, kind: str, labels: Sequence[str]
+) -> Section:
+    if not labels:
+        return Section(name=name, total=0)
+    staged = tuple(
+        Row(
+            section=name,
+            label=str(label),
+            revision=int(revision),
+            digest=str(digest),
+            record=json.loads(str(record)),
+        )
+        for label, revision, digest, record in connection.execute(
+            NAMED_RECORDS, (kind, pg.quote_array(labels))
+        ).rows
+    )
+    return Section(name=name, total=len(staged), rows=staged)
+
+
+def _named_artifacts(connection: pg.Connection, labels: Sequence[str]) -> Section:
+    """The named Artifacts, at revision 0 for `_artifacts`' reason.
+
+    `total` is how many of the asked-for labels this Program holds and not how
+    many were asked for, which is `Reader.receipts`' rule and is here for its
+    reason: a `total` above what the query found would say the Program holds
+    rows the compile never saw, and the labels it does not hold are reported as
+    themselves rather than as a count.
+    """
+    if not labels:
+        return Section(name="artifacts", total=0)
+    staged = tuple(
+        Row(
+            section="artifacts",
+            label=str(label),
+            revision=0,
+            digest=str(digest),
+            record=json.loads(str(record)),
+        )
+        for label, digest, record in connection.execute(
+            NAMED_ARTIFACTS, (pg.quote_array(labels),)
+        ).rows
+    )
+    return Section(name="artifacts", total=len(staged), rows=staged)
 
 
 def _cached(
@@ -959,6 +1213,84 @@ class Reader:
             "omitted": markers,
         }
 
+    def refresh(
+        self,
+        fragment: Packet,
+        asked: Mapping[str, Sequence[str]],
+        held: Mapping[str, Sequence[str]] | None = None,
+    ) -> dict:
+        """Fold rows minted after launch into what this child reads, and say what was folded.
+
+        The one method here that changes the packet rather than reading it, and
+        it is the answer to the one thing every other method on this class could
+        not do: a label the runtime handed this run five seconds ago is a label
+        that resolves to `not_staged` or `no_such_artifact`, because the document
+        these reads answer from was compiled before the container started.
+
+        The rows come back and are also folded in, and the two are not the same
+        thing. Coming back is what makes this a read like the others: a caller
+        gets records, counts and omission markers, in the shape every answer on
+        this surface has. Folding in is what makes the rest of the surface agree
+        with it afterwards -- `get_receipts` for a Receipt this run just made,
+        `get_artifact` for the head of an Artifact it just fetched -- so there is
+        no second shape for a row depending on when the run learned about it.
+
+        The counts are `asked`, `held` and `returned` rather than the four
+        `_page` gives, because the questions are different ones. A packet read
+        subtracts from what the Program holds; a refresh subtracts from what the
+        caller named, and "what the Program holds" is unbounded and not the
+        subject.
+
+        Three subtractions, each named as itself, because a caller can act on
+        one of them and not the others. `not_held` is a label this Program has
+        no row for, which is a label the child got wrong or an exchange that
+        wrote none. `packet_bound` is a row that exists and did not fit in one
+        answer's ceiling, and is the same word `_page` uses for the same fact --
+        ask for fewer and it fits. `not_refreshable` is a section that cannot be
+        asked about at all. Rolling the three into one number would be the
+        "not staged" answer for a row written thirty seconds ago that this
+        ticket exists to refuse.
+        """
+        self.packet = merged(self.packet, fragment)
+        holding = dict(held or {})
+        markers: list[Mapping[str, Any]] = []
+        sections: dict[str, dict] = {}
+        missing: list[str] = []
+        dropped: list[str] = []
+        for section in REFRESHABLE:
+            wanted = _asked(asked.get(section))
+            if not wanted:
+                continue
+            rows = fragment.section(section).rows
+            arrived = [row.label for row in rows]
+            found = _asked(holding.get(section)) or arrived
+            sections[section] = {
+                "counts": {
+                    "asked": len(wanted),
+                    "held": len(found),
+                    "returned": len(rows),
+                },
+                "records": [row.as_dict() for row in rows],
+            }
+            missing.extend(label for label in wanted if label not in found)
+            dropped.extend(label for label in found if label not in arrived)
+        outside = sorted(set(asked) - set(REFRESHABLE))
+        if missing:
+            markers.append(
+                {"reason": "not_held", "count": len(missing), "labels": missing}
+            )
+        if dropped:
+            markers.append(
+                {"reason": "packet_bound", "count": len(dropped), "labels": dropped}
+            )
+        if outside:
+            markers.append({"reason": "not_refreshable", "sections": outside})
+        return {
+            "revision": self.packet.revision,
+            "sections": sections,
+            "omitted": markers,
+        }
+
     # -- the shared page ----------------------------------------------------
 
     def _page(self, section: str, limit: int | None, wanted: Callable[[Row], bool]) -> Answer:
@@ -993,6 +1325,16 @@ def _window(
     Artifact is described by and a window in some other unit would not line up
     with it. A window that cuts through a character gets the replacement
     character for it, which is what a byte range means.
+
+    The window is over the staged head and never over the Artifact, and ticket
+    107 settled that as a rule rather than leaving it as a limitation. Reading
+    past `DEFAULT_EXCERPT` of any Artifact is a Tool run, not a packet read: a
+    refresh restages a head at the same ceiling, so a child that could read
+    further by refreshing would be reading a whole body 4 KB at a time through
+    a surface whose entire ceiling is 32,768 bytes. The route that reads all of
+    an Artifact exists and answers a bounded summary instead of a window --
+    `run_skill_script` hands the program the whole thing untruncated -- and it
+    is the route this marker is pointing at.
     """
     size = int(row.record.get("byte_size") or 0)
     if excerpt is None:

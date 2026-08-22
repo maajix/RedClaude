@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from redkraken import _launch, _startup, agent, document, isolation, packet, pg, proxy
-from redkraken import roster, skill, tls
+from redkraken import roster, skill, store, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -1325,6 +1325,39 @@ class ToolChannelTest(unittest.TestCase):
 
         self.assertNotIn("deadbeef", connection.execute.call_args_list[-1].args[1])
 
+    def test_the_supervisor_names_the_transcripts_of_the_exchange_it_is_asked_about(self):
+        # PH2-106. The one verb on this dispatch that is not a tool: no model
+        # asks for it, and what it answers completes the answer to a call the
+        # child already made. The Receipt label crosses because the door handed
+        # the child that label; the Program does not, because a child naming the
+        # Program a Receipt belongs to would be choosing whose exchange to read.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+        named = {
+            "receipt_label": "R7",
+            "request_artifact": "AF3",
+            "response_artifact": "AF4",
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = json.dumps(named)
+
+        with mock.patch.object(agent.pg, "connect", return_value=connection):
+            served = serving({"verb": agent.NAME_TRANSCRIPTS, "receipt": "R7"})
+
+        self.assertEqual(named, served)
+        self.assertEqual(
+            [(agent.BIND, mock.ANY), (agent.TRANSCRIPTS, ("R7",))],
+            [call.args for call in connection.execute.call_args_list],
+        )
+
+    def test_naming_transcripts_is_not_a_verb_a_model_can_say(self):
+        # It is not in `roster.CONTRACTS` and it does not have the shape a tool
+        # name has, which is what keeps `agent.SERVED` and the startup assertion
+        # honest: a `mcp__rk2__` name is a tool, and the launch is measured
+        # against the roster's list of them.
+        self.assertNotIn(agent.NAME_TRANSCRIPTS, roster.CONTRACTS)
+        self.assertFalse(agent.NAME_TRANSCRIPTS.startswith("mcp__"))
+
     def test_a_database_that_cannot_be_reached_is_a_refusal_and_not_a_raise(self):
         # A child left waiting on a line that never comes ends at its deadline
         # rather than with something it could act on.
@@ -2049,6 +2082,182 @@ class RequestToolTest(unittest.TestCase):
             self.answer(offered["http_request"], {"method": "GET", "url": "http://x.test/"})
 
         self.assertEqual(["http_request"], surface.served)
+
+
+class TranscriptLabelTest(unittest.TestCase):
+    """PH2-106: the exchange the door just filed, named in labels the run can use.
+
+    The bytes were always there and always held. What was missing was a name:
+    every offline tool that takes an `artifact` kind wants one, the packet the
+    read tools answer from was compiled before this run started, and a Receipt
+    label names the record of the fetch rather than the fetch. So everything
+    here is about the naming -- that both halves come back, that they are told
+    apart, that a run which cannot ask says nothing rather than something -- and
+    nothing here is about whether a label resolves, which is ticket 107's and is
+    on rows this process cannot reach.
+    """
+
+    door = agent.Egress(
+        capability="c0ffee" * 10 + "cafe",
+        program_id="11111111-1111-4111-8111-111111111111",
+        proxy_url="http://rk2-proxy:18080",
+        certificate="/run/redkraken-ca.pem",
+    )
+
+    def fetching(self, stack, *answers, decision=None):
+        """One request tool, over a door that answers and a supervisor that names."""
+        surface = _launch.Surface()
+        supervisor = Supervisor(*answers)
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface,
+            packet.Reader(packet.Packet()),
+            _launch.Submission(),
+            self.door,
+            transcripts=_launch.Transcripts(supervisor),
+        )
+        surface.open()
+        stack.enter_context(
+            mock.patch.object(
+                _launch.proxy,
+                "spend",
+                lambda *positional, **keyword: proxy.Answer(
+                    status=200,
+                    body=b"hello",
+                    receipt="R7",
+                    decision=decision,
+                    detail=None,
+                ),
+            )
+        )
+        return offered["http_request"], supervisor
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        return json.loads(wire["content"][0]["text"])
+
+    def request(self) -> dict:
+        return {"method": "GET", "url": "http://x.test/app.js"}
+
+    def test_the_exchange_hands_back_both_halves_and_says_which_is_which(self):
+        # Two labels rather than a pair, because `compare_responses` takes a
+        # `first` and a `second` and the registry says the order is part of the
+        # call: an answer that returned them unordered would push that decision
+        # onto a model.
+        named = {
+            "receipt_label": "R7",
+            "request_artifact": "AF3",
+            "response_artifact": "AF4",
+        }
+        with contextlib.ExitStack() as stack:
+            handler, supervisor = self.fetching(stack, named)
+
+            answered = self.answer(handler, self.request())
+
+        self.assertEqual("R7", answered["receipt"])
+        self.assertEqual("AF3", answered["request_artifact"])
+        self.assertEqual("AF4", answered["response_artifact"])
+
+    def test_the_label_asked_about_is_the_one_the_door_wrote(self):
+        # And nothing beside it. The Program is the supervisor's to fill in, and
+        # the Receipt label is the only handle this side has been given.
+        with contextlib.ExitStack() as stack:
+            handler, supervisor = self.fetching(stack, {"request_artifact": "AF3"})
+
+            self.answer(handler, self.request())
+
+        self.assertEqual([(agent.NAME_TRANSCRIPTS, {"receipt": "R7"})], supervisor.calls)
+
+    def test_a_run_with_no_supervisor_still_makes_the_request_and_names_nothing(self):
+        # The door and the pipe are separate things. A run that cannot ask who
+        # holds the bytes has exactly what every run had before this ticket: the
+        # status, the Receipt label and the excerpt.
+        with contextlib.ExitStack() as stack:
+            surface = _launch.Surface()
+            offered = stack.enter_context(packaged())
+            _launch.server(
+                surface, packet.Reader(packet.Packet()), _launch.Submission(), self.door
+            )
+            surface.open()
+            stack.enter_context(
+                mock.patch.object(
+                    _launch.proxy,
+                    "spend",
+                    lambda *positional, **keyword: proxy.Answer(
+                        status=200, body=b"hello", receipt="R7", decision=None, detail=None
+                    ),
+                )
+            )
+
+            answered = self.answer(offered["http_request"], self.request())
+
+        self.assertEqual("R7", answered["receipt"])
+        self.assertNotIn("request_artifact", answered)
+        self.assertNotIn("response_artifact", answered)
+
+    def test_a_refused_exchange_carries_no_label_rather_than_an_empty_one(self):
+        # `write_blocked_receipt` cannot name a transcript -- registering them is
+        # what failed -- so the verb answers a Receipt label and two nulls, and
+        # a null is not something a model can hand to a tool run. The key is
+        # left out, which is the one thing it can act on.
+        with contextlib.ExitStack() as stack:
+            handler, _ = self.fetching(
+                stack,
+                {"receipt_label": "R7", "request_artifact": None, "response_artifact": None},
+                decision="scope-refused",
+            )
+
+            answered = self.answer(handler, self.request())
+
+        self.assertFalse(answered["served"])
+        self.assertEqual("R7", answered["receipt"])
+        self.assertNotIn("request_artifact", answered)
+        self.assertNotIn("response_artifact", answered)
+
+    def test_an_exchange_that_produced_no_receipt_asks_about_nothing(self):
+        # A door that answered without writing a Receipt has nothing for the
+        # supervisor to look up, and asking anyway would spend a round trip on a
+        # question with no subject.
+        with contextlib.ExitStack() as stack:
+            surface = _launch.Surface()
+            supervisor = Supervisor({"receipt_label": None})
+            offered = stack.enter_context(packaged())
+            _launch.server(
+                surface,
+                packet.Reader(packet.Packet()),
+                _launch.Submission(),
+                self.door,
+                transcripts=_launch.Transcripts(supervisor),
+            )
+            surface.open()
+            stack.enter_context(
+                mock.patch.object(
+                    _launch.proxy,
+                    "spend",
+                    lambda *positional, **keyword: proxy.Answer(
+                        status=502, body=b"", receipt=None, decision=None, detail=None
+                    ),
+                )
+            )
+
+            answered = self.answer(offered["http_request"], self.request())
+
+        self.assertIsNone(answered["receipt"])
+        self.assertEqual([], supervisor.calls)
+
+    def test_the_answer_never_echoes_the_label_it_asked_with(self):
+        # The verb answers the Receipt label back as well, and taking it would
+        # give the answer two `receipt`-shaped fields that can disagree. The
+        # door's own header is the one that stands.
+        with contextlib.ExitStack() as stack:
+            handler, _ = self.fetching(
+                stack, {"receipt_label": "R99", "response_artifact": "AF4"}
+            )
+
+            answered = self.answer(handler, self.request())
+
+        self.assertEqual("R7", answered["receipt"])
+        self.assertNotIn("receipt_label", answered)
 
 
 class ChildTest(unittest.TestCase):
@@ -3250,6 +3459,469 @@ class RecordingTest(unittest.TestCase):
                 with unlatched(), spawn:
                     with self.assertRaises(ValueError):
                         agent.agent_run(self.request(**overrides), self.Untouched())
+
+
+class StateConnection:
+    """An agent-scoped connection that answers a refresh and remembers the asks.
+
+    Everything the refresh does to a database is here rather than mocked away,
+    because the statements are the assertion: which role it checks it is, that
+    it binds the Program in the transaction it reads in, that the read is read
+    only, and that nothing it sends names a Program in the statement itself.
+    """
+
+    def __init__(self, *, revision=51, records=None, artifacts=(), user="rk2_state",
+                 registry=0):
+        self.calls: list[tuple[str, tuple]] = []
+        self.user = user
+        self.registry = registry
+        self.revision = revision
+        self.records = records or {}
+        self.artifacts = list(artifacts)
+        self.bound: str | None = None
+        self.closed = False
+
+    def execute(self, sql: str, parameters=()) -> pg.Result:
+        self.calls.append((sql, tuple(parameters)))
+        return pg.Result(columns=(), rows=tuple(self._answer(sql, parameters)), tag="SELECT")
+
+    def _answer(self, sql: str, parameters) -> list[tuple]:
+        if sql == "SELECT current_user":
+            return [(self.user,)]
+        if sql == agent.state_module.REGISTRY:
+            return [(self.registry,)]
+        if sql.startswith("SELECT set_config"):
+            self.bound = str(parameters[0])
+            return [(self.bound,)]
+        if sql == "SELECT rk2_program()::text":
+            return [(self.bound,)]
+        if sql == packet.REVISION:
+            return [(self.revision,)]
+        if sql == packet.NAMED_RECORDS:
+            kind, labels = parameters
+            return [
+                (item.label, item.revision, item.digest, json.dumps(item.record))
+                for item in self.records.get(kind, ())
+                if item.label in labels
+            ]
+        if sql == packet.NAMED_ARTIFACTS:
+            return [
+                (item.label, item.digest, json.dumps(item.record))
+                for item in self.artifacts
+                if item.label in parameters[0]
+            ]
+        if sql in ("BEGIN", "COMMIT", "ROLLBACK", agent.REFRESH_READ_ONLY):
+            return []
+        raise AssertionError(f"the refresh asked something unplanned: {sql}")
+
+    @contextlib.contextmanager
+    def transaction(self):
+        self.execute("BEGIN")
+        yield self
+        self.execute("COMMIT")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.close()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class Pipe:
+    """The channel, with the supervisor's own dispatch on the other end of it.
+
+    `Channel` is a pipe between two processes and both halves of this ticket are
+    one property, so the two are joined here in the frame the real channel
+    writes -- the arguments beside the verb -- rather than by a script of
+    answers. What that catches is exactly what a scripted supervisor cannot: the
+    two halves agreeing on the shape as well as on the words.
+    """
+
+    def __init__(self, serving) -> None:
+        self._serving = serving
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, verb: str, arguments) -> dict:
+        self.calls.append((verb, dict(arguments)))
+        return dict(self._serving({**dict(arguments), "verb": verb}))
+
+
+def staged(section: str, label: str, revision: int = 1, **record) -> packet.Row:
+    return packet.Row(
+        section=section,
+        label=label,
+        revision=revision,
+        digest=f"{abs(hash(label)) % (16**64):064x}",
+        record={"kind": section.rstrip("s"), "label": label, **record},
+    )
+
+
+def filed(label: str, sha256: str, byte_size: int) -> packet.Row:
+    return packet.Row(
+        section="artifacts",
+        label=label,
+        revision=0,
+        digest=sha256,
+        record={
+            "kind": "artifact",
+            "label": label,
+            "artifact_kind": "runtime",
+            "sha256": sha256,
+            "byte_size": byte_size,
+            "content_type": "text/plain",
+        },
+    )
+
+
+class PacketRefreshTest(unittest.TestCase):
+    """PH2-107: a label minted after launch, resolved in the run that minted it.
+
+    The defect is one thing and not three. A packet is compiled once, on the
+    supervisor's `rk2_state` connection, before the container starts; the act
+    tools mint rows into the database that photograph was taken of. So a Receipt
+    label an exchange handed back a second ago answers `not_staged`, an Artifact
+    label from a tool run answers `no_such_artifact`, and a Tool Run label
+    answers nothing at all -- none of them because the row is missing.
+
+    Decided as A on 2026-08-22: the packet gains a refresh, scoped to the labels
+    the child names. Scoped because one `authentication` run mints 33,974 bytes
+    of rows against a 32,768-byte packet ceiling, so "everything I have made"
+    was not a question anything could have answered.
+
+    Both halves run in different processes and are joined here anyway, because
+    the property is that a label a tool handed a child resolves for that child
+    -- which neither half can be asked about on its own.
+    """
+
+    door = agent.Egress(
+        capability="c0ffee" * 10 + "cafe",
+        program_id="11111111-1111-4111-8111-111111111111",
+        proxy_url="http://rk2-proxy:18080",
+        certificate="/run/redkraken-ca.pem",
+    )
+
+    def tooling(self, root=Path("/store")):
+        return agent.Tooling(
+            container=isolation.ToolContainer(image="rk2-tool"),
+            root=root,
+            runtime=pg.settings_from_url("postgres://rk2_runtime@127.0.0.1:1/rk2"),
+            state=pg.settings_from_url("postgres://rk2_state@127.0.0.1:1/rk2"),
+        )
+
+    def supervising(self, stack, tooling=None, runtime=None, **rows):
+        """The runtime half, over an agent connection that answers the refresh."""
+        held = tooling or self.tooling()
+        request = agent.AgentRunRequest(
+            agent_run_id=str(uuid.uuid4()),
+            objective="find something",
+            container=isolation.AgentContainer(
+                image="rk2-agent",
+                network="rk2-net",
+                proxy_container="rk2-proxy",
+                proxy_url="http://rk2-proxy:8080",
+                certificate=Path("/run/redkraken-ca.pem"),
+            ),
+            role="web_hunter",
+            program_id="11111111-1111-4111-8111-111111111111",
+            tooling=held,
+        )
+        serving = agent._serving(request)
+        assert serving is not None
+        session = StateConnection(**rows)
+        stack.enter_context(
+            mock.patch.object(
+                agent.pg,
+                "connect",
+                lambda settings: session if settings is held.state else runtime,
+            )
+        )
+        return serving, session
+
+    def child(self, stack, reader, pipe, door=None):
+        surface = _launch.Surface()
+        offered = stack.enter_context(packaged())
+        _launch.server(
+            surface, reader, _launch.Submission(), door, channel=pipe
+        )
+        surface.open()
+        return offered
+
+    def answer(self, packaged_tool, arguments: dict) -> dict:
+        wire = asyncio.run(packaged_tool.handler(arguments))
+        return json.loads(wire["content"][0]["text"])
+
+    # -- the runtime half ---------------------------------------------------
+
+    def test_the_refresh_reads_as_the_agent_role_and_binds_this_program(self):
+        # Four statements before a row is read, and each is one of the two
+        # claims this answer rests on: that this connection cannot tell an
+        # absent label from another Program's, and that the Program it can see
+        # is the one this run belongs to.
+        with contextlib.ExitStack() as stack:
+            serving, session = self.supervising(
+                stack, records={"receipt": [staged("receipts", "R7")]}
+            )
+
+            served = serving({"verb": roster.REFRESH_PACKET, "receipt_labels": ["R7"]})
+
+        self.assertEqual(["R7"], served["held"]["receipts"])
+        self.assertEqual("11111111-1111-4111-8111-111111111111", session.bound)
+        self.assertEqual(
+            [
+                "SELECT current_user",
+                agent.state_module.REGISTRY,
+                "BEGIN",
+                agent.REFRESH_READ_ONLY,
+                "SELECT set_config('rk2.program_id', $1, true)",
+                "SELECT rk2_program()::text",
+            ],
+            [sql for sql, _ in session.calls][:6],
+        )
+        self.assertTrue(session.closed)
+
+    def test_the_program_crosses_as_a_binding_and_never_as_a_predicate(self):
+        # Row level security decides which Program these rows belong to. A read
+        # that named one would be a second opinion about it -- on rows a child
+        # named, which is the one place a guessed label would be worth
+        # something. So the Program is sent once, as the session setting the
+        # policies read, and no read statement mentions one at all.
+        with contextlib.ExitStack() as stack:
+            serving, session = self.supervising(
+                stack,
+                records={"receipt": [staged("receipts", "R7")]},
+                artifacts=[filed("AF5", "d" * 64, byte_size=3)],
+            )
+
+            serving({
+                "verb": roster.REFRESH_PACKET,
+                "receipt_labels": ["R7"],
+                "artifact_labels": ["AF5"],
+            })
+
+        reads = (packet.REVISION, packet.NAMED_RECORDS, packet.NAMED_ARTIFACTS)
+        for sql, _ in session.calls:
+            if sql in reads:
+                with self.subTest(sql=sql[:40]):
+                    self.assertNotIn("program", sql.lower())
+        self.assertEqual(
+            ["SELECT set_config('rk2.program_id', $1, true)"],
+            [sql for sql, parameters in session.calls
+             if session.bound in [str(item) for item in parameters]],
+        )
+
+    def test_a_connection_that_is_not_the_agents_answers_no_rows(self):
+        # `rk2_runtime` sees every Program's rows and scopes inside each verb.
+        # A refresh answering whole rows off it would be a read whose isolation
+        # depended on this module remembering to write a predicate.
+        with contextlib.ExitStack() as stack:
+            serving, _ = self.supervising(
+                stack, user="rk2_runtime", records={"receipt": [staged("receipts", "R7")]}
+            )
+
+            served = serving({"verb": roster.REFRESH_PACKET, "receipt_labels": ["R7"]})
+
+        self.assertFalse(served["served"])
+        self.assertEqual(agent.UNREACHABLE_STATE, served["reason"])
+        self.assertIn("rk2_state", served["detail"])
+
+    def test_a_run_with_no_agent_connection_keeps_the_packet_it_started_with(self):
+        # The state settings are optional on `Tooling`, so this is the answer a
+        # run gets on an installation that described none: everything else it
+        # could do it can still do.
+        with contextlib.ExitStack() as stack:
+            serving, _ = self.supervising(
+                stack,
+                tooling=agent.Tooling(
+                    container=isolation.ToolContainer(image="rk2-tool"),
+                    root=Path("/store"),
+                    runtime=pg.settings_from_url("postgres://rk2_runtime@127.0.0.1:1/rk2"),
+                ),
+            )
+
+            served = serving({"verb": roster.REFRESH_PACKET, "receipt_labels": ["R7"]})
+
+        self.assertFalse(served["served"])
+        self.assertEqual(agent.UNREACHABLE_STATE, served["reason"])
+
+    def test_a_label_this_program_does_not_hold_is_absent_and_not_an_error(self):
+        with contextlib.ExitStack() as stack:
+            serving, _ = self.supervising(stack, records={"receipt": []})
+
+            served = serving({"verb": roster.REFRESH_PACKET, "receipt_labels": ["R404"]})
+
+        self.assertEqual([], served["held"]["receipts"])
+        self.assertEqual([], served["packet"]["sections"]["receipts"]["rows"])
+
+    # -- the child half -----------------------------------------------------
+
+    def test_a_run_with_no_supervisor_is_told_so_rather_than_told_nothing(self):
+        # The run that could read its packet can still read its packet. What it
+        # cannot do is learn about a row written since, and a silent empty
+        # refresh would read as "there are none".
+        answered = _launch.Refresh(packet.Reader(packet.Packet())).ask(
+            {"receipt_labels": ["R7"]}
+        )
+
+        self.assertFalse(answered["served"])
+        self.assertEqual(_launch.NO_TOOLING, answered["reason"])
+
+    def test_a_refusal_from_the_supervisor_reaches_the_model_as_itself(self):
+        # A run told the state connection could not be reached can try again or
+        # do something else. A run handed an empty refresh would conclude the
+        # rows are not there.
+        refused = {"served": False, "reason": agent.UNREACHABLE_STATE, "detail": "no"}
+
+        answered = _launch.Refresh(
+            packet.Reader(packet.Packet()), Supervisor(refused)
+        ).ask({"receipt_labels": ["R7"]})
+
+        self.assertEqual(refused, answered)
+
+    def test_a_refresh_this_run_cannot_read_is_a_refusal_and_not_a_crash(self):
+        # `Packet.from_dict` is the only validation this side can perform, so a
+        # fragment it cannot index into has to fail here or fail as a KeyError
+        # in the middle of the model's next turn.
+        answered = _launch.Refresh(
+            packet.Reader(packet.Packet()),
+            Supervisor({"packet": {"sections": {"receipts": {}}}}),
+        ).ask({"receipt_labels": ["R7"]})
+
+        self.assertFalse(answered["served"])
+        self.assertEqual(isolation.UNANSWERED, answered["reason"])
+
+    def test_a_label_array_that_is_not_one_asks_for_nothing(self):
+        # The closed schema refuses this long before the handler, and that is
+        # the check. What must not follow from a broken gate is one string read
+        # as a request for each of its characters.
+        supervisor = Supervisor({"packet": packet.Packet().as_dict(), "held": {}})
+
+        _launch.Refresh(packet.Reader(packet.Packet()), supervisor).ask(
+            {"receipt_labels": "R7"}
+        )
+
+        self.assertEqual([], supervisor.calls[0][1]["receipt_labels"])
+
+    # -- the two halves, which is where the ticket is decided ---------------
+
+    def test_a_receipt_from_an_exchange_resolves_in_the_run_that_made_it(self):
+        """Criterion 6, first half: `http_request`, then `get_receipts`.
+
+        The refresh is between them and is the model's own call, which is what
+        verdict A means: the labels come back from the act tool, the run names
+        the ones it wants, and the read surface answers about them afterwards.
+        """
+        with contextlib.ExitStack() as stack:
+            serving, _ = self.supervising(
+                stack,
+                runtime=self.naming({"receipt_label": "R7", "request_artifact": "AF3",
+                                     "response_artifact": "AF4"}),
+                records={"receipt": [staged("receipts", "R7", status=200)]},
+            )
+            reader = packet.Reader(packet.Packet())
+            offered = self.child(stack, reader, Pipe(serving), self.door)
+            stack.enter_context(
+                mock.patch.object(
+                    _launch.proxy,
+                    "spend",
+                    lambda *positional, **keyword: proxy.Answer(
+                        status=200, body=b"hello", receipt="R7", decision=None, detail=None
+                    ),
+                )
+            )
+
+            exchanged = self.answer(offered["http_request"], {
+                "method": "GET", "url": "http://x.test/app.js"})
+            # Ticket 106's arm over the same dispatch, which is what makes this
+            # a joined test rather than two: the labels came back through the
+            # frame the channel actually writes.
+            self.assertEqual("AF3", exchanged["request_artifact"])
+            self.assertEqual(
+                {"reason": "not_staged", "count": 1, "labels": ["R7"]},
+                self.answer(offered["get_receipts"],
+                            {"receipt_labels": ["R7"]})["omitted"][0],
+            )
+
+            refreshed = self.answer(
+                offered["refresh_packet"], {"receipt_labels": [exchanged["receipt"]]}
+            )
+            resolved = self.answer(offered["get_receipts"], {"receipt_labels": ["R7"]})
+
+        self.assertEqual({"asked": 1, "held": 1, "returned": 1},
+                         refreshed["sections"]["receipts"]["counts"])
+        self.assertEqual(["R7"], [item["label"] for item in resolved["records"]])
+        self.assertEqual([], resolved["omitted"])
+
+    def test_an_artifact_a_tool_run_filed_resolves_in_the_run_that_made_it(self):
+        """Criterion 6, second half: `run_tool`, then `get_artifact` on each output.
+
+        And the bytes, not just the row: a label that resolved to metadata the
+        child cannot read would be the same handle it could not honour, one
+        layer in.
+        """
+        with contextlib.ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            sha256, _ = store.Store(root).put(b"tool output worth reading")
+            serving, _ = self.supervising(
+                stack,
+                tooling=self.tooling(root),
+                records={"tool_run": [staged("tool_runs", "TR3", exit_code=0)]},
+                artifacts=[filed("AF5", sha256, byte_size=25)],
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    agent.tool_module,
+                    "serve",
+                    lambda *positional, **keyword: {
+                        "served": True,
+                        "tool_run": "TR3",
+                        "outputs": [{"label": "AF5", "stream": "stdout"}],
+                    },
+                )
+            )
+            reader = packet.Reader(packet.Packet())
+            offered = self.child(stack, reader, Pipe(serving))
+
+            ran = self.answer(offered["run_tool"], {"tool": "jq", "arguments": {}})
+            self.answer(
+                offered["refresh_packet"],
+                {
+                    "tool_run_labels": [ran["tool_run"]],
+                    "artifact_labels": [item["label"] for item in ran["outputs"]],
+                },
+            )
+            resolved = self.answer(offered["get_artifact"], {"artifact_label": "AF5"})
+
+        self.assertEqual("tool output worth reading", resolved["records"][0]["content"])
+        self.assertEqual([], resolved["omitted"])
+        self.assertEqual(
+            ["TR3"], [item.label for item in reader.packet.section("tool_runs").rows]
+        )
+
+    def test_the_refresh_carries_the_three_arrays_and_nothing_beside_them(self):
+        # Which Program these labels belong to was decided when the run was
+        # opened. A child that named it would be naming whose Receipt it would
+        # like to read, and the closed schema refuses the key long before this.
+        with contextlib.ExitStack() as stack:
+            serving, _ = self.supervising(stack, records={"receipt": []})
+            pipe = Pipe(serving)
+            offered = self.child(stack, packet.Reader(packet.Packet()), pipe)
+
+            self.answer(offered["refresh_packet"], {"receipt_labels": ["R7"]})
+
+        self.assertEqual(
+            [(roster.REFRESH_PACKET,
+              {"receipt_labels": ["R7"], "artifact_labels": [], "tool_run_labels": []})],
+            pipe.calls,
+        )
+
+    def naming(self, document):
+        """The runtime connection ticket 106's arm answers its one read on."""
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = json.dumps(document)
+        return connection
 
 
 if __name__ == "__main__":

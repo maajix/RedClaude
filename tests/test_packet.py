@@ -77,6 +77,21 @@ def artifact(
     )
 
 
+def unarray(literal: str) -> list[str]:
+    """The labels inside a `text[]` literal, the way a server reads one.
+
+    The recorder below decodes what `pg.quote_array` encodes rather than
+    accepting a Python list, because that is exactly the difference a fake
+    connection hides: `pg._encode` writes every parameter that is not bytes with
+    `str`, so a list crosses the wire as `['R7', 'R9']` and the server refuses it
+    as a malformed array literal. A recorder that took the list would have gone
+    on passing over a statement that cannot run.
+    """
+    if not isinstance(literal, str):
+        raise AssertionError(f"an array parameter crossed as {type(literal).__name__}")
+    return [item.strip('"') for item in literal.strip("{}").split(",") if item]
+
+
 def sections(**named: packet.Section) -> dict[str, packet.Section]:
     return dict(named)
 
@@ -132,6 +147,19 @@ class Recorder:
             ][: parameters[0]]
         if sql == packet.ARTIFACT_COUNT:
             return [(self.totals.get("artifacts", len(self.artifacts)),)]
+        if sql == packet.NAMED_RECORDS:
+            kind, labels = parameters
+            return [
+                (item.label, item.revision, item.digest, json.dumps(item.record))
+                for item in self.staged.get(kind, ())
+                if item.label in unarray(labels)
+            ]
+        if sql == packet.NAMED_ARTIFACTS:
+            return [
+                (item.label, item.digest, json.dumps(item.record))
+                for item in self.artifacts
+                if item.label in unarray(parameters[0])
+            ]
         raise AssertionError(f"the compile asked something unplanned: {sql}")
 
 
@@ -372,7 +400,11 @@ class CompileTest(unittest.TestCase):
         packet.compile(recorder, limits=packet.Limits(rows=2))
 
         pages = [parameters for sql, parameters in recorder.calls if sql == packet.RECORDS]
-        self.assertEqual([("entity", 2), ("hypothesis", 2), ("receipt", 2)], pages)
+        # Four kinds since ticket 107, which added the `tool_runs` section so a
+        # refresh has somewhere to fold a `tool_run` label into.
+        self.assertEqual(
+            [("entity", 2), ("hypothesis", 2), ("receipt", 2), ("tool_run", 2)], pages
+        )
         self.assertEqual(2, len(packet.compile(recorder, limits=packet.Limits(rows=2))
                                 .section("surface").rows))
 
@@ -492,6 +524,284 @@ class CompileTest(unittest.TestCase):
         packet.compile(recorder, limits=packet.Limits(byte_limit=700), load=load)
 
         self.assertEqual(sorted(set(asked)), sorted(asked))
+
+
+class RefreshTest(unittest.TestCase):
+    """The rows a run minted after it started, asked for by name.
+
+    The compile above is a photograph and this is the other half of ticket 107:
+    every label an act tool hands a child names a row written after that
+    photograph was taken. Three properties carry it, and they are the three the
+    decision of 2026-08-22 says the arithmetic forces.
+
+    * it is asked by label and never by "everything". One `authentication` run
+      mints 33,974 bytes of rows against a 32,768-byte packet ceiling, so an
+      unscoped refresh could not have been honoured at any ceiling.
+    * a row that exists and did not fit is not a row that does not exist. One
+      is fixed by asking for fewer labels and the other is not, so they are two
+      markers and never one.
+    * what comes back is also folded in, because a refresh that answered once
+      and left `get_receipts` saying `not_staged` would have moved the defect
+      rather than closed it.
+    """
+
+    def connection(self, **overrides) -> Recorder:
+        fields = {
+            "revision": 51,
+            "staged": {
+                "receipt": [row("receipts", "R7"), row("receipts", "R8")],
+                "tool_run": [row("tool_runs", "TR3", exit_code=0)],
+            },
+            "artifacts": [artifact("AF9", "d" * 64, byte_size=11)],
+        }
+        fields.update(overrides)
+        return Recorder(**fields)
+
+    def asked(self, **named) -> dict[str, list[str]]:
+        return {name: list(labels) for name, labels in named.items()}
+
+    # -- what it asks the database ------------------------------------------
+
+    def test_a_refresh_asks_for_the_labels_it_was_given_and_for_no_others(self):
+        recorder = self.connection()
+
+        packet.refresh(
+            recorder,
+            self.asked(receipts=["R7"], artifacts=["AF9"], tool_runs=["TR3"]),
+        )
+
+        asked = {sql: parameters for sql, parameters in recorder.calls}
+        # As `text[]` literals, which is the only shape this client sends an
+        # array in and the shape a real server accepts.
+        self.assertEqual(
+            [("receipt", '{"R7"}'), ("tool_run", '{"TR3"}')],
+            sorted(parameters for sql, parameters in recorder.calls
+                   if sql == packet.NAMED_RECORDS),
+        )
+        self.assertEqual(('{"AF9"}',), asked[packet.NAMED_ARTIFACTS])
+        # The unscoped reads are the compile's, and a refresh that reached for
+        # one would be the "everything I have minted" answer the ceiling says
+        # is not expressible.
+        for unscoped in (packet.RECORDS, packet.ARTIFACTS):
+            self.assertNotIn(unscoped, asked)
+
+    def test_a_section_nobody_named_is_not_a_query(self):
+        recorder = self.connection()
+
+        packet.refresh(recorder, self.asked(receipts=["R7"]))
+
+        self.assertEqual(
+            [("receipt", '{"R7"}')],
+            [parameters for sql, parameters in recorder.calls
+             if sql == packet.NAMED_RECORDS],
+        )
+        self.assertNotIn(
+            packet.NAMED_ARTIFACTS, [sql for sql, _ in recorder.calls]
+        )
+
+    def test_no_statement_and_no_parameter_carries_a_program(self):
+        # The compile's property, and a refresh has to hold it for the compile's
+        # reason: `rk2_state` row level security already decided which Program
+        # this connection is, and a refresh that took one would be a second
+        # opinion about it -- on rows a child named, which is the one place a
+        # guessed label would be worth something.
+        recorder = self.connection()
+
+        packet.refresh(recorder, self.asked(receipts=["R7"], tool_runs=["TR3"]))
+
+        self.assertNotIn("program", str(inspect.signature(packet.refresh)))
+        for sql, parameters in recorder.calls:
+            with self.subTest(sql=sql[:40]):
+                self.assertNotIn("program", sql.lower())
+
+    # -- what comes back ----------------------------------------------------
+
+    def test_the_fragment_carries_the_named_rows_and_the_current_revision(self):
+        fragment, held = packet.refresh(
+            self.connection(),
+            self.asked(receipts=["R7", "R8"], tool_runs=["TR3"], artifacts=["AF9"]),
+        )
+
+        self.assertEqual(51, fragment.revision)
+        self.assertEqual(
+            ["R7", "R8"], [item.label for item in fragment.section("receipts").rows]
+        )
+        self.assertEqual(
+            ["TR3"], [item.label for item in fragment.section("tool_runs").rows]
+        )
+        self.assertEqual({"receipts": ["R7", "R8"], "artifacts": ["AF9"],
+                          "tool_runs": ["TR3"]}, held)
+
+    def test_a_label_this_program_does_not_hold_is_absent_rather_than_an_error(self):
+        # The child composed nothing here: it is repeating a label a tool handed
+        # it. A refresh that raised would turn a stale handle into a failed tool.
+        fragment, held = packet.refresh(
+            self.connection(), self.asked(receipts=["R7", "R404"])
+        )
+
+        self.assertEqual(["R7"], held["receipts"])
+        self.assertEqual(
+            ["R7"], [item.label for item in fragment.section("receipts").rows]
+        )
+
+    def test_what_the_program_holds_is_measured_before_the_fit(self):
+        # Criterion 4, at the seam it is decided on. `held` is read off the
+        # staged sections and the fragment is what survived the ceiling, so a
+        # row that exists and did not fit appears in one and not the other --
+        # which is what lets the reader call it `packet_bound` rather than
+        # `not_held`.
+        heavy = [row("receipts", f"R{n}", body="x" * 4000) for n in range(4)]
+        recorder = self.connection(staged={"receipt": heavy})
+
+        fragment, held = packet.refresh(
+            recorder, self.asked(receipts=[item.label for item in heavy])
+        )
+
+        self.assertEqual(4, len(held["receipts"]))
+        self.assertLess(len(fragment.section("receipts").rows), 4)
+        self.assertLessEqual(fragment.document_bytes, packet.REFRESH_BYTES)
+
+    def test_one_refresh_may_not_spend_what_a_whole_packet_may(self):
+        # The arithmetic the decision turns on: if a refresh were held to the
+        # packet's ceiling, a run could spend its entire read surface again by
+        # asking twice.
+        self.assertLess(packet.REFRESH_BYTES, packet.Limits().byte_ceiling)
+
+    def test_a_refreshed_artifact_gets_no_more_of_its_head_than_a_compile_would(self):
+        # Otherwise the excerpt ceiling is a formality: ask for the same label
+        # twice and read the body 4 KB at a time. The route that reads a whole
+        # Artifact is a tool run, which is what ticket 107 decided out loud.
+        recorder = self.connection(
+            artifacts=[artifact("AF9", "d" * 64, byte_size=9000)]
+        )
+
+        fragment, _ = packet.refresh(
+            recorder,
+            self.asked(artifacts=["AF9"]),
+            load=lambda sha256: b"z" * 9000,
+        )
+
+        self.assertEqual(
+            packet.DEFAULT_EXCERPT, len(fragment.excerpts["AF9"])
+        )
+
+    # -- the fold -----------------------------------------------------------
+
+    def test_a_refreshed_row_joins_the_packet_the_other_reads_answer_from(self):
+        reader = packet.Reader(
+            packet.Packet(revision=7, sections=sections(
+                receipts=section("receipts", [row("receipts", "R1")])))
+        )
+        fragment, held = packet.refresh(self.connection(), self.asked(receipts=["R7"]))
+
+        reader.refresh(fragment, self.asked(receipts=["R7"]), held)
+
+        answer = reader.receipts(receipt_labels=["R7"])
+        self.assertEqual(["R7"], [item["label"] for item in answer["records"]])
+        self.assertEqual([], answer["omitted"])
+
+    def test_a_refreshed_row_replaces_the_staged_one_of_the_same_label(self):
+        # Two revisions of one row in one section would let a reader comparing
+        # revisions find both and believe the Program holds two.
+        staged = packet.Packet(sections=sections(
+            receipts=section("receipts", [row("receipts", "R7", revision=1)], total=3)))
+        fresh = packet.Packet(sections=sections(
+            receipts=section("receipts", [row("receipts", "R7", revision=9)])))
+
+        folded = packet.merged(staged, fresh)
+
+        self.assertEqual([9], [item.revision for item in folded.section("receipts").rows])
+        self.assertEqual(3, folded.section("receipts").total)
+
+    def test_a_row_the_packet_never_had_raises_the_total_it_is_bounded_against(self):
+        staged = packet.Packet(sections=sections(
+            receipts=section("receipts", [row("receipts", "R1")], total=1)))
+        fresh = packet.Packet(sections=sections(
+            receipts=section("receipts", [row("receipts", "R7")])))
+
+        folded = packet.merged(staged, fresh)
+
+        self.assertEqual(2, folded.section("receipts").total)
+        self.assertEqual(
+            ["R7", "R1"], [item.label for item in folded.section("receipts").rows]
+        )
+
+    def test_the_packet_a_refresh_did_not_touch_is_the_packet_it_started_with(self):
+        # A refresh adds. A run that asked about one Receipt and lost its
+        # Entities would be paying for the ask with the reads it already had.
+        reader = packet.Reader(
+            packet.Packet(sections=sections(
+                surface=section("surface", [entity("EP1")], total=4),
+                receipts=section("receipts", [row("receipts", "R1")], total=1)))
+        )
+
+        reader.refresh(packet.Packet(), self.asked(receipts=[]))
+
+        self.assertEqual(4, reader.attack_surface()["counts"]["total"])
+        self.assertEqual(["EP1"], [item["label"]
+                                   for item in reader.attack_surface()["records"]])
+
+    # -- what the answer says -----------------------------------------------
+
+    def test_the_counts_are_what_was_asked_held_and_returned(self):
+        reader = packet.Reader(packet.Packet())
+        fragment, held = packet.refresh(
+            self.connection(), self.asked(receipts=["R7", "R404"])
+        )
+
+        answer = reader.refresh(fragment, self.asked(receipts=["R7", "R404"]), held)
+
+        self.assertEqual(
+            {"asked": 2, "held": 1, "returned": 1},
+            answer["sections"]["receipts"]["counts"],
+        )
+
+    def test_a_label_nobody_holds_and_a_row_that_did_not_fit_are_two_markers(self):
+        # The whole of criterion 4. One is fixed by asking for fewer labels and
+        # the other is not, so a caller that could not tell them apart would
+        # either retry forever or give up on a row it could have had.
+        reader = packet.Reader(packet.Packet())
+        fragment = packet.Packet(sections=sections(
+            receipts=section("receipts", [row("receipts", "R7")])))
+
+        answer = reader.refresh(
+            fragment,
+            self.asked(receipts=["R7", "R8", "R404"]),
+            self.asked(receipts=["R7", "R8"]),
+        )
+
+        self.assertEqual(
+            [
+                {"reason": "not_held", "count": 1, "labels": ["R404"]},
+                {"reason": "packet_bound", "count": 1, "labels": ["R8"]},
+            ],
+            answer["omitted"],
+        )
+
+    def test_a_section_that_cannot_be_refreshed_is_said_so_rather_than_ignored(self):
+        # An Entity becomes canonical through the runtime's promotion step,
+        # which reads this run's result after the container has stopped, so
+        # there is nothing for a running child to refresh. Silence would read
+        # as "you have them all".
+        reader = packet.Reader(packet.Packet())
+
+        answer = reader.refresh(packet.Packet(), self.asked(surface=["EP1"]))
+
+        self.assertEqual(
+            [{"reason": "not_refreshable", "sections": ["surface"]}], answer["omitted"]
+        )
+
+    def test_the_revision_reported_is_the_one_the_reader_now_holds(self):
+        reader = packet.Reader(packet.Packet(revision=7))
+
+        answer = reader.refresh(
+            packet.Packet(revision=51, sections=sections(
+                receipts=section("receipts", [row("receipts", "R7")]))),
+            self.asked(receipts=["R7"]),
+        )
+
+        self.assertEqual(51, answer["revision"])
+        self.assertEqual(51, reader.receipts(receipt_labels=["R7"])["revision"])
 
 
 class ReaderTest(unittest.TestCase):

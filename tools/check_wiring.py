@@ -210,11 +210,17 @@ OWED_GAPS: dict[str, str] = {
     # W4. Every relation the migrations put on the agent's own read surface that
     # no Contract reaches, plus the catalogue-seeded remainder that only a
     # standing check can measure. Ticket 129 decides each one either way. It
-    # counts twenty-one from a hand reading; this is twenty-eight, because four
+    # counts twenty-one from a hand reading; this is twenty-seven, because four
     # of the reports tables reach the surface through a statement that selects
     # its columns out of the catalogue and names the relations in a `WHERE`
     # (`0034_reports.sql:1084-1092`), which a reading that only looked at
     # `VALUES` rows would miss, and `state_read_surface` is itself on it.
+    #
+    # `tool_runs` was on this list and is not any more, and it left by being
+    # read rather than by being decided: ticket 107's `refresh_packet` reaches
+    # it, so the gap this row recorded is measurably gone. The other three of
+    # 129's four -- `tool_run_artifacts`, `tool_run_inputs`, `tool_run_paths` --
+    # are untouched, because a `tool_runs` record is not its inputs or its paths.
     "W4 artifact_refs": "owed:129",
     "W4 browser_runs": "owed:129",
     "W4 browser_step_results": "owed:129",
@@ -241,7 +247,6 @@ OWED_GAPS: dict[str, str] = {
     "W4 tool_run_artifacts": "owed:129",
     "W4 tool_run_inputs": "owed:129",
     "W4 tool_run_paths": "owed:129",
-    "W4 tool_runs": "owed:129",
     "W4 state_read_surface": "owed:129",
 
     # W5. An element a proposal accepts and no read verb returns, and a label
@@ -249,8 +254,12 @@ OWED_GAPS: dict[str, str] = {
     # answer dropped on the way to the model are gone: ticket 108 put `stderr`,
     # `timed_out` and `overflowed` on `tool.serve`'s answer, so the three rows
     # that owed them are removed rather than re-pointed.
+    #
+    # The label class is gone the same way. `tool_run` was here because a run
+    # was handed a Tool Run label and had no verb that took one; ticket 107's
+    # `refresh_packet` takes `tool_run_labels`, so the row is removed rather
+    # than re-pointed. What is left is the one element side of this gate.
     "W5 relationships": "owed:129",
-    "W5 tool_run": "owed:107",
 
     # W6. Twelve tables nothing inserts into and three views nothing selects.
     # `cross_program_exempt_fks`, `program_isolation_candidates` and `secret_dek`
@@ -284,33 +293,23 @@ OWED_GAPS: dict[str, str] = {
     "W9 http-desync transport.certificate_trust": "owed:101",
 
     # W10. The corpus instructs a browser mission through a tool that runs no
-    # browser, and an analysis of bytes the same body just told the model to
-    # fetch. The third reading this register carried -- an identity on a request
-    # that carries none -- is gone: ticket 97 settled that `identity_slot` is a
-    # property of the Tool run rather than an argument and rewrote the twenty
-    # bodies that instructed one, so the twenty rows that owed it are removed
-    # rather than re-pointed.
+    # browser. The other two readings this register carried are both gone, and
+    # both left by being answered rather than by being excused.
+    #
+    # An identity on a request that carries none: ticket 97 settled that
+    # `identity_slot` is a property of the Tool run rather than an argument and
+    # rewrote the twenty bodies that instructed one, so the twenty rows that
+    # owed it are removed rather than re-pointed.
+    #
+    # An analysis of bytes the same body just told the model to fetch: ticket
+    # 106 put `request_artifact` and `response_artifact` on the answer to
+    # `mcp__rk2__http_request`, so a body that says fetch and then analyse is
+    # now naming a call the run can make. The twenty rows that owed it are gone
+    # for the same reason -- and the check itself changed with them, because it
+    # had carried "an exchange returns no Artifact label" as a premise in a
+    # comment and would have gone on reporting all twenty forever. It reads
+    # `_spend`'s answer now.
     "W10 browser-evidence": "owed:99",
-    "W10 api fetch-then-analyse": "owed:106",
-    "W10 api-authorization fetch-then-analyse": "owed:106",
-    "W10 attack-surface fetch-then-analyse": "owed:106",
-    "W10 authentication fetch-then-analyse": "owed:106",
-    "W10 cms fetch-then-analyse": "owed:106",
-    "W10 command-directory-injection fetch-then-analyse": "owed:106",
-    "W10 deserialization fetch-then-analyse": "owed:106",
-    "W10 enumerate-surface fetch-then-analyse": "owed:106",
-    "W10 exceptional-conditions fetch-then-analyse": "owed:106",
-    "W10 file-resolution fetch-then-analyse": "owed:106",
-    "W10 graphql fetch-then-analyse": "owed:106",
-    "W10 grpc fetch-then-analyse": "owed:106",
-    "W10 nosql-injection fetch-then-analyse": "owed:106",
-    "W10 object-ownership fetch-then-analyse": "owed:106",
-    "W10 orm fetch-then-analyse": "owed:106",
-    "W10 secrets fetch-then-analyse": "owed:106",
-    "W10 sql-injection fetch-then-analyse": "owed:106",
-    "W10 ssrf-url-routing fetch-then-analyse": "owed:106",
-    "W10 ssti fetch-then-analyse": "owed:106",
-    "W10 structured-injection fetch-then-analyse": "owed:106",
 }
 
 
@@ -901,6 +900,68 @@ def carried(node: ast.AST) -> frozenset[str]:
     return frozenset(found)
 
 
+def answers(tree: ast.Module, name: str) -> frozenset[str]:
+    """Every key the dict one function hands a model, one merge deep.
+
+    `carried` above is deliberately generous because it reports a loss, and a
+    generous reading makes "this function does not so much as say the word" hard
+    to argue with. This one reports the opposite -- that something *is* handed
+    over -- so generosity here is the direction that goes wrong quietly: a key
+    named in a comment or in a description string would close a gap that is
+    still open. So it reads keys and not mentions.
+
+    One level of `**merged()` is followed, because that is how this package
+    writes a key that is only sometimes there: the conditional half is built in
+    a helper and merged into the answer, and a reading that stopped at the `**`
+    would score exactly the keys a ticket just added as absent. One level and
+    not a walk -- a helper merging a helper is a shape nothing here has, and
+    following it forever would make this a reimplementation of the interpreter.
+    """
+    body = named(tree, name)
+    if body is None:
+        return frozenset()
+    found: set[str] = set()
+    for node in ast.walk(body):
+        if isinstance(node, ast.Return):
+            found |= _answer_keys(node.value, tree)
+    return frozenset(found)
+
+
+def _answer_keys(node: ast.AST | None, tree: ast.Module, *, follow: bool = True) -> frozenset[str]:
+    """The keys one returned expression can carry, for the two shapes this tree writes.
+
+    A literal dict answers with its own literal keys. A dict comprehension
+    answers with the names it iterates -- `{key: ... for key in ("a", "b")}` --
+    which is how a handler says "these keys, each one only if there is something
+    to put in it". Anything else answers nothing, and answering nothing is the
+    safe direction: it reports a gap that may have been closed, which somebody
+    reads, rather than excusing one that is still open, which nobody does.
+    """
+    found: set[str] = set()
+    if isinstance(node, ast.Dict):
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                found.add(key.value)
+            elif (
+                key is None
+                and follow
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+            ):
+                merged = named(tree, value.func.id)
+                for inner in ast.walk(merged) if merged else ():
+                    if isinstance(inner, ast.Return):
+                        found |= _answer_keys(inner.value, tree, follow=False)
+    elif isinstance(node, ast.DictComp):
+        found |= {
+            constant.value
+            for generator in node.generators
+            for constant in ast.walk(generator.iter)
+            if isinstance(constant, ast.Constant) and isinstance(constant.value, str)
+        }
+    return frozenset(found)
+
+
 @dataclass(frozen=True)
 class Surface:
     """What the Python side of this harness declares a model may do."""
@@ -931,6 +992,11 @@ class Surface:
     #: The boundaries W5 measures, as the fields a runtime value carries against
     #: the names the function that answers a model mentions.
     boundaries: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...]
+    #: Every key the answer to one exchange carries. W10's fetch-then-analyse
+    #: reading is about this and about nothing else, and it is read here rather
+    #: than stated in that check because a statement about the answer is a thing
+    #: a gate cannot notice has stopped being true.
+    exchange: frozenset[str]
 
 
 #: The three places a rich runtime value becomes a model-facing dict, named as
@@ -942,6 +1008,20 @@ BOUNDARIES = (
     ("tool.serve", "tool.py", "serve", "isolation.py", "ToolProcess"),
     ("_launch._spend", "_launch.py", "_spend", "proxy.py", "Answer"),
 )
+
+#: Where one exchange's answer is built. `mcp__rk2__http_request` is served by
+#: `_launch._request`, which hands the model whatever `_spend` returns, so the
+#: keys of that dict are the whole of what a run learns from a request. W10 asks
+#: whether an Artifact label is among them.
+EXCHANGE = "_spend"
+
+#: What an Artifact label looks like as a key of an answer: `artifact` itself, or
+#: a name qualified with the half it points at. Ticket 106 hands back two --
+#: `request_artifact` and `response_artifact` -- because `compare_responses`
+#: takes an ordered `first` and `second` and an unordered pair would push that
+#: decision onto a model. Either spelling satisfies the reading; the check is
+#: that a run holding a Receipt label also holds a name for the bytes.
+ARTIFACT_KEY = re.compile(r"(?:[a-z_]+_)?artifact")
 
 
 def read_surface(root: Path = PACKAGE) -> Surface:
@@ -1001,6 +1081,7 @@ def read_surface(root: Path = PACKAGE) -> Surface:
         inserts=python_inserts(root),
         consumers=references(root, skip=frozenset({"roster.py"})),
         boundaries=tuple(boundaries),
+        exchange=answers(launch, EXCHANGE),
     )
 
 
@@ -1556,6 +1637,14 @@ def instruction_gaps(wiring: Wiring) -> list[Gap]:
     """
     surface, catalogue = wiring.surface, wiring.catalogue
     executing = wiring.executing
+    # What an exchange hands back, read rather than assumed. The fourth reading
+    # below used to carry "an exchange returns no Artifact label" as a sentence
+    # in a comment, and a sentence is the one thing a gate cannot notice has
+    # stopped being true: ticket 106 put `request_artifact` and
+    # `response_artifact` on `_spend`'s answer and this check went on reporting
+    # twenty bodies, because what it read was the corpus and the tool registry
+    # and never the answer. So the answer is what it reads.
+    handles = {key for key in surface.exchange if ARTIFACT_KEY.fullmatch(key)}
     gaps = []
     for body in wiring.corpus:
         role = executing.get(body.name)
@@ -1628,17 +1717,19 @@ def instruction_gaps(wiring: Wiring) -> list[Gap]:
             )
 
         # The strongest of the four: no instruction may take as input something
-        # the same body earlier described fetching over the wire. An exchange
-        # hands back a Receipt label and no Artifact label, and the packet the
-        # read tools answer from was compiled before the run started, so the
-        # bytes a request just fetched have no name this run can use.
+        # the same body earlier described fetching over the wire. A body that
+        # tells a model to fetch and then to analyse is instructing a call whose
+        # `artifact` argument has to be a name the run holds, and the only place
+        # such a name can come from is the answer to the fetch -- so the gap is
+        # a body that instructs the pair while `handles` above is empty, and it
+        # closes when an exchange starts naming the bytes it filed.
         consuming = [
             program
             for program, arguments in catalogue.program_arguments.items()
             if "artifact" in arguments.values()
             and re.search(rf"\b{program.replace('_', '[_-]')}\b", body.text)
         ]
-        if consuming and "mcp__rk2__http_request" in tokens:
+        if consuming and "mcp__rk2__http_request" in tokens and not handles:
             gaps.append(
                 Gap(
                     "W10",

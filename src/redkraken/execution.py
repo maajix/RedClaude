@@ -2252,7 +2252,10 @@ class Slice:
                 None
                 if runtime is None or self.tools is None or self.artifacts is None
                 else agent.Tooling(
-                    container=self.tools, root=self.artifacts, runtime=runtime
+                    container=self.tools,
+                    root=self.artifacts,
+                    runtime=runtime,
+                    state=self.state,
                 )
             ),
         )

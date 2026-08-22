@@ -520,6 +520,14 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "mcp__rk2__get_evidence",
         "mcp__rk2__get_receipts",
         "mcp__rk2__get_artifact",
+        # The sixth is the same authority and not a new one: it reads the same
+        # Program's rows through the same views under the same role, and the
+        # only thing it does that the five above cannot is read a row written
+        # after the packet was compiled. A group of its own would have said the
+        # opposite -- that reading a row minted five seconds ago is a different
+        # kind of permission from reading one minted five minutes ago -- and
+        # nothing about scope, isolation or bounding makes that true.
+        "mcp__rk2__refresh_packet",
     ),
     # What a role that executes work may say about state it is not allowed to
     # write. The first member is the whole of one run's reading; the second is
@@ -696,6 +704,57 @@ CONTRACTS: dict[str, Contract] = {
             "range": Argument("string", pattern="^[0-9]+-[0-9]+$"),
         },
     ),
+    # The one read that goes to the database rather than to the snapshot, and
+    # the reason it exists is that every read above it answers from a document
+    # compiled before this container started. `packet.compile` runs once, on the
+    # supervisor's `rk2_state` connection; the act tools mint rows into the
+    # database that document was taken of. So a Receipt label an exchange just
+    # handed back resolves to `not_staged` and an Artifact label to
+    # `no_such_artifact` -- not because the row is missing but because the
+    # photograph is older than the row.
+    #
+    # By label, and that is the design decision rather than an ergonomic one.
+    # One run of the `authentication` Playbook mints 78 labels whose rows weigh
+    # 33,974 bytes, and the whole packet ceiling is 32,768, so "refresh
+    # everything I have minted" is a question with no honest answer at any
+    # ceiling. Three arrays, one per kind of row a run can mint while it is
+    # going, and `packet.REFRESH_BYTES` bounds what one answer to them weighs.
+    #
+    # Nothing here reaches further into an Artifact than the compile did. A
+    # refresh restages a head at the same `DEFAULT_EXCERPT`, because a refresh
+    # that staged more would be a way to read a whole response body 4 KB at a
+    # time; reading past that is `exec.tool_run`'s job, where the answer is a
+    # bounded summary rather than a window into a context.
+    "mcp__rk2__refresh_packet": Contract(
+        "state.read",
+        READ,
+        reads=(
+            "v_records",
+            "receipts",
+            "tool_runs",
+            "v_artifacts",
+            "artifact_references",
+            "artifacts",
+        ),
+        arguments={
+            "receipt_labels": Argument("array", items_pattern=_label("R")),
+            "artifact_labels": Argument(
+                "array", items_pattern=_label(LABEL_PREFIXES["artifact_references"])
+            ),
+            # The third kind, and the one no other read on this surface takes.
+            # A `tool_run` label is handed back by both tool-run tools and until
+            # now resolved to nothing at all, because no Contract read
+            # `tool_runs`. This one does; what it does not do is list them,
+            # which is ticket 129's, so the only way to reach a Tool run here is
+            # to name one the runtime already told this run about. `TR` and not
+            # `T`: `T` is a Task, and a pattern that admitted one would let a
+            # child ask the `tool_runs` kind of `v_records` for a name that kind
+            # never carries.
+            "tool_run_labels": Argument(
+                "array", items_pattern=_label(LABEL_PREFIXES["tool_runs"])
+            ),
+        },
+    ),
     # The six element lists Spec section 13 names -- "proposed Entities,
     # Relationships, Observations, Hypotheses, evidence edges, suggested Tasks
     # and a completion claim". This declaration is the closed set: an element
@@ -866,6 +925,13 @@ CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__http_request": Contract(
         "net.request",
         ACT,
+        # Ticket 106 changed what this answers and deliberately changed nothing
+        # here. The two Artifact labels an exchange now hands back come off
+        # `artifact_refs` rows that `register_proxy_artifacts` and
+        # `hold_receipt_transcripts()` were already writing under this
+        # declaration, in the Receipt's own transaction; the declaration was
+        # never the thing that was missing. A contract states what a call
+        # touches, and this call touched all three before and after.
         writes=("receipts", "artifacts", "artifact_refs"),
         arguments={
             "method": Argument(
@@ -1066,6 +1132,12 @@ PROPOSE_FINDING = "mcp__rk2__propose_finding"
 #: supervisor dispatches on the verb, and a verb typed into the dispatch would
 #: be this surface named in a second place.
 MINT_CALLBACK = "mcp__rk2__mint_callback"
+
+#: The fifth, and the first read among them. Every other state read is answered
+#: inside the container out of the document the child was launched with; this one
+#: crosses the pipe because the rows it is about were written after that document
+#: was compiled, and the side that can see them is the side with a connection.
+REFRESH_PACKET = "mcp__rk2__refresh_packet"
 
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
