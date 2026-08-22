@@ -6,10 +6,10 @@ sentence.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The class does not exist. `client_side.navigation` is named as a property
-      class in three places -- `src/redkraken/playbooks/ssrf-url-routing/playbook.md:128`
+- [ ] The class does not exist, and ticket 100 is the migration it arrives in.
+      `client_side.navigation` is named as a property class in three places -- `src/redkraken/playbooks/ssrf-url-routing/playbook.md:128`
       ("the class is `client_side.navigation` and the Playbook is `routing`"),
       `src/redkraken/playbooks/ssrf-url-routing/references/open-redirection.md:30`
       ("the class is `client_side.navigation`. `routing` asks it"), and a
@@ -18,23 +18,24 @@ sentence.
       There is no `client_side` family: `property_class_families` holds eight
       and none of them is it. The migration comment is the third site and report
       20 lists only the two Playbook files.
-- [ ] The trigger it names is listed by no Playbook. `redirect_target` is
+- [ ] The trigger it names is listed by no Playbook, and ticket 101 is where it
+      gets its first consumer. `redirect_target` is
       registered at `0032_playbooks.sql:66` and is computed --
       `subject_facts` has a branch on `relationships.type = 'redirects_to'` --
       and `grep -rn redirect_target src/redkraken/playbooks --include=playbook.md`
       returns nothing. It is a fact the harness computes for nobody.
-- [ ] The Playbook it delegates to does something else. `routing` triggers on
+- [x] The Playbook it delegates to does something else. `routing` triggers on
       `flow_step` and `state_changing_method` and its declared output is
       `business_logic.workflow_order`. It does not ask about redirect targets
       and cannot claim a class about them.
-- [ ] The decision is which of three repairs is right, and it is a human's.
+- [x] The decision is which of three repairs is right, and it is a human's.
       Add the class and a fixture to grade it, which is ticket 100's mechanism
       and would make this ticket a row in 100's table; give `routing` the
       trigger and the output, which is a change to a shipped Playbook and is
       ticket 101's; or route the reading to a class that already exists and fix
       the two reference pages, which is 101's alone. The ticket names the choice
       rather than making it, because each answer costs a different ticket.
-- [ ] Whichever is chosen, the migration comment moves with the Playbook text.
+- [x] Whichever is chosen, the migration comment moves with the Playbook text.
       A `--` comment in a recorded migration cannot be edited, so the repair is
       a sentence in the migration that supersedes it, which is the house
       standard `20260922T060000Z__a_fixture_may_own_its_own_handshake.sql:100-104`
@@ -143,3 +144,106 @@ reasoning standing, because that reasoning is correct and is load-bearing for
 ticket 47's ledger. The house standard the ticket cites for how to do that
 (`20260922T060000Z__a_fixture_may_own_its_own_handshake.sql:100-104`) is the right
 one.
+
+## What was built, 2026-08-22
+
+One migration and two corpus files. No property class is inserted, no Playbook
+gains a trigger or an output, and `routing` is not opened.
+
+`src/redkraken/migrations/20261004T000000Z__the_open_redirect_reading_names_no_class_this_schema_lacks.sql`
+does three things. It re-issues `COMMENT ON TABLE playbook_references`, which is
+the live object the superseded `--` comment sits above: ticket 45's sentence
+about human-only material is kept whole, 20260902's disposition reasoning is
+promoted onto it in the words the Correction section above asked for -- "a row
+records where a v1 page went, not where its subject is graded" -- and only the
+class name is superseded. It re-freezes `playbooks/ssrf-url-routing/playbook.md`
+from `230cd69c8` / `843d0cf8f` to `74756d306` / `429c2cd22`, in the `VALUES`
+shape `tools/check_coverage.py` reads. And it re-hashes the attached
+`open-redirection.md` from `9372af0aa` to `0a10ef088`, because
+`playbook_references.sha256` is what tells a maintainer whether the page moved.
+
+`playbooks/ssrf-url-routing/playbook.md` step 6 kept its third neighbour bullet
+and lost both false claims in it. It now says that this corpus holds no Playbook
+that asks where a browser is sent and no class that grades it, that it is not
+`routing` and why, and that a claim made there would have no class to carry it.
+
+`playbooks/ssrf-url-routing/references/open-redirection.md` lost the sentence
+that routed the reading to `client_side.navigation` on a `redirect_target`
+trigger, and gained a section that states all three misses against the artifacts
+that disprove them, records the decision above in short form, and names ticket
+100 for the leaf and its fixture and ticket 101 for the emitter. It writes no
+leaf name of its own: the corpus rule that a backticked `family.leaf` in any
+shipped `.md` must be a declared class is already enforced by
+`tests/test_playbook.py:629` over `playbooks/`, `fixtures/` and `skills/`, and
+it caught a first draft of this page that named the proposed leaf.
+
+## What was measured
+
+The four gates, from the worktree root, all rc=0. The three that read the tree
+were also run against a pristine checkout with only these files applied, because
+several other tickets were in flight in the same worktree and a green run there
+says nothing about this change on its own:
+
+* `PYTHONPATH=$PWD python3 -s tools/check_audit.py` -- rc=0. This ticket is
+  `resolved` and reaches ticket 65, which is what the run before the Blocked-by
+  edit refused.
+* `PYTHONPATH=$PWD python3 -s tools/check_wiring.py` -- rc=0, with
+  `W9 vocabulary 9 owed  property classes 57  emitted 50  unmakeable 2` and
+  `register 94 rows`, both unchanged from the reading before this change. That is
+  the point: no class was added, so no W9 finding was added, so no register row
+  was needed and none was written.
+* `PYTHONPATH=$PWD python3 -s tools/check_baseline.py` -- rc=0,
+  `classifications=10 regressions=7 adapters=10 artifacts=223 frozen`.
+* `PYTHONPATH=$PWD/src:$PWD python3 -s tools/check_coverage.py` -- rc=0,
+  `in-scope playbooks 49  loadable 49  frozen 49`, which is the reading that
+  holds the re-freeze above to the bytes this checkout ships.
+
+`python -m unittest tests.test_playbook` -- 58 tests, OK. It is the case that
+matters here rather than a gate:
+`test_no_shipped_document_names_a_property_class_the_vocabulary_lacks` is gate G2
+already implemented, and unlike `check_wiring`'s W9 it reads reference pages and
+fixture ground truth as well as Playbook bodies. It failed a first draft of
+`open-redirection.md` that wrote the proposed leaf name down, which is why that
+name is in this ticket and in no shipped document.
+
+The migration was applied to a scratch database provisioned from empty:
+`migrate ok: True`, the comment read back off `\d+ playbook_references`, and
+both digests read back at the values this file names. Its closing `DO` block was
+then watched failing, one arm at a time, against that database: the comment
+wiped (`the live comment on playbook_references does not carry the
+supersession`), the comment written without the disposition sentence (`the
+supersession dropped the disposition reasoning it was told to keep`), the
+Playbook digest made stale (`ssrf-url-routing is registered at aaaa..., not at
+the text this file froze`), the reference digest made stale (`open-redirection.md
+is attached at bbbb..., not at the bytes this file hashed`), a
+`redirect_target` trigger inserted (`redirect_target has a consumer already, and
+ticket 113 records that it has none`), a `client_side` family inserted (`a
+client_side family exists after all`), and a second output given to `routing`
+(`routing emits {business_logic.workflow_order,injection.markup}`). The control
+passed before and after every one.
+
+## What was not paid, and why
+
+Criteria one and two are unticked and both are deferred by the decision itself
+rather than by this agent.
+
+**The leaf is ticket 100's row.** The decision says it "arrives with the fixture
+that grades it, as a row in ticket 100's table", and the gate agrees: `W9` in
+`tools/check_wiring.py` refuses any declared property class that no Playbook
+emits and that nothing declares unmakeable -- it is what already reports
+`authentication.recovery_flow` and four others, all registered `owed:101`.
+Inserting `injection.navigation_target` here with no emitter would have turned
+that gate red for two new findings, and the register row that would excuse it is
+ticket 101's to write when the emitter lands. So the class is still absent and
+this ticket adds nothing to the vocabulary.
+
+**`redirect_target` still has no consumer.** It is ticket 101's, for the reason
+the decision gives: the emitter belongs to a Playbook whose whole question is
+where the browser is sent, and `routing` cannot be it. The migration's `DO` block
+asserts the absence rather than assuming it, so the day some file gives the fact
+a consumer this assertion is where it is found out.
+
+What is paid today is that no shipped document points at the hole any more. The
+class name is gone from both corpus files and superseded on the live comment,
+and nothing in the tree now tells a reader that `routing` grades a redirect
+target.

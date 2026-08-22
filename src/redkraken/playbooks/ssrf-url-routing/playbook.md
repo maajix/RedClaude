@@ -130,8 +130,11 @@ Three neighbours are close.
   `injection.request_forgery` and the Playbook is `webhooks`. A blind fetcher
   belongs there, not here.
 * Where the caller's URL decides where a *browser* is sent rather than where the
-  server fetches, the class is `client_side.navigation` and the Playbook is
-  `routing`.
+  server fetches, this corpus holds no Playbook that asks it and no class that
+  grades it. It is not `routing`, which asks whether a flow step enforces the
+  steps before it and says nothing about where a browser is sent. Record that the
+  endpoint redirects, say it is out of this reading, and stop: a claim made here
+  would have no class to carry it.
 * Where the served document loads a script from a host the target does not
   claim, the class is `injection.foreign_resource` and the Playbook is
   `external-resources`.
