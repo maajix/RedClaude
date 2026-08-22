@@ -27,11 +27,13 @@ the exact inbound bytes become an immutable Observation -- is in
 
 from __future__ import annotations
 
+import contextlib
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from redkraken import callback, config, pg, scope
+from redkraken import callback, config, migrate, pg, scope
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -509,6 +511,160 @@ class ProvisionTest(unittest.TestCase):
                 settings(), write(source_text), channel, "TEC1", lifetime=lifetime
             )
         return opened, result
+
+
+class Answer:
+    """One statement's answer, in the two shapes `provision` reads."""
+
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def scalar(self) -> object:
+        return self.rows[0][0]
+
+
+class Vouching:
+    """The database as `provision` sees it, with the control answer under test.
+
+    Everything the verb asks between opening the Program and printing the
+    address, and nothing else. The point of scripting it rather than reaching a
+    server is the order: what has to be true is that the channel's proof of life
+    is asked about before a correlator exists, so a refusal here leaves nothing
+    minted for an operator to go and clear.
+    """
+
+    def __init__(self, control: dict) -> None:
+        self.control = control
+        self.statements: list[str] = []
+
+    def __enter__(self) -> "Vouching":
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
+
+    @contextlib.contextmanager
+    def transaction(self):
+        yield self
+
+    def execute(self, statement: str, parameters: tuple = ()) -> Answer:
+        self.statements.append(statement)
+        if statement == callback.SUBJECT:
+            return Answer([("2f6c4b0e-1111-4000-8000-000000000001", "technology")])
+        if statement == callback.BINDING:
+            return Answer(
+                [
+                    (
+                        json.dumps(
+                            {
+                                "declared": True,
+                                "bound": True,
+                                "endpoint": TUNNEL,
+                                "placement": "path",
+                                "provider": "cloudflare-quick",
+                            }
+                        ),
+                    )
+                ]
+            )
+        if statement == callback.CONTROL_ARRIVAL:
+            return Answer([(json.dumps(self.control),)])
+        if statement == callback.MINT:
+            return Answer([(CORRELATOR_ID,)])
+        if statement == callback.EXPIRY:
+            return Answer([("2026-08-21T12:00:00+00:00",)])
+        return Answer([])
+
+
+#: What the reader answers for a channel a control was taken on this morning.
+VOUCHED = {
+    "declared": True,
+    "publishable": True,
+    "bound": True,
+    "endpoint": TUNNEL,
+    "has_control": True,
+    "fresh": True,
+    "interaction": "CB1",
+    "correlator_id": "1f0e5c22-9b3d-4c8a-8f21-6a5d0e3b7c41",
+    "age_seconds": 12,
+    "window_seconds": 86400,
+}
+
+
+class ControlTest(unittest.TestCase):
+    """What `provision` will not mint against, and what it says when it does.
+
+    A canary is embedded to be read either way round: an arrival refutes on its
+    own, and no arrival is a finding only if something has demonstrated that an
+    arrival would have been written down. Before this, a dead publisher and an
+    uninteresting target produced the same silence, so a negative reading was a
+    statement about our own plumbing wearing a subject's name.
+    """
+
+    def provision(self, control: dict, channel: str = PUBLISHED_CHANNEL):
+        connection = Vouching(control)
+        with mock.patch.object(
+            migrate, "open_connection", return_value=connection
+        ), mock.patch.object(callback, "open_program", return_value="P1"):
+            return connection, callback.provision(
+                settings(), write(PUBLISHED), channel, "TEC1"
+            )
+
+    def test_a_channel_nothing_has_vouched_for_mints_nothing(self):
+        connection, result = self.provision(
+            dict(VOUCHED, has_control=False, fresh=False, interaction=None,
+                 reason="nothing has ever arrived at the endpoint to prove this channel records")
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIsNone(result.facts["callback"])
+        self.assertEqual(["argument:--channel"], [one.source for one in result.violations])
+        self.assertIn("nothing has ever arrived", result.violations[0].detail)
+        self.assertNotIn(callback.MINT, connection.statements)
+
+    def test_a_control_that_aged_out_of_the_window_is_named_by_its_age(self):
+        # The reader answers a moment and an age for this case and no sentence,
+        # because what is wrong with it is arithmetic rather than structural.
+        _connection, result = self.provision(dict(VOUCHED, fresh=False, age_seconds=90_000))
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
+        self.assertIn("CB1 arrived 90000 second(s) ago", result.violations[0].detail)
+        self.assertIn("86400", result.violations[0].detail)
+
+    def test_the_channel_is_asked_about_before_a_correlator_exists(self):
+        connection, result = self.provision(VOUCHED)
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertLess(
+            connection.statements.index(callback.CONTROL_ARRIVAL),
+            connection.statements.index(callback.MINT),
+        )
+
+    def test_a_fresh_control_is_cited_in_the_same_sentence_as_the_address(self):
+        # Beside the address rather than instead of it: the two are read
+        # together, and a reading of silence with no provenance is an absence
+        # nobody can weigh.
+        _connection, result = self.provision(VOUCHED)
+
+        self.assertEqual(VOUCHED, result.facts["callback"]["control"])
+        said = result.assertions[0].detail
+        self.assertIn(f"CB1 arrived at {TUNNEL} 12 second(s) ago", said)
+        self.assertIn("reading about the subject", said)
+
+    def test_a_channel_this_harness_does_not_publish_mints_and_says_so(self):
+        # The honest half. There is no publisher of ours at a declared endpoint,
+        # so there is no control to take and refusing the mint would withdraw a
+        # working capability to make a point. What changes is the sentence.
+        _connection, result = self.provision(
+            {"declared": True, "publishable": False, "has_control": False,
+             "fresh": False, "window_seconds": 86400}
+        )
+
+        self.assertTrue(result.ok, result.violations)
+        self.assertIn(
+            "the absence of a refutation and not a refutation",
+            result.assertions[0].detail,
+        )
 
 
 class ClearTest(unittest.TestCase):

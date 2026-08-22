@@ -22,7 +22,9 @@ and that a name nobody bound cannot be minted on -- is in
 
 from __future__ import annotations
 
+import contextlib
 import http.client
+import json
 import os
 import threading
 import unittest
@@ -30,12 +32,13 @@ import warnings
 from pathlib import Path
 from unittest import mock
 
-from redkraken import oob, pg
+from redkraken import callback, oob, pg
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
     Ledger,
 )
+from redkraken.store import Store
 from tests.fixtures import PUBLISHED, SCOPED, scratch, unused_pid, write
 
 
@@ -51,6 +54,25 @@ CHANNEL = "oob-files"
 #: One engagement file, the shape the ticket was written for: a DTD a target
 #: with an XXE parses and fetches, which is the payload a canary cannot carry.
 EXPLOIT = b'<!ENTITY % rk SYSTEM "file:///etc/hostname">\n'
+
+#: The name a quick tunnel handed this channel, which is what `rk oob up` binds
+#: and what every arrival from the edge carries in its `Host`. Nothing in the
+#: configuration says it, which is the whole point of the binding table.
+ENDPOINT = "bright-fox-1234.trycloudflare.com"
+
+#: The row id `mint_control_correlator` answers with. Not derived from the
+#: correlator it names, and not derivable from it.
+CONTROL_ID = "1f0e5c22-9b3d-4c8a-8f21-6a5d0e3b7c41"
+
+#: A channel a quick tunnel could bind and no publisher could ever serve: one
+#: hostname has no labels to vary, so a correlator that lives in a label of it
+#: is a canary with nowhere to be.
+LABELLED = SCOPED + '''
+[[callback]]
+name = "oob-labelled"
+kind = "http"
+provider = "cloudflare-quick"
+'''
 
 
 def settings() -> pg.Settings:
@@ -401,6 +423,271 @@ class ProbeTest(unittest.TestCase):
         self.assertNotIsInstance(self.listener, __import__("socketserver").ThreadingMixIn)
 
 
+class Answer:
+    """One statement's answer, in the two shapes the code under test reads."""
+
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def scalar(self) -> object:
+        return self.rows[0][0]
+
+
+class Recording:
+    """The publisher's connection: every correlator is live and every arrival files.
+
+    Deliberately incurious about which correlator it was asked about. What the
+    control has to demonstrate is that a request at the bound name travels the
+    publisher's ordinary path -- `_answer`, `_serves`, `_record` -- and the
+    arrival this collects is the thing that proves it did.
+    """
+
+    rows: list = []
+
+    def __init__(self, channel: str = CHANNEL) -> None:
+        self.channel = channel
+        self.arrivals: list[dict] = []
+
+    @contextlib.contextmanager
+    def transaction(self):
+        yield self
+
+    def execute(self, statement: str, parameters: tuple = ()) -> Answer:
+        if statement == oob.RESOLVE:
+            return Answer([(self.channel, "path")])
+        if statement == callback.RECORD:
+            self.arrivals.append(json.loads(parameters[1]))
+            return Answer(
+                [
+                    (
+                        json.dumps(
+                            {
+                                "interaction": "CB1",
+                                "observation": None,
+                                "artifact": "AR1",
+                                "duplicate": False,
+                                "is_control": True,
+                            }
+                        ),
+                    )
+                ]
+            )
+        return Answer([])
+
+
+class Operator:
+    """The connection `rk oob up` holds while it takes a control.
+
+    Scripted rather than faked loosely: what each test varies is one of the
+    three answers `_control` reads -- the mint, whether the arrival landed, and
+    nothing else -- and every statement is kept so that the order they were
+    asked in is itself assertable.
+    """
+
+    def __init__(self, *, refusal: str | None = None, recording: "Recording | None" = None) -> None:
+        self.refusal = refusal
+        #: The publisher this control is being taken against, or nothing when
+        #: the case under test is one where it never files. Held rather than
+        #: answered by a flag, because that is what the reader in the database
+        #: does: `callback_control_arrival` reports the control when the row is
+        #: there, so a poll that answered before the publisher had written would
+        #: be a fake that races where the real one waits.
+        self.recording = recording
+        self.statements: list[tuple[str, tuple]] = []
+        self.correlator: str | None = None
+
+    @contextlib.contextmanager
+    def transaction(self):
+        yield self
+
+    def executed(self, statement: str) -> list[tuple[str, tuple]]:
+        return [one for one in self.statements if one[0] == statement]
+
+    def execute(self, statement: str, parameters: tuple = ()) -> Answer:
+        self.statements.append((statement, parameters))
+        if statement == oob.CONTROL_MINT:
+            if self.refusal is not None:
+                return Answer(
+                    [(json.dumps({"outcome": "refused", "refusal": self.refusal}),)]
+                )
+            self.correlator = str(parameters[1])
+            return Answer(
+                [
+                    (
+                        json.dumps(
+                            {
+                                "outcome": "minted",
+                                "correlator_id": CONTROL_ID,
+                                "channel": CHANNEL,
+                                "kind": "http",
+                                "placement": "path",
+                                "endpoint": ENDPOINT,
+                            }
+                        ),
+                    )
+                ]
+            )
+        if statement == oob.CONTROL_ARRIVAL:
+            landed = bool(self.recording is not None and self.recording.arrivals)
+            return Answer(
+                [
+                    (
+                        json.dumps(
+                            {
+                                "declared": True,
+                                "publishable": True,
+                                "bound": True,
+                                "endpoint": ENDPOINT,
+                                "has_control": landed,
+                                "fresh": landed,
+                                "interaction": "CB1" if landed else None,
+                                "correlator_id": CONTROL_ID if landed else None,
+                                "age_seconds": 0,
+                                "window_seconds": 86400,
+                            }
+                        ),
+                    )
+                ]
+            )
+        return Answer([])
+
+
+class ControlTest(unittest.TestCase):
+    """The positive control: an arrival this harness caused, so silence can mean something.
+
+    Until there was one, a canary that never fired and a publisher that was
+    never reachable were the same reading, and a step reporting the second as
+    the first was reporting our own plumbing as a fact about somebody's
+    software. What this asserts is the three things that make the difference: the
+    request is one the publisher takes as an arrival rather than as a probe, it
+    carries the bound name exactly as the edge would send it, and a control that
+    did not reach the record is a refusal rather than a shrug.
+
+    The publisher here is a real listener on a real socket with a fake database
+    beneath it; the operator's side is a second fake, because what `rk oob up`
+    does between the mint and the clear is decided in this process.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        published = oob.publishable(Ledger(), base(), SLUG, write(PUBLISHED))
+        assert published is not None
+        cls.published = published
+
+    def publisher(self) -> tuple[oob.Listener, Recording, int]:
+        """One publisher, serving until this test is over."""
+        recording = Recording()
+        listener = oob.Listener(
+            (oob.LISTEN_HOST, 0),
+            self.published,
+            recording,
+            Store(scratch()),
+            lambda line: None,
+            CHANNEL,
+        )
+        serving = threading.Thread(target=listener.serve_forever, daemon=True)
+        serving.start()
+        self.addCleanup(listener.server_close)
+        self.addCleanup(serving.join, 5)
+        self.addCleanup(listener.shutdown)
+        return listener, recording, listener.server_address[1]
+
+    def test_the_control_is_an_arrival_at_the_bound_name(self):
+        # The whole claim, in one row: the request the control makes is the same
+        # shape an arrival from the edge has -- the tunnel routes by hostname and
+        # forwards the one it was given -- so a publisher that files this one is
+        # a publisher that would have filed a target's.
+        listener, recording, port = self.publisher()
+        connection = Operator(recording=recording)
+        ledger = Ledger()
+
+        answer = oob._control(ledger, connection, CHANNEL, ENDPOINT, port)
+
+        self.assertEqual([], ledger.violations)
+        self.assertEqual("CB1", answer["interaction"])
+        self.assertEqual(
+            [
+                {
+                    "host": ENDPOINT,
+                    "arrival_kind": "http",
+                    "peer_class": "client",
+                    "received_at": None,
+                    "path": f"/{connection.correlator}/",
+                }
+            ],
+            recording.arrivals,
+        )
+        self.assertEqual(1, listener.recorded)
+
+    def test_the_control_correlator_is_ended_however_the_fetch_turned_out(self):
+        # A control left live is a canary at a name we published and told nobody
+        # about, so it is ended in a `finally` and the failing case is the one
+        # worth asserting.
+        for name, arrives in (("arrived", True), ("never arrived", False)):
+            with self.subTest(name):
+                _, recording, port = self.publisher()
+                connection = Operator(recording=recording if arrives else None)
+                with mock.patch.object(oob, "CONTROL_TIMEOUT", 1.0):
+                    oob._control(Ledger(), connection, CHANNEL, ENDPOINT, port)
+
+                self.assertEqual(
+                    [(oob.CLEAR_CORRELATOR, (CONTROL_ID,))],
+                    connection.executed(oob.CLEAR_CORRELATOR),
+                )
+
+    def test_a_control_that_never_reaches_the_record_is_a_refusal(self):
+        # Answered and not written down is the failure this exists to catch: the
+        # socket is up, the request came back, and nothing about the channel has
+        # been demonstrated. `rk oob up` reads this as a name not to hand out.
+        _, _, port = self.publisher()
+        ledger = Ledger()
+
+        with mock.patch.object(oob, "CONTROL_TIMEOUT", 0.2):
+            answer = oob._control(ledger, Operator(), CHANNEL, ENDPOINT, port)
+
+        self.assertIsNone(answer)
+        self.assertEqual(["database"], [one.source for one in ledger.violations])
+        self.assertIn(ENDPOINT, ledger.violations[0].detail)
+
+    def test_a_publisher_that_stopped_answering_is_named_as_the_port_it_was_on(self):
+        # Between the readiness probe and here, which is the window `_listening`
+        # cannot cover: it is asked before the tunnel starts and this is asked
+        # after the name is bound. Port 1, which is the port the probe's own
+        # "nobody is on this" test uses and for the same reason.
+        ledger = Ledger()
+
+        answer = oob._control(ledger, Operator(), CHANNEL, ENDPOINT, 1)
+
+        self.assertIsNone(answer)
+        self.assertEqual(["argument:--port"], [one.source for one in ledger.violations])
+        self.assertIn(f"{oob.LISTEN_HOST}:1", ledger.violations[0].detail)
+
+    def test_a_channel_no_control_can_be_taken_on_is_refused_in_the_databases_words(self):
+        # The reader's sentence rather than a second one composed here: what a
+        # control cannot be taken on is a question about the channel row, and an
+        # operator reading a paraphrase would be reading this file's opinion of
+        # it.
+        ledger = Ledger()
+        said = "channel oob-files declares its own endpoint, which this harness does not publish"
+
+        answer = oob._control(ledger, Operator(refusal=said), CHANNEL, ENDPOINT, 1)
+
+        self.assertIsNone(answer)
+        self.assertIn(said, ledger.violations[0].detail)
+        self.assertEqual(["argument:--channel"], [one.source for one in ledger.violations])
+
+    def test_nothing_is_fetched_before_a_correlator_exists_to_fetch(self):
+        # A request at a name with no live correlator is an arrival attributable
+        # to nothing, and this command would have caused it.
+        _, recording, port = self.publisher()
+
+        oob._control(
+            Ledger(), Operator(refusal="no binding"), CHANNEL, ENDPOINT, port
+        )
+
+        self.assertEqual([], recording.arrivals)
+
+
 class RunningTest(unittest.TestCase):
     """Whether a tunnel process is still there, which is the whole of a binding."""
 
@@ -555,6 +842,20 @@ class LifecycleRefusalTest(unittest.TestCase):
 
         self.assertEqual(EXIT_INVALID_CONFIGURATION, answer.exit_code)
         self.assertRegex(answer.violations[0].detail, r"declares provider static")
+
+    def test_a_channel_a_publisher_could_not_serve_is_not_bound_either(self):
+        # `serve` has always refused a label channel, because one hostname has
+        # no labels to vary. `up` binds a name in front of that publisher, so a
+        # name bound for a label channel was a name in front of nothing -- and
+        # it is also the one shape no control could be taken on, since the
+        # publisher reads a correlator out of the path and would find none.
+        answer = oob.up(
+            settings(), write(LABELLED), "oob-labelled", store=scratch(), port=0
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, answer.exit_code)
+        self.assertRegex(answer.violations[0].detail, r"has\s+no labels to vary")
+        self.assertEqual(["argument:--channel"], [one.source for one in answer.violations])
 
     def test_an_undeclared_channel_is_refused_by_every_verb(self):
         for verb in (oob.status, oob.down):

@@ -40,6 +40,7 @@ import http.server
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,15 @@ TUNNEL_POLL = 0.25
 #: socket serving one word out of memory; a second is generous.
 PROBE_TIMEOUT = 1.0
 
+#: How long `rk oob up` waits for the arrival its own control fetch caused to
+#: reach the record. The publisher answers the request first and files it
+#: afterwards, both on one thread, so what this waits out is a write that has
+#: already been decided rather than a channel that might yet answer.
+CONTROL_TIMEOUT = 15.0
+
+#: How often to ask the database whether it landed.
+CONTROL_POLL = 0.05
+
 #: The loopback port the publisher listens on and `rk oob up` points a tunnel
 #: at when nobody says otherwise. Shared, because the two commands have to agree
 #: and a default only one of them had would be two ports.
@@ -134,6 +144,9 @@ RESOLVE = "SELECT channel_name, channel_placement FROM resolve_callback_correlat
 BIND = "SELECT bind_callback_channel($1, $2, $3, $4, $5::jsonb)"
 RELEASE = "SELECT release_callback_binding($1::uuid)"
 BINDING = callback.BINDING
+CONTROL_MINT = "SELECT mint_control_correlator($1, $2)"
+CONTROL_ARRIVAL = callback.CONTROL_ARRIVAL
+CLEAR_CORRELATOR = callback.END_CORRELATOR
 LIVE_BINDINGS = (
     "SELECT id::text, channel_name, endpoint_host, tunnel_pid"
     "  FROM callback_channel_bindings"
@@ -548,6 +561,18 @@ class Request(http.server.BaseHTTPRequestHandler):
             self.log_message("%s was not recorded: %s", target, error)
             return
         listener.recorded += 1
+        if answer.get("is_control"):
+            # A control is this harness fetching its own publisher, so there is
+            # no Observation to name: what the line reports is the arrival that
+            # proves this channel records at all, which is the only thing about
+            # it an operator reading the log has to be able to find.
+            self.log_message(
+                "%s recorded as control arrival %s%s",
+                target,
+                answer.get("interaction"),
+                " (already on the record)" if answer.get("duplicate") else "",
+            )
+            return
         self.log_message(
             "%s recorded as interaction %s, observation %s%s",
             target,
@@ -735,6 +760,12 @@ def up(
     and nowhere else, so the bytes it was read from are stored and the binding
     cites them. A binding whose endpoint nobody can check against anything is a
     claim about what happened rather than a record of it.
+
+    And one measurement after it, which is what a name is bound for. `_listening`
+    asked whether a socket is open; the control asks whether an arrival at this
+    name becomes a row, by making one. A binding this command could not
+    demonstrate is released again before it returns, because the alternative is
+    an agent embedding a canary and reading a silence that means nothing.
     """
     ledger = Ledger()
     # `released` sits beside `oob` rather than inside it: reaping happens before
@@ -753,6 +784,22 @@ def up(
             "oob_channel",
             f"channel {channel} declares provider {endpoint.provider}, which "
             f"binds no name; {UP} starts a {QUICK_PROVIDER} tunnel",
+            code=INVALID_CONFIGURATION,
+            source="argument:--channel",
+        )
+        return report(UP, ledger, **facts)
+    if endpoint.placement != "path":
+        # The same refusal `rk oob serve` makes, moved in front of the tunnel it
+        # would otherwise start. What this command binds a name for is the
+        # publisher, and the publisher serves one hostname with no labels to
+        # vary -- so a name bound for a channel whose correlator is a label was
+        # always a name in front of nothing, and it is also the one channel
+        # shape no control below could be taken on.
+        ledger.fail(
+            "oob_channel",
+            f"channel {channel} carries its correlator in the "
+            f"{endpoint.placement}; a publisher serves one hostname, which has "
+            f"no labels to vary, so {UP} has nothing to bind a name in front of",
             code=INVALID_CONFIGURATION,
             source="argument:--channel",
         )
@@ -824,6 +871,20 @@ def up(
                 )
                 return report(UP, ledger, **facts)
 
+        # After the bind commits, because the correlator the control carries is
+        # minted against this binding and the publisher resolves it on a
+        # connection of its own.
+        control = _control(ledger, connection, channel, str(answer.get("endpoint")), port)
+        if control is None:
+            # A name nothing demonstrated does not stay bound. Every other
+            # refusal in this command happens before the name exists; this one
+            # happens after, so it has to take the name away again -- and the
+            # correlators that die with it are none, because nothing has been
+            # able to mint one yet.
+            with connection.transaction():
+                connection.execute(RELEASE, (str(answer.get("binding_id")),))
+            return report(UP, ledger, **facts)
+
     facts["oob"] = {
         "channel": channel,
         "binding_id": answer.get("binding_id"),
@@ -831,12 +892,21 @@ def up(
         "provider": QUICK_PROVIDER,
         "tunnel_pid": started.pid,
         "evidence_sha256": sha256,
+        "control": control,
     }
     ledger.hold(
         "oob",
         f"channel {channel} is bound to {answer.get('endpoint')} by tunnel "
         f"{started.pid}; the name is in binding {answer.get('binding_id')} and "
         f"nowhere else, and `rk {STATUS}` is how anything reads it",
+    )
+    ledger.hold(
+        "oob_control",
+        f"a fetch of this harness's own publisher at {answer.get('endpoint')} "
+        f"arrived and was recorded as {control.get('interaction')}, so an "
+        f"arrival on channel {channel} is demonstrated rather than assumed and "
+        f"nothing coming back on it is a reading about the target for the next "
+        f"{control.get('window_seconds')} second(s)",
     )
     return report(UP, ledger, **facts)
 
@@ -1077,6 +1147,168 @@ def _running(pid: int) -> bool:
     return True
 
 
+def _control(
+    ledger: Ledger,
+    connection: pg.Connection,
+    channel: str,
+    endpoint: str,
+    port: int,
+) -> dict | None:
+    """Demonstrate that an arrival on this channel becomes a row, by causing one.
+
+    The positive control, and the reason it exists is that until it did, a
+    reading of "nothing came back" carried no information. An out-of-band
+    Observation that never arrives and a publisher that was never reachable are
+    the same silence, so a Playbook step reporting the second as the first was
+    reporting our own plumbing as a fact about somebody's software. What makes
+    the difference is one arrival nobody was hoping for: if a request this
+    harness sent itself is on the record, then the record is what an arrival
+    would have reached.
+
+    It is a request at the publisher's own socket carrying the bound name in its
+    `Host`, which is byte for byte what the edge forwards -- the tunnel routes by
+    hostname and sends the one it was given, so this is the shape every real
+    arrival has on this side. It is deliberately not a request to the public
+    name: every outbound request this installation makes goes through the door,
+    and a second dialler here reaching a hostname no scope rule admits is the
+    alternate path the whole harness exists to keep shut. So what this proves is
+    the socket, the correlator, the writer and the row; that the tunnel process
+    is alive is the other half, and `_reap` is what asks it.
+
+    The correlator is minted for the occasion, has no subject and is marked as a
+    control, so the arrival it carries is filed and produces no Observation --
+    it is a fact about this installation, and putting it on the evidence surface
+    under whichever Entity was at hand would be a true sentence about the wrong
+    thing. It is cleared the moment the arrival lands, however that turns out: a
+    control left live is a canary at a name we published and told nobody about.
+    """
+    minted = _mint_control(ledger, connection, channel)
+    if minted is None:
+        return None
+    identifier = str(minted.get("correlator_id"))
+    correlator = str(minted.get("correlator"))
+    try:
+        # The status is not the question and is not read. `/<correlator>/` names
+        # a canary and no file, so the publisher answers the same 404 a target
+        # embedding the printed address gets, and records the arrival after it.
+        if not _fetch(f"/{correlator}/", endpoint, port):
+            ledger.fail(
+                "oob_control",
+                f"nothing answered a control fetch at {LISTEN_HOST}:{port} for "
+                f"{endpoint}; the name is bound in front of a publisher that "
+                "stopped answering between the readiness probe and now",
+                code=INVALID_CONFIGURATION,
+                source="argument:--port",
+            )
+            return None
+        arrived = _arrived(connection, channel, identifier)
+    finally:
+        _clear_control(connection, identifier)
+
+    if arrived is None:
+        ledger.fail(
+            "oob_control",
+            f"a control fetch of {endpoint} was answered and never reached the "
+            f"record within {CONTROL_TIMEOUT:g} second(s); an arrival this "
+            "harness caused itself is the only thing that makes a canary's "
+            "silence a reading, so the name is released rather than handed out",
+            code=INVALID_CONFIGURATION,
+            source="database",
+        )
+        return None
+    return arrived
+
+
+def _mint_control(ledger: Ledger, connection: pg.Connection, channel: str) -> dict | None:
+    """The correlator the control fetch carries, or the refusal saying why not.
+
+    Generated here for the reason every other correlator is: the plaintext
+    exists in this process and in the request it travels in, and the database
+    keeps its digest. Returned beside the row id because the caller needs both
+    -- the plaintext to address the fetch and the id to end it with.
+    """
+    correlator = secrets.token_hex(callback.CORRELATOR_BYTES)
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {UP}",))
+            minted = _decode(
+                str(connection.execute(CONTROL_MINT, (channel, correlator)).scalar())
+            )
+    except pg.DatabaseError as error:
+        ledger.fail(
+            "oob_control",
+            f"the control correlator was refused: {error}",
+            code=INVALID_CONFIGURATION,
+            source="database",
+        )
+        return None
+    if minted.get("outcome") != "minted":
+        ledger.fail(
+            "oob_control",
+            f"no control could be taken on channel {channel}: {minted.get('refusal')}",
+            code=INVALID_CONFIGURATION,
+            source="argument:--channel",
+        )
+        return None
+    return dict(minted, correlator=correlator)
+
+
+def _clear_control(connection: pg.Connection, correlator_id: str) -> None:
+    """End the control correlator, whatever happened to the fetch it was for.
+
+    In a `finally`, because the one state that must not be left behind is a live
+    correlator at a published name that nothing is watching for. A refused clear
+    is swallowed rather than reported: the caller is already answering a
+    question about the channel, and the correlator expires in five minutes on
+    its own.
+    """
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {UP}",))
+            connection.execute(CLEAR_CORRELATOR, (correlator_id,))
+    except pg.DatabaseError:
+        return
+
+
+def _fetch(target: str, host: str, port: int) -> bool:
+    """One request at the publisher's socket, under the name the edge would send.
+
+    Whether it was answered at all, which is all this asks. What the answer was
+    is the publisher's business and is not evidence of anything: a canary's own
+    address names no file, so the honest answer to it is a 404 and the arrival
+    is what matters.
+    """
+    try:
+        session = http.client.HTTPConnection(LISTEN_HOST, port, timeout=PROBE_TIMEOUT)
+        try:
+            session.request("GET", target, headers={"Host": host})
+            session.getresponse().read()
+            return True
+        finally:
+            session.close()
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+def _arrived(connection: pg.Connection, channel: str, correlator_id: str) -> dict | None:
+    """Wait for the control this command caused to reach the record, or give up.
+
+    Polled rather than awaited, because the publisher is a different process on
+    a connection of its own: it answered the request before filing it, and this
+    is the wait for a write that has already been decided. The correlator id is
+    what makes this the control we just took rather than one an earlier `up`
+    left on this binding.
+    """
+    deadline = time.monotonic() + CONTROL_TIMEOUT
+    while True:
+        answer = _decode(str(connection.execute(CONTROL_ARRIVAL, (channel,)).scalar()))
+        if str(answer.get("correlator_id")) == correlator_id:
+            return answer
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(CONTROL_POLL)
+
+
 def _listening(port: int) -> bool:
     """Whether our own publisher answers on this port.
 
@@ -1085,6 +1317,13 @@ def _listening(port: int) -> bool:
     tunnel's. So a 200 here is this machine answering, not something the tunnel
     is pointed at, and `rk oob up` binds a name to a publisher rather than to
     whatever else happened to be on the port.
+
+    It is the cheap half of the question and it stays the first half: it costs a
+    socket and it is asked before a tunnel is started, so a publisher that is
+    not there is a refusal that took no name from anybody. What it cannot answer
+    is whether an arrival becomes a row -- the health path is the one target this
+    publisher answers without writing anything down -- and that is `_control`'s
+    question, asked once the name exists to ask it at.
     """
     address = f"{LISTEN_HOST}:{port}"
     try:

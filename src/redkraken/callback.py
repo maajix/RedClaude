@@ -87,6 +87,7 @@ SUBJECT = "SELECT id::text, type FROM entities WHERE program_id = $1::uuid AND l
 EXPIRY = "SELECT expires_at::text FROM callback_correlators WHERE id = $1::uuid"
 END_CORRELATOR = "SELECT clear_callback_correlator($1::uuid)"
 BINDING = "SELECT callback_channel_binding($1)"
+CONTROL_ARRIVAL = "SELECT callback_control_arrival($1)"
 
 
 def provision(
@@ -108,6 +109,14 @@ def provision(
     capability has and for the opposite reason -- not because it would be
     dangerous to keep, but because a stored canary is one more place a name can
     be learned from.
+
+    On a channel this harness publishes, nothing is minted until something has
+    demonstrated that an arrival on it reaches the record. That is what makes
+    the reading this canary produces readable in both directions: an arrival
+    refutes on its own, and no arrival is a finding only beside a control. On a
+    channel whose endpoint the operator declared there is no publisher of ours
+    to take one at, and the report says so rather than refusing a mint it has no
+    way to improve.
     """
     ledger = Ledger()
     facts: dict[str, object] = {"program_id": None, "callback": None}
@@ -175,6 +184,32 @@ def provision(
             return report(PROVISION, ledger, **facts)
         host = str(binding["endpoint"])
 
+        # And what proves the channel records, asked before anything is minted.
+        # A canary is embedded to be read either way round: an arrival is a
+        # finding on its own, and no arrival is a finding only if something
+        # demonstrates that an arrival would have been written down. Without
+        # that, a dead publisher and an uninteresting target produce the same
+        # silence, and an operator reading the second has read the first.
+        #
+        # `rk oob up` is what takes the control, and this is the same reader
+        # `request_callback_correlator` asks -- the window is written down in
+        # that function and in neither of its callers, so the operator's path
+        # and the agent's cannot come to different answers about the same
+        # channel.
+        control = _decode(str(connection.execute(CONTROL_ARRIVAL, (channel,)).scalar()))
+        if control.get("publishable") and not control.get("fresh"):
+            ledger.fail(
+                "callback_control",
+                f"channel {channel} has no proof-of-life arrival inside the last "
+                f"{control.get('window_seconds')} second(s) "
+                f"({_unproved(control)}), so nothing failing to come back on it "
+                f"would be a fact about {subject}; `rk oob up` takes one when "
+                "it binds the name",
+                code=INVALID_CONFIGURATION,
+                source="argument:--channel",
+            )
+            return report(PROVISION, ledger, **facts)
+
         correlator = secrets.token_hex(CORRELATOR_BYTES)
         with connection.transaction():
             connection.execute("SELECT set_actor('runtime', $1)", (f"rk {PROVISION}",))
@@ -208,13 +243,52 @@ def provision(
         "subject_type": entity_type,
         "expires_at": expires,
         "lifetime_seconds": lifetime,
+        "control": control,
     }
     ledger.hold(
         "callback",
         f"channel {channel} ({endpoint.kind}) is listening for {subject}: "
-        f"embed {address}, live until {expires}",
+        f"embed {address}, live until {expires}{_vouched(control)}",
     )
     return report(PROVISION, ledger, **facts)
+
+
+def _unproved(control: dict) -> str:
+    """Why this channel is standing on nothing, in the reader's own words.
+
+    The database says it when the answer is structural -- no binding, no control
+    ever -- and says nothing when the control merely aged out, because a moment
+    and an age are what it returned instead. This composes the second case and
+    passes the first through untouched.
+    """
+    said = control.get("reason")
+    if said:
+        return str(said)
+    return (
+        f"{control.get('interaction')} arrived {control.get('age_seconds')} "
+        "second(s) ago"
+    )
+
+
+def _vouched(control: dict) -> str:
+    """What the reading this correlator produces may be read against.
+
+    In the same sentence as the address, because the two are read together: an
+    arrival refutes on its own, and no arrival is a finding only beside a
+    control. A channel this harness does not publish gets the honest half of
+    that -- there is no publisher of ours to take a control at, so silence on it
+    stays the absence of a refutation rather than becoming one.
+    """
+    if not control.get("publishable"):
+        return (
+            "; this harness does not publish this channel, so no arrival on it "
+            "is the absence of a refutation and not a refutation"
+        )
+    return (
+        f"; {control.get('interaction')} arrived at {control.get('endpoint')} "
+        f"{control.get('age_seconds')} second(s) ago, so nothing coming back is "
+        "a reading about the subject rather than about this channel"
+    )
 
 
 def _address(placement: str, host: str, correlator: str) -> str:

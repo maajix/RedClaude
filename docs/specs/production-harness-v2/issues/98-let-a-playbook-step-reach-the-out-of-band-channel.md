@@ -7,7 +7,7 @@ evidence surface, and a positive control that makes silence mean something.
 **Blocked by:** nothing. Tickets 14 and 69 are resolved and they built the
 recording half; this is the half neither of them owned.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] The state this ticket starts from is stated rather than re-discovered:
       **the record and the channel are built and sound, and the agent-facing
@@ -40,7 +40,7 @@ recording half; this is the half neither of them owned.
       interaction table itself stays off the read surface, because
       `observed_host` carries the correlator and the table comment says so
       (`20260812T040000Z…:235`, `:262-265`).
-- [ ] **There is a positive control, and before it silence proved nothing.**
+- [x] **There is a positive control, and before it silence proved nothing.**
       `_listening` proves our own publisher answers `/health` on loopback before
       a name is bound (`oob.py:1080-1099`); nothing proves the bound public name
       is reachable from outside, and no proof-of-life arrival is ever recorded,
@@ -53,26 +53,37 @@ recording half; this is the half neither of them owned.
       `playbooks/webhooks/playbook.md:61` -- "No arrival inside the declared
       window is not a refutation on its own" -- from a caveat into a finding.
 
-      **NOT BUILT.** This is the one criterion of the eight that is not in the
-      tree, and it is not a decision or a judgement call: every part of it lives
-      in a file this work was not given. A proof-of-life arrival has to be
-      recorded through the publisher's own request handler, which is
-      `oob.py:432-480` (`_answer`, and `_record` beneath it); the thing it would
-      replace is `_listening` at `oob.py:1080-1099`; and the refusal that makes
-      silence mean something belongs in `provision` at `callback.py:92-217`,
-      whose agent-facing twin `request_callback_correlator` would take the same
-      clause. `oob.py` and `callback.py` are both outside the file list this
-      work owns, so nothing here touched either.
+      **BUILT**, in a second pass that owned `oob.py`, `callback.py` and one
+      migration. `rk oob up` now takes a control the moment it has a name to
+      take one at: it mints a subjectless correlator marked `is_control`,
+      fetches `/<correlator>/` at the publisher's own socket carrying the bound
+      hostname in the `Host` header -- byte for byte what the edge forwards --
+      waits for the arrival to reach `callback_interactions`, and clears the
+      correlator. A binding it could not demonstrate is released before the
+      command returns. `provision` and `request_callback_correlator` both read
+      `callback_control_arrival`, which is where the window is written down, and
+      both refuse a channel this harness publishes that has no arrival inside
+      it; both cite the control beside the address when they mint.
 
-      What the rest of the ticket left in place for it: the mint verb built
-      below already refuses on five conditions and answers each in a sentence,
-      so a sixth -- "this channel has no control arrival inside the window" --
-      is one more arm of the same block and one more sentence in the same
-      shape. The `is_control` column a control correlator would need does not
-      exist either, and `callback_correlators` is 014's table, so that part is a
-      migration on top of these. Until it is built, the sentence in
-      `playbooks/webhooks/playbook.md` step 3 is still the honest one: no
-      arrival is the absence of a refutation and not a refutation.
+      Two narrowings, and both are recorded on the migration rather than
+      discovered later. **The control does not prove Cloudflare's edge.** The
+      criterion asks for proof "the bound public name is reachable from
+      outside", and taking that would mean this process dialling a public
+      hostname -- a second dialler in `oob.py` reaching a name no scope rule
+      admits, which is the alternate path `check_baseline`'s network-adapter
+      boundary exists to keep shut. So the control proves everything from the
+      socket the tunnel forwards to inwards: the correlator resolves, the
+      writer admits, the row lands. That the tunnel process is alive is the
+      other half and `_reap` already asks it. **And a static channel cannot be
+      controlled at all**, because there is no publisher of ours behind a name
+      the operator wrote down; `callback_control_arrival` answers
+      `publishable: false` for one, both callers read that as "this question
+      does not apply", and the report says in words that no arrival on such a
+      channel is the absence of a refutation rather than a refutation. That was
+      forced rather than chosen: `CallbackAdmissionTest` and
+      `CallbackPublisherTest` both provision on declared-host channels, and a
+      blanket refusal would have withdrawn a working capability to make a point
+      about one this harness has no way to improve.
 - [x] The stale refusal in the vocabulary is superseded.
       `0018_vocabularies.sql:251-269` still reads as a live refusal: it says an
       out-of-band kind "cannot be in the vocabulary, because its
@@ -121,9 +132,10 @@ startup by design (`oob.py:144-160`).
 
 ## What was built
 
-Seven of the eight criteria. The one that is not is the positive control, and
-the reason is recorded on the criterion itself: every file it lives in is
-outside this work's file list.
+All eight criteria, in two passes. The first built seven and recorded on the
+fifth why it could not build that one: every file the positive control lives in
+was outside its file list. The second pass owned those files and built it. What
+follows is the first pass's account, then the second's.
 
 **The Contract, at `src/redkraken/roster.py`.** `mcp__rk2__mint_callback` is a
 `REQUEST` in the `state.propose` group, writing `callback_correlators`. It is
@@ -219,6 +231,74 @@ asking for a name the publisher cannot bind.
 `webhooks` step 1 names the verb it had been describing in prose since it
 shipped, and says the address is embedded exactly as returned.
 
+## What the second pass built: the positive control
+
+**The marker and the missing subject, at
+`migrations/20261001T000000Z__a_control_arrival_is_what_makes_silence_a_finding.sql`.**
+`callback_correlators` gains `is_control`, and `subject_entity_id` becomes
+nullable behind a CHECK that ties the two into one state: a canary has a subject
+and a control may not have one. The first pass expected the marker and did not
+expect this, and it is the reason the writer had to move. 14 made the subject
+NOT NULL and said why -- "an Observation has a subject, so a correlator with none
+would produce a fact about nothing" -- and a control is exactly the correlator
+that is about nothing. Every other way of satisfying that column was worse: a
+control minted against whichever Entity was at hand would put a true sentence
+about our own fetch on the evidence surface under a subject it is not about,
+which is the one thing "non-evidential for the target" has to rule out.
+
+**The writer, replaced whole and changed in four places.**
+`record_callback_interaction` is 69's text with one more local, one read of
+`is_control` off the correlator, and the two branches that write an Observation
+each now taken only for a canary. Copied rather than wrapped because a second
+writer with its own opinion about attribution is the thing 14 built one function
+to prevent, and every refusal, the artifact registration, the arrival key and
+the duplicate answer are untouched. The duplicate arm's `INTO STRICT` is the
+subtle one: for a control there is no Observation to find, so not finding one is
+no longer the corruption that arm shouts about.
+
+**`mint_control_correlator` and `callback_control_arrival`,** the two new verbs,
+both the runtime's alone and both registered. The first mints the subjectless,
+five-minute, control-marked correlator against the channel's live binding and
+refuses a channel this harness does not publish, in words. The second is the
+only place the freshness window is written down: twenty-four hours, because
+`oob.py`'s own first paragraph says a quick tunnel's hostname is a fact about
+today, and the control should vouch for exactly as long as the name it was taken
+at is good for. A shorter window would have been a trap -- `rk oob up` is what
+takes a control and `up` cannot be re-run without releasing the binding, so a
+window an operator could sit past in one session would end an engagement's
+canaries to prove they still worked.
+
+**The clause, in both minting paths.** `request_callback_correlator` is
+`CREATE OR REPLACE`d -- its own migration is applied and what applied, applied --
+to gain a sixth arm in the same shape as its five, and a `control` key beside
+the address so a step reading nothing back can cite what proved the channel was
+listening. `rk callback provision` gains the same refusal from the same reader.
+Both in one file, because the clause in one and not the other is the failure the
+first pass named in advance: the CLI alone leaves every Playbook step unguarded,
+the verb alone leaves the operator unguarded.
+
+**The control itself, at `src/redkraken/oob.py`.** `_control` mints, fetches,
+waits and clears; `up` calls it once the name exists and releases the binding
+again if it could not be demonstrated, because a bound name nothing has vouched
+for is precisely the "name in front of nothing" the command already refuses one
+step earlier. The fetch is at the publisher's own socket with the bound hostname
+in the `Host` header, which is what the edge forwards and therefore what a real
+arrival looks like on this side; it is deliberately not a request to the public
+name, and the migration says why at length. `_listening` stays where it was and
+keeps its job: it is the cheap half, asked before a tunnel is started, so a
+publisher that is not there costs nobody a name. What it cannot answer is
+whether an arrival becomes a row, because the health path is the one target this
+publisher answers without writing anything down -- and that is the whole of what
+the control adds.
+
+**One narrowing that came with it.** `rk oob up` now refuses a channel whose
+correlator is a label, beside its existing refusal of a provider that binds no
+name. `rk oob serve` has always refused one, because a publisher serves one
+hostname and one hostname has no labels to vary; `up` binds a name in front of
+that publisher, so a name bound for a label channel was always a name in front
+of nothing. It is also the one channel shape no control could be taken on: the
+publisher reads a correlator out of the path and would find none.
+
 ## Where the ticket was right, and where it was thin
 
 Every line reference in this ticket checked out: `callback.py:82-84` is the
@@ -243,4 +323,26 @@ Two places the ticket is thinner than the tree:
   caps the count, so this had to be built as a refusal rather than assumed as
   an invariant. That is what the verb does: it mints when there is exactly one
   and names both when there are two.
+
+And three from the second pass, which re-measured the first pass's own note:
+
+- Every line the note cited resolves, with one slip. `oob.py:1080-1099` is
+  `_listening` exactly, first line to last, and `callback.py:92-217` is
+  `provision` exactly. `oob.py:432-480` is `_answer` exactly -- but the note
+  reads "(`_answer`, and `_record` beneath it)", and `_record` is at
+  `oob.py:513-556`, outside the range. The prose is right and the range is one
+  function, not two.
+- The note planned the `is_control` column and stopped there. It did not reach
+  the fact that `callback_correlators.subject_entity_id` is NOT NULL, which
+  makes a control unmintable without inventing a subject for it -- so "a
+  migration on top of these" turned out to include relaxing a column of 14's
+  and replacing a function of 69's. That is the difference between a marker and
+  a state.
+- The criterion's refusal cannot be unconditional, and the tree says so rather
+  than the ticket. `CallbackAdmissionTest` provisions on `oob-dns` and
+  `CallbackPublisherTest` provisions on `oob-http`, both of which declare their
+  own endpoint and neither of which this harness publishes. A control is a
+  request to our own publisher, so on those channels there is none to take, and
+  a blanket refusal would have withdrawn a capability rather than qualified a
+  reading.
 
