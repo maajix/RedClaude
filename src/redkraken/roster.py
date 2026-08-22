@@ -76,7 +76,7 @@ VALIDATOR = "validator"
 
 #: The task-kind vocabulary of migration 0019. Held here so the compile can
 #: check the mapping is total and injective without a database.
-TASK_KINDS = ("recon", "hunt", "analyze", "perform", "validate", "report")
+TASK_KINDS = ("recon", "hunt", "analyze", "perform", "conclude", "validate", "report")
 
 #: The delegation tool, and the older name of the same tool. The pair announces
 #: `Task` in its init frame and has been observed to spell the same tool `Agent`
@@ -1734,7 +1734,13 @@ ROLES: dict[str, Role] = {
         name="web_hunter",
         runs_as=SUBAGENT,
         invocable_by=("orchestrator",),
-        task_kinds=("hunt",),
+        # Two kinds, and the second is ticket 156's. A hunter is the role that
+        # already looks at a target and decides what a weakness in it is
+        # called, and it already holds `state.propose` -- so `propose_finding`
+        # is a tool it has and had no Task that would ever put it in front of a
+        # settled claim. `role_task_kinds` is UNIQUE on kind and PRIMARY KEY on
+        # (role, kind): one role per kind, several kinds per role.
+        task_kinds=("hunt", "conclude"),
         model="opus",
         effort="high",
         max_turns=120,

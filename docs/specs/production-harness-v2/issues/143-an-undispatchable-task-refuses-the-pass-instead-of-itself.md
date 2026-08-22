@@ -19,7 +19,9 @@ would keep such a Task off the slate in the first place.
 - [x] **And it does not stay pending either.** Skipping it forever is the same
       wedge at a slower rate, with an attempt spent each pass until
       `max_attempts` parks it. Whatever the pass does with it, the Task ends and
-      the ending says why.
+      the ending says why. **Paid by 158, not by this ticket** — see the note in
+      "How it was paid" below. What shipped here was the runtime half; the
+      scheduler half is `rank_pass` steps (2b) and (2c).
 - [x] **`ready_for` answers "this subject carries no address".** A `recon` Task
       is ready today on two grounds -- it has a subject and the subject is in
       scope (`0023_scheduler_ranking.sql:468`) -- and neither is the question
@@ -68,6 +70,16 @@ after the insert, so the walk would inherit the refusal as
 `refused_by_invariant` with the predicate's own name in it.
 
 ## How it was paid
+
+**One criterion was ticked early, and 158 is what paid it.** This ticket shipped
+the runtime half of criterion 2: a Task the dispatch slice cannot serve is
+retired instead of refusing the pass. The scheduler half -- a Task the readiness
+predicate will never clear, which is never dispatched at all and so never
+reaches `retire_task` -- was left open, and `rk2hunt16` measured it: T3 held at
+`hunt.no_address` for five laps with zero attempts and no ending. 158 is the
+counter and the rule that ends it; 157 is what made that particular Task
+runnable instead.
+
 
 Two halves, because two different things know the answer.
 

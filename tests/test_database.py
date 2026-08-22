@@ -21155,8 +21155,14 @@ class OrchestratorDispatchTest(SchedulerFixture, DatabaseCase):
         # The rule joins `role_skills` through `role_task_kinds`, so what makes
         # the hunt Task admissible is that the one role running `hunt` holds
         # the Skill -- not that some role somewhere does.
+        #
+        # Both of the hunter's kinds come back, because the join is on the role
+        # and 156 gave it a second one. That is the shape of the mapping and not
+        # a widening of the grant: `role_task_kinds` is UNIQUE on kind, so
+        # `hunt` still has exactly one role and the Skill is still held by that
+        # role and no other.
         self.assertEqual(
-            [("web_hunter", "hunt")],
+            [("web_hunter", "conclude"), ("web_hunter", "hunt")],
             [
                 (str(row["role"]), str(row["kind"]))
                 for row in self.as_owner(
@@ -48372,4 +48378,481 @@ class ScopedSpecificationTest(ClaimFixture, SchedulerFixture, DatabaseCase):
                     (self.identifiers["scope"], self.label),
                 ).scalar()
             ),
+        )
+
+
+CONCLUSION_SLUG = "selftest-conclusion"
+
+
+class FindingClaimTest(ReplayFixture, DatabaseCase):
+    """Ticket 156: a settled claim becomes the work that writes it up.
+
+    `rk2hunt16` on 22 August ran the chain for the first time -- a claim was
+    proposed, graded, hunted, a Test was authored, a `perform` Task replayed it,
+    the replay held and the claim reached `supported`. Then the campaign
+    stopped, with `findings = 0` and a lap reporting `nothing_to_execute`.
+    Nothing opened work against a settled claim, so the one role holding
+    `propose_finding` was never put in front of one.
+
+    The arrangement is 36's, because that is the only way a claim reaches
+    `supported` here: a Test is stored, replayed through the door and closed,
+    and the close writes the transition the derivation reads. A claim moved into
+    `supported` by hand would be a test of the fixture -- and worse, it would
+    pass the part of this that matters least while missing the part that
+    matters most, which is that `rk2_finding_frontier` asks for the settling
+    transition and not merely for the status.
+
+    Four passes, in `setUpClass`, because a pass only means anything against the
+    rows the pass before it left. The second is the one this ticket was almost
+    lost on: `cancel_reason_for` ends a Task whose claim has settled, and a
+    `conclude` Task's claim has settled by definition, so without section 4 of
+    the migration every one of them would be abandoned in step (2) of the pass
+    that derived it in step (3e).
+    """
+
+    slug = CONCLUSION_SLUG
+
+    OPEN_FINDING = "SELECT open_finding($1::uuid, $2::uuid, $3, $4)"
+
+    #: A Test that settles its claim: the variant is served, the control is not,
+    #: and the two bodies differ. 36's, because what this case needs is a claim
+    #: at `supported` and this is the plan that produces one.
+    HELD = [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+        {"id": "the-control-is-not", "kind": "status_differs", "action": 3, "against": 2},
+        {"id": "the-bodies-differ", "kind": "body_differs", "action": 1, "against": 2},
+    ]
+    ANSWERS = {1: (200, "order one"), 2: (200, "order two"), 3: (403, "denied")}
+
+    #: And a Test that cannot settle one: every assertion it states holds, and
+    #: the control it never asked for is why the close reads the walk as
+    #: `inconclusive`. The frontier must not name it, and this is the sharper
+    #: case of the two that are not `supported` -- a refuted claim is refused by
+    #: three separate rules and this one only by the status.
+    UNSETTLED = [
+        {"id": "the-variant-is-served", "kind": "status_equals", "action": 2, "status": 200},
+    ]
+    PARTIAL = {1: (200, "order one"), 2: (200, "order two")}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.klass = str(
+            cls.connection.execute(
+                "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
+            ).scalar()
+        )
+        cls.subject = cls.configured_application()
+
+        # Both walks against the one in-scope subject, because the frontier
+        # asks `e.in_scope` and the Entity this module's other offline helpers
+        # make is a `technology` the scope never admitted. Two claims about one
+        # subject are two claims about two properties of it, which is what
+        # `claim_waiting` picks the next Property class for.
+        cls.held = cls.walked(
+            "the orders API leaks a neighbour's order",
+            specification(cls.HELD),
+            answers=cls.ANSWERS,
+            subject=cls.subject,
+        )
+        cls.unsettled = cls.walked(
+            "the orders API answers a neighbour's order at all",
+            specification(cls.UNSETTLED),
+            answers=cls.PARTIAL,
+            subject=cls.subject,
+        )
+
+        cls.statuses = cls.claim_statuses()
+        cls.first_pass = cls.pass_over()
+        cls.after_first = cls.conclusions()
+        cls.second_pass = cls.pass_over()
+        cls.after_second = cls.conclusions()
+
+        # And then the Finding the Task exists to produce, written by the verb
+        # the child would have called. What the pass does next is the other half
+        # of the derivation being correct: there is nothing left to conclude, so
+        # nothing new is derived and what is standing is answered.
+        cls.opened = cls.called(
+            cls.OPEN_FINDING,
+            (cls.held["hypothesis"], cls.held["closed"]["test_run_id"], cls.klass,
+             "a neighbour's order is served"),
+        )
+        cls.third_pass = cls.pass_over()
+        cls.after_third = cls.conclusions()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def configured_application(cls) -> str:
+        """The subject the Program's own scope put on the Surface."""
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM entities"
+                " WHERE program_id = $1::uuid AND type = 'application'"
+                "   AND metadata ->> 'source' = 'program_scope'",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def pass_over(cls) -> dict:
+        """One ranking pass on this Program, as the runtime runs it."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(cls.connection.execute("SELECT rank_pass('runtime')").scalar())
+            )
+
+    @classmethod
+    def claim_statuses(cls) -> dict[str, str]:
+        """Where the two walks left the two claims."""
+        rows = cls.connection.execute(
+            "SELECT statement, status FROM hypotheses WHERE program_id = $1::uuid",
+            (cls.program_id,),
+        ).dicts()
+        return {str(row["statement"]): str(row["status"]) for row in rows}
+
+    @classmethod
+    def conclusions(cls) -> list[tuple[str, str, str, str]]:
+        """Every `conclude` Task, with both questions the scheduler puts to it.
+
+        `ready_for` on its own would have called these Tasks ready while
+        `cancel_reason_for` was abandoning them, which is exactly the pair of
+        answers 152 shipped with for `perform`. So both are read, and the claim
+        each Task names is read beside them -- a derivation that opened one
+        against the wrong claim would otherwise count correctly.
+        """
+        rows = cls.connection.execute(
+            "SELECT h.statement, t.status,"
+            "       coalesce(ready_for(t.*), 'ready') AS blocked,"
+            "       coalesce(cancel_reason_for(t.*, w.*), 'alive') AS standing"
+            "  FROM tasks t"
+            "  CROSS JOIN scheduler_weights w"
+            "  JOIN hypotheses h ON h.id = t.hypothesis_id"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'conclude'"
+            " ORDER BY t.created_at, t.id",
+            (cls.program_id,),
+        ).dicts()
+        return [
+            (str(row["statement"]), str(row["status"]), str(row["blocked"]),
+             str(row["standing"]))
+            for row in rows
+        ]
+
+    # -- what the derivation opened -------------------------------------------
+
+    def test_the_two_walks_left_one_claim_settled_and_one_still_testing(self):
+        # The arrangement, asserted before anything reads it: this case is about
+        # what happens to a claim at `supported`, and a fixture that quietly
+        # settled neither would make every count below correct and meaningless.
+        self.assertEqual(
+            {
+                "the orders API leaks a neighbour's order": "supported",
+                "the orders API answers a neighbour's order at all": "inconclusive",
+            },
+            self.statuses,
+        )
+
+    def test_a_settled_claim_becomes_exactly_one_conclude_task(self):
+        self.assertEqual(
+            [("the orders API leaks a neighbour's order", "pending", "ready", "alive")],
+            self.after_first,
+        )
+        self.assertEqual(1, self.first_pass["conclusions_derived"])
+        self.assertEqual(0, self.first_pass["conclusions_deferred"])
+
+    def test_the_pass_that_derived_it_does_not_end_it_in_the_same_breath(self):
+        # Ticket 156's own worst case, and the reason section 4 of the migration
+        # exists. `cancel_reason_for` reads a claim at `supported` as an
+        # answered question and ends the Task asking it -- correct for every
+        # kind that existed when it was written, and exactly backwards for the
+        # one kind that exists BECAUSE the claim settled.
+        #
+        # Read off the second pass rather than the first: step (3e) opens these
+        # Tasks after step (2) has already run, so a Task derived in one pass is
+        # first offered to the cancellation rules by the next one.
+        self.assertEqual(
+            [("the orders API leaks a neighbour's order", "pending", "ready", "alive")],
+            self.after_second,
+        )
+        self.assertEqual(0, self.second_pass["conclusions_derived"])
+
+    def test_a_claim_that_never_settled_opens_no_conclusion(self):
+        # One row in both lists above, and the claim named in it is the settled
+        # one. The frontier asks for `supported` and for the transition that
+        # produced it, and this claim has neither.
+        self.assertEqual(
+            ["the orders API leaks a neighbour's order"],
+            sorted({statement for statement, _, _, _ in self.after_second}),
+        )
+
+    def test_a_claim_a_finding_already_rests_on_opens_no_second_one(self):
+        self.assertEqual("created", self.opened["outcome"])
+        self.assertEqual(0, self.third_pass["conclusions_derived"])
+        # And nothing waiting behind the ceiling either: `deferred` is what a
+        # frontier row the pass could not afford looks like, so a zero here is
+        # the difference between "the claim is off the frontier" and "the claim
+        # is on it and the pass was busy".
+        self.assertEqual(0, self.third_pass["conclusions_deferred"])
+
+    def test_the_standing_task_ends_once_the_finding_it_asked_for_exists(self):
+        # The other side of the same pass. There is nothing left to conclude, so
+        # `novelty_for` scores the Task 0, the general rule in
+        # `cancel_reason_for` reads that as answered, and the pass ends it --
+        # which is the ordinary path and not a special case. `ready_for` says
+        # the same thing in its own words.
+        self.assertEqual(
+            [("the orders API leaks a neighbour's order", "abandoned",
+              "conclude.already_found", "answered")],
+            self.after_third,
+        )
+
+    def test_the_role_that_holds_propose_finding_is_the_one_that_gets_the_task(self):
+        # The whole point of the kind, asserted where the schema states it: a
+        # Task nobody can run is a Task the scheduler creates and never staffs,
+        # and `web_hunter` is the role that already holds `state.propose`.
+        self.assertEqual(
+            "web_hunter",
+            str(
+                self.connection.execute(
+                    "SELECT role FROM role_task_kinds WHERE kind = 'conclude'"
+                ).scalar()
+            ),
+        )
+
+    def test_the_scheduler_is_still_closed_over_the_kind_this_added(self):
+        # Every standing check that enumerates the kind vocabulary, asked at
+        # once: a cost prior, a default lane, a quota slot in all three profiles
+        # and exactly one role. A kind missing from any of them is a Task that
+        # is ranked and never offered.
+        for check in ("check_role_kind_mapping", "check_scheduler_closure",
+                      "check_lane_quota_closure"):
+            with self.subTest(check):
+                self.assertEqual(
+                    [],
+                    [
+                        tuple(str(field) for field in row)
+                        for row in self.rows(f"SELECT * FROM {check}()")
+                    ],
+                )
+
+
+UNREADY_SLUG = "selftest-never-ready"
+
+
+class UnreadyTaskTest(ClaimFixture, SchedulerFixture, DatabaseCase):
+    """Ticket 158: a Task the scheduler will never call ready must end.
+
+    143's second criterion said "and it does not stay pending either", and 143
+    paid only the runtime half of it. `rk2hunt16` measured the half that was
+    left open:
+
+        T3  hunt  pending  ready_for -> hunt.no_address  cancel_reason_for -> none
+
+    Zero attempts, five laps, never offered, never ended. 157 un-stuck that
+    particular Task; this is the rule that ends the next one.
+
+    Three Tasks, because the rule is a distinction and one Task can only show
+    half of it. One is unready for a fact about its own row, which no later pass
+    can change, and must end. One is unready for a fact about the queue around
+    it -- there is no validated Finding yet -- and must not, because that is
+    work that is merely early. And one is ready, and must keep its counter at
+    zero pass after pass.
+
+    Everything runs in `setUpClass` because a counter only means anything across
+    passes. This case commits and purges what it wrote.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        cls.identifiers = {}
+        opened = program.run(
+            cls.harness.runtime,
+            write(
+                UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{UNREADY_SLUG}"'
+                )
+            ),
+        )
+        assert opened.ok, opened.violations
+        cls.identifiers["never"] = opened.facts["program_id"]
+
+        cls.subject, cls.receipt = cls.grounds("never")
+        cls.attempts = int(
+            str(
+                cls.as_owner(
+                    "SELECT max_attempts FROM scheduler_weights WHERE active"
+                ).scalar()
+            )
+        )
+
+        # The three. Written as the owner rather than through `open_task`,
+        # because `open_task` refuses two of them -- which is the point: these
+        # are the rows a derivation, an import or a migration leaves behind, and
+        # the rule has to end them wherever they came from.
+        cls.doomed = cls.task("perform")   # perform.no_test, and no later pass changes that
+        cls.early = cls.task("report")     # report.no_validated_finding, which a Finding would
+        cls.fine = cls.task("recon")       # ready, and stays ready
+
+        cls.laps = []
+        cls.standing = []
+        for _ in range(cls.attempts):
+            cls.laps.append(cls.pass_over("never"))
+            cls.standing.append(cls.tasks_now())
+        cls.retirement = cls.retirement_event()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{UNREADY_SLUG}%",)
+            )
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def task(cls, kind: str) -> str:
+        """One pending Task of that kind against the one in-scope subject."""
+        return str(
+            cls.as_owner(
+                "INSERT INTO tasks (program_id, kind, subject_entity_id)"
+                " VALUES ($1::uuid, $2, $3::uuid) RETURNING id::text",
+                (cls.identifiers["never"], kind, cls.subject),
+            ).scalar()
+        )
+
+    @classmethod
+    def tasks_now(cls) -> dict[str, tuple[str, str, int]]:
+        """Each Task by kind: where it stands, what blocks it, and for how long."""
+        rows = cls.as_owner(
+            "SELECT t.kind, t.status, t.unready_passes,"
+            "       coalesce(ready_for(t.*), 'ready') AS blocked,"
+            "       coalesce(t.abandoned_reason, '') AS ended"
+            "  FROM tasks t WHERE t.program_id = $1::uuid"
+            " ORDER BY t.kind",
+            (cls.identifiers["never"],),
+        ).dicts()
+        # Three and only three, asserted here rather than trusted: the dict
+        # below is keyed by kind, so a fourth Task of a kind already in it would
+        # be dropped silently and every arm would still read correctly.
+        assert len(rows) == 3, [dict(row) for row in rows]
+        return {
+            str(row["kind"]): (
+                str(row["status"]) + (":" + str(row["ended"]) if row["ended"] else ""),
+                str(row["blocked"]),
+                int(row["unready_passes"]),
+            )
+            for row in rows
+        }
+
+    @classmethod
+    def retirement_event(cls) -> dict:
+        """The `task.retired` event, which is where the predicate is kept.
+
+        `abandoned_reason` is a closed vocabulary of eleven words and
+        `perform.no_test` is not one of them, so the sentence lives on the
+        event 143 already writes for the same state seen from the runtime's
+        side. A rule that ended a Task without saying which predicate ended it
+        would be a rule an operator cannot act on.
+        """
+        rows = cls.as_owner(
+            "SELECT payload::text FROM events"
+            " WHERE program_id = $1::uuid AND type = 'task.retired'",
+            (cls.identifiers["never"],),
+        ).dicts()
+        assert len(rows) == 1, rows
+        return json.loads(str(rows[0]["payload"]))
+
+    # -- what the passes did ---------------------------------------------------
+
+    def test_the_counter_climbs_only_for_what_the_pass_calls_unready(self):
+        # The first pass, where all three are still standing and the two unready
+        # ones have counted one pass each. The ready one is at zero and stays
+        # there, which is what makes the column a run rather than a total.
+        self.assertEqual(
+            {
+                "perform": ("pending", "perform.no_test", 1),
+                "report": ("pending", "report.no_validated_finding", 1),
+                "recon": ("pending", "ready", 0),
+            },
+            self.standing[0],
+        )
+
+    def test_a_task_unready_for_a_fact_about_itself_ends_on_the_last_pass(self):
+        # `max_attempts` consecutive passes, and the same number the scheduler
+        # already uses to say how many times it tries something before giving
+        # up. `undispatchable` is 143's word for this state and is reused
+        # rather than doubled: the Task is well-formed and this installation
+        # cannot serve it.
+        self.assertEqual(
+            ("abandoned:undispatchable", "perform.no_test", self.attempts),
+            self.standing[-1]["perform"],
+        )
+        self.assertEqual(1, self.laps[-1]["retired_unready"])
+        self.assertEqual(
+            [0] * (self.attempts - 1), [lap["retired_unready"] for lap in self.laps[:-1]]
+        )
+
+    def test_the_event_says_which_predicate_ended_it(self):
+        self.assertEqual("undispatchable", self.retirement["reason"])
+        self.assertEqual("perform.no_test", self.retirement["detail"])
+        self.assertEqual("perform", self.retirement["kind"])
+
+    def test_a_task_waiting_on_the_queue_is_early_rather_than_doomed(self):
+        # The distinction the whole rule rests on. `report.no_validated_finding`
+        # is unready for as many passes as it takes somebody to validate a
+        # Finding, and ending it would end the one Task that writes the report
+        # -- which is the failure `cancel_reason_for`'s own `report` exception
+        # was written to stop, in the other function, for the same reason.
+        self.assertEqual(
+            ("pending", "report.no_validated_finding", self.attempts),
+            self.standing[-1]["report"],
+        )
+
+    def test_the_ready_task_is_untouched_by_any_of_it(self):
+        self.assertEqual(("pending", "ready", 0), self.standing[-1]["recon"])
+
+    def test_a_predicate_is_terminal_only_where_it_names_the_tasks_own_row(self):
+        # The list, asked directly, because it is the whole of the rule and an
+        # operator reading "why did this Task end" is reading it. The four that
+        # are terminal read a column of `tasks` and find it NULL; the five
+        # beside them read a row somewhere else, and every one of those can
+        # change with no change to the Task at all.
+        answers = self.as_owner(
+            "SELECT p AS predicate, rk2_terminal_predicate(p) AS terminal"
+            "  FROM unnest($1::text[]) p",
+            (
+                "{recon.no_subject,hunt.no_hypothesis,"
+                "perform.no_test,validate.no_finding,"
+                "recon.no_address,hunt.hypothesis_not_testable,"
+                "conclude.already_found,report.no_validated_finding,"
+                "analyze.no_agent_visible_artifact}",
+            ),
+        ).dicts()
+        self.assertEqual(
+            {
+                "recon.no_subject": True,
+                "hunt.no_hypothesis": True,
+                "perform.no_test": True,
+                "validate.no_finding": True,
+                # And the one that reads like the others and is not. 157 made a
+                # name addressable by finding the Application this Program holds
+                # on it, and recon is what promotes Applications -- so a subject
+                # with no address today can have one next pass, which makes this
+                # a fact about `applications` rather than about the Task.
+                "recon.no_address": False,
+                "hunt.hypothesis_not_testable": False,
+                "conclude.already_found": False,
+                "report.no_validated_finding": False,
+                "analyze.no_agent_visible_artifact": False,
+            },
+            {str(row["predicate"]): bool(row["terminal"]) for row in answers},
         )

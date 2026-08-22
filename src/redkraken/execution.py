@@ -106,6 +106,7 @@ MISSIONS = {
     "hunt": "Look for one exploitable weakness in this target.",
     "analyze": "Read what this target returned and say what it implies.",
     "perform": "Perform the Test that was written to settle this claim.",
+    "conclude": "Say what the claim this Test settled is a Finding of.",
     "validate": "Decide whether what was claimed about this target holds.",
     "report": "Write up what has been established about this target.",
 }
@@ -778,10 +779,15 @@ class Claimed:
         produce exactly the prompt this method was written to stop producing.
         """
         mission = MISSIONS.get(self.kind, f"Carry out this {self.kind} Task.")
-        prompt = (
+        head = (
             f"{mission}\n\n"
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
+        )
+        if self.kind == "conclude" and self.hypothesis_label is not None:
+            return self._selected(self._conclusion(head), playbooks)
+        prompt = (
+            f"{head}"
             "Send that one request with mcp__rk2__http_request and read the answer. "
             "Then call mcp__rk2__submit_mission_result once, with one observation per "
             "thing you actually established, each citing the Receipt the request "
@@ -818,6 +824,47 @@ class Claimed:
                 "conditions above -- so a plan authored after it is a plan this run "
                 "never files."
             )
+        return self._selected(prompt, playbooks)
+
+    def _conclusion(self, head: str) -> str:
+        """Ticket 156. What a child is told when the measuring is already done.
+
+        The other kinds are asked to establish something. This one is asked to
+        name something already established: the claim is supported because the
+        runtime replayed the Test that settles it and the replay held, and all
+        that is missing is what the settled claim is a Finding OF.
+
+        So the paragraph the other kinds get is not appended. It tells a child
+        to send a request, read the answer and submit Observations, and a child
+        that did that here would spend its turns re-measuring a claim the
+        runtime has already settled -- and would end the run without ever
+        calling the one tool the Task was opened for.
+        """
+        return (
+            f"{head}"
+            f"The claim {self.hypothesis_label} is supported. The runtime replayed "
+            "the Test written to settle it and the replay held, so nothing further "
+            "needs to be measured and nothing you send will change the verdict.\n\n"
+            "What is missing is the name. Call mcp__rk2__propose_finding once, "
+            f"naming {self.hypothesis_label} by that label, a vulnerability class "
+            "from this harness's vocabulary, and a title a person will read. You do "
+            "not name the run that settled the claim: the claim names it, and no "
+            "other run would be accepted.\n\n"
+            "Read the claim with the state tools before you choose the class. Its "
+            "statement says what was believed wrong and the Test says what was "
+            "shown; the class is which kind of weakness that is, and it is the one "
+            "part of this a person cannot correct later without reopening the "
+            "Finding. If seeing the target once would settle which class it is, "
+            "send that one request with mcp__rk2__http_request first -- and if it "
+            "would not, do not send it.\n\n"
+            "The runtime answers created, merged or refused. Merged means a Finding "
+            "is already open on this cell and your claim was added to it, which is a "
+            "result and not a rejection."
+        )
+
+    @staticmethod
+    def _selected(prompt: str, playbooks: Sequence[playbook_module.Projection]) -> str:
+        """The Playbooks, appended to whichever objective was built above."""
         if not playbooks:
             return prompt
         selected = "\n\n".join(one.text() for one in playbooks)
