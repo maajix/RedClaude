@@ -6,14 +6,14 @@ constraints and the matching arms that exist only for them come out.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The decision is recorded before anything is changed. Address-range scope
+- [x] The decision is recorded before anything is changed. Address-range scope
       and effort tiers are both in the schema and in neither compiler, and
       which of the two answers is right is a product question rather than a
       wiring one: a program that scopes by `10.0.0.0/8` is a real bug bounty
       scope, and no configuration file the loader accepts can express one.
-- [ ] The gap is stated as it stands. `program_scope_rules` declares `net cidr`
+- [x] The gap is stated as it stands. `program_scope_rules` declares `net cidr`
       (`0021_scope_policy.sql:91`), `tier text` (`:94`) and
       `allow_private_ips boolean NOT NULL DEFAULT false` (`:95`).
       `src/redkraken/program.py:910-921` writes the rules with a thirteen-column
@@ -22,7 +22,7 @@ constraints and the matching arms that exist only for them come out.
       spec_len` -- and none of those three is in it. The compiler that produces
       the rows produces exactly two pattern kinds, `Pattern(kind="wildcard"...)`
       at `src/redkraken/scope.py:579` and `Pattern(kind="exact"...)` at `:584`.
-- [ ] Each thing that is therefore unreachable is named, and the ticket says
+- [x] Each thing that is therefore unreachable is named, and the ticket says
       which of them is a defect and which is inert:
       the `'cidr'` arm of `pattern_kind text NOT NULL CHECK (pattern_kind IN
       ('exact','wildcard','cidr'))` (`0021:86`);
@@ -36,7 +36,7 @@ constraints and the matching arms that exist only for them come out.
       (`20260810T193000Z__scope_policy_compilation.sql:341-343`);
       and `allow_private_ips`, which has no writer and no reader anywhere in
       `src/` -- the only occurrence in the tree is its own declaration.
-- [ ] The tier half is treated as its own question, because it fails one step
+- [x] The tier half is treated as its own question, because it fails one step
       further along. `tier` is never set on a rule and `default_tier` is never
       set on a version, so the tier expression
       (`20260810T193000Z...:394-399`) always yields NULL, `entities.scope_tier`
@@ -45,7 +45,7 @@ constraints and the matching arms that exist only for them come out.
       Entity in the system. An effort policy that is declared, projected,
       published and always NULL is worse than one that is absent, because a
       reader cannot tell the two apart.
-- [ ] Whichever way the decision goes, the outcome is testable. If the columns
+- [x] Whichever way the decision goes, the outcome is testable. If the columns
       stay, a configuration with a CIDR target compiles, projects, and an
       Entity inside the range comes out `target`. If they go, the migration
       that removes them says in its own prose why the design chose host-shaped
@@ -211,3 +211,135 @@ disagreeing.
 target rule (mirrors the Python compiler)". There is nothing in the Python
 compiler to mirror -- `scope.py` contains no `tier` at any line. Whoever removes
 the column should not preserve the comment.
+
+## What was built
+
+The decision's split was implemented as written: the range half stays and the
+compiler emits it, the tier half and `allow_private_ips` come out.
+
+**The range half.** `parse_pattern` (`src/redkraken/scope.py:616-644`) now reads
+a slash before anything else and returns a third kind, `Pattern(kind="cidr",
+text=...)`, canonicalised through a new `parse_network` (`:226-242`); a pattern
+carrying both a slash and a `*` is refused, because a suffix test over names and
+containment over addresses would have to be read as one of them and neither
+reading is what an operator wrote. `Pattern` (`:551-641`) answers the three
+questions the schema asks of a rule differently for that kind: `match_key` is
+None and `net` is the text, so the CHECK pair at `0021:109-110` is satisfied
+from the same object rather than at the insert; `spec_kind` is `SPEC_CIDR`;
+`spec_len` is the prefix length, so a /24 is cited over the /8 that also
+matched. `covers` does address containment and `covers_subtree` returns False,
+which is the second point of the decision expressed in code. `Rule.row()` gained
+a thirteenth key, `net` (`:741`), and `program.py:910-925` gained the matching
+column in both the insert list and the `jsonb_to_recordset` definition (`net
+cidr`). The loader learned the shape it must accept for any of that to be
+reachable: `_Reader.host` takes `ranges=True` from `_rule` (`config.py:384-429`,
+`:544`) and hands a slashed value to a new `_range`, which parses it with
+`ipaddress.ip_network(value, strict=True)` and, when only the non-strict parse
+succeeds, names the range the operator meant -- `10.0.0.1/8` is refused with
+"write 10.0.0.0/8" rather than silently widened. `GRAMMAR_VERSION` went to 2
+(`scope.py:64-71`), because a policy digest computed under a grammar with two
+pattern kinds is not a statement about a grammar with three.
+
+`_unroutable` (`scope.py:1194-1240`) now takes the `Pattern` rather than the
+host text and, for a range, applies `address_refusal` to both edges of the
+block. This is the first point of the decision -- an inclusion the compiler
+accepts must not become an address the proxy refuses after a capability was
+spent -- and it is deliberately not complete: `172.0.0.0/8` has two globally
+routable edges and contains `172.16.0.0/12`, so it is admitted here and its
+private interior is refused at the door by `proxy.unroutable`. An exclusion is
+exempt, exactly as a broad host is, because breadth there withdraws authority.
+
+**The tier half.**
+`20260929T030000Z__a_range_is_scope_and_a_tier_never_was.sql` drops
+`program_scope_rules.tier`, `program_scope_rules.allow_private_ips`,
+`program_scope_versions.default_tier` and `entities.scope_tier`. Four columns
+cost five objects re-issued in full, because Postgres will not drop a column
+anything depends on: `scope_class_of` and `scope_class_of_entity` are dropped
+and recreated without the `tierpick` CTE and with a three-column `RETURNS
+TABLE`; `entities_scope_is_projected` and `refresh_scope_projection` lose every
+`scope_tier` clause; `v_records` is rewritten whole, minus `'scope_tier',
+e.scope_tier`; `scope_rules_key_idx` and `entities_in_scope_idx` are recreated
+without the dropped columns in their `INCLUDE` lists. A sixth thing goes with
+them and it is a row, not an object: `state_read_surface` carried
+`entities.scope_tier` as part of the agent read surface, and
+`check_state_grants()` fails a registry row whose column no longer exists, so
+the migration deletes it in the same file. The file's prose carries
+the argument the fifth criterion asks for, so the next reader does not re-add
+them, and it says what an operator who set `allow_private_ips` should be told:
+nothing in `src/` ever read it, and the door it would have re-opened is now
+`scope.address_refusal` at compile time and `proxy.unroutable` at dial time,
+with `authorize_fixture_address` as the one lawful way to reach a private
+address. The CHECK comment at `0021:112` that claimed to mirror a Python
+compiler went with the column it constrained, as the last correction asks.
+
+## What it is asserted with
+
+Nine tests, and an apply-time proof where no test file was available.
+`tests/test_config.py` gains three:
+
+- `test_an_address_range_is_accepted_where_a_scope_rule_names_a_host`
+- `test_a_range_whose_address_is_inside_it_is_refused_with_the_one_meant`
+- `test_a_callback_endpoint_is_not_a_range`
+
+`tests/test_scope.py` gains six:
+
+- `test_a_range_compiles_to_a_rule_that_matches_by_containment`
+- `test_a_range_decides_an_address_and_never_a_name`
+- `test_a_range_is_cited_over_a_wider_range_and_under_an_exact_host`
+- `test_an_inclusion_may_not_name_a_range_the_proxy_will_refuse`
+- `test_an_exclusion_may_name_a_private_range`
+- `test_a_range_is_neither_a_wildcard_nor_a_widened_address`
+
+The migration's own section 3 is a rolled-back `DO` block that inserts a `cidr`
+target rule, asserts `scope_class_of_entity` answers `target` for an address
+inside the range, `denied` for one outside it and `denied` for a *name*, then
+projects the version and asserts the two Entities' `scope_class` -- which is the
+fifth criterion, written the way the decision's second point says it must be
+written. Section 4 asserts the four columns are gone from
+`information_schema.columns` and that `pg_get_viewdef('v_records')` no longer
+mentions `scope_tier`.
+
+## Five places the ticket or its decision was wrong
+
+1. **The edit to `Rule.matches` (`:609`) was not needed.** The decision's fourth
+   point lists it among the files. `Rule.matches` delegates the host question to
+   `Pattern.covers`, so teaching the pattern taught the rule; `matches` is
+   unchanged in this build.
+2. **`_HOST_SHAPE` and the shape regexes at `config.py:128-136` were not
+   changed either.** A range is detected by the slash before any host regex
+   runs, so the regexes still describe exactly what they described. What was
+   added is a second message, `_RANGE_SHAPE`, because an operator who wrote a
+   malformed range should be told what a range looks like and not what a
+   hostname looks like.
+3. **The diagnostic needed no grammar of its own.** The correction section says
+   ranges "must land in the Python evaluator and in the diagnostic's grammar as
+   well as in the compiler". `scope.diagnose` compiles the document through
+   `compile_policy` and evaluates through the same `Rule` objects, so it has no
+   separate grammar to teach; the three-way matrix agrees because there is one
+   parser, not three.
+4. **`record_configured_subjects` is the fourth edit the ticket does not
+   mention, and the decision is why it stays unedited.** Its `AND r.pattern_kind
+   = 'exact'` filter (`20260831T000000Z...:203`) means a Program scoped only by
+   range opens with no configured subject and therefore no first Task. That is
+   the decision's third point rather than a defect, so nothing was changed
+   there -- but it is a consequence an operator can hit, and the ticket's
+   criteria do not name it.
+5. **"What was measured" could not have found the fifth reader of
+   `scope_tier`, and there is one.** The section proves the column is dead with
+   greps over `src/` and `tools/`, and those greps are correct. The reader it
+   cannot see is a row: `state_read_surface` names `entities.scope_tier`
+   because `0030_corpus_corrections.sql:256-263` seeded that registry from
+   `has_column_privilege('rk2_state', ...)` rather than by naming columns, so
+   no grep for the word finds it. Dropping the column without deleting the row
+   leaves `check_state_grants()` failing with
+   `state_surface_names_missing_object,entities.scope_tier`, which is how this
+   build found it -- `CleanCreationTest` went red before the delete was added.
+
+## What was left alone, and why
+
+The partial GiST index `scope_rules_net_idx` (`0021:119-121`) was not touched:
+its predicate is now reachable and its column is now sometimes non-NULL, which
+is the state it was written for. `README.md:246` says "A scope entry names a
+hostname, an address, or a wildcard such as `*.example.com`" and is now
+incomplete, but that file was outside this change's ownership and no gate reads
+the sentence.

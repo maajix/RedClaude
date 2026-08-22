@@ -61,8 +61,14 @@ COMMAND = "scope"
 
 #: The compiled grammar's own version, recorded in every policy document. A
 #: change to how a pattern matches is a change here, so a stored policy always
-#: says which rules produced it.
-GRAMMAR_VERSION = 1
+#: says which rules produced it. 2 is the address range: a third pattern kind,
+#: matched by containment rather than by key, and a `net` column on every rule
+#: row. Every policy compiled by 1 hashes differently under 2 even when the
+#: operator's file has not moved, which is the case
+#: `program_scope_versions.configuration_revision` exists to keep separable --
+#: the compiler changing while the file does not is a change in what the policy
+#: means and therefore a new version.
+GRAMMAR_VERSION = 2
 
 #: What a rule does when it matches, and the order in which those answers win.
 #: Withdrawal beats support beats authorisation, over every match at once: this
@@ -215,6 +221,23 @@ def canonical_address(value: str) -> str:
                 f"{value} is in the deprecated IPv4-compatible range; write the address itself",
             )
     return (mapped or address).compressed
+
+
+def parse_network(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """One address range, in the strict spelling `config` already accepted.
+
+    Strict, so `10.0.0.5/8` raises rather than widening to `10.0.0.0/8`: the
+    loader refuses that spelling with the canonical form in the message, and a
+    compiler that read it the other way would compile a policy the file does
+    not state. There is no mapped or compatible form to collapse here the way
+    `canonical_address` collapses one -- a range is written the way it is
+    delegated, and `::ffff:0:0/96` is a different assertion from a v4 range,
+    which is why containment across families answers false rather than raising.
+    """
+    try:
+        return ipaddress.ip_network(value, strict=True)
+    except ValueError as error:
+        raise PolicyError("malformed_host", f"{value} is not an address range") from error
 
 
 def address_refusal(value: str) -> str | None:
@@ -526,27 +549,67 @@ def canonical_selector(value: object) -> tuple[str, int | None, str]:
 
 @dataclass(frozen=True)
 class Pattern:
-    """One host pattern, already parsed, in the form SQL joins on."""
+    """One host pattern, already parsed, in the form SQL joins on.
+
+    Three kinds, and the third one matches differently from the other two.
+    `exact` and `wildcard` are keys: SQL joins them by equality against the
+    candidate series a host expands to. `cidr` is a range, and the only thing
+    that decides it is address containment, which is why `match_key` is None
+    there and `net` is not -- `program_scope_rules` asserts both directions of
+    that pairing (`0021_scope_policy.sql:109-110`), so a pattern that answered
+    both would fail the insert.
+    """
 
     kind: str
     text: str
 
     @property
-    def match_key(self) -> str:
-        return self.text
+    def match_key(self) -> str | None:
+        return None if self.kind == "cidr" else self.text
+
+    @property
+    def net(self) -> str | None:
+        return self.text if self.kind == "cidr" else None
 
     @property
     def spec_kind(self) -> int:
+        if self.kind == "cidr":
+            return SPEC_CIDR
         return SPEC_EXACT if self.kind == "exact" else SPEC_WILDCARD
 
     @property
     def spec_len(self) -> int:
-        return self.text.count(".") + 1
+        # A prefix length, so a /24 is cited over the /8 that also matched, on
+        # the same reading that cites `a.b.c` over `*.c`: the narrower rule is
+        # the one that describes the decision. Only compared within a kind,
+        # because `spec_kind DESC` is applied first.
+        return parse_network(self.text).prefixlen if self.kind == "cidr" else self.text.count(".") + 1
 
     def covers(self, host: str) -> bool:
+        """Whether this pattern covers one host, by key or by containment.
+
+        A range decides addresses and never names, and that is deliberate
+        rather than unfinished: the door decides before it resolves -- "So the
+        order is decide, then resolve, then dial" (`proxy.resolve`) -- so a
+        request naming `www.example.com` cannot be admitted by the range its
+        address happens to fall in without the policy depending on what a
+        resolver said today. `scope_class_of` guards its containment arm on the
+        same test, `nh.h ~ '^([0-9.]+|[0-9a-f:]+)$'`.
+        """
+        if self.kind == "cidr":
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                return False
+            return address in parse_network(self.text)
         return self.match_key in host_candidates(host)
 
     def covers_subtree(self, suffix: str) -> bool:
+        # A range is not a domain and cannot cover one, whatever addresses the
+        # names beneath it resolve to. `scope_class_of` says the same thing by
+        # guarding the containment arm with `p_question <> 'subtree'`.
+        if self.kind == "cidr":
+            return False
         return self.match_key in wildcard_candidates(suffix)
 
 
@@ -562,10 +625,22 @@ def parse_pattern(raw: str, *, broad: bool = False) -> Pattern:
     no floor, because breadth there withdraws authority rather than claiming it"
     -- and `config.load` already implements it through `_BROAD_HOST`, so without
     the flag a configuration that loads is one this function refuses to compile.
+
+    A slash is a range and is read before anything else, because every other
+    branch here is about names: `10.0.0.0/8` carries the label `0/8` to the
+    hostname reader, which is a refusal that tells an operator nothing about
+    what they wrote.
     """
     if not isinstance(raw, str):
         raise PolicyError("malformed_host", "a host pattern must be text")
     text = raw.strip(" ").lower().rstrip(".")
+    if "/" in text:
+        if "*" in text:
+            # A wildcard is a suffix test over names and a range is containment
+            # over addresses. Something that claimed both would have to be read
+            # as one of them, and neither reading is the one an operator wrote.
+            raise PolicyError("malformed_host", f"{raw!r} wildcards an address range")
+        return Pattern(kind="cidr", text=str(parse_network(text)))
     if text.startswith("*."):
         suffix = normalize_host(text[2:])
         if "*" in suffix:
@@ -649,6 +724,12 @@ class Rule:
         configuration entry the rule was expanded from, which is what makes a
         stored policy readable back to the file that produced it; the insert
         selects the columns it needs and leaves it in the document.
+
+        `match_key` and `net` are the pair the table's two CHECKs assert both
+        directions of: exactly one of them is set, and which one it is says how
+        the rule is matched. Both keys are always present and one of them is
+        always null, because the rows are projected through
+        `jsonb_to_recordset`, which needs every row to name the same columns.
         """
         return {
             "ord": self.ord,
@@ -657,6 +738,7 @@ class Rule:
             "pattern_kind": self.pattern.kind,
             "pattern_text": self.pattern.text,
             "match_key": self.pattern.match_key,
+            "net": self.pattern.net,
             "protocol": self.protocol,
             "port": self.port,
             "path_prefix": self.path_prefix,
@@ -914,15 +996,16 @@ def compile_policy(
         except PolicyError as error:
             refusals.append(_refusal(f"{source}.host", error.detail))
             return
-        if effect != EXCLUDE and pattern.kind == "exact" and _unroutable(pattern.text):
+        if effect != EXCLUDE and _unroutable(pattern):
             # Only on the authorising side. An exclusion naming a private range
             # withdraws authority and is the operator's business; an inclusion
             # naming one points the harness at infrastructure the Program's
             # scope statement cannot have meant, most often its own.
+            subject = "address range" if pattern.kind == "cidr" else "address"
             refusals.append(
                 _refusal(
                     f"{source}.host",
-                    f"{pattern.text} is not a globally routable address; "
+                    f"{pattern.text} is not a globally routable {subject}; "
                     "an inclusion may not name one",
                 )
             )
@@ -1068,7 +1151,9 @@ def compile_policy(
                 compiled.values(),
                 key=lambda item: (
                     item.effect_rank,
-                    item.pattern.match_key,
+                    # The pattern's own text rather than its match key, which is
+                    # None on a range and would not order against a host.
+                    item.pattern.text,
                     item.pattern.kind,
                     item.protocol,
                     item.port,
@@ -1106,13 +1191,35 @@ def _refusal(source: str, detail: str) -> Violation:
     return Violation(code=INVALID_CONFIGURATION, source=f"scope:{source}", detail=detail)
 
 
-def _unroutable(host: str) -> bool:
-    """Whether a host is an address literal outside the globally routable space."""
+def _unroutable(pattern: Pattern) -> bool:
+    """Whether an authorising pattern names address space the door would refuse.
+
+    `address_refusal` is the rule, shared with the egress door, so an inclusion
+    the compiler accepts cannot become an address the proxy refuses only after a
+    capability has been spent. A range is asked the same question at both ends,
+    which is what catches the ones an operator reaches for by accident --
+    `10.0.0.0/8`, `192.168.0.0/16`, `0.0.0.0/0`, `::/0`.
+
+    What both ends do not catch is a globally routable block that contains a
+    private one, `172.0.0.0/8` being the case: private space is itself carved
+    into CIDR blocks, so a wider block can straddle one with global addresses on
+    either side. That range compiles, and every private address inside it is
+    still refused at the door -- `proxy.unroutable` denies by default and
+    `authorize_egress_address` re-decides the literal address the proxy pinned.
+    Closing it here would mean restating the door's block list in this module,
+    which is the duplication `address_refusal` exists to prevent.
+    """
+    if pattern.kind == "cidr":
+        edges = parse_network(pattern.text)
+        return any(
+            address_refusal(str(edge)) is not None
+            for edge in (edges.network_address, edges.broadcast_address)
+        )
     try:
-        ipaddress.ip_address(host)
+        ipaddress.ip_address(pattern.text)
     except ValueError:
         return False
-    return address_refusal(host) is not None
+    return address_refusal(pattern.text) is not None
 
 
 # ---------------------------------------------------------------------------

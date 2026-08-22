@@ -80,11 +80,20 @@ BUDGET_CEILINGS = (
 )
 SCOPE_KEYS = ("exclude", "include")
 RULE_KEYS = ("host", "paths", "ports", "protocols")
-IDENTITY_KEYS = ("name", "slot_ref")
+IDENTITY_KEYS = ("class", "name", "slot_ref")
 HEADER_KEYS = ("name", "value_ref")
 CALLBACK_KEYS = ("host", "kind", "name", "placement", "provider")
 PROTOCOLS = ("http", "https")
 CALLBACK_KINDS = ("dns", "http")
+
+#: What an Identity slot is, as far as anything can know it. Whether a
+#: credential is an administrator's is a fact about how the operator provisioned
+#: the account and not a property of any response the harness can fetch, so it
+#: is declared here beside the reference that resolves it rather than inferred
+#: from a session that happened to see an admin panel. `anonymous` is absent
+#: because it is what the runtime mints for a slot nobody provisioned, and this
+#: key names a slot that carries material; a configuration entry always does.
+IDENTITY_CLASSES = ("privileged", "user")
 
 #: Where in an arrival the correlator sits, and who says what name the
 #: channel answers at. `static` is the endpoint the operator wrote down;
@@ -133,6 +142,17 @@ _WILDCARD = re.compile(rf"\*\.({_LABEL}\.)+{_TOP_LABEL}")
 #: floor would be on the wrong side of the rule.
 _BROAD_HOST = re.compile(rf"(\*\.)?({_LABEL}\.)*{_TOP_LABEL}")
 _HOST_SHAPE = "must be a hostname, a wildcard such as *.example.com, or an address"
+
+#: What a scope rule may name that a callback endpoint may not. A Program
+#: scoped to `203.0.113.0/24` is an ordinary bounty scope and was expressible
+#: only as 256 entries; a Program scoped to a /16 or to any IPv6 range was not
+#: expressible at all. It is admitted here and nowhere else because a range is
+#: a statement about authority over address space, and a callback names one
+#: endpoint the harness itself operates.
+_RANGE_SHAPE = (
+    "must be a hostname, a wildcard such as *.example.com, an address, "
+    "or an address range such as 203.0.113.0/24"
+)
 
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
 _PATH_SHAPE = (
@@ -361,13 +381,16 @@ class _Reader:
             return None
         return value
 
-    def host(self, value: object, source: str, broad: bool = False) -> str | None:
+    def host(
+        self, value: object, source: str, broad: bool = False, ranges: bool = False
+    ) -> str | None:
         """One host, normalised so that two spellings of it hash alike.
 
         An address is read first, so a dotted number is never mistaken for a
         name; a name is lowercased and its root dot dropped. `broad` relaxes
         the wildcard floor for an exclusion, where breadth withdraws authority
-        instead of claiming it.
+        instead of claiming it. `ranges` admits an address range, which is a
+        scope rule's to name and not a callback's.
         """
         if not isinstance(value, str):
             self.fail(source, "must be text")
@@ -376,11 +399,34 @@ class _Reader:
             return str(ipaddress.ip_address(value))
         except ValueError:
             pass
+        if ranges and "/" in value:
+            return self._range(value, source)
         name = value[:-1].lower() if value.endswith(".") else value.lower()
         patterns = (_BROAD_HOST,) if broad else (_HOSTNAME, _WILDCARD)
         if any(pattern.fullmatch(name) for pattern in patterns):
             return name
-        self.fail(source, _HOST_SHAPE)
+        self.fail(source, _RANGE_SHAPE if ranges else _HOST_SHAPE)
+        return None
+
+    def _range(self, value: str, source: str) -> str | None:
+        """One address range in its canonical spelling, or a refusal.
+
+        Strict, so `10.0.0.5/8` is refused rather than read as `10.0.0.0/8`:
+        the two differ by sixteen million addresses, and a loader that silently
+        widened a scope statement by that much would be deciding authority the
+        operator did not write. The canonical form is what the refusal names,
+        because an operator who meant the range now has the line to paste.
+        """
+        try:
+            return str(ipaddress.ip_network(value, strict=True))
+        except ValueError:
+            pass
+        try:
+            intended = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            self.fail(source, _RANGE_SHAPE)
+            return None
+        self.fail(source, f"names an address inside the range it declares; write {intended}")
         return None
 
 
@@ -495,7 +541,7 @@ def _rule(reader: _Reader, entry: object, source: str, broad: bool = False) -> d
     host = None
     raw = reader.required(table, source, "host")
     if raw is not None:
-        host = reader.host(raw, f"{source}.host", broad)
+        host = reader.host(raw, f"{source}.host", broad, ranges=True)
     return {
         "host": host,
         "paths": _members(reader, table, source, "paths", _is_path, _PATH_SHAPE),
@@ -569,22 +615,30 @@ def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build
 
 
 def _identity(reader: _Reader, table: dict, source: str) -> dict | None:
-    """Both fields are read before the entry is dropped, and both are required.
+    """Both required fields are read before the entry is dropped.
 
     Leaving on a bad name would hide the `slot_ref` violation behind it, and
     that field is the one deciding whether a configuration carries credential
     material of its own. An entry without it is not an identity with no
     material: `project_identity` stores `str(item["slot_ref"])`, so a missing
     reference would be written into the state as the four letters `None`.
+
+    `class` is the third field and the only optional one. It says what the
+    operator provisioned the slot as, which is the one fact about an Identity
+    nothing downstream can observe: the state role's grant on `identities`
+    excludes `secret_ref`, so no runtime path could promote a slot even if
+    privilege were visible from a response, and it is not. Absent means `user`,
+    so every configuration written before this key reads exactly as it did.
     """
     name = _name(reader, table, source, SLUG, SLUG.pattern)
+    klass = _vocabulary(reader, table, source, "class", IDENTITY_CLASSES, "user")
     reference = None
     raw = reader.required(table, source, "slot_ref")
     if raw is not None:
         reference = reader.text(raw, f"{source}.slot_ref", _REFERENCE, _REFERENCE_SHAPE)
-    if name is None or reference is None:
+    if name is None or klass is None or reference is None:
         return None
-    return {"name": name, "slot_ref": reference}
+    return {"class": klass, "name": name, "slot_ref": reference}
 
 
 def _header(reader: _Reader, table: dict, source: str) -> dict | None:

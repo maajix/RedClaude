@@ -243,8 +243,8 @@ compared upwards. A Lane allowed more than the campaign holds is slack rather
 than a contradiction, because the campaign total binds first and the Lane never
 does.
 
-A scope entry names a hostname, an address, or a wildcard such as
-`*.example.com`. An inclusion's wildcard must name at least two labels of its
+A scope entry names a hostname, an address, an address range in CIDR
+notation such as `10.0.0.0/24`, or a wildcard such as `*.example.com`. An inclusion's wildcard must name at least two labels of its
 own, so `*.com` is refused. That is a floor, not a public-suffix rule: `*.co.uk`
 passes it, and how wide an inclusion may be remains the operator's judgement
 against the Program. An exclusion has no floor, because breadth there withdraws

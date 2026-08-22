@@ -200,6 +200,51 @@ class ScopeTest(unittest.TestCase):
 
         self.assertEqual((), found)
 
+    def test_an_address_range_is_accepted_where_a_scope_rule_names_a_host(self):
+        """The shape a Program scoped by network writes, and its canonical form.
+
+        `_HOST_SHAPE` refused this before ticket 117, so a Program scoped to
+        `203.0.113.0/24` was expressible as 256 entries and one scoped to a /16
+        was not expressible at all -- against a schema that has carried the
+        `cidr` arm, the `net` column and the containment evaluator since 021.
+        """
+        for written, canonical in (
+            ("203.0.113.0/24", "203.0.113.0/24"),
+            ("2001:DB8::/32", "2001:db8::/32"),
+            ("203.0.113.10/32", "203.0.113.10/32"),
+        ):
+            with self.subTest(written):
+                configuration, found = config.load(write(
+                    VALID.replace('host = "app.example.com"', f'host = "{written}"')
+                ))
+
+                self.assertEqual((), found)
+                self.assertEqual(
+                    canonical, configuration.document["scope"]["include"][0]["host"]
+                )
+
+    def test_a_range_whose_address_is_inside_it_is_refused_with_the_one_meant(self):
+        # Never widened silently: `10.0.0.5/8` and `10.0.0.0/8` differ by
+        # sixteen million addresses, and reading one as the other would be the
+        # loader deciding authority the operator did not write.
+        self.assertEqual(
+            [(
+                INVALID_CONFIGURATION,
+                "config:scope.include[0].host",
+                "names an address inside the range it declares; write 10.0.0.0/8",
+            )],
+            violations(VALID.replace('host = "app.example.com"', 'host = "10.0.0.5/8"')),
+        )
+
+    def test_a_callback_endpoint_is_not_a_range(self):
+        # A range is a statement about authority over address space. A callback
+        # names one endpoint the harness itself operates, so the key that admits
+        # a range is the scope rule's and not this one's.
+        self.assertEqual(
+            ["config:callback[0].host"],
+            sources(VALID.replace('host = "oob.example.net"', 'host = "203.0.113.0/24"')),
+        )
+
     def test_wildcard_host_is_accepted(self):
         _, found = config.load(write(VALID.replace('host = "app.example.com"', 'host = "*.example.com"')))
 
@@ -399,6 +444,52 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(
             [(INVALID_CONFIGURATION, "config:identity[0].slot_ref", "required key is absent")],
             violations(VALID.replace('slot_ref = "slot://identity/member"\n', "")),
+        )
+
+    def test_an_identity_that_states_no_class_is_a_user(self):
+        # Every configuration written before ticket 112 says nothing about the
+        # class, and reading those as `user` is what makes them still mean what
+        # they meant: `_project_identities` wrote that literal for all of them.
+        configuration, refusals = config.load(write(VALID))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual(
+            [{"class": "user", "name": "member", "slot_ref": "slot://identity/member"}],
+            configuration.document["identity"],
+        )
+
+    def test_an_identity_may_be_declared_privileged(self):
+        """The one fact about a slot nothing downstream can observe.
+
+        The schema requires a `secret_ref` on every class but `anonymous`, and
+        the only writer of that column reads this document, so this key is the
+        whole of what can ever make `privileged_identity_available` true.
+        """
+        configuration, refusals = config.load(write(
+            VALID.replace('name = "member"\n', 'name = "member"\nclass = "privileged"\n')
+        ))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual("privileged", configuration.document["identity"][0]["class"])
+
+    def test_identity_class_is_closed_to_the_two_a_document_may_state(self):
+        # `anonymous` is refused with the rest: it is what the runtime mints for
+        # a slot nobody provisioned, and an entry here carries material by
+        # construction. `service` is refused because it was retired -- it named
+        # nothing an Identity is, and it is an Entity type two tables away.
+        self.assertEqual(
+            [
+                (
+                    INVALID_CONFIGURATION,
+                    "config:identity[0].class",
+                    "must be one of: privileged, user",
+                )
+            ],
+            violations(VALID.replace('name = "member"\n', 'name = "member"\nclass = "service"\n')),
+        )
+        self.assertEqual(
+            ["config:identity[0].class"],
+            sources(VALID.replace('name = "member"\n', 'name = "member"\nclass = "anonymous"\n')),
         )
 
     def test_callback_kind_is_closed(self):

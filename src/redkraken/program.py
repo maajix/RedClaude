@@ -907,16 +907,21 @@ def _project_scope(
     # One statement per table, whatever the rule count: the ordinals and the
     # digest are already fixed by the compiler, so the rows are a projection of
     # the document rather than a second decision made here.
+    #
+    # `net` carries the address range a `cidr` rule matches by, and is the
+    # column the table's two CHECKs pair against `match_key`: exactly one of the
+    # two is set on every row, so a rule that named both or neither would be one
+    # the evaluator silently skipped and the insert refuses instead.
     connection.execute(
         "INSERT INTO program_scope_rules"
         " (program_id, version, ord, effect, effect_rank, pattern_kind, pattern_text,"
-        "  match_key, protocol, port, path_prefix, spec_kind, spec_len)"
+        "  match_key, net, protocol, port, path_prefix, spec_kind, spec_len)"
         " SELECT $1::uuid, $2, r.ord, r.effect, r.effect_rank, r.pattern_kind,"
-        "        r.pattern_text, r.match_key, r.protocol, r.port, r.path_prefix,"
+        "        r.pattern_text, r.match_key, r.net, r.protocol, r.port, r.path_prefix,"
         "        r.spec_kind, r.spec_len"
         "   FROM jsonb_to_recordset($3::jsonb) AS r("
         "        ord integer, effect text, effect_rank smallint, pattern_kind text,"
-        "        pattern_text text, match_key text, protocol text, port integer,"
+        "        pattern_text text, match_key text, net cidr, protocol text, port integer,"
         "        path_prefix text, spec_kind smallint, spec_len smallint)",
         (program_id, version, _encode([rule.row() for rule in policy.rules])),
     )
@@ -1009,14 +1014,20 @@ def _project_identities(
     reference, and the state role's column grant excludes it.  Updating the
     redacted entity metadata in the same transaction gives a configuration
     change one Event without copying that reference into the Event payload.
+
+    ``class`` is declared by the same document and for the same reason. It is
+    the only writer of anything but ``anonymous`` in the tree, because the
+    schema requires a ``secret_ref`` on every other class and this is the only
+    writer of that column: the set of rows that could ever be ``privileged`` is
+    exactly the set this function creates.
     """
     configured = {
-        str(item["name"]): str(item["slot_ref"])
+        str(item["name"]): (str(item["class"]), str(item["slot_ref"]))
         for item in configuration.document["identity"]
     }
     rows = connection.execute(
         "SELECT i.entity_id::text, i.slot_name, i.secret_ref, i.invalidated_at IS NOT NULL,"
-        "       e.metadata ->> 'configuration_revision'"
+        "       e.metadata ->> 'configuration_revision', i.class"
         "  FROM identities i JOIN entities e ON e.id = i.entity_id"
         " WHERE i.program_id = $1::uuid"
         "   AND e.metadata ->> 'source' = 'program_configuration'",
@@ -1024,7 +1035,7 @@ def _project_identities(
     ).rows
     existing = {str(row[1]): row for row in rows}
 
-    for label, reference in configured.items():
+    for label, (klass, reference) in configured.items():
         current = existing.get(label)
         metadata = json.dumps(
             {
@@ -1042,18 +1053,27 @@ def _project_identities(
             ).scalar()
             connection.execute(
                 "INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
-                " VALUES ($1::uuid, $2, 'user', $3)",
-                (str(entity_id), label, reference),
+                " VALUES ($1::uuid, $2, $3, $4)",
+                (str(entity_id), label, klass, reference),
             )
             continue
 
-        entity_id, _, prior_reference, invalidated, _ = current
-        if str(prior_reference) == reference and not bool(invalidated):
+        # The class is carried by the re-projection as well as by the first
+        # write. Without it an operator who reclassified a slot they had already
+        # opened would change the file, see the run resume, and find the state
+        # still saying what it said before -- a silent refusal to adopt, in the
+        # one place where the declaration is the only source of the fact.
+        entity_id, _, prior_reference, invalidated, _, prior_class = current
+        if (
+            str(prior_reference) == reference
+            and str(prior_class) == klass
+            and not bool(invalidated)
+        ):
             continue
         connection.execute(
-            "UPDATE identities SET secret_ref = $2, invalidated_at = NULL"
+            "UPDATE identities SET secret_ref = $2, class = $3, invalidated_at = NULL"
             " WHERE entity_id = $1::uuid",
-            (str(entity_id), reference),
+            (str(entity_id), reference, klass),
         )
         connection.execute(
             "UPDATE entities SET metadata = $2::jsonb WHERE id = $1::uuid",

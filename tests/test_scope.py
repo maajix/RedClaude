@@ -238,6 +238,107 @@ class CompilationTest(unittest.TestCase):
                 with self.assertRaises(scope.PolicyError):
                     scope.parse_pattern(pattern)
 
+    def test_a_range_compiles_to_a_rule_that_matches_by_containment(self):
+        """The third pattern kind, in the shape `program_scope_rules` holds it.
+
+        `match_key` and `net` are the pair the table's two CHECKs assert both
+        directions of, so a range that carried a key -- or a host that carried a
+        network -- would fail the insert rather than be silently skipped by the
+        evaluator.
+        """
+        text = SCOPED.replace('host = "api.example.net"', 'host = "93.184.216.0/24"')
+        policy = compiled(text)
+
+        [rule] = [rule for rule in policy.rules if rule.pattern.kind == "cidr"]
+        self.assertEqual("93.184.216.0/24", rule.pattern.text)
+        self.assertIsNone(rule.pattern.match_key)
+        self.assertEqual("93.184.216.0/24", rule.pattern.net)
+        self.assertEqual((scope.SPEC_CIDR, 24), (rule.pattern.spec_kind, rule.pattern.spec_len))
+        self.assertEqual(
+            [None, "93.184.216.0/24"], [rule.row()["match_key"], rule.row()["net"]]
+        )
+        for host in ("admin.example.com", "*.example.com"):
+            with self.subTest(host):
+                [other] = {
+                    rule.pattern.text: rule for rule in policy.rules if rule.pattern.text == host
+                }.values()
+                self.assertEqual((host, None), (other.row()["match_key"], other.row()["net"]))
+
+    def test_a_range_decides_an_address_and_never_a_name(self):
+        """The door decides before it resolves, so a name is not in the range.
+
+        `scope_class_of` guards its containment arm on the same test -- the host
+        being asked about has to look like an address literal -- and a policy
+        that admitted a name because of what a resolver said today would be a
+        policy that changed under a file nobody rewrote.
+        """
+        text = SCOPED.replace('host = "api.example.net"', 'host = "93.184.216.0/24"')
+        policy = compiled(text)
+
+        inside = scope.decide(policy, "https://93.184.216.7/v1/x")
+        outside = scope.decide(policy, "https://93.184.217.7/v1/x")
+        named = scope.decide(policy, "https://api.example.net/v1/x")
+
+        self.assertEqual(scope.TARGET, inside.scope_class)
+        self.assertEqual((scope.DENIED, "unlisted"), (outside.scope_class, outside.reason))
+        self.assertEqual((scope.DENIED, "unlisted"), (named.scope_class, named.reason))
+        # An entity is the same question one polarity wider, and a subtree is a
+        # question about a domain, which a range is not and cannot answer.
+        self.assertEqual(
+            scope.TARGET, scope.decide_entity(policy, "host", "93.184.216.7").scope_class
+        )
+        self.assertEqual(
+            scope.DENIED,
+            scope.decide_entity(policy, "wildcard_domain", "api.example.net").scope_class,
+        )
+
+    def test_a_range_is_cited_over_a_wider_range_and_under_an_exact_host(self):
+        # Specificity picks only which rule is named. `spec_kind DESC` puts every
+        # host above every range, and `spec_len DESC` puts the /24 above the /16.
+        text = SCOPED.replace(
+            'host = "api.example.net"\nports = [443]\nprotocols = ["https"]\npaths = ["/v1/"]',
+            'host = "93.184.0.0/16"\nports = [443]\nprotocols = ["https"]\npaths = ["/"]\n\n'
+            '[[scope.include]]\nhost = "93.184.216.0/24"\n'
+            'ports = [443]\nprotocols = ["https"]\npaths = ["/"]',
+        )
+        policy = compiled(text)
+        cited = scope.decide(policy, "https://93.184.216.7/")
+
+        by_ord = {rule.ord: rule.pattern.text for rule in policy.rules}
+        self.assertEqual("93.184.216.0/24", by_ord[cited.rule_ord])
+
+    def test_an_inclusion_may_not_name_a_range_the_proxy_will_refuse(self):
+        # The same rule `address_refusal` applies to one address, applied at
+        # both ends of the range: an inclusion that the compiler accepted and
+        # the door refused would be a capability spent on a refusal.
+        for network in ("10.0.0.0/8", "192.168.0.0/16", "0.0.0.0/0", "::/0"):
+            with self.subTest(network=network):
+                text = SCOPED.replace('host = "api.example.net"', f'host = "{network}"')
+
+                self.assertEqual(("scope:scope.include[1].host",), refused(text))
+
+    def test_an_exclusion_may_name_a_private_range(self):
+        # Breadth withdraws authority here, so the asymmetry runs the same way
+        # it does for a single private address.
+        text = SCOPED.replace('host = "admin.example.com"', 'host = "10.0.0.0/8"')
+        policy = compiled(text)
+
+        self.assertIn("10.0.0.0/8", {rule.pattern.text for rule in policy.rules})
+
+    def test_a_range_is_neither_a_wildcard_nor_a_widened_address(self):
+        for pattern in ("*.10.0.0.0/8", "10.0.0.0/33", "10.0.0.0/", "example.com/8"):
+            with self.subTest(pattern):
+                with self.assertRaises(scope.PolicyError) as refusal:
+                    scope.parse_pattern(pattern)
+                self.assertEqual("malformed_host", refusal.exception.reason)
+        # Strict, so the compiler cannot read a spelling the loader refused as
+        # something sixteen million addresses wider than what was written.
+        with self.assertRaises(scope.PolicyError):
+            scope.parse_pattern("10.0.0.5/8")
+        # A bare address is still an exact rule and not a /32 range, because a
+        # host that is one machine should be cited as one machine.
+        self.assertEqual("exact", scope.parse_pattern("93.184.216.34").kind)
+
     def test_the_policy_digest_covers_the_rules(self):
         policy = compiled()
         moved = scope.Policy(
