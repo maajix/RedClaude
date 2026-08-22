@@ -1510,7 +1510,7 @@ class Slice:
             },
         }
 
-        opened = self._authorize(ledger, connection, program_id, claimed, facts)
+        opened = self._authorize(ledger, connection, program_id, claimed, selected, facts)
         if opened is None:
             return
         tool_run_id, door, lifetime = opened
@@ -1908,6 +1908,7 @@ class Slice:
         connection: pg.Connection,
         program_id: str,
         claimed: Claimed,
+        selected: tuple[playbook_module.Projection, ...],
         facts: dict,
     ) -> tuple[str, agent.Egress, float] | None:
         """One Tool run naming the Task, one verdict, one capability with a clock.
@@ -1921,6 +1922,12 @@ class Slice:
         this runtime could not obtain is a reason to report and close the
         attempt, and a traceback out of here would leave `rk run` answering with
         one where it owes a Ledger.
+
+        The Playbooks come in because one of the four things written into the
+        Tool run's args is derived from them. `body_allowed` is ticket 96's rule
+        stated at the moment the risk class is computed and a human is asked, so
+        that the answer a person gives is an answer about a run whose authority
+        is already settled rather than about one that could grow it afterwards.
         """
         try:
             with connection.transaction():
@@ -1938,6 +1945,7 @@ class Slice:
                                 "url": claimed.url,
                                 "method": claimed.method,
                                 "identity_slot": "",
+                                "body_allowed": _body_allowed(selected),
                             }
                         ),
                     ),
@@ -2368,6 +2376,30 @@ class Slice:
 def _actor(connection: pg.Connection) -> None:
     """Who the database records as writing. Transaction-local by construction."""
     connection.execute("SELECT set_actor('runtime', $1)", (program.ACTOR,))
+
+
+def _body_allowed(selected: Sequence[playbook_module.Projection]) -> bool:
+    """Whether this attempt may put bytes in front of the target's parser.
+
+    Ticket 96's first rule, computed where the Tool run's authority is written
+    down rather than where a request is made. A Playbook declares what it does
+    to a target in `bb:effects`, the vocabulary is four words, and
+    `read_only` is the one of them that describes a reading. So a run whose
+    whole selection is readings is opened without a body and the door refuses
+    one, and a run carrying a single Playbook that admits to changing a
+    session, an object or an account is opened with one.
+
+    The maximum and not the minimum, because the selection is what this attempt
+    may do and not what each of its Playbooks does in turn: one Playbook that
+    submits a form makes the attempt one that submits a form, whatever the other
+    four alongside it only read.
+
+    No Playbook at all is a run under the Task's own instructions and nothing
+    else, and that is opened read-only. A corpus that said nothing about this
+    subject has not said that bytes may be sent to it, and the honest reading of
+    silence on a permission is that it was not granted.
+    """
+    return any(one.effects != "read_only" for one in selected)
 
 
 def _rotation(value: object) -> Mapping[str, object] | None:

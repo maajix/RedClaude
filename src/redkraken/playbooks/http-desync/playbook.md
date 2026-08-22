@@ -156,6 +156,17 @@ bytes the target frames are the proxy's rather than the reading's, and a
 smuggling result would describe the proxy. That refusal is a trigger on the
 Hypothesis table, not advice: the class cannot be written down.
 
+A request may now carry a body, and that changes nothing above. Ticket 96 gave
+`http_request` a `body` argument, so a reading can put bytes in front of the
+target's parser where it could not before, and the two things a desync needs are
+still both absent. The framing headers are not arguments: `Content-Length` is the
+door's own measurement of the document the door itself re-serialises, and a
+`Transfer-Encoding: chunked` request body is refused at the door with a blocked
+Receipt rather than forwarded and found not to work. So the refusal here is a
+refusal and not a limitation that a later ticket quietly lifted, and a reading
+that wants to test framing should read this paragraph as the answer rather than
+spend an attempt discovering it.
+
 It does not tunnel and it does not coalesce. It sends no `CONNECT`, no
 absolute-form request line, and no request whose authority names a host other
 than the one the Task scoped. A reading that got a front end to forward on its

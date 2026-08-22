@@ -274,6 +274,13 @@ class Target(BaseHTTPRequestHandler):
 
     Appends `(command, path, headers)` to the server's own `seen` list, which the
     test owns and clears. Subclass and set `answer` to change the body.
+
+    What arrived after the headers goes to the server's `bodies` list rather than
+    into that tuple, because the tuple is what every suite in this repository
+    unpacks by position and a fourth element would rewrite all of them to say
+    nothing new. Read rather than ignored: a request body left in the socket is
+    read as the next request line by the next request on that connection, which
+    is a desynchronised target rather than a test failure.
     """
 
     protocol_version = "HTTP/1.1"
@@ -301,6 +308,8 @@ class Target(BaseHTTPRequestHandler):
                 [(name.lower(), value) for name, value in self.headers.items()],
             )
         )
+        length = int(self.headers.get("Content-Length") or 0)
+        self.server.bodies.append(self.rfile.read(length) if length > 0 else b"")
 
     def do_GET(self) -> None:
         self.record()
@@ -360,10 +369,11 @@ def counterparty(
 ) -> tuple[ThreadingHTTPServer, threading.Thread]:
     """One target, on a port of its own, already serving and already recording.
 
-    The `seen` list has to exist before the first request arrives and the port
-    has to be bound before it is named in a URL, so the four lines that arrange
-    that live here rather than in each suite's setup: a copy that forgot `seen`
-    fails inside a handler thread, where the failure is a log line and not a test.
+    The `seen` and `bodies` lists have to exist before the first request arrives
+    and the port has to be bound before it is named in a URL, so the lines that
+    arrange that live here rather than in each suite's setup: a copy that forgot
+    `seen` fails inside a handler thread, where the failure is a log line and not
+    a test.
 
     With a `context` the listening socket is wrapped rather than each accepted
     connection, so a handshake that fails -- which is what a client trusting the
@@ -374,6 +384,7 @@ def counterparty(
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.seen = []
+    server.bodies = []
     server.daemon_threads = True
     if context is not None:
         server.socket = context.wrap_socket(server.socket, server_side=True)

@@ -698,6 +698,67 @@ def project_identity_response(
     return kept, body
 
 
+def project_identity_request(
+    headers: list[tuple[str, str]], body: bytes, secrets: Sequence[str] = ()
+) -> tuple[list[tuple[str, str]], bytes]:
+    """The Agent's view of a request made while some Identity's credential was live.
+
+    Redaction on this side was not needed while the only thing an Agent could
+    put on a wire was headers it wrote itself and the only injected material
+    was headers the door added, because the two views were then built from one
+    body and that body was always empty. Ticket 96 makes a body something a
+    model composes, and an Agent that got a credential value from anywhere --
+    a target that echoed one past `_renderings`, a configuration somebody
+    pasted, a guess that happened to be right -- can now write it into the
+    request rather than only read it out of a response. The agent-visible
+    request Artifact is where that would be stored in the clear, so it is
+    scrubbed against the same values the response is scrubbed against.
+
+    Replacement and not suppression, and unlike the response side that goes for
+    the headers too. A response header carrying a credential is dropped because
+    a header is parsed rather than read, and `/continue/[redacted]` is a
+    `Location` something downstream would follow. A request header is the
+    Agent's own account of what it sent, so dropping one would make the record
+    say the Agent sent something it did not, and nothing downstream parses this
+    document -- what is parsed is the wire view, which is sealed and exact.
+
+    `Content-Length` is restated rather than scrubbed, and that is the one
+    place this differs from what it mirrors. On the response side the length is
+    the target's claim and the door does not rewrite a target's words. Here it
+    is the door's own measurement of the door's own document, so an Agent view
+    whose body has been shortened states the length of the body it actually
+    contains, and an auditor reading it does not see a message that was framed
+    for more bytes than it holds. The wire view keeps the number that went out.
+    """
+    renderings = [rendering for secret in secrets for rendering in _renderings(secret)]
+    if not renderings:
+        return headers, body
+    scrubbed = body
+    for rendering in renderings:
+        scrubbed = scrubbed.replace(rendering, REDACTION)
+    kept = [
+        (name, str(len(scrubbed)))
+        if name.lower() == "content-length"
+        else (_scrubbed(name, renderings), _scrubbed(value, renderings))
+        for name, value in headers
+    ]
+    return kept, scrubbed
+
+
+def _scrubbed(text: str, renderings: Sequence[bytes]) -> str:
+    """One header's name or value with every rendering of a secret taken out.
+
+    Through bytes rather than over the string, because `_renderings` answers in
+    bytes and it answers in bytes for a reason: a value's base64 and hex
+    spellings are byte transformations and a comparison done in text would have
+    to guess an encoding for each of them.
+    """
+    raw = text.encode("utf-8", "surrogateescape")
+    for rendering in renderings:
+        raw = raw.replace(rendering, REDACTION)
+    return raw.decode("utf-8", "surrogateescape")
+
+
 def _renderings(secret: str) -> tuple[bytes, ...]:
     """The spellings of one credential value a target is likely to echo back.
 
@@ -945,10 +1006,19 @@ def _unbindable(host: str, contained: bool) -> str | None:
 #: is a differential waiting to be found, and the one that matters is the one
 #: whose answer the socket is opened against. So the proxy sends what it
 #: canonicalised and the function refuses anything that is not canonical.
+#:
+#: The eighth value is not canonical and is not a spelling: it is whether this
+#: request has bytes after its headers. It goes to the same decision rather than
+#: to a second one because a body is part of the request, and a separate call
+#: would be one a door with a bug could simply not make -- which is the whole
+#: difference between a check and a suggestion. What the function does with it
+#: is ticket 96's rule: a body is refused unless the Tool run was opened as
+#: body-bearing.
 AUTHORIZE = (
     "SELECT program_id::text, tool_run_id::text, scope_version, scope_class,"
     "       identity_entity_id::text, identity_label"
-    "  FROM authorize_identity_egress_request($1, $2, $3, $4, $5::integer, $6, $7)"
+    "  FROM authorize_identity_egress_request("
+    "       $1, $2, $3, $4, $5::integer, $6, $7, $8::boolean)"
 )
 
 #: The second decision, about the address rather than the name. It is a separate
@@ -1150,7 +1220,12 @@ class Fence:
             raise Refused("program bind refused", str(error)) from error
 
     def authorize(
-        self, program_id: str, capability: str, method: str, request: scope.Request
+        self,
+        program_id: str,
+        capability: str,
+        method: str,
+        request: scope.Request,
+        has_body: bool = False,
     ) -> Authorization:
         with self._lock:
             self._bind(program_id)
@@ -1165,6 +1240,7 @@ class Fence:
                         request.port,
                         request.path_raw,
                         request.path_norm,
+                        has_body,
                     ),
                 ).rows
             except pg.DatabaseError as error:
@@ -2206,10 +2282,18 @@ class Handler(BaseHTTPRequestHandler):
             request = self._request(url)
             if control.capability is None:
                 raise Refused("capability refused", "no capability was offered")
-            authorization = self.server.fence.authorize(
-                program_id, control.capability, self.command, request
-            )
+            # Read before the decision rather than after it, because the
+            # decision now depends on it: ticket 96 binds a body to the Tool run
+            # the way the method has always been bound, and "does this request
+            # have bytes after its headers" is not a question that can be
+            # answered from the headers alone once a chunked one is refused
+            # here. What moves with it is only the order of two refusals a
+            # caller can earn at once -- a chunked body offered with a dead
+            # capability is now recorded as the framing it is.
             body = self._body()
+            authorization = self.server.fence.authorize(
+                program_id, control.capability, self.command, request, bool(body)
+            )
             slot = self.server.fence.reserve(program_id, control.capability, request)
         except Refused as refusal:
             return self._refuse(program_id, control.capability, refusal, arrival, url=url)
@@ -2826,7 +2910,18 @@ class Handler(BaseHTTPRequestHandler):
                 egress=egress,
             )
 
-        sent = transcript(line, agent_headers, body)
+        # Ticket 96's third rule. The two views of the request were built from
+        # one header list and one body while the only injected material was
+        # headers, which was correct exactly as long as an Agent had no way to
+        # put bytes in front of a parser. It has one now, so the Agent's view of
+        # its own request is scrubbed against the same values the response is
+        # scrubbed against, and the wire view stays the bytes that went.
+        agent_body = body
+        if binding is not None:
+            agent_headers, agent_body = project_identity_request(
+                agent_headers, body, binding.session.secrets(url)
+            )
+        sent = transcript(line, agent_headers, agent_body)
         wire_sent = transcript(line, wire_headers, body)
         wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
         store = self.server.store
@@ -3950,6 +4045,7 @@ def spend(
     program_id: str,
     method: str = "GET",
     headers: Mapping[str, str] | None = None,
+    body: bytes = b"",
     timeout: float = TIMEOUT,
     trust: ssl.SSLContext | None = None,
 ) -> Answer:
@@ -3967,6 +4063,13 @@ def spend(
     the tunnel is opened and the door's refusal is read back -- and the third of
     those is the one that decides whether a Tool run closes as denied or as
     served.
+
+    The body is bytes and not a string, because what a caller means to send is
+    a byte sequence and the encoding it chose is already spent by the time it
+    reaches here. Whether the door will accept one is not asked here: the door
+    re-decides every request against live policy, and a client that decided for
+    itself which of its requests may carry a body would be the second opinion
+    this whole arrangement exists to not have.
     """
     return _through(
         listener,
@@ -3978,6 +4081,7 @@ def spend(
         scope.canonical_request(url),
         trust,
         headers=headers,
+        body=body,
     )
 
 
@@ -3992,6 +4096,7 @@ def _through(
     trust: ssl.SSLContext | None,
     *,
     headers: Mapping[str, str] | None = None,
+    body: bytes = b"",
 ) -> Answer:
     """The request itself, with the capability on the hop that reaches the door.
 
@@ -4006,6 +4111,14 @@ def _through(
     the door cannot read them anyway. The control headers are applied last, so
     a caller that names one is naming a value this hop overwrites rather than
     one it sends.
+
+    The body rides the same hop as the headers that describe it, which on the
+    tunnelled shape is inside the tunnel, so the door reads it as the request
+    it terminated rather than as anything the CONNECT carried. `http.client`
+    frames it with a `Content-Length` it measures itself, which is the only
+    length that could be right here: `_carried` has already dropped whatever
+    the caller said the length was, because a length this client did not
+    measure is a length nothing on this hop may state.
     """
     host, port = listener
     control = {AUTHORIZATION: f"RedKraken {capability}", PROGRAM: program_id}
@@ -4013,7 +4126,7 @@ def _through(
     if trust is None:
         client = http.client.HTTPConnection(host, port, timeout=timeout)
         try:
-            client.request(method.upper(), url, headers={**carried, **control})
+            client.request(method.upper(), url, body=body, headers={**carried, **control})
             return _answered(client.getresponse())
         finally:
             client.close()
@@ -4032,7 +4145,7 @@ def _through(
         client = http.client.HTTPConnection(request.host, request.port, timeout=timeout)
         client.sock = secured
         try:
-            client.request(method.upper(), origin_form(url), headers=carried)
+            client.request(method.upper(), origin_form(url), body=body, headers=carried)
             return _answered(client.getresponse())
         finally:
             client.close()

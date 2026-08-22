@@ -500,7 +500,15 @@ DESCRIPTIONS = {
         "headers and the body are bounded excerpts of the transcript that Receipt "
         "names, so an Observation about a header cites that same Receipt. Headers "
         "carrying credentials the target issued are not among them. A refusal "
-        "names the door's decision rather than pretending the request happened."
+        "names the door's decision rather than pretending the request happened.\n\n"
+        "A body is the bytes you want sent after the headers, spelled exactly, "
+        "with their Content-Type given as a header. Do not set Content-Length: "
+        "the door measures the bytes it forwards and states that number itself, "
+        "and a chunked request body is refused rather than re-framed. Whether "
+        "this run may send a body at all was decided when it was opened, from "
+        "the effects the Playbooks chosen for its Task declare; a run whose "
+        "reading is entirely read-only is refused a body at the door, with a "
+        "Receipt saying so."
     ),
     # The element lists stay open -- `roster.OPEN_ARGUMENTS` says why -- so this
     # sentence is the only place a child is told which fields promotion reads
@@ -647,6 +655,7 @@ def _request(surface: Surface, door: agent.Egress | None):
                 str(given.get("url") or ""),
                 str(given.get("method") or "GET"),
                 _headers(given.get("headers")),
+                _body(given.get("body")),
             )
         )
 
@@ -693,7 +702,13 @@ def _tool_run(surface: Surface, channel: Channel | None, name: str):
     return handler
 
 
-def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]) -> dict:
+def _spend(
+    door: agent.Egress,
+    url: str,
+    method: str,
+    headers: Mapping[str, str],
+    body: bytes = b"",
+) -> dict:
     """One exchange through the door, as the four facts a model can act on.
 
     The Receipt label is the first of them and the reason the rest are bounded:
@@ -709,6 +724,11 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
     an Observation about a header cites the Receipt it would have cited anyway,
     because the transcript that Receipt names holds every header of the
     exchange exactly and this list is an excerpt of it.
+
+    The body goes through the same way and is not bounded again here. The
+    roster bounded it at 64 KiB before the call arrived, the door bounds what
+    it will read at its own ceiling, and a third measurement in this handler
+    would be a third opinion about a number two layers already hold.
     """
     try:
         listener = proxy.peer(door.proxy_url)
@@ -731,6 +751,7 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
             program_id=door.program_id,
             method=method,
             headers=headers,
+            body=body,
             trust=trust,
         )
     except (OSError, http.client.HTTPException) as error:
@@ -743,7 +764,7 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
         # handler that tells the child nothing.
         return {"served": False, "reason": UNUSABLE_TARGET, "detail": str(error)}
 
-    body = answer.body[: packet.DEFAULT_EXCERPT]
+    excerpt = answer.body[: packet.DEFAULT_EXCERPT]
     headers, cut = _readable(answer.headers)
     return {
         "served": answer.decision is None,
@@ -752,10 +773,10 @@ def _spend(door: agent.Egress, url: str, method: str, headers: Mapping[str, str]
         "decision": answer.decision,
         "detail": answer.detail,
         "byte_size": len(answer.body),
-        "truncated": len(answer.body) > len(body),
+        "truncated": len(answer.body) > len(excerpt),
         "headers": headers,
         "headers_truncated": cut,
-        "body": body.decode("utf-8", "replace"),
+        "body": excerpt.decode("utf-8", "replace"),
     }
 
 
@@ -831,6 +852,24 @@ def _headers(given: object) -> dict[str, str]:
     if not isinstance(given, Mapping):
         return {}
     return {str(name): str(value) for name, value in given.items()}
+
+
+def _body(given: object) -> bytes:
+    """The bytes a call asked to be sent after its headers, or none at all.
+
+    UTF-8, because that is what the string the model wrote already is by the
+    time it has come through JSON, and encoding it back the same way is the
+    only spelling that puts the bytes it meant on the wire. What that forbids
+    is a body no UTF-8 string can hold -- a binary upload, a filename with a
+    null byte in it -- and the honest place for those is an encoding field this
+    contract does not have rather than a lossy encode here.
+
+    Cast rather than trusted, for the same reason the url, the method and the
+    headers are: the gate has already refused every value outside the
+    contract's bounds, and what this handler acts on is what arrived rather
+    than what was promised.
+    """
+    return str(given).encode("utf-8") if isinstance(given, str) else b""
 
 
 def _slate(surface: Surface, choice: Choice):

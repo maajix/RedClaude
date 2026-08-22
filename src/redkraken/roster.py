@@ -764,14 +764,45 @@ CONTRACTS: dict[str, Contract] = {
                 items_pattern="^[A-Za-z][A-Za-z0-9-]{0,63}\\Z",
                 values_pattern="^[\\x20-\\x7e]{0,1024}\\Z",
             ),
-            # No body and no identity. Both were declared here and neither was
-            # ever reachable: the child has no store, so it cannot name a body
-            # the door could send, and the runtime opens the Tool run with the
-            # identity already chosen and the capability already minted, so an
-            # identity named at call time would be naming a decision that has
-            # been taken. A declared argument the runtime drops is a promise
-            # the schema cannot keep, and the honest form of "not yet" is not
-            # to declare it.
+            # The bytes after the headers. This argument was withheld until
+            # ticket 96 with the reason "the child has no store, so it cannot
+            # name a body the door could send", and half of that sentence was
+            # about a store the child still does not have: what changed is that
+            # a bounded string is a body the child can spell itself, so nothing
+            # has to be named out of a store for the door to send one.
+            #
+            # A string and not an object, and that is the decision this
+            # argument is. The gate walks every container argument at every
+            # depth and refuses `password`, `token`, `secret`, `authorization`
+            # and a dozen other names, while `_scan` returns immediately for
+            # anything that is not a Mapping, a list or a tuple. An object body
+            # carrying a username and a password is the most ordinary POST in
+            # web testing and the gate would deny it; a string body is never
+            # scanned at all. What the string costs is that the model spells
+            # its own encoding, which is the same thing that makes a multipart
+            # boundary or a deliberately malformed document expressible.
+            #
+            # `bounds` alone makes the argument constrained, so no
+            # `OPEN_ARGUMENTS` entry is spent here. The ceiling is 64 KiB and
+            # it is an argument ceiling: these bytes are written by a model
+            # into a model's context, and the number that bounds them has
+            # nothing to do with the door's own 32 MiB, which is how much of a
+            # target's answer this harness will hold in memory to hash and
+            # store. Two different questions, two numbers, stated apart.
+            #
+            # `Content-Type` is not here because it is a header and the header
+            # argument above already constrains it, which also keeps "send a
+            # body with no Content-Type at all" expressible. `Content-Length`
+            # is not here and never will be: the door strips the length that
+            # arrives and re-measures the bytes it forwards, so an argument for
+            # it would be a promise the door drops.
+            "body": Argument("string", bounds=(0, 65536)),
+            # No identity, and that half of the withheld pair is unchanged. The
+            # runtime opens the Tool run with the identity already chosen and
+            # the capability already minted, so an identity named at call time
+            # would be naming a decision that has been taken. A declared
+            # argument the runtime drops is a promise the schema cannot keep,
+            # and the honest form of "not yet" is not to declare it.
         },
     ),
     "mcp__rk2__run_tool": Contract(

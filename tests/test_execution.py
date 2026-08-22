@@ -1626,9 +1626,68 @@ class AttemptTest(unittest.TestCase):
         # name the roster shows the model.
         self.assertEqual(proxy.TOOL, tool)
         self.assertEqual(
-            {"url": "https://app.example.com/login", "method": "GET", "identity_slot": ""},
+            {
+                "url": "https://app.example.com/login",
+                "method": "GET",
+                "identity_slot": "",
+                # Ticket 96. The selected Playbook is `read_only`, so this
+                # attempt was not opened to put bytes in front of a parser and
+                # the door refuses a request that tries to.
+                "body_allowed": False,
+            },
             json.loads(args),
         )
+
+    def test_an_attempt_is_opened_body_bearing_when_a_playbook_mutates(self):
+        """Ticket 96's first rule, at the moment it is decided.
+
+        Permission for a body is not a property of the call, which arrives after
+        this row is written and is chosen by a model. It is a property of the
+        work the Task was planned as, and the only statement of that in this
+        system is `bb:effects` on the Playbooks selected for it. So it is
+        computed here, written beside the url and the method, and read back by
+        the authorizer the door calls and by the digest a human answers.
+        """
+        mutating = playbook.PLAYBOOKS["file-upload"]
+        connection = Recorder(
+            selections=[(mutating.path, mutating.sha256, mutating.version)]
+        )
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+
+        self.assertEqual("mutates_object", mutating.effects)
+        self.assertIs(True, json.loads(args)["body_allowed"])
+
+    def test_one_mutating_playbook_among_readings_opens_the_attempt_for_a_body(self):
+        # The maximum and not the minimum. A Task is one attempt with one
+        # capability, and a selection that contains any writing is a Task the
+        # child may write on: a body refused because a reading was selected
+        # alongside would refuse work the plan already approved.
+        mutating = playbook.PLAYBOOKS["authentication"]
+        connection = Recorder(
+            selections=[
+                (SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256, SELECTED_PLAYBOOK.version),
+                (mutating.path, mutating.sha256, mutating.version),
+            ]
+        )
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+
+        self.assertEqual("read_only", SELECTED_PLAYBOOK.effects)
+        self.assertEqual("mutates_session", mutating.effects)
+        self.assertIs(True, json.loads(args)["body_allowed"])
+
+    def test_an_attempt_with_no_playbook_at_all_is_not_opened_for_a_body(self):
+        # Silence on a permission is not a grant. A Task that selected nothing is
+        # a Task nothing said may write, and the honest reading of that is no.
+        connection = Recorder(selections=[])
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+
+        self.assertIs(False, json.loads(args)["body_allowed"])
 
     def test_the_child_is_handed_the_capability_and_cannot_mint_one(self):
         launcher = Launcher()

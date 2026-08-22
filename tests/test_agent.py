@@ -1412,6 +1412,53 @@ class RequestToolTest(unittest.TestCase):
         self.assertEqual({"X-Trace": "abc"}, calls[0][1]["headers"])
         self.assertEqual({}, calls[1][1]["headers"])
 
+    def test_the_body_the_call_named_is_what_the_capability_is_spent_with(self):
+        """Ticket 96, at the one place the string a model wrote becomes bytes.
+
+        UTF-8, because that is what the string already is by the time it has
+        come through JSON, and encoding it back the same way is the only
+        spelling that puts on the wire the bytes the caller meant. A call that
+        names no body sends none, which is every request this handler made
+        before the argument existed.
+        """
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                answer = self.answer(
+                    handler,
+                    {
+                        "method": "POST",
+                        "url": "http://x.test/login",
+                        "headers": {"Content-Type": "application/json"},
+                        "body": '{"user":"admin","note":"caf\u00e9"}',
+                    },
+                )
+                self.answer(handler, {"method": "GET", "url": "http://x.test/a"})
+
+        self.assertEqual(
+            '{"user":"admin","note":"café"}'.encode("utf-8"), calls[0][1]["body"]
+        )
+        self.assertEqual(b"", calls[1][1]["body"])
+        # The request's body and the response's excerpt are two different things
+        # under one word, and the handler returns the second while sending the
+        # first. A single name for both would have answered the caller with what
+        # it had just sent.
+        self.assertEqual("hello", answer["body"])
+        self.assertFalse(answer["truncated"])
+
+    def test_a_body_the_contract_could_not_have_produced_is_sent_as_nothing(self):
+        # The gate refuses every value outside the contract's bounds before this
+        # handler runs, so what arrives here is what arrived rather than what was
+        # promised. The cast is the same one the url, the method and the headers
+        # get, and a number where a string belongs sends no body rather than the
+        # digits of the number.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                self.answer(handler, {"method": "POST", "url": "http://x.test/a", "body": 7})
+
+        self.assertEqual(b"", calls[0][1]["body"])
+
     def test_a_header_no_client_will_put_on_a_wire_is_reported_as_a_refusal(self):
         # What `http.client` raises for a value with a line break in it. The
         # gate refuses those first, so arriving here means the request cannot

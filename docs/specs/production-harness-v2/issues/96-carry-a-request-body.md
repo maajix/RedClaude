@@ -7,9 +7,9 @@ afterwards.
 
 **Blocked by:** 95 — A bounded string argument must say maxLength.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `mcp__rk2__http_request` declares `body` as a **string** with
+- [x] `mcp__rk2__http_request` declares `body` as a **string** with
       `bounds=(0, 65536)` and no pattern. A string and not an object, because
       the gate's forbidden-name scan walks every container argument at every
       depth and refuses `password`, `token`, `secret`, `authorization`,
@@ -21,7 +21,7 @@ afterwards.
       (`roster.py:348-356`), so no `OPEN_ARGUMENTS` entry is needed
       (`roster.py:545-555`, `roster.py:1772-1774`) and the roster's rule that an
       unconstrained argument states why it is one is not spent here.
-- [ ] The gap that closes is the contract and the in-container client, not the
+- [x] The gap that closes is the contract and the in-container client, not the
       door. The door already reads a request body, refuses a chunked one with
       the reason written down, and caps what it reads at `CEILING`
       (`proxy.py:2394-2409`; `CEILING` is 32 MiB at `proxy.py:328`). It already
@@ -37,7 +37,7 @@ afterwards.
       (`_launch.py:627-635`). The ticket adds no column and states that it adds
       none: a `request_body_sha256` would be a second hash of bytes already
       hashed.
-- [ ] **Rule one, permission decided at open.** A request may carry a body only
+- [x] **Rule one, permission decided at open.** A request may carry a body only
       if the Tool run that authorized it was opened as body-bearing, and a Tool
       run is opened as body-bearing only when the Playbooks selected for its
       Task declare `bb:effects` above `read_only`. The runtime already writes
@@ -50,7 +50,7 @@ afterwards.
       `playbook.py:95-112`. The door refuses the mismatch beside the method
       binding it mirrors (`20260810T214500Z__capability_proxy_egress.sql:240-255`),
       with a blocked Receipt like every other refusal.
-- [ ] **Rule two, the approval digest sees the bytes.** `canonical_request`
+- [x] **Rule two, the approval digest sees the bytes.** `canonical_request`
       derives `body_keys` only from an object body
       (`0026_human_control.sql:183-186`) and sets `reusable: true` for this tool
       (`:172`), and `equivalence_key` is the sha256 of that document
@@ -58,7 +58,7 @@ afterwards.
       therefore share one key and one human approval covers both. After this
       ticket they do not: either `body_sha256` is in the digest or a call with a
       non-object body is `reusable: false`.
-- [ ] **Rule three, the request artifact is redacted the way the response
+- [x] **Rule three, the request artifact is redacted the way the response
       already is.** Redaction today is response-only:
       `project_identity_response` (`proxy.py:659-698`) drops the headers
       carrying an injected secret and replaces the secret's renderings in the
@@ -71,20 +71,20 @@ afterwards.
       (`identity.py:331-351`); the wire view stays sealed and exact, so an
       exchange whose redaction was incomplete is still one an auditor can see
       whole.
-- [ ] Desync stays out of reach and is refused rather than discovered. The door
+- [x] Desync stays out of reach and is refused rather than discovered. The door
       strips both length headers and re-measures, and refuses a chunked body
       outright because "a proxy that re-chunks is recording bytes that differ
       from the ones it read" (`proxy.py:2394-2402`). A body whose declared
       framing disagrees with its bytes cannot survive this door, and the ticket
       says so where `playbooks/http-desync` can read it.
-- [ ] `Content-Type` is a header and not an argument, and `Content-Length` is
+- [x] `Content-Type` is a header and not an argument, and `Content-Length` is
       neither. The existing name and value patterns (`roster.py:753-757`) do the
       constraining, "send a body with no Content-Type at all" stays expressible,
       and the length stays the door's (`proxy.py:2693-2694`).
-- [ ] The argument ceiling and the door's ceiling are different numbers, stated
+- [x] The argument ceiling and the door's ceiling are different numbers, stated
       separately. 32 MiB is a store-and-hash bound on what a target may answer
       with (`proxy.py:328`); a tool argument is bytes in a model's context.
-- [ ] No new vocabulary. `body_parameter` already exists as a surface fact
+- [x] No new vocabulary. `body_parameter` already exists as a surface fact
       (`0032_playbooks.sql:57`) and has described endpoints no step could
       exercise since 032; `json_request`, `form_request`, `multipart_request`
       and `xml_request` exist beside it. `writes` on the contract needs no
@@ -110,3 +110,56 @@ techniques in `08`. The contract's own comment records the reason it was
 withheld -- "the child has no store, so it cannot name a body the door could
 send" (`roster.py:758-765`) -- and the half of that sentence about the store is
 what a bounded string argument answers.
+
+## What was built
+
+`body` is a bounded string on `mcp__rk2__http_request` (`roster.py:767-806`),
+threaded through `_launch._spend`, `proxy.spend` and `_through` to the hop the
+door terminates. The door already read, bounded, hashed and refused a chunked
+request body; what was missing was every layer above it.
+
+The comment that withheld the argument is replaced rather than deleted, because
+half of its reason still holds: the child still has no store, and what changed
+is that a bounded string is a body it can spell itself.
+
+## Rule two, and which of the two ways out was taken
+
+**A Tool run opened as body-bearing is `reusable: false`.** Its equivalence key
+carries the nonce, so one human approval covers one Task rather than every
+string body sent to one path template.
+
+The alternative the ticket offered was `body_sha256` in the digest, and it is
+the wrong one: `canonical_request` is written when the Tool run opens, and the
+bytes are chosen after that. A `body_sha256` there would be the digest of a key
+that is never present, which is a field that looks like a check and is not one.
+
+## Rule one, decided where the human is asked
+
+`body_allowed` is computed from the Playbooks selected for the Task and written
+into `tool_runs.args` at open (`execution.py:1945`, `_body_allowed` at
+`:2381-2402`), beside the `url` and `method` that were already there. It is the
+maximum over the selection and not the minimum: one Playbook that submits a form
+makes the attempt one that submits a form, whatever the others alongside it only
+read. A selection that is entirely `read_only`, and a run carrying no Playbook
+at all, are both opened without one, because silence on a permission is not a
+grant.
+
+The door refuses the mismatch beside the method binding it mirrors, with a
+blocked Receipt like every other refusal.
+
+## Rule three, the request Artifact redacted the way the response already was
+
+`project_identity_request` (`proxy.py:701-745`) scrubs the agent-visible request
+against the bound session's secrets. Replacement and not suppression, and unlike
+the response side it goes for the headers too: a request header is the Agent's
+own account of what it sent, so dropping one would make the record say the Agent
+sent something it did not. `Content-Length` is restated rather than scrubbed,
+because here it is the door's measurement of the door's own document. The wire
+view stays sealed and exact.
+
+## Two numbers, stated apart
+
+64 KiB bounds the argument, because those bytes are written by a model into a
+model's context. 32 MiB is the door's `CEILING`, which is how much of a target's
+answer this harness will hold in memory to hash and store. They are answers to
+different questions and neither is derived from the other.

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -49,7 +50,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
-from redkraken import identity, pg, proxy, scope, seal, tls
+from redkraken import identity, pg, proxy, roster, scope, seal, tls
 from redkraken.outcome import EXIT_INVALID_CONFIGURATION
 from redkraken.store import Store
 from tests.fixtures import (
@@ -78,7 +79,7 @@ IDENTITY_ID = "55555555-5555-5555-5555-555555555555"
 DATABASE_ERROR = (
     "23514: egress request is outside current scope | "
     "PL/pgSQL function authorize_egress_request(text,text,text,text,integer,"
-    "text,text,text) line 71 at RAISE"
+    "text,text,text,boolean) line 71 at RAISE"
 )
 
 #: The same, for the second decision. A separate string because it is a separate
@@ -246,15 +247,27 @@ class Stub:
         #: where the database is.
         self.measurements: list[tuple] = []
         self.measurement_fails: Exception | None = None
+        #: Whether the Tool run behind this capability was opened body-bearing,
+        #: ticket 96, and it was by default. The real answer is a column read out
+        #: of `tool_runs.args` inside the authorizer, so what a test can set here
+        #: is the answer it wants; a stub that said no by default would make the
+        #: refusal path the ordinary one and every bodied test a permission test.
+        self.body_allowed = True
 
     def authorize(
-        self, program_id: str, capability: str, method: str, request: scope.Request
+        self,
+        program_id: str,
+        capability: str,
+        method: str,
+        request: scope.Request,
+        has_body: bool = False,
     ) -> proxy.Authorization:
-        self.authorized.append((program_id, capability, method, request))
+        self.authorized.append((program_id, capability, method, request, has_body))
         if (
             request.host in self.out_of_scope
             or capability != CAPABILITY
             or program_id != self.decided.program_id
+            or (has_body and not self.body_allowed)
             or (self.revoked_after is not None and len(self.authorized) > self.revoked_after)
         ):
             # Shaped like the real one: `Fence.authorize` turns a `DatabaseError`
@@ -510,6 +523,62 @@ class HeaderTest(unittest.TestCase):
         self.assertNotIn(encoded.encode(), body)
         self.assertEqual(
             b"raw=[redacted] quoted=[redacted] b64=[redacted] hex=[redacted]", body
+        )
+
+    def test_a_credential_the_agent_wrote_into_its_own_request_is_redacted(self):
+        """Ticket 96's third rule, as the function that carries it.
+
+        The request side was built from one header list and one body while the
+        only injected material was headers, and that was right for exactly as
+        long as an Agent had no way to put bytes in front of a parser. It has a
+        `body` now, and a model that pasted a token it read somewhere into a
+        form field would otherwise have written that token into the artifact it
+        is allowed to read back.
+        """
+        marker = "rk2-session-identity-token"
+        headers, body = proxy.project_identity_request(
+            [("Content-Type", "text/plain"), ("X-Echo", marker)],
+            f"token={marker}&hex={marker.encode().hex()}".encode(),
+            (marker,),
+        )
+
+        self.assertEqual(b"token=[redacted]&hex=[redacted]", body)
+        # The header is scrubbed and not dropped, which is the one place this
+        # differs from the response projection. A response header carrying a
+        # credential is the target reflecting one and is removed because
+        # something downstream canonicalises it; a request header is the Agent's
+        # own account of what it sent, nothing parses this document, and a
+        # missing line would read as a request that never carried the header.
+        self.assertEqual(
+            [("Content-Type", "text/plain"), ("X-Echo", "[redacted]")], headers
+        )
+
+    def test_the_agents_view_of_its_own_request_states_the_length_it_can_see(self):
+        # Redaction changes the length, and `Content-Length` on the request side
+        # is the door's own measurement of the door's own document rather than a
+        # claim a target made. So it is restated: an artifact whose header says
+        # 42 and whose body is 30 bytes is a document that reads as truncated
+        # when the truth is that six characters were taken out of it.
+        marker = "rk2-secret"
+        sent = f"a={marker}".encode()
+        headers, body = proxy.project_identity_request(
+            [("Content-Length", str(len(sent))), ("Content-Type", "text/plain")],
+            sent,
+            (marker,),
+        )
+
+        self.assertEqual(b"a=[redacted]", body)
+        self.assertEqual([("Content-Length", str(len(body))), ("Content-Type", "text/plain")],
+                         headers)
+
+    def test_a_request_that_reflects_no_credential_is_the_bytes_that_went(self):
+        # No session, or a session whose values appear nowhere: the same list and
+        # the same bytes come back, so the ordinary exchange pays nothing for a
+        # rule that only applies to a bound one.
+        headers = [("Content-Length", "5"), ("Accept", "*/*")]
+
+        self.assertEqual(
+            (headers, b"a=1&b"), proxy.project_identity_request(headers, b"a=1&b", ())
         )
 
     def test_every_control_and_hop_by_hop_header_is_dropped_from_the_forwarded_request(self):
@@ -1015,6 +1084,7 @@ class ExchangeTest(unittest.TestCase):
 
     def setUp(self):
         self.target.seen.clear()
+        self.target.bodies.clear()
         self.fence = Stub()
         #: What the resolver answers with, and what it was asked. Both are the
         #: test's to set and to read: a name that answers with two addresses, or
@@ -1726,6 +1796,135 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual("POST /v1/notes HTTP/1.1", head[0])
         self.assertEqual(sorted(seen), sorted((name.lower(), value) for name, value in recorded))
 
+    def test_a_body_reaches_the_target_and_is_in_the_hash_the_receipt_names(self):
+        """Ticket 96, end to end through the door with nothing new recording it.
+
+        No column was added for this and none was needed. `transcript` is the
+        start line, the headers, a blank line and the body, and the Receipt has
+        named the hash of that document since there were Receipts. A body is
+        simply the part of it that used to be empty, so the assertion is that the
+        artifact the Receipt already points at contains the bytes the target
+        already read.
+        """
+        sent = b"note=the+body+the+model+wrote&id=7"
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=sent,
+        )
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual([sent], self.target.bodies)
+        method, _, seen = self.target.seen[0]
+        self.assertEqual("POST", method)
+        # The door measured the document it is sending. The caller never states
+        # this number and could not be believed if it did.
+        self.assertEqual(
+            [str(len(sent))], [value for name, value in seen if name == "content-length"]
+        )
+        # And the header that says what the bytes are is a header, carried the
+        # way every other one is rather than as an argument of its own.
+        self.assertEqual(
+            ["application/x-www-form-urlencoded"],
+            [value for name, value in seen if name == "content-type"],
+        )
+
+        receipt = self.fence.allowed[0]["receipt"]
+        stored = Store(self.root).load(receipt["request_agent_sha"])
+        self.assertEqual(receipt["request_agent_sha"], hashlib.sha256(stored).hexdigest())
+        self.assertTrue(stored.endswith(b"\r\n\r\n" + sent))
+        # The decision saw it. A door that forwarded the bytes and asked about a
+        # request with none would be asking the schema the wrong question.
+        self.assertEqual([True], [asked for *_, asked in self.fence.authorized])
+
+    def test_a_body_on_a_tool_run_that_was_not_opened_for_one_is_refused(self):
+        """Ticket 96's first rule, from the side that has to hold it.
+
+        Permission is decided when the Tool run is opened, out of the effects the
+        Playbooks selected for its Task declare, and the door is where it binds.
+        The refusal is the ordinary one: 407, a blocked Receipt, and a target
+        that was never contacted, which is what makes it the same kind of event
+        as a method the Tool run was not authorized for.
+        """
+        self.fence.body_allowed = False
+
+        response = self.through(
+            "http://target.example.test/v1/notes", method="POST", body=b"delete=all"
+        )
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.target.seen)
+        self.assertEqual([], self.fence.allowed)
+        self.assertEqual(1, len(self.fence.blocked))
+        self.assertEqual("capability refused", self.fence.blocked[0]["receipt"]["reason"])
+        # Read before the decision and therefore off the socket, which is what
+        # lets the same connection carry the refusal back.
+        self.assertEqual([True], [asked for *_, asked in self.fence.authorized])
+
+    def test_a_request_with_no_body_is_still_asked_about_as_one_with_none(self):
+        # The other half, and the one that keeps every read-only Task working:
+        # the flag is a statement about this request rather than about the Tool
+        # run, so a body-less GET under a read-only run is decided as it always
+        # was and reaches the target.
+        self.fence.body_allowed = False
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual([False], [asked for *_, asked in self.fence.authorized])
+        self.assertEqual(1, len(self.fence.allowed))
+
+    def test_the_argument_ceiling_and_the_doors_ceiling_are_two_numbers(self):
+        # They bound different things and neither is derived from the other. The
+        # contract bounds what a model may write as an argument, which is a value
+        # that has to survive a JSON round trip through a packet; the door bounds
+        # what it will read off a socket and hash into an Artifact, and it holds
+        # that number for every caller including the ones that are not models.
+        # A single constant would make raising either one a decision about both.
+        self.assertEqual(65536, roster.CONTRACTS["mcp__rk2__http_request"]
+                         .arguments["body"].bounds[1])
+        self.assertEqual(32 * 1024 * 1024, proxy.CEILING)
+        self.assertLess(
+            roster.CONTRACTS["mcp__rk2__http_request"].arguments["body"].bounds[1],
+            proxy.CEILING,
+        )
+
+    def test_a_chunked_request_body_is_refused_before_the_target_is_contacted(self):
+        """Still refused, and this is the assertion that says so out loud.
+
+        A body is expressible now, so the reason this refusal exists is worth
+        restating: the door re-serialises every request, so a framing the caller
+        chose is a framing the target would never see, and forwarding a chunked
+        body would make the Receipt a claim about bytes nobody sent. It is
+        refused rather than re-framed, and the Playbook that would otherwise
+        spend an attempt discovering that says the same thing in prose.
+        """
+        client = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=5
+        )
+        self.addCleanup(client.close)
+        client.putrequest("POST", "http://target.example.test/v1/notes")
+        client.putheader(proxy.AUTHORIZATION, f"RedKraken {CAPABILITY}")
+        client.putheader(proxy.PROGRAM, PROGRAM_ID)
+        client.putheader("Transfer-Encoding", "chunked")
+        client.endheaders()
+        client.send(b"5\r\nhello\r\n0\r\n\r\n")
+        response = client.getresponse()
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual([], self.target.seen)
+        self.assertEqual([], self.fence.allowed)
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertEqual("unsupported framing", filed["reason"])
+
     def test_the_receipt_names_the_bytes_of_both_directions_and_never_the_capability(self):
         self.through("http://target.example.test/v1/notes").read()
 
@@ -1843,6 +2042,78 @@ class ExchangeTest(unittest.TestCase):
             ),
         )
         self.assertIn(marker.encode(), opened)
+
+    def test_a_credential_the_agent_sent_in_a_body_is_scrubbed_from_its_own_view(self):
+        """Ticket 96's third rule, through the door rather than in the function.
+
+        The response side has been scrubbed against the bound session's secrets
+        since ticket 12, because a target echoes a credential back. This is the
+        outbound direction of the same rule, and it became reachable the moment a
+        model could write a `body`: a hunter that read a token off one page and
+        pasted it into a form on another would otherwise have put it into the one
+        artifact it is allowed to fetch and read.
+
+        Both halves in one exchange: the target got the bytes, the agent-visible
+        request does not have them, and the sealed wire view is exact.
+        """
+        marker = "rk2-target-bearer-identity-8c40d1"
+        root = seal.Root("test-only-root", b"i" * seal.KEY_BYTES)
+        self.server.root_secret = root
+        self.addCleanup(setattr, self.server, "root_secret", None)
+        self.fence.decided = proxy.Authorization(
+            program_id=PROGRAM_ID,
+            tool_run_id="22222222-2222-2222-2222-222222222222",
+            scope_version=1,
+            scope_class="target",
+            identity_entity_id=IDENTITY_ID,
+            identity_label="member",
+        )
+        self.fence.identity = proxy.IdentityBinding.provisioned(
+            entity_id=IDENTITY_ID,
+            label="member",
+            revision=1,
+            material={
+                "schema_version": 1,
+                "origins": [
+                    {
+                        "url": "http://target.example.test/",
+                        "headers": [{"name": "Authorization", "value": f"Bearer {marker}"}],
+                        "cookies": [],
+                    }
+                ],
+            },
+        )
+        sent = f"csrf=abc&token={marker}".encode()
+        redacted = b"csrf=abc&token=[redacted]"
+
+        response = self.through(
+            "http://target.example.test/v1/identity", method="POST", body=sent
+        )
+        response.read()
+
+        self.assertEqual([sent], self.target.bodies)
+        recorded = self.fence.allowed[0]
+        receipt = recorded["receipt"]
+        visible = Store(self.root).load(receipt["request_agent_sha"])
+        self.assertNotIn(marker.encode(), visible)
+        self.assertTrue(visible.endswith(b"\r\n\r\n" + redacted))
+        # The document still describes itself. A length left at the unredacted
+        # count would read as a request whose body was cut short.
+        self.assertIn(b"Content-Length: %d\r\n" % len(redacted), visible)
+
+        [description] = [item for item in recorded["seals"] if item["field"] == "target_request"]
+        envelope = Store(self.root).load(description["ciphertext_sha256"])
+        self.assertNotIn(marker.encode(), envelope)
+        opened = seal.unseal(
+            self.fence.wire_key(PROGRAM_ID, CAPABILITY, root)[1],
+            seal.Sealed.decode(envelope),
+            aad=seal.associated_data(
+                program_id=PROGRAM_ID,
+                sha256=description["sha256"],
+                generation=description["kek_gen"],
+            ),
+        )
+        self.assertTrue(opened.endswith(sent))
 
     def test_a_required_header_reaches_the_target_and_not_the_agent_view(self):
         """The whole of story 8: the target sees it, the model does not.
@@ -2620,7 +2891,7 @@ class RedirectTest(Redirected):
         # criterion and is asserted there: the Tool run is resolved from the
         # capability inside the fence, so a stub asserting it here would be
         # asserting its own constant.
-        self.assertEqual({CAPABILITY}, {held for _, held, _, _ in self.fence.authorized})
+        self.assertEqual({CAPABILITY}, {held for _, held, *_ in self.fence.authorized})
         self.assertEqual({CAPABILITY}, {held for _, held, _, _ in self.fence.addressed})
         # Two Receipts, and two different exchanges rather than one written twice.
         self.assertEqual(
@@ -3025,7 +3296,7 @@ class TunnelTest(unittest.TestCase):
         # And the host is what the fence was asked about, not just what the row
         # says afterwards.
         self.assertEqual(
-            ["admin.example.test"], [asked.host for *_, asked in self.fence.authorized]
+            ["admin.example.test"], [asked.host for *_, asked, _ in self.fence.authorized]
         )
 
     def test_an_address_withdrawn_inside_a_tunnel_is_refused_like_any_other(self):
@@ -3055,7 +3326,7 @@ class TunnelTest(unittest.TestCase):
         # two calls a plain request makes.
         self.assertEqual(
             [("target.example.test", 443)],
-            [(asked.host, asked.port) for *_, asked in self.fence.authorized],
+            [(asked.host, asked.port) for *_, asked, _ in self.fence.authorized],
         )
         self.assertEqual(
             [("target.example.test", WITHDRAWN)],

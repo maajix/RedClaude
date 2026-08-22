@@ -7824,6 +7824,10 @@ class ProxyEgressTest(DatabaseCase):
             "identity-audit",
             "identity-revision",
             "mtls",
+            # Ticket 96's arms open Tool runs of their own and send a request
+            # body through one of them, and a Program of their own is what keeps
+            # that out of the counting the exchange arms above do.
+            "body",
             # The queue cases park questions and leave some of them open across a
             # sweep, and a sweep is machine-wide. Their own Program keeps that out
             # of the counting assertions the exchanges above make.
@@ -8050,12 +8054,19 @@ class ProxyEgressTest(DatabaseCase):
 
     # -- the arms of criterion 5, each of which needs a capability of its own ---
 
-    def mint(self, name: str) -> tuple[str, str, str]:
+    def mint(
+        self, name: str, *, method: str = "GET", body_allowed: bool = False
+    ) -> tuple[str, str, str]:
         """One Agent run, one Tool run and one live capability, committed.
 
         Committed because the fence resolves it on a session of its own, which is
         the arrangement production has and the reason these arms cannot be asked
         inside a transaction that rolls back.
+
+        The two keywords are what the runtime derives before this row is written:
+        the method from the plan and, since ticket 96, whether the Playbooks
+        selected for the Task declare effects above `read_only`. Both default to
+        the read the rest of this case is about.
         """
         self.runtime.execute(proxy.BIND, (self.identifiers[name],))
         with self.runtime.transaction():
@@ -8070,7 +8081,14 @@ class ProxyEgressTest(DatabaseCase):
                     self.identifiers[name],
                     str(run),
                     proxy.TOOL,
-                    json.dumps({"url": URL, "method": "GET", "identity_slot": ""}),
+                    json.dumps(
+                        {
+                            "url": URL,
+                            "method": method,
+                            "identity_slot": "",
+                            "body_allowed": body_allowed,
+                        }
+                    ),
                 ),
             ).rows[0]
         gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (str(opened[0]),)).scalar()
@@ -8079,6 +8097,147 @@ class ProxyEgressTest(DatabaseCase):
         self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
         return str(capability), str(opened[0]), str(run)
 
+    def writing(self, name: str, *, method: str = "POST") -> tuple[str, str, str]:
+        """A capability for a Task whose Playbooks let it write, and the approval.
+
+        Three things happen here that `mint` never reaches, and all three are
+        ticket 96's rule two. The gate answers `ask`, because a method that
+        mutates is a question. The question is parked, which closes the Tool run
+        it was asked about -- `park_for_human` says so in its own comment. And
+        the Task is claimed again and opened as a second Tool run, which is what
+        the scheduler does with a Task an operator released, and which is where
+        the approval either transfers or does not.
+
+        The re-claim is written by the owner because granting a lease is the
+        scheduler's, and `park_for_human` took this Task's lease away when it
+        filed the question.
+        """
+        task = self.fresh_task(name)
+        first = self.attempting(name, task, method)
+        gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (first,)).scalar()
+        answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
+        if answer.get("decision") != "ask":
+            # A safe method is not a question, and a Task planned as a read may
+            # still be opened body-bearing: `body_allowed` comes from what the
+            # Playbooks declare rather than from the verb. So the arms that are
+            # about the body alone take this branch and never meet the operator.
+            capability = answer.get("capability")
+            self.assertIsNotNone(capability, f"the gate answered {answer.get('decision')}")
+            return str(capability), first, task
+
+        decision = str(
+            self.runtime.execute(
+                "SELECT park_for_human($1::uuid, interval '10 minutes')", (first,)
+            ).scalar()
+        )
+        self.human.execute(proxy.BIND, (self.identifiers[name],))
+        with self.human.transaction():
+            self.human.execute(
+                "SELECT answer_decision($1, 'approved', 'selftest approved a write',"
+                " interval '10 minutes')",
+                (decision,),
+            )
+        self.owner(
+            "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
+            "                 lease_expires_at = now() + interval '10 minutes'"
+            " WHERE id = $1::uuid",
+            (task,),
+        )
+        second = self.attempting(name, task, method)
+        gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (second,)).scalar()
+        answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
+        capability = answer.get("capability")
+        self.assertIsNotNone(
+            capability,
+            f"the gate answered {answer.get('decision')} to a Task an operator released",
+        )
+        return str(capability), second, task
+
+    def fresh_task(self, name: str) -> str:
+        """One live Task of this Program, with whatever was live before it settled.
+
+        `tasks_live_dedup_idx` allows a Program one live Task per kind and
+        subject, and the ticket 96 arms open several on purpose: each is a
+        separate approval, which is the whole of what rule two is about.
+
+        Settling is the scheduler's move rather than a delete, and the runs
+        holding the old Task are closed through `finish_task_attempt` first: a
+        settled Task with an open run on it is `open_agent_run_on_settled_task`,
+        and that check reads the whole corpus rather than this Program, so
+        leaving one behind is a failure some unrelated case inherits.
+        """
+        self.settle(name)
+        self.addCleanup(self.settle, name)
+        return self.owned(
+            "INSERT INTO tasks (program_id, kind, status, claimed_at, lease_expires_at)"
+            " VALUES ($1::uuid, 'recon', 'claimed', now(), now() + interval '10 minutes')"
+            " RETURNING id::text",
+            (self.identifiers[name],),
+        )
+
+    def settle(self, name: str) -> None:
+        """Every live Task of this Program ended, and every run holding one closed."""
+        for row in self.connection.execute(
+            "SELECT ar.id::text FROM agent_runs ar"
+            "  JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
+            " WHERE t.program_id = $1::uuid AND ar.finished_at IS NULL"
+            " ORDER BY ar.label",
+            (self.identifiers[name],),
+        ).rows:
+            # Closed by the runtime, because closing a run is the runtime's and
+            # `finish_task_attempt` asks `rk2_program_required` which Program it
+            # is doing it in. The owner writes the Task's own row below, for the
+            # reason `owner` states: what the scheduler writes may be written by
+            # neither the runtime nor the proxy.
+            self.runtime.execute(proxy.BIND, (self.identifiers[name],))
+            with self.runtime.transaction():
+                self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+                self.runtime.execute(
+                    "SELECT finish_task_attempt($1::uuid, 'completed')", (str(row[0]),)
+                )
+        self.owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            "                 finished_at = now(), priority = NULL,"
+            "                 claimed_at = NULL, lease_expires_at = NULL,"
+            "                 pending_decision_id = NULL"
+            " WHERE program_id = $1::uuid AND status NOT IN ('done', 'abandoned')",
+            (self.identifiers[name],),
+        )
+
+    def attempting(self, name: str, task: str, method: str) -> str:
+        """One attempt at a Task: an Agent run holding it, and a body-bearing Tool run."""
+        self.runtime.execute(proxy.BIND, (self.identifiers[name],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = self.runtime.execute(
+                "INSERT INTO agent_runs (program_id, task_id, role, kind, runs_as, model,"
+                " effort, mission_packet)"
+                " VALUES ($1::uuid, $2::uuid, 'recon', 'recon', 'subagent', 'operator',"
+                " 'low', $3::jsonb) RETURNING id::text",
+                (self.identifiers[name], task, json.dumps({"command": "selftest"})),
+            ).scalar()
+            return str(
+                self.runtime.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args,"
+                    " status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb,"
+                    " 'running', 'runtime') RETURNING id::text",
+                    (
+                        self.identifiers[name],
+                        str(run),
+                        task,
+                        proxy.TOOL,
+                        json.dumps(
+                            {
+                                "url": URL,
+                                "method": method,
+                                "identity_slot": "",
+                                "body_allowed": True,
+                            }
+                        ),
+                    ),
+                ).scalar()
+            )
+
     def answered(
         self,
         capability: str | None,
@@ -8086,12 +8245,18 @@ class ProxyEgressTest(DatabaseCase):
         url: str = URL,
         method: str = "GET",
         port: int | None = None,
+        body: bytes | None = None,
     ) -> http.client.HTTPResponse:
         """One request at the door, and the whole answer it came back with.
 
         The `port` is a parameter because a Program's limits are not one door's:
         the arms that prove that send half their requests at a second door with a
         fence of its own, and the only thing that differs between them is this.
+
+        The `body` is one because ticket 96 made a request body expressible, and
+        the door's own framing is part of what is under test: `http.client`
+        measures the bytes handed to it, so what arrives is a request whose
+        length nobody here stated.
         """
         headers = {}
         if capability is not None:
@@ -8102,7 +8267,7 @@ class ProxyEgressTest(DatabaseCase):
             "127.0.0.1", port or self.server.server_address[1], timeout=proxy.TIMEOUT
         )
         try:
-            client.request(method, url, headers=headers)
+            client.request(method, url, headers=headers, body=body)
             answer = client.getresponse()
             answer.read()
             return answer
@@ -8329,6 +8494,190 @@ class ProxyEgressTest(DatabaseCase):
                 ).scalar()
             ),
         )
+
+    def test_a_body_is_refused_unless_its_tool_run_was_opened_to_carry_one(self):
+        """Ticket 96's first rule, at the only place that can hold it.
+
+        Permission for a body is decided when the Tool run is opened, out of the
+        `bb:effects` the Playbooks selected for its Task declare, and the door is
+        where it binds. Asked of the authorizer rather than of a Python guard,
+        because a decision the door could be talked out of is not a fence: the
+        same reason the method binding is a `RAISE` in this function and not an
+        `if` in `proxy.py`.
+        """
+        read_only, _, _ = self.mint("body")
+        writing, _, _ = self.writing("body", method="GET")
+        request = scope.canonical_request(URL)
+
+        # The Tool run that was not opened for one sends requests exactly as it
+        # did before ticket 96, and is refused the moment it has bytes after its
+        # headers.
+        self.fence.authorize(self.identifiers["body"], read_only, "GET", request, False)
+        with self.assertRaises(proxy.Refused) as raised:
+            self.fence.authorize(self.identifiers["body"], read_only, "GET", request, True)
+
+        self.assertEqual("capability refused", raised.exception.reason)
+        self.assertIn("egress body does not match authorized tool run", raised.exception.detail)
+
+        # And the one that was opened for it carries a body under the same
+        # capability shape, which is what makes this a permission rather than a
+        # prohibition.
+        decided = self.fence.authorize(
+            self.identifiers["body"], writing, "GET", request, True
+        )
+        self.assertEqual("target", decided.scope_class)
+
+    def test_a_browser_mission_is_not_asked_whether_its_page_may_send_a_body(self):
+        """The one tool named out of ticket 96's rule, and why it is named out.
+
+        A browser mission's bytes are a page's rather than a model's: a form the
+        target itself served, filled in and submitted by a real engine, and a
+        Tool run opened by `open_browser_run` carries no `body_allowed` because
+        nothing about it is a string a model wrote. What binds it is the method
+        set its own plan derived, which is a rule of its own in the same
+        function. Refusing it here would break every mission that submits a form
+        while protecting nothing, and doing that by omission -- because the key
+        happens to be absent -- would be worse than doing it on purpose.
+        """
+        self.runtime.execute(proxy.BIND, (self.identifiers["body"],))
+        with self.runtime.transaction():
+            self.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            run = self.runtime.execute(
+                proxy.OPEN_RUN,
+                (self.identifiers["body"], "operator", json.dumps({"command": "selftest"})),
+            ).scalar()
+            opened = self.runtime.execute(
+                proxy.OPEN_TOOL_RUN,
+                (
+                    self.identifiers["body"],
+                    str(run),
+                    str(self.connection.execute("SELECT rk2_browser_tool()").scalar()),
+                    json.dumps({"url": URL, "methods": ["GET", "POST"], "identity_slot": ""}),
+                ),
+            ).rows[0]
+        gate = self.runtime.execute(proxy.AUTHORIZE_TOOL_RUN, (str(opened[0]),)).scalar()
+        answer = json.loads(gate) if isinstance(gate, str) else dict(gate)
+        capability = str(answer["capability"])
+
+        decided = self.fence.authorize(
+            self.identifiers["body"], capability, "POST", scope.canonical_request(URL), True
+        )
+
+        self.assertEqual("target", decided.scope_class)
+        # And the method its plan did not derive is still refused, which is the
+        # rule that does bind a mission.
+        with self.assertRaises(proxy.Refused):
+            self.fence.authorize(
+                self.identifiers["body"],
+                capability,
+                "DELETE",
+                scope.canonical_request(URL),
+                True,
+            )
+
+    def test_a_body_the_tool_run_did_not_allow_leaves_a_blocked_receipt(self):
+        # The same rule from the caller's side, and the half that says a refusal
+        # is a record. 407 like every other capability refusal, one blocked
+        # Receipt, and a target that counted no request: a door that refused
+        # after forwarding would already have put the bytes in front of the
+        # parser it was protecting.
+        capability, _, _ = self.mint("body")
+        before = len(self.receipts("body"))
+        seen = len(self.target.seen)
+
+        answer = self.answered(
+            capability, self.identifiers["body"], method="POST", body=b"delete=all"
+        )
+
+        self.assertEqual(407, answer.status)
+        self.assertEqual(seen, len(self.target.seen))
+        filed = self.receipts("body")[before:]
+        self.assertEqual(1, len(filed))
+        lane, decision, reason, _, _ = filed[0]
+        self.assertEqual(("agent", "blocked", "capability refused"), (lane, decision, reason))
+
+    def test_a_body_a_tool_run_allowed_reaches_the_target_and_is_in_the_receipt(self):
+        """The permitted path, all the way through, with no new column recording it.
+
+        `receipts.request_agent_sha` has named the hash of the whole request
+        document since there were Receipts, and `transcript` has always been the
+        start line, the headers, a blank line and the body. So the assertion is
+        that the artifact the existing column points at holds the bytes the
+        target read, which is what makes a second `request_body_sha256` a hash of
+        bytes already hashed.
+        """
+        capability, tool_run, _ = self.writing("body", method="POST")
+        sent = b"note=the+body+the+model+wrote"
+        before = len(self.receipts("body"))
+
+        answer = self.answered(
+            capability, self.identifiers["body"], method="POST", body=sent
+        )
+
+        self.assertEqual(200, answer.status)
+        self.assertEqual(sent, self.target.bodies[-1])
+        method, _, arrived = self.target.seen[-1]
+        self.assertEqual("POST", method)
+        # The door's own measurement of the door's own document, which is why
+        # `Content-Length` is neither an argument nor a header a caller may set.
+        self.assertEqual(
+            [str(len(sent))], [value for name, value in arrived if name == "content-length"]
+        )
+
+        filed = self.receipts("body")[before:]
+        self.assertEqual(1, len(filed))
+        self.assertEqual(("agent", "allowed"), (filed[0][0], filed[0][1]))
+        stored = self.connection.execute(
+            "SELECT request_agent_sha FROM receipts"
+            " WHERE program_id = $1::uuid AND tool_run_id = $2::uuid",
+            (self.identifiers["body"], tool_run),
+        ).scalar()
+        self.assertTrue(Store(self.root).load(str(stored)).endswith(b"\r\n\r\n" + sent))
+
+    def test_one_approval_releases_one_task_and_no_other_body_bearing_one(self):
+        """Ticket 96's second rule, at the granularity the digest can express.
+
+        `canonical_request` derives `body_keys` from an object body this contract
+        cannot express, and the bytes are never in the digest at all: they are
+        chosen by a child after the Tool run's args were written, and the door
+        that carries them holds no write on `tool_runs`. So the honest key for a
+        call that may send a body nothing described is a key that matches nothing
+        else, and `writing` above is the whole of what that costs -- the operator
+        is asked once per Task rather than once per Program per path template.
+
+        Both halves, because either alone would pass for the wrong reason. A
+        second attempt at the released Task computes the key its operator
+        answered, or an approval releases work that then asks the same question
+        for ever. A second Task computes a different one, or the first Task's
+        approval is a standing grant to write, which is what this rule exists to
+        stop.
+        """
+        # `writing` already made the second attempt and asserted it was allowed
+        # without a second question, which is the first half.
+        _, released, task = self.writing("body", method="POST")
+        keys = "SELECT equivalence_key(current_request_digest($1::uuid))"
+        answered = str(self.connection.execute(keys, (released,)).scalar())
+
+        third = self.attempting("body", task, "POST")
+        self.assertEqual(answered, str(self.connection.execute(keys, (third,)).scalar()))
+
+        # A different Task, asking for the same method against the same path
+        # template, and it is a different question.
+        other = self.attempting("body", self.fresh_task("body"), "POST")
+
+        self.assertNotEqual(answered, str(self.connection.execute(keys, (other,)).scalar()))
+        # And nothing moved for a Task that may not write: two of those against
+        # one path template are still one question, which is the reading work
+        # this rule was not allowed to disturb.
+        reading = [
+            str(
+                self.connection.execute(
+                    keys, (self.mint("body")[1],)
+                ).scalar()
+            )
+            for _ in range(2)
+        ]
+        self.assertEqual(reading[0], reading[1])
 
     def test_identity_provisioning_leaves_only_an_encrypted_control_side_slot(self):
         marker = "rk2-provisioned-bearer-6d28ea"
@@ -43461,7 +43810,7 @@ READ_ONLY_TO_THE_RUNTIME = (
 #: closed by the time PH2-66 was written.
 PROXY_VERBS = (
     "authorize_identity_egress_address(text, text, text, integer, text)",
-    "authorize_identity_egress_request(text, text, text, text, integer, text, text)",
+    "authorize_identity_egress_request(text, text, text, text, integer, text, text, boolean)",
     "confirm_required_headers_open(text, uuid, text)",
     "ensure_proxy_wire_keying(text, bytea, bytea)",
     "open_required_headers(text)",

@@ -844,15 +844,36 @@ class GateTest(unittest.TestCase):
                 url="https://x",
                 headers={"X-Trace": "a\n"},
             ),
-            # The two arguments this contract used to declare and the runtime
-            # never served: a body the child has no store to name, and an
-            # identity the runtime chose before the child started.
+            # The body under the spelling it was withheld under. Ticket 96 gave
+            # this contract a `body`, and it is a string the child writes itself
+            # rather than a hash into a store the child still does not have, so
+            # the hash form names nothing and is denied for the ordinary reason:
+            # no contract declares it.
             hunting(
                 "mcp__rk2__http_request",
                 method="GET",
                 url="https://x",
                 body_artifact_hash="a" * 64,
             ),
+            # A body one byte past the ceiling the contract states.
+            hunting(
+                "mcp__rk2__http_request",
+                method="POST",
+                url="https://x",
+                body="b" * 65537,
+            ),
+            # A body of the shape the gate cannot scan. An object here would be
+            # walked for a forbidden name and a string never is, which is why
+            # the argument is a string; the schema and the gate agree about that
+            # rather than the gate quietly accepting what the schema refuses.
+            hunting(
+                "mcp__rk2__http_request",
+                method="POST",
+                url="https://x",
+                body={"note": "hello"},
+            ),
+            # And the identity that is still withheld, for the reason that did
+            # not change: the runtime chose it before the child started.
             hunting(
                 "mcp__rk2__http_request",
                 method="GET",
@@ -1239,6 +1260,58 @@ class ContractSchemaTest(unittest.TestCase):
         self.assertEqual(roster._PAGE, (limit["minimum"], limit["maximum"]))
         self.assertNotIn("minLength", limit)
         self.assertNotIn("maxLength", limit)
+
+    def test_a_request_may_declare_a_body_and_it_is_a_bounded_string(self):
+        """Ticket 96's first criterion, read off the document the pair is served.
+
+        A string and not an object, and the reason is the gate rather than
+        taste: the forbidden-name scan returns immediately for anything that is
+        not a mapping, a list or a tuple, so an object body would be walked for
+        an `Authorization` key and the most ordinary login form in web testing
+        would be denied for containing the word. A string is never walked, and a
+        body is the one argument whose contents are the subject of the test
+        rather than an instruction to this harness.
+        """
+        schema = roster.CONTRACTS["mcp__rk2__http_request"].schema()
+        body = schema["properties"]["body"]
+
+        self.assertEqual(
+            {"type": "string", "minLength": 0, "maxLength": 65536}, body
+        )
+        # Not required, because most requests have none, and an empty string is
+        # a body a caller chose to send rather than one it left out.
+        self.assertNotIn("body", schema["required"])
+        # The two framing headers stay out of the contract. `Content-Type` is
+        # not here because it is a header and the contract already takes those;
+        # `Content-Length` is not here and is not a header a caller may set,
+        # because it is the door's measurement of the door's own document.
+        self.assertNotIn("content_type", schema["properties"])
+        self.assertNotIn("content_length", schema["properties"])
+
+    def test_a_body_within_its_bounds_is_a_call_the_gate_allows(self):
+        # The denial list two tests up says which bodies are refused. This is
+        # the other half, and without it a contract that declared `body` and a
+        # gate that denied every one of them would pass this file.
+        hunter = roster.Gate("web_hunter")
+        hunter.bind("agent-1", "web_hunter")
+
+        for sent in ("", "u=admin&p=hunter2", "b" * 65536):
+            with self.subTest(length=len(sent)):
+                self.assertIsNone(
+                    hunter.decide(
+                        roster.Call(
+                            tool="mcp__rk2__http_request",
+                            arguments={
+                                "method": "POST",
+                                "url": "https://target.example.test/login",
+                                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                                "body": sent,
+                            },
+                            agent_id="agent-1",
+                            agent_type="web_hunter",
+                        )
+                    )
+                )
 
     def test_the_one_result_takes_every_element_list_the_spec_names(self):
         # Spec section 13: "proposed Entities, Relationships, Observations,
