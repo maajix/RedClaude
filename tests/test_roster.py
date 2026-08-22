@@ -1622,6 +1622,215 @@ class RelationAgreementTest(unittest.TestCase):
                 self.assertIn(name, self.named())
 
 
+class VocabularyAgreementTest(unittest.TestCase):
+    """Every closed vocabulary the roster serves is the one the corpus declares.
+
+    The roster now states, in `APPLICATION_KINDS` and the tuples beside it, sets
+    of words the database is the authority on: some are a check constraint on
+    the column promotion writes, some are the rows of a reference table its walk
+    looks the value up in. Restating them is what puts them in the served schema,
+    where a model can be refused for a word outside one instead of losing the
+    element to a `proposal_drops` row after its run has ended -- and restating
+    them is also how they go stale, because two statements of one vocabulary
+    agree until somebody edits one.
+
+    So this reads the corpus and not a server, for the reason `RelationAgreement`
+    above reads the corpus: the migrations are what create the database, they are
+    in the tree, and a check that needs PostgreSQL is a check that is skipped in
+    the loop where these constants are actually edited. What it costs is that
+    this parses SQL rather than querying it, which is why the extraction is
+    anchored on the statement -- `CREATE TABLE <table>` or `ALTER TABLE <table>`
+    for a constraint, `INSERT INTO <table>` for a seed -- rather than on the
+    words themselves. A vocabulary the parser cannot find comes back empty and
+    fails, which is the safe direction to be wrong in.
+    """
+
+    LITERAL = re.compile(r"'([^']*)'")
+
+    @classmethod
+    def setUpClass(cls):
+        corpus = ROOT / "src" / "redkraken" / "migrations"
+        cls.migrations = [
+            path.read_text(encoding="utf-8") for path in sorted(corpus.glob("*.sql"))
+        ]
+
+    @classmethod
+    def balanced(cls, text: str, opening: int) -> str:
+        """The text inside the parenthesis that opens at `opening`.
+
+        A count rather than a lazy regex, because every list this reads is
+        nested: `CHECK (value_class IS NULL OR value_class IN (...))` closes two
+        parentheses and a pattern stopping at the first one would read half a
+        vocabulary as the whole of it.
+        """
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[opening:index]
+        raise AssertionError("the corpus has an unbalanced parenthesis")
+
+    @classmethod
+    def constraint(cls, table: str, column: str) -> tuple[str, ...]:
+        """`column`'s vocabulary as the last statement about `table` states it.
+
+        The last and not the first: 20260929T020000Z drops and re-adds
+        `identities_class_check` to retire a value, so the answer is the one the
+        migrations arrive at rather than the one they start from.
+        """
+        found: tuple[str, ...] = ()
+        for text in cls.migrations:
+            statements = []
+            created = re.search(rf"CREATE TABLE {table}\s*\(", text)
+            if created is not None:
+                statements.append(cls.balanced(text, created.end() - 1))
+            for altered in re.finditer(rf"ALTER TABLE {table}\b", text):
+                statements.append(text[altered.end():text.index(";", altered.end())])
+            for statement in statements:
+                for check in re.finditer(r"CHECK\s*\(", statement):
+                    # Only a check this column leads. 0021 constrains
+                    # `entities.scope_selector` with a clause that reads
+                    # `OR type IN ('identity','technology')`, which is a true
+                    # sentence about two of the eight types and would be read
+                    # here as the whole vocabulary.
+                    body = cls.balanced(statement, check.end() - 1)
+                    if not re.match(rf"\(\s*{column}\b", body):
+                        continue
+                    listed = re.search(rf"\b{column} IN \(", body)
+                    if listed is not None:
+                        found = tuple(
+                            cls.LITERAL.findall(cls.balanced(body, listed.end() - 1))
+                        )
+        return found
+
+    @classmethod
+    def seeded(cls, table: str) -> list[list[str]]:
+        """The literals leading each row every `INSERT INTO table` seeds.
+
+        Leading, because that is where the identifiers are and what follows them
+        is a description carrying doubled quotes and commas of its own. A row
+        begins a line -- every seed in this corpus is written that way -- so the
+        rows are the lines opening with a parenthesis, and the statement ends at
+        the first line closing with a semicolon.
+        """
+        rows: list[list[str]] = []
+        for text in cls.migrations:
+            lines = text.splitlines()
+            for number, line in enumerate(lines):
+                if f"INSERT INTO {table} " not in line:
+                    continue
+                head = line.split("VALUES", 1)
+                if len(head) == 2 and head[1].strip():
+                    rows += [cls.LITERAL.findall(one) for one in head[1].split("), (")]
+                    continue
+                for follow in lines[number + 1:]:
+                    if follow.lstrip().startswith("("):
+                        rows.append(cls.LITERAL.findall(follow))
+                    if follow.rstrip().endswith(";"):
+                        break
+        return rows
+
+    def test_the_entity_vocabularies_are_the_columns_the_corpus_checks(self):
+        for constant, table, column in (
+            (roster.ENTITY_TYPES, "entities", "type"),
+            (roster.APPLICATION_KINDS, "applications", "kind"),
+            (roster.PARAMETER_LOCATIONS, "parameters", "location"),
+            (roster.PARAMETER_VALUE_CLASSES, "parameters", "value_class"),
+            (roster.RELATIONSHIP_TYPES, "relationships", "type"),
+            (roster.EVIDENCE_POLARITIES, "hypothesis_evidence", "polarity"),
+            (roster.EVIDENCE_ROLES, "hypothesis_evidence", "role"),
+            (roster.HYPOTHESIS_STATUSES, "hypotheses", "status"),
+        ):
+            with self.subTest(column=f"{table}.{column}"):
+                self.assertEqual(set(constant), set(self.constraint(table, column)))
+
+    def test_the_only_identity_class_an_agent_proposes_is_one_the_column_takes(self):
+        # A subset and not an equality, and the one vocabulary here that is.
+        # `IDENTITY_CLASSES` states what may be *sent*, which is narrower than
+        # what the column holds: the other two classes carry a `secret_ref` the
+        # operator places, and `promote_proposal` refuses an element naming one.
+        # What this can still catch is the failure that matters -- the column
+        # losing the word the schema tells every hunter to use.
+        declared = set(self.constraint("identities", "class"))
+
+        self.assertTrue(declared)
+        self.assertLessEqual(set(roster.IDENTITY_CLASSES), declared)
+        self.assertIn("anonymous", roster.IDENTITY_CLASSES)
+
+    def test_the_task_kinds_are_the_rows_the_scheduler_seeds(self):
+        self.assertEqual(
+            set(roster.TASK_KINDS), {row[0] for row in self.seeded("task_kinds")}
+        )
+
+    def test_every_observation_kind_carries_the_provenance_its_row_allows(self):
+        # Both halves of the row. The keys are what the schema serves as an
+        # enum; the values are what the description states in a sentence, and a
+        # sentence with nothing measuring it is how this vocabulary came to be
+        # wrong in prose in the first place.
+        seeded = {}
+        for row in self.seeded("observation_kinds"):
+            # `'{receipt,tool_run}'` in most rows and `ARRAY['receipt']` in the
+            # one 0025 adds. Two spellings of one array, flattened to the words.
+            seeded[row[0]] = tuple(
+                word
+                for literal in row[2:]
+                for word in literal.strip("{}").split(",")
+                if word
+            )
+
+        self.assertEqual(dict(roster.OBSERVATION_KINDS), seeded)
+
+    def test_every_property_class_is_seeded_and_sits_in_a_seeded_family(self):
+        seeded = {row[0]: row[1] for row in self.seeded("property_classes")}
+
+        self.assertEqual(set(roster.PROPERTY_CLASSES), set(seeded))
+        # The family is the part before the dot, which is what lets the roster
+        # hold one flat tuple instead of a mapping. True of every seeded row and
+        # asserted rather than assumed, because a class whose family_id did not
+        # match its prefix would make the flat tuple a lossy restatement.
+        self.assertEqual(
+            {identifier.split(".")[0] for identifier in roster.PROPERTY_CLASSES},
+            {row[0] for row in self.seeded("property_class_families")},
+        )
+        for identifier, family in sorted(seeded.items()):
+            with self.subTest(property_class=identifier):
+                self.assertEqual(family, identifier.split(".")[0])
+
+    def test_every_element_field_the_schema_closes_names_a_corpus_vocabulary(self):
+        # The wiring itself, so that a seventh element list or a fifth entity
+        # field cannot be added with a tuple nothing above measures. Every enum
+        # the served schema carries under `items` is one of the constants those
+        # tests hold to the corpus, and no other.
+        held = {
+            roster.ENTITY_TYPES,
+            roster.APPLICATION_KINDS,
+            roster.PARAMETER_LOCATIONS,
+            roster.PARAMETER_VALUE_CLASSES,
+            roster.IDENTITY_CLASSES,
+            roster.RELATIONSHIP_TYPES,
+            tuple(roster.OBSERVATION_KINDS),
+            roster.PROPERTY_CLASSES,
+            roster.EVIDENCE_POLARITIES,
+            roster.EVIDENCE_ROLES,
+            roster.TASK_KINDS,
+        }
+        contract = roster.CONTRACTS["mcp__rk2__submit_mission_result"]
+
+        declared = [
+            (name, field, shape)
+            for name, argument in contract.arguments.items()
+            if argument.element is not None
+            for field, shape in argument.element.items()
+        ]
+        self.assertTrue(declared)
+        for name, field, shape in declared:
+            with self.subTest(element=f"{name}[].{field}"):
+                self.assertIn(shape.enum, held)
+
+
 def agent_read() -> str:
     """One tool a launch serves, spelled the way the CLI spells it.
 

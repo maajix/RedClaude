@@ -202,6 +202,171 @@ HYPOTHESIS_STATUSES = (
     "inconclusive",
 )
 
+# The vocabularies a proposed element is measured against, restated from the
+# migration corpus that declares them. Every one is a closed set the database
+# already refuses outside of -- a check constraint on the column promotion
+# writes, or a reference table promotion looks the value up in -- and until now
+# the only place a child could learn one was a sentence in a tool description.
+# Four hunts against real targets lost 30, 24, 14 and 11 elements to drops
+# written after the run had ended, and the widest of them started at a word:
+# one `kind` of "website" took an Application, two Endpoints, four
+# Relationships, seventeen Observations, three Hypotheses and three evidence
+# edges down with it, because everything after it named it by ref.
+#
+# A word outside one of these is not a claim promotion might yet accept; it is a
+# word this system has no row for, and `unknown_kind` is the only answer
+# promotion can give it. So these are not the roster deciding what a proposal
+# says -- that is still promotion's, and `OPEN_ARGUMENTS` still holds -- they
+# are the words a proposal can be spelled in. `tests/test_roster.py` holds every
+# one of them to the corpus, because a vocabulary stated in two places is a
+# vocabulary that goes stale in one of them.
+
+#: `applications.kind`, from migration 0003's check constraint.
+APPLICATION_KINDS = ("web", "api", "spa", "graphql", "websocket")
+
+#: `parameters.location`, from the same file. There is no `form` and no `json`:
+#: both are a body.
+PARAMETER_LOCATIONS = ("query", "body", "path", "header", "cookie")
+
+#: `parameters.value_class`, which 20260926T010000Z closed at the column after
+#: finding that promotion stored whatever it was handed. Optional on the row and
+#: so optional in an element; what it may not be is a tenth word.
+PARAMETER_VALUE_CLASSES = (
+    "uuid",
+    "integer_id",
+    "opaque_id",
+    "url",
+    "file",
+    "email",
+    "number",
+    "path",
+    "serialized",
+)
+
+#: The one `identities.class` an agent may propose. The column admits three --
+#: 20260929T020000Z retired a fourth -- and the two this omits both require a
+#: `secret_ref`, which is credential material the operator places and no model
+#: proposes. `promote_proposal` says so in a sentence and refuses the element;
+#: this says the same thing one step earlier. It is deliberately the proposable
+#: set rather than the column's, because a served schema is a promise about
+#: calls and not an inventory of rows.
+IDENTITY_CLASSES = ("anonymous",)
+
+#: `relationships.type`, as 20260829T000000Z last amended it. Which ordered pair
+#: of Entity types each one admits is `relationship_directions` and is not here:
+#: an element names its two ends by ref or by label, so nothing in the payload
+#: says what types are being joined and no schema over that payload could check
+#: the pair. That half of the rule stays prose, and is the reason the prose
+#: still exists.
+RELATIONSHIP_TYPES = (
+    "resolves_to",
+    "serves",
+    "runs",
+    "owns",
+    "member_of",
+    "redirects_to",
+    "embeds",
+    "same_as",
+)
+
+#: `observation_kinds`, and the `allowed_provenance` array each row carries.
+#: The keys are the vocabulary the schema serves; the values are the second
+#: rule, which the schema cannot serve -- whether a kind may stand on a Receipt
+#: or on a Tool run is a relation between two fields of one element, and the
+#: description states it in words. They are held here anyway so that the
+#: sentence has something the corpus test can measure it against.
+OBSERVATION_KINDS = {
+    "artifact_captured": ("receipt", "tool_run"),
+    "callback_interaction": ("callback",),
+    "content_match": ("tool_run",),
+    "credential_effect": ("receipt",),
+    "endpoint_discovered": ("receipt", "tool_run"),
+    "error_detail": ("receipt", "tool_run"),
+    "header_policy_observed": ("receipt", "tool_run"),
+    "identity_established": ("receipt",),
+    "parameter_discovered": ("receipt", "tool_run"),
+    "reflected_input": ("receipt", "tool_run"),
+    "response_differential": ("receipt",),
+    "response_invariant": ("receipt",),
+    "state_change": ("receipt",),
+    "technology_identified": ("receipt", "tool_run"),
+    "timing_differential": ("receipt",),
+    "transport_parameters_observed": ("receipt",),
+}
+
+#: `property_classes.id`, every row the corpus seeds. Written flat rather than
+#: as eight families, because the family is the part of the id before the dot
+#: and a second structure saying so is a second thing to keep true; the corpus
+#: test derives the families back out and checks them against
+#: `property_class_families`. Long, and that is the point: a hunter picking the
+#: nearest of fifty-seven declared classes is doing what the vocabulary is for,
+#: while a hunter inventing a fifty-eighth loses the Hypothesis and every
+#: evidence edge that named it.
+PROPERTY_CLASSES = (
+    "authentication.credential_verification",
+    "authentication.factor_enforcement",
+    "authentication.federation_trust",
+    "authentication.recovery_flow",
+    "authorization.channel_subscription",
+    "authorization.edge_rule",
+    "authorization.function_access",
+    "authorization.object_ownership",
+    "authorization.parallel_route",
+    "authorization.state_transition",
+    "authorization.tenant_isolation",
+    "authorization.token_scope",
+    "business_logic.quantity_or_price",
+    "business_logic.replay",
+    "business_logic.workflow_order",
+    "information_disclosure.artifact_exposure",
+    "information_disclosure.cached_response",
+    "information_disclosure.client_storage",
+    "information_disclosure.credential_material",
+    "information_disclosure.dependency_manifest",
+    "information_disclosure.error_detail",
+    "information_disclosure.excess_field",
+    "information_disclosure.identifier_oracle",
+    "information_disclosure.log_record",
+    "information_disclosure.undeclared_field",
+    "information_disclosure.workload_metadata",
+    "injection.client_channel",
+    "injection.client_path",
+    "injection.command",
+    "injection.document_parser",
+    "injection.foreign_resource",
+    "injection.formula",
+    "injection.markup",
+    "injection.model_instruction",
+    "injection.object_graph",
+    "injection.parameter_precedence",
+    "injection.path",
+    "injection.query_field",
+    "injection.query_language",
+    "injection.query_operator",
+    "injection.request_forgery",
+    "injection.stored_file",
+    "injection.template",
+    "injection.url_authority",
+    "rate_limiting.per_identity",
+    "rate_limiting.per_origin",
+    "rate_limiting.resource_cost",
+    "session_handling.cookie_scope",
+    "session_handling.cross_origin_read",
+    "session_handling.csrf",
+    "session_handling.fixation",
+    "session_handling.lifetime",
+    "transport.certificate_trust",
+    "transport.datagram_transport",
+    "transport.header_policy",
+    "transport.request_framing",
+    "transport.tls_configuration",
+)
+
+#: `hypothesis_evidence.polarity` and `.role`, from migration 0007. A refutation
+#: is evidence, which is why `refutes` is a polarity and not a failure to file.
+EVIDENCE_POLARITIES = ("supports", "refutes")
+EVIDENCE_ROLES = ("baseline", "variant", "control", "context")
+
 #: Names for the runtime's own choice of tenant. Every canonical table is
 #: program-scoped and the program is bound in the handler from runtime
 #: configuration, so an argument that named one would be the agent choosing
@@ -334,6 +499,15 @@ class Argument:
     admission that this roster constrains nothing about a value; it is allowed
     only where `OPEN_ARGUMENTS` says why, and never on a tool the validator can
     reach.
+
+    `element` is the one thing that sits beside `free_text` rather than against
+    it, and it is deliberately not counted by `constrained`. An open argument is
+    open about what it *carries*: any key, any depth, no required field, and the
+    gate reads an instruction word inside it as the hunter's own report rather
+    than as an instruction. Naming the closed vocabulary a particular field of a
+    particular element is drawn from takes none of that back -- it says which
+    words exist, not which claims are true -- so the two are orthogonal and an
+    argument may hold both.
     """
 
     kind: str
@@ -344,6 +518,11 @@ class Argument:
     values_pattern: str | None = None
     bounds: tuple[int, int] | None = None
     free_text: bool = False
+    #: The named fields of one element of an array, each a declared `Argument`
+    #: of its own. Spelled `element` and not `items` because this codebase calls
+    #: these the element lists, and because `items_pattern` already spends the
+    #: other word on an array of labels.
+    element: Mapping[str, "Argument"] | None = None
 
     @property
     def constrained(self) -> bool:
@@ -390,6 +569,31 @@ class Argument:
             # nothing about its value, and on an argument that is put on a
             # wire the value is the half that can carry a second request.
             body["additionalProperties"] = {"type": "string", "pattern": self.values_pattern}
+        if self.element is not None:
+            # Three things are absent from this subschema and each absence is
+            # the decision. No `required`, so an element that leaves a field out
+            # is still a well-formed call: a missing field costs that one
+            # element at promotion, and refusing the call for it would cost
+            # every other element sent beside it. No
+            # `additionalProperties: false`, because the
+            # fields named here are a handful of the dozen a typed element
+            # carries and closing the object would refuse every honest one. No
+            # `type: object` either, for the same reason as the first: a string
+            # where an element belongs is dropped by promotion today and there
+            # is nothing to gain by ending the whole submission over it.
+            #
+            # What is left is the half that is worth refusing loudly. A value
+            # outside one of these enums is refused by the CLI before
+            # `PreToolUse` runs, which the model sees as a rejected tool call it
+            # can correct and re-send inside the same run -- where the same
+            # value reaching promotion is a `proposal_drops` row written after
+            # the run has ended, taking every later element that pointed at the
+            # dropped one with it.
+            body["items"] = {
+                "properties": {
+                    name: shape.schema() for name, shape in self.element.items()
+                }
+            }
         return body
 
 
@@ -578,6 +782,13 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
 #: `completion_claim` is deliberately not here. It is the one member of that
 #: packet the runtime reads a field out of, so its keys are closed like any
 #: other interpreted argument's.
+#:
+#: The six lists are still here now that they carry an `Argument.element`, and
+#: that is not an oversight. Being open is what `_opaque` reads them by, and
+#: what it decides is that `secret` and `password` inside an Observation are the
+#: hunter's report of what it found rather than an attempt to send one. A
+#: closed vocabulary for `kind` does not make an element list any less the place
+#: an exposed credential gets written down.
 OPEN_ARGUMENTS = {
     "mcp__rk2__park_for_human": ("question",),
     "mcp__rk2__submit_mission_result": (
@@ -618,6 +829,41 @@ _ARGUMENT_NAME = "^[a-z][a-z0-9_]{0,31}$"
 #: response by serialized bytes as well, so this is the coarse half of the
 #: ceiling and the byte budget is the half that binds.
 _PAGE = (1, 200)
+
+#: The named fields of one element of each of the six lists, and the vocabulary
+#: each of those fields is drawn from. Keyed by the argument name so that the
+#: contract below reads as six lists rather than six shapes, and so that
+#: `proposal_drops.element_path` and this table are indexed the same way.
+#:
+#: Only the fields whose vocabulary is closed. `fqdn`, `base_url`,
+#: `path_template`, `statement` and the rest of what promotion reads are absent,
+#: because a schema that named them without constraining them would be
+#: documentation in the wrong place -- the description is where a field name a
+#: model has to guess belongs.
+#:
+#: `new_entities` is one list for eight Entity types, so its shape is the union
+#: of four fields no two of those types share: `kind` is an Application's,
+#: `location` and `value_class` are a Parameter's, `class` is an Identity's.
+#: That union is only safe while it stays a union -- a later type that spelled
+#: `kind` differently would silently narrow the other one -- and the corpus test
+#: is what would notice.
+_ELEMENTS: dict[str, Mapping[str, Argument]] = {
+    "new_entities": {
+        "type": Argument("string", enum=ENTITY_TYPES),
+        "kind": Argument("string", enum=APPLICATION_KINDS),
+        "location": Argument("string", enum=PARAMETER_LOCATIONS),
+        "value_class": Argument("string", enum=PARAMETER_VALUE_CLASSES),
+        "class": Argument("string", enum=IDENTITY_CLASSES),
+    },
+    "relationships": {"type": Argument("string", enum=RELATIONSHIP_TYPES)},
+    "observations": {"kind": Argument("string", enum=tuple(OBSERVATION_KINDS))},
+    "hypotheses": {"property_class": Argument("string", enum=PROPERTY_CLASSES)},
+    "evidence": {
+        "polarity": Argument("string", enum=EVIDENCE_POLARITIES),
+        "role": Argument("string", enum=EVIDENCE_ROLES),
+    },
+    "suggested_tasks": {"kind": Argument("string", enum=TASK_KINDS)},
+}
 
 # The view each read comes through, then the canonical relations behind it.
 # The child has no database: `packet.compile` runs these on the supervisor's
@@ -766,17 +1012,51 @@ CONTRACTS: dict[str, Contract] = {
     # element lists stay open because a proposal is raw model output and the
     # runtime decides what grounds; the claim is not raw output, it is an
     # answer to a question this schema asked.
+    #
+    # And they stay open while carrying `_ELEMENTS`, which is the distinction
+    # that decision turns on rather than an exception to it. "The runtime
+    # decides what grounds" is about judgement: whether a Receipt supports a
+    # reading, whether a claim is worth a row, whether a proposal is true. None
+    # of that moves. What `_ELEMENTS` states is the opposite kind of fact -- the
+    # set of words a field can be spelled in -- and promotion holds no opinion
+    # about a word outside it: `unknown_kind` is the only answer it has, and it
+    # writes that answer into `proposal_drops` after the run that made the
+    # mistake has already ended. Four hunts promoted zero Hypotheses between
+    # them, and every rule they broke was already written out in this tool's
+    # description at the time they broke it. Prose served once at schema time is
+    # not read again while a thirty-element payload is being composed; an enum
+    # in the schema is checked against every element that carries the field.
+    #
+    # The cost is real and is the reason the shape is as thin as it is. The CLI
+    # validates against the served schema before `PreToolUse` runs, so a value
+    # outside an enum fails the whole call rather than losing one element, and a
+    # run that cannot get its result accepted files nothing at all. That is why
+    # no field of an element is `required`, why the element object is not
+    # closed, and why only fields with a genuinely closed vocabulary are named:
+    # everything that is merely *probably* wrong is left to promotion, where it
+    # costs one element, and only what is *certainly* refused is refused here,
+    # where it costs a retry the model can actually make.
     "mcp__rk2__submit_mission_result": Contract(
         "state.propose",
         PROPOSE,
         writes=STAGING,
         arguments={
-            "observations": Argument("array", required=True, free_text=True),
-            "new_entities": Argument("array", free_text=True),
-            "relationships": Argument("array", free_text=True),
-            "hypotheses": Argument("array", free_text=True),
-            "evidence": Argument("array", free_text=True),
-            "suggested_tasks": Argument("array", free_text=True),
+            "observations": Argument(
+                "array", required=True, free_text=True, element=_ELEMENTS["observations"]
+            ),
+            "new_entities": Argument(
+                "array", free_text=True, element=_ELEMENTS["new_entities"]
+            ),
+            "relationships": Argument(
+                "array", free_text=True, element=_ELEMENTS["relationships"]
+            ),
+            "hypotheses": Argument(
+                "array", free_text=True, element=_ELEMENTS["hypotheses"]
+            ),
+            "evidence": Argument("array", free_text=True, element=_ELEMENTS["evidence"]),
+            "suggested_tasks": Argument(
+                "array", free_text=True, element=_ELEMENTS["suggested_tasks"]
+            ),
             "completion_claim": Argument(
                 "object", required=True, items_pattern="^(status|note)$"
             ),
@@ -1714,6 +1994,22 @@ def _value_fault(argument: Argument, value: Any) -> str | None:
         measure = value if isinstance(value, int) else len(value)
         if not low <= measure <= high:
             return f"is outside {low}-{high}"
+    if argument.element is not None and isinstance(value, (list, tuple)):
+        # The gate's half of the element shape, checked for the reason every
+        # other property here is checked twice: the schema is the pair's promise
+        # and this is ours. An element that is not an object, or that leaves a
+        # field out, is passed over rather than refused -- the subschema does
+        # not ask for either, and promotion is where a shapeless element stops
+        # being a candidate.
+        for one in value:
+            if not isinstance(one, Mapping):
+                continue
+            for member, shape in argument.element.items():
+                if member not in one:
+                    continue
+                fault = _value_fault(shape, one[member])
+                if fault is not None:
+                    return f"carries {member!r}, which {fault}"
     return None
 
 
@@ -2064,6 +2360,20 @@ def _check_argument(tool: str, contract: Contract, name: str, argument: Argument
                 raise RosterError(f"{tool}.{name}: {error}") from error
     if argument.bounds is not None and argument.bounds[0] > argument.bounds[1]:
         raise RosterError(f"{tool}.{name}: bounds are the wrong way round")
+    if argument.element is not None:
+        if argument.kind != "array":
+            raise RosterError(f"{tool}.{name}: only an array has elements")
+        if argument.items_pattern is not None:
+            raise RosterError(f"{tool}.{name}: an array of labels has no element fields")
+        # Each field checked as the argument it is, which is what makes the
+        # nesting worth having: a field named `token` or `model` is refused by
+        # `FORBIDDEN_ARGUMENTS` here exactly as a top-level argument would be,
+        # and a field declared with no vocabulary at all is refused for being
+        # neither constrained nor declared open. An element shape that
+        # constrained nothing would be a subschema that promised something and
+        # said nothing.
+        for member, shape in argument.element.items():
+            _check_argument(tool, contract, member, shape)
 
 
 def _check_authority() -> None:

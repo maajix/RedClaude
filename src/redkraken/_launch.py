@@ -843,27 +843,71 @@ DESCRIPTIONS = {
         "reading is entirely read-only is refused a body at the door, with a "
         "Receipt saying so."
     ),
-    # The element lists stay open -- `roster.OPEN_ARGUMENTS` says why -- so this
-    # sentence is the only place a child is told which fields promotion reads
-    # out of them. A field name it has to guess is a drop row with
-    # `malformed_field` on it and no way for the model to learn the spelling.
+    # The element lists carry `roster._ELEMENTS` now, so every closed vocabulary
+    # this tool used to spell out is served as an enum instead and is checked on
+    # the call rather than read once. What is left here is what a schema over
+    # this payload cannot say: which field names promotion reads out of an
+    # untyped element, and the four rules that hold between two fields rather
+    # than about one -- the ref/label handles, the containment parent, the
+    # ordered pair a relationship type admits, and the provenance a kind admits.
+    # A field name a child has to guess is a `malformed_field` drop with no way
+    # for the model to learn the spelling, which is why the typed fields stay.
     "submit_mission_result": (
         "Submit this run's one result: proposed Entities, Relationships, "
-        "Hypotheses, Observations with the Receipt or Tool Run each cites, evidence "
-        "edges, suggested Tasks and a completion claim. It is staging data. The "
-        "runtime checks provenance and decides what becomes canonical; nothing here "
-        "is true because it was submitted.\n\n"
-        "Every element cites its evidence with exactly one of receipt_label or "
-        "tool_run_label. An entity carries type and the typed fields of that type: "
-        "domain fqdn and wildcard; host hostname and address; service parent_ref "
-        "with port and protocol; application base_url and kind; endpoint parent_ref "
-        "with method and path_template; parameter parent_ref with name and "
-        "location; technology name and version; identity slot_name. A service, an "
-        "endpoint and a parameter name their containment parent by parent_ref or "
-        "parent_label; give an entity a ref of your own and later elements can "
-        "point at it by that name before it has a label. A relationship carries "
-        "type with src_ref or src_label and dst_ref or dst_label, and containment "
-        "is never one of them."
+        "Observations, Hypotheses, evidence edges, suggested Tasks and a completion "
+        "claim. It is staging data. The runtime checks provenance and decides what "
+        "becomes canonical; nothing here is true because it was submitted.\n\n"
+        "Every element -- every entity, every relationship, every observation, "
+        "without exception -- cites its evidence with exactly one of receipt_label "
+        "or tool_run_label. An element that names neither is dropped before any "
+        "other field of it is read, so put the citation on each one as you write "
+        "it rather than on the result as a whole.\n\n"
+        "Give an element a ref of your own and later elements reach it by that "
+        "name before it has a label: an entity's ref answers parent_ref, src_ref, "
+        "dst_ref and subject_ref, an observation's answers observation_ref, a "
+        "hypothesis's answers hypothesis_ref. A row this Program already holds is "
+        "named by its label in the same places -- parent_label, src_label, "
+        "subject_label.\n\n"
+        "An entity carries its type and the typed fields of that type: domain "
+        "fqdn and wildcard; host hostname and address; service port and protocol; "
+        "application base_url and kind; endpoint method and path_template; "
+        "parameter name, location and value_class; technology name and version; "
+        "identity slot_name. A service, an endpoint and a parameter each name a "
+        "containment parent by parent_ref or parent_label, and only one type may "
+        "hold each: a service under a host, an endpoint under an application, a "
+        "parameter under an endpoint. Containment is never a relationship.\n\n"
+        "A relationship type admits one ordered pair of entity types and refuses "
+        "the rest: resolves_to domain to host; serves host to application; runs "
+        "host or application to technology; embeds and redirects_to endpoint to "
+        "endpoint; owns identity to any of domain, host, service, application, "
+        "endpoint, parameter; member_of identity to identity; same_as two "
+        "entities of the same type.\n\n"
+        "An observation is about an Entity and says what sort of reading it is, "
+        "so it carries a subject and a kind; one missing either is dropped whole, "
+        "however good the sentence in it is. A kind admits only some provenance. "
+        "content_match takes a Tool Run only; callback_interaction takes a "
+        "callback; credential_effect, identity_established, "
+        "response_differential, response_invariant, state_change, "
+        "timing_differential and transport_parameters_observed take a Receipt "
+        "only; the other seven take either. transport_parameters_observed has a "
+        "second condition: this Program's egress is intercepted, so the TLS "
+        "parameters on an ordinary Receipt are the fence's own and not the "
+        "target's, and an observation asserting them is refused. Claim transport "
+        "only from a Receipt whose transport is citable.\n\n"
+        "A hypothesis is a falsifiable claim about one Entity: a subject, a "
+        "property_class, a statement, a ref of its own, and a rationale object "
+        "whose only three keys are mechanism, expectation and falsifier, all "
+        "three answered. Do not carry status, outcome, verdict or transition: "
+        "those are the runtime's answer, and an element that states one is refused "
+        "even when it states the answer the runtime would have written. A "
+        "hypothesis with no surviving supporting evidence is rolled back, so give "
+        "each one at least one evidence edge naming it.\n\n"
+        "A word outside a set this schema declares is refused as you send it, and "
+        "you can correct it and send again. A mistake the schema cannot see -- a "
+        "parent of the wrong type, a relationship pointing the wrong way, a kind "
+        "whose provenance does not match -- is dropped instead, after this run "
+        "has ended and where you will not be told, and every later element that "
+        "pointed at it by ref is dropped with it."
     ),
     "run_tool": (
         "Run one registered offline tool over Artifacts this Program already holds, "
