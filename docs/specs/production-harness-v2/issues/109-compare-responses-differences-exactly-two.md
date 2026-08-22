@@ -7,7 +7,7 @@ corpus that stops asking it to.
 **Blocked by:** 107 — A label minted after launch must be resolvable in the run
 that minted it.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 - [ ] The two ends of the mismatch are stated exactly.
       `src/redkraken/skills/compare-responses/scripts/compare.py` refuses
@@ -48,3 +48,61 @@ The report is unsure which side is wrong, and so is this ticket. What it is not
 unsure about is that both sides are shipped: the script is registered, granted
 to `web_hunter` and named in thirty-nine Playbook bodies, and eleven of those
 bodies ask it a question it refuses at argument parse time.
+
+## The decision, taken 2026-08-22
+
+**B: rewrite the eleven -- in fact thirteen -- Playbook bodies as one call per
+arm against a named baseline, and leave `compare_responses` at two. The script is
+not widened.**
+
+What decides it is that **not one of the thirteen bodies asks for what an n-way
+compare computes.** An n-way compare answers "how do these k things differ from
+each other". Every body in this corpus names one thing as the reference and asks
+how each of the others differs from *it*: the `authentication` body walks a fixed
+credential set against the same endpoint; the `identity-parsing` body walks
+encodings of one identifier; the `api` body walks methods against one route. That
+shape is k-1 independent two-way comparisons, and running them as k-1 calls loses
+nothing, because there is no cross term for the missing calls to have carried.
+Widening the script to k arms would compute a k x k matrix of which the bodies use
+one row.
+
+**The blocker is not the script's arity; it is that the answer cannot say which
+arm it is about.** `skill.envelope` carries the script name, the exit status and
+the streams, and no argument name at all
+(`src/redkraken/skill.py:170-198`), and `run_skill_script` hands the program its
+inputs positionally (`src/redkraken/tool.py:741-748`). So a child that made
+thirteen calls today would get thirteen answers it cannot key back to the
+credential, encoding or method that produced them, and that is exactly the defect
+a widened script would make worse rather than better -- a 13-arm answer with no
+arm names is unreadable in a way a 2-arm answer is not. The fix that makes B work
+is one field on the envelope naming the inputs, which is smaller than a second
+comparison engine and is useful to every other registered program.
+
+**Rejected: A, widen `compare_responses` to n arms.** Beyond computing a matrix
+nobody reads, it multiplies the output. The measured two-arm answer is 520 bytes;
+a full 13-arm difference set on the same inputs is 78 pairs. Against the packet's
+32,768-byte ceiling (`src/redkraken/packet.py:133-134`) that is the arithmetic of
+ticket 107 arriving in a place it does not need to.
+
+**Rejected: leave the bodies as they are.** They currently instruct the child to
+do something the tool cannot do, which is a Playbook that mints refusals.
+
+## What was measured
+
+Thirty-nine Playbook bodies under `src/redkraken/playbooks/` were read and every
+`compare_responses` instruction in them classified by the number of things the
+prose puts in the comparison
+(`docs/research/decisions/31-inline-values-and-nway-compare.md`, "Ticket 109").
+**Thirteen bodies ask for three or more arms.** Twelve of the thirteen are
+fan-out against a single named reference; the thirteenth is a pairwise sweep
+whose prose still names a reference in the sentence before. **Zero ask for the
+arms to be compared to each other.**
+
+## Correction: thirteen bodies, not eleven
+
+The ticket's criterion 3 says "the eleven Playbook bodies". Verified against this
+tree: it is thirteen. The two the count misses are
+`src/redkraken/playbooks/identity-parsing/playbook.md:84` and
+`src/redkraken/playbooks/api/playbook.md:62`. The corpus figure the ticket gives
+-- thirty-nine Playbook bodies -- is exactly right. Whoever does the rewrite
+should work from a fresh grep and not from the number eleven.

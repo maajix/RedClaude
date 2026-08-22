@@ -5,7 +5,7 @@ report must be held back: `redaction_failure` and `program_known_issues`.
 
 **Blocked by:** nothing.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 - [ ] A redaction that fails is recorded. `redaction_failure`
       (`0024_secret_keying.sql:143-154`) carries the rule that tripped, the
@@ -65,3 +65,114 @@ anything back today.
 the operator's configuration ends and the runtime begins, and because the
 redaction half may be hiding a second, larger question about what the harness
 does when a redaction rule trips.
+
+## The decision, taken 2026-08-22
+
+**The two halves get opposite answers. `program_known_issues` gets a writer, and
+it is the configuration document, on the pattern `identity`, `required_header`
+and `callback` already set. `redaction_failure` is retired: the design it
+presumes was overruled at the point of implementation, and no honest
+implementation can write the row.**
+
+### `program_known_issues` is a configuration table
+
+The corpus already named the writer and then did not build it. `0034_reports.sql:1073`
+registers the table as `'reference'` with the rationale "the program's published
+do-not-send list, entered by the operator through the control surface", and the
+`source` CHECK (`0034:356`) names three origins of which two are the operator's:
+`program_policy` is the published list transcribed, `operator` is the operator's
+own addition, and `prior_submission` is the harness's record of what it has
+already sent.
+
+The shape to copy is next door. `config.TOP_LEVEL` (`src/redkraken/config.py:31-40`)
+holds eight keys, three of which -- `identity`, `required_header`, `callback` --
+are lists of typed entries validated by a per-entry reader and projected into
+state by a `_project_*` function in `program.py` that inserts what is new,
+updates what changed and invalidates what the document stopped naming
+(`_project_identities`, `src/redkraken/program.py:998-1085`). A known-issue entry
+is `class_id`, an optional `entity_like`, a `source` and a `note`; the offline
+validator checks shape, and `class_id REFERENCES vulnerability_classes(id)`
+checks membership at projection time -- the same division of labour the scope
+compiler already uses.
+
+**It is worth building rather than dropping because the override for this gate
+already ships.** `rk finding clear-gate` (`src/redkraken/cli.py:1378-1392`) exists
+to let an operator overrule exactly two of the nine emission blockers, and the
+first one it names is `known_issue`: "where the program published a do-not-send
+list and whether this instance is what they meant is a reading of their words".
+The harness ships the power to lift a gate that can never be raised. And the gate
+is a hard one when it is raised -- `report_blockers` returns `'hard',
+'known_issue'` joined on `class_id` and `entity_like`
+(`0034_reports.sql:815-825`), and `0034:992` refuses on every hard blocker -- so
+the ticket's last criterion is already enforced by the function; it needs rows,
+not new enforcement.
+
+`prior_submission` is not this ticket's. It is a runtime write that happens after
+a report has actually gone out, and nothing in this tree sends one yet.
+
+### `redaction_failure` is retired
+
+The table promises a two-part behaviour (`0024_secret_keying.sql:139-141`): "A
+redaction that fails open is worse than none, so the projection is withheld and
+the failure is a row here, not a log line." Both parts were reconsidered, in
+prose, by the code that does the redaction.
+
+**The withholding was rejected explicitly.** `project_identity_response`
+(`src/redkraken/proxy.py:659-697`) opens with "Redaction and not suppression"
+and gives the reason: "Withholding it whole would cite nothing and would make an
+authenticated exchange -- the one an access control finding is made of -- an
+exchange whose answer nobody may read." The compensating control is named in the
+same docstring: "the Agent view and the wire view are hashed separately and the
+difference is sealed, so an exchange whose redaction was incomplete is one an
+auditor can still see whole."
+
+**And the row cannot be written by an honest implementation.** The table's own
+columns say what would write it: `rule_id` is "which verifier tripped" and
+`encoding_path` is "'raw', 'urldecode', 'base64>urldecode', ..."
+(`0024:147-148`) -- a second pass that re-scans the redacted bytes through
+encodings. That vocabulary now lives in the scrubber instead: `_renderings`
+(`proxy.py`, the function `project_identity_response` calls) expands each injected
+secret into eight spellings -- raw, percent-encoded, four base64 variants and two
+hex cases -- and every one of them is replaced in the body and dropped from the
+headers. So a verifier searching the same eight finds nothing by construction,
+and a verifier searching for a ninth would be a better detector than the
+scrubber, in which case it belongs *in* the scrubber. **Any detector good enough
+to write the row is good enough to prevent it**, which is why the table has no
+writer and would not get one.
+
+What the scrubber does not catch it says it does not catch: "a target may
+transform a value beyond any spelling `_renderings` knows -- so what this narrows
+is the ordinary case rather than closing the class. Anything richer -- a hash, a
+truncation, half a value on each side of a template -- is not recoverable by
+search and is not pretended to be." That is a stated residual risk with a stated
+control, not a missing writer.
+
+The migration that drops the table says all of this, so that the next reader does
+not re-add it: the harness redacts and records; it does not verify and withhold;
+and the sealed wire view is where an incomplete redaction stays visible.
+
+## What was measured
+
+`grep -rn "redaction_failure" src/ tools/` returns its own `CREATE TABLE` and
+nothing else -- no INSERT, no SELECT, no FK. `grep -rn "program_known_issues"`
+returns the table, the `report_blockers` join, the `'reference'` registry row and
+the read-surface grants -- one reader, no writer. `_renderings` produces eight
+distinct spellings per secret and `project_identity_response` applies all of them
+to both halves of the message; `project_identity_request` (`proxy.py:700-`) does
+the same for the request side, added by ticket 96 when a model could first compose
+a body.
+
+## Correction: `evidence.redact` is not the function this ticket is about
+
+The ticket reads `redaction_failure` against `evidence.redact`
+(`src/redkraken/evidence.py:103-152`) and concludes the missing piece is a
+verifier for it. Those are two different redactions with two different subjects.
+`evidence.redact` applies the six `redaction_rules` rows
+(`0034_reports.sql:328-341`: email, phone, bearer, jwt, card, national_id) to an
+**export bundle**, and its subject is other people's personal data -- "Nothing
+about another person" (`evidence.py:18-22`). `redaction_failure` is a 0024 table,
+and 0024's subject is the harness's own injected credential material in the
+**agent's view of an exchange**; its `encoding_path` vocabulary matches
+`_renderings`, not the six PII patterns. The conclusion the ticket draws from
+`evidence.redact` -- single pass, cannot fail, no second pass to fail -- is true
+of that function and is not the reason this table is empty. The reason is above.

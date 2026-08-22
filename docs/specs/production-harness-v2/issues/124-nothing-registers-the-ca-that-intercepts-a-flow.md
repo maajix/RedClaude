@@ -6,7 +6,7 @@ withholding what it already knows.
 
 **Blocked by:** nothing.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 - [ ] A run registers its CA. `interception_cas`
       (`0025_transport_claims.sql:467-503`) has nine columns, six named CHECKs
@@ -63,3 +63,105 @@ prose at the point of refusal. That makes this a deferred phase rather than a
 defect -- but an undeclared one, which is why it needs a decision rather than a
 patch: nothing in the tree says when the CA registry is due, and the whole
 transport-claim design in 025 rests on it.
+
+## The decision, taken 2026-08-22
+
+**Register the authority that actually exists, and change one CHECK to let it be
+registered. The row is written by the runtime, from the CA *certificate* it was
+told to trust, at the point a Program first has a door to intercept with. The CA
+key does not move into the secret store, and 025's channel-delivery design is
+retired rather than built.**
+
+### Why a writer cannot simply be added
+
+The CA the schema describes and the CA this harness makes are different objects,
+and one constraint is where they collide.
+
+What ships is a per-run, on-disk root: `tls.authority(directory)`
+(`src/redkraken/tls.py:293-340`) makes it with `openssl req -x509` if it is not
+there and reuses it if it is, writes the key to `ca-key.pem` in a directory the
+door owns (`:150-151`), gives it `DAYS = 7` (`:58`), and constrains it with
+`basicConstraints=critical,CA:TRUE,pathlen:0` and
+`keyUsage=critical,keyCertSign,cRLSign`. It is made by the **door**, which is
+started by an operator with `--authority` (`src/redkraken/cli.py:130`,
+`src/redkraken/proxy.py:3555-3568`), and the key is "handed to nobody"
+(`src/redkraken/evaluation.py:248-249`).
+
+Held against the table (`0025_transport_claims.sql:467-503`), three of the four
+things that look like obstacles are not:
+
+* `interception_cas_max_lifetime` caps life at 90 days. Seven passes.
+* `program_id NOT NULL` and `interception_cas_one_current` look wrong for an
+  authority one door shares across Programs, and are not: the row is a statement
+  that *this Program's* flows were intercepted under *that* key, so the same
+  authority is registered once per Program, one row each, exactly one current.
+  Nothing about the table has to change for that.
+* `spki_sha256` is derivable without the key: the SPKI comes out of the
+  certificate, and the door already does the equivalent computation over its
+  other key in `Authority.pin` (`tls.py:207-224`). One note for the
+  implementer -- `pin()` hashes the **leaf signing key** (`leaf-key.pem`), not
+  the root; `spki_sha256` is the root's, and the two are different keys in the
+  same directory.
+
+The one that does block it is `interception_cas_secret_ref_shape CHECK
+(secret_ref ~ '^(op://|kek:)')` on a `NOT NULL` column. The shipped key has no
+secret reference of any kind -- it is a file in the door's directory -- so there
+is no honest string to write, and writing one would be a lie about where key
+material lives, which is the exact thing that CHECK and
+`interception_cas_no_key_material` exist to prevent. **The migration that ships
+the writer is the migration that admits a third form: a CA whose key is held by
+the door and referenced nowhere.**
+
+### Why not build 025's design instead
+
+025's own preamble (`0025_transport_claims.sql:458-465`) sets up the choice: the
+CA key is ticket 15's to hold "in the RUNTIME process ... so either the CA key
+travels the runtime->proxy channel or 15's holder must be reachable from the
+proxy. It must be the former; the proxy must not become a second 1Password
+client." What shipped is a third option the preamble did not consider, and it is
+better than either: the key is never in the runtime, never in a message, never in
+1Password, and never lives longer than a week. `tls.py:55-57` states the property
+that would be given up -- "a trust root that outlives the run it was minted for is
+a trust root someone still trusts after the door that owns its key has stopped
+answering." Moving a CA private key through an IPC channel to lengthen its life to
+ninety days is the wrong trade, and the two constraints 025 wrote to keep key
+material out of the database are satisfied more completely by the design that
+ships than by the one it anticipated.
+
+### Why not delete the table
+
+`receipts_intercepted_leaf_names_ca` (`0025:154-157`) is what makes the door's
+silence mandatory rather than merely cautious: an intercepted Receipt that names
+a leaf must name the CA. Without a registry there is no CA to name, so the four
+`agent_cert_*` columns can never be filled on any intercepted exchange, and the
+transport-claim family loses the evidence it was built to carry. Deleting the
+table would make that permanent rather than pending.
+
+### Who writes the row
+
+The runtime, not the door. The door holds the key and must not gain a database
+grant that lets it describe itself; the runtime already holds the CA
+**certificate** -- it verifies every target against `$RK_PROXY_CA_FILE`
+(`src/redkraken/door.py:349`, the variable at `proxy.py:181`) -- and subject,
+`not_before`, `not_after` and the SPKI all come out of that public half. So the
+write needs no key access at all, which is the property that makes it safe to put
+on the run-start path.
+
+## What was measured
+
+`grep -rn "INSERT INTO interception_cas" src/ tools/` returns **nothing**, in
+Python and in the migration corpus alike -- the ticket's claim, verified. The
+certificate the door makes carries a 7-day validity, subject
+`/CN=redKraken run authority`, and a key at a filesystem path; the table requires
+a `secret_ref` matching `^(op://|kek:)`. That single CHECK is the only one of the
+six the shipped authority fails.
+
+## Note on the ticket's read-surface criterion
+
+Ten `interception_cas` columns are on the agent's read surface with `secret_ref`
+excluded, and `check_transport_claims` asserts the exclusion
+(`20260815T000000Z...:2472-2475`). Under this decision `secret_ref` stops
+carrying a reference at all for door-held CAs, and the exclusion still stands as
+written -- a column that may name a secret store for some rows must stay off the
+surface for all of them. Nothing in the read surface needs to change; nine of the
+ten columns simply stop being NULL.
