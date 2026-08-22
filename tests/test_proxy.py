@@ -3535,5 +3535,116 @@ class RuntimeTest(unittest.TestCase):
                     proxy.endpoint(url)
 
 
+class ControlPlaneTest(unittest.TestCase):
+    """The one tunnel this door carries instead of terminating.
+
+    A child reaches its own model session through this proxy, because
+    `tls.agent_environment` exempts nothing -- and it carries no capability,
+    which is what every other request is refused for. Measured on 2026-08-22:
+    every agent run died on `API Error: 407 status code (no body)` before it
+    thought once.
+
+    What is asserted is the shape of the exemption rather than the fact of it:
+    one name and one port wide, still decided by `destination`, and taken
+    before the authority is asked for -- so the three tests below are a
+    carried tunnel, a refused one, and a host that gets neither.
+    """
+
+    #: Not `api.anthropic.com`. The constant is patched in each test, because
+    #: what is under test is that the door carries whatever `CONTROL_PLANE`
+    #: names and nothing else -- a test that dialled the real name would be
+    #: asserting against the internet.
+    NAME = "model.example.test"
+
+    def setUp(self):
+        self.upstream = socket.socket()
+        self.upstream.bind(("127.0.0.1", 0))
+        self.upstream.listen(1)
+        self.upstream_port = self.upstream.getsockname()[1]
+        self.addCleanup(self.upstream.close)
+        threading.Thread(target=self._echo, daemon=True).start()
+
+        self.server = proxy.listen(
+            ("127.0.0.1", 0),
+            fence=Stub(),
+            store=Store(scratch() / "control-plane-store"),
+            connector=self._never,
+            resolver=lambda host, port: ("127.0.0.1",),
+            # Deliberately none. A door with no certificate material refuses
+            # every other tunnel, which is what makes a carried one visible.
+            authority=None,
+        )
+        self.serving = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.serving.start()
+        self.addCleanup(self.stop)
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.serving.join(timeout=5)
+
+    def _echo(self) -> None:
+        """The far end of the tunnel, answering in upper case.
+
+        Upper case rather than an echo, so a test that passed because it read
+        back its own bytes off a socket buffer would fail instead.
+        """
+        try:
+            peer, _ = self.upstream.accept()
+        except OSError:
+            return
+        with peer:
+            while True:
+                try:
+                    block = peer.recv(65536)
+                except OSError:
+                    return
+                if not block:
+                    return
+                peer.sendall(block.upper())
+
+    def _never(self, *arguments, **keywords):
+        raise AssertionError("the ordinary outbound path was taken for a carried tunnel")
+
+    def _connect(self, authority: str) -> tuple[int, socket.socket]:
+        client = socket.create_connection(self.server.server_address, timeout=5)
+        self.addCleanup(client.close)
+        client.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        answer = client.recv(4096)
+        return int(answer.split()[1]), client
+
+    def test_a_control_plane_tunnel_is_carried_without_a_capability(self):
+        with (
+            mock.patch.object(
+                proxy, "CONTROL_PLANE", frozenset({(self.NAME, self.upstream_port)})
+            ),
+            # The fixture answers on loopback, which `destination` refuses for
+            # every name. Patched here and nowhere else, so the test below
+            # still measures the refusal.
+            mock.patch.object(proxy, "unroutable", lambda address: None),
+        ):
+            status, client = self._connect(f"{self.NAME}:{self.upstream_port}")
+            self.assertEqual(200, status)
+            client.sendall(b"hello")
+            self.assertEqual(b"HELLO", client.recv(4096))
+
+    def test_a_control_plane_name_that_answers_unroutably_is_still_refused(self):
+        with mock.patch.object(
+            proxy, "CONTROL_PLANE", frozenset({(self.NAME, self.upstream_port)})
+        ):
+            status, _ = self._connect(f"{self.NAME}:{self.upstream_port}")
+            self.assertEqual(407, status)
+
+    def test_any_other_host_is_not_carried(self):
+        with mock.patch.object(
+            proxy, "CONTROL_PLANE", frozenset({(self.NAME, self.upstream_port)})
+        ):
+            status, _ = self._connect(f"other.example.test:{self.upstream_port}")
+            # 405 and not 407: this door has no authority, so the tunnel it
+            # cannot sign for is refused before anything about a capability is
+            # asked. Which is the whole point -- the carried one was answered.
+            self.assertEqual(405, status)
+
+
 if __name__ == "__main__":
     unittest.main()

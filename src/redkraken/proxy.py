@@ -91,7 +91,7 @@ from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from urllib.parse import SplitResult, quote, urljoin, urlsplit
 
 from redkraken import build, config, identity, migrate, pg, program, scope, seal, tls, vault
@@ -273,6 +273,24 @@ ESTABLISHED = "Connection Established"
 #: a certificate directory gets a refusal that says so, rather than a tunnel
 #: this process would have to relay blind.
 NO_AUTHORITY = f"this door was started without a certificate authority (${AUTHORITY_VARIABLE})"
+
+#: The one destination this door carries without a capability: the model its
+#: children think with. `tls.agent_environment` exempts nothing, so a child's
+#: own session reaches Anthropic through this proxy like everything else -- and
+#: the CLI has no capability to send, the orchestrator being started with none
+#: at all. Every request it made was answered `407 no-program`, and every run
+#: died before it thought once.
+#:
+#: This is not target egress. No Program's budget pays for it, no scope admits
+#: it, and nothing a Receipt could describe crosses it: what goes out is the
+#: session the runtime itself opened. Pinned to the exact name and port, so the
+#: exemption cannot be widened by a child naming a host that merely ends the
+#: same way. Telemetry is deliberately not here -- the CLI also dials a logging
+#: endpoint, and a hunt's telemetry is not this door's to forward.
+CONTROL_PLANE = frozenset({("api.anthropic.com", 443)})
+
+#: What the log line calls a tunnel this door carried rather than terminated.
+CARRIED = "control-plane"
 
 #: The minted shape, pinned: `authorize_tool_run` emits 32 random bytes as
 #: lowercase hex and nothing else is a capability. Anchored on both ends, so a
@@ -2126,6 +2144,38 @@ def _dial(
     return connection, handshake(secured, defect)
 
 
+def _pour(source: BinaryIO, sink: BinaryIO, wake: socket.socket) -> None:
+    """Move one direction of a carried tunnel, and end the other when it stops.
+
+    File objects on both sides rather than the sockets themselves, because the
+    client's end has already been read from: `BaseHTTPRequestHandler` took the
+    CONNECT line and its headers through `rfile`, and bytes a client sent behind
+    them are sitting in that buffer. A relay reading the socket directly would
+    leave them there and start the tunnel one record short.
+
+    `wake` is the other direction's socket. A tunnel ends when either side hangs
+    up, and the thread blocked on the side that did not is only released by
+    shutting its socket down under it.
+    """
+    try:
+        while True:
+            block = source.read1(65536)
+            if not block:
+                break
+            sink.write(block)
+            sink.flush()
+    except OSError:
+        # Either end going away mid-copy is how a tunnel ends, not a fault to
+        # report: the CONNECT was answered long ago and there is nobody left to
+        # answer to.
+        pass
+    finally:
+        try:
+            wake.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 class Server(ThreadingHTTPServer):
     """The listening socket, and the three things a request is answered from."""
 
@@ -2367,6 +2417,11 @@ class Handler(BaseHTTPRequestHandler):
         socket towards the target is opened later, by the request inside, and
         only after the database has authorized that request.
 
+        `CONTROL_PLANE` is the one exception, and it is not a target: it is the
+        session this runtime opened for the child to think in, carried by
+        `_relay` and never read. Taken before the authority is asked for,
+        because a door with no certificate material can still carry one.
+
         No Receipt is written for the CONNECT, and that is not the hole `_serve`
         closes. A CONNECT is not an exchange -- no bytes reach a target because
         of one -- and the row it could write would name a request nobody has
@@ -2382,11 +2437,16 @@ class Handler(BaseHTTPRequestHandler):
         control = take_control(self.headers)
         if control.ambiguous:
             return self._answer(407, AMBIGUOUS, detail=TWO_HEADERS, body=b"")
+        try:
+            host, port = _hostport(self.path)
+        except Refused as refusal:
+            return self._answer(refusal.status, TUNNEL, detail=refusal.detail, body=b"")
+        if (host, port) in CONTROL_PLANE:
+            return self._relay(host, port)
         authority = self.server.authority
         if authority is None:
             return self._answer(405, TUNNEL, detail=NO_AUTHORITY, body=b"")
         try:
-            host, port = _hostport(self.path)
             context = authority.context(host)
         except Refused as refusal:
             return self._answer(refusal.status, TUNNEL, detail=refusal.detail, body=b"")
@@ -2435,6 +2495,58 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             secured.close()
+
+    def _relay(self, host: str, port: int) -> None:
+        """Carry one control-plane tunnel to its end without reading it.
+
+        The narrower of the two ways to let a child reach its own model.
+        Terminating this tunnel the way every other one is terminated would put
+        the operator's subscription credential through this process in the clear
+        on every turn a child takes -- the door would hold the one credential it
+        exists to stop a child spending elsewhere. So the bytes are relayed, and
+        this door knows what the CONNECT already told it and nothing more: which
+        name, and that a session was open.
+
+        `destination` still decides what may be dialled, so a control-plane name
+        answering with a private address is refused here exactly as a target's
+        would be. What is not asked is the database: there is no Program, no
+        capability and no Receipt, which is the whole difference between this
+        and an exchange.
+
+        No timeout on either socket. A model session is idle between turns for
+        as long as the child is thinking, and a fence that timed that out would
+        end the run it exists to carry.
+        """
+        try:
+            addresses = destination(host, port, self.server.resolver)
+        except Refused as refusal:
+            return self._answer(refusal.status, TUNNEL, detail=refusal.detail, body=b"")
+        try:
+            upstream = socket.create_connection(
+                (addresses[0], port), timeout=self.server.target_timeout
+            )
+        except OSError as error:
+            self.log_error("no %s tunnel to %s: %s", CARRIED, self.path, error)
+            return self._answer(502, UNAVAILABLE, body=b"")
+
+        self.close_connection = True
+        self.send_response_only(200, ESTABLISHED)
+        self.end_headers()
+        self.wfile.flush()
+        self.log_message("carried %s to %s unread", CARRIED, self.path)
+        upstream.settimeout(None)
+        self.connection.settimeout(None)
+        outward = threading.Thread(
+            target=_pour,
+            args=(self.rfile, upstream.makefile("wb"), upstream),
+            daemon=True,
+        )
+        outward.start()
+        try:
+            _pour(upstream.makefile("rb"), self.wfile, self.connection)
+        finally:
+            outward.join(timeout=self.server.target_timeout)
+            upstream.close()
 
     def _url(self) -> str:
         """The absolute URL this request is about, whichever hop it arrived on.
