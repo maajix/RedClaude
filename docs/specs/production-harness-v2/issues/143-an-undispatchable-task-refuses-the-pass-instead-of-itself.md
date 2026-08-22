@@ -6,9 +6,9 @@ would keep such a Task off the slate in the first place.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] **A Task nobody can dispatch does not take the pass down with it.** Two
+- [x] **A Task nobody can dispatch does not take the pass down with it.** Two
       steps in `execution.Slice._run` refuse with `ledger.fail`: the target step
       at `execution.py:1616`, when the subject carries no address, and the role
       step at `execution.py:1643`, when the role the roster gives the kind holds
@@ -16,22 +16,22 @@ would keep such a Task off the slate in the first place.
       top of the ranking refuses every later pass with `ok: false` and exit 3.
       Measured on 2026-08-22: an `analyze` Task opened by hand against an
       Application in `rk2hunt4` did exactly this.
-- [ ] **And it does not stay pending either.** Skipping it forever is the same
+- [x] **And it does not stay pending either.** Skipping it forever is the same
       wedge at a slower rate, with an attempt spent each pass until
       `max_attempts` parks it. Whatever the pass does with it, the Task ends and
       the ending says why.
-- [ ] **`ready_for` answers "this subject carries no address".** A `recon` Task
+- [x] **`ready_for` answers "this subject carries no address".** A `recon` Task
       is ready today on two grounds -- it has a subject and the subject is in
       scope (`0023_scheduler_ranking.sql:468`) -- and neither is the question
       `execution.STARTED` asks, which is whether the subject is an Application or
       an Endpoint under one. Moving it there fixes the wedge for every producer
       at once and lets `scheduler_idle_report` name the predicate.
-- [ ] **The roster decision is not quietly reversed.** `roster.ROLES` withholds
+- [x] **The roster decision is not quietly reversed.** `roster.ROLES` withholds
       `net.request` from `js_analyst` on purpose -- *"an analyst that fetches is
       a hunter with the wrong quota"* -- and `reporter` is a renderer with no
       served surface at all. If this ticket changes either, it changes the
       roster where the decision is written and says why there.
-- [ ] **Checked by something that would go red.** The covering
+- [x] **Checked by something that would go red.** The covering
       `tests/test_database.py` classes are named and run under `flock` with
       `CleanCreationTest` in the same invocation, and a `tests/test_execution.py`
       case holds the pass to surviving a Task it cannot dispatch.
@@ -66,3 +66,41 @@ resolves a URL from. If this ticket moves that question into `ready_for`, that
 branch becomes redundant and should go: `open_task` already asks `ready_for`
 after the insert, so the walk would inherit the refusal as
 `refused_by_invariant` with the predicate's own name in it.
+
+## How it was paid
+
+Two halves, because two different things know the answer.
+
+The half the database knows is the address. `rk2_subject_addressable(uuid)` asks
+the one question `execution.STARTED` resolves a URL from -- is this Entity an
+Application, or an Endpoint under one -- and `ready_for` reads it, returning
+`recon.no_address` and `hunt.no_address`. A Task like that is never ranked,
+never offered and never claimed, and `scheduler_idle_report` names the predicate
+the same way it names every other one. `analyze` is deliberately not guarded
+this way: what stops an `analyze` Task is the roster, not the address.
+
+The half the database does not know stays in the runtime. Whether a role can
+start as an isolated child, and whether it holds `net.request`, are facts of
+`roster.ROLES`; putting them in SQL would be the roster decision written in a
+second place, which criterion 4 refuses. So `execution.Slice._run` keeps
+deciding and gains `retire_task(uuid, text)` to end the Task it cannot serve:
+the three `ledger.fail` sites became `Slice._retire`, which ends that one Task
+as `abandoned` for the new reason `undispatchable`, records a `task.retired`
+event carrying the detail, and holds rather than fails -- so the pass goes on to
+the next Task instead of ending at `ok: false`.
+
+`retire_task` rather than a fourth argument to `finish_task_attempt`: an attempt
+that never happened is not one to spend. `retire_task` rather than
+`cancel_reason_for`: that would need a list of kinds in SQL that the roster is
+free to change under it.
+
+142's `no_address` branch in `rk2_promote_tasks` stays, against the Notes above.
+Inheriting the refusal as `refused_by_invariant` would be true and useless: a
+named drop reason is what the model reads back, and `no_address` says what to do
+differently where the generic one does not.
+
+Migration `20261019T000000Z__an_undispatchable_task_ends_itself.sql`. Covered by
+`tests.test_database.FirstTaskTest` (the predicate and the addressability
+question, run with `CleanCreationTest` in the same invocation) and by
+`tests.test_execution.RefusalTest` (the pass survives all three, and the one
+refusal left is a Task that could not be retired either).

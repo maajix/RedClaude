@@ -452,6 +452,14 @@ PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
 FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3, $4)"
 
+#: Ticket 143. The other ending, for a Task that never reached an attempt
+#: because this runtime cannot dispatch it. `FINISH` settles an attempt and
+#: this one settles a Task, which is why it is a second verb and not a
+#: fourth argument to the first: an attempt that did not happen is not one
+#: to spend, and a Task returned to pending is one the next pass claims and
+#: refuses in exactly the same words.
+RETIRE = "SELECT retire_task($1::uuid, $2)"
+
 #: The Lease this run was given, and the one call that moves both halves of it.
 #: The TTL is read rather than assumed: it is a weights column, so a harness
 #: that shortened it would shorten what a crash costs, and a runtime carrying
@@ -1703,12 +1711,13 @@ class Slice:
             self._replay(ledger, connection, claimed, facts)
             return
         if claimed.url is None:
-            ledger.fail(
+            self._retire(
+                ledger,
+                connection,
+                claimed,
                 "target",
                 f"the {claimed.subject_type} {claimed.subject_label} carries no address "
                 "to send a request to; only applications and endpoints do",
-                code=INVALID_CONFIGURATION,
-                source="database",
             )
             return
         facts["target"] = {"url": claimed.url, "method": claimed.method}
@@ -1721,12 +1730,13 @@ class Slice:
             # nothing serves yet -- and asking after the capability was minted
             # would spend an authorisation on a child that was never going to
             # start.
-            ledger.fail(
+            self._retire(
+                ledger,
+                connection,
+                claimed,
                 "role",
                 f"{claimed.agent_run_label} is a {claimed.role} run, which this runtime "
                 "cannot start as an isolated child",
-                code=INVALID_CONFIGURATION,
-                source="database",
             )
             return
         if NET not in role.tool_groups:
@@ -1735,12 +1745,13 @@ class Slice:
             # purpose -- an analyst that fetches is a hunter with the wrong
             # quota -- so a Tool run opened for it would be an authorisation
             # nobody may use, sitting live until the closing swept it.
-            ledger.fail(
+            self._retire(
+                ledger,
+                connection,
+                claimed,
                 "role",
                 f"a {claimed.role} run holds no {NET}; this slice serves one "
                 f"target request and {claimed.task_label} needs a role that may make it",
-                code=INVALID_CONFIGURATION,
-                source="roster",
             )
             return
 
@@ -1932,6 +1943,50 @@ class Slice:
         # attempt spent and the Task correctly not done.
         settled = performed.facts.get("test_run") is not None
         run["stop_reason"] = "completed" if settled else "error"
+
+    def _retire(
+        self,
+        ledger: Ledger,
+        connection: pg.Connection,
+        claimed: Claimed,
+        step: str,
+        detail: str,
+    ) -> None:
+        """End a Task this runtime cannot dispatch, and let the pass go on.
+
+        Ticket 143. These three refusals used to be `ledger.fail`, and a pass
+        that fails is `ok: false` and exit 3. `_pass` claims one Task per pass,
+        so the same Task came back to the top of the ranking and refused the
+        next pass in the same words, and the one after that: `rk2hunt4` lost the
+        rest of a campaign to a single `analyze` Task opened by hand.
+
+        Held rather than failed, because nothing went wrong with the run. The
+        Task is well-formed and this installation cannot serve it, which is a
+        sentence about the Task and not about the pass that read it.
+
+        Ended rather than skipped, because skipping is the same wedge more
+        slowly: the Task stays at the top, spends an attempt a pass, and is
+        parked as `attempts_exhausted` several passes later under a reason that
+        names the wrong thing. `retire_task` says `undispatchable` once and
+        writes the sentence into a `task.retired` Event.
+
+        A database that will not take the ending is reported as one. That is a
+        genuine failure -- the Task is still live and the next pass meets it
+        again -- and it is the one case here that keeps `ledger.fail`.
+        """
+        try:
+            with connection.transaction():
+                _actor(connection)
+                status = connection.execute(RETIRE, (claimed.task_id, detail)).scalar()
+        except pg.DatabaseError as error:
+            ledger.fail(
+                step,
+                f"{detail}; and {claimed.task_label} could not be retired: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return
+        ledger.hold(step, f"{detail}; {claimed.task_label} is {status} as undispatchable")
 
     def _dispatchable(
         self, ledger: Ledger, claimed: Claimed, chosen: Chosen | None

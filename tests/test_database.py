@@ -3483,6 +3483,7 @@ class FirstTaskTest(DatabaseCase):
 
         cls.subject = cls.entity_of("main")
         cls.elsewhere = cls.entity_of("other")
+        cls.addressless = cls.host_with_no_application()
         cls.pass_ledger, cls.offered, cls.claimed = cls.run_one_pass()
         cls.refusals = {}
         cls.refuse_what_is_not_a_subject()
@@ -3495,6 +3496,52 @@ class FirstTaskTest(DatabaseCase):
             cls.connection.execute("SET LOCAL app.purging = 'on'")
             cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{FIRST_SLUG}-%",))
         super().tearDownClass()
+
+    @classmethod
+    def host_with_no_application(cls) -> str:
+        """Ticket 143: one in-scope Entity that no target table holds.
+
+        A `host` is in scope and is still not a thing to send a request to: no
+        Application keys on it and no Endpoint sits under it. It is the only
+        arrangement in which `ready_for` reaches its address arm at all, because
+        the scope arm above it answers first for everything out of scope.
+
+        Written as the owner, and it is the one row this case writes by hand.
+        Recon promotes hosts, and running a recon child here to get one would be
+        this case proving something else. It goes in the second Program, so the
+        Task the pass claimed and every count over `main` is untouched, and the
+        purge in `tearDownClass` takes it with the Program.
+        """
+        owner = pg.connect(cls.harness.migrate)
+        try:
+            with owner.transaction():
+                owner.execute("SELECT set_actor('runtime', 'selftest')")
+                entity = owner.execute(
+                    "INSERT INTO entities (program_id, type, label, dedup_key,"
+                    "        scope_selector_kind, scope_selector, scope_port,"
+                    "        scope_path_raw, scope_path_norm)"
+                    " VALUES ($1::uuid, 'host', $2, $2, 'host', $3, $4, $5, $5)"
+                    " RETURNING id::text",
+                    (cls.identifiers["other"], f"{FIRST_SLUG}-unreachable-host")
+                    + cls.SUBJECT[:1]
+                    + (cls.SUBJECT[1], cls.SUBJECT[2]),
+                ).scalar()
+                owner.execute(
+                    "INSERT INTO hosts (entity_id, hostname) VALUES ($1::uuid, $2)",
+                    (entity, cls.SUBJECT[0]),
+                )
+                # Born denied, like every other row: `in_scope` is projected and
+                # asserting it is what `entities_scope_is_projected` refuses. The
+                # selector above is the configured inclusion, so the projection
+                # admits this host for the same reason it admits the Application
+                # beside it -- and the two differ in exactly one thing, which is
+                # the thing under test.
+                owner.execute(
+                    "SELECT refresh_scope_projection($1::uuid)", (cls.identifiers["other"],)
+                )
+            return str(entity)
+        finally:
+            owner.close()
 
     @classmethod
     def subjects_of(cls, name: str) -> list[dict]:
@@ -3726,6 +3773,50 @@ class FirstTaskTest(DatabaseCase):
         self.assertEqual(0, len(self.subjects_of("wide")))
         self.assertEqual(0, len(self.tasks_of("wide")))
         self.assertEqual({"subjects_recorded": 0, "tasks_opened": 0}, self.reported["wide"])
+
+    def ready_for_subject(self, entity: str | None) -> str | None:
+        """`ready_for` about the live recon Task, asked with its subject swapped.
+
+        `jsonb_populate_record` rather than an UPDATE: the predicate takes a
+        whole `tasks` row and only one column of it is under test, so the row
+        the rest of this case reads is left exactly as the seeding wrote it.
+        """
+        return self.connection.execute(
+            "SELECT ready_for(jsonb_populate_record(t.*, $2::jsonb))"
+            "  FROM tasks t WHERE t.program_id = $1::uuid",
+            (self.identifiers["other"], json.dumps({"subject_entity_id": entity})),
+        ).scalar()
+
+    def test_an_entity_no_target_table_holds_carries_no_address(self):
+        # Ticket 143. The question the dispatch slice used to ask by trying:
+        # an Entity has an address when an Application or an Endpoint is what
+        # it is, and the Identity a Program projects is neither and never will
+        # be. NULL in, NULL out, because a Task with no subject at all is a
+        # different sentence and `recon.no_subject` already says it.
+        [row] = self.connection.execute(
+            "SELECT rk2_subject_addressable($1::uuid) AS subject,"
+            "       rk2_subject_addressable($2::uuid) AS identity,"
+            "       rk2_subject_addressable(NULL) AS nothing",
+            (self.subject["id"], self.addressless),
+        ).dicts()
+        self.assertIs(True, row["subject"])
+        self.assertIs(False, row["identity"])
+        self.assertIsNone(row["nothing"])
+
+    def test_a_recon_task_whose_subject_has_no_address_is_never_ready(self):
+        # Ticket 143. `rk2hunt4` lost a whole pass to a Task the dispatch slice
+        # could not serve: it refused, the pass ended at `ok: false`, and the
+        # Task stayed at the top of the ranking to refuse every later pass in
+        # the same words. Answered here, before the slate, so the Task is never
+        # offered and the pass never meets it.
+        self.assertIsNone(self.ready_for_subject(self.elsewhere["id"]))
+        self.assertEqual("recon.no_address", self.ready_for_subject(self.addressless))
+        # And the arm above it still answers first, because an Entity the scope
+        # refuses is refused for that and not for the address it also lacks.
+        self.assertEqual(
+            "recon.subject_not_in_scope",
+            self.ready_for_subject(self.identity_of(self.identifiers["other"])),
+        )
 
     def test_the_first_task_is_a_recon_task_against_that_subject(self):
         # The narrow shape criterion 2 asks for: one kind, one subject the scope

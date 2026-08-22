@@ -412,6 +412,8 @@ class Recorder:
                 "leases_released": 0,
             },
         )
+        # Ticket 143. What `retire_task` answers: the status the Task ended at.
+        self.retired = answers.get("retired", "abandoned")
         # What the weights row says one Mission packet may cost. An empty list
         # is a scheduler with no active row, which is a real state and the one
         # the module answers with its own defaults.
@@ -559,6 +561,9 @@ class Recorder:
             return [(json.dumps(self.fingerprint),)]
         if sql == execution.FINISH:
             return [(json.dumps(self.closure),)]
+        # Ticket 143. One column, one row: the status the Task ended at.
+        if sql == execution.RETIRE:
+            return [(self.retired,)]
         if sql == execution.agent.CLOSE:
             return [(self.refusal_closed,)]
         if sql == proxy.PARK_TOOL_RUN:
@@ -2362,18 +2367,47 @@ class RefusalTest(unittest.TestCase):
     def closed(self, connection: Recorder) -> None:
         self.assertEqual(1, len(connection.finished()), connection.statements)
 
-    def test_a_subject_with_no_address_is_refused_and_the_task_returned(self):
+    def retired(self, connection: Recorder, ledger) -> str:
+        """Ticket 143. The Task ended and the pass did not, said as one check.
+
+        Three refusals share this: the runtime cannot dispatch the Task, so it
+        ends that Task rather than the pass. No violation, because nothing went
+        wrong that an operator can mend -- the pass goes on to the next Task,
+        and this one is gone from the ranking instead of sitting at the top of
+        it refusing every later pass in the same words.
+        """
+        self.assertEqual([], ledger.violations)
+        [sent] = connection.sent(execution.RETIRE)
+        self.assertEqual(TASK, sent[0])
+        self.closed(connection)
+        return sent[1]
+
+    def test_a_subject_with_no_address_ends_that_task_and_not_the_pass(self):
         connection = Recorder(started=(started_row(subject_type="hypothesis", url=None),))
         launcher = Launcher()
         with compiled():
             ledger, facts = attempt(connection, launcher)
-        self.assertEqual(1, len(ledger.violations))
+        self.assertIn("carries no address", self.retired(connection, ledger))
         self.assertIsNone(facts["target"])
         self.assertEqual([], launcher.requests)
         self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+
+    def test_a_task_that_cannot_be_retired_is_the_one_refusal_left(self):
+        # The only way this slice still fails on an undispatchable Task: the
+        # end could not be written either, which is a database this pass cannot
+        # trust for the next Task either.
+        connection = Recorder(
+            started=(started_row(subject_type="hypothesis", url=None),),
+            raises={execution.RETIRE: database_error("gone")},
+        )
+        with compiled():
+            ledger, _ = attempt(connection, Launcher())
+        [violation] = ledger.violations
+        self.assertEqual("database", violation.source)
+        self.assertIn("could not be retired", violation.detail)
         self.closed(connection)
 
-    def test_a_role_this_runtime_cannot_start_is_refused_before_the_packet(self):
+    def test_a_role_this_runtime_cannot_start_ends_the_task_before_the_packet(self):
         # A `report` Task claimed as the role the roster gives that kind: the
         # refusal under test is about what this runtime can start, not about a
         # role and a kind that do not go together.
@@ -2381,9 +2415,8 @@ class RefusalTest(unittest.TestCase):
         launcher = Launcher()
         with compiled():
             ledger, _ = attempt(connection, launcher)
-        self.assertEqual(1, len(ledger.violations))
+        self.assertIn("cannot start as an isolated child", self.retired(connection, ledger))
         self.assertEqual([], launcher.requests)
-        self.closed(connection)
 
     def test_a_role_that_may_not_make_the_request_is_refused_before_minting_one(self):
         # `js_analyst` is startable and holds no `net.request`, deliberately.
@@ -2395,10 +2428,9 @@ class RefusalTest(unittest.TestCase):
         launcher = Launcher()
         with compiled():
             ledger, _ = attempt(connection, launcher)
-        self.assertEqual(["roster"], [item.source for item in ledger.violations])
+        self.assertIn("holds no net.request", self.retired(connection, ledger))
         self.assertEqual([], launcher.requests)
         self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
-        self.closed(connection)
 
     def test_a_packet_that_cannot_be_compiled_starts_no_child(self):
         connection = Recorder()
