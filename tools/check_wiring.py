@@ -256,15 +256,12 @@ OWED_GAPS: dict[str, str] = {
     "W5 tool.serve.timed_out": "owed:108",
     "W5 tool.serve.overflowed": "owed:108",
 
-    # W6. Fourteen tables nothing inserts into and four views nothing selects.
-    # `cross_program_exempt_fks` and `program_isolation_candidates` are the two
-    # the plan cut no ticket for: the database audit grades the first a table the
-    # isolation check reads and nothing fills, and the second a DDL helper left
-    # behind by the migration that used it. Both are recorded against this ticket
-    # because this gate is what found them.
+    # W6. Twelve tables nothing inserts into and three views nothing selects.
+    # `cross_program_exempt_fks` and `program_isolation_candidates` are not
+    # among them: both are read as harmless by the database audit and excluded
+    # by name in `producer_gaps`, above `BY_DESIGN`, rather than owed here.
     "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
-    "W6 cross_program_exempt_fks": "owed:130",
     "W6 eval_family_coverage": "owed:126",
     "W6 eval_fn_attribution": "owed:126",
     "W6 eval_pair_scores": "owed:126",
@@ -273,7 +270,6 @@ OWED_GAPS: dict[str, str] = {
     "W6 observation_embeddings": "owed:127",
     "W6 hypothesis_retest_triggers": "owed:114",
     "W6 interception_cas": "owed:124",
-    "W6 program_isolation_candidates": "owed:130",
     "W6 program_known_issues": "owed:125",
     "W6 redaction_failure": "owed:125",
     "W6 report_queue": "owed:105",
@@ -1409,6 +1405,24 @@ def result_gaps(wiring: Wiring) -> list[Gap]:
     return gaps
 
 
+#: Two relations the database audit itself reads as harmless rather than as a
+#: gap, and this check's own file-only reach cannot tell that apart from a real
+#: one. `cross_program_exempt_fks` is an override table read by
+#: `check_program_isolation` (`0017_program_isolation.sql:328`): it stays empty
+#: because it is meant to, an empty override table is full isolation and not a
+#: missing writer, and an operator who needs a named exemption inserts a row by
+#: hand rather than through a code path this reader would find. Its parallel
+#: `INDEX` scan is what caught it here in the first place, so the exemption is
+#: named for the finding rather than for a class of table this reader ignores.
+#: `program_isolation_candidates` is a view selected twice inside the very
+#: migration that defines it (`0017_program_isolation.sql:189`, `:238`), inside
+#: a `DO` block this reader's scan does not reach; it generates the isolation
+#: constraints at DDL time and has done its one job by the time this file ever
+#: runs. Both are named rather than matched by shape, because a shape wide
+#: enough to catch them is a shape wide enough to excuse a real one.
+BY_DESIGN = frozenset({"cross_program_exempt_fks", "program_isolation_candidates"})
+
+
 def producer_gaps(wiring: Wiring) -> list[Gap]:
     """W6: a table has a producer, a view has a reader, and a rule has an input.
 
@@ -1426,12 +1440,12 @@ def producer_gaps(wiring: Wiring) -> list[Gap]:
     gaps = [
         Gap("W6", table, f"nothing inserts a row into {table}")
         for table in sorted(catalogue.tables)
-        if table not in produced
+        if table not in produced and table not in BY_DESIGN
     ]
     gaps.extend(
         Gap("W6", view, f"nothing selects from {view}")
         for view in sorted(catalogue.views)
-        if view not in catalogue.selected and view not in surface.names
+        if view not in catalogue.selected and view not in surface.names and view not in BY_DESIGN
     )
     for column, reads in sorted(catalogue.generated.items()):
         gaps.extend(

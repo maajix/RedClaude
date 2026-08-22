@@ -149,7 +149,7 @@ reimplementation of what `integrity.py` owns.
 
 ## The register
 
-127 rows naming 22 open tickets: W10 41, W4 28, W3 21, W6 18, W9 9, W5 5, W1 3,
+125 rows naming 21 open tickets: W10 41, W4 28, W3 21, W6 16, W9 9, W5 5, W1 3,
 W7 1, W8 1. Every row was measured before it was written, and both directions
 fail. A gap with no row is refused as `unregistered:`. A row whose gap is gone is
 refused with `remove the row`, because a tracked absence that outlives its gap
@@ -163,18 +163,22 @@ reader meets it. It is seeded from the catalogue at
 and the two are the same question only in a system where nothing was ever
 granted and left.
 
-## Three gaps the plan cut no ticket for
+## One gap the plan cut no ticket for, and two that were not gaps
 
-Found by measuring rather than by reading the audits, and recorded against this
-ticket because it is what found them:
+Found by measuring rather than by reading the audits. `find_in_database` is
+granted to `rk2_runtime` and called by nothing, and it is recorded against this
+ticket because this gate is what found it: it is the cross-table secret sweep,
+and the redaction verifier ticket 125 owes is what would feed it.
 
-* `find_in_database` is granted to `rk2_runtime` and called by nothing. It is
-  the cross-table secret sweep; the redaction verifier ticket 125 owes is what
-  would feed it.
-* `cross_program_exempt_fks` is read by the isolation check and nothing fills
-  it.
-* `program_isolation_candidates` is a view nothing selects, left behind by the
-  migration that used it.
+`cross_program_exempt_fks` and `program_isolation_candidates` first landed here
+the same way, as `owed:130` rows. Both turned out to be the database audit's own
+harmless verdicts read as gaps by a check with no way to tell them apart: an
+override table that stays empty on purpose reads exactly like a table nothing
+fills, and a view selected only inside a `DO` block reads exactly like one
+nothing selects. Naming them and excluding them by name, in `producer_gaps`
+above `BY_DESIGN`, is the honest fix -- a register row would have kept this
+ticket open to track two things that are not wrong, and a shape wide enough to
+catch both automatically is a shape wide enough to excuse a real one.
 
 W4 also reports seven relations more than the twenty-one the agent-surface audit
 counted by hand. Four of them -- `finding_chain_step_citations`,
