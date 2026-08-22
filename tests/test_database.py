@@ -3483,7 +3483,8 @@ class FirstTaskTest(DatabaseCase):
 
         cls.subject = cls.entity_of("main")
         cls.elsewhere = cls.entity_of("other")
-        cls.addressless = cls.host_with_no_application()
+        cls.beside = cls.rows_beside_the_subject()
+        cls.addressless = cls.beside["addressless"]
         cls.pass_ledger, cls.offered, cls.claimed = cls.run_one_pass()
         cls.refusals = {}
         cls.refuse_what_is_not_a_subject()
@@ -3498,48 +3499,74 @@ class FirstTaskTest(DatabaseCase):
         super().tearDownClass()
 
     @classmethod
-    def host_with_no_application(cls) -> str:
-        """Ticket 143: one in-scope Entity that no target table holds.
+    def rows_beside_the_subject(cls) -> dict[str, str]:
+        """Three Entities in the second Program, for the one address question.
 
-        A `host` is in scope and is still not a thing to send a request to: no
-        Application keys on it and no Endpoint sits under it. It is the only
-        arrangement in which `ready_for` reaches its address arm at all, because
-        the scope arm above it answers first for everything out of scope.
+        Ticket 157 gives "where does a request for this Entity go" a single
+        answer, and these are the shapes that answer has to have arms for. A
+        `domain` carrying the name the Application already stands on, an
+        `endpoint` under that Application, and a wildcard `domain` -- which
+        resolves to nothing on purpose, because `*.app.example.com` names a set
+        of hosts, this build enumerates none of them, and the Application it
+        would otherwise join to is an Application on a different name.
 
-        Written as the owner, and it is the one row this case writes by hand.
-        Recon promotes hosts, and running a recon child here to get one would be
-        this case proving something else. It goes in the second Program, so the
-        Task the pass claimed and every count over `main` is untouched, and the
-        purge in `tearDownClass` takes it with the Program.
+        In scope, all three, which is what makes them reach the address arm at
+        all: the arm above answers first for everything the scope refuses, and
+        that is the case `identity_of` already covers.
+
+        Written as the owner, and these are the only rows this case writes by
+        hand. Recon promotes domains and endpoints, and running a recon child
+        here to get one would be this case proving something else. They go in
+        the second Program, so the Task the pass claimed and every count over
+        `main` is untouched, and the purge in `tearDownClass` takes them with
+        the Program.
         """
         owner = pg.connect(cls.harness.migrate)
-        try:
-            with owner.transaction():
-                owner.execute("SELECT set_actor('runtime', 'selftest')")
-                entity = owner.execute(
+        scope = cls.SUBJECT[:1] + (cls.SUBJECT[1], cls.SUBJECT[2])
+        made = {}
+
+        def entity(kind: str, name: str) -> str:
+            return str(
+                owner.execute(
                     "INSERT INTO entities (program_id, type, label, dedup_key,"
                     "        scope_selector_kind, scope_selector, scope_port,"
                     "        scope_path_raw, scope_path_norm)"
-                    " VALUES ($1::uuid, 'host', $2, $2, 'host', $3, $4, $5, $5)"
+                    " VALUES ($1::uuid, $2, $3, $3, 'host', $4, $5, $6, $6)"
                     " RETURNING id::text",
-                    (cls.identifiers["other"], f"{FIRST_SLUG}-unreachable-host")
-                    + cls.SUBJECT[:1]
-                    + (cls.SUBJECT[1], cls.SUBJECT[2]),
+                    (cls.identifiers["other"], kind, f"{FIRST_SLUG}-{name}") + scope,
                 ).scalar()
+            )
+
+        try:
+            with owner.transaction():
+                owner.execute("SELECT set_actor('runtime', 'selftest')")
+                made["named"] = entity("domain", "named-domain")
                 owner.execute(
-                    "INSERT INTO hosts (entity_id, hostname) VALUES ($1::uuid, $2)",
-                    (entity, cls.SUBJECT[0]),
+                    "INSERT INTO domains (entity_id, fqdn, apex, wildcard)"
+                    " VALUES ($1::uuid, $2, 'example.com', false)",
+                    (made["named"], cls.SUBJECT[0]),
+                )
+                made["route"] = entity("endpoint", "route-under-it")
+                owner.execute(
+                    "INSERT INTO endpoints (entity_id, application_id, method, path_template)"
+                    " VALUES ($1::uuid, $2::uuid, 'GET', '/health')",
+                    (made["route"], cls.elsewhere["id"]),
+                )
+                made["addressless"] = entity("domain", "wildcard-domain")
+                owner.execute(
+                    "INSERT INTO domains (entity_id, fqdn, apex, wildcard)"
+                    " VALUES ($1::uuid, $2, $3, true)",
+                    (made["addressless"], f"*.{cls.SUBJECT[0]}", cls.SUBJECT[0]),
                 )
                 # Born denied, like every other row: `in_scope` is projected and
                 # asserting it is what `entities_scope_is_projected` refuses. The
                 # selector above is the configured inclusion, so the projection
-                # admits this host for the same reason it admits the Application
-                # beside it -- and the two differ in exactly one thing, which is
-                # the thing under test.
+                # admits all three for the same reason it admits the Application
+                # beside them -- and what they differ in is the thing under test.
                 owner.execute(
                     "SELECT refresh_scope_projection($1::uuid)", (cls.identifiers["other"],)
                 )
-            return str(entity)
+            return made
         finally:
             owner.close()
 
@@ -3787,19 +3814,50 @@ class FirstTaskTest(DatabaseCase):
             (self.identifiers["other"], json.dumps({"subject_entity_id": entity})),
         ).scalar()
 
-    def test_an_entity_no_target_table_holds_carries_no_address(self):
-        # Ticket 143. The question the dispatch slice used to ask by trying:
-        # an Entity has an address when an Application or an Endpoint is what
-        # it is, and the Identity a Program projects is neither and never will
-        # be. NULL in, NULL out, because a Task with no subject at all is a
-        # different sentence and `recon.no_subject` already says it.
+    def test_the_address_of_a_subject_has_one_answer(self):
+        # Ticket 157. The question is "where does a request for this Entity go",
+        # and it used to be answered in two places: `rk2_subject_addressable`
+        # tested two tables, and `execution.STARTED` resolved the URL from the
+        # same two in a `CASE` of its own. Either could be changed without the
+        # other, and the second one was -- `rk2hunt16` froze a hunt against a
+        # domain the Program had an Application on the whole time.
+        #
+        # So the four arms are asserted here as one row: an Application is its
+        # own base URL, an Endpoint is that URL and its path, and a name is the
+        # Application this Program holds on that name.
+        [row] = self.connection.execute(
+            "SELECT rk2_subject_url($1::uuid) AS application,"
+            "       rk2_subject_url($2::uuid) AS endpoint,"
+            "       rk2_subject_url($3::uuid) AS name,"
+            "       rk2_subject_url($4::uuid) AS wildcard",
+            (
+                self.elsewhere["id"],
+                self.beside["route"],
+                self.beside["named"],
+                self.beside["addressless"],
+            ),
+        ).dicts()
+        self.assertEqual(self.BASE_URL, row["application"])
+        self.assertEqual(f"{self.BASE_URL}/health", row["endpoint"])
+        self.assertEqual(self.BASE_URL, row["name"])
+        self.assertIsNone(row["wildcard"])
+
+    def test_an_entity_nothing_is_served_on_carries_no_address(self):
+        # Ticket 143, asked through 157's one answer. An Entity has an address
+        # when a request can be aimed at it, the Identity a Program projects is
+        # a credential and never will be, and a wildcard is a set of names this
+        # build does not enumerate. NULL in, NULL out, because a Task with no
+        # subject at all is a different sentence and `recon.no_subject` already
+        # says it.
         [row] = self.connection.execute(
             "SELECT rk2_subject_addressable($1::uuid) AS subject,"
-            "       rk2_subject_addressable($2::uuid) AS identity,"
+            "       rk2_subject_addressable($2::uuid) AS wildcard,"
+            "       rk2_subject_addressable($3::uuid) AS identity,"
             "       rk2_subject_addressable(NULL) AS nothing",
-            (self.subject["id"], self.addressless),
+            (self.subject["id"], self.addressless, self.identity_of(self.identifiers["other"])),
         ).dicts()
         self.assertIs(True, row["subject"])
+        self.assertIs(False, row["wildcard"])
         self.assertIs(False, row["identity"])
         self.assertIsNone(row["nothing"])
 

@@ -288,12 +288,13 @@ STARTED = (
     " t.id::text, t.label, t.kind, t.attempts,"
     " e.id::text, e.type, e.label,"
     " coalesce(ep.method, 'GET'),"
-    " CASE"
-    "   WHEN ep.entity_id IS NOT NULL THEN rtrim(pa.base_url, '/')"
-    "     || CASE WHEN left(ep.path_template, 1) = '/' THEN ep.path_template"
-    "             ELSE '/' || ep.path_template END"
-    "   WHEN ap.entity_id IS NOT NULL THEN ap.base_url"
-    " END,"
+    # Ticket 157. This used to be a CASE over `applications` and `endpoints`
+    # here, and `rk2_subject_addressable` was the same rule written a second
+    # time in SQL for `ready_for` to read. One of the two could be changed
+    # without the other, and the second one was: a claim promoted against a
+    # Domain froze in `rk2hunt16` because the predicate said no address where
+    # this side could have resolved one. Both now ask the one function.
+    " rk2_subject_url(e.id),"
     " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active),"
     " (SELECT br.tokens FROM budget_reservations br"
     "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL),"
@@ -302,8 +303,6 @@ STARTED = (
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
-    " LEFT JOIN applications pa ON pa.entity_id = ep.application_id"
-    " LEFT JOIN applications ap ON ap.entity_id = e.id"
     " LEFT JOIN hypotheses h ON h.id = t.hypothesis_id AND h.program_id = t.program_id"
     " LEFT JOIN tests ts ON ts.id = t.test_id AND ts.program_id = t.program_id"
     " WHERE ar.label = $1 AND ar.program_id = $2::uuid"
