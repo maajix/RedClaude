@@ -440,6 +440,19 @@ def serve(
     output is an Artifact in the store, and the way to see more of it than fits
     here is to analyse that Artifact rather than to read it into a context.
 
+    Both streams, and not just the one that worked.  A tool that failed wrote
+    its diagnostic to stderr, and an answer carrying an exit code beside an
+    empty stdout says that something went wrong and hides what.  Both heads are
+    cut to the same `excerpt` and both say when they were cut, for the reason
+    `_streams` files both: an empty stream is a fact about the run.
+
+    And the two ceilings are named rather than left inside the sentence
+    `_verdict` writes.  A run the supervisor stopped kept a fragment of a run
+    that was taken away; a tool that exited non-zero ran to the end and said no.
+    One is a bound an operator has to raise and the other is the tool's own
+    answer, and a model that had to read the detail line to tell them apart
+    would be parsing prose for a fact the run already holds.
+
     A refusal is answered rather than raised.  A child that asked for a tool the
     registry does not admit has made a call that failed, which is a thing it can
     read and do something else about; an exception out of here would reach it as
@@ -518,6 +531,7 @@ def serve(
         raise
 
     head = answer.stdout.data[:excerpt]
+    diagnostic = answer.stderr.data[:excerpt]
     return {
         "served": closed["status"] == "success",
         "tool_run": plan["tool_run"],
@@ -532,6 +546,12 @@ def serve(
         ],
         "stdout": head.decode("utf-8", "replace"),
         "truncated": answer.stdout.truncated or len(answer.stdout.data) > len(head),
+        "stderr": diagnostic.decode("utf-8", "replace"),
+        "stderr_truncated": (
+            answer.stderr.truncated or len(answer.stderr.data) > len(diagnostic)
+        ),
+        "timed_out": answer.timed_out,
+        "overflowed": answer.overflowed,
     }
 
 

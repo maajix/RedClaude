@@ -244,14 +244,13 @@ OWED_GAPS: dict[str, str] = {
     "W4 tool_runs": "owed:129",
     "W4 state_read_surface": "owed:129",
 
-    # W5. An element a proposal accepts and no read verb returns; a label class
-    # an act tool mints and no read verb resolves; and three fields a tool answer
-    # drops on the way to the model.
+    # W5. An element a proposal accepts and no read verb returns, and a label
+    # class an act tool mints and no read verb resolves. The three fields a tool
+    # answer dropped on the way to the model are gone: ticket 108 put `stderr`,
+    # `timed_out` and `overflowed` on `tool.serve`'s answer, so the three rows
+    # that owed them are removed rather than re-pointed.
     "W5 relationships": "owed:129",
     "W5 tool_run": "owed:107",
-    "W5 tool.serve.stderr": "owed:108",
-    "W5 tool.serve.timed_out": "owed:108",
-    "W5 tool.serve.overflowed": "owed:108",
 
     # W6. Twelve tables nothing inserts into and three views nothing selects.
     # `cross_program_exempt_fks`, `program_isolation_candidates` and `secret_dek`
