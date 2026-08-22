@@ -6,9 +6,9 @@ and their five read functions are retired.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The state is recorded first. `eval_runs` (`0033_eval_store.sql:37`),
+- [x] The state is recorded first. `eval_runs` (`0033_eval_store.sql:37`),
       `eval_pair_scores` (`:60`), `eval_fn_attribution` (`:150`) and
       `eval_family_coverage` (`:198`) have no `INSERT` anywhere -- not in a
       function, not in Python, not even a seed row in their own migration. The
@@ -17,13 +17,13 @@ and their five read functions are retired.
       `eval_key_diff` (`:296`) and `eval_comparable` (`:307`) -- have no caller.
       Twenty-nine columns and twenty-seven CHECK constraints sit between two
       ends that are both open.
-- [ ] The evaluation that does exist is distinguished from the one that is
+- [x] The evaluation that does exist is distinguished from the one that is
       declared. `src/redkraken/evaluation.py` writes `evaluation_programs`
       (`evaluation.py:140`) and is reached by `rk playbook evaluate` and
       `rk playbook cost`. That is a fixture-program registry, not a score: it
       says which Playbook is being measured against which fixture, and nothing
       records how it did.
-- [ ] The question the ticket answers is whether a run is meant to be
+- [x] The question the ticket answers is whether a run is meant to be
       measurable from the database at all. `run_key` is "the sha256 of
       everything that must be equal for two runs to be repeats of the same
       measurement" and `key_components` keeps the pre-image so two runs that
@@ -31,11 +31,11 @@ and their five read functions are retired.
       answer whether two runs may be compared at all. That is a considered
       design for A/B measurement of the hunter, and either it is due or it is
       not.
-- [ ] The one thing that is not re-decided is the exclusion from the agent's
+- [x] The one thing that is not re-decided is the exclusion from the agent's
       read surface. `0033:17-20` gives the reason and it stands: "an eval score
       is a measurement of the hunter, and letting the hunter read it is the one
       thing that would make the measurement worthless."
-- [ ] If the answer is "later", it is written into the migration corpus rather
+- [x] If the answer is "later", it is written into the migration corpus rather
       than left as an absence, so the next audit does not re-report four empty
       tables as a hole.
 
@@ -181,3 +181,109 @@ right about its own SQL -- the single Python `INSERT` is at `evaluation.py:139-1
 "nothing records how it did" is not true: `playbook_test_runs` records exactly
 that, and `playbook_test_verdict` reads it back. The eval store's emptiness is
 not evidence that the harness cannot grade a Playbook.
+
+## What was built
+
+`src/redkraken/migrations/20260929T000000Z__the_eval_store_leaves_with_the_model_it_was_missing.sql`,
+and nothing else. No Python changed, because the decision was to retire and
+because `evaluation.py` was never a writer for these tables in the first place.
+
+**The four tables and the five readers are gone**, readers first. The functions
+are dropped before their subjects so that a reader outliving what it reads is
+impossible rather than merely unlikely -- `eval_precision` is plpgsql and would
+have parsed against absent tables and failed at its first call instead of at
+apply time -- and `eval_comparable` goes before `eval_key_diff` because it calls
+it. The tables then drop children-first, four plain statements in dependency
+order, so no `CASCADE` is written and the blast radius is in the file rather
+than in the catalogue. The three `derive_program_id` triggers (`0033:218-228`)
+and the row-level-security policies `apply_state_rls()` had given each table go
+with their tables.
+
+**The migration's body is the scoring model**, which is the part of the decision
+that is not a deletion. The header states what was built, what a writer would
+have had to supply, which of those fourteen values has no producer anywhere in
+this repository, and then the five conditions -- a per-entry `gt_id`, an
+enumerated `gt_declared`/`gt_recallable`, a per-entry verdict into the five
+buckets `eval_gt_accounting` partitions, a `sut` identifier, and a `run_key`
+pre-image whose every component exists here -- that would have to exist before
+the design could be rebuilt. It also records the trigger to watch: if
+`playbook_test_runs` ever grows a per-fixture recall or precision column, the
+two run-key designs collide and one has to go.
+
+**Three registers were emptied of it, and all three had to be.**
+`event_table_exempt` (four rows) because `check_event_coverage()` reports
+`exempt_row_missing_table`; `runtime_table_surface` (sixteen rows, four
+privileges on each table, every one stamped `66-seed`) because
+`check_runtime_privileges()` reports `runtime_table_surface_names_missing_object`;
+`purge_cascade_edges` (five rows -- the four from `0033:230-233` plus the fifth
+that cited ticket 08's row, `0033:345-347`) because `check_purge_travel()` arm
+(a) joins the register to `pg_class` and therefore *cannot* see a stale row for
+a table that no longer exists. That last one is the reason the deletion is
+written by hand: the check that keeps the register honest goes blind at exactly
+the moment the row becomes wrong. Every count is asserted, so a name that
+matched nothing fails the migration instead of letting it declare itself
+finished.
+
+No `runtime_verb_surface` row was deleted, and the absence is the point: the
+five readers were never granted to `rk2_runtime`. `0033:17-20` gives the reason
+there are no grants in that file at all, and 029's default privileges cover
+tables, not functions closed to `PUBLIC`. The house rule that a `REVOKE` deletes
+a matching row has nothing to match, because there was no `GRANT`.
+
+**One constraint the eval store had added to somebody else's table** goes with
+it. `hypothesis_near_matches_id_program_key` (`0033:134-148`) exists only
+because `eval_fn_attribution.near_match_id` cited that row across the program
+boundary. Measured on a migrated database:
+`eval_fn_attribution_near_match_id_program_id_fkey` was the only foreign key in
+the corpus referencing `hypothesis_near_matches` at all. With it gone the unique
+key is an orphan this ticket created, so this ticket removes it.
+
+**What the apply-time assertion claims** is not "four tables were dropped" --
+`DROP TABLE` already raises on an absent table. It is that nothing named
+`eval_*` survives as a relation or a function, that no row in any of the five
+registers still names one, and then the question asked the other way round:
+`rk2_state` reaches no column of `playbook_test_runs`. That last arm is
+criterion 4 made falsifiable. The rule being kept is about the measurement that
+*survives*, not the one that goes, and a retirement that quietly widened the
+hunter's read surface would have given up the only thing this ticket said it was
+not re-deciding.
+
+**The register rows the wiring gate booked to this ticket are removed**, and the
+gate was made to say so both ways before they were: with the four rows still in
+`OWED_GAPS`, `tools/check_wiring.py` reports `W6 eval_family_coverage names
+owed:126 and this tree has no such gap; remove the row` and the same for the
+other three; with them removed it reports neither those nor any new gap.
+
+### Where this ticket was wrong
+
+**"Twenty-nine columns and twenty-seven CHECK constraints" is neither number.**
+Counted from `0033_eval_store.sql`: `eval_runs` 10 columns / 1 CHECK,
+`eval_pair_scores` 21 / 21, `eval_fn_attribution` 8 / 4, `eval_family_coverage`
+6 / 3 -- **45 columns and 29 CHECK constraints**. The 29 is the CHECK count
+written onto the column line, and 27 is not the count of anything in the file.
+It does not change the argument; it is the one measurement in criterion 1 that
+was not taken.
+
+**Everything else criterion 1 states is exact, and was re-measured.**
+`INSERT INTO` against the four tables across `src/`, `tools/` and `tests/`:
+zero. Callers of the five readers outside `0033` itself: zero each. The four
+`CREATE TABLE` line numbers (`:37`, `:60`, `:150`, `:198`) and the five
+`CREATE FUNCTION` line numbers (`:244`, `:260`, `:286`, `:296`, `:307`) are all
+correct. `find . -name grading.py -o -name metrics.py`: nothing.
+`grep -rn "\bsut\b" src/ tools/ docs/research/wiring/`: three hits, exactly the
+three the decision names.
+
+**The Correction section's `evaluation.py:539` is four lines late.** The
+`open_fixture_address` call is `connection.execute(` at `evaluation.py:534` with
+`OPEN_FIXTURE_ADDRESS` at `:535`; `:539` is `origin(subject.fixture),` inside
+the argument tuple. The `record_playbook_test_run` citation (`:869`) and the
+`INSERT INTO evaluation_programs` citation (`:140`) are both exact. The
+substance of the correction -- that the module reaches two writes inside SQL
+functions and that the second of them is where the grade goes -- holds, and it
+is why the migration can say the grading path is not missing.
+
+**One thing the ticket did not ask about and this file had to answer.** Ticket
+126 lists four tables and five functions. It does not mention
+`hypothesis_near_matches_id_program_key`, which `0033` added to a table it did
+not own, for the sole benefit of a foreign key that is now gone. A retirement
+that removed only what the ticket enumerated would have left it behind.

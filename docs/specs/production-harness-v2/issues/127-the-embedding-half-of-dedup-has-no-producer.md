@@ -135,3 +135,116 @@ table anywhere in the corpus. `hypothesis_near_matches` has exactly one writer
 writes `key_collision`, so `hypothesis_near_matches_stage2_cols`
 (`0018_vocabularies.sql:429-436`) is satisfied only on its first arm.
 `claude_agent_sdk` is imported in two files, both of them the child.
+
+## Not built: where the retirement stops, measured 2026-08-22
+
+**Status stays `ready-for-agent` and no criterion is ticked.** Nothing was
+written for this ticket. The decision above is sound and is not re-opened; what
+follows is the blast radius, measured rather than estimated, because it is
+larger than the decision says and every part of it lands in a file this work was
+not allowed to write.
+
+### The headline element cannot be done by a migration at all
+
+"pgvector comes out of the provision path with them" is not a `DROP EXTENSION`
+in a `.sql` file. Measured on a freshly provisioned and fully migrated database:
+
+```
+vector owner                                  postgres, pgvector 0.8.6
+rk2_migrate rolsuper                          false
+pg_has_role('rk2_migrate','postgres','USAGE') false
+[as rk2_migrate] DROP EXTENSION vector        42501: must be owner of extension vector
+```
+
+The extension is created by the superuser step (`src/redkraken/migrate.py:381`),
+so only that step can uncreate it. There is no arrangement of migration SQL that
+removes it, which means this element is `src/redkraken/migrate.py` and nothing
+else.
+
+Two other facts from the same measurement, both confirming the decision's own
+reading:
+
+```
+[as rk2_migrate] DROP TABLE observation_embeddings
+    2BP01: cannot drop table observation_embeddings because other objects
+           depend on it | view hnsw_headroom depends on table observation_embeddings
+[as rk2_migrate] ALTER TABLE hypothesis_near_matches DROP COLUMN similarity
+    SUCCEEDED
+```
+
+So the two tables and `hnsw_headroom` are one unit that has to move together --
+the view cannot be left standing over a dropped table -- and the near-match
+columns are the one part a migration can do unaided.
+
+### Every part of the decision reaches `tests/test_database.py`
+
+Each of the four parts was checked against the suite as it stands. All four
+subjects currently pass; the four tests below were run and reported `ok`, so
+nothing here is a pre-existing failure.
+
+| Part of the decision | Test it removes the subject of |
+| --- | --- |
+| drop `hypothesis_embeddings` / `observation_embeddings` | `tests/test_database.py:2697-2714`, `NegativeControlTest.test_an_index_the_server_cannot_build_fails_the_headroom_check` -- it arranges the failure by `INSERT INTO hypothesis_embeddings` at `:2708-2712` and asserts `"baseline:hnsw_headroom" in failed` at `:2714` |
+| drop `hnsw_headroom` and its baseline arm | `tests/test_database.py:2918`, inside `NegativeControlTest.test_every_check_the_gate_runs_has_a_control`: `covered` is seeded with `"baseline:hnsw_headroom"` and `:2922` asserts `covered - ran` is empty, so a gate that stops running the check fails there |
+| drop the two similarity arms of `hypothesis_near_matches` | `tests/test_database.py:13713-13726`, `HypothesisPromotionTest.test_the_statement_that_converged_is_kept_as_a_key_collision`, which selects `nm.similarity, nm.embedding_model` at `:13715-13716` and asserts both are NULL at `:13724-13725`; without the columns the query raises 42703 |
+| pgvector out | `tests/test_database.py:2552-2553` (`RUNTIME_CONTROLS` rows `baseline:pgvector_version` and `baseline:hnsw_cosine_opclass`, exercised at `:2686-2696`, which asserts each named check is the *only* failing row of `evaluate_server_runtime`), `:1028-1029` (`CONTROLS` rows `baseline:hnsw_iterative_scan` and `baseline:hnsw_max_scan_tuples`), and `:519-520` (`CleanCreationTest` asserts both settings are green) |
+
+### The files a complete change has to write, with lines
+
+* `tests/test_database.py` -- `:519-520`, `:1028-1029`, `:2552-2553`,
+  `:2697-2714`, `:2918`, `:13713-13726`. Six sites, five test methods.
+* `src/redkraken/migrate.py` -- `:381` (`CREATE EXTENSION IF NOT EXISTS
+  vector`), `:383-386` (the `extversion` read and `ledger.hold("extension:vector",
+  ...)`), `:302-306` (the `provision()` docstring, which names the extension as
+  the third of the three things a database owner cannot do for itself), and
+  `:862-863` (`_assert_superuser`'s failure text, "roles, databases and the
+  vector extension cannot be created without one").
+* `src/redkraken/backup.py` -- `:76-82`, `PROVISIONED_EXTENSIONS = ("vector",)`
+  and the paragraph above it. Once nothing provisions the extension, the archive
+  exclusion names something that is not there.
+* `tests/test_backup.py:282` -- `self.assertEqual(("vector",),
+  backup.PROVISIONED_EXTENSIONS)`, which pins the tuple above.
+
+### One coupling the decision does not mention
+
+`apply_server_settings()` (`0028_server_settings.sql:44-135`) opens with
+`PERFORM '[1]'::vector` at `:56` and then sets `hnsw.iterative_scan` (`:127`)
+and `hnsw.max_scan_tuples` (`:133`). `0028:46-55` explains why that cast is
+there and is not redundant: `CREATE EXTENSION` does not load the library, and until it is loaded
+`hnsw.*` is an undefined custom GUC that only a superuser may define. It is a
+**finalizer**, re-executed on every `rk db migrate` -- so the moment the
+extension is gone, every subsequent migration run fails on that one line. The
+three settings are live on the database today:
+
+```
+maintenance_work_mem=256MB  hnsw.iterative_scan=relaxed_order  hnsw.max_scan_tuples=40000
+```
+
+`maintenance_work_mem` stays -- it is not a pgvector setting and
+`0028:59-93` argues it on its own terms with a measured sweep -- but the two `hnsw.*` values have to
+be `RESET` on the database as well as removed from the function, or a
+`pg_db_role_setting` row survives naming a GUC prefix no extension defines. That
+is inside a migration and so is not a blocker; it is a fifth thing the change
+has to carry, and it is not in the decision's list.
+
+### What is still true and does not need re-measuring
+
+* `grep -rn "embedding" src/redkraken/*.py` returns nothing.
+* There is no `INSERT` into either embedding table anywhere in the corpus.
+* `hypothesis_near_matches` has exactly one writer,
+  `20260814T070000Z__a_proposal_becomes_a_canonical_hypothesis.sql:796-800`, and
+  it writes `key_collision` with neither stage-2 column -- confirmed by reading
+  the statement, which names only `program_id, candidate_statement,
+  matched_hypothesis_id, action, agent_run_id`.
+* All three of `similarity`, `embedding_model` and `candidate_hypothesis_id` are
+  on `state_read_surface` today, which is the decision's "three always-NULL
+  columns sit on the agent's read surface", confirmed against a migrated
+  database.
+* `runtime_table_surface` holds eight `66-seed` rows for the two embedding
+  tables (four privileges each), `event_table_exempt` two (`derived`, owner
+  ticket `06`, `0027_migration_baseline.sql:73-74`) and `purge_cascade_edges`
+  two (`0016_event_log_corrections.sql:216-217`). All twelve have to go with the
+  tables, for the reason ticket 126's migration gives: two of the three
+  registers are policed by checks that report a row naming a missing table, and
+  the third is policed by a check that joins to `pg_class` and therefore goes
+  blind at exactly the moment the row becomes wrong.

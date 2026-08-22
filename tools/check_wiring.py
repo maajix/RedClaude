@@ -260,10 +260,6 @@ OWED_GAPS: dict[str, str] = {
     # owed here.
     "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
-    "W6 eval_family_coverage": "owed:126",
-    "W6 eval_fn_attribution": "owed:126",
-    "W6 eval_pair_scores": "owed:126",
-    "W6 eval_runs": "owed:126",
     "W6 hypothesis_embeddings": "owed:127",
     "W6 observation_embeddings": "owed:127",
     "W6 interception_cas": "owed:124",
