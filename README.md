@@ -223,6 +223,7 @@ paths = ["/"]
 
 [[identity]]
 name = "member"
+class = "user"
 slot_ref = "slot://identity/member"
 
 [[required_header]]
@@ -244,7 +245,9 @@ than a contradiction, because the campaign total binds first and the Lane never
 does.
 
 A scope entry names a hostname, an address, an address range in CIDR
-notation such as `10.0.0.0/24`, or a wildcard such as `*.example.com`. An inclusion's wildcard must name at least two labels of its
+notation such as `93.184.216.0/24`, or a wildcard such as
+`*.example.com`. A range must be globally routable, the same rule a bare
+address is held to. An inclusion's wildcard must name at least two labels of its
 own, so `*.com` is refused. That is a floor, not a public-suffix rule: `*.co.uk`
 passes it, and how wide an inclusion may be remains the operator's judgement
 against the Program. An exclusion has no floor, because breadth there withdraws
@@ -267,6 +270,11 @@ two Applications, and why an inclusion naming a wildcard records nothing:
 as `first_tasks`, and rerunning an unchanged configuration records nothing and
 opens nothing, because the Task each subject already carries is the one being
 resumed.
+
+An identity also declares its `class`, either `user` or `privileged`,
+defaulting to `user`. Whether a credential is an administrator's is a
+provisioning fact the operator knows and no response can reveal, so it is
+stated here rather than inferred.
 
 Secret material is never written into a configuration. An identity carries a
 `slot_ref` and a required header carries a `value_ref`. Both name a

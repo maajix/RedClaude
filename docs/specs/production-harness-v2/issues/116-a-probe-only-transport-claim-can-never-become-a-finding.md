@@ -10,7 +10,7 @@ by the Finding that rests on it.
 
 **Status:** ready-for-agent
 
-- [x] `reject_non_agent_evidence()` admits a `transport_citable` Receipt. Its
+- [ ] `reject_non_agent_evidence()` admits a `transport_citable` Receipt. Its
       current body
       (`20260815T120000Z__a_supported_claim_becomes_a_candidate.sql:687-706`)
       raises when the Receipt behind a cited Observation is on a lane outside
@@ -19,13 +19,13 @@ by the Finding that rests on it.
       reads off the generated column, exactly as ticket 93's does at
       `20260923T000000Z__the_runtime_takes_its_own_transport_measurement.sql:481`:
       `r.lane = 'proxy_internal' AND NOT r.transport_citable`.
-- [x] `reject_non_agent_citation()` is widened with it
+- [ ] `reject_non_agent_citation()` is widened with it
       (`20260815T120000Z...:721-737`), for the reason 20260815T120000Z gives at
       `:715-720` for widening them together: `finding_chain_step_citations`
       carries both triggers, so leaving one alone makes one table answer two
       ways about one exchange -- admissible cited through the Observation it
       produced, inadmissible cited directly.
-- [x] The unreachable state is what the criterion is stated against. Follow a
+- [ ] The unreachable state is what the criterion is stated against. Follow a
       `probe_only` class end to end: `transport_evidence_guard()`
       (`0025_transport_claims.sql:361-390`) requires a `supports` row on such a
       class to cite a `transport_parameters_observed` Observation;
@@ -36,13 +36,13 @@ by the Finding that rests on it.
       Observation that can support the hypothesis is the only Observation that
       cannot be the Finding's evidence. After this ticket, a Finding on
       `transport.tls_configuration` reaches `validated`.
-- [x] The two classes are named and no more are admitted.
+- [ ] The two classes are named and no more are admitted.
       `transport_makeability` (`0025_transport_claims.sql:203-233`) seeds five
       rows: `transport.tls_configuration` and `transport.certificate_trust` are
       `probe_only`, `transport.header_policy` is `agent_ok`,
       `transport.request_framing` and `transport.datagram_transport` are
       `unmakeable`. This ticket changes nothing for the other three.
-- [x] Decision 15 keeps what it is for, and the ticket says so in the same
+- [ ] Decision 15 keeps what it is for, and the ticket says so in the same
       terms 20260923T000000Z uses at `:463-469`: a token the proxy fetched, a
       preflight, a redirect it followed for itself is still not evidence,
       because none of it is a measurement and none of it is citable. The
@@ -186,11 +186,15 @@ are three.
 
 ## Why this is not resolved yet (2026-08-22)
 
-The migration `20260927T000000Z__a_probe_only_claim_becomes_a_finding.sql` is
-written and sits in the tree, and the first five criteria are paid by it. Two
-things are still owed, and the ticket was briefly marked `resolved` without
-them, which turned both `check_audit` and `check_wiring` red:
+A draft migration, `20260927T000000Z__a_probe_only_claim_becomes_a_finding.sql`,
+is written and sits UNCOMMITTED in the working tree. It was never verified
+against a database: the agent that wrote it stopped before its run finished.
+So no criterion is ticked here, because a ticked box in a committed ticket file
+has to mean committed work. The ticket was briefly marked `resolved` with the
+boxes ticked, which turned both `check_audit` and `check_wiring` red. Three
+things are owed:
 
+- The draft migration must be run against a database and committed.
 - Criterion 6 is unpaid. The end-to-end test has not been written, and
   `tests/test_database.py` is held by another agent for ticket 127, so it
   cannot be written yet.

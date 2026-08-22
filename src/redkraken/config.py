@@ -144,14 +144,17 @@ _BROAD_HOST = re.compile(rf"(\*\.)?({_LABEL}\.)*{_TOP_LABEL}")
 _HOST_SHAPE = "must be a hostname, a wildcard such as *.example.com, or an address"
 
 #: What a scope rule may name that a callback endpoint may not. A Program
-#: scoped to `203.0.113.0/24` is an ordinary bounty scope and was expressible
+#: scoped to `93.184.216.0/24` is an ordinary bounty scope and was expressible
 #: only as 256 entries; a Program scoped to a /16 or to any IPv6 range was not
-#: expressible at all. It is admitted here and nowhere else because a range is
+#: expressible at all. The example is a globally routable block on purpose: a
+#: documentation range such as `203.0.113.0/24` parses and is then refused by
+#: `scope._unroutable`, so quoting one here would hand the reader a spelling
+#: that never compiles as an inclusion. It is admitted here and nowhere else because a range is
 #: a statement about authority over address space, and a callback names one
 #: endpoint the harness itself operates.
 _RANGE_SHAPE = (
     "must be a hostname, a wildcard such as *.example.com, an address, "
-    "or an address range such as 203.0.113.0/24"
+    "or an address range such as 93.184.216.0/24"
 )
 
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
