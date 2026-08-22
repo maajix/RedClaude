@@ -32,6 +32,7 @@ TOP_LEVEL = (
     "budgets",
     "callback",
     "identity",
+    "known_issue",
     "program",
     "required_header",
     "rules_of_engagement",
@@ -83,6 +84,7 @@ RULE_KEYS = ("host", "paths", "ports", "protocols")
 IDENTITY_KEYS = ("class", "name", "slot_ref")
 HEADER_KEYS = ("name", "value_ref")
 CALLBACK_KEYS = ("host", "kind", "name", "placement", "provider")
+KNOWN_ISSUE_KEYS = ("class_id", "entity_like", "note", "source")
 PROTOCOLS = ("http", "https")
 CALLBACK_KINDS = ("dns", "http")
 
@@ -101,6 +103,15 @@ IDENTITY_CLASSES = ("privileged", "user")
 #: absent for those and `scope.Channel` refuses one that states it anyway.
 CALLBACK_PLACEMENTS = ("label", "path")
 CALLBACK_PROVIDERS = ("cloudflare-quick", "static")
+
+#: Where a do-not-send entry came from, as far as a configuration can say it.
+#: `program_known_issues.source` (`0034_reports.sql:356`) admits a third,
+#: `prior_submission`, and it is absent here because it is not a declaration:
+#: it is the harness's own record of a report it has already sent, written
+#: after the sending rather than transcribed before it. A document that could
+#: state it would be an operator asserting the harness's history to the
+#: harness.
+KNOWN_ISSUE_SOURCES = ("operator", "program_policy")
 
 #: Key names that would carry a secret inline. Naming them separately turns a
 #: leaked credential into a precise refusal rather than an unknown key.
@@ -158,6 +169,20 @@ _RANGE_SHAPE = (
 )
 
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
+
+#: What a vulnerability class is named. Shape only: `vulnerability_classes` is
+#: the vocabulary and it lives in the database, so membership is decided by the
+#: foreign key at projection time. Thirty-seven class names copied into this
+#: file would be a second vocabulary free to disagree with the schema's.
+_CLASS_ID = re.compile(r"[a-z][a-z0-9_]{0,62}")
+
+#: One printable line, which is what both free-text fields of a known issue
+#: are: a `LIKE` pattern over `entities.dedup_key`, and the sentence
+#: `report_blockers` hands back as the reason a report was refused. Bounded, so
+#: a configuration cannot put a paragraph where an operator reads one line, and
+#: leading whitespace is refused so that one rule has one spelling.
+_ONE_LINE = re.compile(r"[^\x00-\x20\x7f][^\x00-\x1f\x7f]{0,511}")
+_ONE_LINE_SHAPE = "one printable line of 1 to 512 characters"
 _PATH_SHAPE = (
     "must be a path prefix beginning with one forward slash, printable and free of .. segments"
 )
@@ -202,6 +227,7 @@ class Configuration:
             "identities": [entry["name"] for entry in self.document["identity"]],
             "required_headers": [entry["name"] for entry in self.document["required_header"]],
             "callbacks": [entry["name"] for entry in self.document["callback"]],
+            "known_issues": len(self.document["known_issue"]),
         }
 
 
@@ -292,6 +318,9 @@ def validate(document: object) -> tuple[dict | None, tuple[Violation, ...]]:
         "budgets": _budgets(reader, root),
         "scope": _scope(reader, root),
         "identity": _entries(reader, root, "identity", IDENTITY_KEYS, _identity),
+        "known_issue": _entries(
+            reader, root, "known_issue", KNOWN_ISSUE_KEYS, _known_issue, _by_instance
+        ),
         "required_header": _entries(reader, root, "required_header", HEADER_KEYS, _header),
         "callback": _entries(reader, root, "callback", CALLBACK_KEYS, _callback),
     }
@@ -592,7 +621,26 @@ def _is_path(value: object) -> bool:
     return ".." not in value.split("/")
 
 
-def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build) -> list[dict]:
+def _by_name(item: dict) -> tuple[str, str]:
+    """What makes two entries the same entry, for a list an operator names."""
+    return "name", str(item["name"]).lower()
+
+
+def _by_instance(item: dict) -> tuple[str, str]:
+    """What makes two known issues the same rule: the pair the blocker joins on.
+
+    `report_blockers` matches a Finding on `class_id` and on `entity_like`
+    (`0034_reports.sql:815-825`), so two entries agreeing on both are one rule
+    written twice, and which of the two notes a refusal quotes would be
+    whichever row the join happened to reach first.
+    """
+    where = item["entity_like"] or "the whole program"
+    return "class_id", f"{item['class_id']} on {where}"
+
+
+def _entries(
+    reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build, unique=_by_name
+) -> list[dict]:
     if key not in root:
         return []
     entries = reader.array(root[key], key, minimum=0)
@@ -608,11 +656,11 @@ def _entries(reader: _Reader, root: dict, key: str, keys: tuple[str, ...], build
         item = build(reader, table, source)
         if item is None:
             continue
-        name = item["name"].lower()
-        if name in seen:
-            reader.fail(f"{source}.name", f"duplicate name: {name}")
+        field, value = unique(item)
+        if value in seen:
+            reader.fail(f"{source}.{field}", f"duplicate {field}: {value}")
             continue
-        seen.add(name)
+        seen.add(value)
         built.append(item)
     return sorted(built, key=canonical_bytes)
 
@@ -653,6 +701,43 @@ def _header(reader: _Reader, table: dict, source: str) -> dict | None:
     if name is None or reference is None:
         return None
     return {"name": name, "value_ref": reference}
+
+
+def _known_issue(reader: _Reader, table: dict, source: str) -> dict | None:
+    """One entry of the do-not-send list the Program published.
+
+    `entity_like` is the only optional key and its absence is the wider rule,
+    not a narrower one: `program_known_issues.entity_like` is "SQL LIKE over
+    entities.dedup_key; NULL = whole program" (`0034_reports.sql:355`), so an
+    entry that names no instance refuses the class outright. It is read like
+    `callback.host` -- present and unreadable drops the entry, absent does not
+    -- because a pattern the operator wrote and this file could not read is not
+    the same fact as a pattern they did not write.
+
+    Both other fields are read before the entry is dropped, for the reason
+    `_identity` states: leaving on a bad `class_id` would hide the `note`
+    violation behind it, and the note is the sentence an operator reads when
+    the report they expected does not go out.
+    """
+    klass = None
+    raw = reader.required(table, source, "class_id")
+    if raw is not None:
+        klass = reader.text(raw, f"{source}.class_id", _CLASS_ID, _CLASS_ID.pattern)
+    origin = _vocabulary(reader, table, source, "source", KNOWN_ISSUE_SOURCES)
+    note = None
+    raw = reader.required(table, source, "note")
+    if raw is not None:
+        note = reader.text(raw, f"{source}.note", _ONE_LINE, _ONE_LINE_SHAPE)
+    entity = None
+    if "entity_like" in table:
+        entity = reader.text(
+            table["entity_like"], f"{source}.entity_like", _ONE_LINE, _ONE_LINE_SHAPE
+        )
+        if entity is None:
+            return None
+    if klass is None or origin is None or note is None:
+        return None
+    return {"class_id": klass, "entity_like": entity, "note": note, "source": origin}
 
 
 def _callback(reader: _Reader, table: dict, source: str) -> dict | None:

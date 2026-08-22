@@ -505,10 +505,15 @@ class CleanCreationTest(DatabaseCase):
 
         self.assertEqual((), drift)
 
-    def test_the_shipped_settings_reach_the_connection_the_gate_runs_on(self):
+    def test_the_shipped_setting_reaches_the_connection_the_gate_runs_on(self):
         # `apply_server_settings` is `ALTER DATABASE ... SET`, which only reaches
         # sessions opened after it. Verifying on the connection that applied it
         # reports the settings the run started with, so the gate opens its own.
+        #
+        # One setting rather than three since ticket 127: the two `hnsw.*` values
+        # tuned a scan over indexes the retirement removed, and both the settings
+        # and their baseline arms went with them. `maintenance_work_mem` is not a
+        # pgvector setting and stays.
         settings = {
             check.name: check.ok
             for check in integrity.run(self.connection, self.harness.expected)
@@ -516,8 +521,8 @@ class CleanCreationTest(DatabaseCase):
         }
 
         self.assertTrue(settings["maintenance_work_mem"])
-        self.assertTrue(settings["hnsw_iterative_scan"])
-        self.assertTrue(settings["hnsw_max_scan_tuples"])
+        self.assertNotIn("hnsw_iterative_scan", settings)
+        self.assertNotIn("hnsw_max_scan_tuples", settings)
 
     def test_the_migrate_report_says_how_much_of_the_gate_ran(self):
         # "The gate passed" is worth nothing without the number of checks behind
@@ -1024,9 +1029,11 @@ CONTROLS = (
     ),
     Control("baseline:schema_migrations_present", "DROP TABLE rk2_meta.schema_migrations"),
     # --- the settings the schema depends on ----------------------------------
+    # Ticket 127 took `baseline:hnsw_iterative_scan` and
+    # `baseline:hnsw_max_scan_tuples` off this list with the arms they controlled:
+    # both settings tuned an HNSW index scan, and the retirement left no HNSW
+    # index to scan.
     Control("baseline:maintenance_work_mem", "SET LOCAL maintenance_work_mem = '16MB'"),
-    Control("baseline:hnsw_iterative_scan", "SET LOCAL hnsw.iterative_scan = 'off'"),
-    Control("baseline:hnsw_max_scan_tuples", "SET LOCAL hnsw.max_scan_tuples = 5000"),
     Control(
         "baseline:default_transaction_isolation",
         "SET LOCAL default_transaction_isolation = 'repeatable read'",
@@ -2695,23 +2702,26 @@ class NegativeControlTest(DatabaseCase):
 
                 self.assertEqual([check], [str(row[0]) for row in failed])
 
-    def test_an_index_the_server_cannot_build_fails_the_headroom_check(self):
-        # The one check that needs rows rather than an edit: headroom is the
-        # number of vectors an HNSW build fits in maintenance_work_mem, so
-        # falsifying it means having more rows than the setting allows.
-        with self.arranged() as failed:
-            self.connection.execute("SET LOCAL maintenance_work_mem = '64kB'")
-            program = self.connection.execute(PROGRAM, ("headroom-selftest",)).scalar()
-            entity = self.connection.execute(ENTITY, (program,)).scalar()
-            hypothesis = self.connection.execute(HYPOTHESIS, (program, entity)).scalar()
-            self.connection.execute(
-                "INSERT INTO hypothesis_embeddings (hypothesis_id, model, embedding, program_id)"
-                " SELECT $1, 'selftest-' || g, array_fill(0::real, ARRAY[1536])::vector, $2"
-                "   FROM generate_series(1, 12) g",
-                (hypothesis, program),
-            )
+    def test_no_vector_column_is_left_for_a_headroom_check_to_measure(self):
+        # What used to stand here was the control for `baseline:hnsw_headroom`:
+        # it inserted twelve `vector(1536)` rows under a 64kB
+        # `maintenance_work_mem` so the next HNSW build would spill, and asserted
+        # the check said so. Ticket 127 retired the two embedding tables, the two
+        # HNSW indexes and the view, so there is no subject left to break — and
+        # the replacement is the claim that makes that permanent rather than
+        # incidental, asked of the type instead of of the two table names.
+        left = self.connection.execute(
+            "SELECT c.relname || '.' || a.attname FROM pg_attribute a"
+            "  JOIN pg_class c ON c.oid = a.attrelid"
+            "  JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'"
+            "  JOIN pg_type t ON t.oid = a.atttypid"
+            " WHERE a.attnum > 0 AND NOT a.attisdropped AND t.typname = 'vector'"
+        ).rows
 
-        self.assertIn("baseline:hnsw_headroom", failed)
+        self.assertEqual([], [str(row[0]) for row in left])
+        self.assertIsNone(
+            self.connection.execute("SELECT to_regclass('hnsw_headroom')").scalar()
+        )
 
     def test_an_unattributable_receipt_fails_the_receipt_check(self):
         # Also rows rather than an edit: an agent-lane request that no tool run
@@ -2915,7 +2925,7 @@ class NegativeControlTest(DatabaseCase):
         # gate as one more thing nobody has seen fail.
         covered = {control.check for control in CONTROLS}
         covered |= {check for check, *_ in RUNTIME_CONTROLS}
-        covered |= {"baseline:hnsw_headroom", "standing:receipt_integrity"}
+        covered |= {"standing:receipt_integrity"}
         ran = {check.source for check in integrity.run(self.connection, self.harness.expected)}
 
         self.assertEqual(set(), ran - covered, "a check with no negative control")
@@ -13711,9 +13721,13 @@ class HypothesisPromotionTest(DatabaseCase):
         self.assertEqual("the object id is not checked against the caller", str(row[1]))
 
     def test_the_statement_that_converged_is_kept_as_a_key_collision(self):
+        # `similarity` and `embedding_model` used to be selected here and asserted
+        # NULL. Ticket 127 removed them with the two similarity-based actions that
+        # were their only reason to exist, so what is asserted now is the stronger
+        # half of the same claim: the trace is one action wide, and the CHECK on
+        # the column is what says so to a writer rather than a test.
         [row] = self.rows(
-            "SELECT nm.candidate_statement, nm.action, nm.similarity,"
-            "       nm.embedding_model, h.label"
+            "SELECT nm.candidate_statement, nm.action, h.label"
             "  FROM hypothesis_near_matches nm"
             "  JOIN hypotheses h ON h.id = nm.matched_hypothesis_id"
             " WHERE nm.program_id = $1::uuid"
@@ -13721,9 +13735,25 @@ class HypothesisPromotionTest(DatabaseCase):
 
         self.assertEqual("any member can read any note by guessing its id", str(row[0]))
         self.assertEqual("key_collision", str(row[1]))
-        self.assertIsNone(row[2])
-        self.assertIsNone(row[3])
-        self.assertEqual(self.claimed["hypotheses"][0], str(row[4]))
+        self.assertEqual(self.claimed["hypotheses"][0], str(row[2]))
+
+    def test_the_near_match_vocabulary_admits_no_action_but_the_collision(self):
+        # The half of ticket 127 a reader would otherwise have to take on trust:
+        # `penalised` is not merely unwritten, it is refused. In a transaction
+        # that is rolled back, because this case commits and a refused write must
+        # leave nothing behind either.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            with self.connection.transaction():
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "INSERT INTO hypothesis_near_matches"
+                    " (program_id, candidate_statement, matched_hypothesis_id, action)"
+                    " SELECT $1::uuid, 'a near duplicate in meaning', h.id, 'penalised'"
+                    "   FROM hypotheses h WHERE h.program_id = $1::uuid LIMIT 1",
+                    (self.identifiers["main"],),
+                )
+
+        self.assertIn("hypothesis_near_matches_action_check", str(refused.exception))
 
     def test_the_converged_claim_kept_the_evidence_of_both_proposals(self):
         rows = self.rows(

@@ -7,14 +7,14 @@ retired.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The producer that does not exist is named. `hypothesis_embeddings`
+- [x] The producer that does not exist is named. `hypothesis_embeddings`
       (`0010_embeddings.sql:7-13`) and `observation_embeddings` (`:15-21`) each
       hold a `vector(1536)` keyed by model, each carries an HNSW index
       (`:23-26`), and neither has an `INSERT` anywhere. Nothing in the harness
       computes an embedding.
-- [ ] The consequence on the dedup side is stated. `hypothesis_near_matches`
+- [x] The consequence on the dedup side is stated. `hypothesis_near_matches`
       (`0012_scheduler.sql:69-79`) declares three actions after
       `0018_vocabularies.sql:429-436`: `suppressed`, `penalised` and
       `key_collision`. Its only writer
@@ -24,20 +24,20 @@ retired.
       to be NOT NULL for the other two actions -- are never written, and the two
       similarity-based actions are unreachable. The CHECK is satisfiable only on
       its `key_collision` arm.
-- [ ] `candidate_hypothesis_id` is understood rather than lumped in. It was
+- [x] `candidate_hypothesis_id` is understood rather than lumped in. It was
       added by `0023_scheduler_ranking.sql:165-166` so that from the Hypothesis
       a candidate became there is a way back to the row, and `0023:161-164` says
       the `penalised` action exists for exactly that lookup and that
       `key_collision` "has no candidate row either". It is NULL today because
       the only action written is the one that correctly has no candidate, not
       because a writer forgot it.
-- [ ] `hnsw_headroom` (`0027_migration_baseline.sql:364-376`) is decided with
+- [x] `hnsw_headroom` (`0027_migration_baseline.sql:364-376`) is decided with
       the rest. It counts rows in the two embedding tables against
       `maintenance_work_mem` to say whether the next index build spills to disk,
       and `check_server_baseline` asserts on it. It is a live check over two
       permanently empty tables: the answer is always "infinite headroom", and it
       will stop being true on the first day anything writes a vector.
-- [ ] Whichever way it goes, `0018_vocabularies.sql:414-421` keeps its point:
+- [x] Whichever way it goes, `0018_vocabularies.sql:414-421` keeps its point:
       the design's own words are that what can be fixed is "the *silence*" --
       a suppressed hypothesis leaves a trace. If embeddings are deferred, the
       trace is `key_collision` only, and the migration that says so also says
@@ -136,13 +136,13 @@ writes `key_collision`, so `hypothesis_near_matches_stage2_cols`
 (`0018_vocabularies.sql:429-436`) is satisfied only on its first arm.
 `claude_agent_sdk` is imported in two files, both of them the child.
 
-## Not built: where the retirement stops, measured 2026-08-22
+## The blast radius, measured 2026-08-22 before anything was written
 
-**Status stays `ready-for-agent` and no criterion is ticked.** Nothing was
-written for this ticket. The decision above is sound and is not re-opened; what
-follows is the blast radius, measured rather than estimated, because it is
-larger than the decision says and every part of it lands in a file this work was
-not allowed to write.
+Kept because it is the reading the retirement was planned from, and because one
+line of it turned out to be wrong in a way worth leaving visible (the
+`runtime_table_surface` count below says eight; it is twelve -- `hnsw_headroom`
+is a relation and carries four rows of its own). The decision above was not
+re-opened.
 
 ### The headline element cannot be done by a migration at all
 
@@ -248,3 +248,184 @@ has to carry, and it is not in the decision's list.
   registers are policed by checks that report a row naming a missing table, and
   the third is policed by a check that joins to `pg_class` and therefore goes
   blind at exactly the moment the row becomes wrong.
+
+## Built, 2026-08-22
+
+`src/redkraken/migrations/20261003T000000Z__a_key_collision_is_the_whole_of_the_trace.sql`
+carries the retirement and the reasoning. All five criteria are ticked: the
+absent producer, the consequence on the dedup side, `candidate_hypothesis_id`,
+`hnsw_headroom` and what the harness gives up are each stated in the migration
+header, and each is the reason for a statement in the file rather than a note
+beside one.
+
+**What went.** The two embedding tables and their HNSW indexes; `hnsw_headroom`
+and `hnsw_bytes_per_tuple`; the `hnsw_headroom` arm of `check_server_baseline`;
+the `suppressed` and `penalised` actions of `hypothesis_near_matches`, its
+`similarity`, `embedding_model` and `candidate_hypothesis_id` columns and the
+three constraints and one index over them; and sixteen register rows -- two
+`event_table_exempt`, two `purge_cascade_edges`, twelve `runtime_table_surface`
+(the two tables and `hnsw_headroom`, four privileges each) -- plus three
+`state_read_surface` rows.
+
+**Two couplings the decision above did not name, both paid.** `novelty_for`
+(`0023:325-329`) was the only reader of `similarity` in the corpus and
+`check_scheduler_closure` arm (e) (`0023:1186-1189`) was the only reader of
+`candidate_hypothesis_id`; both are string-bodied, so neither would have refused
+the `ALTER TABLE` and both would have failed at their next call instead. They are
+replaced in place -- `CREATE OR REPLACE`, so `novelty_for(tasks)` keeps the grant
+its `runtime_verb_surface` row declares. `novelty_for('hunt')` returns the same
+number it always did: `coalesce(1 - sim, 1)` was 1 on every row, because no
+writer ever filled the column.
+
+**A third, from the parent's brief, paid differently than expected.**
+`apply_server_settings()` (`0028:56`) opens with `PERFORM '[1]'::vector` and is a
+finalizer re-run on every `rk db migrate`, so it would break the moment the
+extension went. The extension does not go (below), so it does not break -- but
+the two `hnsw.*` values it sets tune an HNSW index scan and there is no HNSW
+index left, so they are out of the finalizer and `ALTER DATABASE ... RESET` on
+the database, with their two baseline arms. `maintenance_work_mem = 256MB` stays
+and `0028:59-93` still argues it. The vector cast survives once, in this
+migration, because the owner cannot reset a `hnsw.*` GUC until the library that
+defines it is loaded.
+
+**The one element of the decision that was not paid, and why.** "pgvector comes
+out of the provision path with them" is not payable from `src/redkraken/migrate.py`,
+which is where the previous reading placed it. The obstacle is
+`src/redkraken/migrations/0001_extensions.sql:2` -- `CREATE EXTENSION IF NOT
+EXISTS vector` -- which runs as `rk2_migrate` on every database this corpus is
+applied to from empty. Measured on a fresh database with no `vector` in it:
+
+```
+[as rk2_migrate] CREATE EXTENSION IF NOT EXISTS vector
+    ERROR:  permission denied to create extension "vector"
+    HINT:   Must be superuser to create this extension.
+```
+
+It is a no-op today only because `provision()` (`migrate.py:381`) installed the
+extension as a superuser first. Take the install out and `rk db migrate` cannot
+reach migration two. So `migrate.py`, `backup.py` and `tests/test_backup.py` are
+unchanged, `backup.PROVISIONED_EXTENSIONS` still names `vector`, and the
+`pgvector_version` and `hnsw_cosine_opclass` baseline arms stay: all three are
+still true statements about what applying this corpus requires. The line drawn
+is between the PRESENCE of the extension, which the corpus still demands, and the
+BEHAVIOUR of HNSW indexes, of which there are now none. Section 6(f) of the
+migration asserts the extension is still there and names, in its failure text,
+the four things that have to move in one change when `0001` can finally be
+rewritten -- it is the only assertion in the file that is asking to be broken.
+
+One consequence worth recording for whoever does it: after this migration nothing
+in the schema uses the `vector` type, so `--exclude-extension=vector` no longer
+excludes any table definition from an archive -- only the `COMMENT ON EXTENSION`
+`pg_dump` emits, which is still superuser work the restore connection cannot do.
+
+**Tests.** `tests/test_database.py`: the two `hnsw.*` settings assertions became
+`assertNotIn`; the two `CONTROLS` rows for their baseline arms are gone;
+`baseline:hnsw_headroom` is off the `covered` seed;
+`test_an_index_the_server_cannot_build_fails_the_headroom_check` is replaced by
+`test_no_vector_column_is_left_for_a_headroom_check_to_measure`, which asks the
+catalogue for a `vector` column rather than the two table names; and
+`test_the_statement_that_converged_is_kept_as_a_key_collision` no longer selects
+the two dropped columns, with
+`test_the_near_match_vocabulary_admits_no_action_but_the_collision` added beside
+it so that `penalised` being refused is measured rather than assumed.
+`tools/check_wiring.py` loses both `owed:127` rows: W6 no longer reports either
+table, because the checker applies drops in corpus order.
+
+## Finished and measured, 2026-08-22
+
+The section above was written before the change had been run. What follows is
+the same change after it was completed and executed, and it names the one thing
+that was missing.
+
+**What was missing: house rule G8.** The file moved the closed set on
+`hypothesis_near_matches.action` from three spellings to one and re-issued
+`COMMENT ON TABLE` only. G8 is about the column -- "a migration that moves a
+constraint, a default or a closed set on a column must re-issue that column's
+`COMMENT ON` in the same file" -- and it is the rule ticket 115 was raised to
+pay off by hand and ticket 130 will mechanise. `COMMENT ON COLUMN
+hypothesis_near_matches.action` is now issued beside the `ALTER TABLE` that
+moves the CHECK, in the shape `20260922T060000Z:105` set. The column had no
+live comment before this file; a reader of `\d+ hypothesis_near_matches` who
+saw a one-element CHECK would otherwise have had nothing on the relation
+saying whether the other two actions were coming back.
+
+**The corpus applies and the gate passes.** Measured against a `git archive
+HEAD` tree carrying only this ticket's two files, so nothing another agent has
+in the shared working tree is being credited or blamed:
+
+```
+tests.test_database.CleanCreationTest NegativeControlTest HypothesisPromotionTest
+    ArchiveTest ProgramPurgeTest RuntimePrivilegeSurfaceTest
+Ran 84 tests in 361.444s
+OK
+```
+
+`CleanCreationTest` is the one that matters most here: it applies the corpus
+from empty, so every assertion in section 6 of the migration -- no `vector`
+column left, no `hnsw.*` row left in `pg_db_role_setting`, the action CHECK
+closed on `key_collision` alone, the writer's five columns intact, sixteen
+register rows gone and `maintenance_work_mem` still set -- is executed on a
+real server as a condition of that run passing. `ArchiveTest`,
+`ProgramPurgeTest` and `RuntimePrivilegeSurfaceTest` were added to the batch
+because the change deletes rows from `purge_cascade_edges`,
+`runtime_table_surface` and `event_table_exempt` and rewrites the
+`apply_server_settings` finalizer; all three are green.
+
+The same three primary classes were then run again in the shared working tree,
+alongside four migrations four other tickets have in flight, to show this file
+does not collide with any of them:
+
+```
+tests.test_database.CleanCreationTest NegativeControlTest HypothesisPromotionTest
+Ran 56 tests in 319.513s
+OK
+```
+
+**The four gates.**
+
+```
+PYTHONPATH=$PWD python3 -s tools/check_audit.py           rc=0
+PYTHONPATH=$PWD python3 -s tools/check_wiring.py          rc=1
+PYTHONPATH=$PWD python3 -s tools/check_baseline.py        rc=0
+PYTHONPATH=$PWD/src:$PWD python3 -s tools/check_coverage.py rc=0
+```
+
+`check_wiring` in the isolated tree reports exactly two lines, both of them the
+`OWED_GAPS` rows this change makes false and neither of them removable from here
+-- `tools/check_wiring.py` is held by another agent this round:
+
+```
+register: W6 hypothesis_embeddings names owed:127 and this tree has no such gap; remove the row
+register: W6 observation_embeddings names owed:127 and this tree has no such gap; remove the row
+```
+
+**The unpaid element, re-measured rather than restated.** The decision's
+"pgvector comes out of the provision path with them" is still unpaid, and the
+obstacle is now measured from the catalogue rather than from a single error
+message:
+
+```
+SELECT rolname, rolsuper FROM pg_roles WHERE rolname = 'rk2_migrate'
+    ('rk2_migrate', False)
+SELECT DISTINCT name, version, trusted, superuser
+  FROM pg_available_extension_versions WHERE name = 'vector'
+    ('vector', '0.8.6', False, True)
+```
+
+`trusted = false` and `superuser = true` is the general form of the previous
+reading's `permission denied to create extension "vector"`: no non-superuser
+can install it, on any database, whatever the ownership. So
+`0001_extensions.sql:2` -- `CREATE EXTENSION IF NOT EXISTS vector`, run as
+`rk2_migrate` -- can only ever be the no-op it is today, and only because
+`provision()` installed the extension first. `src/redkraken/migrate.py`,
+`src/redkraken/backup.py` and `tests/test_backup.py:282` are therefore
+unchanged, and section 6(f) of the migration is the assertion that will fail
+when `0001` can finally be rewritten.
+
+**One thing found outside this ticket's files and not written to.**
+`docs/adr/0001-rows-authoritative-events-same-transaction.md:13` gives three
+hot paths as the reason rows are authoritative: "recursive CTE traversal over
+the attack-surface graph, `FOR UPDATE SKIP LOCKED` on the task queue, and
+pgvector similarity search". The third no longer exists after this file. The
+decision stands on the other two, so this is a stale sentence rather than a
+withdrawn ADR, and it belongs to whoever holds `docs/adr/`.

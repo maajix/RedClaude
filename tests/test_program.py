@@ -282,5 +282,161 @@ class RefusalTest(unittest.TestCase):
             self.assertNotIn(secret, rendered)
 
 
+#: A Program identifier the recorder below never resolves. The projection takes
+#: it as text and hands it straight back to the statements, so what it is worth
+#: testing about is that every statement gets the same one.
+PROGRAM = "0198b0f0-0000-7000-8000-0000000000ab"
+
+
+class Recorder:
+    """A connection that answers the one SELECT and records every write.
+
+    What `_project_known_issues` decides is which statement each entry produces
+    against what the table already holds, and that is answerable here: the
+    alternative is standing a server up to watch three INSERTs, which is
+    `tests/test_database.py`'s to do once the projection is called by a run.
+    """
+
+    def __init__(self, held: tuple[tuple[object, ...], ...] = ()) -> None:
+        self.held = held
+        self.statements: list[tuple[str, tuple]] = []
+
+    def execute(self, statement: str, parameters: tuple = ()) -> pg.Result:
+        self.statements.append((" ".join(statement.split()), tuple(parameters)))
+        if statement.lstrip().upper().startswith("SELECT"):
+            return pg.Result(columns=(), rows=self.held, tag=f"SELECT {len(self.held)}")
+        return pg.Result(tag=statement.split()[0].upper() + " 1")
+
+    def issued(self, verb: str) -> list[tuple[str, tuple]]:
+        return [item for item in self.statements if item[0].upper().startswith(verb)]
+
+
+def known_issue(entity_like: str | None, source: str, note: str) -> str:
+    """`VALID` with one do-not-send entry, spelled the way an operator would."""
+    instance = "" if entity_like is None else f'entity_like = "{entity_like}"\n'
+    return (
+        VALID
+        + f'\n[[known_issue]]\nclass_id = "idor"\n{instance}'
+        + f'source = "{source}"\nnote = "{note}"\n'
+    )
+
+
+class KnownIssueProjectionTest(unittest.TestCase):
+    """The do-not-send list, projected into the table `report_blockers` joins.
+
+    `0034_reports.sql:1073` registered `program_known_issues` as the program's
+    published list "entered by the operator through the control surface", and
+    ticket 125 settled that the surface it meant is the configuration document.
+    Three answers per entry -- insert what is new, update what changed, delete
+    what the document stopped naming -- on the pattern `_project_identities`
+    already sets.
+    """
+
+    def project(self, text: str, held: tuple = ()) -> Recorder:
+        recorder = Recorder(held=held)
+        program._project_known_issues(recorder, loaded(text), PROGRAM)
+        return recorder
+
+    def test_an_entry_the_table_does_not_hold_is_inserted(self):
+        recorder = self.project(known_issue("%/tickets/%", "program_policy", "known and wontfix"))
+
+        self.assertEqual(
+            [(PROGRAM, "idor", "%/tickets/%", "program_policy", "known and wontfix")],
+            [parameters for _, parameters in recorder.issued("INSERT")],
+        )
+        self.assertEqual([], recorder.issued("UPDATE") + recorder.issued("DELETE"))
+
+    def test_an_entry_that_names_no_instance_is_written_as_the_null_that_means_the_class(self):
+        # `entity_like` NULL is the whole program, so the absent key has to
+        # reach the column as NULL rather than as a pattern matching nothing.
+        recorder = self.project(known_issue(None, "operator", "the staging tier is open"))
+
+        self.assertEqual(
+            [(PROGRAM, "idor", None, "operator", "the staging tier is open")],
+            [parameters for _, parameters in recorder.issued("INSERT")],
+        )
+
+    def test_a_row_the_document_still_declares_unchanged_is_left_alone(self):
+        # A resume is the ordinary case, and one that rewrote every row would
+        # make an unchanged document look like a policy change to anything
+        # reading the table's history.
+        held = (("row-1", "idor", "%/tickets/%", "program_policy", "known and wontfix"),)
+
+        recorder = self.project(
+            known_issue("%/tickets/%", "program_policy", "known and wontfix"), held=held
+        )
+
+        self.assertEqual([], recorder.statements[1:])
+
+    def test_a_changed_note_is_an_update_of_the_row_that_holds_it(self):
+        # Not a delete and a re-insert: the row's identity is the rule, and
+        # replacing it would give the same rule a new `id` every time the
+        # operator reworded the sentence a refusal quotes.
+        held = (("row-1", "idor", "%/tickets/%", "operator", "the old wording"),)
+
+        recorder = self.project(
+            known_issue("%/tickets/%", "program_policy", "the new wording"), held=held
+        )
+
+        self.assertEqual(
+            [("row-1", "program_policy", "the new wording")],
+            [parameters for _, parameters in recorder.issued("UPDATE")],
+        )
+        self.assertEqual([], recorder.issued("INSERT") + recorder.issued("DELETE"))
+
+    def test_an_entry_the_document_stopped_naming_is_deleted(self):
+        # Deleted rather than invalidated, which is where this parts company
+        # with `_project_identities`: nothing cites one of these rows, so there
+        # is no row whose meaning a deletion would change, and one kept past the
+        # document that declared it would go on refusing reports about something
+        # the Program no longer says it does not want.
+        held = (
+            ("row-1", "idor", "%/tickets/%", "operator", "still declared"),
+            ("row-2", "idor", "%/orders/%", "operator", "withdrawn"),
+        )
+
+        recorder = self.project(known_issue("%/tickets/%", "operator", "still declared"), held=held)
+
+        self.assertEqual(
+            [("row-2",)], [parameters for _, parameters in recorder.issued("DELETE")]
+        )
+        self.assertEqual([], recorder.issued("INSERT") + recorder.issued("UPDATE"))
+
+    def test_a_document_that_declares_nothing_withdraws_the_whole_list(self):
+        held = (("row-1", "idor", None, "program_policy", "was published"),)
+
+        recorder = self.project(VALID, held=held)
+
+        self.assertEqual(
+            [("row-1",)], [parameters for _, parameters in recorder.issued("DELETE")]
+        )
+
+    def test_the_harnesss_own_record_of_what_it_sent_is_never_read(self):
+        # `prior_submission` is the third origin the CHECK admits and the only
+        # one this document cannot state, so a row carrying it is not the
+        # document's to keep or to withdraw. The exclusion is in the SELECT
+        # rather than in a filter afterwards, because a row this function never
+        # sees is a row it cannot delete by forgetting to check.
+        recorder = self.project(known_issue("%/tickets/%", "operator", "declared"))
+
+        statement, parameters = recorder.statements[0]
+        self.assertIn("FROM program_known_issues", statement)
+        self.assertIn("source <> 'prior_submission'", statement)
+        self.assertEqual((PROGRAM,), parameters)
+
+    def test_every_statement_is_scoped_to_the_program_or_to_one_of_its_rows(self):
+        # The table is program-scoped and the delete arm addresses rows by `id`.
+        # An `id` is only ever reached through the program-scoped read above, so
+        # the pair is what keeps one Program's list off another's.
+        held = (("row-1", "idor", "%/orders/%", "operator", "withdrawn"),)
+
+        recorder = self.project(known_issue("%/tickets/%", "operator", "declared"), held=held)
+
+        self.assertEqual(
+            [(PROGRAM,), (PROGRAM, "idor", "%/tickets/%", "operator", "declared"), ("row-1",)],
+            [parameters for _, parameters in recorder.statements],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

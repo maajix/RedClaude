@@ -541,6 +541,7 @@ def _open_program(
             str(program_id),
             revision=identity_revision,
         )
+        _project_known_issues(connection, configuration, str(program_id))
 
         # Every answer that keeps the Program open leaves it running a compiled
         # policy, resume included: a Program opened before this path existed has
@@ -1099,6 +1100,73 @@ def _project_identities(
         connection.execute(
             "UPDATE entities SET metadata = $2::jsonb WHERE id = $1::uuid",
             (entity_id, metadata),
+        )
+
+
+def _project_known_issues(
+    connection: pg.Connection, configuration: config.Configuration, program_id: str
+) -> None:
+    """Project the do-not-send list the Program published into the blocker table.
+
+    `0034_reports.sql:1073` registered `program_known_issues` as "the program's
+    published do-not-send list, entered by the operator through the control
+    surface", and the surface it meant is this document. Two of the three
+    origins its `source` CHECK admits are the operator's -- `program_policy` is
+    the published list transcribed and `operator` is their own addition -- and
+    both are declarations rather than observations, which is what a
+    configuration holds. The third, `prior_submission`, is the harness's record
+    of a report it has already sent, so a row carrying it is left exactly where
+    it is; nothing in this tree sends one yet.
+
+    A withdrawn entry is deleted rather than invalidated, which is where this
+    parts company with `_project_identities`. Nothing cites one -- no foreign
+    key points at the table and `report_blockers` joins it live -- so there is
+    no row whose meaning a deletion would change, and a row kept past the
+    document that declared it would go on refusing reports about something the
+    Program no longer says it does not want.
+
+    `class_id` reached here has been checked for shape and not for membership.
+    `class_id REFERENCES vulnerability_classes(id)` is the vocabulary, so an
+    entry naming a class this schema does not hold leaves as a refusal from the
+    insert, inside this transaction, rather than from a copy of the class list
+    kept in Python and free to disagree with it.
+    """
+    configured = {
+        (str(item["class_id"]), item["entity_like"]): (str(item["source"]), str(item["note"]))
+        for item in configuration.document["known_issue"]
+    }
+    rows = connection.execute(
+        "SELECT id::text, class_id, entity_like, source, note"
+        "  FROM program_known_issues"
+        " WHERE program_id = $1::uuid AND source <> 'prior_submission'",
+        (program_id,),
+    ).rows
+    existing = {
+        (str(row[1]), None if row[2] is None else str(row[2])): row for row in rows
+    }
+
+    for instance, (origin, note) in configured.items():
+        current = existing.get(instance)
+        if current is None:
+            connection.execute(
+                "INSERT INTO program_known_issues"
+                "       (program_id, class_id, entity_like, source, note)"
+                " VALUES ($1::uuid, $2, $3, $4, $5)",
+                (program_id, instance[0], instance[1], origin, note),
+            )
+            continue
+        if (str(current[3]), str(current[4])) == (origin, note):
+            continue
+        connection.execute(
+            "UPDATE program_known_issues SET source = $2, note = $3 WHERE id = $1::uuid",
+            (str(current[0]), origin, note),
+        )
+
+    for instance, current in existing.items():
+        if instance in configured:
+            continue
+        connection.execute(
+            "DELETE FROM program_known_issues WHERE id = $1::uuid", (str(current[0]),)
         )
 
 

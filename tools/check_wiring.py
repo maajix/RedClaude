@@ -205,7 +205,7 @@ OWED_GAPS: dict[str, str] = {
     # The cross-table secret sweep. The plan cut no ticket naming this verb, and
     # this gate is how that was found out; it is recorded against the ticket that
     # builds the redaction verifier, whose output is what a sweep would feed.
-    "W3 find_in_database": "owed:125",
+    "W3 find_in_database": "owed:138",
 
     # W4. Every relation the migrations put on the agent's own read surface that
     # no Contract reaches, plus the catalogue-seeded remainder that only a
@@ -259,11 +259,7 @@ OWED_GAPS: dict[str, str] = {
     # owed here.
     "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
-    "W6 hypothesis_embeddings": "owed:127",
-    "W6 observation_embeddings": "owed:127",
     "W6 interception_cas": "owed:124",
-    "W6 program_known_issues": "owed:125",
-    "W6 redaction_failure": "owed:125",
     "W6 report_queue": "owed:105",
 
     # W7. The one open contradiction, and the standing check that would have to

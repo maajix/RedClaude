@@ -25,6 +25,11 @@ def sources(text: str) -> list[str]:
     return [source for _, source, _ in violations(text)]
 
 
+def known_issue(*entries: str) -> str:
+    """`VALID` plus a do-not-send list, one entry per argument."""
+    return VALID + "".join(f"\n[[known_issue]]\n{entry}" for entry in entries)
+
+
 class ValidConfigurationTest(unittest.TestCase):
     def test_valid_configuration_is_accepted_and_hashed(self):
         configuration, found = config.load(write(VALID))
@@ -539,6 +544,176 @@ class ControlsTest(unittest.TestCase):
               "placement": "path", "provider": "cloudflare-quick"}],
             bound,
         )
+
+
+class KnownIssueTest(unittest.TestCase):
+    """The do-not-send list the Program published, as a document can state it.
+
+    `program_known_issues` (`0034_reports.sql:351`) is read by `report_blockers`
+    as a hard refusal and had no writer. Ticket 125 settled that the writer is
+    this document: two of the three origins its `source` CHECK admits are the
+    operator's -- `program_policy` is the published list transcribed and
+    `operator` is their own addition -- and both are declarations rather than
+    observations, which is what a configuration holds.
+    """
+
+    def test_a_document_that_names_no_list_declares_an_empty_one(self):
+        # Every configuration written before this key says nothing, and an
+        # absent list is no rule rather than a rule refusing nothing.
+        configuration, refusals = config.load(write(VALID))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual([], configuration.document["known_issue"])
+
+    def test_an_entry_is_read_into_the_four_columns_the_table_holds(self):
+        configuration, refusals = config.load(write(known_issue(
+            'class_id = "idor"\n'
+            'entity_like = "%/api/tickets/%"\n'
+            'source = "program_policy"\n'
+            'note = "the ticket API returns other tenants ids by design"\n'
+        )))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual(
+            [{
+                "class_id": "idor",
+                "entity_like": "%/api/tickets/%",
+                "note": "the ticket API returns other tenants ids by design",
+                "source": "program_policy",
+            }],
+            configuration.document["known_issue"],
+        )
+
+    def test_an_entry_that_names_no_instance_refuses_the_whole_class(self):
+        # `entity_like` is "SQL LIKE over entities.dedup_key; NULL = whole
+        # program" (`0034_reports.sql:355`), so its absence is the wider rule
+        # and not a narrower one.
+        configuration, refusals = config.load(write(known_issue(
+            'class_id = "missing_authorization"\n'
+            'source = "operator"\n'
+            'note = "the staging tier is unauthenticated on purpose"\n'
+        )))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertIsNone(configuration.document["known_issue"][0]["entity_like"])
+
+    def test_the_source_is_closed_to_the_two_a_document_can_declare(self):
+        # `prior_submission` is the third origin the CHECK admits and the one a
+        # configuration cannot state: it is the harness's own record of a report
+        # it has already sent, written after the sending rather than transcribed
+        # before it, so a document stating it would be an operator asserting the
+        # harness's history to the harness.
+        self.assertEqual(
+            [(
+                INVALID_CONFIGURATION,
+                "config:known_issue[0].source",
+                "must be one of: operator, program_policy",
+            )],
+            violations(known_issue(
+                'class_id = "idor"\nsource = "prior_submission"\nnote = "already sent"\n'
+            )),
+        )
+
+    def test_a_class_and_a_note_are_both_required(self):
+        # Both are read before the entry is dropped: leaving on the missing
+        # class would hide the note, and the note is the sentence an operator
+        # reads when the report they expected does not go out.
+        self.assertEqual(
+            [
+                (INVALID_CONFIGURATION, "config:known_issue[0].class_id", "required key is absent"),
+                (INVALID_CONFIGURATION, "config:known_issue[0].note", "required key is absent"),
+            ],
+            sorted(violations(known_issue('source = "operator"\n'))),
+        )
+
+    def test_a_class_is_named_the_way_the_schema_spells_it(self):
+        # Shape only. `vulnerability_classes` is the vocabulary and it lives in
+        # the database, so a class this schema does not hold leaves as a refusal
+        # from `class_id REFERENCES vulnerability_classes(id)` at projection
+        # time rather than from a copy of the class list kept here and free to
+        # disagree with it.
+        self.assertEqual(
+            ["config:known_issue[0].class_id"],
+            sources(known_issue(
+                'class_id = "IDOR (authorization)"\nsource = "operator"\nnote = "no"\n'
+            )),
+        )
+
+    def test_a_note_is_one_printable_line(self):
+        # It is quoted back by `report_blockers` as the detail of a hard
+        # refusal, so a paragraph here is a paragraph where an operator reads
+        # one line.
+        self.assertEqual(
+            ["config:known_issue[0].note"],
+            sources(known_issue(
+                'class_id = "idor"\nsource = "operator"\nnote = "first line\\nsecond line"\n'
+            )),
+        )
+
+    def test_two_entries_naming_the_same_class_and_instance_are_one_rule(self):
+        # `report_blockers` joins on `class_id` and `entity_like` together
+        # (`0034_reports.sql:815-825`), so two entries agreeing on both are one
+        # rule written twice, and which of the two notes a refusal quoted would
+        # be whichever row the join happened to reach first.
+        self.assertEqual(
+            [(
+                INVALID_CONFIGURATION,
+                "config:known_issue[1].class_id",
+                "duplicate class_id: idor on %/tickets/%",
+            )],
+            violations(known_issue(
+                'class_id = "idor"\nentity_like = "%/tickets/%"\n'
+                'source = "operator"\nnote = "one"\n',
+                'class_id = "idor"\nentity_like = "%/tickets/%"\n'
+                'source = "program_policy"\nnote = "two"\n',
+            )),
+        )
+
+    def test_the_same_class_on_two_instances_is_two_rules(self):
+        configuration, refusals = config.load(write(known_issue(
+            'class_id = "idor"\nentity_like = "%/tickets/%"\nsource = "operator"\nnote = "one"\n',
+            'class_id = "idor"\nentity_like = "%/orders/%"\nsource = "operator"\nnote = "two"\n',
+        )))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual(
+            ["%/orders/%", "%/tickets/%"],
+            sorted(entry["entity_like"] for entry in configuration.document["known_issue"]),
+        )
+
+    def test_a_class_wide_entry_and_an_instance_entry_are_two_rules(self):
+        # The class-wide one has no instance to compare, and reading its absence
+        # as equal to any pattern would make the wider rule swallow the narrower
+        # one at load time rather than at the join.
+        configuration, refusals = config.load(write(known_issue(
+            'class_id = "idor"\nsource = "operator"\nnote = "everywhere"\n',
+            'class_id = "idor"\nentity_like = "%/tickets/%"\nsource = "operator"\nnote = "there"\n',
+        )))
+
+        self.assertIsNotNone(configuration, refusals)
+        self.assertEqual(2, len(configuration.document["known_issue"]))
+
+    def test_an_entry_is_closed_like_every_other(self):
+        self.assertEqual(
+            ["config:known_issue[0].severity"],
+            sources(known_issue(
+                'class_id = "idor"\nsource = "operator"\nnote = "no"\nseverity = "low"\n'
+            )),
+        )
+
+    def test_the_summary_counts_the_list_without_quoting_it(self):
+        # `summary` is built by positive selection, so what it says about the
+        # list is how many rules were declared and not what any of them says.
+        configuration, refusals = config.load(write(known_issue(
+            'class_id = "idor"\nsource = "program_policy"\n'
+            'note = "the ticket API leaks tenant ids by design"\n'
+        )))
+
+        self.assertIsNotNone(configuration, refusals)
+        summary = configuration.summary()
+
+        self.assertEqual(1, summary["known_issues"])
+        self.assertNotIn("tenant ids", repr(summary))
 
 
 class SourceTest(unittest.TestCase):
