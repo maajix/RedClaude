@@ -6,9 +6,9 @@ Identity Entity with a raw INSERT, so that an Entity with no address comes out
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `rk2_anonymous_identity(uuid)` projects what it creates. It inserts the
+- [x] `rk2_anonymous_identity(uuid)` projects what it creates. It inserts the
       Program's anonymous Identity at
       `20260908T010000Z__a_clamped_run_holds_the_identity_it_acts_as.sql:177-180`
       with `(program_id, type, dedup_key, metadata)` and returns. Nothing
@@ -18,7 +18,7 @@ Identity Entity with a raw INSERT, so that an Entity with no address comes out
       `scope_class_of_entity` would classify it `not_addressable` for both
       fields, on the `p_kind IS NULL` arm at
       `20260810T193000Z__scope_policy_compilation.sql:424-427`.
-- [ ] The identity slots the operator configured are projected on the path
+- [x] The identity slots the operator configured are projected on the path
       where they are not today. `src/redkraken/program.py:1037-1047` inserts
       them with the same four columns, and in the ordinary case the
       `set_scope_version` call at `:940-943` reprojects the whole Program in
@@ -39,7 +39,7 @@ Identity Entity with a raw INSERT, so that an Entity with no address comes out
       at all". An unprojected Identity Entity defeats that reasoning, because it
       is sitting in the class the check does refuse. A test composes a chain
       with an Identity subject and asserts the chain is sound.
-- [ ] `add_entity` is either used or its comment is corrected. Its own
+- [x] `add_entity` is either used or its comment is corrected. Its own
       `COMMENT ON FUNCTION`
       (`20260813T090000Z__a_recon_run_becomes_typed_surface.sql:131-134`) says
       the origin "defaults to the operator's configuration because that is the
@@ -53,7 +53,7 @@ Identity Entity with a raw INSERT, so that an Entity with no address comes out
       projection. This ticket does not require them to be routed through
       `add_entity`; it requires the comment to stop claiming a caller that does
       not exist.
-- [ ] Nothing about the projection guard changes.
+- [x] Nothing about the projection guard changes.
       `refresh_scope_projection` refuses outside a runtime session
       (`0021_scope_policy.sql:514-518`), and both callers this ticket adds are
       already in one: `rk2_anonymous_identity` is granted to `rk2_runtime` and
@@ -77,3 +77,111 @@ operator refused this address" and "this is not an address" are different
 answers. Every Entity that is the second and reads as the first is a hole in
 that distinction, and `chain_soundness` is where it becomes visible: a kill
 chain whose pivot ran as the anonymous Identity reports itself unsound.
+
+## What was built
+
+One migration,
+`src/redkraken/migrations/20260925T020000Z__an_identity_slot_is_not_a_refused_address.sql`,
+and no Python. `rk2_anonymous_identity` is replaced with 20260908's body and one
+statement more: after both rows exist, and only on the branch that created them,
+it projects the Program. The early return that finds a slot an earlier Task
+already made projects nothing, because re-projecting a Program to discover that
+nothing moved is work every clamped Task of the run would repeat.
+
+The Entities that were written before it did are corrected in the same file.
+Every Program with a live scope version that holds an Entity with no selector
+still classed `denied` is re-projected once, and the migration then refuses to
+finish if any such row survives. The selection is on the absence of a selector
+rather than on `type = 'identity'`, because that is the question
+`scope_class_of_entity` asks on the arm this ticket is about: an Identity Entity
+that does carry a selector is a scope question with an answer, and one classed
+`denied` for a reason a rule gave is left exactly as it is.
+
+## The projection is asked for, not assumed
+
+`refresh_scope_projection` raises when the Program has no live scope version, and
+`rk2_anonymous_identity` is not reached by a call somebody wrote: it runs inside
+`derive_task_identities`, the trigger `rk2_project_task_identities` fires on
+every clamped Task. A Program that never compiled a policy can still have a hunt
+Task inserted into it, and the integrity gate's own negative control for the
+identity clamp does exactly that -- `tests/test_database.py:1550-1565` opens a
+Program with a slug and a name and puts a running `hunt` Task in it. Projecting
+unconditionally would have turned that INSERT into an exception, which is this
+ticket refusing work it has no opinion about.
+
+So the call is guarded on the version, which is the guard
+`20260813T090000Z...:1102-1104` and `20260814T070000Z...:1460-1462` already
+write at the end of their own walks for the same reason. Nothing is lost by
+skipping it: `set_scope_version` re-projects every Entity of the Program the
+first time one exists, so the row is right before anything can be sent under
+that version. Measured both ways on a scratch database: a hunt Task in a Program
+with no version still inserts and leaves the slot `denied`, and the first
+`set_scope_version` afterwards reports one Entity moved and leaves it
+`not_addressable` at that version.
+
+## What the ticket got wrong about the configured slots
+
+Criterion 2 says the identity slots `program._project_identities` creates are
+not re-projected when `_project_scope` takes its unchanged-policy early return
+at `program.py:847-865`. That is true of `_project_scope` and false of the
+transaction it is called in, and the difference is two statements further down.
+Every answer that keeps a Program open reaches
+`seeded = _decoded(connection, "SELECT open_configured_recon($1::uuid)", ...)`
+at `program.py:572`, `open_configured_recon` calls `record_configured_subjects`
+first thing (`20260831T000000Z...:388`), and that function ends with an
+unconditional `PERFORM refresh_scope_projection(p_program)`
+(`20260831T000000Z...:226-229`) under a comment saying why it is unconditional:
+"the rules may have moved under Entities this call did not create". 20260831
+closed this half of the ticket before the ticket was written, and it closed it
+structurally rather than by accident, because `refresh_scope_projection` has no
+narrower form than the whole Program.
+
+Measured rather than read: a Program with a live version, an identity Entity
+inserted by hand with `program._project_identities`'s own two statements, and
+then `open_configured_recon`, which answers
+`{"tasks_opened": 0, "subjects_recorded": 0}` -- the unchanged-policy resume, in
+other words -- moves that Entity from `denied`/`unlisted` to
+`not_addressable`/`not_addressable` at the live version. So the criterion holds
+in the tree and a second projection call in `_project_scope` would have been a
+statement that never has anything to do.
+
+## `add_entity`
+
+Its comment is corrected and its body is not. The claim that the origin
+"defaults to the operator's configuration because that is the only caller this
+function has ever had" names a caller that does not exist, and the reason for the
+default survives without it: a row nobody recorded a provenance for is one the
+Program was configured to go looking for. The new comment says that, and says
+what is true of the six writers instead -- each states its own scope selector and
+projects for itself. Routing them through `add_entity` is not this ticket's, and
+the ticket says so.
+
+## What criterion 3 is owed
+
+The consequence is asserted at the class and not at the chain. The migration
+refuses to finish while any Entity with no address is left in `denied`, which is
+the one class `rk2_chain_unsoundness` arm (e) refuses
+(`20260818T000000Z...:721-729`), so an Identity subject can no longer be the
+reason a chain reports itself unsound. What is not here is the case the criterion
+asks for in those words: a composed chain with an Identity subject, asserted
+sound. That case needs `ChainFixture` and everything under it, which lives in
+`tests/test_database.py` -- a file this agent does not own -- and there is no
+second module in this repository that reaches a server. It is owed to whoever
+next opens that file, beside `PivotStampFixture`, and it is one assertion once
+the fixture is in hand.
+
+## What it is asserted with
+
+Nothing in `tests/` changed, because nothing in `src/**/*.py` changed. The
+migration was verified against a scratch database migrated from empty: the
+corpus applied without this file, a Program with a live scope version and a hunt
+Task reproduced the defect exactly -- `('identity', 'anonymous-identity',
+'denied', 'unlisted', NULL selector, NULL version)` -- and applying this file
+moved that row to `not_addressable`/`not_addressable` at version 1 while leaving
+the version-less Program's slot alone. Afterwards a fresh Program classes its
+anonymous Identity on creation, a second call returns the row it already made,
+and the two comments read as this file writes them.
+
+The apply-time assertion in section 2 is the durable half: `rk db migrate`
+refuses the corpus if the repair does not land, and `tests/test_database.py`
+applies the corpus from empty twice in `CleanCreationTest`.
