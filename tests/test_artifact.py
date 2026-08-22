@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import re
 import typing
 import unittest
 from pathlib import Path
@@ -522,6 +523,140 @@ class SealArgumentTest(unittest.TestCase):
         path = scratch() / name
         path.write_bytes(data)
         return path
+
+
+class Answering:
+    """A connection with one canned answer, for the single read `_exchange` makes.
+
+    `Recorder` deliberately answers nothing, and its own comment says why a fake
+    that matches statements by substring is a bad idea. This one matches nothing:
+    it is handed the rows it will return, it is used only where exactly one
+    statement is sent, and what varies between the cases below is how many rows
+    came back rather than which question was asked.
+    """
+
+    def __init__(self, rows: tuple = ()):
+        self.answer = rows
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, parameters: tuple = ()) -> pg.Result:
+        self.calls.append((sql, parameters))
+        return pg.Result(columns=("id",), rows=self.answer, tag="SELECT")
+
+
+class AuditTest(unittest.TestCase):
+    """Ticket 123: the row that records a wire read names the exchange it was for.
+
+    `secret_access_log.receipt_id` had no writer anywhere in the corpus, and the
+    cost of that was narrower than it sounds. The row already named the Program,
+    the key generation and, on the proxy paths, the Tool run -- and a Tool run
+    makes many requests, so an audit could place a credential read inside a run
+    and could not place it against a request.
+
+    What makes the answer reachable from here rather than only from the door is
+    that the store and the Receipt already share a value: a sealed wire artifact
+    is filed under the hash of its plaintext, and that hash is what the Receipt
+    recorded as `request_wire_sha` or `response_wire_sha`. So `rk artifact open`
+    reads the exchange back out weeks later from a label alone.
+
+    The cases are about the two halves that can be wrong. The lookup has to be
+    bounded and has to decline to guess, and the parameters have to land in the
+    positions the statement reads them from -- a receipt passed into the slot the
+    field name is read from would be a column silently filled with the wrong
+    thing rather than a failure.
+    """
+
+    def test_the_statement_names_the_column_and_binds_every_placeholder(self):
+        connection = Recorder()
+
+        artifact._access(
+            connection,
+            "open",
+            "018f0000-0000-7000-8000-000000000001",
+            outcome="ok",
+            detail="AF1 released to a file: a reason",
+            generation=1,
+            receipt="018f0000-0000-7000-8000-000000000002",
+            length=len(BODY),
+            fingerprint=b"\x01\x02\x03\x04",
+        )
+
+        self.assertEqual(1, len(connection.calls))
+        sql, parameters = connection.calls[0]
+        self.assertIn("receipt_id", sql)
+        self.assertEqual({int(found) for found in re.findall(r"\$(\d+)", sql)},
+                         set(range(1, len(parameters) + 1)))
+        self.assertEqual("018f0000-0000-7000-8000-000000000002", parameters[3])
+        self.assertEqual(artifact.FIELD, parameters[4])
+
+    def test_a_writer_with_no_exchange_to_name_leaves_the_column_null(self):
+        # Sealing, and the two refusals that precede the label lookup. None of
+        # them names an artifact whose hash a Receipt could be found by, and the
+        # honest record of that is a null rather than the nearest exchange.
+        connection = Recorder()
+
+        artifact._access(connection, "seal", "P1", outcome="denied", detail="already sealed")
+
+        _, parameters = connection.calls[0]
+        self.assertIsNone(parameters[3])
+
+    def test_a_refused_open_records_the_exchange_it_was_refused_for(self):
+        # The refusals matter more than the releases here. Which request an
+        # operator tried and failed to open a credential for is the question an
+        # audit asks after the fact.
+        connection = Recorder()
+        answers = artifact._Answers(artifact.OPEN)
+
+        artifact._refuse_open(
+            artifact.Ledger(),
+            answers,
+            connection,
+            "P1",
+            generation=1,
+            recorded="the sealed bytes cannot be read",
+            receipt="018f0000-0000-7000-8000-000000000002",
+        )
+
+        _, parameters = connection.calls[0]
+        self.assertEqual("018f0000-0000-7000-8000-000000000002", parameters[3])
+        self.assertEqual("error", parameters[7])
+
+    def test_the_lookup_is_bounded_by_the_program_and_asks_about_the_wire_hash(self):
+        connection = Answering()
+
+        artifact._exchange(connection, "P1", "a" * 64)
+
+        self.assertEqual(1, len(connection.calls))
+        sql, parameters = connection.calls[0]
+        self.assertEqual(("P1", "a" * 64), parameters)
+        self.assertIn("FROM receipts", sql)
+        self.assertIn("program_id = $1", sql)
+        self.assertIn("request_wire_sha", sql)
+        self.assertIn("response_wire_sha", sql)
+
+    def test_one_receipt_naming_the_bytes_is_the_exchange(self):
+        connection = Answering((("018f0000-0000-7000-8000-000000000002",),))
+
+        self.assertEqual(
+            "018f0000-0000-7000-8000-000000000002",
+            artifact._exchange(connection, "P1", "a" * 64),
+        )
+
+    def test_bytes_no_receipt_names_are_an_open_with_no_exchange(self):
+        self.assertIsNone(artifact._exchange(Answering(), "P1", "a" * 64))
+
+    def test_bytes_two_receipts_name_are_recorded_as_neither(self):
+        # Identical wire bytes sent twice are one content-addressed artifact and
+        # two exchanges. Naming either would put a request in the trail that this
+        # read cannot be shown to have been made for.
+        connection = Answering(
+            (
+                ("018f0000-0000-7000-8000-000000000002",),
+                ("018f0000-0000-7000-8000-000000000003",),
+            )
+        )
+
+        self.assertIsNone(artifact._exchange(connection, "P1", "a" * 64))
 
 
 class ContentTest(unittest.TestCase):

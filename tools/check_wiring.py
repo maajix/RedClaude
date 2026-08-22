@@ -257,9 +257,10 @@ OWED_GAPS: dict[str, str] = {
     "W5 tool.serve.overflowed": "owed:108",
 
     # W6. Twelve tables nothing inserts into and three views nothing selects.
-    # `cross_program_exempt_fks` and `program_isolation_candidates` are not
-    # among them: both are read as harmless by the database audit and excluded
-    # by name in `producer_gaps`, above `BY_DESIGN`, rather than owed here.
+    # `cross_program_exempt_fks`, `program_isolation_candidates` and `secret_dek`
+    # are not among them: all three are read as harmless by the database audit
+    # and excluded by name in `producer_gaps`, above `BY_DESIGN`, rather than
+    # owed here.
     "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
     "W6 eval_family_coverage": "owed:126",
@@ -273,7 +274,6 @@ OWED_GAPS: dict[str, str] = {
     "W6 program_known_issues": "owed:125",
     "W6 redaction_failure": "owed:125",
     "W6 report_queue": "owed:105",
-    "W6 secret_dek": "owed:123",
     "W6 v_negative_knowledge": "owed:114",
     "W6 v_surface_deltas": "owed:114",
 
@@ -1418,9 +1418,17 @@ def result_gaps(wiring: Wiring) -> list[Gap]:
 #: migration that defines it (`0017_program_isolation.sql:189`, `:238`), inside
 #: a `DO` block this reader's scan does not reach; it generates the isolation
 #: constraints at DDL time and has done its one job by the time this file ever
-#: runs. Both are named rather than matched by shape, because a shape wide
-#: enough to catch them is a shape wide enough to excuse a real one.
-BY_DESIGN = frozenset({"cross_program_exempt_fks", "program_isolation_candidates"})
+#: runs. `secret_dek` is the third, and ticket 123 is what moved it here from the
+#: register: it is the DEK half of an envelope ticket 07 superseded, the audit
+#: grades it "harmless-superseded rather than load-bearing", and it is the one of
+#: these three whose emptiness is asserted -- `check_wire_artifact_secrecy`
+#: grades a wrapped data key in it a violation, so a writer for it is not work
+#: anybody owes but work the corpus refuses. All three are named rather than
+#: matched by shape, because a shape wide enough to catch them is a shape wide
+#: enough to excuse a real one.
+BY_DESIGN = frozenset(
+    {"cross_program_exempt_fks", "program_isolation_candidates", "secret_dek"}
+)
 
 
 def producer_gaps(wiring: Wiring) -> list[Gap]:

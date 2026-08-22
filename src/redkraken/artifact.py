@@ -268,13 +268,40 @@ ESTABLISH_GENERATION = (
 #: The audit row, written on every attempt including the refused ones. `peer_pid`,
 #: `peer_uid` and `peer_exe` stay null on purpose: they exist to record what a
 #: keyholder reads off SO_PEERCRED about somebody else, and a process writing
-#: them about itself would be recording a claim it could have made up.
+#: them about itself would be recording a claim it could have made up. `dek_gen`
+#: stays null for a different reason and an equally settled one: ticket 07
+#: derives a key per Program and per generation from a file the operator names,
+#: so there is no wrapped data key to number and `secret_dek` is asserted empty
+#: rather than merely left alone.
+#:
+#: `receipt_id` is the fifth column of this table that had no writer anywhere,
+#: and the only one of the five that was a defect rather than a decision. Ticket
+#: 123 is why it is filled in now. A wire artifact is the wire side of one
+#: exchange, that exchange has a Receipt, and until this row named it the trail
+#: could say a credential was released and not say what it was released for.
 ACCESS = (
     "INSERT INTO secret_access_log"
-    " (verb, scope_kind, scope_id, kek_gen, program_id, field, value_len, value_fpr,"
-    "  outcome, detail)"
-    " VALUES ($1, 'program', $2::uuid, $3::integer, $2::uuid, $4, $5::integer,"
-    "  $6::bytea, $7, $8)"
+    " (verb, scope_kind, scope_id, kek_gen, program_id, receipt_id, field, value_len,"
+    "  value_fpr, outcome, detail)"
+    " VALUES ($1, 'program', $2::uuid, $3::integer, $2::uuid, $4::uuid, $5, $6::integer,"
+    "  $7::bytea, $8, $9)"
+)
+
+#: Which exchange these wire bytes were seen on. The two tables already meet on a
+#: value neither was given in order to point at the other: a sealed wire artifact
+#: is filed under the hash of its plaintext, and that hash is what the Receipt of
+#: the exchange recorded as `request_wire_sha` or `response_wire_sha`. So the
+#: back-link is read out of the store rather than carried down from a caller, and
+#: an operator opening an artifact days later gets the same answer the door would
+#: have given at the time.
+#:
+#: Every matching row is returned rather than the first one, because more than
+#: one is a real case and not a tie to break. Identical wire bytes sent twice are
+#: one content-addressed artifact and two Receipts.
+EXCHANGE = (
+    "SELECT id FROM receipts"
+    " WHERE program_id = $1::uuid"
+    "   AND (request_wire_sha = $2 OR response_wire_sha = $2)"
 )
 
 #: What the audit row is about. One value, because there is one field this
@@ -758,6 +785,12 @@ def open_wire(
     whether the value released here is the one that turned up somewhere else, and
     not enough to reconstruct it.
 
+    From ticket 123 the row also names the exchange. The operator's reason says
+    why the credential was opened and the Receipt says what it was opened out of,
+    and the second is the half an audit cannot supply for itself: a Tool run
+    makes many requests, and until this column was written the trail could place
+    a release inside a run and not against a request.
+
     The bytes leave through the file the caller names, never through the report.
     A report is printed to a terminal, redirected into a log and pasted into a
     ticket, which is precisely the set of places §6 says a credential may not
@@ -831,6 +864,14 @@ def open_wire(
             "byte_size": int(byte_size),
         }
 
+        # The exchange the credential was read for, settled once and carried by
+        # every row this call goes on to write. It is asked here rather than at
+        # each outcome because it is a property of the artifact rather than of
+        # what became of the attempt, and asking it once means a refusal and a
+        # release cite the same request rather than two readings of the store
+        # taken a few statements apart.
+        receipt = _exchange(connection, program_id, str(wire_sha))
+
         keying = _keying(ledger, connection, root_secret, program_id, generation=int(generation))
         if keying is None:
             # `_keying` has already said which of the two it was -- a generation
@@ -842,6 +883,7 @@ def open_wire(
                 connection,
                 program_id,
                 generation=int(generation),
+                receipt=receipt,
                 recorded="key material does not match the generation this seal names",
             )
 
@@ -860,6 +902,7 @@ def open_wire(
                 connection,
                 program_id,
                 generation=int(generation),
+                receipt=receipt,
                 recorded=f"the sealed bytes cannot be read: {error}",
                 name="integrity",
                 detail=f"{found} cannot be opened: {error}",
@@ -890,6 +933,7 @@ def open_wire(
                 connection,
                 program_id,
                 generation=int(generation),
+                receipt=receipt,
                 recorded=str(error),
                 name="integrity",
                 detail=f"{found} does not authenticate: {error}",
@@ -907,6 +951,7 @@ def open_wire(
             "open",
             program_id,
             generation=int(generation),
+            receipt=receipt,
             outcome="ok",
             detail=f"{found} released to a file: {authorize}",
             length=len(plaintext),
@@ -921,6 +966,7 @@ def open_wire(
                 connection,
                 program_id,
                 generation=int(generation),
+                receipt=receipt,
                 recorded=f"the plaintext could not be written out: {error}",
                 name="released",
                 detail=f"the plaintext could not be written to {Path(into).name}: {error}",
@@ -1151,6 +1197,22 @@ def _seals(connection: pg.Connection, program_id: str) -> list[dict]:
     ]
 
 
+def _exchange(connection: pg.Connection, program_id: str, sha256: str) -> str | None:
+    """The Receipt of the exchange these wire bytes were seen on, when there is one.
+
+    Nothing is the answer in both of the cases that are not one exchange, and
+    they are different situations that deserve the same honest record. Wire bytes
+    no Receipt names are an operator sealing a capture taken somewhere else, and
+    there is no request to point at. Wire bytes two Receipts name are the same
+    bytes sent twice, which a content-addressed store keeps once, and choosing
+    between the two would put a request in the trail that this read cannot be
+    shown to have been made for. A back-link that is sometimes a guess is worth
+    less than one that is always a fact.
+    """
+    rows = connection.execute(EXCHANGE, (program_id, sha256)).rows
+    return str(rows[0][0]) if len(rows) == 1 else None
+
+
 def _access(
     connection: pg.Connection,
     verb: str,
@@ -1159,6 +1221,7 @@ def _access(
     outcome: str,
     detail: str,
     generation: int | None = None,
+    receipt: str | None = None,
     length: int | None = None,
     fingerprint: bytes | None = None,
 ) -> None:
@@ -1169,6 +1232,13 @@ def _access(
     cannot answer "who tried". The value never appears -- what is kept is its
     length and a keyed fingerprint, which is enough to recognise the same value
     turning up elsewhere and not enough to reconstruct it.
+
+    `receipt` is the exchange the read was made for, and it is an argument rather
+    than a lookup here because not every caller has one to make. The two refusals
+    that precede the label lookup name no artifact at all, so there is nothing to
+    trace back to a Receipt and nothing they could offer but a guess. Sealing has
+    no Receipt for a second reason: it is bytes arriving for the first time, and
+    an exchange that had already recorded them would have sealed them itself.
 
     No `set_actor` precedes this, unlike every other write in this module. The
     row is the audit record itself: `0030_corpus_corrections.sql` classifies
@@ -1185,6 +1255,7 @@ def _access(
             verb,
             program_id,
             generation,
+            receipt,
             FIELD,
             length,
             fingerprint,
@@ -1218,6 +1289,7 @@ def _refuse_open(
     *,
     generation: int | None,
     recorded: str,
+    receipt: str | None = None,
     name: str | None = None,
     detail: str = "",
     code: int = INTEGRITY_FAILED,
@@ -1231,12 +1303,19 @@ def _refuse_open(
     holds. `recorded` is what the trail says happened; `name` and `detail` are
     what the operator is told, and `name` is None where the refusal is already in
     the ledger because something further down decided it.
+
+    The exchange is named on a refusal for the same reason the row is written at
+    all. Which request an operator tried and failed to open a credential for is
+    the question an audit asks after the fact, and a trail that carried the
+    answer only when the attempt succeeded would answer it least often where it
+    matters most.
     """
     _access(
         connection,
         "open",
         program_id,
         generation=generation,
+        receipt=receipt,
         outcome="error",
         detail=recorded,
     )
