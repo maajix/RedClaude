@@ -255,6 +255,59 @@ def job(launch_workspace, **overrides) -> dict:
     return fields
 
 
+def announcement():
+    """The one message a corroborated launch reads before anything else."""
+    return _launch.SystemMessage(_launch.INIT, {"apiKeySource": agent.EXPECTED_KEY_SOURCE})
+
+
+def turn(**usage):
+    """One assistant answer, billed in the categories the provider reports.
+
+    The usage block is the SDK's own shape and is passed through unread, so a
+    test states what the provider said rather than what this runtime makes of
+    it.
+    """
+    return _launch.AssistantMessage(content=[], model="opus", usage=dict(usage) or None)
+
+
+def terminal(**overrides):
+    """One `ResultMessage`, with the six fields the SDK gives no default."""
+    fields = {
+        "subtype": "success",
+        "duration_ms": 1,
+        "duration_api_ms": 1,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "session-1",
+    }
+    fields.update(overrides)
+    return _launch.ResultMessage(**fields)
+
+
+def concluded(messages, **overrides) -> dict:
+    """One whole child run over a scripted stream, and the report it returns.
+
+    The transport is the one thing a test cannot arrange honestly, for
+    `INIT_CHILD`'s reason: nothing this suite can do makes the real pair report
+    the usage a budget test needs to state. Everything else is the real run --
+    the assertion, the corroboration, the loop and the report it builds.
+    """
+
+    async def transport(**_):
+        yield announcement()
+        for message in messages:
+            yield message
+
+    return asyncio.run(
+        _launch.run(
+            job(fixtures.scratch(), **overrides),
+            environment={},
+            runtime=_launch.runtime_facts(),
+            transport=transport,
+        )
+    )
+
+
 def launched(
     environment: dict, arguments: tuple = ("-m", agent.CHILD), workspace=None
 ) -> subprocess.CompletedProcess[str]:
@@ -1151,6 +1204,84 @@ class ServedToolTest(unittest.TestCase):
             self.answer(offered["get_receipts"], {"receipt_labels": ["R1"]})
 
         self.assertEqual(["get_hypotheses", "get_receipts"], surface.served)
+
+
+class RoleSurfaceTest(unittest.TestCase):
+    """What one role is served, which is what the roster grants it and no more.
+
+    Ticket 165's third open question. A `conclude` run spent a third of its
+    budget reaching for `get_validation_packet` and `get_slate` and being
+    refused by its own gate, because every tool was built for every run and the
+    allowlist was the only thing narrowing them. The allowlist is still the
+    authority; this is the frame around it, and it is derived from the same
+    roster row, so the two cannot come to disagree.
+    """
+
+    def offered(self, role: str) -> list[str]:
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            _launch.server(
+                _launch.Surface(),
+                packet.Reader(packet.Packet()),
+                _launch.Submission(),
+                role=roster.ROLES[role],
+            )
+        return sorted(served)
+
+    def granted(self, role: str) -> list[str]:
+        return sorted(
+            agent.BARE[name] for name in roster.ROLES[role].allowed_tools(agent.SERVED)
+        )
+
+    def test_every_role_is_offered_exactly_the_tools_the_roster_grants_it(self):
+        for name, compiled in roster.ROLES.items():
+            if not compiled.allowed_tools(agent.SERVED):
+                continue
+            with self.subTest(role=name):
+                self.assertEqual(self.granted(name), self.offered(name))
+
+    def test_a_hunter_can_neither_see_nor_call_another_roles_contract(self):
+        offered = self.offered("web_hunter")
+
+        self.assertNotIn("get_validation_packet", offered)
+        self.assertNotIn("get_slate", offered)
+        # And the gate stays the second line of defence rather than being
+        # replaced by the first: a call nothing offered is still refused by the
+        # roster, which is what a run's evidence needs if one is ever injected.
+        gate = roster.Gate("web_hunter")
+        for name in ("mcp__rk2__get_validation_packet", "mcp__rk2__get_slate"):
+            with self.subTest(tool=name):
+                self.assertIsNotNone(gate.decide(roster.Call(tool=name)))
+
+    def test_a_launch_that_names_no_role_is_served_everything_it_could_serve(self):
+        # The stand-in every handler test uses. Naming no role is not a wider
+        # grant: `run` always has one, because a launch that could not be
+        # described by a roster row never reaches a transport.
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            _launch.server(
+                _launch.Surface(), packet.Reader(packet.Packet()), _launch.Submission()
+            )
+
+        self.assertEqual(sorted(agent.BARE.values()), sorted(served))
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class RoleServerTest(unittest.TestCase):
+    """That the run builds its server for the role it was dispatched as."""
+
+    def test_the_child_serves_its_own_roles_tools_and_no_others(self):
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            concluded([terminal(stop_reason="end_turn")], role=SKILLED)
+
+        self.assertEqual(
+            sorted(
+                agent.BARE[name]
+                for name in roster.ROLES[SKILLED].allowed_tools(agent.SERVED)
+            ),
+            sorted(served),
+        )
 
 
 class ToolChannelTest(unittest.TestCase):

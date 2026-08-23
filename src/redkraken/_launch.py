@@ -44,6 +44,7 @@ import ssl
 import sys
 import threading
 from collections.abc import Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import NoReturn
 
@@ -1160,6 +1161,7 @@ def server(
     correlator: Correlator | None = None,
     transcripts: Transcripts | None = None,
     refresh: Refresh | None = None,
+    role: roster.Role | None = None,
 ):
     """Six reads, a request, two tool runs, a result, a Test, a Finding, a canary, a choice, a judgement.
 
@@ -1175,12 +1177,25 @@ def server(
     same properties again afterwards. Two checks of one statement, which is the
     arrangement, rather than two statements.
 
-    Every tool is built for every run, including the two only an orchestrator
-    may call. What a run may reach is the roster's allowlist and not this list,
-    for the reason `net.request` is served unconditionally: an allowlist that
-    varied with the job would be an allowlist the startup assertion could not
-    check against the roster. A worker's Slate is empty, which is the honest
-    answer for a run that was offered no choice.
+    Only the role's own tools are built, so what a run is offered is exactly
+    `allowed_tools` -- the same intersection of the roster's grants with what
+    this launch serves that the options value carries and the assertion checks.
+    Out of the roster and never out of the job: an allowlist that varied with
+    the job would be one the startup assertion could not check against
+    anything, while a frame that varies with the role is the role's own row
+    read twice.
+
+    Ticket 165's third open question is why it is not the allowlist alone. A
+    `conclude` run spent a third of its budget calling `get_validation_packet`
+    and `get_slate` and being told by its own gate that it held neither: the
+    tools were in front of the model because every tool was built for every
+    run. The gate stays exactly where it was -- it is the enforcement point and
+    this is context management -- and no role gains anything, because the list
+    kept here is the list the gate was already deciding from.
+
+    A caller naming no role is served everything it could serve. `run` always
+    names one: a launch whose role the roster does not know has no options value
+    and never reaches a transport at all.
     """
     reads = {
         "get_attack_surface": reader.attack_surface,
@@ -1214,19 +1229,33 @@ def server(
     # back as rows, and `Refresh` is what puts those rows into the document the
     # other five read.
     refreshing = Refresh(reader, channel) if refresh is None else refresh
-    tools = [_read(surface, name, answer) for name, answer in reads.items()]
-    tools.append(_refresh(surface, refreshing))
-    tools.append(_request(surface, door, naming))
-    tools.append(_tool_run(surface, channel, "run_tool"))
-    tools.append(_tool_run(surface, channel, "run_skill_script"))
-    tools.append(_propose(surface, submission))
-    tools.append(_finding(surface, proposing))
-    tools.append(_specification(surface, authoring))
-    tools.append(_callback(surface, minting))
-    tools.append(_slate(surface, picking))
-    tools.append(_pick(surface, picking))
-    tools.append(_packet(surface, judging))
-    tools.append(_judge(surface, judging))
+    # Named rather than appended, so that the role's grants decide which
+    # handlers are built rather than which of them survive being built. Each
+    # name here is the one its factory serves the tool under, and the two are
+    # held together by the roster: what this returns is compared against
+    # `allowed_tools` for every role, so a key that drifted from its factory is
+    # a tool served under the wrong grant and fails there.
+    builders = {
+        **{name: partial(_read, surface, name, answer) for name, answer in reads.items()},
+        "refresh_packet": partial(_refresh, surface, refreshing),
+        "http_request": partial(_request, surface, door, naming),
+        "run_tool": partial(_tool_run, surface, channel, "run_tool"),
+        "run_skill_script": partial(_tool_run, surface, channel, "run_skill_script"),
+        "submit_mission_result": partial(_propose, surface, submission),
+        "propose_finding": partial(_finding, surface, proposing),
+        "propose_test": partial(_specification, surface, authoring),
+        "mint_callback": partial(_callback, surface, minting),
+        "get_slate": partial(_slate, surface, picking),
+        "pick_task": partial(_pick, surface, picking),
+        "get_validation_packet": partial(_packet, surface, judging),
+        "submit_verdict": partial(_judge, surface, judging),
+    }
+    offered = (
+        set(builders)
+        if role is None
+        else {agent.BARE[name] for name in role.allowed_tools(agent.SERVED)}
+    )
+    tools = [build() for name, build in builders.items() if name in offered]
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
 
@@ -1926,7 +1955,16 @@ async def run(
         else options_for(
             job,
             runtime,
-            server(surface, reader, submission, door, choice, judgement, channel),
+            server(
+                surface,
+                reader,
+                submission,
+                door,
+                choice,
+                judgement,
+                channel,
+                role=gate.role,
+            ),
             launch,
             gate,
         )
