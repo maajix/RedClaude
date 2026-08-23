@@ -191,35 +191,13 @@ class Gap:
 #: before it was written down, which is the only way a register can be honest
 #: about what it excuses.
 OWED_GAPS: dict[str, str] = {
-    # W1. Three Contracts are declared and served by nothing. Ticket 104 serves
-    # the parking request; ticket 105 decides whether the two queue requests get
-    # a handler or a deletion.
-    "W1 mcp__rk2__park_for_human": "owed:104",
+    # W1. Two Contracts are declared and served by nothing. Ticket 105 decides
+    # whether the two queue requests get a handler or a deletion.
     "W1 mcp__rk2__request_report": "owed:105",
     "W1 mcp__rk2__request_validation": "owed:105",
 
-    # W3. The Finding lifecycle, from the verb that creates a Finding to the one
-    # that composes a chain, is granted to the runtime and called by nothing.
-    # Ticket 102 has taken the first two rows off this list: `propose_finding`
-    # calls `open_finding`, `open_finding` calls `rk2_finding_refusal`, and the
-    # supervisor calls `propose_finding` -- so reachability now runs from a
-    # Python call site to both. Ticket 103 owns the six verbs downstream of it,
-    # and the helpers each of those is the only caller of come with it.
-    "W3 open_impact_task": "owed:103",
-    "W3 state_severity": "owed:103",
-    "W3 apply_computed_cvss": "owed:103",
-    "W3 issue_pivot_stamp": "owed:103",
-    "W3 rk2_pivot_source": "owed:103",
-    "W3 rk2_capability_vocabulary_sha256": "owed:103",
-    "W3 build_kill_chain": "owed:103",
-    "W3 read_kill_chain": "owed:103",
-    "W3 rk2_chain_cycle": "owed:103",
-    "W3 rk2_chain_depths": "owed:103",
-    "W3 rk2_chain_edges": "owed:103",
-    "W3 rk2_chain_problem": "owed:103",
-    "W3 rk2_chain_reached": "owed:103",
-    # The four evidence profiles dispatch off a Task column nothing writes, which
-    # is the whole of ticket 120.
+    # W3. The four evidence profiles dispatch off a Task column nothing writes,
+    # which is the whole of ticket 120.
     "W3 evidence_profile_allowed_receipt_only": "owed:120",
     "W3 evidence_profile_browser_run_evidence": "owed:120",
     "W3 evidence_profile_identity_differential": "owed:120",
@@ -1062,10 +1040,22 @@ def read_surface(root: Path = PACKAGE) -> Surface:
     for key, call in zip(declared["CONTRACTS"].keys, declared["CONTRACTS"].values):
         keywords = {word.arg: word.value for word in call.keywords}
         arguments = {}
-        for name, argument in zip(
-            keywords.get("arguments", ast.Dict(keys=[], values=[])).keys,
-            keywords.get("arguments", ast.Dict(keys=[], values=[])).values,
-        ):
+        entries = keywords.get("arguments", ast.Dict(keys=[], values=[]))
+        pending = list(zip(entries.keys, entries.values))
+        while pending:
+            name, argument = pending.pop(0)
+            # A `**NAME` entry is a key of `None` over the name of a module-level
+            # dict of arguments. Spliced in place, ahead of what is left, a shared
+            # part reads exactly as the same lines written inline would -- which is
+            # what the server actually serves, and an argument this could not see
+            # is an argument this could not police. `declared` is indexed, not
+            # queried: a splice that resolves to nothing is a surface read short,
+            # and looping rather than recursing lets a spliced dict splice further
+            # at no cost.
+            if name is None:
+                spliced = declared[argument.id]
+                pending[:0] = list(zip(spliced.keys, spliced.values))
+                continue
             spelled = {word.arg: value(word.value, declared) for word in argument.keywords}
             arguments[name.value] = {
                 "kind": value(argument.args[0], declared) if argument.args else None,

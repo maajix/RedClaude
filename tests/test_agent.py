@@ -1014,21 +1014,22 @@ class ServedToolTest(unittest.TestCase):
 
         self.assertEqual(sorted(agent.BARE.values()), sorted(offered))
 
-    def test_the_contracts_no_launch_serves_are_the_three_the_runtime_answers_for(self):
+    def test_the_contracts_no_launch_serves_are_the_two_the_runtime_answers_for(self):
         """The declared surface is wider than the served one, and by how much.
 
-        Three, and each is a decision rather than a gap: the runtime asks for a
-        validation, files a report and parks a Tool run for a human, each on its
-        own connection, so the model-facing contract is a name the roster keeps
-        for the risk rules and the allowlists rather than a handler anybody
-        built. The two that used to be here are ticket 87's: a tool run is now
-        asked of the supervisor across the pipe the child was launched on, so
-        both are served like everything else. Pinned as a list because a fourth
-        entry appearing here is a tool some role holds and no child can call.
+        Two now -- `mcp__rk2__request_report` and `mcp__rk2__request_validation`
+        -- and both are ticket 105's: the runtime asks for a validation and files
+        a report on its own connection, so each model-facing contract is a name
+        the roster keeps for the risk rules and the allowlists until that ticket
+        decides between a handler and a deletion. The third that stood here is
+        ticket 104's, which serves parking a Tool run for a human like everything
+        else, and the two before that were ticket 87's, which asks a tool run of
+        the supervisor across the pipe the child was launched on. Pinned as a
+        list because a third entry appearing here is a tool some role holds and
+        no child can call.
         """
         self.assertEqual(
             [
-                "mcp__rk2__park_for_human",
                 "mcp__rk2__request_report",
                 "mcp__rk2__request_validation",
             ],

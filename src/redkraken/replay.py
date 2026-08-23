@@ -35,6 +35,12 @@ which records a demonstration and settles nothing. Which pair of verbs is used
 is the only difference: the plan, the door, the walk and the report are the
 same, because what a replay does to the target is the same either way and the
 difference is entirely in what may be concluded from it.
+
+Ticket 103 hung two more verbs off the closing end of that pair, and only of
+that pair. A closed impact run is stamped as a pivot if it showed one, and the
+stamps this Program holds are offered to a chain; both name nothing but rows
+this file wrote, both refuse by answering, and both are silent on the detection
+path because a claim that was settled demonstrated no transition.
 """
 
 from __future__ import annotations
@@ -82,10 +88,17 @@ class _Verbs:
     what the walk produced -- so nothing below this declaration asks which one
     it is running. What differs is entirely inside the database: one settles a
     claim, the other proves an impact under a grant and settles nothing.
+
+    The one thing that does ask which pair is running is what follows the close.
+    Ticket 103's two runtime steps are on the impact path and empty on the other,
+    because a replay that settles a claim demonstrated no pivot: there is nothing
+    to stamp, and nothing new for a chain to compose.
     """
 
     open_sql: str
     close_sql: str
+    stamp_sql: str = ""
+    chain_sql: str = ""
 
 
 DETECTION = _Verbs(
@@ -95,6 +108,19 @@ DETECTION = _Verbs(
 IMPACT = _Verbs(
     "SELECT open_impact_replay($1::uuid, $2::uuid, $3)",
     "SELECT close_impact_replay($1::uuid, $2, $3)",
+    "SELECT issue_pivot_stamp($1::uuid, $2::uuid)",
+    # The members are the whole of a caller's contribution here, and they are
+    # rows this machine wrote: the entry set, the edges, the depths and the
+    # connected component are derived from the Program and the stamps alone, by
+    # `rk2_chain_entry`, `rk2_chain_edges`, `rk2_chain_depths` and
+    # `rk2_chain_reached` (`20260818T000000Z__a_chain_is_composed_and_stays_sound.sql`
+    # `:62`, `:94`, `:116`, `:162`). `p_flow` goes as SQL NULL and not as a
+    # sentence this process invented -- the column's own comment is "Recorded and
+    # never read" (`:521-522`), so a story written here would be a fact nobody
+    # measured, kept forever beside the ones that were.
+    "SELECT build_kill_chain("
+    "ARRAY(SELECT id FROM pivot_stamps WHERE program_id = $1::uuid ORDER BY id),"
+    " NULL, $2::uuid)",
 )
 
 
@@ -281,6 +307,7 @@ def run(
                         ).scalar()
                     )
                 )
+                _downstream(ledger, connection, verbs, plan, answers.program_id, run_id)
         except pg.DatabaseError as error:
             return _abandon(
                 ledger, answers, connection, verbs, plan,
@@ -476,6 +503,65 @@ def _trust(
             f"this Test reaches an https target: pass --ca or set {proxy.CA_VARIABLE}"
         )
     return tls.trust(ca_file), None
+
+
+def _downstream(
+    ledger: Ledger,
+    connection: pg.Connection,
+    verbs: _Verbs,
+    plan: Mapping[str, object],
+    program_id: str,
+    run_id: str,
+) -> None:
+    """Ticket 103's two runtime steps, in the transaction that closed the run.
+
+    Neither takes anything this process decided. `issue_pivot_stamp` names the
+    Tool run this file has just closed and the agent run it was opened for, and
+    every column of the stamp comes out of `rk2_pivot_source`
+    (`20260817T000000Z__a_pivot_is_stamped_from_the_run_that_showed_it.sql:992-993`);
+    `build_kill_chain` names the stamps this Program holds and derives the rest.
+    Inside the close and not after it, because a stamp is a reading of the run
+    the close derived, and a stamp that outlived a close that rolled back would
+    be a reading of a run nobody has.
+
+    Both answer their refusals rather than raising them -- a refusal is a row in
+    `pivot_proposals` or in `chain_proposals` and a sentence in the document --
+    so every refusal here is a hold, and neither step can turn a run that closed
+    into a command that failed. Both are the ordinary answer rather than the
+    exception: an impact Test that states no pivot is refused a stamp, and a
+    Program holding one stamp is refused a chain, because "one stamp is a stamp,
+    and a chain composes at least two"
+    (`20260818T000000Z__a_chain_is_composed_and_stays_sound.sql:252`). A second
+    call on either says so and writes nothing: `issued` and `built` are the words
+    for that, and the digest underneath them is unchanged.
+    """
+    if not verbs.stamp_sql:
+        return
+
+    stamped = json.loads(
+        str(connection.execute(verbs.stamp_sql, (plan["tool_run_id"], run_id)).scalar())
+    )
+    if stamped["refusal"] is not None:
+        ledger.hold("pivot", f"this run stamps no pivot: {stamped['refusal']}")
+        return
+    said = f"{stamped['stamp']} records {stamped['provides']} obtained off {stamped['member']}"
+    if not stamped["issued"]:
+        said += ", already stamped from this evidence"
+    ledger.hold("pivot", said)
+
+    chained = json.loads(
+        str(connection.execute(verbs.chain_sql, (program_id, run_id)).scalar())
+    )
+    if chained["refusal"] is not None:
+        ledger.hold("chain", f"these stamps compose no chain: {chained['refusal']}")
+        return
+    said = (
+        f"{chained['chain']} composes {chained['steps']} step(s) "
+        f"over {chained['edges']} edge(s)"
+    )
+    if not chained["built"]:
+        said += ", and is the chain these stamps already built"
+    ledger.hold("chain", said)
 
 
 def _conclude(ledger: Ledger, plan: Mapping[str, object], closed: Mapping[str, object]) -> None:

@@ -658,19 +658,33 @@ class Specification:
     every caller reaches this through a thread for the reason `Channel` gives.
     """
 
-    def __init__(self, channel: Channel | None = None) -> None:
+    def __init__(
+        self,
+        channel: Channel | None = None,
+        verb: str = "propose_test",
+        subject: str = "hypothesis_label",
+    ) -> None:
         self._channel = channel
+        self._verb = verb
+        self._subject = subject
         self.attempts = 0
         self.refused = 0
 
     def ask(self, arguments: Mapping[str, object]) -> dict:
         """Carry one specification to the runtime, or say why it was not carried.
 
-        The claim's label and the five parts, and nothing beside them. Which
+        The subject's label and the five parts, and nothing beside them. Which
         Agent run and which Program this belongs to are the supervisor's to fill
         in, for `Proposal.ask`'s reason; the digest that will be this Test's
         identity is the database's, because a caller that supplied one would be
         a caller whose arithmetic the identity depends on.
+
+        Two verbs and one assembler. Ticket 103's `open_impact_task` is the same
+        five parts about a Finding rather than about a claim, ruled on by the
+        same `rk2_test_spec_problem`, so what differs is the verb it is carried
+        to and the label it names its subject by -- and a second copy of the
+        normalisation below would be a second copy free to drift from the rule
+        it is keeping.
 
         Every part is sent whether or not the model named it. A missing key and
         an empty array have to reach `rk2_test_spec_digest` as the same
@@ -700,13 +714,24 @@ class Specification:
                 ),
             }
         carried: dict[str, object] = {
-            "hypothesis_label": str(arguments.get("hypothesis_label") or "")
+            self._subject: str(arguments.get(self._subject) or "")
         }
         for part in SPECIFICATION_PARTS:
             given = arguments.get(part)
             carried[part] = list(given) if isinstance(given, (list, tuple)) else []
+        # The impact block is the one part of a specification that is not a list
+        # and that only one of the two verbs declares, so it is sent when it is
+        # there and left out when it is not -- the opposite of the rule for the
+        # five above, and it keeps that rule rather than breaking it. The five
+        # are the shape every specification has, and defaulting a sixth key into
+        # a plain plan would put it in the document the digest is taken over, so
+        # the same plan authored before this ticket would author a second Test.
+        # A plain plan never carries one: `propose_test` declares no `impact`,
+        # its schema is closed, and the gate refuses the key long before here.
+        if isinstance(impact := arguments.get("impact"), Mapping):
+            carried["impact"] = dict(impact)
         answered = dict(
-            self._channel.call(f"mcp__{agent.SERVER}__propose_test", carried)
+            self._channel.call(f"mcp__{agent.SERVER}__{self._verb}", carried)
         )
         # Only the database's own word for it counts, for the reason `Proposal`
         # gives: a supervisor that could not be reached has not refused a
@@ -1191,6 +1216,52 @@ DESCRIPTIONS = {
         "back is the Tool Run label to cite, what it exited with and the first few "
         "kilobytes of what it printed, with the whole of it filed as an Artifact."
     ),
+    "open_impact_task": (
+        "Ask the runtime to author the impact Test for a Finding of this Program: the "
+        "plan that would demonstrate what the Finding actually lets somebody do. Name "
+        "the Finding by its label and state the plan in the same five parts a Test "
+        "takes -- preconditions, setup, actions, assertions and cleanup -- under the "
+        "same rules propose_test states.\n\n"
+        "What is extra is the impact block, and it is the part only you can write: "
+        "the class of impact, one sentence for the effect the Test would have, one "
+        "sentence for how it is undone, and the ordinal of the action that reads the "
+        "state the Test leaves behind. Nothing in the database says which of your "
+        "requests undoes a write, which is why you state it. Three classes are "
+        "offered and the rest are refused before a row exists.\n\n"
+        "The runtime decides, and a refusal comes back as one sentence naming the "
+        "rule the plan broke, which is worth correcting rather than re-sending."
+    ),
+    "state_severity": (
+        "State the severity band for a Finding of this Program, the basis it rests on "
+        "and the reasoning behind it. The basis is the half the runtime checks: a band "
+        "claimed as demonstrated needs a demonstration, an inference is refused about "
+        "a Finding that has one, and high or critical read out of nothing but the "
+        "Program document is refused. The band itself is your judgement, and the "
+        "rationale is prose a person will read -- between 20 and 2000 characters. A "
+        "refusal comes back as one sentence and writes nothing at all."
+    ),
+    "compose_finding_report": (
+        "Compose the report for a Finding of this Program: which effects it has and "
+        "which Observation witnesses each, and the steps of the chain with the "
+        "Receipts and Observations each step rests on. The join exists and cannot do "
+        "this -- which observation witnesses which effect is a judgement rather than "
+        "a lookup, and that judgement is the whole of what is asked for here.\n\n"
+        "Cite by label throughout. What comes back is what was composed and the hard "
+        "blockers that remain true afterwards; the CVSS vector is computed by the "
+        "runtime between those two, out of the effects you just named, so it is never "
+        "something you are asked to hand back."
+    ),
+    "park_for_human": (
+        "Stop the Task you are running and ask a person the question you cannot "
+        "answer yourself. Name that Task, one of the five question codes -- "
+        "scope_ambiguous, destructive_action, third_party_impact, credential_needed, "
+        "policy_unclear -- and the question in your own words.\n\n"
+        "Asking is not failing. The Task parks with no attempt charged against it and "
+        "is as ready as it was, your identity leases go back, and only an operator "
+        "releases it. Nothing waits here for the answer: your run ends with this "
+        "call. A Task that is not the one you are running is refused, and so is a "
+        "code this harness does not file under."
+    ),
 }
 
 
@@ -1260,6 +1331,11 @@ def server(
     # And the same for the ask one step earlier in the same chain: the Test that
     # would settle the claim a Finding would rest on.
     authoring = Specification(channel) if specification is None else specification
+    # And once more one authority later, for the impact Test a hunter plans
+    # against a Finding that already holds. One object per verb rather than one
+    # shared: what a `Specification` holds is how many refusals this run has
+    # left, and a run that spent its impact attempts still has its Test ones.
+    concluding = Specification(channel, "open_impact_task", "finding_label")
     # And the same for the out-of-band ask, which goes down the same pipe to the
     # same party for the same reason.
     minting = Correlator(channel) if correlator is None else correlator
@@ -1289,7 +1365,20 @@ def server(
         "run_skill_script": partial(_tool_run, surface, channel, "run_skill_script"),
         "submit_mission_result": partial(_propose, surface, submission),
         "propose_finding": partial(_finding, surface, proposing),
-        "propose_test": partial(_specification, surface, authoring),
+        "propose_test": partial(_specification, surface, authoring, "propose_test"),
+        "open_impact_task": partial(_specification, surface, concluding, "open_impact_task"),
+        "state_severity": partial(
+            _carry, surface, channel, "state_severity",
+            "this run was started with no supervisor to ask; no severity was stated",
+        ),
+        "compose_finding_report": partial(
+            _carry, surface, channel, "compose_finding_report",
+            "this run was started with no supervisor to ask; nothing was composed",
+        ),
+        "park_for_human": partial(
+            _carry, surface, channel, "park_for_human",
+            "this run was started with no supervisor to ask; the Task is still running",
+        ),
         "mint_callback": partial(_callback, surface, minting),
         "get_slate": partial(_slate, surface, picking),
         "pick_task": partial(_pick, surface, picking),
@@ -1420,6 +1509,44 @@ def _tool_run(surface: Surface, channel: Channel | None, name: str):
                     "detail": "this run was started with no tool image; nothing was run",
                 }
             )
+        return _content(
+            await asyncio.to_thread(
+                channel.call, f"mcp__{agent.SERVER}__{name}", dict(arguments or {})
+            )
+        )
+
+    return handler
+
+
+def _carry(surface: Surface, channel: Channel | None, name: str, nothing: str):
+    """One verb the supervisor runs against the database, carried and reported back.
+
+    Three tools are this function, for `_tool_run`'s reason and with one
+    difference from it: those two start a container and these three write a row,
+    and neither can be answered on this side of the boundary, because this
+    process has no container runtime and no database.  What crosses is the call
+    the model made, unchanged; what comes back is what the verb said, including
+    a refusal, which is reported as a refusal rather than as a tool that failed.
+
+    Nothing is counted here, unlike `Specification` beside it.  Each of the
+    three reaches a verb that refuses by answering rather than by raising and
+    writes nothing when it refuses, so a ceiling on this side would be a second
+    opinion about a call the database has already decided for nothing.
+
+    The sentence a run with no supervisor is told is a parameter because it is
+    the only thing that differs between the three, and it has to differ: a park
+    answered with "nothing was run" would be telling a model about a tool image
+    it never asked about.
+
+    On a thread for `_tool_run`'s reason: the pipe is blocking and the caller is
+    an event loop.
+    """
+
+    @tool(name, DESCRIPTIONS[name], _schema(name))
+    async def handler(arguments: dict) -> dict:
+        surface.serve(name)
+        if channel is None:
+            return _content({"served": False, "reason": NO_TOOLING, "detail": nothing})
         return _content(
             await asyncio.to_thread(
                 channel.call, f"mcp__{agent.SERVER}__{name}", dict(arguments or {})
@@ -1742,7 +1869,7 @@ def _finding(surface: Surface, proposal: Proposal):
     return handler
 
 
-def _specification(surface: Surface, specification: Specification):
+def _specification(surface: Surface, specification: Specification, name: str):
     """The one plan this run may ask the runtime to store as a Test.
 
     Asked rather than staged, which is what separates it from
@@ -1762,10 +1889,14 @@ def _specification(surface: Surface, specification: Specification):
     the whole product of the call, and an exception would deliver the failure
     without it.
 
+    Two tools are this function, because `open_impact_task` is the same plan
+    about a Finding rather than about a claim and is ruled on by the same thirty
+    rules. What differs is the object it is handed -- each verb's own attempt
+    count -- and the name it is served under.
+
     On a thread for `_tool_run`'s reason: the pipe is blocking and the caller is
     an event loop.
     """
-    name = "propose_test"
 
     @tool(name, DESCRIPTIONS[name], _schema(name))
     async def handler(arguments: dict) -> dict:

@@ -460,6 +460,9 @@ class Recorder:
         self.fingerprint = answers.get(
             "fingerprint", {"applications": 1, "changed": 1, "fingerprints": []}
         )
+        self.topology = answers.get(
+            "topology", {"hosts": 1, "resolves_to": 1, "serves": 1}
+        )
         self.closure = answers.get(
             "closure",
             {
@@ -648,6 +651,8 @@ class Recorder:
             return [(json.dumps(self.promotion),)]
         if sql == execution.FINGERPRINT:
             return [(json.dumps(self.fingerprint),)]
+        if sql == execution.TOPOLOGY:
+            return [(json.dumps(self.topology),)]
         if sql == execution.FINISH:
             return [(json.dumps(self.closure),)]
         # Ticket 143. One column, one row: the status the Task ended at.

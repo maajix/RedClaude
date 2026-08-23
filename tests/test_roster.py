@@ -1860,6 +1860,8 @@ class VocabularyAgreementTest(unittest.TestCase):
             (roster.EVIDENCE_POLARITIES, "hypothesis_evidence", "polarity"),
             (roster.EVIDENCE_ROLES, "hypothesis_evidence", "role"),
             (roster.HYPOTHESIS_STATUSES, "hypotheses", "status"),
+            (roster.SEVERITY_BANDS, "severity_statements", "severity"),
+            (roster.SEVERITY_BASES, "severity_statements", "basis"),
         ):
             with self.subTest(column=f"{table}.{column}"):
                 self.assertEqual(set(constant), set(self.constraint(table, column)))
@@ -1945,6 +1947,40 @@ class VocabularyAgreementTest(unittest.TestCase):
             "no migration states the one kind of action a Test performs",
         )
 
+    def test_the_concluding_vocabularies_are_the_rows_the_corpus_seeds(self):
+        # Ticket 103's three, and the first of them is deliberately not the
+        # whole of its table. `IMPACT_CLASSES` is the three of six whose risk
+        # class is not `deny`; the other three can be approved by nobody, so a
+        # schema offering the word would be a door painted on a wall. Both
+        # halves are asserted, because a test reading only the three that are
+        # there would still pass on the day a forbidden class was added to the
+        # served schema -- which is the one failure this constant exists to
+        # stop.
+        decision = {row[0]: row[1] for row in self.seeded("risk_classes")}
+        seeded = self.seeded("impact_classes")
+
+        self.assertTrue(seeded, "impact_classes seeds no vocabulary")
+        self.assertEqual(
+            set(roster.IMPACT_CLASSES),
+            {row[0] for row in seeded if decision[row[1]] != "deny"},
+        )
+        for impact_class in (row[0] for row in seeded if decision[row[1]] == "deny"):
+            with self.subTest(impact_class=impact_class):
+                self.assertNotIn(impact_class, roster.IMPACT_CLASSES)
+
+        # The two report vocabularies are their whole tables. Every seeded row
+        # is a word a composition may say, and the effect's row is what
+        # `compute_finding_cvss` reads the vector out of -- so a word the roster
+        # withheld would be an impact this harness can hold and never score.
+        for constant, table in (
+            (roster.REPORT_EFFECTS, "report_effects"),
+            (roster.REPORT_MECHANISMS, "report_mechanisms"),
+        ):
+            with self.subTest(table=table):
+                declared = {row[0] for row in self.seeded(table)}
+                self.assertTrue(declared, f"{table} seeds no vocabulary")
+                self.assertEqual(set(constant), declared)
+
     def test_every_element_field_the_schema_closes_names_a_corpus_vocabulary(self):
         # The wiring itself, so that a seventh element list, a fifth entity field
         # or a later Contract's element cannot be added with a tuple nothing
@@ -1967,6 +2003,9 @@ class VocabularyAgreementTest(unittest.TestCase):
             roster.TEST_ACTION_KINDS,
             roster.TEST_ASSERTION_KINDS,
             roster.TEST_REQUEST_METHODS,
+            roster.IMPACT_CLASSES,
+            roster.REPORT_EFFECTS,
+            roster.REPORT_MECHANISMS,
         }
 
         # Only the fields that close a vocabulary. An element field may instead

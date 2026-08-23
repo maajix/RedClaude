@@ -488,6 +488,12 @@ EXCHANGE = (
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
 PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
+#: The address a Receipt pinned, read back as a Host and as the two edges
+#: that hang off it. No argument: the function's own default sweeps every
+#: allowed Receipt of this Program that has no topology yet, which is
+#: idempotent, and naming one Receipt would ask this side to know which
+#: Receipts the promotion had just made attachable -- which it does not.
+TOPOLOGY = "SELECT record_receipt_topology()"
 #: The one call that closes an Agent run, its Task and its Reservation. Named
 #: arguments rather than positional ones since ticket 165 widened it: the
 #: parameters past the two totals all default to NULL and are applied as
@@ -3184,10 +3190,15 @@ class Slice:
         inside the transaction that writes the Observations, which is the only
         place one would survive to be read.
 
-        The fingerprint is the third call and shares the second one's
-        transaction: 022 asks for one after recon, and a promotion that
-        committed without one would leave the Surface changed and nothing
-        recording that it had.
+        Topology is the third call and shares the second one's transaction:
+        `record_receipt_topology` joins the address a Receipt pinned to the
+        Domain that answered with it and the Application it serves, and both of
+        those ends are rows the promotion has just written -- so a pass before
+        it would find nothing to attach to.
+
+        The fingerprint is the last call and shares that transaction too: 022
+        asks for one after recon, and a promotion that committed without one
+        would leave the Surface changed and nothing recording that it had.
         """
         if result.mission_result is None:
             ledger.hold(
@@ -3233,6 +3244,12 @@ class Slice:
                 promotion = proxy.as_object(
                     connection.execute(PROMOTE, (staged.proposal_id,)).scalar()
                 )
+                # Ticket 159, after the promotion for the reason the
+                # docstring gives: the Domain and the Application the two edges
+                # attach to are what promotion just wrote. Read out of Receipts
+                # this harness wrote itself, which is why the runtime records it
+                # rather than a child proposing what the door already pinned.
+                topology = proxy.as_object(connection.execute(TOPOLOGY).scalar())
                 # In the same transaction, because "after recon" means after
                 # the rows exist and before anything reads them: a fingerprint
                 # taken in a later transaction would be a fingerprint of
@@ -3264,6 +3281,11 @@ class Slice:
             "tasks": opened,
             "refused": int(promotion.get("refused") or 0),
         }
+        facts["topology"] = {
+            "hosts": int(topology.get("hosts") or 0),
+            "resolves_to": int(topology.get("resolves_to") or 0),
+            "serves": int(topology.get("serves") or 0),
+        }
         facts["fingerprint"] = {
             "applications": int(swept.get("applications") or 0),
             "changed": int(swept.get("changed") or 0),
@@ -3273,6 +3295,12 @@ class Slice:
             f"{staged.label} is {promotion.get('status')}: {len(observations)} "
             f"Observation(s) canonical, {len(opened)} Task(s) opened, "
             f"{promotion.get('refused')} refused",
+        )
+        ledger.hold(
+            "topology",
+            f"{facts['topology']['hosts']} Host(s) recorded, "
+            f"{facts['topology']['resolves_to']} resolves_to and "
+            f"{facts['topology']['serves']} serves edge(s) written",
         )
         ledger.hold(
             "fingerprint",

@@ -418,6 +418,62 @@ TEST_ACTION_KINDS = ("request",)
 #: to the checker and not to the other enum.
 TEST_REQUEST_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 
+#: The impact a Test may state it would have, from `impact_classes` in
+#: `20260816T000000Z__impact_is_authorized_before_it_is_proved.sql`. THREE OF
+#: SIX, and the missing three are the point: `degrade_availability`,
+#: `reach_third_party` and `pivot_out_of_scope` map to the `forbidden` risk
+#: class, which `pending_decisions_never_forbidden` refuses to file a question
+#: about at all. A schema offering a word no answer could ever admit would be a
+#: door painted on a wall -- so the surface offers the three an operator may
+#: grant, and `rk2_refuse_forbidden_impact` stays the door behind it for a
+#: caller that is not this one.
+IMPACT_CLASSES = ("read_other_data", "write_target_state", "escalate_privilege")
+
+#: `severity_statements.severity`, from the same file's CHECK. Four and not
+#: five: `info` is `findings.severity`'s default and the band nobody states, so
+#: a statement carrying it would be a judgement that the Finding is worth
+#: nothing, filed with a rationale nobody wrote.
+SEVERITY_BANDS = ("low", "medium", "high", "critical")
+
+#: What a stated severity may rest on, from `state_severity`'s three arms. Each
+#: is refused for its own reason and the reasons are not interchangeable, which
+#: is why the word is carried rather than derived: the runtime can see whether a
+#: demonstration exists, and it cannot see whether the hunter reasoned from what
+#: the Finding showed or from what the Program document pays for.
+SEVERITY_BASES = ("demonstrated_impact", "constrained_inference", "program_context")
+
+#: `report_effects.id`, seeded by `0034_reports.sql`. The vocabulary a Finding's
+#: impact sentence is written in, and the row each word carries is what
+#: `compute_finding_cvss` reads the vector out of -- so the word is a claim
+#: about confidentiality, integrity, availability and scope, and not a phrase.
+REPORT_EFFECTS = (
+    "command_execution",
+    "arbitrary_file_read",
+    "arbitrary_file_write",
+    "cross_account_read",
+    "cross_account_write",
+    "account_takeover",
+    "session_theft",
+    "internal_network_access",
+    "price_manipulation",
+    "information_disclosure",
+    "service_disruption",
+)
+
+#: `report_mechanisms.id`, seeded by the same file. One sentence template each,
+#: with named slots the composition fills and a citation minimum the trigger
+#: enforces, so a step is a mechanism this harness can write and a set of rows
+#: that prove it rather than prose a model composed.
+REPORT_MECHANISMS = (
+    "ssti.injection_point",
+    "ssti.sink.pug",
+    "ssti.escalation.node_rce",
+    "filter.bypass_differential",
+    "idor.injection_point",
+    "idor.differential",
+    "generic.control",
+)
+
 #: Names for the runtime's own choice of tenant. Every canonical table is
 #: program-scoped and the program is bound in the handler from runtime
 #: configuration, so an argument that named one would be the agent choosing
@@ -849,6 +905,27 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "mcp__rk2__mint_callback",
         "mcp__rk2__propose_test",
     ),
+    # What a role may say about a Finding that already holds, which is a later
+    # authority than proposing one and not the same one. Ticket 103's three
+    # served Contracts: the impact work a hunter asks for, the band it states
+    # and the report it composes, each reaching a wrapper in
+    # `20261031T000000Z__the_verbs_downstream_of_a_finding_get_their_callers.sql`
+    # that turns a label into the row and an exception into a sentence.
+    #
+    # A GROUP OF ITS OWN AND NOT THREE MORE MEMBERS OF `state.propose`.
+    # `state.propose` is held by `recon` and `js_analyst` as well as
+    # `web_hunter`, and a group is the unit a role holds -- so putting the
+    # impact, severity and report verbs in there would hand two roles the
+    # authority to author an impact specification and state a severity band,
+    # which is a widening this ticket was not given and nothing in it asks for.
+    # Only `web_hunter` holds this group, because it is the role that holds
+    # `task_kinds=("hunt", "conclude")` and the second of those kinds is what
+    # these three verbs are the work of.
+    "state.conclude": (
+        "mcp__rk2__open_impact_task",
+        "mcp__rk2__state_severity",
+        "mcp__rk2__compose_finding_report",
+    ),
     # Scheduling as the orchestrator sees it, which is not scheduling as the
     # runtime does it. "The runtime decides what may be chosen; the orchestrator
     # decides which; the runtime commits the claim" -- so the model reads a
@@ -1024,6 +1101,86 @@ _ELEMENTS: dict[str, Mapping[str, Argument]] = {
 # out of the document that produced. So the first name is the relation actually
 # queried and the rest are what it is a view of -- which is the shape
 # `get_artifact` already had, and the reason it is the shape here.
+
+#: The five parts of a Test specification a model authors, each an array whose
+#: element fields are declared where the shape rule closes a vocabulary. Held
+#: here rather than inside one Contract because two Contracts author a
+#: specification: `propose_test` writes the detection plan and
+#: `open_impact_task` writes the impact plan, and `rk2_test_spec_problem` is one
+#: function that rules on both. Two copies of these five would be two schemas
+#: served for one rule, free to drift the day a sixth part is added.
+_TEST_SPEC_PARTS: dict[str, "Argument"] = {
+    # Not required, and empty is a specification that states no
+    # precondition rather than one that forgot to. The shape rule admits
+    # an empty array in every part and the handler sends `[]` for a part
+    # left out, so "absent" and "empty" are one thing here and the digest
+    # cannot depend on which spelling a model used.
+    "preconditions": Argument(
+        "array",
+        bounds=(0, 16),
+        element={
+            "kind": Argument("string", enum=TEST_PRECONDITION_KINDS),
+            # A precondition is prose under a typed word, so the length
+            # is the whole of what is stated about the prose.
+            "detail": Argument("string", bounds=(1, 500)),
+        },
+    ),
+    "setup": Argument(
+        "array",
+        bounds=(0, 16),
+        element={
+            "method": Argument("string", enum=TEST_REQUEST_METHODS),
+            # The url's length and not its shape. `rk2_test_request_problem`
+            # answers a relative url, a lower-case method, a path that
+            # resolves elsewhere and a `%2e` in four different sentences,
+            # each naming the position it found the fault in, and a
+            # pattern here would replace all four with a rejected call.
+            # A length is the one rule whose sentence adds nothing.
+            "url": Argument("string", bounds=(1, 2000)),
+        },
+    ),
+    "actions": Argument(
+        "array",
+        required=True,
+        bounds=(3, 32),
+        element={
+            # Carried by the model and checked against its position,
+            # because a plan read in one order and numbered in another is
+            # a plan whose assertions point at requests nobody planned.
+            "ordinal": Argument("integer", bounds=(1, 32)),
+            "role": Argument("string", enum=TEST_ACTION_ROLES),
+            "kind": Argument("string", enum=TEST_ACTION_KINDS),
+            "method": Argument("string", enum=TEST_REQUEST_METHODS),
+            "url": Argument("string", bounds=(1, 2000)),
+        },
+    ),
+    "assertions": Argument(
+        "array",
+        required=True,
+        bounds=(1, 32),
+        element={
+            # 035's spelling, restated here for the reason
+            # `submit_verdict.failed_assertion_ids` restates it: a
+            # validator names a failed assertion by this identifier, so
+            # an identifier a Test could be authored with and a verdict
+            # could not name would be a failure nobody can report.
+            "id": Argument("string", pattern="^[a-z][a-z0-9-]{2,62}$"),
+            "kind": Argument("string", enum=TEST_ASSERTION_KINDS),
+            "action": Argument("integer", bounds=(1, 32)),
+            "against": Argument("integer", bounds=(1, 32)),
+            "status": Argument("integer", bounds=(100, 599)),
+        },
+    ),
+    "cleanup": Argument(
+        "array",
+        bounds=(0, 16),
+        element={
+            "method": Argument("string", enum=TEST_REQUEST_METHODS),
+            "url": Argument("string", bounds=(1, 2000)),
+        },
+    ),
+}
+
 CONTRACTS: dict[str, Contract] = {
     "mcp__rk2__get_attack_surface": Contract(
         "state.read",
@@ -1315,73 +1472,147 @@ CONTRACTS: dict[str, Contract] = {
         writes=("test_proposals",),
         arguments={
             "hypothesis_label": Argument("string", required=True, pattern=_label("H")),
-            # Not required, and empty is a specification that states no
-            # precondition rather than one that forgot to. The shape rule admits
-            # an empty array in every part and the handler sends `[]` for a part
-            # left out, so "absent" and "empty" are one thing here and the digest
-            # cannot depend on which spelling a model used.
-            "preconditions": Argument(
-                "array",
-                bounds=(0, 16),
+            **_TEST_SPEC_PARTS,
+        },
+    ),
+    # The three below are ticket 103's, and each reaches a wrapper in
+    # `20261031T000000Z__the_verbs_downstream_of_a_finding_get_their_callers.sql`
+    # rather than the granted verb itself. The wrapper is what makes them
+    # Contracts at all: all three underlying verbs take a uuid and two of them
+    # raise rather than answer, so a direct call would tell the child "an error
+    # occurred" and take the transaction with it (`:21-37`). What the child
+    # names is a Finding label it can read, and `rk2_finding_for_label`
+    # (`:62`) turns that into the row.
+    #
+    # The impact work a hunter asks for. `p_spec` is a whole Test
+    # specification, and what makes it an impact specification rather than a
+    # detection one is the four authored fields `rk2_impact_problem` checks
+    # (`20260816T000000Z__impact_is_authorized_before_it_is_proved.sql:88-141`):
+    # a class, an `effect` sentence, a `cleanup` sentence and the ordinal of the
+    # action that reads the state the Test leaves behind. Nothing in the
+    # database says which request undoes a write, which is the whole reason this
+    # is served rather than derived.
+    #
+    # `writes=("test_proposals",)` for `propose_test`'s reason and not a weaker
+    # one: `open_impact_task` writes `tests` and `tasks`, both in `CANONICAL`,
+    # so `_check_contracts` refuses any Contract naming either. The audit row
+    # beside `tests` is what `propose_impact_task` files, on both outcomes
+    # (`20261031T000000Z...:157-168`), so a refused impact specification is
+    # counted beside every other refused specification.
+    #
+    # `_TEST_SPEC_PARTS` and not a second copy of the five parts. One shape rule
+    # -- `rk2_test_spec_problem` -- rules on both specifications, and two
+    # declarations of it would be two schemas free to drift.
+    #
+    # `IMPACT_CLASSES` offers three of six. The other three map to the
+    # `forbidden` risk class; `rk2_refuse_forbidden_impact` refuses them inside
+    # `open_impact_task` before a `tests` row exists, and this wrapper catches
+    # that refusal and passes the sentence on (`20261031T000000Z...:103-108`).
+    # The schema not offering the word is the first door, not the only one.
+    "mcp__rk2__open_impact_task": Contract(
+        "state.conclude",
+        REQUEST,
+        writes=("test_proposals",),
+        arguments={
+            "finding_label": Argument("string", required=True, pattern=_label("F")),
+            **_TEST_SPEC_PARTS,
+            # An object and not five arguments, because these four are the block
+            # `rk2_impact_problem` reads as one -- and an object that names its
+            # fields is what `_check_argument` counts as constrained, so no
+            # `OPEN_ARGUMENTS` entry is spent on the most consequential half of
+            # this call.
+            "impact": Argument(
+                "object",
+                required=True,
                 element={
-                    "kind": Argument("string", enum=TEST_PRECONDITION_KINDS),
-                    # A precondition is prose under a typed word, so the length
-                    # is the whole of what is stated about the prose.
-                    "detail": Argument("string", bounds=(1, 500)),
+                    "class": Argument("string", enum=IMPACT_CLASSES),
+                    # Prose under a typed word, so the length is the whole of
+                    # what is stated about it -- `_TEST_SPEC_PARTS`' rule for a
+                    # precondition's `detail`, for the same reason.
+                    "effect": Argument("string", bounds=(1, 500)),
+                    "cleanup": Argument("string", bounds=(1, 500)),
+                    # The ordinal of an action, bounded by the same 32 the
+                    # `actions` part is, because it names a position in that
+                    # list and a number outside it names nothing.
+                    "after_state": Argument("integer", bounds=(1, 32)),
                 },
             ),
-            "setup": Argument(
-                "array",
-                bounds=(0, 16),
-                element={
-                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
-                    # The url's length and not its shape. `rk2_test_request_problem`
-                    # answers a relative url, a lower-case method, a path that
-                    # resolves elsewhere and a `%2e` in four different sentences,
-                    # each naming the position it found the fault in, and a
-                    # pattern here would replace all four with a rejected call.
-                    # A length is the one rule whose sentence adds nothing.
-                    "url": Argument("string", bounds=(1, 2000)),
-                },
-            ),
-            "actions": Argument(
+        },
+    ),
+    # The band a hunter states. Served because the judgement is not one the
+    # runtime can make: the basis is constrained by state and the band is not,
+    # and `p_rationale` is prose between 20 and 2000 characters
+    # (`20260816T000000Z...:1698`), which is the bound restated here so a
+    # rationale too short to be one is refused by the CLI before `PreToolUse`
+    # runs rather than by a `RAISE` the wrapper has to carry back.
+    #
+    # `writes=("severity_statements",)` -- `findings` is canonical and
+    # `state_severity` is its only severity writer, so what this Contract
+    # declares is the statement row, which is the record of what was said. A
+    # refusal writes nothing at all (`20261031T000000Z...:191-193`): a row there
+    # would be a severity on a Finding that does not carry it.
+    "mcp__rk2__state_severity": Contract(
+        "state.conclude",
+        REQUEST,
+        writes=("severity_statements",),
+        arguments={
+            "finding_label": Argument("string", required=True, pattern=_label("F")),
+            "severity": Argument("string", required=True, enum=SEVERITY_BANDS),
+            "basis": Argument("string", required=True, enum=SEVERITY_BASES),
+            "rationale": Argument("string", required=True, bounds=(20, 2000)),
+        },
+    ),
+    # The report a hunter composes. Served for the sentence the file it reaches
+    # was written around -- "which observation witnesses which effect is a
+    # judgement, not a join"
+    # (`20260820T000000Z__a_report_is_a_projection_of_what_holds.sql:436-437`).
+    # The join exists; what it cannot do is decide which of the Observations a
+    # run left behind is the one that shows the effect.
+    #
+    # Three staging relations in `writes` and no canonical one, which is the
+    # composition written out: an effect list, the steps of the chain and the
+    # citations each step rests on. `apply_computed_cvss` is not named here
+    # because it is not this Contract's to call -- it runs inside
+    # `propose_finding_report` (`20261031T000000Z...:389-393`), between the
+    # composition and the blocker list, precisely so that a model is never asked
+    # to hand the runtime back a vector the runtime computed.
+    "mcp__rk2__compose_finding_report": Contract(
+        "state.conclude",
+        REQUEST,
+        writes=("finding_effects", "finding_chain_steps", "finding_chain_step_citations"),
+        arguments={
+            "finding_label": Argument("string", required=True, pattern=_label("F")),
+            "effects": Argument(
                 "array",
                 required=True,
-                bounds=(3, 32),
+                bounds=(1, 16),
                 element={
-                    # Carried by the model and checked against its position,
-                    # because a plan read in one order and numbered in another is
-                    # a plan whose assertions point at requests nobody planned.
-                    "ordinal": Argument("integer", bounds=(1, 32)),
-                    "role": Argument("string", enum=TEST_ACTION_ROLES),
-                    "kind": Argument("string", enum=TEST_ACTION_KINDS),
-                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
-                    "url": Argument("string", bounds=(1, 2000)),
+                    # The word is the claim `compute_finding_cvss` reads the
+                    # vector out of, so a phrase where a `report_effects` row
+                    # belongs is a Finding with no CVSS rather than a typo.
+                    "effect": Argument("string", enum=REPORT_EFFECTS),
+                    "witness": Argument("string", pattern=_label("O")),
                 },
             ),
-            "assertions": Argument(
+            "steps": Argument(
                 "array",
                 required=True,
-                bounds=(1, 32),
+                bounds=(1, 16),
                 element={
-                    # 035's spelling, restated here for the reason
-                    # `submit_verdict.failed_assertion_ids` restates it: a
-                    # validator names a failed assertion by this identifier, so
-                    # an identifier a Test could be authored with and a verdict
-                    # could not name would be a failure nobody can report.
-                    "id": Argument("string", pattern="^[a-z][a-z0-9-]{2,62}$"),
-                    "kind": Argument("string", enum=TEST_ASSERTION_KINDS),
-                    "action": Argument("integer", bounds=(1, 32)),
-                    "against": Argument("integer", bounds=(1, 32)),
-                    "status": Argument("integer", bounds=(100, 599)),
-                },
-            ),
-            "cleanup": Argument(
-                "array",
-                bounds=(0, 16),
-                element={
-                    "method": Argument("string", enum=TEST_REQUEST_METHODS),
-                    "url": Argument("string", bounds=(1, 2000)),
+                    "mechanism": Argument("string", enum=REPORT_MECHANISMS),
+                    # The named slots the mechanism's sentence template fills.
+                    # Open in its keys -- each mechanism names its own -- and
+                    # bounded in what those keys carry, which is the half that
+                    # goes into a rendered sentence.
+                    "params": Argument("object", values_pattern="^.{1,200}$"),
+                    "citations": Argument(
+                        "array",
+                        bounds=(1, 8),
+                        element={
+                            "receipt": Argument("string", pattern=_label("R")),
+                            "observation": Argument("string", pattern=_label("O")),
+                        },
+                    ),
                 },
             ),
         },
@@ -1708,6 +1939,23 @@ MINT_CALLBACK = "mcp__rk2__mint_callback"
 #: was compiled, and the side that can see them is the side with a connection.
 REFRESH_PACKET = "mcp__rk2__refresh_packet"
 
+#: Ticket 103's three, spelled here for the reason the four above are: the
+#: supervisor dispatches on the verb name, and a name typed into the dispatch
+#: would be this surface named a second time. Each reaches a wrapper in
+#: `20261031T000000Z__the_verbs_downstream_of_a_finding_get_their_callers.sql`
+#: -- `propose_impact_task` (`:110`), `propose_severity` (`:195`) and
+#: `propose_finding_report` (`:277`) -- rather than the granted verb the tool is
+#: named for, because the granted verb takes a uuid and raises.
+OPEN_IMPACT_TASK = "mcp__rk2__open_impact_task"
+STATE_SEVERITY = "mcp__rk2__state_severity"
+COMPOSE_FINDING_REPORT = "mcp__rk2__compose_finding_report"
+
+#: Ticket 104's, and the odd one of the set: its Contract has been in
+#: `sched.pick` since 023 and the dispatch is what it never had. Spelled beside
+#: the others because it is the same dispatch and the same rule about naming a
+#: verb twice.
+PARK_FOR_HUMAN = "mcp__rk2__park_for_human"
+
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
 #: that is neither granted nor refused here is a tool this roster has not
@@ -1786,7 +2034,14 @@ ROLES: dict[str, Role] = {
         effort="high",
         max_turns=120,
         builtin_tools=(SKILL,),
-        tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
+        # `state.conclude` is ticket 103's and this role's alone. The second
+        # kind above is what it is the work of: a Task of kind `conclude` runs
+        # from a validated Finding to the impact specification, the severity
+        # band and the composed report, and the three verbs of that walk are
+        # authority no other role has a Task that would put it in front of.
+        tool_groups=(
+            "state.read", "state.propose", "state.conclude", "net.request", "exec.tool_run",
+        ),
         max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:
         # two hunters sharing one upstream slot is the session mixing that the

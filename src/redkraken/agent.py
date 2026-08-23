@@ -137,20 +137,38 @@ SERVER_VERSION = "0.1.0"
 #: supervisor with nothing to serve them with answers a refusal, and an
 #: allowlist that varied with the job is an allowlist the assertion cannot check
 #: against the roster.
+#:
+#: `state.conclude` is 103's three and the one group here that a single role
+#: holds. Served whole because all three of its members are: the impact work a
+#: hunter asks for, the band it states and the report it composes each reach a
+#: wrapper that turns a Finding label into the row and an exception into a
+#: sentence, and each is answered on the supervisor's connection for
+#: `exec.tool_run`'s reason -- the rows are on this side and the child is not.
+#: Serving it widens nothing, because serving is not granting: `allowed_tools`
+#: intersects the roster's grants with this list, and `web_hunter` is the only
+#: role the roster grants the group to.
 SERVED_GROUPS = (
     "state.read", "state.propose", "net.request", "validate.judge", "exec.tool_run",
+    "state.conclude",
 )
 
 #: The one group served in part, and exactly which of its members. `sched.pick`
-#: is five tools built by four tickets: the two here are the Slate the
-#: orchestrator is offered and the choice it makes on it, and the other three --
-#: validation, a report and parking for a human -- are requests their own
-#: tickets serve. Naming the members is what keeps the difference visible: a
-#: group is served whole unless there is a list saying which part, and the list
-#: is checked below against the group it claims to be part of, so a tool that
-#: later moved to another authority class fails the compile here rather than
-#: arriving quietly on the orchestrator's allowlist.
-SERVED_MEMBERS = {"sched.pick": ("mcp__rk2__get_slate", "mcp__rk2__pick_task")}
+#: is five tools built by four tickets: the three here are the Slate the
+#: orchestrator is offered, the choice it makes on it and the ask that stops the
+#: work for a person, and the other two -- validation and a report -- are
+#: requests ticket 105 serves. Those two are the whole of what this tree
+#: declares and no launch serves, which is the count ticket 104 corrected: it
+#: read three until `park_for_human` joined the list above. Naming the members
+#: is what keeps the difference visible: a group is served whole unless there is
+#: a list saying which part, and the list is checked below against the group it
+#: claims to be part of, so a tool that later moved to another authority class
+#: fails the compile here rather than arriving quietly on the orchestrator's
+#: allowlist.
+SERVED_MEMBERS = {
+    "sched.pick": (
+        "mcp__rk2__get_slate", "mcp__rk2__pick_task", "mcp__rk2__park_for_human",
+    )
+}
 
 #: Everything this launch actually serves. The roster says what a role may
 #: call; this says what exists to be called, and the allowlist a launch carries
@@ -220,6 +238,12 @@ UNVERIFIABLE = "unverifiable"
 #: answer it could act on.
 UNKNOWN_CALL = "unknown_call"
 UNREACHABLE_STATE = "unreachable_state"
+#: And why a verb this side carried came back as an error rather than as an
+#: answer. Its own word rather than `UNREACHABLE_STATE`, because the two are
+#: different facts about different things: that one is about the connection and
+#: this one is about the statement, and a child told the state was unreachable
+#: would go and try the same call again.
+REFUSED_STATEMENT = "refused_statement"
 #: A supervisor that can write a row and cannot start a container. Its own
 #: word rather than `_launch.NO_TOOLING`, because they are different states:
 #: that one is a run with no supervisor at all, this one is a supervisor an
@@ -267,6 +291,40 @@ PROPOSE_TEST = "SELECT propose_test($1, $2::jsonb, $3::uuid)"
 #: than a second number, because a correlator that is one DNS label is a rule
 #: the callback module already states.
 MINT_CALLBACK = "SELECT request_callback_correlator($1, $2, $3, $4::uuid)"
+
+#: Ticket 103's three, each the caller half of a verb that had none. The named
+#: function is the wrapper rather than the granted verb the tool is named for:
+#: `open_impact_task`, `state_severity` and `compose_finding_report` each take a
+#: uuid nothing a model reads can be, and each raises where a child needs a
+#: sentence. The Agent run on the first is this side's to fill in, for the
+#: reason it is on `PROPOSE` above; the other two write no row of their own.
+IMPACT = "SELECT propose_impact_task($1, $2::jsonb, $3::uuid)"
+SEVERITY = "SELECT propose_severity($1, $2, $3, $4)"
+REPORT = "SELECT propose_finding_report($1, $2::jsonb)"
+
+#: Ticket 104's, and the one statement on this dispatch that resolves a label
+#: before it sends it. `park_task_for_human` takes the Task as a uuid and the
+#: roster declares `task_label`, so the word is resolved here against this
+#: Program's rows -- scoped by the Program this object was built for rather than
+#: by row level security, which is `USING (true)` for `rk2_runtime` and would
+#: have found a label under any Program. The resolution is not the check: what
+#: refuses a Task that is not this run's is the verb's own comparison against
+#: the run's Task, and a label this Program does not hold arrives there as
+#: nothing and is refused in the sentence naming the Task the run does hold.
+PARK = (
+    "SELECT park_task_for_human($1::uuid, "
+    "(SELECT id FROM tasks WHERE program_id = $2::uuid AND label = $3), $4, $5)"
+)
+
+#: How a refused statement is kept from costing the call after it. The four
+#: verbs above answer a refusal rather than raising it, so a `DatabaseError`
+#: from one of them is the statement being refused -- and a refusal aborts the
+#: transaction it is in, on a connection this object holds open across every
+#: call one child makes. The savepoint is what the refusal is undone back to,
+#: so the next call arrives on a connection that is not in a transaction it
+#: never opened.
+SAVEPOINT = "SAVEPOINT rk2_verb"
+UNDO = "ROLLBACK TO SAVEPOINT rk2_verb"
 
 #: The two Artifact labels for one exchange, asked for by the Receipt label the
 #: door already handed the child. `hold_receipt_transcripts()` wrote them in the
@@ -1319,7 +1377,7 @@ class _Tools:
 
     The dispatch is on the verb and it is closed. The roster has already refused
     every call that does not fit its contract, so what arrives here is a
-    well-formed call to one of four tools, or the one ask that is not a tool;
+    well-formed call to one of ten tools, or the one ask that is not a tool;
     anything else is a child that has started making things up, and it is
     answered rather than executed.
 
@@ -1344,6 +1402,15 @@ class _Tools:
     opens its own connection as that role, and every scoping question about it
     is answered by the server rather than by this module.
 
+    The last four are 103's and 104's, and they are here for the reason every
+    write on this dispatch is: the rows are on this side. Three of them say what
+    a Finding that already holds comes to -- the impact work asked for, the band
+    stated, the report composed -- and the fourth stops the work for a person.
+    What is different about them is not the direction but the answer: each
+    reaches a wrapper written to return every refusal rather than raise it, so
+    an error from one of them is the statement being refused and not a verdict
+    on the call, and `_carried` below is where those two facts stop being one.
+
     The connection is opened at the first call and not before. Most runs ask for
     no tool at all, and a connection held open through every one of them would
     be one connection per child for a thing most children never do.
@@ -1364,6 +1431,10 @@ class _Tools:
             roster.PROPOSE_TEST,
             roster.MINT_CALLBACK,
             roster.REFRESH_PACKET,
+            roster.OPEN_IMPACT_TASK,
+            roster.STATE_SEVERITY,
+            roster.COMPOSE_FINDING_REPORT,
+            roster.PARK_FOR_HUMAN,
             NAME_TRANSCRIPTS,
         ):
             return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
@@ -1420,6 +1491,18 @@ class _Tools:
 
         if verb == NAME_TRANSCRIPTS:
             return self._transcripts(connection, call)
+
+        if verb == roster.OPEN_IMPACT_TASK:
+            return self._impact(connection, call)
+
+        if verb == roster.STATE_SEVERITY:
+            return self._severity(connection, call)
+
+        if verb == roster.COMPOSE_FINDING_REPORT:
+            return self._report(connection, call)
+
+        if verb == roster.PARK_FOR_HUMAN:
+            return self._park(connection, call)
 
         if verb == roster.RUN_TOOL:
             named: str | None = str(call.get("tool") or "")
@@ -1606,6 +1689,185 @@ class _Tools:
                 TRANSCRIPTS, (str(arguments.get("receipt") or ""),)
             ).scalar()
         except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        document = json.loads(str(answered))
+        return document if isinstance(document, Mapping) else {}
+
+    def _impact(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one impact specification to the runtime and answer what it said.
+
+        `_specify` one authority later, and assembled the same way and for the
+        same reason: everything in the frame except the verb and the label is
+        the specification, because `rk2_test_spec_problem` rules on both
+        documents and is the authority on which parts exist. What is extra here
+        is the `impact` block, and it travels inside the specification rather
+        than beside it because that is where `rk2_impact_problem` reads it --
+        so it reaches the digest, which is what makes two runs that planned the
+        same impact Test collide on one row rather than author two.
+
+        A refusal comes back as a refusal, for `_propose`'s reason. What is
+        different is where the sentence is made: `open_impact_task` raises, and
+        `propose_impact_task` is the wrapper that catches the raise, files the
+        `test_proposals` row on either outcome and answers the sentence.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        specification = {
+            str(name): value
+            for name, value in arguments.items()
+            if name not in ("verb", "finding_label")
+        }
+        return self._carried(
+            connection,
+            IMPACT,
+            (
+                str(arguments.get("finding_label") or ""),
+                json.dumps(specification),
+                self._agent_run_id,
+            ),
+        )
+
+    def _severity(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one severity statement to the runtime and answer what it said.
+
+        The four declared arguments and nothing else. The Program is bound on
+        the connection as everywhere on this dispatch, and there is no Agent run
+        among them because `state_severity` records what was stated rather than
+        who asked: the statement row is the record, and a refused statement
+        writes nothing at all.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        return self._carried(
+            connection,
+            SEVERITY,
+            (
+                str(arguments.get("finding_label") or ""),
+                str(arguments.get("severity") or ""),
+                str(arguments.get("basis") or ""),
+                str(arguments.get("rationale") or ""),
+            ),
+        )
+
+    def _report(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one composed report to the runtime and answer what it said.
+
+        The two lists under the keys the verb reads them by, which is the whole
+        of the assembly: `propose_finding_report` takes the composition as one
+        document, resolves every Observation and Receipt label inside it to the
+        ids `compose_finding_report` takes, and answers the blockers that are
+        true after the vector has been computed.
+
+        Neither list is defaulted into a shape. A missing `effects` reaches the
+        verb as an empty array and is refused there by the sentence written for
+        one that is empty, which is the same refusal and is the verb's to make.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        composition = {
+            "effects": arguments.get("effects") or [],
+            "steps": arguments.get("steps") or [],
+        }
+        return self._carried(
+            connection,
+            REPORT,
+            (str(arguments.get("finding_label") or ""), json.dumps(composition)),
+        )
+
+    def _park(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Ask for this run's own Task to wait for a person, and answer what was said.
+
+        The one arm here whose success ends the run that made the call. What
+        `park_task_for_human` does is release the Leases, close the Agent run
+        and park the Task with no attempt charged, so the answer a child reads
+        is the last thing it reads -- which is why the refusals are answers and
+        not exceptions: a run that recognised a scope ambiguity and spelled it
+        out should not spend the recognition on a traceback.
+
+        Which Agent run is asking is this side's to fill in, like the Program
+        bound on the connection: a child naming its own run would be naming
+        whose work it would like stopped. The Task is the child's to name and is
+        checked against that run by the verb, which is the check ticket 104's
+        fourth criterion is about and is not re-implemented here.
+
+        How long the question stays open is the verb's default and there is no
+        argument for it, for `_callback`'s reason: a run that chose how long a
+        person has to answer would be choosing how long it may hold a Task off
+        the queue.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        return self._carried(
+            connection,
+            PARK,
+            (
+                self._agent_run_id,
+                self._program_id,
+                str(arguments.get("task_label") or ""),
+                str(arguments.get("question_code") or ""),
+                str(arguments.get("question") or ""),
+            ),
+        )
+
+    def _carried(
+        self,
+        connection: pg.Connection,
+        statement: str,
+        parameters: tuple[object, ...],
+    ) -> Mapping[str, object]:
+        """One verb of 103's and 104's, run where a refusal cannot cost the next call.
+
+        The four arms above share this and the five older ones do not, and the
+        difference is what their verbs do with a refusal. `propose_finding` and
+        the rest answer their refusals as jsonb and raise only when the
+        statement itself fails, so one `except` over both kinds is the same
+        answer either way. These four reach wrappers written to return every
+        refusal -- ticket 103's whole subject is that the verbs underneath them
+        raised -- so a `DatabaseError` from one of them is the statement being
+        refused rather than the database being gone, and the sentence in it is
+        something the child can act on. A connection that broke is the other
+        fact and is reported as the state it is.
+
+        Under a savepoint because the two are not the same for the connection
+        either. A refused statement leaves its transaction aborted, and this
+        object holds one connection open across every call one child makes, so
+        a refusal answered without undoing it would leave the next call failing
+        about a transaction it did not open.
+
+        The binding is taken inside the transaction and before the savepoint.
+        `set_config(..., false)` outlives the transaction it runs in, so it is
+        not the commit that keeps it -- but a rollback to a savepoint taken
+        before it would take it back, leaving the connection bound to nothing
+        for every call after this one.
+
+        What is answered is the verb's own document and nothing this side added
+        to it, which is the rule everywhere on this dispatch: a call's answer
+        carries what the database said about the rows, and nothing about the
+        run, the target or the model that asked.
+        """
+        try:
+            with connection.transaction():
+                connection.execute(BIND, (self._program_id,))
+                connection.execute(SAVEPOINT)
+                try:
+                    answered = connection.execute(statement, parameters).scalar()
+                except pg.DatabaseError as refusal:
+                    connection.execute(UNDO)
+                    return {
+                        "served": False,
+                        "reason": REFUSED_STATEMENT,
+                        "detail": str(refusal),
+                    }
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            # Reached from the binding, the savepoint or the transaction's own
+            # two statements, and never from the verb: the one statement that
+            # is a verdict on the call is answered above. None of these four is
+            # about the call at all, which is why they read as the state rather
+            # than as a refusal of it.
             return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
         document = json.loads(str(answered))
         return document if isinstance(document, Mapping) else {}

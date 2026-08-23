@@ -43,14 +43,36 @@ from redkraken import config, migrate, pg, program
 from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 
 
-__all__ = ["COMMAND", "FACTS", "RUN", "Refused", "VERSION", "projected", "render", "run"]
+__all__ = [
+    "COMMAND",
+    "FACTS",
+    "RUN",
+    "Refused",
+    "SOUNDNESS",
+    "SOUNDNESS_FACTS",
+    "VERSION",
+    "projected",
+    "render",
+    "run",
+    "soundness",
+]
 
 
 COMMAND = "report"
 RUN = COMMAND
 
+#: The sibling that renders nothing. A subject of `run` would have to be a
+#: subject with no form, no bytes and no narrative, so it is a command of its
+#: own: it answers a question about a chain rather than producing a document.
+SOUNDNESS = f"{COMMAND} soundness"
+
 #: What this command reports on every path, refused or performed.
 FACTS = ("program_id", "program_slug", "subject", "label", "template", "document")
+
+#: What `soundness` reports, on the same terms. Neither `subject` nor
+#: `template`: it is only ever asked about a chain, and there is no form to
+#: ask it under.
+SOUNDNESS_FACTS = ("program_id", "program_slug", "label", "soundness")
 
 #: Recorded on every rendering row, so a document filed by one version can be
 #: told from a document filed by another. Bumped when the bytes this module
@@ -70,6 +92,13 @@ SUBJECTS = {
     ),
 }
 RECORD = "SELECT record_rendering($1::uuid, $2, $3, $4)"
+
+#: The operator's read of a composed chain: whether it is still sound and,
+#: when it is not, the first reason it stopped being so. STABLE and granted to
+#: `rk2_human` as well as to the runtime, which is what makes it the operator's
+#: question -- a chain answering the verdict on its own soundness is not
+#: something the model that built it may ask for.
+SOUND = "SELECT read_kill_chain($1::uuid)"
 
 #: Which bundle key holds the thing the document is about. A finding bundle
 #: carries `chain` as its list of mechanism steps, so the two subjects cannot
@@ -742,6 +771,75 @@ def run(
             return _report(ledger, answers)
         connection.execute(BIND, (answers.program_id,))
         return _rendered(ledger, answers, connection, prose, out=out, record=record)
+
+
+def soundness(runtime: pg.Settings, configuration_path: Path, *, label: str) -> Report:
+    """Whether one composed chain is still sound, without rendering it.
+
+    `run`'s sibling rather than one of its subjects. `rk report chain` refuses
+    an unsound chain and says so in a violation, which makes the reason
+    something an operator learns by asking for a document they cannot have;
+    this asks the question on its own, and an unsound answer is an answer
+    rather than a failure -- the exit status is what stopped the command, not
+    what the database said about the chain.
+
+    Reads, and there is nothing here that could do otherwise: the label lookup
+    is the renderer's own, `read_kill_chain` is STABLE, and neither runs in a
+    transaction this opens. A chain that stopped being true keeps every row it
+    was built from.
+    """
+    ledger = Ledger()
+    # Every declared fact on every path, including the refused ones, because a
+    # key that appears only when the command got far enough is a key a caller
+    # has to guard for. `run` holds the same promise through `_Answers`.
+    facts = {"program_id": None, "program_slug": None, "label": label, "soundness": None}
+
+    configuration, refusals = config.load(Path(configuration_path))
+    if configuration is None:
+        ledger.refuse("configuration", f"refused by {len(refusals)} violation(s)", refusals)
+        return report(SOUNDNESS, ledger, **facts)
+    facts["program_slug"] = configuration.document["program"]["name"]
+    ledger.hold(
+        "configuration", f"{facts['program_slug']}, schema {configuration.schema_version}"
+    )
+
+    connection = migrate.open_connection(ledger, runtime)
+    if connection is None:
+        return report(SOUNDNESS, ledger, **facts)
+    with connection:
+        program.assert_runtime_connection(ledger, connection)
+        if ledger.violations:
+            return report(SOUNDNESS, ledger, **facts)
+        facts["program_id"] = program.resolve(ledger, connection, facts["program_slug"])
+        if facts["program_id"] is None:
+            return report(SOUNDNESS, ledger, **facts)
+        connection.execute(BIND, (facts["program_id"],))
+
+        # The renderer's own lookup rather than a second one, so that a label
+        # naming one chain to `rk report chain` cannot name another here.
+        identify, _ = SUBJECTS["chain"]
+        rows = connection.execute(identify, (facts["program_id"], label)).rows
+        if not rows:
+            ledger.fail(
+                "subject",
+                f"{label} is not a chain of this Program",
+                code=INVALID_CONFIGURATION,
+                source="argument:--label",
+            )
+            return report(SOUNDNESS, ledger, **facts)
+        answered = connection.execute(SOUND, (str(rows[0][0]),)).scalar()
+
+    # Passed on whole. What the verb answers is the answer -- a summary written
+    # here would be this process's reading of it, and the steps and edges a
+    # sound chain carries are what makes the verdict checkable.
+    facts["soundness"] = json.loads(str(answered))
+    ledger.hold(
+        "soundness",
+        f"{label} is sound"
+        if facts["soundness"]["sound"]
+        else f"{label} is not reportable: {facts['soundness']['unsound']}",
+    )
+    return report(SOUNDNESS, ledger, **facts)
 
 
 def projected(

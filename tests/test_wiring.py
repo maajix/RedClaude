@@ -195,30 +195,50 @@ class WiringRegisterTest(unittest.TestCase):
         cls.wiring = read()
         cls.gaps = gaps(cls.wiring)
 
+    def owes_a_live_gap(self):
+        """The lowest open ticket every one of whose `owed` rows is still a gap.
+
+        Read off the register rather than named, because a fixture that names a
+        ticket is a fixture the next ticket to finish its work breaks, and this
+        class is here to ask about the register rather than about whichever
+        debt happened to be outstanding on the day it was written.
+        """
+        found = {gap.key for gap in self.gaps}
+        rows: dict[int, list[str]] = {}
+        for key, row in sorted(check_wiring.OWED_GAPS.items()):
+            number = check_wiring.TICKET.match(row)
+            if number:
+                rows.setdefault(int(number.group(1)), []).append(key)
+        for number, keys in sorted(rows.items()):
+            if set(keys) <= found:
+                return number, keys
+        self.fail("no owed ticket holds a live gap for these fixtures to use")
+
     def test_a_row_naming_a_resolved_ticket_over_a_live_gap_is_refused(self):
         # The rule `check_audit` writes for its own `owed:NN` rows, in the place
         # it costs the most: work that was called finished while the gap it was
         # meant to close is still measurable.
         #
-        # Ticket 103 stands in for the rule, and the two rows this fixture used
-        # to name are why it has to: ticket 102 gave `open_finding` its caller,
-        # so those gaps are gone and a fixture over a closed gap asserts
-        # nothing. The keys are read off the register rather than written out,
-        # because the next ticket to close its own rows would otherwise break
-        # this test instead of being caught by the gate.
-        ticket = self.wiring.tickets[103]
+        # Neither the ticket nor its rows are written out. This fixture used to
+        # name 102 and then 103, and both closed their own gaps and left it
+        # asserting nothing, so it takes the first ticket the register still
+        # owes a whole live gap to -- every row of it, or the flip would raise a
+        # second kind of error and the comparison below would be measuring two
+        # rules at once.
+        number, owed = self.owes_a_live_gap()
         tickets = {
             **self.wiring.tickets,
-            103: dataclasses.replace(ticket, status=check_audit.RESOLVED),
+            number: dataclasses.replace(
+                self.wiring.tickets[number], status=check_audit.RESOLVED
+            ),
         }
-        owed = sorted(key for key, row in check_wiring.OWED_GAPS.items() if row == "owed:103")
-        self.assertTrue(owed, "ticket 103 owes no register row for this fixture to use")
 
         errors = check_wiring.register_errors(self.gaps, tickets)
 
         self.assertEqual(
             [
-                f"register: {key} names owed:103, which is resolved, and the gap is still here"
+                f"register: {key} names owed:{number}, which is resolved,"
+                " and the gap is still here"
                 for key in owed
             ],
             errors,
@@ -275,11 +295,16 @@ class WiringRegisterTest(unittest.TestCase):
         )
 
     def test_a_row_naming_no_ticket_at_all_is_refused(self):
-        with mock.patch.dict(check_wiring.OWED_GAPS, {"W3 open_impact_task": "owed:9999"}):
+        # Over a key that is still a gap, for the same reason and read the same
+        # way: a row re-pointed onto a gap somebody has since filled is refused
+        # twice, and this case is about the tracker rather than about the tree.
+        _, owed = self.owes_a_live_gap()
+
+        with mock.patch.dict(check_wiring.OWED_GAPS, {owed[0]: "owed:9999"}):
             errors = check_wiring.register_errors(self.gaps, self.wiring.tickets)
 
         self.assertEqual(
-            ["register: W3 open_impact_task names owed:9999 and the tracker holds no such ticket"],
+            [f"register: {owed[0]} names owed:9999 and the tracker holds no such ticket"],
             errors,
         )
 
@@ -383,23 +408,39 @@ class TicketThirtyEightTest(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertIn(verb, self.ticket)
 
-    def test_two_of_the_three_verbs_it_calls_called_are_called_by_nothing(self):
-        # The measurement the prose stood in for. `open_impact_replay` is called
-        # from Python and the sentence is right about it; the other two are
-        # granted to the runtime, reached from no call site, no trigger binding
-        # and no standing check, and the sentence was written in one review and
-        # believed in every one after it.
+    def test_the_two_verbs_the_claim_was_wrong_about_are_called_now(self):
+        # The measurement the prose stood in for, and the repair it produced.
+        # 38 said all three verbs "are called by the CLI and by the tests"; one
+        # third of that was true, because `open_impact_replay` is called from
+        # Python, and the other two were granted to the runtime and reached
+        # from no call site, no trigger binding and no standing check. Ticket
+        # 103 gave them the callers the sentence had already claimed:
+        # `propose_impact_task` and `propose_severity` are served as Contracts,
+        # dispatched from `agent.py`, and each calls the verb underneath it.
         self.assertIn("open_impact_replay", self.reached)
-        self.assertNotIn("open_impact_task", self.reached)
-        self.assertNotIn("state_severity", self.reached)
-        for verb in ("open_impact_task", "state_severity"):
+        self.assertIn("open_impact_task", self.reached)
+        self.assertIn("state_severity", self.reached)
+        for caller, verb in (
+            ("propose_impact_task", "open_impact_task"),
+            ("propose_severity", "state_severity"),
+        ):
             with self.subTest(verb=verb):
+                # The whole of the chain, not that the verb is somehow reached:
+                # Python names the proposer, the proposer's body calls the verb,
+                # and the verb is still on the runtime's surface, which is what
+                # made W3 ask about it in the first place.
+                self.assertIn(caller, self.wiring.surface.names)
+                self.assertIn(verb, self.wiring.catalogue.calls[caller])
                 self.assertIn(check_wiring.RUNTIME, self.wiring.catalogue.grants[verb])
 
-    def test_the_gate_reports_both_of_them(self):
+    def test_the_gate_reports_neither_of_them(self):
+        # The other side of the same repair. W3 reported both verbs for as long
+        # as 38's sentence stood in for a caller; ticket 103 wired them, so the
+        # check that disagreed with the prose now agrees with the tree, and a
+        # regression that took either caller away would put the key back.
         found = {gap.key for gap in check_wiring.verb_gaps(self.wiring)}
 
-        self.assertLessEqual({"W3 open_impact_task", "W3 state_severity"}, found)
+        self.assertEqual(set(), {"W3 open_impact_task", "W3 state_severity"} & found)
 
 
 if __name__ == "__main__":

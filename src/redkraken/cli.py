@@ -1522,6 +1522,41 @@ def build_parser() -> argparse.ArgumentParser:
         "and their evidence",
     ).set_defaults(record=False)
 
+    # A third form beside the two that render, because what it answers is not a
+    # document: `read_kill_chain` says whether a composed chain is still sound,
+    # which is the question `rk report chain` refuses on without being asked.
+    # Longhand rather than through `_report_form`, since every argument that
+    # builder adds beyond the Program and the label -- the form, the file, the
+    # prose -- is about bytes this one never produces.
+    soundness = forms.add_parser(
+        "soundness",
+        help=f"state whether one composed chain is still sound (${DATABASE_URL})",
+        description=(
+            "Ask one chain whether it is still reportable. Every step is asked "
+            "whether its pivot would be stamped again today, and the chain is "
+            "asked the four questions it has of its own: the capabilities it "
+            "starts from, the scope it was read in, the Identities it leans on "
+            "and the review gates on its members. A chain that is not sound "
+            "answers with the first reason and no steps, which is the refusal "
+            "`rk report chain` raises rather than a document. Reads only."
+        ),
+    )
+    _add_url(soundness, RUNTIME)
+    soundness.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the Program this chain belongs to",
+    )
+    soundness.add_argument(
+        "--label",
+        required=True,
+        metavar="label",
+        help="the chain to ask about, by its label",
+    )
+    soundness.set_defaults(run=_report_soundness)
+
     bundles = commands.add_parser(
         "evidence",
         help="pack what holds into a bundle somebody else can check, and check one",
@@ -2786,6 +2821,25 @@ def _report(arguments: argparse.Namespace) -> int:
                 out=arguments.out,
                 record=arguments.record,
             ),
+        )
+    )
+
+
+def _report_soundness(arguments: argparse.Namespace) -> int:
+    """The same one connection its siblings take, and less of everything else.
+
+    Nothing is rendered here, so there is no form to render under, no path to
+    write to and no prose to offer: a chain is named and the database answers
+    whether it still holds.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, reporting.SOUNDNESS)
+    if runtime is None:
+        return _render(report(reporting.SOUNDNESS, ledger))
+    return _render(
+        _guarded(
+            reporting.SOUNDNESS,
+            lambda: reporting.soundness(runtime, arguments.config, label=arguments.label),
         )
     )
 
