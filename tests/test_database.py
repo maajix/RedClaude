@@ -14610,7 +14610,7 @@ class SuggestedTaskPromotionTest(DatabaseCase):
         for reason, fragment in (
             ("unknown_kind", "teleport"),
             ("unopenable_kind", "hunt: a hunt Task is opened against a testable"),
-            ("no_subject", ""),
+            ("no_subject", "ENT-nobody-issued-this"),
             ("no_address", "only an application or an endpoint carries an address"),
             ("queue_at_ceiling", f"and the active slate offers {self.ceiling}"),
             ("refused_by_invariant", "already carries a live recon Task against"),
