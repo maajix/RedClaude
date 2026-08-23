@@ -471,7 +471,7 @@ def _close(
                 "aborted" if result is None else execution.stopped_as(result.stop_reason),
                 None if result is None else result.input_tokens,
                 None if result is None else result.output_tokens,
-                *(usage[name] for name in execution.SPEND),
+                *execution.charged(usage),
                 # A validation run is not a dispatch this runtime repeats, so it
                 # has no attempt profile: ticket 165 counts budget ends on one
                 # Task under one unchanged dispatch instruction.

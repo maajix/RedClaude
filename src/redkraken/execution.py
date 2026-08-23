@@ -609,6 +609,25 @@ def spent(result: "agent.AgentRunResult | None") -> dict:
         "error_detail": result.error_detail,
     }
 
+
+def charged(usage: Mapping[str, object]) -> tuple:
+    """The seven `SPEND` values, with the budget pair kept together.
+
+    `agent_runs_budget_tokens_named`: a number and the name of what produced it
+    are both written or neither is. A child counts from zero and names no policy
+    until it has one, so a run that reported no accounting of its own arrives
+    here as a charge of zero under no name -- which the schema refuses, and
+    rightly, because nobody can read that charge backwards. Dropping both is
+    what hands the run to `derive_budget_tokens`, which charges the raw sum
+    under `legacy-raw-v1`: the answer this schema already has for a run that did
+    not count for itself, rather than a second one invented at the wire.
+    """
+    values = {name: usage.get(name) for name in SPEND}
+    if not values["budget_policy"]:
+        values["budget_policy"] = None
+        values["budget_tokens"] = None
+    return tuple(values[name] for name in SPEND)
+
 #: Ticket 143. The other ending, for a Task that never reached an attempt
 #: because this runtime cannot dispatch it. `FINISH` settles an attempt and
 #: this one settles a Task, which is why it is a second verb and not a
@@ -1950,7 +1969,7 @@ class Slice:
                         "aborted" if result is None else stopped_as(result.stop_reason),
                         None if result is None else result.input_tokens,
                         None if result is None else result.output_tokens,
-                        *(usage[name] for name in SPEND),
+                        *charged(usage),
                         # A session holds no Task, so there is no attempt to
                         # profile: what ticket 165 counts is budget ends on one
                         # Task under one unchanged dispatch.
@@ -3261,7 +3280,7 @@ class Slice:
                             stop_reason,
                             run.get("input_tokens"),
                             run.get("output_tokens"),
-                            *(run.get(name) for name in SPEND),
+                            *charged(run),
                             run.get("attempt_profile"),
                         ),
                     ).scalar()
