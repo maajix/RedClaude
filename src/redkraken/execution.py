@@ -354,6 +354,21 @@ SELECTED = (
     " ORDER BY s.rank"
 )
 
+#: Ticket 164's answer to "nothing in the corpus is about this subject", which
+#: was true and unusable: it named no Playbook and no fact, so an operator
+#: looking at a Drupal login page and a corpus holding a CMS Playbook had
+#: nothing to read. Asked only when the selection kept nothing, because that is
+#: the one moment the near miss is the whole of the news -- a run with a
+#: Playbook is a run whose strategy is already in the ledger.
+#:
+#: One fact short and no further. Two facts short is most of a fifty-document
+#: catalogue against a thin surface, and a list that long says the same thing
+#: the empty one did.
+NEAR_MISSES = (
+    "SELECT path, array_to_string(missing_facts, ', ')"
+    " FROM playbook_near_misses($1::uuid, $2::uuid, 1)"
+)
+
 #: The staleness sweep, which 027 wrote and nothing has ever run. Staleness is
 #: evaluated at selection and never again inside a run, so what this writes is a
 #: record rather than an eviction: a live selection whose Playbook expired under
@@ -1804,7 +1819,7 @@ class Slice:
         # Before the packet and before the capability, which is what the
         # migration that built the selection is named for: a Playbook chosen
         # after the child started would be a Playbook it did not read.
-        selected = self._playbooks(ledger, connection, claimed, facts)
+        selected = self._playbooks(ledger, connection, program_id, claimed, facts)
         if selected is None:
             return
 
@@ -2144,6 +2159,7 @@ class Slice:
         self,
         ledger: Ledger,
         connection: pg.Connection,
+        program_id: str,
         claimed: Claimed,
         facts: dict,
     ) -> tuple[playbook_module.Projection, ...] | None:
@@ -2160,7 +2176,11 @@ class Slice:
         Keeping nothing is an answer and not a failure. A subject whose facts
         match no trigger has no strategy in the corpus, and the hunt goes ahead
         under the Task's own instructions -- which is the state every run before
-        this one was in, said out loud rather than by omission.
+        this one was in, said out loud rather than by omission. Said with the
+        near misses beside it since ticket 164: "nothing in the corpus is about
+        this subject" was true of a Drupal login page and a corpus holding a CMS
+        Playbook, and an operator could not tell that from a corpus that really
+        had nothing to say.
 
         What is refused is a selection that cannot be shown: a row naming a path
         this installation does not carry, or one whose frozen digest is not the
@@ -2215,16 +2235,40 @@ class Slice:
                 f"{demoted} stable Playbook(s) were demoted before this selection: "
                 "their own test fails or their review date has passed",
             )
-        ledger.hold(
-            "playbooks",
-            f"{claimed.task_label} runs under "
-            + (
-                ", ".join(one.path for one in kept)
-                if kept
-                else "no Playbook: nothing in the corpus is about this subject"
-            ),
-        )
+        if kept:
+            ledger.hold(
+                "playbooks",
+                f"{claimed.task_label} runs under " + ", ".join(one.path for one in kept),
+            )
+        else:
+            ledger.hold(
+                "playbooks",
+                f"{claimed.task_label} runs under no Playbook: nothing in the "
+                "corpus is about this subject" + self._near(connection, program_id, claimed),
+            )
         return tuple(one.projection for one in kept)
+
+    @staticmethod
+    def _near(connection: pg.Connection, program_id: str, claimed: Claimed) -> str:
+        """What this subject would have had to carry, or nothing to add.
+
+        Read after the selection's transaction closed and outside any of its
+        own, because it decides nothing: a hunt whose corpus said nothing is a
+        hunt that goes ahead under the Task's own instructions either way. That
+        is also why a database that will not answer this is not a failure here.
+        The run is not worse off for a diagnostic it could not print, and
+        failing it would turn the sentence that explains a quiet run into a new
+        way for the run to stop.
+        """
+        try:
+            rows = connection.execute(NEAR_MISSES, (program_id, claimed.subject_entity_id)).rows
+        except pg.DatabaseError:
+            return ""
+        if not rows:
+            return ""
+        return "; one fact short: " + ", ".join(
+            f"{row[0]} wants {row[1]}" for row in rows
+        )
 
     def _packet(
         self,

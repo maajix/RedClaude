@@ -315,6 +315,11 @@ class Recorder:
             answers.get("selections", [(SELECTED_PLAYBOOK.path, SELECTED_PLAYBOOK.sha256,
                                         SELECTED_PLAYBOOK.version)])
         )
+        # Ticket 164. What the corpus nearly matched, asked only when the
+        # selection kept nothing. Empty is the honest default: a case with a
+        # kept Playbook never reaches the question, and a case with none is
+        # asking what a subject with no strategy at all reads like.
+        self.near_misses = list(answers.get("near_misses", []))
         # How many live selections the sweep found their Playbook had expired
         # under. Zero is the ordinary pass; a catalogue that moved under a
         # running mission is what a case says otherwise to see.
@@ -524,6 +529,8 @@ class Recorder:
             return [(len(self.selections),)]
         if sql == execution.SELECTED:
             return list(self.selections)
+        if sql == execution.NEAR_MISSES:
+            return list(self.near_misses)
         if sql == execution.SWEEP_STALE:
             return [(self.marked,)]
         if sql == execution.ARM_WATCHES:
@@ -1634,6 +1641,50 @@ class PlaybookSelectionTest(unittest.TestCase):
             attempt(connection)
 
         self.assertEqual([], connection.sent(execution.DEMOTE))
+
+    def test_a_subject_the_corpus_missed_by_one_fact_is_named_in_the_ledger(self):
+        # Ticket 164. "Nothing in the corpus is about this subject" was true of
+        # a Drupal login page and a catalogue holding a CMS Playbook, and an
+        # operator could not tell that from a catalogue that really had nothing
+        # to say. The near miss is what tells them apart.
+        connection = Recorder(
+            selections=[],
+            near_misses=[("playbooks/cms/playbook.md", "authenticated_endpoint")],
+        )
+        with compiled():
+            ledger, _ = attempt(connection)
+
+        said = " ".join(item.detail for item in ledger.assertions)
+        self.assertIn("nothing in the corpus is about this subject", said)
+        self.assertIn(
+            "one fact short: playbooks/cms/playbook.md wants authenticated_endpoint",
+            said,
+        )
+
+    def test_a_subject_the_corpus_really_has_nothing_for_says_only_that(self):
+        # The other half, and the reason the near miss is a suffix rather than
+        # a replacement: a subject nothing is one fact away from gets the
+        # sentence it always got, with nothing appended to read into.
+        connection = Recorder(selections=[])
+        with compiled():
+            ledger, _ = attempt(connection)
+
+        said = [
+            item.detail for item in ledger.assertions if "runs under" in item.detail
+        ]
+        self.assertEqual(
+            ["T1 runs under no Playbook: nothing in the corpus is about this subject"],
+            said,
+        )
+
+    def test_the_near_miss_is_not_asked_for_when_a_playbook_was_kept(self):
+        # It is a diagnostic for the empty answer. A run with a strategy has
+        # its strategy in the ledger already, and asking anyway would put a
+        # list of what it nearly ran beside what it is running.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        self.assertEqual([], connection.sent(execution.NEAR_MISSES))
 
     def test_the_choice_is_made_before_the_capability_the_child_would_spend(self):
         # The migration's own title: a Playbook is chosen before the model

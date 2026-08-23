@@ -38660,7 +38660,7 @@ class PlaybookSelectionTest(DatabaseCase):
             cls.subjects = {
                 "matching": cls.endpoint(application, "/notes/{id}", "id", "path", "integer_id"),
                 "second": cls.endpoint(application, "/orders/{id}", "id", "path", "uuid"),
-                "other": cls.endpoint(application, "/search", "q", "query", "text"),
+                "other": cls.endpoint(application, "/search", "q", "query", None),
             }
             # Two of them, and both `user`: `multiple_test_identities` is what
             # makes an ownership question askable at all, and it is the trigger
@@ -38698,7 +38698,12 @@ class PlaybookSelectionTest(DatabaseCase):
 
     @classmethod
     def endpoint(
-        cls, application: str, template: str, name: str, location: str, value_class: str
+        cls,
+        application: str,
+        template: str,
+        name: str,
+        location: str,
+        value_class: str | None,
     ) -> str:
         """One authenticated GET with one parameter on it."""
         endpoint = cls.entity("endpoint", f"endpoint:GET {template}")
@@ -39531,7 +39536,9 @@ class PlaybookSelectionTest(DatabaseCase):
         slice_ = execution.Slice(
             boundary=boundary(proxy_url="http://127.0.0.1:1"), state=self.harness.state
         )
-        return ledger, facts, slice_._playbooks(ledger, self.runtime, claimed, facts)
+        return ledger, facts, slice_._playbooks(
+            ledger, self.runtime, self.program_id, claimed, facts
+        )
 
     def test_the_runtime_runs_the_selection_this_schema_holds(self):
         # `other` is the subject nothing is about and its Task was never
@@ -39613,7 +39620,11 @@ class Surface:
     path: str
     authenticated: bool | None
     #: `(location, value_class)`, or None for a route that carries nothing.
-    parameter: tuple[str, str] | None
+    #: A `value_class` of None is a parameter recon saw and did not classify,
+    #: which is what `text` meant here until ticket 111 closed the column to
+    #: nine values and left this table spelling a tenth. Neither value is a
+    #: `subject_facts` branch, so what each Surface matches is unchanged.
+    parameter: tuple[str, str | None] | None
     #: Defaulted because only the one Playbook that triggers on `json_request`
     #: needs it, and a recon pass records nothing here for a route it never saw
     #: a typed body on.
@@ -39668,13 +39679,13 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     #: Playbooks key on the kind and none of them keys on that one, so a Surface
     #: that is not about the Application shape says so by being an `spa`.
     SURFACES = {
-        "agentic-ai": Surface("spa", "llm", "POST", "/assistant", True, ("body", "text")),
-        "api": Surface("api", None, "GET", "/api/v1/documents", True, ("query", "text")),
+        "agentic-ai": Surface("spa", "llm", "POST", "/assistant", True, ("body", None)),
+        "api": Surface("api", None, "GET", "/api/v1/documents", True, ("query", None)),
         # A path segment that names an object and a write against it, with the
         # segment left untyped: an identifier a recon pass could classify would
         # make this the object-ownership Surface as well.
         "api-authorization": Surface("spa", None, "POST", "/orders/{reference}/cancel",
-                                     True, ("path", "text")),
+                                     True, ("path", None)),
         # The one unauthenticated Surface, which is what this Playbook is for:
         # what a reader can reach before presenting anything.
         "attack-surface": Surface("spa", None, "GET", "/openapi.json", False, None),
@@ -39683,7 +39694,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # Application kind is the one a browser renders. Six of them are a GET
         # on a `web` Application and are told apart by one further fact each:
         # what the route carries, what points at it, or what runs in front of it.
-        "browser-framing": Surface("web", None, "POST", "/transfer", True, ("body", "text"),
+        "browser-framing": Surface("web", None, "POST", "/transfer", True, ("body", None),
                                    "application/x-www-form-urlencoded"),
         # Auth left unknown on all five of the unauthenticated-looking reads
         # below, rather than false: `attack-surface` is `read_method` with
@@ -39691,12 +39702,12 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # match it as well.
         "browser-messaging": Surface("web", None, "GET", "/widget", None, None),
         "browser-realtime": Surface("websocket", None, "GET", "/socket", None,
-                                    ("query", "text")),
-        "browser-script": Surface("web", None, "GET", "/search", None, ("query", "text"),
+                                    ("query", None)),
+        "browser-script": Surface("web", None, "GET", "/search", None, ("query", None),
                                   None, True),
         "browser-storage": Surface("web", None, "GET", "/profile", True, None),
         "client-side-path-traversal": Surface("web", None, "GET", "/view/{ref}", None,
-                                              ("path", "text")),
+                                              ("path", None)),
         # The two authenticated reads with no parameter at all that only the
         # technology behind the Application tells apart, and
         # `information-disclosure` is the third. A content platform is one
@@ -39713,7 +39724,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # Two cookie-bearing Surfaces, told apart by method rather than by
         # anything else: reading an account is where a scope claim can be made
         # and logging out is where a lifetime claim can be.
-        "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", "text")),
+        "cookies": Surface("spa", None, "GET", "/account", True, ("cookie", None)),
         # The second Surface running a technology in front of the Application
         # rather than inside it, and `web-cache` is the first. A caching front
         # end and a terminating proxy are different readings -- what is stored
@@ -39735,9 +39746,9 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # under. A write carrying the file alone is the converter route above.
         "file-upload": Surface("spa", None, "POST", "/uploads", True, ("body", "file"),
                                "application/octet-stream"),
-        "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", "text")),
+        "graphql": Surface("graphql", None, "POST", "/graphql", True, ("body", None)),
         "grpc": Surface("spa", "grpc", "POST", "/billing.Admin/ListAll", True,
-                        ("body", "text")),
+                        ("body", None)),
         # The second Surface running a proxy in front of the Application, and
         # `deployment` is the first. The Application kind is the whole
         # difference: what a front end and an application disagree about when
@@ -39745,15 +39756,15 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # connection negotiated is asked of the shell an application serves.
         "http-desync": Surface("spa", "nginx", "GET", "/", None, None),
         "identity-lifecycle": Surface("spa", None, "POST", "/session/logout", True,
-                                      ("cookie", "text")),
+                                      ("cookie", None)),
         "identity-parsing": Surface("spa", "saml", "POST", "/sso/acs", False,
-                                    ("body", "text")),
+                                    ("body", None)),
         # The one Application that publishes a contract, and the one subject in
         # this table with no parameter at all: what this reading compares is the
         # response against the document the application published about it.
         "information-disclosure": Surface("spa", "openapi", "GET", "/api/v2/orders", True,
                                           None),
-        "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", "text")),
+        "jwt-jose": Surface("spa", "jwt", "GET", "/api/v1/profile", True, ("query", None)),
         # The second read whose authentication nobody has established and which
         # carries no parameter, and `supply-chain` is the third. Both are told
         # apart from everything above by the technology alone: an orchestrator
@@ -39764,24 +39775,24 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # `race-conditions`: both are a typed JSON body on a POST, and only the
         # store behind the route and the caller's standing tell them apart.
         "nosql-injection": Surface("spa", "mongodb", "POST", "/search", None,
-                                   ("body", "text"), "application/json"),
+                                   ("body", None), "application/json"),
         # The two Surfaces whose authentication nobody has established, which is
         # where a callback and a machine-to-machine route sit before an Identity
         # has been leased against them.
-        "oauth": Surface("spa", "oauth", "GET", "/oauth/callback", None, ("query", "text")),
+        "oauth": Surface("spa", "oauth", "GET", "/oauth/callback", None, ("query", None)),
         "object-ownership": Surface("spa", None, "GET", "/notes/{id}", True,
                                     ("path", "integer_id")),
         # The second of the three authenticated query reads that only the store
         # behind them tells apart. `jwt-jose` is the first, and the third is
         # below.
-        "orm": Surface("spa", "django", "GET", "/accounts", True, ("query", "text")),
+        "orm": Surface("spa", "django", "GET", "/accounts", True, ("query", None)),
         # The three writes with a body, which nothing above tells apart. The
         # value class does it for the first, the content type for the second,
         # and the redirect arranged below for the third.
         "payment-workflows": Surface("spa", None, "POST", "/cart/items", True,
                                      ("body", "number")),
         "race-conditions": Surface("spa", None, "POST", "/coupons/redeem", True,
-                                   ("body", "text"), "application/json"),
+                                   ("body", None), "application/json"),
         "realtime": Surface("websocket", None, "GET", "/socket", True, None),
         # The one authenticated read carrying a header parameter.
         # `workload-identities` is the other header in this table and its
@@ -39789,13 +39800,13 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # between asking who a machine route answers for and asking who may read
         # what a caller's own route answered.
         "request-integrity": Surface("spa", None, "GET", "/api/account", True,
-                                     ("header", "text")),
+                                     ("header", None)),
         # The second route in this table with two parameters, added below by
         # `repeat_the_export_format`: one name in the query string and the same
         # name in the body, which is the only shape 020's uniqueness admits.
         "request-parsing": Surface("web", None, "POST", "/orders/export", None,
-                                   ("body", "text")),
-        "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", "text")),
+                                   ("body", None)),
+        "routing": Surface("spa", None, "POST", "/checkout/confirm", True, ("body", None)),
         # The second document something else loads, and `browser-messaging` is
         # the first. The Application kind is the whole difference: a widget in a
         # page a browser renders is a messaging question, and a bundle an
@@ -39805,10 +39816,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # What separates them is the Application kind and the reflection: a form
         # that comes back is where a stored value reaches an export.
         "spreadsheet-injection": Surface("spa", None, "POST", "/contacts", True,
-                                         ("body", "text"),
+                                         ("body", None),
                                          "application/x-www-form-urlencoded", True),
         "sql-injection": Surface("spa", "postgresql", "GET", "/reports", True,
-                                 ("query", "text")),
+                                 ("query", None)),
         # The one route that takes a URL and authenticates. `external-resources`
         # is the other URL parameter in this table and it is a `web` page nobody
         # has logged into, which is the difference between reading what a
@@ -39817,13 +39828,13 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                     ("query", "url")),
         # The one authenticated write whose parameter comes back, which is what a
         # template engine renders.
-        "ssti": Surface("spa", "jinja", "POST", "/preview", True, ("body", "text"),
+        "ssti": Surface("spa", "jinja", "POST", "/preview", True, ("body", None),
                         None, True),
         # The one XML body in this table. Nothing else states a content type a
         # document parser reads, which is what makes this route the one where a
         # parser exists to be reached.
         "structured-injection": Surface("spa", None, "POST", "/services/orders", True,
-                                        ("body", "text"), "text/xml"),
+                                        ("body", None), "text/xml"),
         # The third served document in this table. `secrets` is a bundle a shell
         # embeds and `browser-messaging` is a widget a page frames; this one is
         # the map the build wrote beside the bundle, and what picks it out is the
@@ -39833,10 +39844,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # rather than inside it, which is what `tech_cdn` is.
         "web-cache": Surface("web", "cloudflare", "GET", "/dashboard", None, None),
         "webauthn": Surface("spa", "webauthn", "POST", "/account/recovery-email", True,
-                            ("body", "text")),
+                            ("body", None)),
         "webhooks": Surface("spa", None, "POST", "/webhooks", True, ("body", "url")),
         "workload-identities": Surface("spa", None, "GET", "/internal/metrics", None,
-                                       ("header", "text")),
+                                       ("header", None)),
     }
 
     @classmethod
@@ -39890,14 +39901,21 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                         f"slot://identity/{CORPUS_SLUG}-{slot}",
                     ),
                 )
-                # The organisation an account belongs to is an Identity of class
-                # `service`, which is how the rest of the corpus spells a tenant.
-                # It is not a test account, so it does not count towards
-                # `multiple_test_identities`.
+                # The organisation an account belongs to. It is not a test
+                # account, so it must not count towards
+                # `multiple_test_identities`, which leaves `privileged` and
+                # `anonymous` -- and `anonymous` means "presents no credential",
+                # which a tenant that owns accounts does not.
+                #
+                # It was `service` until ticket 112 closed the class to three
+                # values and did not carry this row with it, which left this
+                # class erroring in `setUpClass` from 20260929 onward. Neither
+                # class this could be is a Playbook trigger, so what the
+                # catalogue matches here is unchanged either way.
                 organisation = cls.entity("identity", f"identity:{tenant}")
                 cls.connection.execute(
                     "INSERT INTO identities (entity_id, program_id, slot_name, class,"
-                    " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'service', $4)",
+                    " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'privileged', $4)",
                     (
                         organisation,
                         cls.program_id,
@@ -40095,7 +40113,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         """
         cls.connection.execute(
             "INSERT INTO parameters (entity_id, endpoint_id, name, location, value_class)"
-            " VALUES ($1::uuid, $2::uuid, 'subject', 'query', 'text')",
+            " VALUES ($1::uuid, $2::uuid, 'subject', 'query', NULL)",
             (
                 cls.entity(
                     "parameter", f"parameter:{cls.base_url('request-parsing')}/orders/export:query"
@@ -40282,6 +40300,238 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # without a Surface here would be tested by nothing above and would
         # leave the three claims true of everything they were asked about.
         self.assertEqual(sorted(playbook.PLAYBOOKS), sorted(self.SURFACES))
+
+
+APPLICATION_SUBJECT_SLUG = "selftest-application-subject"
+
+
+class ApplicationSubjectFactsTest(DatabaseCase):
+    """Ticket 164: a subject that is an Application carries facts, and a near
+    miss is something an operator can read.
+
+    Every case above asks the selection about an Endpoint, which is the only
+    subject 032's view had a key for. Every `hunt` Task in production carries
+    the subject of the Hypothesis that derived it, and a Hypothesis a recon
+    child writes is about the Application -- so the two halves never met, and
+    `playbook_selections` was empty in every database this tree had produced
+    while fifty Playbooks sat in the catalogue.
+
+    The Surface here is `rk2hunt17`'s, reduced to what mattered: a `web`
+    Application running Drupal with one unauthenticated GET under it. That is
+    a real operator's "Drupal login page, check username enumeration", and the
+    corpus holds `playbooks/cms/playbook.md`, which wants
+    `authenticated_endpoint`, `read_method` and `tech_cms` and can have two of
+    the three here. So the same arrangement answers both questions this ticket
+    asks: what a subject that is an Application matches, and what it can be
+    told about the one it did not.
+
+    A second Application with no Endpoint at all is here because the view now
+    reads the Application's own shape off a key of its own. A site recon found
+    before it found a route used to carry nothing, and it is exactly the state
+    a first pass leaves behind.
+
+    This case commits its Program and purges it at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: The one this Surface is one fact short of, and the fact. Written down
+    #: rather than derived, for `PlaybookCorpusSelectionTest`'s reason at its
+    #: own table: a near miss computed from the rows the near miss reads would
+    #: agree with a trigger list that is wrong.
+    CMS = "playbooks/cms/playbook.md"
+    LACKS = "authenticated_endpoint"
+
+    #: What this Surface satisfies outright, so the assertion that the
+    #: selection is non-empty says which Playbook rather than merely how many.
+    #: It comes back dropped, and dropped for a metadata reason -- `web_hunter`
+    #: does not hold its Skills -- which is the thing this ticket is not about:
+    #: a reason an operator can read was already there for everything past the
+    #: trigger stage, and the trigger stage is what returned nothing at all.
+    REACHED = "playbooks/attack-surface/playbook.md"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(
+                SCOPED.replace(
+                    'name = "matrix-web"', f'name = "{APPLICATION_SUBJECT_SLUG}"'
+                )
+            ),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.arrange()
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (APPLICATION_SUBJECT_SLUG,)
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def entity(cls, kind: str, dedup: str) -> str:
+        """One in-scope Entity, through the one verb that projects scope.
+
+        `subject_facts` reads `in_scope` on the Application now as well as on
+        the Endpoint, so an Application inserted by hand would carry no fact and
+        make every case below pass for the reason it is here to rule out.
+        """
+        return str(
+            cls.connection.execute(
+                "SELECT add_entity($1::uuid, $2, '', 'host', $3, 80, $4)::text",
+                (cls.program_id, kind, HOST, dedup),
+            ).scalar()
+        )
+
+    @classmethod
+    def arrange(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+
+            cls.application = cls.entity("application", f"application:{BASE_URL}")
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (cls.application, BASE_URL),
+            )
+            drupal = cls.entity("technology", f"technology:{BASE_URL}:drupal")
+            cls.connection.execute(
+                "INSERT INTO technologies (entity_id, name, version)"
+                " VALUES ($1::uuid, 'drupal', '10')",
+                (drupal,),
+            )
+            cls.connection.execute(
+                "INSERT INTO relationships (program_id, src_entity_id, dst_entity_id,"
+                " type) VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
+                (cls.program_id, cls.application, drupal),
+            )
+            cls.endpoint = cls.entity("endpoint", f"endpoint:GET {BASE_URL}/user/login")
+            cls.connection.execute(
+                "INSERT INTO endpoints (entity_id, application_id, method,"
+                " path_template, auth_required)"
+                " VALUES ($1::uuid, $2::uuid, 'GET', '/user/login', false)",
+                (cls.endpoint, cls.application),
+            )
+
+            # The Application recon found before it found a route.
+            routeless = f"{BASE_URL}:8443"
+            cls.routeless = cls.entity("application", f"application:{routeless}")
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'api')",
+                (cls.routeless, routeless),
+            )
+
+    # -- asking the view -------------------------------------------------------
+
+    def facts(self, subject: str) -> set[str]:
+        return {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT fact FROM subject_facts"
+                " WHERE program_id = $1::uuid AND subject_entity_id = $2::uuid",
+                (self.program_id, subject),
+            ).rows
+        }
+
+    def candidates(self, subject: str) -> dict[str, str | None]:
+        return {
+            str(row[0]): None if row[1] is None else str(row[1])
+            for row in self.connection.execute(
+                "SELECT path, dropped_because"
+                " FROM playbook_candidates($1::uuid, $2::uuid)",
+                (self.program_id, subject),
+            ).rows
+        }
+
+    def near(self, subject: str) -> dict[str, list[str]]:
+        return {
+            str(row[0]): sorted(str(row[1]).strip("{}").split(","))
+            for row in self.connection.execute(
+                "SELECT path, array_to_string(missing_facts, ',')"
+                " FROM playbook_near_misses($1::uuid, $2::uuid, 1)",
+                (self.program_id, subject),
+            ).rows
+        }
+
+    # -- the cases -------------------------------------------------------------
+
+    def test_an_application_subject_carries_the_facts_of_what_it_serves(self):
+        # The ticket's own assertion: one `web` Application, one
+        # unauthenticated Endpoint under it, and both facts readable off the
+        # Application. Before this ticket the set was empty.
+        self.assertLessEqual(
+            {"web_surface", "unauthenticated_endpoint", "read_method", "tech_cms"},
+            self.facts(self.application),
+        )
+
+    def test_an_endpoint_subject_still_carries_its_own_facts(self):
+        # The other direction of the same rebuild. The Endpoint was the only
+        # subject the view answered for, and a change that moved the key rather
+        # than widening it would pass the case above and lose every subject
+        # production has ever asked about.
+        self.assertLessEqual(
+            {"web_surface", "unauthenticated_endpoint", "read_method", "tech_cms"},
+            self.facts(self.endpoint),
+        )
+
+    def test_an_application_with_no_endpoint_still_says_what_it_is(self):
+        # Recon finds a site before it finds a route, and the shape of the
+        # Application is a fact about the Application rather than about
+        # anything under it.
+        self.assertEqual({"api_surface"}, self.facts(self.routeless))
+
+    def test_the_selection_reaches_a_playbook_for_an_application_subject(self):
+        # Criterion 6's second half. `playbook_candidates` filters on
+        # `playbooks_by_trigger`, so a subject with no facts returns nothing at
+        # all -- which is what every hunt Task in `rk2hunt17` got. What comes
+        # back is a row with a reason on it, and a reason is what an operator
+        # can act on; no row is what they had.
+        self.assertEqual(
+            {self.REACHED: "role_lacks_skill"}, self.candidates(self.application)
+        )
+
+    def test_a_playbook_one_fact_short_says_which_fact(self):
+        # The CMS Playbook against a Drupal site: `tech_cms` fired, the
+        # detection worked, and the one thing missing is whether the route
+        # wants a session. Today that Playbook and a Playbook about GraphQL
+        # produce the same output, which is none.
+        self.assertEqual([self.LACKS], self.near(self.application).get(self.CMS))
+
+    def test_a_playbook_the_subject_matched_is_not_a_near_miss(self):
+        # The count is the one `playbooks_by_trigger` decides on, so a Playbook
+        # this returns at zero would be one that function should have admitted.
+        # Asked as an overlap because the two answers partition the catalogue.
+        self.assertEqual(
+            set(),
+            set(self.candidates(self.application)) & set(self.near(self.application)),
+        )
+
+    def test_the_near_misses_are_the_ones_this_surface_actually_lacks(self):
+        # Eight Playbooks one fact short, which is 164's own measurement of
+        # this Surface. Written out rather than counted: a rebuild of
+        # `subject_facts` that quietly dropped a branch would keep the count
+        # and change which Playbook is missing what.
+        self.assertEqual(
+            {
+                "playbooks/browser-messaging/playbook.md": ["embedded_document"],
+                "playbooks/browser-storage/playbook.md": ["authenticated_endpoint"],
+                "playbooks/client-side-path-traversal/playbook.md": ["path_parameter"],
+                "playbooks/cms/playbook.md": ["authenticated_endpoint"],
+                "playbooks/cookies/playbook.md": ["cookie_parameter"],
+                "playbooks/deployment/playbook.md": ["tech_edge_proxy"],
+                "playbooks/external-resources/playbook.md": ["url_valued_parameter"],
+                "playbooks/web-cache/playbook.md": ["tech_cdn"],
+            },
+            self.near(self.application),
+        )
 
 
 #: The four Programs an evaluation of one Playbook against two fixture pairs
