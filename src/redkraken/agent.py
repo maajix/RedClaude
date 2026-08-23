@@ -705,6 +705,17 @@ def agent_run(
             # would wait there until the run's own deadline.
             "tooling": serving is not None,
         }
+        # Ticket 146. The setup token travels on the child's own stdin, in the
+        # document that is already private to it, and it is put in last so that
+        # every other value above is decided without it. The key is absent
+        # rather than null where this machine holds no token: a child popping a
+        # key that is not there is a child that has been told there is none, and
+        # the doctor is where an operator is told before a run finds out. It
+        # goes nowhere else -- not into a Docker argument, a log, the database,
+        # a Mission packet, the Program directory or an Artifact.
+        token = isolation.oauth_token()
+        if token:
+            job["oauth_token"] = token
         return _spawn(request, job, serving)
     except StartupRefusal as refusal:
         # Latched first. The cleanup talks to a database, and a database that

@@ -187,6 +187,7 @@ def diagnose(
     _assert_database(ledger, database_url)
     _assert_proxy(ledger, described)
     _assert_isolation(ledger, described)
+    _assert_agent_credential(ledger, described)
     _assert_catalogue(ledger, corpora)
     summary = _assert_configuration(ledger, configuration_path)
 
@@ -410,6 +411,57 @@ def _assert_isolation(ledger: Ledger, environment: Mapping[str, str]) -> None:
         "agent_boundary",
         f"{container.network} is internal and holds {container.proxy_container} alone",
     )
+
+
+def _assert_agent_credential(ledger: Ledger, environment: Mapping[str, str]) -> None:
+    """Whether a child started now would have anything to authenticate with.
+
+    Ticket 146. The launch already refuses an unusable credential, and that
+    refusal arrives after a Task has been claimed: it costs an attempt, and
+    three of them abandon the Task. The same predicate is asked here, before a
+    run, and the message carries the remedy rather than only the path.
+
+    Asked only of a machine that describes an Agent boundary, for the reason
+    `_assert_isolation` is: a machine that starts no children needs no token,
+    and refusing one over a file it will never open would withhold the four
+    other answers this command has.
+
+    The age is a hold and not a violation. A setup token lasts about a year and
+    one that is 340 days old still works; what an operator needs is to be told
+    now rather than in the middle of the hunt it expires under.
+    """
+    if not execution.requested(environment):
+        ledger.hold("agent_credential", "no Agent boundary described")
+        return
+    try:
+        token = isolation.oauth_token(environment)
+    except isolation.Unavailable as error:
+        ledger.fail(
+            "agent_credential",
+            str(error),
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{isolation.OAUTH_TOKEN_VARIABLE}",
+        )
+        return
+    path = isolation.oauth_token_file(environment)
+    if token is None:
+        ledger.fail(
+            "agent_credential",
+            f"no Claude setup token at {path}, and no child authenticates without one; "
+            f"{isolation.OAUTH_TOKEN_REMEDY}",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{isolation.OAUTH_TOKEN_VARIABLE}",
+        )
+        return
+    days = isolation.oauth_token_days(environment)
+    if days is not None and days >= isolation.OAUTH_TOKEN_DAYS:
+        ledger.hold(
+            "agent_credential",
+            f"the Claude setup token at {path} was installed {days} days ago and a setup "
+            f"token lasts about a year; {isolation.OAUTH_TOKEN_REMEDY} again",
+        )
+        return
+    ledger.hold("agent_credential", f"{path} holds a setup token this operator alone can read")
 
 
 def _assert_catalogue(ledger: Ledger, corpora: tuple[Corpus, ...]) -> None:

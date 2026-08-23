@@ -2,8 +2,11 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
+import os
 import sys
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from redkraken import doctor, execution, isolation, playbook, proxy
@@ -20,8 +23,24 @@ from redkraken.outcome import (
 from tests.fixtures import VALID, scratch, write
 
 
+#: The token the setup wizard installs, as a sentinel no assertion here prints.
+#: Ticket 146: what a diagnosis may report about a setup token is the path, the
+#: property that failed and the remedy, and never the value.
+SENTINEL = "RK-SYNTHETIC-SETUP-TOKEN-2f7c"
+
+
+def token_file(value: str = SENTINEL, *, mode: int = 0o600) -> Path:
+    """A setup token installed the way `tools/setup-agent-oauth.sh` installs one."""
+    directory = scratch() / "redkraken"
+    directory.mkdir(mode=0o700)
+    path = directory / "claude-oauth-token"
+    path.write_text(value, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
 @contextlib.contextmanager
-def described(**engine):
+def described(token: Path | None = None, **engine):
     """A machine describing a full boundary and a trust root that is current.
 
     The certificate is a file rather than a certificate: what `doctor` asks of
@@ -30,6 +49,10 @@ def described(**engine):
     test wait on `openssl`. The `isolation` calls each test wants stubbed are
     passed by name, because the ones it does not stub would inspect containers
     that do not exist on the machine running the suite.
+
+    A boundary comes with a setup token, because since ticket 146 that is what
+    a child authenticates with: a machine describing one and holding no token is
+    a machine no run starts on, which is a case rather than the default.
     """
     certificate = scratch() / "ca.pem"
     certificate.write_text("-- not read, `spent` is the answer --", encoding="utf-8")
@@ -43,6 +66,9 @@ def described(**engine):
             execution.PROXY_CONTAINER: "rk-proxy",
             execution.PROXY_URL: "http://rk-proxy:8080",
             execution.CERTIFICATE: str(certificate),
+            isolation.OAUTH_TOKEN_VARIABLE: str(
+                token_file() if token is None else token
+            ),
         }
 
 
@@ -372,6 +398,102 @@ class SubjectTest(unittest.TestCase):
                 counted, _, word = detail(diagnosis, f"catalogue:{name}").partition(" ")
                 self.assertEqual("compiled", word)
                 self.assertGreater(int(counted), 0)
+
+
+class AgentCredentialTest(unittest.TestCase):
+    """Ticket 146: the question the launch used to ask a Task's attempt for.
+
+    `rk2hunt7` spent three attempts on `Exception: Claude Code returned an error
+    result: success` and then one on `an Agent credential the child cannot
+    write`, and `attempts_exhausted` retired the Task. Every case here is the
+    same predicate asked before a run rather than by one.
+    """
+
+    def credential(self, diagnosis) -> str:
+        return detail(diagnosis, "agent_credential")
+
+    def test_a_machine_that_starts_no_children_is_asked_for_no_token(self):
+        diagnosis = doctor.diagnose(None, environment={})
+
+        self.assertTrue(diagnosis.ok)
+        self.assertEqual("no Agent boundary described", self.credential(diagnosis))
+
+    def test_a_boundary_with_a_token_this_operator_alone_can_read_holds(self):
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}", one_peer=lambda *seen: None
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertTrue(diagnosis.ok)
+        self.assertIn("holds a setup token", self.credential(diagnosis))
+        self.assertNotIn(SENTINEL, json.dumps(diagnosis.as_dict()))
+
+    def test_a_boundary_holding_no_token_is_refused_before_a_run_spends_an_attempt(self):
+        absent = scratch() / "redkraken"
+        absent.mkdir(mode=0o700)
+        with described(
+            token=absent / "claude-oauth-token",
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: None,
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("no Claude setup token", self.credential(diagnosis))
+        self.assertIn("setup-agent-oauth.sh", self.credential(diagnosis))
+
+    def test_a_credential_owned_by_neither_contained_id_is_refused_by_the_doctor(self):
+        """Ticket 146's own criterion, in the mode `rk2hunt7` measured.
+
+        `660`, owned by the supervisor and by no group the child is in, with no
+        other-write bit: no arm of `writable_by_the_child` matched it and the
+        launch refused it after the claim. It is refused here now, and for the
+        reason that outlives the mount -- a token another local account can read
+        is a live Anthropic token this operator does not hold alone.
+        """
+        path = token_file(mode=0o660)
+        status = path.stat()
+        self.assertNotEqual(isolation.UID, status.st_uid)
+        self.assertNotEqual(isolation.GID, status.st_gid)
+        self.assertFalse(status.st_mode & 0o002)
+
+        with described(
+            token=path,
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: None,
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("group or world", self.credential(diagnosis))
+
+    def test_a_token_old_enough_to_expire_mid_hunt_offers_the_wizard_again(self):
+        path = token_file()
+        aged = time.time() - (isolation.OAUTH_TOKEN_DAYS + 1) * 86400
+        os.utime(path, (aged, aged))
+
+        with described(
+            token=path,
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: None,
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        # A warning and not a refusal: a token that still works is one an
+        # operator may finish the hunt on.
+        self.assertTrue(diagnosis.ok)
+        self.assertIn(f"{isolation.OAUTH_TOKEN_DAYS + 1} days ago", self.credential(diagnosis))
+        self.assertIn("setup-agent-oauth.sh", self.credential(diagnosis))
+
+    def test_a_relative_override_is_refused_rather_than_resolved(self):
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}", one_peer=lambda *seen: None
+        ) as environment:
+            environment[isolation.OAUTH_TOKEN_VARIABLE] = "claude-oauth-token"
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, diagnosis.exit_code)
+        self.assertIn("absolute", self.credential(diagnosis))
 
 
 class NoSideEffectTest(unittest.TestCase):
