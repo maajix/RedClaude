@@ -438,5 +438,54 @@ class KnownIssueProjectionTest(unittest.TestCase):
         )
 
 
+class StopReasonTest(unittest.TestCase):
+    """The one word a driver loop reads, and the order it is decided in.
+
+    Ticket 161. `hunt.sh` stops on `nothing_to_execute` and has to keep doing
+    so, which makes that word a statement about the Program and not about the
+    pass: it may only be said when there was nothing to attempt. A chooser that
+    spent a ceiling before it named a Task attempted nothing either, and saying
+    the same word for both ended `rk2hunt17` six laps early.
+    """
+
+    def stopped(self, ledger: Ledger | None = None, **state) -> str:
+        return program._report(ledger or Ledger(), program._State(**state)).facts["stop_reason"]
+
+    def test_a_pass_that_attempted_nothing_at_all_is_the_empty_slate(self):
+        self.assertEqual(program.STOPPED_NOTHING_TO_EXECUTE, self.stopped())
+
+    def test_a_chooser_that_ran_out_of_room_is_not_the_empty_slate(self):
+        self.assertEqual(
+            program.STOPPED_CHOOSER_CUT_OFF,
+            self.stopped(execution={"choice": {"cut_off": "budget"}, "task": None}),
+        )
+
+    def test_a_chooser_that_declined_the_slate_leaves_the_empty_slate_word(self):
+        self.assertEqual(
+            program.STOPPED_NOTHING_TO_EXECUTE,
+            self.stopped(execution={"choice": {"cut_off": None}, "task": None}),
+        )
+
+    def test_an_attempt_that_was_made_outranks_how_the_chooser_stopped(self):
+        # The cut-off word is about a pass that did no work. A ceilinged chooser
+        # whose Task the runtime's own walk claimed anyway did work, and an
+        # operator reading `chooser_cut_off` there would read it as idle.
+        self.assertEqual(
+            program.STOPPED_TASK_ATTEMPTED,
+            self.stopped(execution={"choice": {"cut_off": "budget"}, "task": {"label": "T1"}}),
+        )
+
+    def test_a_refusal_and_a_pending_decision_both_outrank_it(self):
+        refused = Ledger()
+        refused.fail("integrity", "a check failed", code="x", source="database")
+        cut_off = {"choice": {"cut_off": "budget"}, "task": None}
+
+        self.assertEqual(program.STOPPED_REFUSED, self.stopped(refused, execution=cut_off))
+        self.assertEqual(
+            program.STOPPED_AWAITING_DECISION,
+            self.stopped(pending=[{"task": "T1"}], execution=cut_off),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

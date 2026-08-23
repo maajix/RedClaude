@@ -138,6 +138,15 @@ ACCEPTED_STOPS = (
     "completed", "stop_condition", "budget", "refusal", "error", "aborted", "parked",
 )
 
+#: The two words that mean a run ended of its own accord. Ticket 161: everything
+#: else in `ACCEPTED_STOPS` means the run was cut where it stood -- a token
+#: ceiling, a turn ceiling, an SDK error, a child that died -- and a session cut
+#: off mid-sentence did not decline the Slate, it never finished reading it.
+#: Named as the small set rather than the large one because the large one grows:
+#: a stop reason added later is a way of being cut off until somebody says it is
+#: not, which is the safe direction for this particular question.
+ANSWERED_STOPS = ("completed", "stop_condition")
+
 #: One scheduler pass, in the three steps the corpus states it in. All three,
 #: because `offer_slate` on its own offers nothing: `rank_candidates` filters on
 #: `t.estimated_cost`, which is NULL until a ranking writes it, and NULL fails
@@ -565,6 +574,27 @@ def stopped_as(reported: str | None) -> str:
     return STOP_REASONS.get(reported, "error")
 
 
+def cut_off(result: "agent.AgentRunResult | None") -> str | None:
+    """The word for a session that answered nothing because it ran out of room.
+
+    Ticket 161. `rk2hunt17` lap 6 offered three ready Tasks, the orchestrator
+    stopped on `budget` at 175 027 input tokens without picking one, and the
+    pass reported `nothing_to_execute` -- which `hunt.sh` reads as "the campaign
+    is finished" and stopped on, with six of twelve laps unused. A session that
+    declined the Slate and a session that never got to look at it are different
+    events, and only the first is a campaign decision.
+
+    Nothing for a session that answered, whatever it answered: a pick, an
+    unreadable pick, or a considered nothing. The word for the ones that did not
+    is the stop reason itself, because "which ceiling" is the next question an
+    operator asks and it is already in the answer.
+    """
+    if result is None or result.choice or result.pick_attempts:
+        return None
+    stopped = stopped_as(result.stop_reason)
+    return None if stopped in ANSWERED_STOPS else stopped
+
+
 @dataclass(frozen=True, slots=True)
 class Chosen:
     """What one orchestrator decision came to, in the words the runtime acts on.
@@ -581,6 +611,13 @@ class Chosen:
     `task_label` is what the session named even where the outcome refused it.
     A refusal that forgot the label would leave an operator asking why nothing
     ran with no way to see what was asked for.
+
+    `cut_off` is the half `outcome` cannot carry. `record_choice` writes five
+    words and none of them distinguishes a session that declined the Slate from
+    one that was cut off before it read it -- both are `no_choice` there, and
+    ticket 161 is what that cost. So the stop reason travels beside the outcome
+    rather than instead of it: the row still says what the database recorded,
+    and the pass can still say which of the two an operator is looking at.
     """
 
     agent_run_id: str
@@ -589,6 +626,7 @@ class Chosen:
     task_label: str | None
     attempts: int
     detail: str | None
+    cut_off: str | None = None
 
     @property
     def committed(self) -> bool:
@@ -609,6 +647,7 @@ class Chosen:
             "task": self.task_label,
             "attempts": self.attempts,
             "detail": self.detail,
+            "cut_off": self.cut_off,
         }
 
 
@@ -1210,6 +1249,19 @@ class Slice:
         pass's open will write instead. What it must not do is take the pass
         down with it -- the session is closed by arithmetic, and arithmetic that
         cannot be recorded is not a reason to fail work that already succeeded.
+
+        Ticket 161 asked when a session closed on `tokens` is meant to rotate,
+        and this pair of calls is the answer as it stands: **the pass that
+        spends a ceiling closes the session, and the next pass opens its
+        successor**. No operator is in it, and nothing rotates mid-pass -- a
+        turn is an Agent run and a run is not restarted halfway through. What
+        `rk2hunt17` shows is not a rotation that failed but a successor nobody
+        asked for: one row at generation 1, `close_reason` `tokens`,
+        `rotated_from` null, because `hunt.sh` read the pass's
+        `nothing_to_execute` as the campaign being finished and never ran the
+        pass that would have opened generation 2. So the fix is the stop reason
+        rather than the rotation, and this hold says which of the two happened
+        so an operator does not have to read the table to find out.
         """
         try:
             with connection.transaction():
@@ -1229,7 +1281,8 @@ class Slice:
         ledger.hold(
             "rotation",
             f"{closed.get('session')} reached its {closed.get('reason')} ceiling "
-            f"and was closed at the end of the pass",
+            f"and was closed at the end of the pass; the next pass opens the "
+            f"successor that continues this campaign",
         )
         return closed
 
@@ -1575,6 +1628,13 @@ class Slice:
         by the same function the model would have called. A runtime that decided
         it here would be deciding it against a copy of the Slate with no lock on
         it, and would refuse a choice the claim would have honoured.
+
+        Ticket 161: a session cut off before it answered is still `no_choice` to
+        the database, because that vocabulary is a migration's and there is no
+        fifth word to write. What changes is that the stop reason stops being
+        dropped -- it goes into the detail the Event carries, and `cut_off`
+        carries it out to the pass, so the two ways of picking nothing are
+        legible in the record and in what the command reports.
         """
         if result is None:
             return "unavailable", None, "no session answered"
@@ -1586,6 +1646,9 @@ class Slice:
                 None,
                 f"{result.pick_attempts} pick(s) carried no task label",
             )
+        stopped = cut_off(result)
+        if stopped is not None:
+            return "no_choice", None, f"the session stopped as {stopped} before it chose"
         return "no_choice", None, None
 
     def _record(
@@ -1638,6 +1701,7 @@ class Slice:
                 task_label=task,
                 attempts=0 if result is None else result.pick_attempts,
                 detail=str(error),
+                cut_off=cut_off(result),
             )
         chosen = Chosen(
             agent_run_id=session.agent_run_id,
@@ -1649,12 +1713,18 @@ class Slice:
             ),
             attempts=0 if result is None else result.pick_attempts,
             detail=None if recorded.get("detail") is None else str(recorded["detail"]),
+            cut_off=cut_off(result),
         )
         ledger.hold(
             "choice",
             f"{session.label} answered {chosen.outcome}"
             + (f" ({chosen.task_label})" if chosen.task_label else "")
-            + f" after {chosen.attempts} pick(s)",
+            + f" after {chosen.attempts} pick(s)"
+            + (
+                ""
+                if chosen.cut_off is None
+                else f", having stopped as {chosen.cut_off} rather than declined the Slate"
+            ),
         )
         return chosen
 

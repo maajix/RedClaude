@@ -648,6 +648,7 @@ class Launcher:
         error: Exception | None = None,
         picks: object = FIRST,
         planning: Exception | None = None,
+        planning_stop: str | None = None,
     ):
         self.requests: list[agent.AgentRunRequest] = []
         self.choices: list[agent.AgentRunRequest] = []
@@ -655,6 +656,10 @@ class Launcher:
         self.error = error
         self.picks = picks
         self.planning = planning
+        # How the session ended, in the SDK's own word. `None` is a session that
+        # ran to the end of its own accord; ticket 161 is about the ones that
+        # did not, and a stop reason is the only thing that tells them apart.
+        self.planning_stop = planning_stop
 
     def __call__(self, request: agent.AgentRunRequest) -> agent.AgentRunResult:
         if request.role == roster.ORCHESTRATOR:
@@ -684,6 +689,7 @@ class Launcher:
             mission_result=None,
             choice=latch.task,
             pick_attempts=latch.attempts,
+            **({} if self.planning_stop is None else {"stop_reason": self.planning_stop}),
         )
 
     @property
@@ -1253,6 +1259,40 @@ class ChoiceTest(unittest.TestCase):
         self.assertIsNone(facts["choice"]["task"])
         self.assertEqual("T1", facts["task"]["label"])
         self.assertEqual([], self.ledger.violations)
+
+    def test_a_chooser_the_ceiling_cut_off_is_not_a_slate_nobody_wanted(self):
+        # Ticket 161, and the shape `rk2hunt17` lap 6 had: Tasks on the Slate,
+        # a session that spent its token ceiling before it picked one, and a
+        # claim that answered nothing because the walk found the Slate held
+        # only what the choice would have named. The database still hears
+        # `no_choice` -- that vocabulary is closed by a migration -- but the
+        # pass now carries the word for why, and the detail says it too.
+        connection = Recorder(claim=None)
+        facts = self.choice(connection, Launcher(picks=None, planning_stop="budget"))
+        _, outcome, _, detail = connection.sent(execution.CHOICE)[0]
+
+        self.assertEqual("no_choice", outcome)
+        self.assertIn("stopped as budget", detail)
+        self.assertEqual("budget", facts["choice"]["cut_off"])
+        self.assertIsNone(facts["task"])
+        self.assertNotEqual(
+            program.STOPPED_NOTHING_TO_EXECUTE,
+            program._report(self.ledger, program._State(execution=facts)).facts["stop_reason"],
+        )
+
+    def test_a_chooser_that_read_the_slate_and_declined_it_was_cut_off_by_nothing(self):
+        # The other half: `nothing_to_execute` has to keep meaning something, so
+        # a session that ran to the end of its own accord and named no Task
+        # carries no cut-off word however empty its answer was.
+        connection = Recorder(claim=None)
+        facts = self.choice(connection, Launcher(picks=None))
+
+        self.assertEqual("no_choice", facts["choice"]["outcome"])
+        self.assertIsNone(facts["choice"]["cut_off"])
+        self.assertEqual(
+            program.STOPPED_NOTHING_TO_EXECUTE,
+            program._report(self.ledger, program._State(execution=facts)).facts["stop_reason"],
+        )
 
     def test_a_pick_that_carried_no_label_is_malformed_and_not_a_choice(self):
         connection = Recorder()
