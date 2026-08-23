@@ -7,7 +7,7 @@ recon Task to come from.
 
 **Blocked by:** nothing. Ticket 83 built `open_task` and this uses it unchanged.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] **`suggested_tasks` is read at all.** It is declared in the
       `submit_mission_result` Contract (`roster.py:800`, `roster.py:1057`),
@@ -49,15 +49,14 @@ recon Task to come from.
 - [x] **The pass says what it opened.** `execution._promote` reports the Task
       labels, so "the run suggested nothing" and "everything it suggested was
       refused" do not read the same way to an operator watching the queue.
-- [ ] **Reviewed and committed.** The implementation is in the tree uncommitted,
-      on `worktree-bridge-cse_01KiwRdMnYkG1mJfM1GnDp5G`.
-- [ ] **Checked by something that would go red.** Measured by hand against a
-      scratch database copied from a finished hunt: every branch of the walk was
-      exercised and `check_opened_tasks()` returned no rows. It is not yet a
-      `tests/test_database.py` class, because that module rotates cluster-global
-      role passwords at `:313` and the live engagement at
-      `/home/majix/engagements/yekta-first-hunt-2026-08-22` was in flight while
-      this was built.
+- [x] **Reviewed and committed.** The promotion pass, its schema wiring and its
+      regression coverage are committed on `main` in the Goal-1 integration.
+- [x] **Checked by something that would go red.**
+      `tests.test_database.SuggestedTaskPromotionTest` proves that a valid
+      suggestion opens one Task, an invalid suggestion becomes one explained
+      drop, every branch is accounted for, and `check_opened_tasks()` stays
+      empty. The database test ran under the serial database lock with
+      `CleanCreationTest`.
 
 ## Why
 
@@ -160,3 +159,10 @@ Entity and Relationship walks already do with a raised invariant.
 
 `tools/check_wiring.py:1288` has mapped `suggested_tasks` to `tasks` since it
 was written. The gate has been asserting a promotion that did not exist.
+
+## Resolution, 2026-08-23
+
+The positive database proof is now part of the suite and the implementation is
+integrated on `main`. Hunt 21 promoted four proposals without silently losing a
+suggested element: each invalid element appears as one typed `proposal_drops`
+row and accepted elements remain visible in canonical state.

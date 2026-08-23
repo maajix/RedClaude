@@ -1,14 +1,14 @@
 # 146 — The Agent credential loses its link on every token refresh
 
-**What to build:** A supported way for an operator to give the contained user a
-credential it can write, and a `rk doctor` check that says so before a run
-spends an attempt finding out.
+**What to build:** A supported, refresh-independent setup-token path from the
+supervisor to one short-lived child, and a `rk doctor` check that refuses an
+unsafe or unusable token file before a run spends an attempt finding out.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] **The measurement is in the ticket.** `rk2hunt7`, 2026-08-22, two
+- [x] **The measurement is in the ticket.** `rk2hunt7`, 2026-08-22, two
       refusals from one cause.
 
       First, exit 9. The child crashed with `Exception: Claude Code returned an
@@ -32,19 +32,20 @@ spends an attempt finding out.
       was `660 majix:majix`; the child is `65534:65534`; no arm of the check
       matches.
 
-- [ ] **The operator step is named somewhere an operator reads.** Making the
-      inode reachable by gid 65534 needs `chgrp nogroup`, which needs root once.
-      Nothing in the harness says this, and the alternative an operator will
-      reach for without root is `chmod 666` on a live Anthropic token.
+- [x] **The operator step is named somewhere an operator reads.**
+      `tools/setup-agent-oauth.sh` runs the exact `claude setup-token` command,
+      reads the value once without echo, installs it atomically with safe modes,
+      and verifies Doctor plus the pinned SDK/CLI canary. No `chgrp`, hardlink
+      or world-writable credential is required.
 
-- [ ] **`rk doctor` asks the question before a run does.** The launch refusal
-      is correct and arrives too late: it costs a Task an attempt, and three of
-      them abandon it. The same predicate belongs in the preflight, with the
-      remedy in the message.
+- [x] **`rk doctor` asks the question before a run does.** Doctor and launch
+      share the setup-token predicate and its remedy, so an invalid path, type,
+      owner, mode, age warning or content shape is visible before dispatch.
 
-- [ ] **Checked by something that would go red.** A test that a credential
-      owned by neither the contained uid nor gid, with no other-write bit, is
-      refused by the doctor and not only by the launch.
+- [x] **Checked by something that would go red.** The credential regressions
+      reject relative overrides, symlinks, unsafe parent/file modes, wrong
+      ownership, empty and multiline values, and prove the private-envelope and
+      `apiKeySource=none` success paths.
 
 ## Why
 
@@ -57,3 +58,20 @@ path without naming what to do to it.
 
 Blocking for a live hunt, cheap to fix, and independent of every other open
 ticket.
+
+## Resolution, 2026-08-23
+
+The writable `.credentials.json` arrangement was replaced by one supervisor-
+owned setup-token file. `rk doctor` and launch both require an absolute regular
+file below a `0700` parent, mode `0600`, one non-empty line, no symlink, and the
+supervisor owner. `tools/setup-agent-oauth.sh` installs it atomically, warns at
+330 days, runs Doctor and the pinned SDK/CLI canary, and is the only documented
+human step.
+
+The token crosses only the private stdin job envelope and is inserted into the
+short-lived child environment after the ambient/configuration checks;
+`ClaudeAgentOptions.env` remains empty. Hunt 21 recorded ten completed Agent
+runs across five supervisor processes with SDK `0.2.132`, CLI `2.1.224` and
+`apiKeySource=none`. The new Agent home contains no `.credentials.json`, and
+the sentinel scan found zero matches in process output, container inspection,
+Program files, Mission packets, Artifacts and the database dump.

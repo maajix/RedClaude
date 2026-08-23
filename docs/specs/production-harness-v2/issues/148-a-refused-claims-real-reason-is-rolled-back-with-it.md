@@ -6,9 +6,9 @@ with a sentence that names the wrong cause.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] **The measurement is in the ticket.** `rk2hunt7`, proposal `PR1`,
+- [x] **The measurement is in the ticket.** `rk2hunt7`, proposal `PR1`,
       2026-08-22. Seven refusals; three of them describe one event and two of
       those three are wrong.
 
@@ -57,17 +57,17 @@ with a sentence that names the wrong cause.
       `technology_identified` may only be cited with `role=context`, which is the
       one sentence that would stop it repeating the mistake.
 
-- [ ] **The refusal names the cause.** Whether by collecting the edge faults
+- [x] **The refusal names the cause.** Whether by collecting the edge faults
       outside the block that rolls back, by re-deriving the evidential kinds
       before the insert, or by carrying `SQLERRM` into the `no_support` citation
       -- the record must say `technology_identified is not evidential` somewhere
       a run can read.
 
-- [ ] **The cascade stops claiming to be a cause.** `the hypothesis it names was
+- [x] **The cascade stops claiming to be a cause.** `the hypothesis it names was
       not promoted` is true and useless. If it stays, it should say which
       refusal it is downstream of.
 
-- [ ] **Checked by something that would go red.** A promotion test staging a
+- [x] **Checked by something that would go red.** A promotion test staging a
       claim supported only by a non-evidential Observation, asserting the drops
       name the kind.
 
@@ -81,3 +81,12 @@ run, and this one teaches it nothing.
 Small, contained to one function, and worth more than its size: ticket 139 and
 ticket 144 both turned on the same insight, that what the runtime tells a model
 is what the model does next.
+
+## Resolution, 2026-08-23
+
+Migration `20261025T000000Z` preserves the edge fault outside the subtransaction
+that may reject its Hypothesis, and downstream drops cite that refusal instead
+of inventing `no_subject` as the cause. The database regression stages support
+from a non-evidential Observation and asserts that the kind is named. Hunt 21
+filed 20 individually typed drops across its proposals; no drop was silent and
+no cascade obscured a more specific cause.

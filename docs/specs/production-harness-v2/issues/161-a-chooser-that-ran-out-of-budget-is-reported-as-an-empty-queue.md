@@ -7,32 +7,32 @@ reads the second one as "the campaign is finished".
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] **A session cut off is not a session that answered.**
+- [x] **A session cut off is not a session that answered.**
       `execution.Dispatch._answered` returns `no_choice` whenever the result
       carries neither a choice nor a pick attempt. The result also carries
       `stop_reason`, which said `budget`, and that word is dropped on the floor.
       A run that stopped on `budget`, `max_turns` or an error answered nothing
       and must say so with a word of its own.
-- [ ] **`nothing_to_execute` means the Slate was empty.** `program._report`
+- [x] **`nothing_to_execute` means the Slate was empty.** `program._report`
       reaches it as the `else` of three tests, so it is what a pass says when it
       cannot think of anything better. Its own comment claims it "covers both
       ways of having nothing to do"; a Slate with three ready entries on it is
       neither of those ways. Either a fifth stop reason, or the existing one
       narrowed to the case its comment describes.
-- [ ] **A driver loop can tell the two apart.** `hunt.sh` stops on
+- [x] **A driver loop can tell the two apart.** `hunt.sh` stops on
       `nothing_to_execute` and is right to: it means the campaign is done. It
       must not stop on a chooser that ran out of room, because the next pass
       opens a new session and the work is still there.
-- [ ] **Say whether the session should have rotated.**
+- [x] **Say whether the session should have rotated.**
       `orchestrator_sessions` carries `rotated_from` and `generation` and
       `rk2hunt17` holds exactly one row: `OS1`, generation 1, `close_reason`
       `tokens`, `rotated_from` null. Rotation exists and did not happen. Settle
       whether a session closed on `tokens` is meant to rotate inside the pass
       that closed it, on the next pass, or only when an operator says so — and
       make the answer visible, because right now the campaign simply stops.
-- [ ] **Checked by something that would go red.** A test that stands a Slate
+- [x] **Checked by something that would go red.** A test that stands a Slate
       with a ready Task on it, has the chooser return a result whose
       `stop_reason` is `budget`, and asserts the pass does not report
       `nothing_to_execute`.
@@ -78,3 +78,12 @@ The two words are also not the same severity. A pass that ends because a model
 declined the Slate is a campaign decision. A pass that ends because the chooser
 was cut off mid-sentence is an installation running out of something, and an
 operator should be told which one they are looking at.
+
+## Resolution, 2026-08-23
+
+The result path now preserves `budget`, `max_turns`, SDK and child failures as
+typed cut-offs, while `nothing_to_execute` is reserved for a genuinely empty
+Slate. A token/turn-closed orchestrator session rotates on the next pass and
+the driver continues; a real empty Slate still stops. The focused execution and
+program regressions cover both sides. Hunt 21 completed five passes without
+misreporting any cut-off as an empty queue.

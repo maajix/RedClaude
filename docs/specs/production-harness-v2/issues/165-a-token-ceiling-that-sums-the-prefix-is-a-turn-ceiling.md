@@ -8,7 +8,7 @@ supports.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## What was measured
 
@@ -83,22 +83,22 @@ the next lap starts the whole thing over with the same ceiling.
 
 ## Open
 
-- [ ] **The turn count is calculated, not measured.** The child counts its own
+- [x] **The turn count is calculated, not measured.** The child counts its own
       turns as `answers` (`_launch.py:1993`) and the run report drops the number
       on the floor. Carry it into `execution.agent_run` so "six turns" stops
       being arithmetic. This is the cheapest thing here and it should come first,
       because every number below is read against it.
-- [ ] **Decide what the ceiling is meant to bound.** A cached prefix is billed at
+- [x] **Decide what the ceiling is meant to bound.** A cached prefix is billed at
       roughly a tenth, and `_usage` counts it at full price by choice -- the
       docstring says "a cached read is cheaper, not free". At four re-sends of a
       40 000-token prefix the difference between those two readings is most of
       the budget. Either credit the cache and say so, or keep the full count and
       state the ceiling in the turns it actually buys.
-- [ ] **Stop paying for refusals.** `web_hunter` reaches for
+- [x] **Stop paying for refusals.** `web_hunter` reaches for
       `get_validation_packet` and `get_slate` on a `conclude` and holds neither.
       Either grant them or take them out of what the role is told it has; a turn
       spent on `R-TOOL` is a turn the Task does not get back.
-- [ ] **A Task that has burned its budget twice should not be picked a third
+- [x] **A Task that has burned its budget twice should not be picked a third
       time unchanged.** T6 in `rk2hunt20` is `pending` after two full-cap runs
       and the scheduler will keep offering it. Whatever the fix above, the
       retry needs to differ from the attempt -- a smaller packet, a narrower
@@ -110,3 +110,26 @@ Found while verifying ticket 164's fix. `rk2hunt20` holds the whole trail: 16
 Observations, one `supported` Hypothesis (`transport.header_policy`), a `hunt`
 Task that ran under `playbooks/deployment/playbook.md`, a `perform` Task that
 settled two Tests -- and zero Findings, because T6 cannot finish.
+
+## Resolution, 2026-08-23
+
+Agent runs now persist uncached input, cache creation, cache reads, output,
+`answer_count`, raw input and the charged `budget_tokens`. The fixed
+`cache-credit-v1` policy charges
+`uncached + creation + ceil(cache_read / 10) + output`; `max_turns` remains an
+independent hard limit. A terminal `ResultMessage` replaces accumulated usage
+only when it carries its own usage values.
+
+The Role-specific MCP server omits foreign contracts from `web_hunter` while
+the pre-tool gate still rejects an injected call. An attempt profile binds Task,
+Mission packet, Role, Model, budget, policy and build/SDK/CLI. Its first
+unchanged budget retry receives a completion-only objective; the database
+abandons the second as `budget_exhausted_twice` and refuses a third unchanged
+dispatch, while a changed profile starts a new first attempt.
+
+The cached/uncached boundary, terminal outcomes and third-dispatch regressions
+pass. Hunt 21's ten completed runs recorded 658066 raw input tokens, 29659
+output tokens, 80 uncached input tokens, 133521 cache-creation tokens, 524465
+cache-read tokens, 95 answers and 215710 charged budget tokens. Every raw and
+budget formula matched, all charged reservations reconciled, and conclude
+reached a candidate Finding.
