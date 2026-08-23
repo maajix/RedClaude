@@ -2024,6 +2024,25 @@ async def run(
     )
 
     violations = agent.assess(options, environment, runtime, launch_dir=launch, role=role)
+    # The vector the measured matrix has no case for, refused here rather than
+    # added to it. `_startup`'s seven rules each name a case in a frozen
+    # measurement manifest, and `CLAUDE_CODE_OAUTH_TOKEN` is not among them --
+    # so an ambient one would be inherited by the CLI and used silently, and the
+    # ordering below, which puts the supervisor's token in only after the
+    # assertion, would be guarding an environment the assertion never looked at.
+    # There is nothing to measure here: the rule is not what the CLI resolves
+    # this to, it is that a child runs on the token its supervisor handed it
+    # through the job envelope or on none at all.
+    if environment.get(OAUTH_VARIABLE):
+        violations = [
+            *violations,
+            {
+                "code": "credential_vector",
+                "vector": OAUTH_VARIABLE,
+                "source": f"environment:{OAUTH_VARIABLE}",
+                "effect": "off_supervisor_token",
+            },
+        ]
     if violations:
         raise agent.StartupRefusal(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")

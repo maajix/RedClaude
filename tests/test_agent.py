@@ -4421,3 +4421,64 @@ class PacketRefreshTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmbientSetupTokenTest(unittest.TestCase):
+    """A child runs on the token its supervisor handed it, or on none.
+
+    `_startup`'s seven credential vectors each name a case in a frozen
+    measurement manifest, and `CLAUDE_CODE_OAUTH_TOKEN` is not one of them. So an
+    ambient one is inherited by the CLI and used silently -- and the ordering
+    that puts the supervisor's token in only after the assertion is then
+    guarding an environment the assertion never looked at.
+    """
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop(_launch.OAUTH_VARIABLE, None)
+
+    def refusal(self, **overrides) -> agent.StartupRefusal:
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn")
+
+        with self.assertRaises(agent.StartupRefusal) as raised:
+            asyncio.run(
+                _launch.run(
+                    job(fixtures.scratch(), **overrides),
+                    environment={_launch.OAUTH_VARIABLE: "sk-ant-oat01-ambient"},
+                    runtime=_launch.runtime_facts(),
+                    transport=transport,
+                )
+            )
+        return raised.exception
+
+    def test_an_ambient_setup_token_refuses_the_launch(self):
+        refused = self.refusal()
+
+        self.assertIn(
+            _launch.OAUTH_VARIABLE,
+            [violation["vector"] for violation in refused.violations],
+        )
+
+    def test_it_refuses_even_when_the_supervisor_sent_one_of_its_own(self):
+        # The worse of the two: the assertion has already run against a CLI that
+        # could have resolved the ambient one.
+        refused = self.refusal(oauth_token="sk-ant-oat01-carried")
+
+        self.assertIn(
+            _launch.OAUTH_VARIABLE,
+            [violation["vector"] for violation in refused.violations],
+        )
+
+    def test_the_refusal_never_carries_the_value(self):
+        refused = self.refusal(oauth_token="sk-ant-oat01-carried")
+
+        self.assertNotIn("sk-ant-oat01-ambient", json.dumps(refused.violations))
+        self.assertNotIn("sk-ant-oat01-carried", json.dumps(refused.violations))
+
+    def test_the_violation_is_shaped_like_every_other_one(self):
+        refused = self.refusal()
+        mine = [v for v in refused.violations if v["vector"] == _launch.OAUTH_VARIABLE]
+
+        self.assertEqual([_startup.VIOLATION_KEYS], [frozenset(v) for v in mine])
