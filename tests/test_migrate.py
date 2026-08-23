@@ -84,22 +84,25 @@ class CorpusTest(unittest.TestCase):
         self.assertIn("control_plane", purposes)
         self.assertIn("transport_measurement", purposes)
 
-    def test_only_one_verb_sets_the_causing_event_from_inside_the_database(self):
+    def test_only_the_two_self_emitting_verbs_set_their_causing_event_inside_the_database(self):
         # Every other write takes its cause from the connection helper, which
         # sets it once for the transaction. `open_task` is the argued exception:
         # it names an Event it emits itself as the cause of the Task it then
         # opens, and it saves and restores what it found. The exception holds
-        # only while it is the only one -- two setters is two places the causal
-        # chain is decided, and they diverge the first time one of them forgets
-        # to put back what it took. This is that condition, enforced rather
-        # than tracked.
+        # `retire_task` is the same argued shape: it emits task.retired and the
+        # Task update names that event. Both save and restore the prior cause;
+        # no ordinary writer is allowed to add a third setter.
         setters = [
             item.identity
             for item in self.migrations
             if "set_config('app.caused_by_event_id'" in item.sql
         ]
         self.assertEqual(
-            ["20260831T000000Z__a_program_opens_the_first_task_of_its_own_scope"], setters
+            [
+                "20260831T000000Z__a_program_opens_the_first_task_of_its_own_scope",
+                "20261019T000000Z__an_undispatchable_task_ends_itself",
+            ],
+            setters,
         )
 
     def test_the_emitter_binds_the_actor_to_the_writing_transaction(self):

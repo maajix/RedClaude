@@ -3622,6 +3622,7 @@ def serve(
     key: seal.Location | None = None,
     contained: bool = False,
     announce: Callable[[str], None] | None = None,
+    announce_identity: Callable[[str, str], None] | None = None,
     build_anchor: Traversable | None = None,
 ) -> Report:
     """Run the fence until it is interrupted.
@@ -3735,7 +3736,9 @@ def serve(
     # Announced here rather than at the bind, because a socket with no fence
     # behind it answers every request with a refusal: a starter that took the
     # bind for readiness would hand back a door that is up and useless.
-    if announce is not None:
+    if announce_identity is not None:
+        announce_identity(endpoint, pg.database_identity(connection))
+    elif announce is not None:
         announce(endpoint)
     try:
         server.serve_forever()
@@ -3783,7 +3786,10 @@ PARK_TOOL_RUN = "SELECT park_for_human($1::uuid)"
 #: this one does not have: the decision it is waiting on, and `parked` rather
 #: than an outcome. Unguarded, the last writer would win and erase them.
 CLOSE_TOOL_RUN = (
-    "UPDATE tool_runs SET status = $2, finished_at = now()"
+    "UPDATE tool_runs SET status = $2, finished_at = now(),"
+    " exit_detail = CASE WHEN $2 = 'error' THEN coalesce(exit_detail,"
+    " 'runtime closed the Tool run as error before a Receipt was recorded')"
+    " ELSE exit_detail END"
     " WHERE id = $1::uuid AND status = 'running'"
 )
 CLOSE_RUN = (

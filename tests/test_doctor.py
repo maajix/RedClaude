@@ -19,6 +19,7 @@ from redkraken.outcome import (
     EXIT_MISSING_DEPENDENCY,
     EXIT_OK,
     EXIT_UNSUPPORTED_VERSION,
+    Ledger,
 )
 from tests.fixtures import VALID, scratch, write
 
@@ -264,6 +265,46 @@ class SubjectTest(unittest.TestCase):
         self.assertEqual("no connection string supplied", detail(diagnosis, "database"))
         self.assertIn("no trust root described", detail(diagnosis, "proxy_trust_root"))
         self.assertEqual("no Agent boundary described", detail(diagnosis, "agent_boundary"))
+
+    def test_the_doctor_matches_the_configured_program_to_the_running_door(self):
+        ledger = Ledger()
+        connection = mock.Mock()
+        connection.execute.return_value.rows = [("00000000-0000-4000-8000-1",)]
+        opened = mock.MagicMock()
+        opened.__enter__.return_value = connection
+        with described() as environment, \
+             mock.patch.object(doctor.pg, "connect", return_value=opened), \
+             mock.patch.object(doctor.door, "preflight", return_value="matched"):
+            doctor._assert_door_program(
+                ledger,
+                environment,
+                "postgresql://runtime@db/rk2hunt21",
+                {"program_name": "rk2hunt21"},
+            )
+
+        self.assertEqual([], list(ledger.violations))
+        self.assertEqual(
+            "matched",
+            next(item.detail for item in ledger.assertions if item.name == "door_preflight"),
+        )
+
+    def test_the_doctor_refuses_a_program_absent_from_the_runtime_database(self):
+        ledger = Ledger()
+        connection = mock.Mock()
+        connection.execute.return_value.rows = []
+        opened = mock.MagicMock()
+        opened.__enter__.return_value = connection
+        with described() as environment, mock.patch.object(
+            doctor.pg, "connect", return_value=opened
+        ):
+            doctor._assert_door_program(
+                ledger,
+                environment,
+                "postgresql://runtime@db/rk2hunt21",
+                {"program_name": "rk2hunt21"},
+            )
+
+        self.assertEqual(["door"], [item.source for item in ledger.violations])
 
     def test_a_connection_string_this_client_cannot_use_is_refused(self):
         diagnosis = doctor.diagnose(None, database_url="mysql://rk@127.0.0.1/rk")

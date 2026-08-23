@@ -2288,6 +2288,7 @@ def _slice(
         # `perform` Task to claim is fully configured without it. The refusal
         # belongs where the capability would be spent, and says so there.
         proxy_url=os.environ.get(PROXY.variable),
+        preflight=door.preflight,
     )
 
 

@@ -67,6 +67,9 @@ READY = "rk2-door listening on "
 #: on this machine reach one database by two addresses, and comparing those
 #: would refuse the arrangement that is working.
 SERVING = " serving "
+IDENTITY = " identity "
+
+PROGRAM_VISIBLE = "SELECT EXISTS (SELECT 1 FROM programs WHERE id = $1::uuid)"
 
 #: Where `start` puts what the door needs, inside the container.  Fixed paths for
 #: the reason `isolation` gives for its own: a path that means one thing inside
@@ -170,8 +173,9 @@ def main() -> int:
             authority=Path(authority) if authority else None,
             key=Path(key) if key else None,
             contained=True,
-            announce=lambda endpoint: print(
-                f"{READY}{endpoint}{SERVING}{settings.database}", flush=True
+            announce_identity=lambda endpoint, identity: print(
+                f"{READY}{endpoint}{SERVING}{settings.database}{IDENTITY}{identity}",
+                flush=True,
             ),
         )
     )
@@ -249,14 +253,16 @@ def start(
             fence=environment.get(proxy.DATABASE_VARIABLE, ""),
             host_environment=host_environment,
         )
-        bound, serving = _listening(
+        bound, serving, served_identity = _listening(
             engine, container.proxy_container, host_environment, timeout
         )
         wanted = pg.settings_from_url(environment[proxy.DATABASE_VARIABLE]).database
-        if serving != wanted:
+        if serving != wanted or not served_identity:
             raise isolation.Unavailable(
                 f"the door serves {serving or 'a database it did not name'} and this "
-                f"runtime serves {wanted}; the door reads its connection string once "
+                f"runtime serves {wanted}; the door's exact database identity is "
+                f"{'stated' if served_identity else 'missing'}. The door "
+                "reads its connection string once "
                 "at startup and outlives the command that started it, so it is still "
                 "the one a previous engagement began. Remove it and start it again."
             )
@@ -528,7 +534,7 @@ def _run(
 
 def _listening(
     engine: str, name: str, host_environment: Mapping[str, str], timeout: float
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Wait for the door to say it is serving, or say what it said instead.
 
     Answers where it is bound and which database it opened. The refusal carries
@@ -547,8 +553,9 @@ def _listening(
         for line in written.splitlines():
             if line.startswith(READY):
                 said = line[len(READY) :].strip()
-                bound, _, serving = said.partition(SERVING.strip())
-                return bound.strip(), serving.strip()
+                bound, _, served = said.partition(SERVING.strip())
+                serving, _, identity = served.partition(IDENTITY.strip())
+                return bound.strip(), serving.strip(), identity.strip()
         if time.monotonic() >= deadline:
             said = written.strip().splitlines()
             raise isolation.Unavailable(
@@ -556,6 +563,35 @@ def _listening(
                 + (said[-1] if said else "it said nothing at all")
             )
         time.sleep(POLL)
+
+
+def preflight(
+    container: isolation.AgentContainer,
+    connection: pg.Connection,
+    program_id: str,
+) -> str:
+    """Prove the runtime and the already-running Door see this Program together."""
+    if not connection.execute(PROGRAM_VISIBLE, (program_id,)).scalar():
+        raise isolation.Unavailable(
+            f"Program {program_id} is not visible on the runtime database"
+        )
+    expected = pg.database_identity(connection)
+    engine = isolation.engine_for(container.engine)
+    isolation.peered(engine, container)
+    _, serving, actual = _listening(
+        engine,
+        container.proxy_container,
+        {"PATH": os.environ.get("PATH", "")},
+        0.0,
+    )
+    wanted = connection.settings.database
+    if serving != wanted or actual != expected:
+        raise isolation.Unavailable(
+            f"the Door serves {serving or 'an unnamed database'} but the runtime "
+            f"serves {wanted}; their exact database identities do not match. "
+            "Restart the Door against this Program's database before starting a child."
+        )
+    return f"{container.proxy_container} and the runtime both serve {wanted} and Program {program_id}"
 
 
 def _ask(

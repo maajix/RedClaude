@@ -92,11 +92,15 @@ value: `RK_AGENT_APPLICATION`, `RK_AGENT_SDK` and `RK_AGENT_HOME` name the
 application, the SDK and the home mounted inside a child. A container with no
 home mounted has no credential at all rather than somebody else's. The home is a
 template: each run is handed a copy of it, and the copy is removed when the run
-ends, so what one child writes is never what the next child reads. The one
-exception is `.claude/.credentials.json`, which is not copied but mounted from
-the home itself, because the CLI writes a refreshed token where it read the old
-one -- so it has to be a file the contained user can write, and a run that
-refreshes is a refresh the next run resolves.
+ends, so what one child writes is never what the next child reads.
+
+Claude authentication is a setup-token file on the supervisor, at
+`~/.config/redkraken/claude-oauth-token` by default or the absolute path in
+`RK_AGENT_OAUTH_TOKEN_FILE`. Run `tools/setup-agent-oauth.sh` for the one human
+`claude setup-token` step and the Doctor/canary checks around it. The token is
+read only by the supervisor and sent in the private stdin envelope of the
+short-lived child; it is never copied or mounted. An existing
+`.claude/.credentials.json` is ignored and left untouched.
 
 ### Satisfying them
 

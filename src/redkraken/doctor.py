@@ -36,6 +36,7 @@ from redkraken import (
     build,
     config,
     document,
+    door,
     execution,
     fixture,
     isolation,
@@ -190,6 +191,7 @@ def diagnose(
     _assert_agent_credential(ledger, described)
     _assert_catalogue(ledger, corpora)
     summary = _assert_configuration(ledger, configuration_path)
+    _assert_door_program(ledger, described, database_url, summary)
 
     return Diagnosis(
         application_version=__version__,
@@ -462,6 +464,49 @@ def _assert_agent_credential(ledger: Ledger, environment: Mapping[str, str]) -> 
         )
         return
     ledger.hold("agent_credential", f"{path} holds a setup token this operator alone can read")
+
+
+def _assert_door_program(
+    ledger: Ledger,
+    environment: Mapping[str, str],
+    database_url: str | None,
+    configuration: Mapping[str, object] | None,
+) -> None:
+    """Whether a child would reach a Door attached to this Program's database."""
+    if not execution.requested(environment):
+        ledger.hold("door_preflight", "no Agent boundary described")
+        return
+    if not database_url:
+        ledger.hold("door_preflight", "no database connection string supplied")
+        return
+    if configuration is None or not configuration.get("program_name"):
+        ledger.hold("door_preflight", "no Program configuration supplied")
+        return
+    container, _ = execution.boundary(environment)
+    if container is None:
+        return
+    try:
+        settings = pg.settings_from_url(database_url, application_name="rk doctor door")
+        with pg.connect(settings) as connection:
+            rows = connection.execute(
+                "SELECT id::text FROM programs WHERE slug = $1",
+                (str(configuration["program_name"]),),
+            ).rows
+            if len(rows) != 1:
+                raise isolation.Unavailable(
+                    f"Program {configuration['program_name']} is not visible on the "
+                    "database this diagnosis opened"
+                )
+            detail = door.preflight(container, connection, str(rows[0][0]))
+    except (ValueError, isolation.Unavailable, pg.DatabaseError, pg.ConnectionError_) as error:
+        ledger.fail(
+            "door_preflight",
+            f"the Door, database and Program do not form one runtime: {error}",
+            code=INVALID_CONFIGURATION,
+            source="door",
+        )
+        return
+    ledger.hold("door_preflight", detail)
 
 
 def _assert_catalogue(ledger: Ledger, corpora: tuple[Corpus, ...]) -> None:

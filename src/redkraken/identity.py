@@ -14,6 +14,7 @@ import json
 import os
 import re
 import ssl
+import tempfile
 from dataclasses import dataclass, field
 from email.message import Message
 from pathlib import Path
@@ -125,10 +126,20 @@ class ClientCertificate:
 
     def install(self, context: ssl.SSLContext) -> None:
         """Load this credential through an anonymous in-memory Linux file."""
-        if not hasattr(os, "memfd_create"):
-            raise Invalid("this platform cannot load a client Identity without a plaintext file")
         material = (self.certificate_pem.rstrip() + "\n" + self.private_key_pem).encode()
-        descriptor = os.memfd_create("rk2-client-identity", flags=os.MFD_CLOEXEC)
+        if hasattr(os, "memfd_create"):
+            descriptor = os.memfd_create("rk2-client-identity", flags=os.MFD_CLOEXEC)
+        elif hasattr(os, "O_TMPFILE") and Path("/proc/self/fd").is_dir():
+            # Some Linux Python builds omit memfd_create even though the kernel
+            # supports anonymous files. O_TMPFILE has the same security
+            # property here: no directory entry ever names the plaintext.
+            descriptor = os.open(
+                tempfile.gettempdir(), os.O_TMPFILE | os.O_RDWR, 0o600
+            )
+        else:
+            raise Invalid(
+                "this platform cannot load a client Identity without a plaintext file"
+            )
         try:
             remaining = memoryview(material)
             while remaining:

@@ -1572,17 +1572,21 @@ def oauth_token(environment: Mapping[str, str] | None = None) -> str | None:
         raise Unavailable(
             f"the Claude setup token at {path} cannot be read; {OAUTH_TOKEN_REMEDY}"
         ) from None
-    lines = text.strip().splitlines()
-    if len(lines) > 1:
+    # One conventional final LF is part of the file, not part of the value.
+    # Anything left after removing exactly that one -- including a blank
+    # second line -- means the file carries more than one line.
+    value = text[:-1] if text.endswith("\n") else text
+    if "\n" in value or "\r" in value:
+        line_count = value.count("\n") + 1
         raise Unavailable(
-            f"the Claude setup token at {path} carries {len(lines)} lines and carries "
+            f"the Claude setup token at {path} carries {line_count} lines and carries "
             f"one value; {OAUTH_TOKEN_REMEDY}"
         )
-    if not lines or not lines[0].strip():
+    if not value.strip():
         raise Unavailable(
             f"the Claude setup token at {path} is empty; {OAUTH_TOKEN_REMEDY}"
         )
-    return lines[0].strip()
+    return value.strip()
 
 
 def _refuse_loose_token(path: Path) -> None:
@@ -1599,7 +1603,10 @@ def _refuse_loose_token(path: Path) -> None:
             f"the Claude setup token at {path} is a symlink and has to be a regular "
             f"file; {OAUTH_TOKEN_REMEDY}"
         )
-    for subject, name in ((path, "token"), (path.parent, "token directory")):
+    for subject, name, required in (
+        (path, "token", 0o600),
+        (path.parent, "token directory", 0o700),
+    ):
         try:
             status = subject.stat()
         except OSError:
@@ -1611,10 +1618,12 @@ def _refuse_loose_token(path: Path) -> None:
                 f"the Claude setup {name} at {subject} is owned by uid {status.st_uid} "
                 f"and has to be owned by the supervisor; {OAUTH_TOKEN_REMEDY}"
             )
-        if status.st_mode & 0o077:
+        mode = stat.S_IMODE(status.st_mode)
+        if mode != required:
+            exposure = "reachable by group or world and " if mode & 0o077 else ""
             raise Unavailable(
-                f"the Claude setup {name} at {subject} is reachable by group or world "
-                f"({stat.filemode(status.st_mode)}); {OAUTH_TOKEN_REMEDY}"
+                f"the Claude setup {name} at {subject} is {exposure}{mode:04o} and "
+                f"has to be {required:04o}; {OAUTH_TOKEN_REMEDY}"
             )
     if not stat.S_ISREG(path.stat().st_mode):
         raise Unavailable(

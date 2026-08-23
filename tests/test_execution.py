@@ -199,7 +199,7 @@ def result(**overrides) -> agent.AgentRunResult:
         "cache_creation_input_tokens": 100,
         "cache_read_input_tokens": 900,
         "answer_count": 6,
-        "budget_tokens": 390,
+        "budget_tokens": 690,
         "budget_policy": execution.BUDGET_POLICY,
     }
     fields.update(overrides)
@@ -897,6 +897,34 @@ def attempt(connection: Recorder, launcher: Launcher | None = None, **overrides)
     return ledger, facts
 
 
+class DoorPreflightTest(unittest.TestCase):
+    def test_a_mismatch_starts_no_agent_and_claims_no_task(self):
+        launcher = Launcher()
+
+        def refused(*_):
+            raise isolation.Unavailable("the Door serves another database")
+
+        ledger, facts = attempt(Recorder(), launcher, preflight=refused)
+
+        self.assertEqual([], launcher.requests)
+        self.assertIsNone(facts["task"])
+        self.assertEqual(["door"], [item.source for item in ledger.violations])
+
+    def test_the_door_is_checked_before_the_chooser_and_again_before_the_worker(self):
+        checked = []
+
+        def ready(*_):
+            checked.append("ready")
+            return "matched"
+
+        with compiled():
+            ledger, facts = attempt(Recorder(), preflight=ready)
+
+        self.assertEqual([], list(ledger.violations))
+        self.assertIsNotNone(facts["task"])
+        self.assertEqual(["ready", "ready"], checked)
+
+
 class ExcerptLoaderTest(unittest.TestCase):
     """The one thing the packet cannot compile for itself: Artifact bytes.
 
@@ -1392,7 +1420,7 @@ class SpendTest(unittest.TestCase):
                 "cache_creation_input_tokens": 100,
                 "cache_read_input_tokens": 900,
                 "answer_count": 6,
-                "budget_tokens": 390,
+                "budget_tokens": 690,
                 "budget_policy": execution.BUDGET_POLICY,
                 "error_detail": None,
             },
@@ -1418,9 +1446,10 @@ class SpendTest(unittest.TestCase):
         with compiled():
             attempt(connection, launcher)
 
+        expected = dict.fromkeys(execution.SPEND)
+        expected["error_detail"] = "the child died"
         self.assertEqual(
-            dict.fromkeys(execution.SPEND),
-            {name: connection.spend()[name] for name in execution.SPEND},
+            expected, {name: connection.spend()[name] for name in execution.SPEND}
         )
 
     def test_the_session_that_chose_is_charged_the_same_way(self):
@@ -1430,7 +1459,7 @@ class SpendTest(unittest.TestCase):
         with compiled():
             attempt(connection)
 
-        self.assertEqual(390, connection.spend(SESSION)["budget_tokens"])
+        self.assertEqual(690, connection.spend(SESSION)["budget_tokens"])
         self.assertIsNone(connection.spend(SESSION)["attempt_profile_sha256"])
 
     def test_what_the_child_said_went_wrong_reaches_the_row(self):

@@ -44,7 +44,7 @@ import ssl
 import sys
 import threading
 from collections.abc import Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import NoReturn
@@ -2257,6 +2257,7 @@ class Spend:
     cache_creation: int = 0
     cache_read: int = 0
     output: int = 0
+    reported: bool = field(default=False, compare=False, repr=False)
 
     def __add__(self, other: "Spend") -> "Spend":
         return Spend(
@@ -2264,6 +2265,7 @@ class Spend:
             self.cache_creation + other.cache_creation,
             self.cache_read + other.cache_read,
             self.output + other.output,
+            self.reported or other.reported,
         )
 
     @property
@@ -2289,7 +2291,13 @@ class Spend:
     @property
     def measured(self) -> bool:
         """Whether anything was reported at all, in any one of the four."""
-        return bool(self.uncached or self.cache_creation or self.cache_read or self.output)
+        return bool(
+            self.reported
+            or self.uncached
+            or self.cache_creation
+            or self.cache_read
+            or self.output
+        )
 
 
 def _usage(stated: object) -> Spend:
@@ -2323,6 +2331,15 @@ def _usage(stated: object) -> Spend:
         cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
         cache_read=int(usage.get("cache_read_input_tokens") or 0),
         output=int(usage.get("output_tokens") or 0),
+        reported=any(
+            name in usage
+            for name in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+            )
+        ),
     )
 
 

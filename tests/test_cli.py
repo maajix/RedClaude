@@ -2151,6 +2151,7 @@ class ContainmentTest(unittest.TestCase):
             for name in observed["loaded"]
             if name and not Path(name).resolve().is_relative_to(SOURCE)
             and Path(name).resolve().is_relative_to(ROOT)
+            and not Path(name).resolve().is_relative_to(Path(sys.prefix).resolve())
         ]
         self.assertEqual([], outside)
 

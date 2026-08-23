@@ -1361,6 +1361,9 @@ class Slice:
     #: process did not make. Optional like the rest: only `perform` spends a
     #: capability from here, and it refuses by name when this is absent.
     proxy_url: str | None = None
+    #: A read-only Door/Program check supplied by the production command. Tests
+    #: with an in-process launcher leave it absent; production never does.
+    preflight: Callable[[isolation.AgentContainer, pg.Connection, str], str] | None = None
 
     def attempt(self, ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
         """Reconcile, offer, claim, run, promote, close. Once, and closed either way.
@@ -1398,11 +1401,33 @@ class Slice:
             "closure": None,
         }
         connection.execute(proxy.BIND, (program_id,))
+        if not self._door_ready(ledger, connection, program_id):
+            return facts
         try:
             self._pass(ledger, connection, program_id, facts)
         finally:
             self._rotate(ledger, connection)
         return facts
+
+    def _door_ready(
+        self, ledger: Ledger, connection: pg.Connection, program_id: str
+    ) -> bool:
+        """The production preflight, immediately before each launch boundary."""
+        if self.preflight is None:
+            return True
+        try:
+            ready = self.preflight(self.boundary, connection, program_id)
+        except (isolation.Unavailable, pg.DatabaseError, pg.ConnectionError_) as error:
+            ledger.fail(
+                "door_preflight",
+                f"no Agent run was started because the Door and runtime could not "
+                f"be matched to this Program: {error}",
+                code=INVALID_CONFIGURATION,
+                source="door",
+            )
+            return False
+        ledger.hold("door_preflight", ready)
+        return True
 
     def _pass(
         self,
@@ -2168,6 +2193,16 @@ class Slice:
             return
         objective = claimed.objective(selected, vocabulary, completion_only=ended == 1)
 
+        # The pass-level check is immediately before the choosing run. Ask
+        # again immediately before the worker: the Door is a long-lived process
+        # and the two Agent runs are separate launch boundaries.
+        if not self._door_ready(ledger, connection, program_id):
+            facts["agent_run"]["stop_reason"] = "error"
+            facts["agent_run"]["error_detail"] = (
+                "the Door preflight failed immediately before the worker launch"
+            )
+            return
+
         opened = self._authorize(ledger, connection, program_id, claimed, selected, facts)
         if opened is None:
             return
@@ -2210,6 +2245,9 @@ class Slice:
                 # word is how the trigger tells that ending from a run that
                 # never started.
                 facts["agent_run"]["stop_reason"] = "aborted"
+                facts["agent_run"]["error_detail"] = (
+                    str(error)[:2048] or "the child process failed without detail"
+                )
                 ledger.fail(
                     "agent_run",
                     f"{claimed.agent_run_label} left no account of itself: {error}",

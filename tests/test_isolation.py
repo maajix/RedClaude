@@ -1600,11 +1600,26 @@ class SetupTokenTest(unittest.TestCase):
                 with self.assertRaisesRegex(isolation.Unavailable, "group or world"):
                     isolation.oauth_token(self.named(path))
 
+    def test_the_token_file_has_exactly_the_installed_mode(self):
+        """Read-only or owner-executable is drift, not the wizard's 0600 file."""
+        for mode in (0o400, 0o700):
+            with self.subTest(mode=oct(mode)):
+                path = self.installed(mode=mode)
+                with self.assertRaisesRegex(isolation.Unavailable, "0600"):
+                    isolation.oauth_token(self.named(path))
+
     def test_a_token_directory_a_second_account_could_reach_is_refused(self):
         path = self.installed()
         path.parent.chmod(0o755)
 
         with self.assertRaisesRegex(isolation.Unavailable, "token directory"):
+            isolation.oauth_token(self.named(path))
+
+    def test_the_token_directory_has_exactly_the_installed_mode(self):
+        path = self.installed()
+        path.parent.chmod(0o500)
+
+        with self.assertRaisesRegex(isolation.Unavailable, "0700"):
             isolation.oauth_token(self.named(path))
 
     def test_a_symlink_is_a_way_of_naming_a_file_the_operator_did_not_hand_over(self):
@@ -1617,6 +1632,12 @@ class SetupTokenTest(unittest.TestCase):
 
     def test_a_file_carrying_more_than_one_value_is_not_the_file_this_expects(self):
         path = self.installed(f"{self.SENTINEL}\nand something else\n")
+
+        with self.assertRaisesRegex(isolation.Unavailable, "carries 2 lines"):
+            isolation.oauth_token(self.named(path))
+
+    def test_a_blank_second_line_is_still_a_second_line(self):
+        path = self.installed(f"{self.SENTINEL}\n\n")
 
         with self.assertRaisesRegex(isolation.Unavailable, "carries 2 lines"):
             isolation.oauth_token(self.named(path))
@@ -1682,7 +1703,9 @@ class SetupWizardTest(unittest.TestCase):
         path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
         path.chmod(0o755)
 
-    def run_wizard(self, token: str = SENTINEL) -> subprocess.CompletedProcess[str]:
+    def run_wizard(
+        self, token: str = SENTINEL, environment_overrides: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """One whole run, with the two commands it shells out to stood in for."""
         self.stub("claude", f'printf "%s\\n" "$@" >> {self.record}\nexit 0')
         # The doctor's own report, in the shape the script reads back. Stubbed
@@ -1699,6 +1722,7 @@ class SetupWizardTest(unittest.TestCase):
             "HOME": str(self.home),
             "TERM": "dumb",
         }
+        environment.update(environment_overrides or {})
         # Enter past the banner, `y` to mint, Enter past the mint, the token.
         return subprocess.run(
             ["bash", str(self.WIZARD)],
@@ -1723,6 +1747,15 @@ class SetupWizardTest(unittest.TestCase):
             ["--version", "setup-token"],
             self.record.read_text(encoding="utf-8").split(),
         )
+
+    def test_a_relative_override_is_refused_before_the_cli_is_run(self):
+        answer = self.run_wizard(
+            environment_overrides={"RK_AGENT_OAUTH_TOKEN_FILE": "relative/token"}
+        )
+
+        self.assertNotEqual(0, answer.returncode)
+        self.assertIn("absolute", answer.stdout + answer.stderr)
+        self.assertFalse(self.record.exists())
 
     def test_the_installed_token_is_one_this_operator_alone_can_read(self):
         self.run_wizard()

@@ -203,6 +203,11 @@ TOKEN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/redkraken"
 TOKEN_FILE="${RK_AGENT_OAUTH_TOKEN_FILE:-$TOKEN_DIR/claude-oauth-token}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if [[ "$TOKEN_FILE" != /* ]]; then
+  warn "RK_AGENT_OAUTH_TOKEN_FILE has to name an absolute path: $TOKEN_FILE"
+  exit 1
+fi
+
 banner "redKraken — the Agent's Claude setup token"
 
 # ── 1. Which CLI is about to mint the token ───────────────────────────────

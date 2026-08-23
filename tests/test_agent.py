@@ -3469,6 +3469,27 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(1000, report["cache_read_input_tokens"])
         self.assertEqual(10, report["output_tokens"])
 
+    def test_a_result_that_explicitly_reports_zero_replaces_the_turn_sum(self):
+        """Presence is a measurement even where every measured value is zero."""
+        report = concluded(
+            [
+                turn(input_tokens=100, cache_read_input_tokens=1000, output_tokens=10),
+                terminal(
+                    stop_reason="end_turn",
+                    usage={
+                        "input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                ),
+            ]
+        )
+
+        self.assertEqual(0, report["input_tokens"])
+        self.assertEqual(0, report["output_tokens"])
+        self.assertEqual(0, report["budget_tokens"])
+
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
 class TerminalTest(unittest.TestCase):

@@ -144,6 +144,24 @@ class Settings:
         return f"{self.user}@{location}/{self.database}"
 
 
+DATABASE_IDENTITY = (
+    "SELECT current_database(), oid::text, pg_postmaster_start_time()::text"
+    " FROM pg_database WHERE datname = current_database()"
+)
+
+
+def database_identity(connection: "Connection") -> str:
+    """The logical database and the live cluster instance serving it.
+
+    The database name alone collides across clusters. Its catalogue OID tells
+    databases in one cluster apart, and the postmaster start distinguishes a
+    different cluster -- or a restarted one whose old Door connection is no
+    longer a readiness signal. None of the three fields is a credential.
+    """
+    database, oid, started = connection.execute(DATABASE_IDENTITY).rows[0]
+    return f"{database}:{oid}:{started}"
+
+
 #: Connection-string keys this client understands. A key outside it is refused
 #: rather than ignored, because a silently dropped `sslmode` is a downgrade.
 _URL_PARAMETERS = frozenset(

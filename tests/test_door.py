@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from redkraken import door, isolation, proxy
+from redkraken import door, isolation, pg, proxy
 
 
 CONTAINER = isolation.AgentContainer(
@@ -106,9 +106,12 @@ class ServingTest(unittest.TestCase):
         return mock.patch.object(door, "_ask", return_value=answer)
 
     def test_the_door_answers_where_it_is_bound_and_what_it_serves(self):
-        with self.logs(f"{door.READY}0.0.0.0:18080{door.SERVING}rk2hunt21\n"):
+        with self.logs(
+            f"{door.READY}0.0.0.0:18080{door.SERVING}rk2hunt21"
+            f"{door.IDENTITY}rk2hunt21:16422:2026-08-23\n"
+        ):
             self.assertEqual(
-                ("0.0.0.0:18080", "rk2hunt21"),
+                ("0.0.0.0:18080", "rk2hunt21", "rk2hunt21:16422:2026-08-23"),
                 door._listening("docker", "rk2-door", {}, 1.0),
             )
 
@@ -118,7 +121,8 @@ class ServingTest(unittest.TestCase):
         # is exactly the stale door the question is asked about.
         with self.logs(f"{door.READY}0.0.0.0:18080\n"):
             self.assertEqual(
-                ("0.0.0.0:18080", ""), door._listening("docker", "rk2-door", {}, 1.0)
+                ("0.0.0.0:18080", "", ""),
+                door._listening("docker", "rk2-door", {}, 1.0),
             )
 
     def test_the_announcement_carries_the_database_the_door_opened(self):
@@ -128,5 +132,48 @@ class ServingTest(unittest.TestCase):
 
     def announcement(self) -> str:
         source = Path(door.__file__).read_text(encoding="utf-8")
-        opening = source.index("announce=lambda endpoint:")
+        opening = source.index("announce_identity=lambda endpoint, identity:")
         return source[opening : source.index("\n", source.index("flush=True", opening))]
+
+
+class PreflightTest(unittest.TestCase):
+    def connection(self, visible: bool = True):
+        connection = mock.Mock()
+        connection.settings = pg.Settings("db", "rk2hunt21", "runtime")
+        connection.execute.return_value.scalar.return_value = visible
+        return connection
+
+    def test_the_runtime_program_and_the_doors_exact_database_match(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(isolation, "peered"), \
+             mock.patch.object(
+                 door, "_listening", return_value=("0.0.0.0:18080", "rk2hunt21", "identity")
+             ):
+            detail = door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+        self.assertIn("rk2hunt21", detail)
+
+    def test_the_same_database_name_on_another_cluster_is_refused(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="runtime-identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(isolation, "peered"), \
+             mock.patch.object(
+                 door,
+                 "_listening",
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "door-identity"),
+             ):
+            with self.assertRaisesRegex(isolation.Unavailable, "exact database identities"):
+                door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+    def test_a_program_missing_from_the_runtime_database_is_refused_before_engine_access(self):
+        with mock.patch.object(isolation, "engine_for") as engine:
+            with self.assertRaisesRegex(isolation.Unavailable, "not visible"):
+                door.preflight(
+                    CONTAINER,
+                    self.connection(visible=False),
+                    "00000000-0000-4000-8000-1",
+                )
+        engine.assert_not_called()

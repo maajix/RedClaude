@@ -668,6 +668,7 @@ class WriteDisciplineTest(DatabaseCase):
                 events = self.connection.execute(
                     "SELECT type, subject_table, subject_id::text, actor_kind,"
                     "       xact_id = pg_current_xact_id() FROM events"
+                    " WHERE xact_id = pg_current_xact_id()"
                 ).rows
 
                 self.assertEqual(
@@ -4705,7 +4706,11 @@ class StateReadTest(DatabaseCase):
         self.assertEqual(self.populated[ROWS], after[ROWS])
         # Anchored, so that a snapshot which had stopped seeing rows would fail
         # here rather than pass as two equal descriptions of nothing.
-        self.assertEqual(1, before[3], "the Lease this case wrote")
+        own_leases = self.connection.execute(
+            "SELECT count(*) FROM identity_leases WHERE program_id = ANY($1::uuid[])",
+            ("{" + ",".join(self.identifiers.values()) + "}",),
+        ).scalar()
+        self.assertEqual(1, int(own_leases), "the Lease this case wrote")
         self.assertGreater(before[1], 0, "the log every revision is read from")
         self.assertNotIn("", before[4:], "a digest over rows that are there")
 
@@ -11499,6 +11504,13 @@ class Child:
         }
 
 
+class NoReceiptChild(Child):
+    """A child that receives a capability but makes no request through it."""
+
+    def spend(self, egress: agent.Egress) -> dict:
+        return {}
+
+
 #: Every row one attempt produced, read from the Receipt outwards. One query
 #: rather than six, because what criterion 2 asks is whether they agree, and six
 #: queries would each be right about a row while saying nothing about the six.
@@ -11609,6 +11621,7 @@ DECIDED = {
     "proposal": ("label", "status", "completion", "drops"),
     "promotion": None,
     "fingerprint": None,
+    "replay": None,
     "closure": ("task_status", "accepted", "runs_closed", "tool_runs_closed",
                 "leases_released"),
 }
@@ -11667,7 +11680,7 @@ class ExecutionSliceTest(DatabaseCase):
 
         cls.identifiers = {}
         cls.configurations = {}
-        for name in ("grounded", "prose", "twin-a", "twin-b"):
+        for name in ("grounded", "prose", "unanswered", "twin-a", "twin-b"):
             # `UNSEEDED` rather than `SCOPED`, because `seed` below writes the
             # one Task this case is about: a configuration that recorded a
             # subject of its own would put a second Task on the slate, and what
@@ -11739,6 +11752,11 @@ class ExecutionSliceTest(DatabaseCase):
                 ],
             ),
             Ledger(),
+        )
+
+        unanswered, _ = cls.seed("unanswered")
+        cls.unanswered = cls.attempt(
+            "unanswered", NoReceiptChild(unanswered), Ledger()
         )
 
         cls.twins = {}
@@ -12188,6 +12206,16 @@ class ExecutionSliceTest(DatabaseCase):
             )
 
         self.assertIn("no result of it has been accepted", str(raised.exception))
+
+    def test_a_tool_run_closed_without_a_receipt_keeps_a_durable_reason(self):
+        [row] = self.connection.execute(
+            "SELECT status, exit_detail FROM tool_runs"
+            " WHERE agent_run_id = $1::uuid",
+            (self.unanswered["agent_run"]["id"],),
+        ).rows
+
+        self.assertEqual("error", str(row[0]))
+        self.assertTrue(str(row[1]).strip())
 
     # -- criterion 5: nothing left open, and closing again changes nothing ----
 
@@ -15724,7 +15752,7 @@ TWIN = {
             "auth": True,
             "content_type": None,
             "parameters": [
-                {"name": "q", "location": "query", "value_class": "text",
+                {"name": "q", "location": "query", "value_class": None,
                  "reflected": False},
                 {"name": "page", "location": "query", "value_class": "number",
                  "reflected": False},
@@ -15736,7 +15764,7 @@ TWIN = {
             "auth": True,
             "content_type": "application/json",
             "parameters": [
-                {"name": "body", "location": "body", "value_class": "text",
+                {"name": "body", "location": "body", "value_class": "serialized",
                  "reflected": False},
             ],
         },
@@ -16558,8 +16586,8 @@ NEGATIVE_SLUG = "selftest-negative"
 #: unrelated change to the other, and a parameter under each so the claim scope
 #: has something under it to reach.
 KEPT = {
-    "GET /notes": [("q", "query", "text"), ("page", "query", "number")],
-    "POST /notes": [("body", "body", "text")],
+    "GET /notes": [("q", "query", None), ("page", "query", "number")],
+    "POST /notes": [("body", "body", "serialized")],
 }
 
 #: The refutations the case places, in the order it places them. Named once
@@ -18655,7 +18683,8 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         # them, and an Observation citing the Receipt.
         cls.as_owner(
             "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
-            " VALUES ($1, 9, 'text/plain', 'agent_visible')",
+            " VALUES ($1, 9, 'text/plain', 'agent_visible')"
+            " ON CONFLICT (sha256) DO NOTHING",
             (ANALYZED_SHA,),
         )
         # An allowed receipt names the capability it was served under, on every
@@ -20341,8 +20370,8 @@ POLICY_SLUG = "selftest-budget-policy"
 LEGACY_FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3::bigint, $4::bigint)"
 
 POLICY_RAW = (30000, 2000)
-POLICY_CHARGED = 9000
-POLICY_NAME = "cache-aware-v1"
+POLICY_CHARGED = 13100
+POLICY_NAME = "cache-credit-v1"
 
 #: The digest of the packet, the build and the budget policy one attempt ran
 #: under. A hex digest because the column is constrained to one, and two
@@ -20576,6 +20605,24 @@ class BudgetPolicyTest(SchedulerFixture, DatabaseCase):
                 str(self.policy_row["attempt_profile_sha256"]),
             ),
         )
+
+    def test_no_accounting_counter_can_credit_a_budget_by_going_negative(self):
+        for column in (
+            "input_tokens",
+            "output_tokens",
+            "uncached_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "answer_count",
+            "budget_tokens",
+        ):
+            with self.subTest(column=column):
+                with self.assertRaises(pg.DatabaseError) as refused:
+                    self.as_owner(
+                        f"UPDATE agent_runs SET {column} = -1 WHERE id = $1::uuid",
+                        (self.run_id("policy", self.policy_run),),
+                    )
+                self.assertEqual("23514", refused.exception.sqlstate)
 
     def test_an_error_detail_is_bounded_before_the_constraint_refuses_it(self):
         """The redaction is a truncation and not a rollback.
