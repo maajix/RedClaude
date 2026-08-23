@@ -44,6 +44,7 @@ import ssl
 import sys
 import threading
 from collections.abc import Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import NoReturn
@@ -106,6 +107,20 @@ ANSWER = 1500
 #: plus one value nothing else in this process ever writes down.
 OAUTH_TOKEN = "oauth_token"
 OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
+
+#: What one cached input token costs the agent-run ceiling, as a divisor, and
+#: the name of the policy that spends it. `cache-credit-v1` is a harness budget
+#: policy and not a dollar accounting: what it states is that a cached read is
+#: billed far below ordinary input, so a ceiling that counted a re-sent prefix
+#: at full price is a ceiling on turns rather than on tokens -- which is ticket
+#: 165, where six turns of a 40 000-token prefix spent a 250 000-token budget
+#: and no `conclude` Task ever finished.
+#:
+#: Named on every run it bounds, because the number is only readable against the
+#: policy it was computed under: a row recording 40 200 units says nothing until
+#: something says which arithmetic produced it.
+CACHE_CREDIT = 10
+BUDGET_POLICY = "cache-credit-v1"
 
 #: How much of one response's header list a child may read. The body has had a
 #: ceiling since it was first answered and a header list without one is the same
@@ -2014,8 +2029,7 @@ async def run(
     text = ""
     answers = 0
     stop_reason = None
-    spent_in = 0
-    spent_out = 0
+    spent = Spend()
     async for message in messages:
         if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == INIT:
             # A second announcement is a second startup, and the assertion was
@@ -2025,13 +2039,14 @@ async def run(
             surface.open()
         if isinstance(message, AssistantMessage):
             answers += 1
-            turn_in, turn_out = _usage(getattr(message, "usage", None))
-            spent_in += turn_in
-            spent_out += turn_out
-            # The ceiling stops the run. Not a warning and not a log line: the
-            # tokens past it are ones the Program did not reserve, and a session
-            # asked politely to stop is a session that decides whether to.
-            if ceiling is not None and spent_in + spent_out > ceiling:
+            spent = spent + _usage(getattr(message, "usage", None))
+            # The ceiling stops the run, incrementally and in budget units. Not
+            # a warning and not a log line: the tokens past it are ones the
+            # Program did not reserve, and a session asked politely to stop is a
+            # session that decides whether to. `max_turns` is a separate hard
+            # limit the pair enforces and is not folded in here -- one bound on
+            # how much a run may spend, one on how many times it may act.
+            if ceiling is not None and spent.budget > ceiling:
                 stop_reason = "budget"
                 break
         if isinstance(message, ResultMessage):
@@ -2040,11 +2055,12 @@ async def run(
             # The session's own totals, which is the number to report when there
             # is one: the per-turn sum is what this loop could see, and a turn
             # the SDK accounted for after the last message it sent is in the
-            # result and not in the sum. A result reporting nothing leaves the
-            # sum alone rather than overwriting a measurement with a zero.
-            result_in, result_out = _usage(getattr(message, "usage", None))
-            if result_in or result_out:
-                spent_in, spent_out = result_in, result_out
+            # result and not in the sum. A result reporting nothing in any of
+            # the four leaves the sum alone rather than overwriting a
+            # measurement with a zero.
+            result = _usage(getattr(message, "usage", None))
+            if result.measured:
+                spent = result
     return {
         "role": gate.role.name,
         "sdk_version": runtime.get("sdk_version"),
@@ -2054,12 +2070,26 @@ async def run(
         "tools_served": list(surface.served),
         "denials": [denial.as_dict() for denial in gate.denials],
         "answers": answers,
+        # The same number `answers` counts, under the name the run row records
+        # it as. Ticket 165's cheapest open question: the child counted its own
+        # turns and dropped the number on the floor, so "six turns" was
+        # arithmetic done against a ceiling rather than something measured.
+        "answer_count": answers,
         "stop_reason": stop_reason,
         "text": text,
         "mission_result": submission.result,
         "mission_attempts": submission.attempts,
-        "input_tokens": spent_in,
-        "output_tokens": spent_out,
+        # The raw provider sum, kept as the telemetry it always was, beside the
+        # four categories it is made of and the units the reservation is spent
+        # in. The policy travels with the number because the number is only
+        # readable against it.
+        "input_tokens": spent.raw_input,
+        "output_tokens": spent.output,
+        "uncached_input_tokens": spent.uncached,
+        "cache_creation_input_tokens": spent.cache_creation,
+        "cache_read_input_tokens": spent.cache_read,
+        "budget_tokens": spent.budget,
+        "budget_policy": BUDGET_POLICY,
         "choice": choice.task,
         "pick_attempts": choice.attempts,
         "verdict": judgement.answer,
@@ -2117,15 +2147,75 @@ def _setup_token(job: Mapping[str, object]) -> str | None:
     return stated if isinstance(stated, str) and stated else None
 
 
-def _usage(stated: object) -> tuple[int, int]:
-    """One message's tokens, as the two numbers the run row records.
+@dataclass(frozen=True, slots=True)
+class Spend:
+    """What one message cost, in the four categories the provider bills it in.
 
-    Everything the model was charged for reading counts as input, cache included:
-    a cached read is cheaper, not free, and a ceiling that ignored the cache
-    would be a ceiling a long session walks straight through. A turn's numbers
-    are that turn's own request, prefix and all, which is what the Program is
-    charged for making it -- so the session's cost is the sum of the turns, and
-    the `ResultMessage` total replaces the sum when the SDK reports one.
+    Four numbers rather than two, because the three input categories are not
+    one price. A cached read is billed at roughly a tenth of ordinary input, so
+    a total that adds them at weight one is not a token budget at all -- it is a
+    turn budget worth `ceiling / context` turns, which is ticket 165. Kept
+    separate here and weighted once, in `budget`, so that what a row records
+    and what a ceiling is spent against come out of one statement.
+
+    `raw_input` is the sum as it was and stays the telemetry the run row already
+    carried: it is what the provider counted, and it is the number to read when
+    the question is how much this session actually made the model read.
+    """
+
+    uncached: int = 0
+    cache_creation: int = 0
+    cache_read: int = 0
+    output: int = 0
+
+    def __add__(self, other: "Spend") -> "Spend":
+        return Spend(
+            self.uncached + other.uncached,
+            self.cache_creation + other.cache_creation,
+            self.cache_read + other.cache_read,
+            self.output + other.output,
+        )
+
+    @property
+    def raw_input(self) -> int:
+        """Every input token the provider counted, at weight one."""
+        return self.uncached + self.cache_creation + self.cache_read
+
+    @property
+    def budget(self) -> int:
+        """What `cache-credit-v1` charges the reservation for this much reading.
+
+        Integer division rounding up, because a part of a cached token is a
+        token: rounding towards the Program would leave a ceiling something a
+        long session crosses a fraction at a time and is never charged for.
+        """
+        return (
+            self.uncached
+            + self.cache_creation
+            + (self.cache_read + CACHE_CREDIT - 1) // CACHE_CREDIT
+            + self.output
+        )
+
+    @property
+    def measured(self) -> bool:
+        """Whether anything was reported at all, in any one of the four."""
+        return bool(self.uncached or self.cache_creation or self.cache_read or self.output)
+
+
+def _usage(stated: object) -> Spend:
+    """One message's tokens, in the categories the provider billed them in.
+
+    Everything the model was charged for reading is counted, cache included --
+    but each category is kept as itself rather than summed on the way in, and
+    what weights them is `cache-credit-v1` where the ceiling is spent. A cached
+    read is cheaper, not free, and this is the reading that says by how much: at
+    four re-sends of a 40 000-token prefix the difference between "cheaper" and
+    "the same price" is most of the budget.
+
+    A turn's numbers are that turn's own request, prefix and all, which is what
+    the Program is charged for making it -- so the session's cost is the sum of
+    the turns, and the `ResultMessage` total replaces the sum when the SDK
+    reports one of its own.
 
     Nothing reported is zero: a message carrying no usage block still happened,
     and absent fields inside a block that is there are zero for the same reason.
@@ -2134,15 +2224,15 @@ def _usage(stated: object) -> tuple[int, int]:
     zero here is a session running unbounded.
     """
     if stated is None:
-        return (0, 0)
+        return Spend()
     if not isinstance(stated, Mapping):
         raise TypeError(f"usage is {type(stated).__name__}, not a mapping")
     usage = stated
-    return (
-        int(usage.get("input_tokens") or 0)
-        + int(usage.get("cache_read_input_tokens") or 0)
-        + int(usage.get("cache_creation_input_tokens") or 0),
-        int(usage.get("output_tokens") or 0),
+    return Spend(
+        uncached=int(usage.get("input_tokens") or 0),
+        cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
+        cache_read=int(usage.get("cache_read_input_tokens") or 0),
+        output=int(usage.get("output_tokens") or 0),
     )
 
 

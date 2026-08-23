@@ -2502,27 +2502,40 @@ class ChildTest(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     _launch._token_cap(stated)
 
-    def test_every_read_the_model_was_charged_for_counts_as_input(self):
-        # A cached read is cheaper, not free. A ceiling that ignored the cache
-        # is one a long session walks straight through.
-        self.assertEqual(
-            (600, 20),
-            _launch._usage(
-                {
-                    "input_tokens": 100,
-                    "cache_read_input_tokens": 300,
-                    "cache_creation_input_tokens": 200,
-                    "output_tokens": 20,
-                }
-            ),
+    def test_every_category_the_provider_billed_is_kept_as_itself(self):
+        # Ticket 165. A cached read is cheaper, not free, and the difference
+        # between "cheaper" and "the same price" is most of a long session's
+        # budget -- so the three input categories are kept apart and weighted
+        # where the ceiling is spent, not summed on the way in.
+        spent = _launch._usage(
+            {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 300,
+                "cache_creation_input_tokens": 200,
+                "output_tokens": 20,
+            }
         )
+
+        self.assertEqual(_launch.Spend(100, 200, 300, 20), spent)
+        self.assertEqual(600, spent.raw_input)
+        # 100 + 200 + ceil(300 / 10) + 20
+        self.assertEqual(350, spent.budget)
+
+    def test_a_part_of_a_cached_token_is_charged_as_a_whole_one(self):
+        # Rounding towards the Program would make a ceiling something a run
+        # crosses a fraction at a time and is never charged for.
+        self.assertEqual(1, _launch.Spend(cache_read=1).budget)
+        self.assertEqual(1, _launch.Spend(cache_read=10).budget)
+        self.assertEqual(2, _launch.Spend(cache_read=11).budget)
 
     def test_a_message_that_reports_no_usage_spends_nothing(self):
         # A message with no usage block still happened, and so does a block with
         # fields missing from it.
-        self.assertEqual((0, 0), _launch._usage(None))
-        self.assertEqual((0, 0), _launch._usage({}))
-        self.assertEqual((7, 0), _launch._usage({"input_tokens": 7}))
+        self.assertEqual(_launch.Spend(), _launch._usage(None))
+        self.assertEqual(_launch.Spend(), _launch._usage({}))
+        self.assertEqual(_launch.Spend(uncached=7), _launch._usage({"input_tokens": 7}))
+        self.assertFalse(_launch.Spend().measured)
+        self.assertTrue(_launch.Spend(cache_read=1).measured)
 
     def test_usage_this_process_cannot_read_is_not_quietly_zero(self):
         # The same reason `_token_cap` raises: a quiet zero here is a running
@@ -3318,6 +3331,136 @@ class SetupTokenTest(unittest.TestCase):
             )
 
         self.assertNotIn(_launch.OAUTH_VARIABLE, os.environ)
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class BudgetTest(unittest.TestCase):
+    """What the agent-run ceiling counts, and what a cached prefix costs it.
+
+    Ticket 165. Every `web_hunter` run in `rk2hunt17` and `rk2hunt20` ended on
+    `budget` at about 250 000 input tokens and thirty output, because each turn
+    charged the whole re-sent prefix at full price -- so the ceiling bought
+    `ceiling / context` turns and a `conclude` needs more than six of them.
+    `cache-credit-v1` is the reading that fixes it: a cached read counts a
+    tenth, which is what the provider bills it at.
+    """
+
+    def test_ten_cached_turns_finish_inside_a_ceiling_the_raw_sum_walks_through(self):
+        report = concluded(
+            [turn(cache_read_input_tokens=40000, output_tokens=20) for _ in range(10)]
+            + [terminal(stop_reason="end_turn")],
+            token_cap=250000,
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual(10, report["answer_count"])
+        # 400 000 tokens read, 40 200 units spent, and the run got to the end.
+        self.assertEqual(400000, report["cache_read_input_tokens"])
+        self.assertEqual(40200, report["budget_tokens"])
+
+    def test_ten_uncached_turns_of_the_same_size_still_cross_the_same_ceiling(self):
+        # The other half of the same reading: crediting the cache must not
+        # become a budget that no longer bounds anything. Uncached input is
+        # counted exactly as it was, so this run stops at the seventh turn.
+        report = concluded(
+            [turn(input_tokens=40000, output_tokens=20) for _ in range(10)]
+            + [terminal(stop_reason="end_turn")],
+            token_cap=250000,
+        )
+
+        self.assertEqual("budget", report["stop_reason"])
+        self.assertEqual(7, report["answer_count"])
+        self.assertEqual(280140, report["budget_tokens"])
+
+    def test_the_raw_numbers_the_answer_count_and_the_budget_units_agree(self):
+        report = concluded(
+            [
+                turn(
+                    input_tokens=1000,
+                    cache_creation_input_tokens=2000,
+                    cache_read_input_tokens=30001,
+                    output_tokens=40,
+                ),
+                turn(input_tokens=1000, cache_read_input_tokens=30000, output_tokens=40),
+                terminal(stop_reason="end_turn"),
+            ]
+        )
+
+        self.assertEqual(2000, report["uncached_input_tokens"])
+        self.assertEqual(2000, report["cache_creation_input_tokens"])
+        self.assertEqual(60001, report["cache_read_input_tokens"])
+        self.assertEqual(80, report["output_tokens"])
+        # `input_tokens` is the raw provider sum and stays what it was: the
+        # telemetry the row already carried, beside the units it is charged in.
+        self.assertEqual(64001, report["input_tokens"])
+        self.assertEqual(
+            report["uncached_input_tokens"]
+            + report["cache_creation_input_tokens"]
+            + report["cache_read_input_tokens"],
+            report["input_tokens"],
+        )
+        # 2000 + 2000 + ceil(60001 / 10) + 80. A part of a cached token is a
+        # token, so the division rounds up rather than towards the Program.
+        self.assertEqual(2000 + 2000 + 6001 + 80, report["budget_tokens"])
+        self.assertEqual("cache-credit-v1", report["budget_policy"])
+        # The turn count is measured rather than calculated, and it is the same
+        # number the run already counted.
+        self.assertEqual(report["answers"], report["answer_count"])
+        self.assertEqual(2, report["answer_count"])
+
+    def test_a_result_that_reports_its_own_categories_replaces_the_turn_sum(self):
+        report = concluded(
+            [
+                turn(input_tokens=100, cache_read_input_tokens=1000, output_tokens=10),
+                terminal(
+                    stop_reason="end_turn",
+                    usage={
+                        "input_tokens": 7,
+                        "cache_creation_input_tokens": 3,
+                        "cache_read_input_tokens": 90,
+                        "output_tokens": 1,
+                    },
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            (7, 3, 90, 1),
+            (
+                report["uncached_input_tokens"],
+                report["cache_creation_input_tokens"],
+                report["cache_read_input_tokens"],
+                report["output_tokens"],
+            ),
+        )
+        self.assertEqual(7 + 3 + 9 + 1, report["budget_tokens"])
+
+    def test_a_result_that_reports_one_category_still_replaces_the_turn_sum(self):
+        # Category-aware: a session whose whole request came out of the cache
+        # reports no uncached input and no output at all, and that is a
+        # measurement rather than a result that measured nothing.
+        report = concluded(
+            [
+                turn(input_tokens=100, output_tokens=10),
+                terminal(stop_reason="end_turn", usage={"cache_read_input_tokens": 500}),
+            ]
+        )
+
+        self.assertEqual(0, report["uncached_input_tokens"])
+        self.assertEqual(500, report["cache_read_input_tokens"])
+        self.assertEqual(50, report["budget_tokens"])
+
+    def test_a_result_that_reports_nothing_leaves_the_measurement_alone(self):
+        report = concluded(
+            [
+                turn(input_tokens=100, cache_read_input_tokens=1000, output_tokens=10),
+                terminal(stop_reason="end_turn", usage={}),
+            ]
+        )
+
+        self.assertEqual(100, report["uncached_input_tokens"])
+        self.assertEqual(1000, report["cache_read_input_tokens"])
+        self.assertEqual(10, report["output_tokens"])
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
