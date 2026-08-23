@@ -2445,8 +2445,9 @@ class ExchangeTest(unittest.TestCase):
         response.read()
 
         self.assertEqual(200, response.status)
-        [credential] = self.client_certificates
+        [credential, measurement_credential] = self.client_certificates
         self.assertIsNotNone(credential)
+        self.assertIsNone(measurement_credential)
         self.assertIn("BEGIN CERTIFICATE", credential.certificate_pem)
         self.assertEqual(1, len(target.seen))
         self.assertEqual(
