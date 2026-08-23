@@ -1652,3 +1652,138 @@ class SetupTokenTest(unittest.TestCase):
 
     def test_a_machine_with_no_token_has_no_age_to_report(self):
         self.assertIsNone(isolation.oauth_token_days(self.named(Path("/nonexistent/token"))))
+
+
+class SetupWizardTest(unittest.TestCase):
+    """`tools/setup-agent-oauth.sh`, driven end to end against stubs.
+
+    `claude setup-token` is a browser flow only a human completes, so what is
+    exercised here is everything around it: that the script runs exactly that
+    command, that it reads the token once and never prints it, and that what it
+    leaves on disk is a file `isolation.oauth_token` will accept. The real mint
+    is the operator's, and this is the whole of what can be checked without
+    them.
+    """
+
+    SENTINEL = "RK-SYNTHETIC-SETUP-TOKEN-2f7c"
+    WIZARD = SOURCE.parent / "tools" / "setup-agent-oauth.sh"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rk2-wizard-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.record = self.root / "claude.argv"
+
+    def stub(self, name: str, body: str) -> None:
+        path = self.bin / name
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_wizard(self, token: str = SENTINEL) -> subprocess.CompletedProcess[str]:
+        """One whole run, with the two commands it shells out to stood in for."""
+        self.stub("claude", f'printf "%s\\n" "$@" >> {self.record}\nexit 0')
+        # The doctor's own report, in the shape the script reads back. Stubbed
+        # rather than run, because a real diagnosis inspects containers this
+        # machine does not have and the assertion under test is the file.
+        self.stub(
+            "rk",
+            'printf \'{"assertions":[{"name":"agent_credential","ok":true,'
+            '"detail":"a setup token this operator alone can read"}],'
+            '"violations":[]}\\n\'',
+        )
+        environment = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.home),
+            "TERM": "dumb",
+        }
+        # Enter past the banner, `y` to mint, Enter past the mint, the token.
+        return subprocess.run(
+            ["bash", str(self.WIZARD)],
+            input=f"\ny\n\n{token}\n",
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+
+    def installed(self) -> Path:
+        return self.home / ".config" / "redkraken" / "claude-oauth-token"
+
+    def test_the_wizard_runs_exactly_claude_setup_token(self):
+        answer = self.run_wizard()
+
+        self.assertEqual(0, answer.returncode, answer.stdout + answer.stderr)
+        # `--version` in stage one, then the mint, and nothing else: the script
+        # asks the CLI which it is and then asks it for a token.
+        self.assertEqual(
+            ["--version", "setup-token"],
+            self.record.read_text(encoding="utf-8").split(),
+        )
+
+    def test_the_installed_token_is_one_this_operator_alone_can_read(self):
+        self.run_wizard()
+        path = self.installed()
+
+        self.assertTrue(path.is_file())
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(0o700, path.parent.stat().st_mode & 0o777)
+        self.assertEqual(os.getuid(), path.stat().st_uid)
+        self.assertEqual(f"{self.SENTINEL}\n", path.read_text(encoding="utf-8"))
+
+    def test_what_it_installs_is_what_the_runtime_reads_back(self):
+        self.run_wizard()
+
+        self.assertEqual(
+            self.SENTINEL,
+            isolation.oauth_token({isolation.OAUTH_TOKEN_VARIABLE: str(self.installed())}),
+        )
+
+    def test_the_token_reaches_no_stream_and_no_file_but_its_own(self):
+        answer = self.run_wizard()
+
+        self.assertNotIn(self.SENTINEL, answer.stdout)
+        self.assertNotIn(self.SENTINEL, answer.stderr)
+        elsewhere = [
+            path
+            for path in self.root.rglob("*")
+            if path.is_file()
+            and path != self.installed()
+            and self.SENTINEL in path.read_text(encoding="utf-8", errors="replace")
+        ]
+        self.assertEqual([], elsewhere)
+
+    def test_a_replaced_token_is_renamed_over_and_never_half_written(self):
+        self.run_wizard()
+        first = self.installed().stat().st_ino
+
+        self.run_wizard("RK-SYNTHETIC-SETUP-TOKEN-9b41")
+
+        # A different inode, which is what a rename over leaves: the old file
+        # was replaced whole rather than truncated and rewritten in place.
+        self.assertNotEqual(first, self.installed().stat().st_ino)
+        self.assertEqual(
+            "RK-SYNTHETIC-SETUP-TOKEN-9b41\n", self.installed().read_text(encoding="utf-8")
+        )
+
+    def test_a_value_that_is_not_one_word_is_refused_before_anything_is_written(self):
+        answer = self.run_wizard("two words")
+
+        self.assertNotEqual(0, answer.returncode)
+        self.assertIn("one word", answer.stdout + answer.stderr)
+        self.assertFalse(self.installed().exists())
+
+    def test_nothing_pasted_installs_nothing(self):
+        answer = self.run_wizard("")
+
+        self.assertNotEqual(0, answer.returncode)
+        self.assertFalse(self.installed().exists())
+
+    def test_the_canary_is_skipped_rather_than_faked_where_no_boundary_is_described(self):
+        answer = self.run_wizard()
+
+        self.assertIn("no Agent boundary is exported", answer.stdout)
