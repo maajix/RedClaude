@@ -13840,7 +13840,6 @@ class HypothesisPromotionTest(DatabaseCase):
         # evidential. Claim and edge are refused together, and the Hypothesis
         # the edge would have supported does not exist.
         self.assertEqual("no_support", self.dropped["hypotheses[7]"][0])
-        self.assertEqual("no_subject", self.dropped["evidence[0]"][0])
         self.assertEqual(
             [],
             self.rows(
@@ -13848,6 +13847,40 @@ class HypothesisPromotionTest(DatabaseCase):
                 "   AND statement = 'the id is not checked'"
             ),
         )
+
+    def test_the_edge_that_took_a_claim_down_is_refused_for_what_refused_it(self):
+        """Ticket 148: the cause survives the block that rolled back.
+
+        `rk2hunt7` filed three refusals about one event and none of them was the
+        cause. The claim was told it had no support; its two edges were told the
+        claim was not promoted; and what had actually happened was that 018's
+        `enforce_evidential_kind` refused a `technology_identified` Observation
+        in a counting role. The edge's own refusal is collected inside the
+        subtransaction that rolls back with the claim, so before this ticket the
+        only path that carried it out was the one where nothing went wrong.
+
+        The same shape, here: `evidence[0]` is the only supporting edge of
+        `hypotheses[7]` and it cites an `endpoint_discovered` Observation as a
+        baseline. What it must say is what the trigger said.
+        """
+        reason, cited = self.dropped["evidence[0]"]
+
+        self.assertEqual("refused_by_invariant", reason)
+        self.assertIn(f"{DISCOVERED} is not evidential", cited)
+        self.assertIn("role=context", cited)
+
+    def test_a_cascaded_refusal_names_the_refusal_it_is_downstream_of(self):
+        # The other half of 148. An edge that had no refusal of its own is still
+        # reported -- it was written and rolled back with the claim -- and "the
+        # hypothesis it names was not promoted" is true, is not a cause, and
+        # reads to a hunter as though the edge were the mistake. `evidence[7]`
+        # is that edge: `context` is a role the column takes, so nothing refused
+        # it, and the claim it stands on was refused for standing on nothing.
+        reason, cited = self.dropped["evidence[7]"]
+
+        self.assertEqual("no_subject", reason)
+        self.assertIn("no_support", cited)
+        self.assertIn("no evidence edge in this result supports it", cited)
 
     def test_a_polarity_and_a_role_outside_their_vocabularies_are_refused(self):
         self.assertEqual(("unknown_kind", "proves"), self.dropped["evidence[1]"])
@@ -14224,6 +14257,356 @@ WAVE_SLUG = "selftest-wave"
 #: subject and the class together, so two hunters claiming different properties
 #: of one route are two claims and two claiming the same one are one.
 ACCESS = "authorization.function_access"
+
+
+SUGGESTED_SLUG = "selftest-suggested-task"
+
+
+class SuggestedTaskPromotionTest(DatabaseCase):
+    """Ticket 142: a suggested task becomes one recon Task or one drop.
+
+    The walk is committed and has been since 142 landed, but nothing here ever
+    asserted it positively: what `rk2hunt16` produced was twenty-four
+    suggestions and twenty-four silences, and the reading that a promotion
+    which opened nothing is indistinguishable from a promotion which was never
+    asked is exactly what a case has to rule out. So one result carries every
+    outcome the walk has -- four suggestions it opens and one per reason it
+    refuses -- and each is asserted against the `tasks` row or the
+    `proposal_drops` row it produced rather than against the summary.
+
+    The ceiling is read off the active weights rather than written down. What
+    `queue_at_ceiling` measures is the slate the picker is actually offered, and
+    a fixture holding its own copy of the number would go on passing after the
+    number moved. The list is sized from it for the same reason: the elements
+    that fill the queue are generated, so the case says "fill it and then ask
+    for one more" rather than "ask for a sixth".
+
+    Everything runs as `rk2_runtime`, which is the role a promotion runs as.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "runtime"
+
+    #: The Application the recon result promotes, and the name that is only a
+    #: name. `no_address` is the one drop reason that needs a subject the live
+    #: scope admits as a target and that still cannot be dialled, and a Domain
+    #: under the wildcard inclusion is the smallest thing that is both.
+    BASE_URL = "http://app.example.com/"
+    FQDN = "www.example.com"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # `UNSEEDED` for the promotion cases' reason and for one of its own: a
+        # Program opened from an exact inclusion records an Application and
+        # opens a recon Task against it, and this case counts live Tasks against
+        # the slate size. A Task the configuration opened would be one the list
+        # below did not account for, and the ceiling would fall a place early.
+        path = write(
+            UNSEEDED.replace('name = "matrix-web"', f'name = "{SUGGESTED_SLUG}"')
+            + DECLARED
+        )
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.ceiling = int(
+            cls.connection.execute(
+                "SELECT slate_size FROM scheduler_weights WHERE active"
+            ).scalar()
+        )
+        assert cls.ceiling >= 3, cls.ceiling
+        cls.seeded = cls._populate()
+
+        # The Surface a suggestion can name: one Application to open Tasks
+        # against, and one Domain that is in scope and carries no address.
+        cls.promote(cls.recon())
+        cls.held = cls.labels()
+
+        cls.staged, cls.answer = cls.promote(cls.suggestions())
+        cls.dropped = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in cls.connection.execute(
+                "SELECT element_path, reason, cited FROM proposal_drops"
+                " WHERE proposal_id = $1::uuid",
+                (cls.staged.proposal_id,),
+            ).rows
+        }
+        opened_labels = set(cls.answer["tasks"])
+        cls.opened_tasks = [
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in cls.connection.execute(
+                "SELECT label, kind, status FROM tasks"
+                " WHERE program_id = $1::uuid ORDER BY label",
+                (cls.program_id,),
+            ).rows
+            if str(row[0]) in opened_labels
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{SUGGESTED_SLUG}%",)
+            )
+        super().tearDownClass()
+
+    # -- the fixture ---------------------------------------------------------
+
+    @classmethod
+    def _populate(cls) -> dict:
+        """One claimed Task, the run under it, and the Tool run to cite.
+
+        The Task is the one this result was returned by, and it is live, so it
+        is also the first of the Tasks the ceiling counts.
+        """
+        seeded: dict[str, str] = {}
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            seeded["task"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, claimed_at,"
+                    " lease_expires_at) VALUES ($1::uuid, 'recon', 'claimed', now(),"
+                    " now() + interval '30 minutes') RETURNING id::text",
+                    (cls.program_id,),
+                ).scalar()
+            )
+            seeded["run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, runs_as, model,"
+                    " effort, mission_packet) VALUES ($1::uuid, $2::uuid, 'recon',"
+                    " 'subagent', 'selftest', 'low', '{}'::jsonb) RETURNING id::text",
+                    (cls.program_id, seeded["task"]),
+                ).scalar()
+            )
+            seeded["tool_run"] = str(
+                cls.connection.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool,"
+                    " args, status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid,"
+                    " 'mcp__rk2__http_request', '{}'::jsonb, 'success', 'runtime')"
+                    " RETURNING label",
+                    (cls.program_id, seeded["run"], seeded["task"]),
+                ).scalar()
+            )
+        return seeded
+
+    @classmethod
+    def recon(cls) -> dict:
+        return {
+            "new_entities": [
+                {"ref": "site_app", "type": "application", "base_url": cls.BASE_URL,
+                 "kind": "web", "tool_run_label": cls.seeded["tool_run"]},
+                {"ref": "site", "type": "domain", "fqdn": cls.FQDN,
+                 "tool_run_label": cls.seeded["tool_run"]},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def suggestions(cls) -> dict:
+        """One element per outcome the walk has, in the order that reaches them.
+
+        Order is the arrangement here rather than an accident of it. The ceiling
+        is counted inside the loop, so an element that has to be refused for a
+        reason the walk asks about *before* the ceiling has to be reached while
+        the queue is still short -- and the one element that must see a full
+        queue has to be last. What is between them is the filling.
+        """
+        spare = cls.ceiling - 2
+        application = cls.held[f"application:{cls.BASE_URL.rstrip('/')}"]
+        elements: list[tuple[dict, str | None]] = [
+            # Resolved through the ref map this same result wrote, which is the
+            # common case and the reason the walk runs last of the six.
+            ({"kind": "recon", "subject_ref": "s0",
+              "rationale": "s0 answers on the same host and nothing has read it"},
+             None),
+            # The other spelling of the sentence, and a subject named by label.
+            ({"kind": "recon", "subject_label": application,
+              "note": "the application root has not been walked"},
+             None),
+            ({"kind": "recon", "subject_label": application,
+              "rationale": "the same subject, suggested twice in one result"},
+             "refused_by_invariant"),
+            ({"kind": "hunt", "subject_ref": "s0",
+              "rationale": "a claim this suggestion has no field to name"},
+             "unopenable_kind"),
+            ({"kind": "teleport", "subject_ref": "s0",
+              "rationale": "a kind no roster gives to anybody"},
+             "unknown_kind"),
+            ({"kind": "recon", "subject_label": "ENT-nobody-issued-this",
+              "rationale": "a subject this Program does not hold"},
+             "no_subject"),
+            ({"kind": "recon", "subject_label": cls.held[f"domain:{cls.FQDN}"],
+              "rationale": "a name in scope, which is not an address"},
+             "no_address"),
+        ]
+        elements += [
+            ({"kind": "recon", "subject_ref": f"s{n}",
+              "rationale": f"s{n} answers on the same host and nothing has read it"},
+             None)
+            for n in range(1, spare)
+        ]
+        elements.append(
+            ({"kind": "recon", "subject_ref": f"s{spare}",
+              "rationale": "the work this run would have queued past the slate"},
+             "queue_at_ceiling")
+        )
+        cls.expected = {
+            f"suggested_tasks[{n}]": reason
+            for n, (_, reason) in enumerate(elements)
+            if reason is not None
+        }
+        cls.reasons = [
+            element.get("rationale") or element.get("note")
+            for element, reason in elements
+            if reason is None
+        ]
+        return {
+            "new_entities": [
+                {"ref": f"s{n}", "type": "application",
+                 "base_url": f"http://s{n}.example.com/", "kind": "web",
+                 "tool_run_label": cls.seeded["tool_run"]}
+                for n in range(spare + 1)
+            ],
+            "suggested_tasks": [element for element, _ in elements],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def promote(cls, payload: dict) -> tuple[proposal.Staged, dict]:
+        """Stage one result and promote it, the way the supervisor does both."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            staged = proposal.stage(
+                cls.connection,
+                proposal.Result(payload=payload),
+                program_id=cls.program_id,
+                agent_run_id=cls.seeded["run"],
+                task_id=cls.seeded["task"],
+            )
+        with cls.connection.transaction():
+            cls.connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.program_id,)
+            )
+            answer = proxy.as_object(
+                cls.connection.execute(
+                    "SELECT promote_proposal($1::uuid)", (staged.proposal_id,)
+                ).scalar()
+            )
+        return staged, answer
+
+    @classmethod
+    def labels(cls) -> dict:
+        """This Program's Entities under the key two proposals converge on."""
+        return {
+            str(row[0]): str(row[1])
+            for row in cls.connection.execute(
+                "SELECT dedup_key, label FROM entities WHERE program_id = $1::uuid",
+                (cls.program_id,),
+            ).rows
+        }
+
+    def rows(self, sql: str, parameters: tuple = ()) -> list:
+        return self.connection.execute(sql, parameters).rows
+
+    # -- what the walk opened -------------------------------------------------
+
+    def test_a_suggested_task_becomes_a_pending_recon_task(self):
+        # One short of the ceiling, because the Task this result was returned by
+        # is live too and the queue is what the ceiling counts.
+        self.assertEqual(self.ceiling - 1, len(self.answer["tasks"]))
+        self.assertEqual(
+            [("recon", "pending")] * (self.ceiling - 1),
+            [(kind, status) for _, kind, status in self.opened_tasks],
+        )
+        self.assertEqual("promoted", self.answer["status"])
+
+    def test_the_task_carries_the_model_sentence_and_says_whose_it_is(self):
+        """83's rule, through the walk: the reason is quoted and attributed.
+
+        `open_task` reads the actor from the session and a promotion runs as
+        `runtime`, so a `task.opened` event carrying only the model's sentence
+        would file the model's idea under the runtime's name. The proposal label
+        in front of it is the attribution, and it is the label of the result
+        this suggestion arrived in rather than a description of one.
+        """
+        said = [
+            str(row[0])
+            for row in self.rows(
+                "SELECT payload ->> 'reason' FROM events"
+                " WHERE program_id = $1::uuid AND type = 'task.opened'",
+                (self.program_id,),
+            )
+        ]
+
+        self.assertEqual(self.ceiling - 1, len(said))
+        prefix = f"{self.staged.label} proposed this recon: "
+        self.assertEqual([], [one for one in said if not one.startswith(prefix)])
+        # Both spellings of the sentence, because the payloads already staged in
+        # live databases use both and a suggestion whose reason was dropped for
+        # having said `note` is a Task nobody can account for.
+        self.assertEqual(
+            sorted(self.reasons),
+            sorted(one[len(prefix):] for one in said),
+        )
+
+    def test_no_task_this_walk_opened_lost_the_reason_it_was_opened_for(self):
+        # Including the four the walk rolled back: `open_task` writes the event
+        # before the row, so a refusal that escaped its subtransaction would
+        # leave the account of a Task that does not exist.
+        self.assertEqual(
+            [],
+            [
+                tuple(str(field) for field in row)
+                for row in self.rows("SELECT * FROM check_opened_tasks()")
+            ],
+        )
+
+    # -- what it refused ------------------------------------------------------
+
+    def test_a_suggestion_it_will_not_open_is_one_drop_and_no_task(self):
+        self.assertEqual(len(self.expected), self.answer["refused"])
+        self.assertEqual(self.expected, {path: reason for path, (reason, _) in self.dropped.items()})
+
+    def test_each_reason_says_the_thing_that_element_got_wrong(self):
+        cited = {path: text for path, (_, text) in self.dropped.items()}
+        reasons = {reason: path for path, reason in self.expected.items()}
+        for reason, fragment in (
+            ("unknown_kind", "teleport"),
+            ("unopenable_kind", "hunt: a hunt Task is opened against a testable"),
+            ("no_subject", ""),
+            ("no_address", "only an application or an endpoint carries an address"),
+            ("queue_at_ceiling", f"and the active slate offers {self.ceiling}"),
+            ("refused_by_invariant", "already carries a live recon Task against"),
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(fragment, cited[reasons[reason]])
+
+    def test_the_queue_is_measured_against_the_slate_the_picker_is_offered(self):
+        """The ceiling counted inside the loop rather than before it.
+
+        The list asks for one more Task than the slate holds, and the refusal it
+        gets back has to be about the queue as this walk left it -- counted once
+        before the loop, every element of the list would have been measured
+        against the queue as it stood before the first one opened.
+        """
+        cited = self.dropped[[
+            path for path, reason in self.expected.items()
+            if reason == "queue_at_ceiling"
+        ][0]][1]
+
+        self.assertTrue(cited.startswith(f"{self.ceiling} live Task(s) already"), cited)
+        self.assertEqual(
+            self.ceiling,
+            int(
+                self.rows(
+                    "SELECT count(*) FROM tasks WHERE program_id = $1::uuid"
+                    " AND status IN ('pending', 'claimed', 'running', 'parked')",
+                    (self.program_id,),
+                )[0][0]
+            ),
+        )
 
 
 class WaveMeasurementTest(DatabaseCase):
@@ -19900,6 +20283,328 @@ RANK_SLUG = "selftest-rank"
 #: "unblocks one". Still high enough that the three together outweigh the richer
 #: recon Task -- 0.1 + 0.5*0.6 against 0.2 -- so the flip is the unlock term's.
 UNLOCKED_WORTH = "0.2"
+
+#: Ticket 165's own Programs. One per thing being asked, because every one of
+#: them is about what a Program's budget was charged and two scenarios sharing
+#: a Program would each be reading the other's spending.
+POLICY_SLUG = "selftest-budget-policy"
+
+#: What the provider reported, and what the budget policy charged for it. The
+#: two differ on purpose and by a lot: a cache read is a token the provider
+#: counts and the policy does not, so a run whose accounting used the raw sum
+#: would be charged more than three times what it cost. Every assertion below
+#: that says "the charge" says one of these two numbers, and which one it is is
+#: the whole of criterion 4.
+POLICY_RAW = (30000, 2000)
+POLICY_CHARGED = 9000
+POLICY_NAME = "cache-aware-v1"
+
+#: The digest of the packet, the build and the budget policy one attempt ran
+#: under. A hex digest because the column is constrained to one, and two
+#: different ones because the rule is about sameness.
+POLICY_PROFILE = "9c" * 32
+OTHER_PROFILE = "3d" * 32
+
+
+class BudgetPolicyTest(SchedulerFixture, DatabaseCase):
+    """Ticket 165: what a run reported, what it was charged, and what ends it.
+
+    `rk2hunt17` spent its whole Program budget on cache reads it was charged
+    for at the input rate and never reached a Test. What it was missing is one
+    number: the tokens the budget policy says the attempt cost, kept apart from
+    the tokens the provider says it counted. So the raw usage stays as
+    telemetry and every accounting site -- the Program's budget, the Lane's,
+    the reservation the claim held out of the pool -- reads `budget_tokens`.
+
+    Four Programs, one per thing being asked. `policy` is a run that reports
+    both numbers. `legacy` is a run that reports only the two the caller has
+    always sent, which is what an unchanged supervisor still does and the whole
+    reason the migration can land on its own: the derivation writes the sum
+    under `legacy-raw-v1` and the accounting is unchanged for it. `twice` is
+    the same dispatch ending on budget twice, which is the thing the database
+    has to refuse rather than trust a runtime to refuse. `changed` is the same
+    two endings with a different profile between them, which is a retry the
+    rule must still permit.
+
+    Everything commits, and this case purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: The ending, spelled with named parameters. Named because the point of
+    #: the twelve is that a caller sends the ones it has: `execution.FINISH`
+    #: still sends four positionally and `legacy` below is closed through it,
+    #: so both spellings are exercised against the one function.
+    FINISH = (
+        "SELECT finish_task_attempt("
+        " p_agent_run := $1::uuid, p_stop_reason := $2,"
+        " p_input_tokens := $3, p_output_tokens := $4,"
+        " p_uncached_input_tokens := $5, p_cache_creation_input_tokens := $6,"
+        " p_cache_read_input_tokens := $7, p_answer_count := $8,"
+        " p_budget_tokens := $9, p_budget_policy := $10,"
+        " p_attempt_profile_sha256 := $11, p_error_detail := $12)"
+    )
+
+    CHARGED = (
+        "SELECT input_tokens, output_tokens, uncached_input_tokens,"
+        "       cache_creation_input_tokens, cache_read_input_tokens,"
+        "       answer_count, budget_tokens, budget_policy,"
+        "       attempt_profile_sha256, error_detail"
+        "  FROM agent_runs WHERE program_id = $1::uuid AND label = $2"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        cls.identifiers = {}
+        for name in ("policy", "legacy", "twice", "changed"):
+            # `UNSEEDED` rather than `SCOPED`: an exact inclusion opens a
+            # recon Task when the Program opens, and two scenarios below claim
+            # the same Task twice on purpose. A second Task the configuration
+            # opened is one the second claim could take instead, and the case
+            # would be asking its question of the wrong row.
+            path = write(
+                UNSEEDED.replace(SCOPED_BUDGETS, BUDGET_WIDE).replace(
+                    'name = "matrix-web"', f'name = "{POLICY_SLUG}-{name}"'
+                )
+            )
+            opened = program.run(cls.harness.runtime, path)
+            assert opened.ok, (name, opened.violations)
+            cls.identifiers[name] = opened.facts["program_id"]
+
+        cls.arrange_policy()
+        cls.arrange_legacy()
+        cls.twice = cls.arrange_endings("twice", POLICY_PROFILE)
+        cls.changed = cls.arrange_endings("changed", OTHER_PROFILE)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug LIKE $1", (f"{POLICY_SLUG}-%",)
+            )
+        super().tearDownClass()
+
+    # -- the scenarios ---------------------------------------------------------
+
+    @classmethod
+    def arrange_policy(cls):
+        """One run that reports both numbers, and an over-long error with it."""
+        cls.seed("policy", 1)
+        cls.bind("policy")
+        cls.offer()
+        cls.policy_run = str(cls.call("SELECT claim_task()"))
+        cls.policy_reserved = int(cls.reservation("policy", cls.policy_run)["tokens"])
+        cls.policy_answer = proxy.as_object(
+            cls.call(
+                cls.FINISH,
+                (cls.run_id("policy", cls.policy_run), "completed",
+                 POLICY_RAW[0], POLICY_RAW[1], 8000, 1000, 21000, 3,
+                 POLICY_CHARGED, POLICY_NAME, POLICY_PROFILE, "x" * 3000),
+            )
+        )
+        cls.policy_row = cls.charged("policy", cls.policy_run)
+        cls.policy_settled = cls.reservation("policy", cls.policy_run)
+        cls.policy_budget = cls.budget("policy")
+        cls.policy_lane = cls.lane("policy", "recon")
+
+    @classmethod
+    def arrange_legacy(cls):
+        """One run closed the way an unchanged caller closes it.
+
+        Through `execution.FINISH`, which is the four-parameter call production
+        still makes: what the eight new parameters defaulting to NULL buys is
+        that this migration lands before the caller that fills them, and a
+        second spelling written here would prove it about the wrong statement.
+        """
+        cls.seed("legacy", 1)
+        cls.bind("legacy")
+        cls.offer()
+        cls.legacy_run = str(cls.call("SELECT claim_task()"))
+        cls.call(
+            execution.FINISH,
+            (cls.run_id("legacy", cls.legacy_run), "completed", *POLICY_RAW),
+        )
+        cls.legacy_row = cls.charged("legacy", cls.legacy_run)
+        cls.legacy_settled = cls.reservation("legacy", cls.legacy_run)
+        cls.legacy_budget = cls.budget("legacy")
+
+    @classmethod
+    def arrange_endings(cls, name: str, second: str) -> dict:
+        """One Task, ended on budget twice, the second time under `second`.
+
+        The same arrangement for both scenarios and one argument between them,
+        because what separates "this dispatch has now failed twice" from "this
+        is a different dispatch" is the digest and nothing else. Written as one
+        method so that the two cannot drift into being two arrangements.
+        """
+        cls.seed(name, 1)
+        cls.bind(name)
+        cls.offer()
+        ended = {}
+        first = str(cls.call("SELECT claim_task()"))
+        ended["first"] = cls.exhausted(name, first, POLICY_PROFILE)
+        # Re-ranked and re-offered, because a Task put back is a Task the
+        # picker has to reach again: a second attempt claimed off a stale slate
+        # would be this case arranging what it is asking about.
+        cls.offer()
+        again = str(cls.call("SELECT claim_task()"))
+        ended["second"] = cls.exhausted(name, again, second)
+        ended["task"] = cls.as_owner(
+            "SELECT status, coalesce(abandoned_reason, '') FROM tasks"
+            " WHERE program_id = $1::uuid",
+            (cls.identifiers[name],),
+        ).rows[0]
+        return ended
+
+    # -- the moves -------------------------------------------------------------
+
+    @classmethod
+    def exhausted(cls, name: str, label: str, profile: str) -> dict:
+        """One run that ended because its budget ran out, under one profile."""
+        return proxy.as_object(
+            cls.call(
+                cls.FINISH,
+                (cls.run_id(name, label), "budget", POLICY_RAW[0], POLICY_RAW[1],
+                 None, None, None, None, POLICY_CHARGED, POLICY_NAME, profile,
+                 "the attempt reached its token ceiling"),
+            )
+        )
+
+    @classmethod
+    def charged(cls, name: str, label: str) -> dict[str, object]:
+        return cls.as_owner(cls.CHARGED, (cls.identifiers[name], label)).dicts()[0]
+
+    @classmethod
+    def budget(cls, name: str) -> dict[str, object]:
+        return cls.as_owner(
+            "SELECT * FROM program_budget WHERE program_id = $1::uuid",
+            (cls.identifiers[name],),
+        ).dicts()[0]
+
+    @classmethod
+    def lane(cls, name: str, kind: str) -> dict[str, object]:
+        return cls.as_owner(
+            "SELECT * FROM lane_budget WHERE program_id = $1::uuid AND kind = $2",
+            (cls.identifiers[name], kind),
+        ).dicts()[0]
+
+    @classmethod
+    def reservation(cls, name: str, label: str) -> dict[str, object]:
+        return cls.as_owner(
+            "SELECT br.* FROM budget_reservations br"
+            "  JOIN agent_runs ar ON ar.id = br.agent_run_id"
+            " WHERE ar.program_id = $1::uuid AND ar.label = $2",
+            (cls.identifiers[name], label),
+        ).dicts()[0]
+
+    @classmethod
+    def run_id(cls, name: str, label: str) -> str:
+        return str(
+            cls.scalar(
+                "SELECT id::text FROM agent_runs"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers[name], label),
+            )
+        )
+
+    # -- criterion 1: the run records what it reported -------------------------
+
+    def test_the_run_carries_every_number_the_ending_reported(self):
+        self.assertEqual(
+            (POLICY_RAW[0], POLICY_RAW[1], 8000, 1000, 21000, 3,
+             POLICY_CHARGED, POLICY_NAME, POLICY_PROFILE),
+            (
+                int(self.policy_row["input_tokens"]),
+                int(self.policy_row["output_tokens"]),
+                int(self.policy_row["uncached_input_tokens"]),
+                int(self.policy_row["cache_creation_input_tokens"]),
+                int(self.policy_row["cache_read_input_tokens"]),
+                int(self.policy_row["answer_count"]),
+                int(self.policy_row["budget_tokens"]),
+                str(self.policy_row["budget_policy"]),
+                str(self.policy_row["attempt_profile_sha256"]),
+            ),
+        )
+
+    def test_an_error_detail_is_bounded_before_the_constraint_refuses_it(self):
+        """The redaction is a truncation and not a rollback.
+
+        A run whose provider error ran to three thousand characters is a run
+        that ended; a `left()` in the writer rather than only a CHECK on the
+        column is what keeps the ending from being rolled back by the rule that
+        exists to bound it.
+        """
+        self.assertEqual(2048, len(str(self.policy_row["error_detail"])))
+
+    # -- criterion 2: what the budget was charged ------------------------------
+
+    def test_the_reservation_settles_at_what_the_policy_charged(self):
+        # And explicitly not at the raw sum, which is the number the reservation
+        # settled at before this ticket and is more than three times as large.
+        self.assertEqual(POLICY_CHARGED, int(self.policy_settled["tokens_spent"]))
+        self.assertNotEqual(sum(POLICY_RAW), int(self.policy_settled["tokens_spent"]))
+        self.assertIsNotNone(self.policy_settled["settled_at"])
+
+    def test_the_program_and_the_lane_are_charged_the_same_number(self):
+        self.assertEqual(POLICY_CHARGED, int(self.policy_budget["tokens_spent"]))
+        self.assertEqual(POLICY_CHARGED, int(self.policy_lane["tokens_spent"]))
+
+    def test_the_standing_check_agrees_with_what_the_run_was_charged(self):
+        self.assertEqual(
+            [],
+            [
+                tuple(str(field) for field in row)
+                for row in self.as_owner(
+                    "SELECT * FROM check_budget_reservations()"
+                ).rows
+            ],
+        )
+
+    # -- criterion 3: the caller that has not been changed yet -----------------
+
+    def test_a_caller_that_names_no_policy_is_charged_the_raw_sum_under_one(self):
+        self.assertEqual(
+            (sum(POLICY_RAW), "legacy-raw-v1"),
+            (int(self.legacy_row["budget_tokens"]),
+             str(self.legacy_row["budget_policy"])),
+        )
+        self.assertIsNone(self.legacy_row["attempt_profile_sha256"])
+
+    def test_the_unchanged_caller_accounts_exactly_as_it_did_before(self):
+        self.assertEqual(sum(POLICY_RAW), int(self.legacy_settled["tokens_spent"]))
+        self.assertEqual(sum(POLICY_RAW), int(self.legacy_budget["tokens_spent"]))
+
+    # -- criterion 4: two identical budget ends, and one changed --------------
+
+    def test_the_first_budget_ending_puts_the_task_back(self):
+        self.assertEqual(1, int(self.twice["first"]["budget_ends"]))
+        self.assertEqual("pending", str(self.twice["first"]["task_status"]))
+
+    def test_the_second_identical_budget_ending_closes_the_task(self):
+        """The rule in the database, so no other path can produce a third.
+
+        A runtime that counted this in Python would be one refactor away from a
+        second dispatcher that did not, and the third dispatch of an unchanged
+        packet is exactly what `rk2hunt17` spent its budget on.
+        """
+        self.assertEqual(2, int(self.twice["second"]["budget_ends"]))
+        self.assertEqual("abandoned", str(self.twice["second"]["task_status"]))
+        self.assertEqual(
+            ("abandoned", "budget_exhausted_twice"),
+            tuple(str(field) for field in self.twice["task"]),
+        )
+
+    def test_a_changed_profile_is_a_first_attempt_again(self):
+        self.assertEqual(1, int(self.changed["second"]["budget_ends"]))
+        self.assertEqual("pending", str(self.changed["second"]["task_status"]))
+        self.assertEqual(
+            ("pending", ""), tuple(str(field) for field in self.changed["task"])
+        )
+
 
 #: One Program per disturbance, so no scenario is read through another's rows.
 SCENARIOS = (
@@ -30326,6 +31031,23 @@ class CandidateFindingTest(ReplayFixture, DatabaseCase):
         ):
             with self.subTest(case=key):
                 self.assertIn(fragment, self.refusals[key])
+
+    def test_the_class_it_did_not_name_is_refused_with_the_words_it_could_use(self):
+        """Ticket 163: the refusal carries the vocabulary, not just the verdict.
+
+        A run that guessed `sql-injection-probably` learns nothing from being
+        told the guess is not a class -- it guesses again, and the next guess
+        is refused for the same reason. The vocabulary is small enough to say
+        in full, and it lives in `vulnerability_classes`, so the sentence is
+        read off the same table the guard checks against rather than out of a
+        second copy that would drift the first time a class is added.
+        """
+        ids = [str(row[0]) for row in self.rows(
+            "SELECT id FROM vulnerability_classes ORDER BY id")]
+        refusal = self.refusals["unknown_class"]
+
+        self.assertIn(f"This harness holds {len(ids)}", refusal)
+        self.assertEqual([], [one for one in ids if one not in refusal])
 
     def test_a_model_cannot_settle_the_claim_a_finding_would_rest_on(self):
         """Criterion 5's fourth vector, in the two places it is answered.
