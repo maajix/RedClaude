@@ -102,6 +102,69 @@ Alle Migrationen und `tests/test_database.py` liegen ausschließlich hier:
 - [ ] Tickets 148/163: Finding-Refusals nennen die wirkliche Ursache und gültige Vocabulary-Werte.
 - [ ] Nur wenn diese positiven Tests rot sind, den kleinsten dafür nötigen Writer-/Constraint-Fix implementieren.
 
+### Naht zwischen den Strängen
+
+Vom Lead vor der Parallelisierung festgelegt, weil drei Stränge ohne festes
+Wortlaut-Format an der Integration auseinanderlaufen. Die Schreibweise ist
+verbindlich; A, B und C bauen gegen genau diese Namen.
+
+**Datei-Ownership.** A: `_launch.py`, `roster.py`, `tests/test_agent.py`,
+`tests/test_roster.py`. B: `agent.py`, `isolation.py`, `doctor.py`,
+`execution.py`, `program.py`, `tools/setup-agent-oauth.sh`,
+`tests/test_isolation.py`, `tests/test_doctor.py`, `tests/test_execution.py`,
+`tests/test_program.py`. C: `src/redkraken/migrations/*.sql` und
+`tests/test_database.py`, exklusiv. Lead: `docs/**`, `tests/fixtures.py`, Ledger.
+`agent.py` war in der ursprünglichen Fassung keinem Strang zugewiesen und liegt
+bei B, weil dort die Job-Zeile gebaut und das Kindergebnis eingelesen wird.
+
+**Child-Job-Envelope.** B legt den Setup Token in die eine JSON-Zeile, die das
+Kind auf stdin liest (`agent.py:692` schreibt, `_launch.py:2159` liest), unter
+dem Schlüssel `oauth_token`. A nimmt ihn sofort aus der Mapping heraus, bevor
+irgendetwas die Job-Zeile liest, speichert, ausgibt oder protokolliert, und
+setzt `CLAUDE_CODE_OAUTH_TOKEN` erst nach der Ambient- und
+Konfigurationsprüfung. `ClaudeAgentOptions.env` bleibt leer.
+
+**Child-Run-Report.** A ergänzt das zurückgegebene Dict um genau diese
+Schlüssel; B trägt sie durch `AgentRunResult` und `execution.py`; C speichert
+sie:
+
+```text
+uncached_input_tokens        int
+cache_creation_input_tokens  int
+cache_read_input_tokens      int
+answer_count                 int
+budget_tokens                int
+budget_policy                str   = "cache-credit-v1"
+error_detail                 str | None   (redigiert, höchstens 2048 Zeichen)
+```
+
+`input_tokens` (rohe Providersumme, Telemetrie) und `output_tokens` behalten
+ihre heutige Bedeutung und bleiben erhalten.
+
+**Datenbankseite.** `agent_runs` erhält `uncached_input_tokens`,
+`cache_creation_input_tokens`, `cache_read_input_tokens`, `answer_count`,
+`budget_tokens`, `budget_policy`, `attempt_profile_sha256` und `error_detail`.
+`finish_task_attempt` erhält passende `p_<name>`-Parameter, alle `DEFAULT NULL`
+und als `coalesce(p_x, x)` angewandt. `DEFAULT NULL` ist der Grund, warum C
+allein vor A und B integriert werden kann: ein unveränderter Aufrufer läuft
+weiter.
+
+**Basen und Diffs.** Implementierungs- und Review-Diff ist `801c491..HEAD`.
+Der Release-Diff für die Provenienz ist
+`hunt-readiness-baseline-402b8bd..HEAD`. `main` bleibt bis zum abschließenden
+Fast-forward auf `801c491` eingefroren. Kein Remote-Push.
+
+**Gates an der Baseline `801c491`**, vom Lead vor der Parallelisierung gemessen,
+alle vier grün: `check_audit` rc=0; `check_wiring` rc=0 (64 Register-Zeilen);
+`check_baseline` rc=0 (classifications=10, regressions=7, adapters=10,
+artifacts=223); `check_coverage` rc=0 (census 223 reconciled).
+
+**CodeGraph.** Das MCP-Tool steht in dieser Sitzung nicht zur Verfügung. Die
+CLI ist der Weg: `codegraph explore "<Symbole>" -p <eigener Worktree>`. Jeder
+der vier Worktrees hat seit dem 23.08.2026 einen eigenen Index, weil die
+Branches während der Implementierung auseinanderlaufen. `.codegraph/` steht in
+`.gitignore` und wird nie committet.
+
 ### Lead — Integration und Live-Abnahme
 
 - [x] Wegen `main...origin/main [ahead 67]` vor Parallelisierung einen lokalen Tag und ein Git-Bundle von `402b8bd` außerhalb des Repos anlegen. Kein Remote-Push ohne gesonderte Freigabe.

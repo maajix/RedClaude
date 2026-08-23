@@ -7,7 +7,7 @@ recon Task to come from.
 
 **Blocked by:** nothing. Ticket 83 built `open_task` and this uses it unchanged.
 
-**Status:** ready-for-human
+**Status:** ready-for-agent
 
 - [x] **`suggested_tasks` is read at all.** It is declared in the
       `submit_mission_result` Contract (`roster.py:800`, `roster.py:1057`),
