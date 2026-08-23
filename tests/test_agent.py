@@ -1693,6 +1693,13 @@ class FindingProposalTest(unittest.TestCase):
         self.assertEqual(3, proposal.attempts)
         self.assertEqual(1, proposal.refused)
 
+    def test_the_ceiling_on_refused_proposals_is_three(self):
+        # Ticket 163 names the number so that a fix elsewhere is not mistaken
+        # for raising it. Three is one more than the number of mistakes a child
+        # can correct by asking again, and what makes those two correctable is
+        # the vocabulary reaching the child -- not a fourth attempt.
+        self.assertEqual(3, _launch.REFUSED_PROPOSALS)
+
     def test_the_ceiling_answers_a_token_and_carries_nothing(self):
         # Not a raise and not a silence. The model is told what it spent and
         # that this one was not asked, which is the only answer it can do
