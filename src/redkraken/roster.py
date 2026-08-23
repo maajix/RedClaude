@@ -937,6 +937,16 @@ _PAGE = (1, 200)
 #: documentation in the wrong place -- the description is where a field name a
 #: model has to guess belongs.
 #:
+#: A field whose value is one name: a ref this result minted, or the label of a
+#: row this Program already holds. Bounded rather than drawn from a vocabulary
+#: because there is no vocabulary -- eight Entity types spell their labels
+#: differently and a ref is whatever the model called it. What the declaration
+#: buys is the *field name*, which is the half ticket 164 found missing: an
+#: element's subject, its ends and its sentence were named in the tool's prose
+#: and nowhere else, so a paragraph added beside that prose was enough to make a
+#: recon run stop writing them and every Observation it sent be dropped.
+_NAME = Argument("string", bounds=(1, 200))
+
 #: `new_entities` is one list for eight Entity types, so its shape is the union
 #: of four fields no two of those types share: `kind` is an Application's,
 #: `location` and `value_class` are a Parameter's, `class` is an Identity's.
@@ -951,10 +961,26 @@ _ELEMENTS: dict[str, Mapping[str, Argument]] = {
         "value_class": Argument("string", enum=PARAMETER_VALUE_CLASSES),
         "class": Argument("string", enum=IDENTITY_CLASSES),
     },
-    "relationships": {"type": Argument("string", enum=RELATIONSHIP_TYPES)},
-    "observations": {"kind": Argument("string", enum=tuple(OBSERVATION_KINDS))},
+    "relationships": {
+        "type": Argument("string", enum=RELATIONSHIP_TYPES),
+        "src_ref": _NAME,
+        "src_label": _NAME,
+        "dst_ref": _NAME,
+        "dst_label": _NAME,
+    },
+    "observations": {
+        "kind": Argument("string", enum=tuple(OBSERVATION_KINDS)),
+        "subject_ref": _NAME,
+        "subject_label": _NAME,
+        # The sentence, under the one name promotion reads it by. Bounded at
+        # what the column takes, so a sentence too long to store is refused
+        # while the run is there to shorten it rather than stored cut in half.
+        "summary": Argument("string", bounds=(1, 2000)),
+    },
     "hypotheses": {
         "property_class": Argument("string", enum=PROPERTY_CLASSES),
+        "subject_ref": _NAME,
+        "subject_label": _NAME,
         # The one field in this table whose column is not text. `type: object`
         # is the half that matters: a run that writes a paragraph here has its
         # whole claim dropped after the run has ended, where a schema refuses
@@ -973,8 +999,16 @@ _ELEMENTS: dict[str, Mapping[str, Argument]] = {
     "evidence": {
         "polarity": Argument("string", enum=EVIDENCE_POLARITIES),
         "role": Argument("string", enum=EVIDENCE_ROLES),
+        "observation_ref": _NAME,
+        "observation_label": _NAME,
+        "hypothesis_ref": _NAME,
+        "hypothesis_label": _NAME,
     },
-    "suggested_tasks": {"kind": Argument("string", enum=TASK_KINDS)},
+    "suggested_tasks": {
+        "kind": Argument("string", enum=TASK_KINDS),
+        "subject_ref": _NAME,
+        "subject_label": _NAME,
+    },
 }
 
 # The view each read comes through, then the canonical relations behind it.
