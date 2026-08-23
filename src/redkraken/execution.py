@@ -31,13 +31,15 @@ slice through a callback it is given, because `proxy` imports `program` and a
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import agent, capsule as capsule_module, isolation, migrate
+from redkraken import _startup, agent, build, capsule as capsule_module, isolation, migrate
 from redkraken import packet as packet_module, pg, playbook as playbook_module
 from redkraken import program, proposal, proxy, replay as replay_module, roster, state as state_module, store
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
@@ -101,6 +103,10 @@ CLAIMED = tuple(name for name in REQUIRED if name != CERTIFICATE) + tuple(
 #: out at each is a kind that can be renamed in one place out of two.
 PERFORM = "perform"
 
+#: The kind that names a Finding rather than measuring one, named for the same
+#: reason: the dispatch branch and ticket 163's vocabulary read both ask for it.
+CONCLUDE = "conclude"
+
 MISSIONS = {
     "recon": "Map what this target exposes.",
     "hunt": "Look for one exploitable weakness in this target.",
@@ -137,6 +143,15 @@ STOP_REASONS = {
 ACCEPTED_STOPS = (
     "completed", "stop_condition", "budget", "refusal", "error", "aborted", "parked",
 )
+
+#: The two words that mean a run ended of its own accord. Ticket 161: everything
+#: else in `ACCEPTED_STOPS` means the run was cut where it stood -- a token
+#: ceiling, a turn ceiling, an SDK error, a child that died -- and a session cut
+#: off mid-sentence did not decline the Slate, it never finished reading it.
+#: Named as the small set rather than the large one because the large one grows:
+#: a stop reason added later is a way of being cut off until somebody says it is
+#: not, which is the safe direction for this particular question.
+ANSWERED_STOPS = ("completed", "stop_condition")
 
 #: One scheduler pass, in the three steps the corpus states it in. All three,
 #: because `offer_slate` on its own offers nothing: `rank_candidates` filters on
@@ -354,6 +369,14 @@ SELECTED = (
     " ORDER BY s.rank"
 )
 
+#: Ticket 163. The words a `conclude` child is allowed to name, read from the
+#: table that defines them. Read per attempt rather than held as a Python
+#: constant for the reason the roster already gives for not making it an enum:
+#: a second copy of this table goes stale, and a migration that seeds a new
+#: class would leave the prompt describing the old vocabulary. `rk2hunt17` spent
+#: six runs and eighteen proposals guessing words that were never in it.
+CLASSES = "SELECT id FROM vulnerability_classes ORDER BY id"
+
 #: Ticket 164's answer to "nothing in the corpus is about this subject", which
 #: was true and unusable: it named no Playbook and no fact, so an operator
 #: looking at a Drupal login page and a corpus holding a CMS Playbook had
@@ -465,7 +488,126 @@ EXCHANGE = (
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
 PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
-FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3, $4)"
+#: The one call that closes an Agent run, its Task and its Reservation. Named
+#: arguments rather than positional ones since ticket 165 widened it: the
+#: parameters past the two totals all default to NULL and are applied as
+#: `coalesce`, so a caller that names them cannot be broken by one being added
+#: between two others.
+FINISH = (
+    "SELECT finish_task_attempt("
+    "p_agent_run => $1::uuid,"
+    " p_stop_reason => $2,"
+    " p_input_tokens => $3,"
+    " p_output_tokens => $4,"
+    " p_uncached_input_tokens => $5,"
+    " p_cache_creation_input_tokens => $6,"
+    " p_cache_read_input_tokens => $7,"
+    " p_answer_count => $8,"
+    " p_budget_tokens => $9,"
+    " p_budget_policy => $10,"
+    " p_error_detail => $11,"
+    " p_attempt_profile_sha256 => $12)"
+)
+
+#: What a child reported spending, in the order `FINISH` names it after the two
+#: totals. One tuple rather than the names written out at each of the two
+#: closings, because the two would drift and the drift would be silent: a key
+#: spelled here and not there is a column that stays NULL for half the runs.
+SPEND = (
+    "uncached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "answer_count",
+    "budget_tokens",
+    "budget_policy",
+    "error_detail",
+)
+
+
+#: The word this build charges a run against its ceiling under. Ticket 165: the
+#: provider's own `input_tokens` is every turn's whole request, prefix and all,
+#: which made a token ceiling into a turn ceiling -- 250 000 bought a
+#: `web_hunter` six turns and a `conclude` needs more than six. The child does
+#: the counting and reports the word back; this copy is what the dispatch is
+#: profiled under, because a profile is needed before there is a child to ask.
+BUDGET_POLICY = "cache-credit-v1"
+
+#: How many times this Task has already ended on its ceiling under exactly this
+#: dispatch. Read rather than counted from the facts, because the attempts that
+#: matter are earlier passes' and this process has no memory of them.
+BUDGET_ENDS = (
+    "SELECT count(*)::int FROM agent_runs"
+    " WHERE task_id = $1::uuid AND stop_reason = 'budget'"
+    " AND attempt_profile_sha256 = $2"
+)
+
+
+@functools.cache
+def _tree_digest() -> str:
+    """What this installation's modules hash to, computed once per process.
+
+    Part of the attempt profile because a build that changed is a dispatch that
+    changed: the objective, the ceiling arithmetic and the tool surface all live
+    in these modules, so a Task refused a third attempt under one build is owed
+    a first one under the next.
+    """
+    return build.verify().tree_digest
+
+
+def attempt_profile(claimed: Claimed, mission: packet_module.Packet, role: roster.Role) -> str:
+    """What this dispatch is, as one digest, so that a repeat can be recognised.
+
+    Ticket 165. `rk2hunt20`'s T6 ended on `budget` twice and was still at the
+    top of the ranking for a third identical attempt: the scheduler ranks a
+    Task, not a Task-and-how-it-was-sent, so "already tried and it did not fit"
+    is not a thing it can see. This is the sentence that makes it visible.
+
+    Everything that changes what the child is asked to do inside what ceiling:
+    the Task, the packet it reads, the role and model that read it, the ceiling
+    itself, the policy the ceiling is counted under and the build doing the
+    counting. A change to any of them is a genuinely different attempt and earns
+    a first retry again.
+
+    Not the recovery hint. The hint is what this runtime says *because* the
+    profile repeated, so a profile that included it would differ on the retry it
+    is the consequence of -- and the second budget end would look like a first
+    one forever.
+    """
+    described = {
+        "task": claimed.task_id,
+        "packet": hashlib.sha256(packet_module.encode(mission.as_dict())).hexdigest(),
+        "role": claimed.role,
+        "model": role.model,
+        "token_cap": claimed.token_cap,
+        "budget_policy": BUDGET_POLICY,
+        "build": _tree_digest(),
+        "runtime": list(_startup.KNOWN_RUNTIME),
+    }
+    return hashlib.sha256(
+        json.dumps(described, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def spent(result: "agent.AgentRunResult | None") -> dict:
+    """What one child's report says its run cost, keyed as the columns are.
+
+    Nothing rather than zero where no child answered, for the reason the facts
+    already give about the two totals: a run whose child never reported spent an
+    amount nobody measured, and a zero written here would be settled against.
+    """
+    if result is None:
+        return dict.fromkeys(SPEND)
+    return {
+        "uncached_input_tokens": result.uncached_input_tokens,
+        "cache_creation_input_tokens": result.cache_creation_input_tokens,
+        "cache_read_input_tokens": result.cache_read_input_tokens,
+        "answer_count": result.answer_count,
+        "budget_tokens": result.budget_tokens,
+        # Empty is a child that named no policy, and the column is left alone
+        # rather than told the run was counted under a word nobody used.
+        "budget_policy": result.budget_policy or None,
+        "error_detail": result.error_detail,
+    }
 
 #: Ticket 143. The other ending, for a Task that never reached an attempt
 #: because this runtime cannot dispatch it. `FINISH` settles an attempt and
@@ -565,6 +707,27 @@ def stopped_as(reported: str | None) -> str:
     return STOP_REASONS.get(reported, "error")
 
 
+def cut_off(result: "agent.AgentRunResult | None") -> str | None:
+    """The word for a session that answered nothing because it ran out of room.
+
+    Ticket 161. `rk2hunt17` lap 6 offered three ready Tasks, the orchestrator
+    stopped on `budget` at 175 027 input tokens without picking one, and the
+    pass reported `nothing_to_execute` -- which `hunt.sh` reads as "the campaign
+    is finished" and stopped on, with six of twelve laps unused. A session that
+    declined the Slate and a session that never got to look at it are different
+    events, and only the first is a campaign decision.
+
+    Nothing for a session that answered, whatever it answered: a pick, an
+    unreadable pick, or a considered nothing. The word for the ones that did not
+    is the stop reason itself, because "which ceiling" is the next question an
+    operator asks and it is already in the answer.
+    """
+    if result is None or result.choice or result.pick_attempts:
+        return None
+    stopped = stopped_as(result.stop_reason)
+    return None if stopped in ANSWERED_STOPS else stopped
+
+
 @dataclass(frozen=True, slots=True)
 class Chosen:
     """What one orchestrator decision came to, in the words the runtime acts on.
@@ -581,6 +744,13 @@ class Chosen:
     `task_label` is what the session named even where the outcome refused it.
     A refusal that forgot the label would leave an operator asking why nothing
     ran with no way to see what was asked for.
+
+    `cut_off` is the half `outcome` cannot carry. `record_choice` writes five
+    words and none of them distinguishes a session that declined the Slate from
+    one that was cut off before it read it -- both are `no_choice` there, and
+    ticket 161 is what that cost. So the stop reason travels beside the outcome
+    rather than instead of it: the row still says what the database recorded,
+    and the pass can still say which of the two an operator is looking at.
     """
 
     agent_run_id: str
@@ -589,6 +759,7 @@ class Chosen:
     task_label: str | None
     attempts: int
     detail: str | None
+    cut_off: str | None = None
 
     @property
     def committed(self) -> bool:
@@ -609,6 +780,7 @@ class Chosen:
             "task": self.task_label,
             "attempts": self.attempts,
             "detail": self.detail,
+            "cut_off": self.cut_off,
         }
 
 
@@ -764,7 +936,12 @@ class Claimed:
             test_label=(None if len(row) < 16 or row[15] is None else str(row[15])),
         )
 
-    def objective(self, playbooks: Sequence[playbook_module.Projection]) -> str:
+    def objective(
+        self,
+        playbooks: Sequence[playbook_module.Projection],
+        vocabulary: Sequence[str] = (),
+        completion_only: bool = False,
+    ) -> str:
         """The whole of what the child is told, and the shape of what it owes back.
 
         The target is named because the child cannot look it up: its packet
@@ -799,8 +976,10 @@ class Claimed:
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
         )
-        if self.kind == "conclude" and self.hypothesis_label is not None:
-            return self._selected(self._conclusion(head), playbooks)
+        if self.kind == CONCLUDE and self.hypothesis_label is not None:
+            return self._finishing(
+                self._selected(self._conclusion(head, vocabulary), playbooks), completion_only
+            )
         prompt = (
             f"{head}"
             "Send that one request with mcp__rk2__http_request and read the answer. "
@@ -839,9 +1018,9 @@ class Claimed:
                 "conditions above -- so a plan authored after it is a plan this run "
                 "never files."
             )
-        return self._selected(prompt, playbooks)
+        return self._finishing(self._selected(prompt, playbooks), completion_only)
 
-    def _conclusion(self, head: str) -> str:
+    def _conclusion(self, head: str, vocabulary: Sequence[str] = ()) -> str:
         """Ticket 156. What a child is told when the measuring is already done.
 
         The other kinds are asked to establish something. This one is asked to
@@ -854,7 +1033,28 @@ class Claimed:
         that did that here would spend its turns re-measuring a claim the
         runtime has already settled -- and would end the run without ever
         calling the one tool the Task was opened for.
+
+        Ticket 163: the vocabulary is written out here rather than referred to.
+        "A vulnerability class from this harness's vocabulary" named a table the
+        child has no route to, so it guessed, and `propose_finding` refuses a
+        guess by name three times and then stops carrying proposals at all.
+        Thirty-seven short words cost less than one refused proposal, and they
+        come from the table on every attempt so that seeding a new class cannot
+        leave this paragraph describing the old list.
         """
+        classes = (
+            "\n\nThe classes are, and are only:\n"
+            f"{', '.join(vocabulary)}.\n\n"
+            "Name one of those ids exactly. A word that is not on that list is "
+            "refused for not being on it, however well it describes the weakness. "
+            "If none of them names this one, do not reach for the nearest synonym: "
+            "say so in mcp__rk2__submit_mission_result, naming the ids you weighed, "
+            "and let the run end without a Finding. That is an answer this harness "
+            "can act on; three refusals of three spellings of the same absent word "
+            "is not."
+            if vocabulary
+            else ""
+        )
         return (
             f"{head}"
             f"The claim {self.hypothesis_label} is supported. The runtime replayed "
@@ -871,10 +1071,40 @@ class Claimed:
             "part of this a person cannot correct later without reopening the "
             "Finding. If seeing the target once would settle which class it is, "
             "send that one request with mcp__rk2__http_request first -- and if it "
-            "would not, do not send it.\n\n"
+            f"would not, do not send it.{classes}\n\n"
             "The runtime answers created, merged or refused. Merged means a Finding "
             "is already open on this cell and your claim was added to it, which is a "
             "result and not a rejection."
+        )
+
+    @staticmethod
+    def _finishing(prompt: str, completion_only: bool) -> str:
+        """Ticket 165's second dispatch: the same Task, told to finish it.
+
+        The first attempt under this dispatch spent the whole ceiling and closed
+        nothing, and the ceiling is not a token budget -- a turn's request is the
+        whole prefix, so what it buys is turns. Sending the same instruction
+        again buys the same turns and spends them the same way, which is what
+        `rk2hunt20`'s T6 did twice.
+
+        So the retry is not a wider budget, it is a narrower job: the packet it
+        already has, no fresh looking, and the calls that end the Task. Said as
+        the last paragraph because it is the one that has to survive a model
+        skimming the middle.
+        """
+        if not completion_only:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            "This Task has already run out of tokens once, doing exactly this. Its "
+            "ceiling buys turns rather than tokens -- every turn re-sends the whole "
+            "transcript -- so this attempt is for finishing it and nothing else. "
+            "Work from the Mission packet you were given: it is the same packet, and "
+            "reading the world again to confirm it is how the last attempt ended with "
+            "nothing filed. Do not explore, do not re-read what the packet already "
+            "carries, and send no request that would only tell you what it says. Call "
+            "the verbs that submit what this Task owes, in the order named above, and "
+            "end. A partial answer that is filed beats a complete one that is not."
         )
 
     @staticmethod
@@ -914,6 +1144,13 @@ class Claimed:
                 "token_cap": self.token_cap,
                 "input_tokens": None,
                 "output_tokens": None,
+                # Ticket 165's numbers, absent for the same reason and filled
+                # from the child's report where there is one. `attempt_profile`
+                # is the exception: it describes the dispatch rather than the
+                # run, so it is known before the child starts and is written
+                # whether or not one answers.
+                **dict.fromkeys(SPEND),
+                "attempt_profile": None,
             },
         }
 
@@ -1210,6 +1447,19 @@ class Slice:
         pass's open will write instead. What it must not do is take the pass
         down with it -- the session is closed by arithmetic, and arithmetic that
         cannot be recorded is not a reason to fail work that already succeeded.
+
+        Ticket 161 asked when a session closed on `tokens` is meant to rotate,
+        and this pair of calls is the answer as it stands: **the pass that
+        spends a ceiling closes the session, and the next pass opens its
+        successor**. No operator is in it, and nothing rotates mid-pass -- a
+        turn is an Agent run and a run is not restarted halfway through. What
+        `rk2hunt17` shows is not a rotation that failed but a successor nobody
+        asked for: one row at generation 1, `close_reason` `tokens`,
+        `rotated_from` null, because `hunt.sh` read the pass's
+        `nothing_to_execute` as the campaign being finished and never ran the
+        pass that would have opened generation 2. So the fix is the stop reason
+        rather than the rotation, and this hold says which of the two happened
+        so an operator does not have to read the table to find out.
         """
         try:
             with connection.transaction():
@@ -1229,7 +1479,8 @@ class Slice:
         ledger.hold(
             "rotation",
             f"{closed.get('session')} reached its {closed.get('reason')} ceiling "
-            f"and was closed at the end of the pass",
+            f"and was closed at the end of the pass; the next pass opens the "
+            f"successor that continues this campaign",
         )
         return closed
 
@@ -1575,6 +1826,13 @@ class Slice:
         by the same function the model would have called. A runtime that decided
         it here would be deciding it against a copy of the Slate with no lock on
         it, and would refuse a choice the claim would have honoured.
+
+        Ticket 161: a session cut off before it answered is still `no_choice` to
+        the database, because that vocabulary is a migration's and there is no
+        fifth word to write. What changes is that the stop reason stops being
+        dropped -- it goes into the detail the Event carries, and `cut_off`
+        carries it out to the pass, so the two ways of picking nothing are
+        legible in the record and in what the command reports.
         """
         if result is None:
             return "unavailable", None, "no session answered"
@@ -1586,6 +1844,9 @@ class Slice:
                 None,
                 f"{result.pick_attempts} pick(s) carried no task label",
             )
+        stopped = cut_off(result)
+        if stopped is not None:
+            return "no_choice", None, f"the session stopped as {stopped} before it chose"
         return "no_choice", None, None
 
     def _record(
@@ -1638,6 +1899,7 @@ class Slice:
                 task_label=task,
                 attempts=0 if result is None else result.pick_attempts,
                 detail=str(error),
+                cut_off=cut_off(result),
             )
         chosen = Chosen(
             agent_run_id=session.agent_run_id,
@@ -1649,12 +1911,18 @@ class Slice:
             ),
             attempts=0 if result is None else result.pick_attempts,
             detail=None if recorded.get("detail") is None else str(recorded["detail"]),
+            cut_off=cut_off(result),
         )
         ledger.hold(
             "choice",
             f"{session.label} answered {chosen.outcome}"
             + (f" ({chosen.task_label})" if chosen.task_label else "")
-            + f" after {chosen.attempts} pick(s)",
+            + f" after {chosen.attempts} pick(s)"
+            + (
+                ""
+                if chosen.cut_off is None
+                else f", having stopped as {chosen.cut_off} rather than declined the Slate"
+            ),
         )
         return chosen
 
@@ -1674,6 +1942,7 @@ class Slice:
         try:
             with connection.transaction():
                 _actor(connection)
+                usage = spent(result)
                 connection.execute(
                     FINISH,
                     (
@@ -1681,6 +1950,11 @@ class Slice:
                         "aborted" if result is None else stopped_as(result.stop_reason),
                         None if result is None else result.input_tokens,
                         None if result is None else result.output_tokens,
+                        *(usage[name] for name in SPEND),
+                        # A session holds no Task, so there is no attempt to
+                        # profile: what ticket 165 counts is budget ends on one
+                        # Task under one unchanged dispatch.
+                        None,
                     ),
                 )
         except pg.DatabaseError as error:
@@ -1823,6 +2097,13 @@ class Slice:
         if selected is None:
             return
 
+        # Read here for the same reason the Playbooks are: a vocabulary the
+        # child is shown after it has started is a vocabulary it proposed
+        # without.
+        vocabulary = self._vocabulary(ledger, connection, claimed)
+        if vocabulary is None:
+            return
+
         mission = self._packet(
             ledger,
             connection,
@@ -1843,6 +2124,31 @@ class Slice:
             },
         }
 
+        # Ticket 165, and after the packet because the packet is part of it: two
+        # attempts that read different documents are two attempts, however alike
+        # the rest of the dispatch looks. Before the capability, because a Task
+        # this pass is about to end should not have one minted for it.
+        profile = attempt_profile(claimed, mission, role)
+        facts["agent_run"]["attempt_profile"] = profile
+        ended = self._budget_ends(ledger, connection, claimed, profile)
+        if ended is None:
+            return
+        if ended >= 2:
+            # `rk2hunt20`'s T6: two full-cap runs, still `pending`, still at the
+            # top of the ranking. A third identical attempt is the second one
+            # again, and the campaign pays for it out of the same capacity.
+            self._retire(
+                ledger,
+                connection,
+                claimed,
+                "budget",
+                f"{claimed.task_label} ended on its token ceiling twice under this "
+                f"dispatch and nothing about it has changed since, so a third would "
+                f"end the same way: budget_exhausted_twice, profile {profile[:12]}",
+            )
+            return
+        objective = claimed.objective(selected, vocabulary, completion_only=ended == 1)
+
         opened = self._authorize(ledger, connection, program_id, claimed, selected, facts)
         if opened is None:
             return
@@ -1857,7 +2163,7 @@ class Slice:
             try:
                 with self._heartbeat(ledger, connection, claimed, facts):
                     result = self._child(
-                        ledger, claimed, selected, mission, door, lifetime, program_id,
+                        ledger, claimed, objective, mission, door, lifetime, program_id,
                         # Always, now. This used to read the settings only where
                         # a tool image was described, on the argument that a
                         # machine serving no tool call needs no connection --
@@ -1898,6 +2204,7 @@ class Slice:
             facts["agent_run"]["stop_reason"] = stopped_as(result.stop_reason)
             facts["agent_run"]["input_tokens"] = result.input_tokens
             facts["agent_run"]["output_tokens"] = result.output_tokens
+            facts["agent_run"].update(spent(result))
             # Which verbs the child actually reached for, and which it was
             # refused. The launcher has collected both since ticket 86 and
             # nothing has ever read them: `AgentRunResult.as_dict` has no
@@ -2004,6 +2311,37 @@ class Slice:
         # attempt spent and the Task correctly not done.
         settled = performed.facts.get("test_run") is not None
         run["stop_reason"] = "completed" if settled else "error"
+
+    def _budget_ends(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed, profile: str
+    ) -> int | None:
+        """How often this exact dispatch has already run out of tokens. 165.
+
+        `None` is a read that failed, which stops the attempt: dispatching
+        anyway would be spending the ceiling on the question this read exists to
+        answer, and the retry that follows would be the same run a third time.
+        """
+        try:
+            ended = int(
+                connection.execute(BUDGET_ENDS, (claimed.task_id, profile)).scalar() or 0
+            )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "budget",
+                f"what {claimed.task_label} has already spent under this dispatch "
+                f"could not be read: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        if ended:
+            ledger.hold(
+                "budget",
+                f"{claimed.task_label} has ended on its token ceiling {ended} time(s) "
+                f"under this dispatch; this attempt is "
+                + ("completion only" if ended == 1 else "not made"),
+            )
+        return ended
 
     def _retire(
         self,
@@ -2154,6 +2492,48 @@ class Slice:
             "revocation",
             f"{tool_run['label']} closed as {outcome}; its capability no longer resolves",
         )
+
+    def _vocabulary(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed
+    ) -> tuple[str, ...] | None:
+        """The vulnerability classes a `conclude` child may name. Ticket 163.
+
+        Asked only where the objective uses it, because the other kinds propose
+        no Finding and a read they never spend is a read they should not make.
+        `None` is a refusal to dispatch: a `conclude` child sent out without the
+        vocabulary is the run `rk2hunt17` had six of -- it calls the one tool
+        the Task was opened for, is refused for a word nobody showed it, and
+        ends with the Task exactly where it started.
+        """
+        if claimed.kind != CONCLUDE:
+            return ()
+        try:
+            rows = connection.execute(CLASSES).rows
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "vocabulary",
+                f"the vulnerability classes {claimed.task_label} has to name one of "
+                f"could not be read: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        classes = tuple(str(row[0]) for row in rows)
+        if not classes:
+            ledger.fail(
+                "vocabulary",
+                "vulnerability_classes is empty, so no Finding this Program proposes "
+                "could name a class; the schema is seeded by a migration",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        ledger.hold(
+            "vocabulary",
+            f"{len(classes)} vulnerability class(es) travel in {claimed.task_label}'s "
+            "objective, so the child names one rather than guessing at one",
+        )
+        return classes
 
     def _playbooks(
         self,
@@ -2548,7 +2928,7 @@ class Slice:
         self,
         ledger: Ledger,
         claimed: Claimed,
-        playbooks: Sequence[playbook_module.Projection],
+        objective: str,
         mission: packet_module.Packet,
         door: agent.Egress,
         lifetime: float,
@@ -2573,7 +2953,7 @@ class Slice:
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
             agent_run_id=claimed.agent_run_id,
-            objective=claimed.objective(playbooks),
+            objective=objective,
             container=self.boundary,
             role=claimed.role,
             program_id=program_id,
@@ -2881,6 +3261,8 @@ class Slice:
                             stop_reason,
                             run.get("input_tokens"),
                             run.get("output_tokens"),
+                            *(run.get(name) for name in SPEND),
+                            run.get("attempt_profile"),
                         ),
                     ).scalar()
                 )

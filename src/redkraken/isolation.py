@@ -9,8 +9,8 @@ the Agent process.
 
 The caller supplies no Docker arguments.  It supplies an image, the already
 running proxy peer, an argv and the host directories an Agent needs to exist
-at all -- the application, the SDK it is measured against, the home its
-credential is resolved from.  The runtime verifies the topology, constructs the
+at all -- the application, the SDK it is measured against, the home the CLI
+keeps its session state in.  The runtime verifies the topology, constructs the
 complete child environment, decides where each of those is mounted and which of
 them may be written, adds the run certificate (never its directory or signing
 key), and applies the process restrictions itself.
@@ -126,15 +126,36 @@ HOMES = "rk2-agent-homes"
 #: the size, so what was pointed at is visible in the refusal.
 HOME_CEILING = 64 * 1024 * 1024
 
-#: The one thing under a home that a run does not get its own copy of. The CLI
-#: refreshes its own credential and writes the result where it found the old
-#: one, so a credential that only ever existed in a copy is a token refreshed
-#: into a directory about to be deleted -- and the run after the first expiry
-#: presenting one that has already been spent. It crosses as itself instead, out
-#: of the template and back into it, which is also the only way the supervisor
-#: never has to read it: the operator's token is the child's to use and nobody
-#: else's to copy.
+#: The one thing under a home that never crosses the boundary at all. Ticket
+#: 146: the CLI refreshes its own credential by renaming a new file over the
+#: old one, which breaks a hard link, so an engagement copy stops tracking the
+#: operator's token the first time the operator's own session refreshes -- and
+#: the file that is left is one the contained user cannot write. Neither
+#: copying it nor mounting it survives that, so this runtime does neither. What
+#: a child authenticates with is the setup token below, handed to it on its own
+#: stdin. An operator's existing `.credentials.json` is ignored where it lies
+#: and is never deleted by anything here.
 CREDENTIAL = ".claude/.credentials.json"
+
+#: Where the Claude setup token lives, and the one variable that moves it. A
+#: file rather than an environment variable on the supervisor, because an
+#: environment variable is inherited by every child of every process this
+#: operator starts and a `0600` file is read by exactly the reader that opens
+#: it. Consumed as `CLAUDE_CODE_OAUTH_TOKEN` inside the short-lived child and
+#: nowhere else; `tools/setup-agent-oauth.sh` is what installs one.
+OAUTH_TOKEN = "~/.config/redkraken/claude-oauth-token"
+OAUTH_TOKEN_VARIABLE = "RK_AGENT_OAUTH_TOKEN_FILE"
+
+#: What an operator is told to run when there is no usable token. Named once,
+#: because a remedy spelled out at each refusal is a remedy that can be right in
+#: one refusal out of five.
+OAUTH_TOKEN_REMEDY = "run tools/setup-agent-oauth.sh to install one"
+
+#: When a setup token is old enough to be worth replacing before a run finds
+#: out. Setup tokens last about a year, so 330 days leaves a month to act in --
+#: and this is a warning rather than a refusal, because a token that still works
+#: is one an operator may finish the hunt on.
+OAUTH_TOKEN_DAYS = 330
 
 
 #: How a child asks the supervisor to do something while it is still running,
@@ -320,7 +341,6 @@ def run(
     if not certificate.is_file():
         raise Unavailable(f"the run trust root is not a readable file: {certificate}")
 
-    credential = seeded_credential(container.home)
     with held(container.network), own_home(container.home) as home:
         return _launched(
             replace(container, home=home),
@@ -330,7 +350,6 @@ def run(
             timeout,
             engine,
             certificate,
-            credential,
             answer,
         )
 
@@ -343,7 +362,6 @@ def _launched(
     timeout: float,
     engine: str,
     certificate: Path,
-    credential: Path | None = None,
     answer: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """The checked launch, inside the claim `run` holds on the network.
@@ -362,7 +380,7 @@ def _launched(
 
     inherited = os.environ if source_environment is None else source_environment
     environment = container_environment(container, inherited)
-    mounts = _mounts(container, certificate, credential)
+    mounts = _mounts(container, certificate)
 
     name = f"rk2-agent-{uuid.uuid4().hex}"
     docker = [
@@ -1132,9 +1150,7 @@ def _supplied(container: AgentContainer) -> list[tuple[str, Path, bool, bool]]:
     ]
 
 
-def _mounts(
-    container: AgentContainer, certificate: Path, credential: Path | None = None
-) -> list[str]:
+def _mounts(container: AgentContainer, certificate: Path) -> list[str]:
     """Everything the runtime puts inside the boundary, and nothing else.
 
     The trust root crosses as a file rather than as the directory holding it,
@@ -1151,11 +1167,11 @@ def _mounts(
     carry the operator's own home, and the writable one has to be writable by
     the user the child actually runs as.
 
-    `credential` is the one file that crosses out of the template rather than
-    out of the copy.  The CLI writes its refreshed credential where it read the
-    old one, so a credential that lived only in the copy would be refreshed into
-    a directory this run is about to delete; and mounting it means the
-    supervisor never reads the operator's token to copy it, only names it.
+    No credential crosses here at all.  Ticket 146: a `.credentials.json`
+    mounted in place is one the contained user has to be able to write, and one
+    the CLI breaks the link of the first time it refreshes -- so the file this
+    used to mount is neither mounted nor copied now, and what a child
+    authenticates with is the setup token, carried on its own stdin.
     """
     arguments = ["--mount", f"type=bind,src={certificate},dst={CA_FILE},readonly"]
     for destination, host, readonly, _ in _supplied(container):
@@ -1163,16 +1179,6 @@ def _mounts(
         _refuse_uncontained(source, readonly)
         mount = f"type=bind,src={source},dst={destination}"
         arguments.extend(("--mount", f"{mount},readonly" if readonly else mount))
-    if credential is not None and container.home is not None:
-        # Written in place or not at all: a file mounted over is a file nothing
-        # can be renamed onto, so a CLI that refreshes by replacing its
-        # credential fails inside the child rather than quietly refreshing into
-        # a copy this run is about to delete. Which means the child has to be
-        # able to write the file itself, and an installation where it cannot is
-        # one whose next token expiry ends it -- said now, once, with the path.
-        if not writable_by_the_child(credential, wanted=0o200):
-            raise Unavailable(f"an Agent credential the child cannot write: {credential}")
-        arguments.extend(("--mount", f"type=bind,src={credential},dst={HOME_DIR}/{CREDENTIAL}"))
     return arguments
 
 
@@ -1403,13 +1409,13 @@ def own_home(template: Path | None) -> Iterator[Path | None]:
     same leak, slower. Nothing here needs it kept: what a session resumes from
     is the capsule in the database, not a file in a home.
 
-    The credential is the exception, and it is not copied at all -- `_mounts`
-    puts the template's own file inside the run.  It has to survive: the CLI
-    refreshes its token and writes the new one where it read the old, so a
-    credential kept in the copy would be refreshed into a directory this run is
-    about to delete, leaving the template holding a token already spent for the
-    run after it.  Mounting it also means the file the operator authenticated
-    with is never read by this process, only named to the engine.
+    The credential is the exception, and it is not copied at all.  Ticket 146:
+    it used to be mounted out of the template instead, so that the CLI's own
+    refresh landed where the operator would read it next -- and that refresh is
+    a rename, which breaks the link and leaves a file the contained user cannot
+    write.  Nothing replaces it here.  What a child authenticates with is the
+    setup token `oauth_token` reads, handed to it on its own stdin, and the
+    operator's `.credentials.json` stays where it is with nothing reading it.
 
     `None` stays `None`. A container with no home mounted has no credential at
     all rather than somebody else's, which is the contained value.
@@ -1501,7 +1507,10 @@ def _not_the_credential(source: Path) -> Callable[[str, list[str]], set[str]]:
 
     By path and not by name.  A file called `.credentials.json` further down a
     home is an ordinary file of the run's, and the reason this one is skipped is
-    not what it is called but that it is mounted out of the template instead.
+    not what it is called but that it is the operator's own subscription
+    credential -- which since ticket 146 does not cross the boundary at all,
+    neither copied nor mounted.  Left where it lies and never deleted: what an
+    operator seeded is theirs, and this runtime has simply stopped reading it.
     """
     holder = source / Path(CREDENTIAL).parent
 
@@ -1512,17 +1521,121 @@ def _not_the_credential(source: Path) -> Callable[[str, list[str]], set[str]]:
     return ignored
 
 
-def seeded_credential(template: Path | None) -> Path | None:
-    """The credential in a configured home, if the operator put one there.
+def oauth_token_file(environment: Mapping[str, str] | None = None) -> Path:
+    """Where this machine keeps its setup token, without asking whether it is there.
 
-    A symlink is not one.  What this returns is mounted into the child writable,
-    and a link is a way of naming a file the operator did not mean to hand over
-    -- the same reason `_carries_operator_home` is asked of every mount.
+    One default and one override, and the override has to be absolute: a
+    relative path would be resolved against whatever directory the supervisor
+    happened to be started in, which is a different file per operator shell.
     """
-    if template is None:
+    described = os.environ if environment is None else environment
+    named = described.get(OAUTH_TOKEN_VARIABLE)
+    if not named:
+        return Path(OAUTH_TOKEN).expanduser()
+    path = Path(named)
+    if not path.is_absolute():
+        raise Unavailable(
+            f"${OAUTH_TOKEN_VARIABLE} names a relative path and has to name an "
+            f"absolute one: {named}"
+        )
+    return path
+
+
+def oauth_token(environment: Mapping[str, str] | None = None) -> str | None:
+    """The Claude setup token this machine holds, or nothing where it holds none.
+
+    Ticket 146. The token is what a contained child authenticates with, and it
+    reaches the child on the child's own stdin -- never in a Docker argument,
+    a log, the database, a Mission packet or an Artifact. So this is the one
+    place it is read, and everything that could make reading it unsafe is a
+    refusal rather than a warning: a symlink is a way of naming a file the
+    operator did not mean to hand over, a group or world bit is another local
+    account holding a live Anthropic token, and a second line is a file that is
+    not what this thinks it is.
+
+    Nothing is the honest answer for a machine with no token file, and it is
+    not an error here: `rk doctor` is where an operator is told, before a run
+    spends a Task's attempt finding out. A file that exists and cannot be
+    trusted is the other case entirely, and it refuses.
+
+    No refusal names the token. What is printed is the path, the property that
+    failed and the remedy, because a refusal an operator pastes into a ticket is
+    a refusal that must be safe to paste.
+    """
+    path = oauth_token_file(environment)
+    if not path.exists() and not path.is_symlink():
         return None
-    seeded = Path(template).resolve() / CREDENTIAL
-    return seeded if seeded.is_file() and not seeded.is_symlink() else None
+    _refuse_loose_token(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise Unavailable(
+            f"the Claude setup token at {path} cannot be read; {OAUTH_TOKEN_REMEDY}"
+        ) from None
+    lines = text.strip().splitlines()
+    if len(lines) > 1:
+        raise Unavailable(
+            f"the Claude setup token at {path} carries {len(lines)} lines and carries "
+            f"one value; {OAUTH_TOKEN_REMEDY}"
+        )
+    if not lines or not lines[0].strip():
+        raise Unavailable(
+            f"the Claude setup token at {path} is empty; {OAUTH_TOKEN_REMEDY}"
+        )
+    return lines[0].strip()
+
+
+def _refuse_loose_token(path: Path) -> None:
+    """Refuse a setup token file anybody but this operator could have reached.
+
+    Asked of the file and of the directory holding it, because a `0600` file in
+    a `0777` directory is a file another local account can rename away and
+    replace. Ownership is the supervisor's own uid rather than the contained
+    one: this file is never mounted, so the question is who on this machine can
+    read it, and the answer has to be nobody else.
+    """
+    if path.is_symlink():
+        raise Unavailable(
+            f"the Claude setup token at {path} is a symlink and has to be a regular "
+            f"file; {OAUTH_TOKEN_REMEDY}"
+        )
+    for subject, name in ((path, "token"), (path.parent, "token directory")):
+        try:
+            status = subject.stat()
+        except OSError:
+            raise Unavailable(
+                f"the Claude setup {name} at {subject} cannot be read; {OAUTH_TOKEN_REMEDY}"
+            ) from None
+        if status.st_uid != os.getuid():
+            raise Unavailable(
+                f"the Claude setup {name} at {subject} is owned by uid {status.st_uid} "
+                f"and has to be owned by the supervisor; {OAUTH_TOKEN_REMEDY}"
+            )
+        if status.st_mode & 0o077:
+            raise Unavailable(
+                f"the Claude setup {name} at {subject} is reachable by group or world "
+                f"({stat.filemode(status.st_mode)}); {OAUTH_TOKEN_REMEDY}"
+            )
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise Unavailable(
+            f"the Claude setup token at {path} is not a regular file; {OAUTH_TOKEN_REMEDY}"
+        )
+
+
+def oauth_token_days(environment: Mapping[str, str] | None = None) -> int | None:
+    """How many whole days ago the setup token was installed, or nothing.
+
+    Read off the file rather than out of the token, because the token is not
+    this runtime's to parse and its expiry is Anthropic's to decide. What the
+    age answers is the operator's question -- is this old enough to replace
+    before it ends a hunt -- and `OAUTH_TOKEN_DAYS` is where that is decided.
+    """
+    path = oauth_token_file(environment)
+    try:
+        installed = path.stat().st_mtime
+    except OSError:
+        return None
+    return int(max(0.0, time.time() - installed) // 86400)
 
 
 def _measured(source: Path) -> int:

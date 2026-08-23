@@ -164,51 +164,48 @@ except isolation.Unavailable as refusal:
         credential.chmod(0o666)
         return template
 
-    def test_the_credential_crosses_out_of_the_template_and_not_out_of_the_copy(self):
-        """PH2-86 criterion 4: what the CLI refreshes has to survive the run.
+    def test_the_credential_crosses_neither_as_a_copy_nor_as_a_mount(self):
+        """Ticket 146: the operator's own credential stops crossing at all.
 
-        The CLI writes its refreshed credential where it read the old one, so a
-        credential that lived in the copy would be refreshed into a directory
-        the run is about to delete -- and the run after the first expiry would
-        present a token already spent. It is the one thing not copied: the
-        template's own file is mounted at the path the CLI looks in, so a
-        refresh lands in the operator's home directly, and this process never
-        reads the token to copy it.
+        It used to be mounted out of the template, so that the CLI's refresh
+        landed where the operator would read it next. That refresh is a rename,
+        which breaks the link and leaves a file owned by the operator and
+        unwritable by uid 65534 -- so the arrangement ends every installation it
+        was built for. Nothing replaces it inside the boundary: the child is
+        handed a setup token on its own stdin instead, and the file the operator
+        seeded is left exactly where it is.
         """
         template = self.seeded()
+        credential = template.resolve() / ".claude" / ".credentials.json"
 
         with isolation.own_home(template) as home:
             self.assertFalse((home / ".claude" / ".credentials.json").exists())
             self.assertTrue((home / ".claude").is_dir())
             mounts = isolation._mounts(
-                fixtures.boundary(home=home),
-                template / "authority.pem",
-                isolation.seeded_credential(template),
+                fixtures.boundary(home=home), template / "authority.pem"
             )
 
-        credential = template.resolve() / ".claude" / ".credentials.json"
-        self.assertIn(
-            f"type=bind,src={credential},dst={isolation.HOME_DIR}/.claude/.credentials.json",
-            mounts,
+        self.assertEqual([], [item for item in mounts if str(credential) in item])
+        self.assertNotIn(
+            f"{isolation.HOME_DIR}/{isolation.CREDENTIAL}", " ".join(mounts)
         )
-        # Writable, because a mounted-over file is one nothing can be renamed
-        # onto: an in-place refresh is the only one that can work.
-        self.assertFalse(
-            any(item.endswith(",readonly") and str(credential) in item for item in mounts)
-        )
+        # And never deleted by anything here: it is the operator's file.
+        self.assertTrue(credential.is_file())
 
-    def test_a_credential_the_child_could_not_write_ends_the_launch_saying_so(self):
-        """An installation whose credential the child cannot write is one whose
-        next token expiry ends it. Said once, with the path, before launch."""
+    def test_a_credential_the_child_could_not_write_no_longer_ends_the_launch(self):
+        """The refusal ticket 86 built is gone with the mount that needed it.
+
+        `660 majix:majix` against a child running as `65534:65534` was exit 3 on
+        every launch, and it was the right refusal for a file that had to be
+        written inside the container. Nothing is written inside the container
+        now, so this file is not the launch's business at all.
+        """
         template = self.seeded()
-        (template / ".claude" / ".credentials.json").chmod(0o444)
+        (template / ".claude" / ".credentials.json").chmod(0o660)
 
-        with self.assertRaisesRegex(isolation.Unavailable, "credential the child cannot write"):
-            isolation._mounts(
-                fixtures.boundary(home=template),
-                template / "authority.pem",
-                isolation.seeded_credential(template),
-            )
+        mounts = isolation._mounts(fixtures.boundary(home=template), template / "authority.pem")
+
+        self.assertTrue(any(str(template.resolve()) in item for item in mounts))
 
     def test_a_credentials_file_anywhere_else_under_a_home_is_the_run_s_own(self):
         """The credential is left behind by path, not by name: a file called the
@@ -219,8 +216,6 @@ except isolation.Unavailable as refusal:
 
         with isolation.own_home(template) as home:
             self.assertTrue((home / "projects" / ".claude" / ".credentials.json").is_file())
-
-        self.assertIsNone(isolation.seeded_credential(None))
 
     def test_the_home_a_killed_run_left_behind_is_taken_away_by_the_next_launch(self):
         """`finally` does not run for a process that is killed, and what a killed
@@ -1122,60 +1117,49 @@ print(json.dumps({'home': home, 'found': found, 'read': read}))
         # inside their copies of it.
         self.assertEqual(["credential.json"], sorted(item.name for item in home.iterdir()))
 
-    def test_a_credential_the_child_refreshed_is_the_one_the_next_child_reads(self):
-        """PH2-86 criterion 4: the CLI's own state still survives where it lives.
+    def test_the_operator_s_own_credential_never_reaches_a_child_at_all(self):
+        """Ticket 146: the file the operator authenticated with stops crossing.
 
-        A home that was entirely per-run would take the refreshed credential
-        with it: the CLI writes its new token where it read the old one, so the
-        run after the first expiry would present a token already spent, which is
-        one failure traded for another. The credential is the one thing not
-        copied -- the template's own file is mounted at the path the CLI reads
-        -- so a refresh inside the run is a refresh the operator keeps, while
-        everything else the child wrote still dies with its copy.
+        It used to be mounted in place so that the CLI's own refresh landed
+        where the operator would read it next. That refresh is a rename, which
+        breaks the link, and the file it leaves is owned by the operator and
+        unwritable by uid 65534 -- so the arrangement ends the installation it
+        was built for, on a schedule nobody controls.
+
+        What a child sees now is a home with no credential in it. The operator's
+        file is untouched on the host, and what a run authenticates with is the
+        setup token the supervisor hands it on stdin.
         """
         home = Path(tempfile.mkdtemp(prefix="rk2-home-", dir=self.root))
         home.chmod(0o777)
         (home / ".claude").mkdir()
         (home / ".claude").chmod(0o777)
         credential = home / ".claude" / ".credentials.json"
-        credential.write_text('{"accessToken": "seeded"}', encoding="utf-8")
-        credential.chmod(0o666)
+        seeded = '{"accessToken": "RK-SYNTHETIC-SETUP-TOKEN-2f7c"}'
+        credential.write_text(seeded, encoding="utf-8")
+        credential.chmod(0o600)
 
         probe = fixtures.PROBE + """
-import sys
-
-path = os.path.join(os.environ['HOME'], '.claude', '.credentials.json')
-with open(path) as handle:
-    read = handle.read()
-
-# In place, which is what a mounted-over file allows and all it allows.
-with open(path, 'w') as handle:
-    handle.write('{"accessToken": "refreshed by ' + sys.argv[1] + '"}')
-
-with open(os.path.join(os.environ['HOME'], 'session'), 'w') as handle:
-    handle.write('what this run did')
-
-print(json.dumps({'read': read}))
+holder = os.path.join(os.environ['HOME'], '.claude')
+print(json.dumps({
+    'holder': os.path.isdir(holder),
+    'found': sorted(os.listdir(holder)) if os.path.isdir(holder) else [],
+}))
 """
 
-        def child(mine: str) -> dict:
-            result = isolation.run(
-                self.boundary(home=home), ("python3", "-c", probe, mine), timeout=60
-            )
-            self.assertEqual(0, result.returncode, result.stderr)
-            return json.loads(result.stdout)
-
-        first = child("first")
-        second = child("second")
-
-        self.assertEqual('{"accessToken": "seeded"}', first["read"])
-        # What the first run refreshed is what the second run resolved.
-        self.assertEqual('{"accessToken": "refreshed by first"}', second["read"])
-        self.assertEqual(
-            '{"accessToken": "refreshed by second"}', credential.read_text(encoding="utf-8")
+        result = isolation.run(
+            self.boundary(home=home), ("python3", "-c", probe), timeout=60
         )
-        # And nothing else a child wrote is in the operator's directory.
-        self.assertEqual([".claude"], sorted(item.name for item in home.iterdir()))
+        self.assertEqual(0, result.returncode, result.stderr)
+        inside = json.loads(result.stdout)
+
+        # The directory the CLI keeps its state in is there; the credential is
+        # not, and no sentinel of it crossed on any stream.
+        self.assertTrue(inside["holder"])
+        self.assertEqual([], inside["found"])
+        self.assertNotIn("RK-SYNTHETIC-SETUP-TOKEN-2f7c", result.stdout + result.stderr)
+        # And the operator's own file is exactly what it was.
+        self.assertEqual(seeded, credential.read_text(encoding="utf-8"))
 
     def test_a_tool_on_the_proxy_adapter_gets_its_own_network_and_gives_it_back(self):
         # PH2-30 criterion 2, the half that is not a refusal. A tool that
@@ -1560,3 +1544,246 @@ class BrowserEgressFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetupTokenTest(unittest.TestCase):
+    """Ticket 146: the one credential a child is given, and what refuses it.
+
+    Every case here is about a file this process reads and hands on. The token
+    itself is a sentinel, and no assertion prints it: what a refusal may carry
+    is the path, the property that failed and the remedy, because a refusal an
+    operator pastes into a ticket has to be safe to paste.
+    """
+
+    SENTINEL = "RK-SYNTHETIC-SETUP-TOKEN-2f7c"
+
+    def installed(self, value: str = SENTINEL, *, mode: int = 0o600) -> Path:
+        """A token file as `tools/setup-agent-oauth.sh` leaves one."""
+        directory = Path(tempfile.mkdtemp(prefix="rk2-token-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        directory.chmod(0o700)
+        path = directory / "claude-oauth-token"
+        path.write_text(value, encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def named(self, path: Path) -> dict:
+        return {isolation.OAUTH_TOKEN_VARIABLE: str(path)}
+
+    def test_the_default_path_is_the_one_the_wizard_writes(self):
+        self.assertEqual(
+            Path("~/.config/redkraken/claude-oauth-token").expanduser(),
+            isolation.oauth_token_file({}),
+        )
+
+    def test_an_operator_may_name_another_absolute_file(self):
+        path = self.installed()
+
+        self.assertEqual(path, isolation.oauth_token_file(self.named(path)))
+        self.assertEqual(self.SENTINEL, isolation.oauth_token(self.named(path)))
+
+    def test_a_relative_override_is_refused_rather_than_resolved(self):
+        with self.assertRaisesRegex(isolation.Unavailable, "absolute"):
+            isolation.oauth_token_file({isolation.OAUTH_TOKEN_VARIABLE: "token"})
+
+    def test_a_machine_holding_no_token_holds_none_rather_than_failing(self):
+        directory = Path(tempfile.mkdtemp(prefix="rk2-token-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        directory.chmod(0o700)
+
+        self.assertIsNone(isolation.oauth_token(self.named(directory / "absent")))
+
+    def test_a_token_a_second_account_could_read_is_refused(self):
+        for mode, description in ((0o640, "group"), (0o604, "world")):
+            with self.subTest(description):
+                path = self.installed(mode=mode)
+                with self.assertRaisesRegex(isolation.Unavailable, "group or world"):
+                    isolation.oauth_token(self.named(path))
+
+    def test_a_token_directory_a_second_account_could_reach_is_refused(self):
+        path = self.installed()
+        path.parent.chmod(0o755)
+
+        with self.assertRaisesRegex(isolation.Unavailable, "token directory"):
+            isolation.oauth_token(self.named(path))
+
+    def test_a_symlink_is_a_way_of_naming_a_file_the_operator_did_not_hand_over(self):
+        path = self.installed()
+        link = path.parent / "link"
+        link.symlink_to(path)
+
+        with self.assertRaisesRegex(isolation.Unavailable, "symlink"):
+            isolation.oauth_token(self.named(link))
+
+    def test_a_file_carrying_more_than_one_value_is_not_the_file_this_expects(self):
+        path = self.installed(f"{self.SENTINEL}\nand something else\n")
+
+        with self.assertRaisesRegex(isolation.Unavailable, "carries 2 lines"):
+            isolation.oauth_token(self.named(path))
+
+    def test_an_empty_token_is_refused_rather_than_handed_on_as_a_value(self):
+        for value, description in (("", "nothing at all"), ("   \n", "whitespace")):
+            with self.subTest(description):
+                path = self.installed(value)
+                with self.assertRaisesRegex(isolation.Unavailable, "is empty"):
+                    isolation.oauth_token(self.named(path))
+
+    def test_a_trailing_newline_is_a_file_an_editor_wrote_and_not_a_second_line(self):
+        path = self.installed(f"{self.SENTINEL}\n")
+
+        self.assertEqual(self.SENTINEL, isolation.oauth_token(self.named(path)))
+
+    def test_no_refusal_ever_carries_the_token_it_refused(self):
+        path = self.installed(f"{self.SENTINEL}\nsecond", mode=0o666)
+
+        with self.assertRaises(isolation.Unavailable) as raised:
+            isolation.oauth_token(self.named(path))
+
+        self.assertNotIn(self.SENTINEL, str(raised.exception))
+
+    def test_the_age_is_read_off_the_file_and_not_out_of_the_token(self):
+        path = self.installed()
+        os.utime(path, (time.time() - 331 * 86400,) * 2)
+
+        self.assertEqual(331, isolation.oauth_token_days(self.named(path)))
+        self.assertGreater(
+            isolation.oauth_token_days(self.named(path)), isolation.OAUTH_TOKEN_DAYS
+        )
+
+    def test_a_machine_with_no_token_has_no_age_to_report(self):
+        self.assertIsNone(isolation.oauth_token_days(self.named(Path("/nonexistent/token"))))
+
+
+class SetupWizardTest(unittest.TestCase):
+    """`tools/setup-agent-oauth.sh`, driven end to end against stubs.
+
+    `claude setup-token` is a browser flow only a human completes, so what is
+    exercised here is everything around it: that the script runs exactly that
+    command, that it reads the token once and never prints it, and that what it
+    leaves on disk is a file `isolation.oauth_token` will accept. The real mint
+    is the operator's, and this is the whole of what can be checked without
+    them.
+    """
+
+    SENTINEL = "RK-SYNTHETIC-SETUP-TOKEN-2f7c"
+    WIZARD = SOURCE.parent / "tools" / "setup-agent-oauth.sh"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rk2-wizard-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.record = self.root / "claude.argv"
+
+    def stub(self, name: str, body: str) -> None:
+        path = self.bin / name
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_wizard(self, token: str = SENTINEL) -> subprocess.CompletedProcess[str]:
+        """One whole run, with the two commands it shells out to stood in for."""
+        self.stub("claude", f'printf "%s\\n" "$@" >> {self.record}\nexit 0')
+        # The doctor's own report, in the shape the script reads back. Stubbed
+        # rather than run, because a real diagnosis inspects containers this
+        # machine does not have and the assertion under test is the file.
+        self.stub(
+            "rk",
+            'printf \'{"assertions":[{"name":"agent_credential","ok":true,'
+            '"detail":"a setup token this operator alone can read"}],'
+            '"violations":[]}\\n\'',
+        )
+        environment = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.home),
+            "TERM": "dumb",
+        }
+        # Enter past the banner, `y` to mint, Enter past the mint, the token.
+        return subprocess.run(
+            ["bash", str(self.WIZARD)],
+            input=f"\ny\n\n{token}\n",
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+
+    def installed(self) -> Path:
+        return self.home / ".config" / "redkraken" / "claude-oauth-token"
+
+    def test_the_wizard_runs_exactly_claude_setup_token(self):
+        answer = self.run_wizard()
+
+        self.assertEqual(0, answer.returncode, answer.stdout + answer.stderr)
+        # `--version` in stage one, then the mint, and nothing else: the script
+        # asks the CLI which it is and then asks it for a token.
+        self.assertEqual(
+            ["--version", "setup-token"],
+            self.record.read_text(encoding="utf-8").split(),
+        )
+
+    def test_the_installed_token_is_one_this_operator_alone_can_read(self):
+        self.run_wizard()
+        path = self.installed()
+
+        self.assertTrue(path.is_file())
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(0o700, path.parent.stat().st_mode & 0o777)
+        self.assertEqual(os.getuid(), path.stat().st_uid)
+        self.assertEqual(f"{self.SENTINEL}\n", path.read_text(encoding="utf-8"))
+
+    def test_what_it_installs_is_what_the_runtime_reads_back(self):
+        self.run_wizard()
+
+        self.assertEqual(
+            self.SENTINEL,
+            isolation.oauth_token({isolation.OAUTH_TOKEN_VARIABLE: str(self.installed())}),
+        )
+
+    def test_the_token_reaches_no_stream_and_no_file_but_its_own(self):
+        answer = self.run_wizard()
+
+        self.assertNotIn(self.SENTINEL, answer.stdout)
+        self.assertNotIn(self.SENTINEL, answer.stderr)
+        elsewhere = [
+            path
+            for path in self.root.rglob("*")
+            if path.is_file()
+            and path != self.installed()
+            and self.SENTINEL in path.read_text(encoding="utf-8", errors="replace")
+        ]
+        self.assertEqual([], elsewhere)
+
+    def test_a_replaced_token_is_renamed_over_and_never_half_written(self):
+        self.run_wizard()
+        first = self.installed().stat().st_ino
+
+        self.run_wizard("RK-SYNTHETIC-SETUP-TOKEN-9b41")
+
+        # A different inode, which is what a rename over leaves: the old file
+        # was replaced whole rather than truncated and rewritten in place.
+        self.assertNotEqual(first, self.installed().stat().st_ino)
+        self.assertEqual(
+            "RK-SYNTHETIC-SETUP-TOKEN-9b41\n", self.installed().read_text(encoding="utf-8")
+        )
+
+    def test_a_value_that_is_not_one_word_is_refused_before_anything_is_written(self):
+        answer = self.run_wizard("two words")
+
+        self.assertNotEqual(0, answer.returncode)
+        self.assertIn("one word", answer.stdout + answer.stderr)
+        self.assertFalse(self.installed().exists())
+
+    def test_nothing_pasted_installs_nothing(self):
+        answer = self.run_wizard("")
+
+        self.assertNotEqual(0, answer.returncode)
+        self.assertFalse(self.installed().exists())
+
+    def test_the_canary_is_skipped_rather_than_faked_where_no_boundary_is_described(self):
+        answer = self.run_wizard()
+
+        self.assertIn("no Agent boundary is exported", answer.stdout)

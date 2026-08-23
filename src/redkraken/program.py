@@ -71,9 +71,18 @@ REFUSE = "refuse"
 #: and is deliberately silent about how it went -- what the Task became is in
 #: the execution facts, and a stop reason that summarised it would be a second
 #: answer to a question the database has already answered.
+#:
+#: `chooser_cut_off` is ticket 161's, and it is the word `nothing_to_execute`
+#: was carrying for it. A Slate with three ready Tasks on it and an orchestrator
+#: that stopped on `budget` before picking one is not an empty queue; it is an
+#: installation running out of something, and a driver loop that stops on the
+#: first is right to keep going on the second. So `nothing_to_execute` is
+#: narrowed to the case its comment describes, and budget, turn, SDK and child
+#: failures answer under their own word.
 STOPPED_REFUSED = "refused"
 STOPPED_AWAITING_DECISION = "awaiting_decision"
 STOPPED_NOTHING_TO_EXECUTE = "nothing_to_execute"
+STOPPED_CHOOSER_CUT_OFF = "chooser_cut_off"
 STOPPED_TASK_ATTEMPTED = "task_attempted"
 
 #: Everything the command reports, and the reason the list is written down: a
@@ -350,14 +359,29 @@ class _State:
 
 
 def _report(ledger: Ledger, state: _State) -> Report:
+    """Everything the command answers, and the one word a driver loop reads.
+
+    The stop reason is decided from the pass's own facts and in this order:
+    a refusal outranks everything, a question waiting on a human outranks the
+    work, an attempt that was made is what the run is about, and only then the
+    two ways of having made none. Ticket 161 is the fourth of those --
+    `nothing_to_execute` is what a genuinely empty Slate answers, and a chooser
+    that ran out of room before it read a Slate with entries on it answers
+    `chooser_cut_off`, because the next pass opens a new session and the work
+    is still there.
+    """
+    execution = state.execution or {}
     pending = state.pending or []
-    attempted = bool((state.execution or {}).get("task"))
+    attempted = bool(execution.get("task"))
+    chooser = (execution.get("choice") or {}).get("cut_off")
     if ledger.violations:
         stop_reason = STOPPED_REFUSED
     elif pending:
         stop_reason = STOPPED_AWAITING_DECISION
     elif attempted:
         stop_reason = STOPPED_TASK_ATTEMPTED
+    elif chooser:
+        stop_reason = STOPPED_CHOOSER_CUT_OFF
     else:
         stop_reason = STOPPED_NOTHING_TO_EXECUTE
     return report(
