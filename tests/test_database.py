@@ -19986,11 +19986,16 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
 
         `execution.FINISH` rather than a statement written here: the parameters
         the reconciliation depends on are the ones production sends, and a
-        second spelling of them would pass while production's did not.
+        second spelling of them would pass while production's did not. It sends
+        twelve now, so this sends twelve: the eight a run without a child has
+        nothing to say about go as NULL, which is what the column defaults mean.
         """
         cls.bind(name)
-        cls.call(execution.FINISH, (cls.run_id(name, label), stop, input_tokens,
-                                    output_tokens))
+        cls.call(
+            execution.FINISH,
+            (cls.run_id(name, label), stop, input_tokens, output_tokens)
+            + (None,) * 8,
+        )
         return cls.reservation(name, label)
 
     @classmethod
@@ -20295,6 +20300,11 @@ POLICY_SLUG = "selftest-budget-policy"
 #: would be charged more than three times what it cost. Every assertion below
 #: that says "the charge" says one of these two numbers, and which one it is is
 #: the whole of criterion 4.
+#: The ending as every caller spelled it before the eight budget parameters
+#: existed. Four positional arguments, which is what `DEFAULT NULL` on the rest
+#: has to keep working for.
+LEGACY_FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3::bigint, $4::bigint)"
+
 POLICY_RAW = (30000, 2000)
 POLICY_CHARGED = 9000
 POLICY_NAME = "cache-aware-v1"
@@ -20415,17 +20425,19 @@ class BudgetPolicyTest(SchedulerFixture, DatabaseCase):
     def arrange_legacy(cls):
         """One run closed the way an unchanged caller closes it.
 
-        Through `execution.FINISH`, which is the four-parameter call production
-        still makes: what the eight new parameters defaulting to NULL buys is
-        that this migration lands before the caller that fills them, and a
-        second spelling written here would prove it about the wrong statement.
+        Through the four-parameter call, which is what every caller made before
+        the eight were added: what the new parameters defaulting to NULL buys is
+        that this migration lands before the caller that fills them. Spelled
+        here rather than taken from `execution`, because that statement has
+        since grown the eight -- and a test of the old spelling that follows the
+        new one has stopped testing what it says it does.
         """
         cls.seed("legacy", 1)
         cls.bind("legacy")
         cls.offer()
         cls.legacy_run = str(cls.call("SELECT claim_task()"))
         cls.call(
-            execution.FINISH,
+            LEGACY_FINISH,
             (cls.run_id("legacy", cls.legacy_run), "completed", *POLICY_RAW),
         )
         cls.legacy_row = cls.charged("legacy", cls.legacy_run)

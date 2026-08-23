@@ -67,7 +67,6 @@ REOPEN = "SELECT reopen_for_reproduction($1::uuid, $2::uuid)"
 OPEN = "SELECT open_validation_session($1::uuid, $2::uuid, $3::uuid)"
 RECORD = "SELECT record_verdict($1::uuid, $2::uuid, $3, $4::text[])"
 ABANDON = "SELECT abandon_validation($1::uuid, $2::uuid, $3)"
-FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3::bigint, $4::bigint)"
 
 #: What the session is told to do, and the whole of it. Every noun in it is a
 #: key of the packet, so a validator that read the objective and nothing else
@@ -457,9 +456,13 @@ def _close(
                     code=INVALID_CONFIGURATION,
                     source="validation_attempts",
                 )
+        usage = execution.spent(result)
         finished = _called(
             connection,
-            FINISH,
+            # `execution.FINISH` rather than a second spelling here: this closing
+            # settles the same columns the dispatch closing does, and a statement
+            # written twice is eight columns that stay NULL for half the runs.
+            execution.FINISH,
             (
                 run_id,
                 # `aborted` rather than a word for how it stopped, because a run
@@ -468,6 +471,11 @@ def _close(
                 "aborted" if result is None else execution.stopped_as(result.stop_reason),
                 None if result is None else result.input_tokens,
                 None if result is None else result.output_tokens,
+                *(usage[name] for name in execution.SPEND),
+                # A validation run is not a dispatch this runtime repeats, so it
+                # has no attempt profile: ticket 165 counts budget ends on one
+                # Task under one unchanged dispatch instruction.
+                None,
             ),
         )
         answers.validation["task_status"] = finished["task_status"]
