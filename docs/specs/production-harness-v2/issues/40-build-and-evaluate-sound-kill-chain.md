@@ -195,3 +195,20 @@ to `rk2_human`, so a chain is a thing the operator is meant to be able to read
 and no operator command reads one. The deferral to an "orchestrator dispatch ticket" is what was wrong: no such ticket
 existed. Ticket 102 owns the Finding path these chains are composed from, and
 ticket 103 owns both verbs.
+
+**Correction closed, 2026-08-23.** The deferral above was owned by ticket 103,
+and 103 has now taken it -- and split the two verbs. `build_kill_chain` is a
+runtime step in the impact close path: it is the third statement of the `IMPACT`
+verb set at `src/redkraken/replay.py:121-123`, run by `_downstream` (`:508`)
+immediately after the pivot stamp, in the transaction that closed the run
+(`:310`). The members are the stamps the Program already holds and everything
+else is derived, so `p_flow` goes as SQL NULL rather than as a sentence the
+process invented; a refusal is a hold (`:556`) and a rebuild of the same members
+answers `"built": false` (`:562-564`). `read_kill_chain` became the operator read
+this note said no command reached: `rk report soundness`
+(`src/redkraken/cli.py:1531`, dispatching to `_report_soundness` at `:2828`)
+reaches a new `soundness()` at `src/redkraken/reporting.py:776`, which runs
+`SELECT read_kill_chain($1::uuid)` (`:101`, executed at `:830`) and passes the
+verdict back whole. It is a sibling of `rk report chain` and not a Contract,
+because a model that could ask whether its own chain is sound would be reading
+the verdict on its own work.

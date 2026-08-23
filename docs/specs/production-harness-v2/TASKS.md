@@ -24,9 +24,10 @@ Baseline ist `main@402b8bd`:
 - [x] Der Setup-Token-Pfad aus Ticket 146 und der terminale
   `ResultMessage`-/`success`-Fix sind implementiert, getestet und live belegt.
 
-Aktuelle Bewertung: **Freigabe A ist am 23.08.2026 erreicht.** Begrenzte,
-beaufsichtigte, anonyme Read-only-Hunts sind vertretbar; Finding-Reports bleiben
-bis Arbeitsblock 1 unter menschlicher Verantwortung.
+Aktuelle Bewertung: **Freigabe A und Freigabe B sind am 23.08.2026 erreicht.**
+Begrenzte, beaufsichtigte, anonyme Read-only-Hunts sind vertretbar, und mit dem
+Abschluss von Arbeitsblock 1 auch ein beaufsichtigter Hunt mit reproduzierbarem
+Finding und Report. Die beiden Vorbehalte stehen bei Freigabe B.
 
 ## Arbeitsblock 0 — Stabiler Abschluss und früher Pilot
 
@@ -190,14 +191,14 @@ fertiggestellt. Abnahmebasis ist `rk2hunt21` auf dem zusammengeführten lokalen
 
 Dauer: weitere **4–6 Arbeitstage**.
 
-- [ ] Ticket 104: `park_for_human` implementieren. Eine Task wird `parked`, verbraucht keinen Versuch, gibt Leases frei und wird nur durch einen Operator wieder freigegeben oder superseded.
-- [ ] Ticket 103 vollständig, nicht als verkürzten Report-Slice implementieren:
+- [x] Ticket 104: `park_for_human` implementieren. Eine Task wird `parked`, verbraucht keinen Versuch, gibt Leases frei und wird nur durch einen Operator wieder freigegeben oder superseded.
+- [x] Ticket 103 vollständig, nicht als verkürzten Report-Slice implementieren:
   - angebotene Contracts: `open_impact_task`, `state_severity`, `compose_finding_report`;
   - Runtime-Verben: `apply_computed_cvss`, `issue_pivot_stamp`, `build_kill_chain`;
   - Operator-Read: `read_kill_chain`;
   - `compose_finding_report` darf nicht mehr über eine zu breite `PUBLIC`-Berechtigung erreichbar sein.
-- [ ] Ticket 159: Host-Entities sowie `resolves_to`- und `serves`-Relationships aus Runtime-Evidenz ableiten.
-- [ ] Einen synthetischen vertikalen Lauf beweisen:
+- [x] Ticket 159: Host-Entities sowie `resolves_to`- und `serves`-Relationships aus Runtime-Evidenz ableiten.
+- [x] Einen synthetischen vertikalen Lauf beweisen:
 
   ```text
   Recon
@@ -213,9 +214,46 @@ Dauer: weitere **4–6 Arbeitstage**.
   → Report
   ```
 
-- [ ] Alle state-changing oder genehmigungspflichtigen Pfade ohne Standing grant müssen parken; verbotene Pfade dürfen nicht angeboten werden.
+- [x] Alle state-changing oder genehmigungspflichtigen Pfade ohne Standing grant müssen parken; verbotene Pfade dürfen nicht angeboten werden.
 
-**Freigabe B:** Danach ist ein kommerziell brauchbarer beaufsichtigter Web-Hunt mit reproduzierbarem Finding und Report vertretbar. Erwartet **02.09.–08.09.2026** bei Start am 24.08.
+**Freigabe B — erreicht am 23.08.2026:** Ein kommerziell brauchbarer
+beaufsichtigter Web-Hunt mit reproduzierbarem Finding und Report ist vertretbar.
+Abnahmebasis ist `77bcfecd` auf dem lokalen Integrationszweig; es erfolgte kein
+Remote-Push. Der Termin **02.09.–08.09.2026** war die Schätzung bei Start am
+24.08. und ist damit gegenstandslos.
+
+Gemessen am Tag der Freigabe:
+
+- `tests.test_database`: 1462 Tests, 1 Fehler, 69 übersprungen.
+- `tests.test_vertical`: 3 Tests, OK. Das ist der synthetische vertikale Lauf.
+- `tests.test_roster` 115 OK; `tests.test_execution` 192 OK; `tests.test_wiring`
+  20 OK; `tests.test_agent` 190 OK bei 37 übersprungenen; `tests.test_cli`
+  zusammen mit `tests.test_reporting` 194 OK.
+- Die vier Repository-Gates enden alle mit rc=0: `tools/check_audit.py`,
+  `tools/check_wiring.py`, `tools/check_baseline.py`, `tools/check_coverage.py`.
+- `rk db verify`: **96 Assertions, 0 Verletzungen**. `standing_checks` hält
+  **66** Zeilen, zwei davon neu: `agent_asks` aus Ticket 104 und
+  `receipt_topology` aus Ticket 159.
+
+Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:
+
+- **(a) Der vertikale Lauf hat genau eine arrangierte Zeile.**
+  `tests/test_vertical.py` schreibt in `the_control_the_playbook_asks_for()`
+  die eine `credential_effect`-Observation samt `control`-Evidenzkante, die
+  `playbooks/object-ownership/playbook.md` für `supported` verlangt, als Owner
+  und nicht über ein Verb. Sie ist im echten Receipt der Recon-Runde verankert,
+  aber sie ist nicht verdient: `close_test_replay` kann ausschließlich
+  `response_invariant` und `response_differential` schreiben, und der
+  Proposal-Pfad verweigert eine Evidenzkante, sobald der Claim über `proposed`
+  hinaus ist. Alles unterhalb dieser Zeile -- Test, Replay, `supported`
+  Hypothesis, Finding, Impact, Severity, Pivot stamp, Kill chain, Report -- ist
+  verdient. Ticket 166 besitzt die Lücke und misst sie: 33 der 50 Playbooks
+  verlangen eine Observation-Art, die kein Runtime-Writer erzeugen kann.
+- **(b) Der eine rote Test ist lastabhängig.**
+  `SurfaceBenchmarkTest.test_slate_computation_is_within_budget` ist der
+  dokumentierte Last-Flake aus `docs/agents/testing.md`, Abschnitt "Known
+  failures that are not yours". Er ist nicht durch diesen Arbeitsblock
+  verursacht und wird hier nicht als grün ausgegeben.
 
 ## Arbeitsblock 2 — Identity und authentifizierte Hunts
 
@@ -274,7 +312,7 @@ Code-Dauer: **5–8 Arbeitstage**, anschließend **2–6 Kalendertage** Grading.
   - `check_coverage.py`
 - [x] Jede Datenbankausführung enthält `CleanCreationTest`, läuft unter `flock -w 3600 /tmp/rk2-db.lock` und niemals parallel zu einem Live-Hunt.
 - [x] Die vollständige Suite nur nach breiter Migration, vor Live-Canary und vor Release Candidate ausführen.
-- [x] Nach jedem Integrationsblock `git diff --check`, die aktuell 93 Integritätsprüfungen und den jeweiligen vertikalen Smoke ausführen.
+- [x] Nach jedem Integrationsblock `git diff --check`, die aktuell 96 Integritätsprüfungen -- die Assertion-Zahl, die `rk db verify` meldet -- und den jeweiligen vertikalen Smoke ausführen.
 
 Besonders erforderliche Regressionen:
 

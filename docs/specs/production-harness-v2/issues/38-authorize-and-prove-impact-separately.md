@@ -185,3 +185,28 @@ $2::uuid, $3)` and `cli.py:2705` reaches it through `replay.run` with
 `verbs=replay.IMPACT`. The "orchestrator dispatch ticket" this section defers
 the model-facing verb to did not exist in the tree; it is now ticket 102, and
 ticket 103 owns the two verbs above that still have no caller.
+
+**Correction closed, 2026-08-23.** Ticket 103 measured this and closed it. Both
+verbs now have a caller. `propose_impact_task`
+(`20261031T000000Z__the_verbs_downstream_of_a_finding_get_their_callers.sql:110`)
+resolves an `F` label to the Finding and calls `open_impact_task` (`:142`);
+`propose_severity` (`:195`) does the same for `state_severity` (`:209`). Both
+are served to a model as Contracts -- `mcp__rk2__open_impact_task`
+(`src/redkraken/roster.py:1512`) and `mcp__rk2__state_severity` (`:1554`) in the
+`state.conclude` group (`:924-928`), dispatched at `src/redkraken/agent.py:1495`
+and `:1498` over `SELECT propose_impact_task($1, $2::jsonb, $3::uuid)` and
+`SELECT propose_severity($1, $2, $3, $4)` (`:301-302`). So "No verb is served to
+a model" was the state of the tree when this ticket resolved and is no longer
+true of these two. What was corrected is the record of who calls them; the work
+this ticket describes stands and its status does not move.
+
+Two smaller corrections 103 measured against this ticket's own migration.
+`state_severity` is granted to `rk2_runtime, rk2_human`
+(`20260816T000000Z__impact_is_authorized_before_it_is_proved.sql:2036`), not to
+`rk2_runtime` alone -- the human grant is for an operator overriding a band and
+the Contract above is for the hunter stating one, so the two do not collide. And
+`report_blockers`'s live definition is at
+`20260906T000000Z__a_person_reports_a_finding_and_lifts_a_gate.sql:140`, not the
+`20260816T000000Z...:1874` one this ticket wrote; the `cvss_stale` arm that kept
+the vector half of the CVSS blocker and dropped the band half is at
+`20260906T000000Z...:181-185`.

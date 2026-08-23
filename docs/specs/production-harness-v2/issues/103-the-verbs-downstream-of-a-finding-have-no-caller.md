@@ -5,9 +5,9 @@ Finding to a sound kill chain, on whatever dispatch shape ticket 102 settles.
 
 **Blocked by:** 102 — Nothing in this tree has ever created a Finding.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Each of these six is granted to `rk2_runtime` and has zero callers in
+- [x] Each of these six is granted to `rk2_runtime` and has zero callers in
       `src/redkraken/*.py`, verified by grep against the current tree:
       `open_impact_task`
       (`20260816T000000Z__impact_is_authorized_before_it_is_proved.sql:1209`,
@@ -20,7 +20,7 @@ Finding to a sound kill chain, on whatever dispatch shape ticket 102 settles.
       `:924`) and `read_kill_chain` (`20260818T000000Z...:797`, granted `:925`).
       `open_impact_replay` is the one verb of this group that does have a
       caller, at `src/redkraken/replay.py:96`.
-- [ ] Ticket 38's factual claim is corrected rather than repeated. It says
+- [x] Ticket 38's factual claim is corrected rather than repeated. It says
       "`open_impact_task`, `open_impact_replay` and `state_severity` are called
       by the CLI and by the tests". Two thirds of that is false: only
       `open_impact_replay` has a Python caller. `open_impact_task` and
@@ -28,7 +28,7 @@ Finding to a sound kill chain, on whatever dispatch shape ticket 102 settles.
       respectively) and nowhere else. A dated correction note is appended to
       ticket 38 naming this ticket, and its `**Status:** resolved` is not
       changed.
-- [ ] `read_kill_chain` is granted to `rk2_human` and has no caller in `src/`:
+- [x] `read_kill_chain` is granted to `rk2_human` and has no caller in `src/`:
       one reference in `tests/test_database.py` and nothing else. `rk report
       chain` (`src/redkraken/cli.py:1517`) is a live verb that reaches
       `read_chain_report`, not this, so the operator's read of a composed chain
@@ -37,20 +37,20 @@ Finding to a sound kill chain, on whatever dispatch shape ticket 102 settles.
       EXECUTE grant and about half have no Python caller -- but most of those
       are predicates a standing check or another function calls from inside SQL,
       and this one is a top-level read with nothing above it.
-- [ ] `apply_computed_cvss` is the one member of this group already documented
+- [x] `apply_computed_cvss` is the one member of this group already documented
       as knowingly dead, at
       `20260819T000000Z__a_chain_unlock_earns_its_place_in_the_queue.sql:440-443`:
       "038 dropped `apply_computed_severity` and left `apply_computed_cvss`
       behind it, and nothing in this corpus calls that function." The ticket
       decides between wiring it and dropping it, and does not leave it as the
       third state.
-- [ ] `compose_finding_report`
+- [x] `compose_finding_report`
       (`20260820T000000Z__a_report_is_a_projection_of_what_holds.sql:461`) is
       classified with the same reading and is not silently carried. It is
       owner-only, it has no grant to any role, and `src/redkraken/reporting.py`
       calls `read_finding_report` instead. Either it is superseded and says so
       in a `COMMENT ON`, or it is wired.
-- [ ] Tickets 39 and 40 each carry a dated note naming this ticket as the owner
+- [x] Tickets 39 and 40 each carry a dated note naming this ticket as the owner
       of the deferral. Their own claims check out -- `issue_pivot_stamp` appears
       once in `tests/test_database.py`, `build_kill_chain` four times and
       `read_kill_chain` once, and neither ticket claimed a CLI caller -- so the
@@ -181,3 +181,92 @@ one.
 `20260816T000000Z...:1874` one; the `cvss_stale` arm that makes
 `apply_computed_cvss` a runtime step rather than a Contract is at
 `20260906T000000Z...:181-185`.
+
+## What was built, 2026-08-23
+
+Two migrations and the three shapes the decision above named. Nothing was
+dropped and nothing was left in the third state.
+
+**Three served Contracts, over three wrappers.**
+`20261031T000000Z__the_verbs_downstream_of_a_finding_get_their_callers.sql`
+adds `propose_impact_task` (`:110`), `propose_severity` (`:195`) and
+`propose_finding_report` (`:277`). Each resolves the `F` label a child can read
+to the Finding row the granted verb takes -- `rk2_finding_for_label` (`:62`) and
+`rk2_no_such_finding` (`:73`) are the two halves of that -- then calls the verb
+itself: `open_impact_task` at `:142`, `state_severity` at `:209`,
+`compose_finding_report` and then `apply_computed_cvss` at `:390`. The wrappers
+exist because the granted verbs raise where a child needs a sentence: an
+exception is a turn a model cannot use, and each of these answers with the
+refusal instead. All three are filed in `runtime_verb_surface` (`:445-448`).
+
+**The roster side.** A group of its own, `state.conclude`
+(`src/redkraken/roster.py:924-928`), holding `mcp__rk2__open_impact_task`
+(`:1512`), `mcp__rk2__state_severity` (`:1554`) and
+`mcp__rk2__compose_finding_report` (`:1579`), with the constants at
+`:1949-1951`. Held by `web_hunter` and by no other role (`:2042-2044`), because
+`state.propose` is also `recon`'s and `js_analyst`'s and putting these three
+there would have handed two more roles the authority to author an impact
+specification and state a severity band. The group is served whole
+(`src/redkraken/agent.py:150-153`) and dispatched at `:1495`, `:1498` and
+`:1501`, over `IMPACT`, `SEVERITY` and `REPORT` (`:301-303`).
+
+**Two runtime steps in the impact close, and one inside a wrapper.**
+`issue_pivot_stamp` and `build_kill_chain` are the third and fourth statements
+of `replay.py`'s `IMPACT` verb set (`src/redkraken/replay.py:111` and
+`:121-123`), run by `_downstream` (`:508`) at `:310` in the transaction that has
+just closed the run: a stamp or a chain that outlived a close that rolled back
+would be a reading of a run nobody has. `p_flow` goes as SQL NULL, because the
+column's own comment is "Recorded and never read". `apply_computed_cvss` is the
+third and did not become a Contract: it runs inside `propose_finding_report`
+(`20261031T000000Z...:390`), where the `cvss_stale` blocker would otherwise be
+raised, so no model is ever asked to hand the runtime back a vector the runtime
+computed.
+
+**One operator read.** `rk report soundness` (`src/redkraken/cli.py:1531`,
+dispatching to `_report_soundness` at `:2828`) reaches `reporting.soundness()`
+(`src/redkraken/reporting.py:776`), which runs `SELECT read_kill_chain($1::uuid)`
+(`:101`, executed at `:830`) and passes the verdict back whole rather than
+summarising it. A sibling of `rk report chain` and not a Contract: a model that
+could ask whether its own chain is sound would be reading the verdict on its own
+work. Criterion 3's "a top-level read with nothing above it" is closed.
+
+**The PUBLIC grant the correction found.**
+`20261029T000000Z__the_report_composer_stops_being_open_to_everybody.sql` is a
+migration of four statements: `REVOKE ALL ON FUNCTION compose_finding_report
+(uuid, jsonb) FROM PUBLIC` (`:32`), the explicit `GRANT EXECUTE ... TO
+rk2_runtime` that replaces the default-privileges one (`:33`), the reissued
+`COMMENT ON` (`:35-36`) and a `DO` block that asserts both directions in the
+migration itself (`:55-65`): PUBLIC cannot reach it and the runtime still can,
+so a wider `REVOKE` would fail here rather than at the first Contract call. It
+lands before 20261031, because a Contract wired over a PUBLIC verb is a wider
+surface served on purpose.
+
+**Corrections carried, not repeated.** Ticket 38 has the dated note criterion 2
+asks for, naming this ticket, correcting "called by the CLI and by the tests"
+to the two callers that now exist, and carrying the two smaller corrections --
+`state_severity`'s `rk2_human` grant and `report_blockers`'s live definition --
+without moving its own `resolved`. Tickets 39 and 40 each have the note
+criterion 6 asks for; 40's also records that `read_kill_chain` stopped being the
+verb no command reached.
+
+**Checked.** `DownstreamVerbTest` (`tests/test_database.py:50470`), 17 cases
+over the three wrappers, the refusals they carry back, the CVSS step and the
+chain rebuild. `VerticalRunTest` (`tests/test_vertical.py:53`), 3 cases, walks
+one Program from a recon Receipt to a composed report and asserts every stage
+off the rows the one before it wrote. `rk db verify` answers 96 assertions, 0
+violations; `standing_checks` holds 66 rows.
+
+### The one row the vertical walk arranges
+
+`tests/test_vertical.py`'s walk has exactly one arranged row, and it is not one
+of this ticket's verbs. `the_control_the_playbook_asks_for()` writes the
+`credential_effect` Observation and the `control` evidence edge that
+`playbooks/object-ownership/playbook.md` demands before
+`enforce_playbook_evidence` will admit `supported`. It is grounded in the recon
+lap's real Receipt and it is written as owner, because no sequence of verbs can
+produce it: `close_test_replay` can only ever write `response_invariant` and
+`response_differential`, and the proposal path refuses an evidence edge once the
+claim is past `proposed`. Everything downstream of that row -- the Test, the
+replay, the `supported` claim, the Finding, the impact, the severity, the stamp,
+the chain and the report -- is earned off rows the walk itself wrote. Ticket 166
+owns the gap.

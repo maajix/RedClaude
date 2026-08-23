@@ -202,3 +202,16 @@ this section names, here and for 038's three verbs, did not exist in the tree
 when this ticket resolved. It is now ticket 102, which owns the Finding path
 itself, and ticket 103, which owns `issue_pivot_stamp` and the other verbs
 downstream of a Finding that still have no production caller.
+
+**Correction closed, 2026-08-23.** The deferral above was owned by ticket 103,
+and 103 has now taken it. `issue_pivot_stamp` is a runtime step in the impact
+close path rather than a verb served to a model: it is the third member of the
+`IMPACT` verb set at `src/redkraken/replay.py:111`, and `_downstream` (`:508`)
+runs it at `:310`, inside the same transaction that has just run
+`close_impact_replay` (`:110`) -- a stamp that outlived a close that rolled back
+would be a reading of a run nobody has. Both parameters name rows this machine
+wrote, the Tool run the file has just closed and the agent run it was opened
+for, so there is nothing a model could contribute. A refusal is a hold in the
+document and not a failed command (`:545`), and a second call on one Tool run
+answers `"issued": false` and is reported as already stamped from that evidence
+(`:548-550`). A pivot is now stamped outside a test.
