@@ -609,6 +609,24 @@ class AgentRunResult:
     was opened against, so a session that answers `confirmed` about a replay
     that did not hold is a session whose answer is filed and acted on by nobody.
     `verdict_attempts` counts the calls for `mission_attempts`' reason.
+
+    The cache fields and `budget_tokens` are ticket 165's. `input_tokens` is
+    the provider's own sum and stays what it was -- every turn's whole request,
+    prefix and all -- which made a token ceiling into a turn ceiling: a
+    `web_hunter` carrying 40 000 tokens of context bought six turns out of
+    250 000 and a `conclude` needs more than six. The three cache numbers are
+    what that sum is made of, `budget_tokens` is what the child charged itself
+    against the ceiling under `budget_policy`, and the two live side by side
+    because one is what the provider billed and the other is what this harness
+    decided to count. Neither replaces the other.
+
+    `answer_count` is the turn count the child measured, which used to be
+    arithmetic here: "six turns" was `ceiling / context` and not a number
+    anybody had counted.
+
+    `error_detail` is what went wrong in the child's own words, or nothing. A
+    run that ended on `error` said so in one word and nothing else, and the word
+    is not enough to tell a broken tool from a broken model.
     """
 
     agent_run_id: str
@@ -626,6 +644,17 @@ class AgentRunResult:
     mission_attempts: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    uncached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    answer_count: int = 0
+    budget_tokens: int = 0
+    #: The word the child's own accounting was done under, or empty where the
+    #: child reported none. Not defaulted to the policy this harness runs: a
+    #: run that said nothing about how it counted is not a run that counted the
+    #: way the current build does.
+    budget_policy: str = ""
+    error_detail: str | None = None
     choice: str | None = None
     pick_attempts: int = 0
     verdict: Mapping[str, object] | None = None
@@ -650,6 +679,13 @@ class AgentRunResult:
             "mission_attempts": self.mission_attempts,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "uncached_input_tokens": self.uncached_input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "answer_count": self.answer_count,
+            "budget_tokens": self.budget_tokens,
+            "budget_policy": self.budget_policy,
+            "error_detail": self.error_detail,
             "choice": self.choice,
             "pick_attempts": self.pick_attempts,
             "verdict": None if self.verdict is None else dict(self.verdict),
@@ -1237,6 +1273,18 @@ def _spawn(
         mission_attempts=int(result.get("mission_attempts") or 0),
         input_tokens=int(result.get("input_tokens") or 0),
         output_tokens=int(result.get("output_tokens") or 0),
+        # Ticket 165. Absent is zero for the counts and empty for the word,
+        # which is what a child built before these existed reports: a number
+        # nobody measured, rather than a number this side invented.
+        uncached_input_tokens=int(result.get("uncached_input_tokens") or 0),
+        cache_creation_input_tokens=int(result.get("cache_creation_input_tokens") or 0),
+        cache_read_input_tokens=int(result.get("cache_read_input_tokens") or 0),
+        answer_count=int(result.get("answer_count") or 0),
+        budget_tokens=int(result.get("budget_tokens") or 0),
+        budget_policy=str(result.get("budget_policy") or ""),
+        error_detail=(
+            detail if isinstance(detail := result.get("error_detail"), str) and detail else None
+        ),
         # A label and nothing else. Anything that is not a non-empty string is
         # read as no choice at all rather than coerced into one: the caller
         # records what a session answered, and `str(None)` is a Task label

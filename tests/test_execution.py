@@ -12,6 +12,7 @@ answers every statement and remembers all of them.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import re
@@ -36,7 +37,7 @@ from redkraken import (
     roster,
     store,
 )
-from redkraken import migrate
+from redkraken import _startup, migrate
 from redkraken import outcome as outcome_module
 from redkraken.outcome import Ledger
 from tests import fixtures
@@ -190,6 +191,16 @@ def result(**overrides) -> agent.AgentRunResult:
             ],
         },
         "mission_attempts": 1,
+        # Ticket 165. What the provider billed, broken into what it was made of,
+        # beside what this harness charged the run for under its own policy. The
+        # cache read is most of it, which is the whole finding: the prefix is
+        # re-sent every turn and counted at full price.
+        "uncached_input_tokens": 200,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 900,
+        "answer_count": 6,
+        "budget_tokens": 390,
+        "budget_policy": execution.BUDGET_POLICY,
     }
     fields.update(overrides)
     return agent.AgentRunResult(**fields)
@@ -360,6 +371,10 @@ class Recorder:
         # Ticket 163. The vocabulary a `conclude` child is shown, as the seeded
         # table holds it. A test that wants the table empty or short says so.
         self.classes = list(answers.get("classes", SEEDED_CLASSES))
+        # Ticket 165. How often this Task has already ended on its ceiling under
+        # the dispatch this pass is about to repeat. Zero is a first attempt,
+        # which is what most cases here are about.
+        self.budget_ends = answers.get("budget_ends", 0)
         # How many live selections the sweep found their Playbook had expired
         # under. Zero is the ordinary pass; a catalogue that moved under a
         # running mission is what a case says otherwise to see.
@@ -517,8 +532,31 @@ class Recorder:
         `finish_task_attempt` closes the orchestrator session as well as the
         attempt, so a count of the statement counts both. What a test asking
         "was the attempt closed" means is this one.
+
+        The four the closing has always carried: the run, how it stopped and the
+        two totals. Ticket 165's columns travel in the same call and are read
+        with `spend` below, so a case about how a run ended is not a case that
+        has to spell eight NULLs to say it.
         """
-        return [parameters for parameters in self.sent(execution.FINISH) if parameters[0] == run_id]
+        return [
+            parameters[:4]
+            for parameters in self.sent(execution.FINISH)
+            if parameters[0] == run_id
+        ]
+
+    def spend(self, run_id: str = RUN) -> dict:
+        """What one closing said the run cost, keyed as `finish_task_attempt` is.
+
+        Ticket 165. The profile is in here too: it is written by the same call
+        and is the one value in it that describes the dispatch rather than the
+        run.
+        """
+        closing = [one for one in self.sent(execution.FINISH) if one[0] == run_id]
+        assert len(closing) == 1, closing
+        return {
+            **dict(zip(execution.SPEND, closing[0][4:])),
+            "attempt_profile_sha256": closing[0][-1],
+        }
 
     def closing(self, run_id: str = RUN) -> int:
         """Where in the sequence one run was closed, for the same reason."""
@@ -573,6 +611,8 @@ class Recorder:
             return list(self.near_misses)
         if sql == execution.CLASSES:
             return [(one,) for one in self.classes]
+        if sql == execution.BUDGET_ENDS:
+            return [(self.budget_ends,)]
         if sql == execution.SWEEP_STALE:
             return [(self.marked,)]
         if sql == execution.ARM_WATCHES:
@@ -1188,6 +1228,221 @@ class FindingVocabularyTest(unittest.TestCase):
         self.assertEqual([], launcher.requests)
         self.assertEqual(
             [execution.INTEGRITY_FAILED], [one.code for one in self.ledger.violations]
+        )
+
+
+class AttemptProfileTest(unittest.TestCase):
+    """Ticket 165. What makes two attempts the same attempt, and what follows.
+
+    `rk2hunt20`'s T6 ran twice at the full ceiling, ended on `budget` both
+    times, closed nothing and was still at the top of the ranking for a third
+    identical run. The scheduler ranks a Task and not a Task-and-how-it-was-
+    sent, so this is the sentence that lets a pass tell a repeat from a retry.
+    """
+
+    def profile(self, mission=None, role: str = "recon", **overrides) -> str:
+        return execution.attempt_profile(
+            claimed(**overrides), mission or packet.Packet(), roster.ROLES[role]
+        )
+
+    def test_the_same_dispatch_twice_is_the_same_profile(self):
+        self.assertEqual(self.profile(), self.profile())
+
+    def test_every_part_of_the_dispatch_moves_the_profile(self):
+        first = self.profile()
+        moved = {
+            "another Task": self.profile(task_id=SUBJECT),
+            "another packet": self.profile(packet.Packet(revision=99)),
+            "another role": execution.attempt_profile(
+                claimed(role="web_hunter"), packet.Packet(), roster.ROLES["web_hunter"]
+            ),
+            "another ceiling": self.profile(token_cap=20_000),
+        }
+
+        for what, digest in moved.items():
+            with self.subTest(what):
+                self.assertNotEqual(first, digest)
+
+    def test_the_model_the_build_and_the_bundled_pair_are_in_it_too(self):
+        # A build that changed is a dispatch that changed: the objective, the
+        # ceiling arithmetic and the tool surface all live in these modules, so
+        # a Task refused a third attempt under one build is owed a first one
+        # under the next. The same argument covers the model and the SDK/CLI
+        # pair the child runs against.
+        first = self.profile()
+        another = dataclasses.replace(roster.ROLES["recon"], model="another-model")
+        moved = {}
+        with mock.patch.object(execution, "_tree_digest", return_value="0" * 64):
+            moved["another build"] = self.profile()
+        with mock.patch.object(_startup, "KNOWN_RUNTIME", ("9.9.9", "9.9.9")):
+            moved["another SDK and CLI"] = self.profile()
+        moved["another model"] = execution.attempt_profile(
+            claimed(), packet.Packet(), another
+        )
+
+        for what, digest in moved.items():
+            with self.subTest(what):
+                self.assertNotEqual(first, digest)
+
+    def test_the_hint_the_repeat_produces_is_not_part_of_what_repeated(self):
+        # The narrowed instruction is what this runtime says *because* the
+        # profile repeated. A profile that carried it would differ on the retry
+        # it is the consequence of, and the second budget end would look like a
+        # first one forever.
+        first = Recorder()
+        second = Recorder(budget_ends=1)
+        with compiled():
+            attempt(first)
+            attempt(second)
+
+        self.assertEqual(
+            first.spend()["attempt_profile_sha256"],
+            second.spend()["attempt_profile_sha256"],
+        )
+        self.assertNotEqual(
+            first.sent(execution.BUDGET_ENDS), []
+        )
+
+    def test_the_profile_is_written_with_the_closing_that_charges_the_run(self):
+        connection = Recorder()
+        with compiled():
+            _, facts = attempt(connection)
+
+        self.assertEqual(
+            facts["agent_run"]["attempt_profile"],
+            connection.spend()["attempt_profile_sha256"],
+        )
+
+    def test_a_second_attempt_is_told_to_finish_rather_than_to_look(self):
+        # The ceiling buys turns and not tokens, so the same instruction buys
+        # the same turns and spends them the same way. The retry is a narrower
+        # job rather than a wider budget.
+        launcher = Launcher()
+        with compiled():
+            ledger, _ = attempt(Recorder(budget_ends=1), launcher)
+        text = launcher.only.objective
+
+        self.assertIn("already run out of tokens once", text)
+        self.assertIn("Mission packet you were given", text)
+        self.assertIn("Do not explore", text)
+        self.assertEqual([], ledger.violations)
+
+    def test_a_first_attempt_is_told_none_of_that(self):
+        launcher = Launcher()
+        with compiled():
+            attempt(Recorder(), launcher)
+
+        self.assertNotIn("already run out of tokens once", launcher.only.objective)
+
+    def test_a_third_identical_attempt_is_not_made_at_all(self):
+        launcher = Launcher()
+        connection = Recorder(budget_ends=2)
+        with compiled():
+            ledger, facts = attempt(connection, launcher)
+        (task, detail), = connection.sent(execution.RETIRE)
+
+        self.assertEqual([], launcher.requests)
+        self.assertEqual(TASK, task)
+        self.assertIn("budget_exhausted_twice", detail)
+        self.assertEqual([], ledger.violations)
+        self.assertNotIn(execution.OPEN_TOOL_RUN, connection.statements)
+
+    def test_the_count_is_asked_of_this_profile_and_not_of_the_task_alone(self):
+        # "If the packet, the build or the policy change, a first retry is
+        # allowed again" is this parameter and nothing else: the count is keyed
+        # on the profile, so a dispatch that moved counts nothing against it.
+        connection = Recorder(budget_ends=2)
+        with compiled():
+            _, facts = attempt(connection)
+
+        self.assertEqual(
+            [(TASK, facts["agent_run"]["attempt_profile"])],
+            connection.sent(execution.BUDGET_ENDS),
+        )
+
+    def test_a_count_that_could_not_be_read_starts_no_child(self):
+        launcher = Launcher()
+        connection = Recorder(raises={execution.BUDGET_ENDS: database_error("gone")})
+        with compiled():
+            ledger, _ = attempt(connection, launcher)
+
+        self.assertEqual([], launcher.requests)
+        self.assertEqual(
+            [execution.INTEGRITY_FAILED], [one.code for one in ledger.violations]
+        )
+
+
+class SpendTest(unittest.TestCase):
+    """What a run cost, in the numbers the ceiling was actually made of.
+
+    Ticket 165's first item. `input_tokens` is the provider's sum of every
+    turn's whole request, prefix and all, so a 250 000 ceiling bought a
+    `web_hunter` six turns; the turn count was arithmetic on this side and the
+    cache split was thrown away. Both now travel from the child to the row.
+    """
+
+    def test_the_closing_carries_what_the_child_measured(self):
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+
+        self.assertEqual(
+            {
+                "uncached_input_tokens": 200,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 900,
+                "answer_count": 6,
+                "budget_tokens": 390,
+                "budget_policy": execution.BUDGET_POLICY,
+                "error_detail": None,
+            },
+            {name: connection.spend()[name] for name in execution.SPEND},
+        )
+
+    def test_the_pass_reports_them_beside_the_two_totals(self):
+        with compiled():
+            _, facts = attempt(Recorder())
+        run = facts["agent_run"]
+
+        self.assertEqual(1200, run["input_tokens"])
+        self.assertEqual(6, run["answer_count"])
+        self.assertEqual(900, run["cache_read_input_tokens"])
+        self.assertEqual(execution.BUDGET_POLICY, run["budget_policy"])
+
+    def test_a_child_that_never_answered_leaves_them_alone(self):
+        # Nothing rather than zero, for the reason the two totals already give:
+        # a run whose child never reported spent an amount nobody measured, and
+        # a zero written here would be settled against.
+        connection = Recorder()
+        launcher = Launcher(error=RuntimeError("the child died"))
+        with compiled():
+            attempt(connection, launcher)
+
+        self.assertEqual(
+            dict.fromkeys(execution.SPEND),
+            {name: connection.spend()[name] for name in execution.SPEND},
+        )
+
+    def test_the_session_that_chose_is_charged_the_same_way(self):
+        # The one closing verb, for the one reason: a second place the tokens
+        # are settled is a second answer to what a Program has spent.
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+
+        self.assertEqual(390, connection.spend(SESSION)["budget_tokens"])
+        self.assertIsNone(connection.spend(SESSION)["attempt_profile_sha256"])
+
+    def test_what_the_child_said_went_wrong_reaches_the_row(self):
+        connection = Recorder()
+        launcher = Launcher(
+            answer=result(stop_reason="error", error_detail="the SDK closed the stream")
+        )
+        with compiled():
+            attempt(connection, launcher)
+
+        self.assertEqual(
+            "the SDK closed the stream", connection.spend()["error_detail"]
         )
 
 

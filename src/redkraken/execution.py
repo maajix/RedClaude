@@ -31,13 +31,15 @@ slice through a callback it is given, because `proxy` imports `program` and a
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import agent, capsule as capsule_module, isolation, migrate
+from redkraken import _startup, agent, build, capsule as capsule_module, isolation, migrate
 from redkraken import packet as packet_module, pg, playbook as playbook_module
 from redkraken import program, proposal, proxy, replay as replay_module, roster, state as state_module, store
 from redkraken.outcome import INTEGRITY_FAILED, INVALID_CONFIGURATION, Ledger
@@ -486,7 +488,126 @@ EXCHANGE = (
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
 PROMOTE = "SELECT promote_proposal($1::uuid)"
 FINGERPRINT = "SELECT fingerprint_program_surface()"
-FINISH = "SELECT finish_task_attempt($1::uuid, $2, $3, $4)"
+#: The one call that closes an Agent run, its Task and its Reservation. Named
+#: arguments rather than positional ones since ticket 165 widened it: the
+#: parameters past the two totals all default to NULL and are applied as
+#: `coalesce`, so a caller that names them cannot be broken by one being added
+#: between two others.
+FINISH = (
+    "SELECT finish_task_attempt("
+    "p_agent_run => $1::uuid,"
+    " p_stop_reason => $2,"
+    " p_input_tokens => $3,"
+    " p_output_tokens => $4,"
+    " p_uncached_input_tokens => $5,"
+    " p_cache_creation_input_tokens => $6,"
+    " p_cache_read_input_tokens => $7,"
+    " p_answer_count => $8,"
+    " p_budget_tokens => $9,"
+    " p_budget_policy => $10,"
+    " p_error_detail => $11,"
+    " p_attempt_profile_sha256 => $12)"
+)
+
+#: What a child reported spending, in the order `FINISH` names it after the two
+#: totals. One tuple rather than the names written out at each of the two
+#: closings, because the two would drift and the drift would be silent: a key
+#: spelled here and not there is a column that stays NULL for half the runs.
+SPEND = (
+    "uncached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "answer_count",
+    "budget_tokens",
+    "budget_policy",
+    "error_detail",
+)
+
+
+#: The word this build charges a run against its ceiling under. Ticket 165: the
+#: provider's own `input_tokens` is every turn's whole request, prefix and all,
+#: which made a token ceiling into a turn ceiling -- 250 000 bought a
+#: `web_hunter` six turns and a `conclude` needs more than six. The child does
+#: the counting and reports the word back; this copy is what the dispatch is
+#: profiled under, because a profile is needed before there is a child to ask.
+BUDGET_POLICY = "cache-credit-v1"
+
+#: How many times this Task has already ended on its ceiling under exactly this
+#: dispatch. Read rather than counted from the facts, because the attempts that
+#: matter are earlier passes' and this process has no memory of them.
+BUDGET_ENDS = (
+    "SELECT count(*)::int FROM agent_runs"
+    " WHERE task_id = $1::uuid AND stop_reason = 'budget'"
+    " AND attempt_profile_sha256 = $2"
+)
+
+
+@functools.cache
+def _tree_digest() -> str:
+    """What this installation's modules hash to, computed once per process.
+
+    Part of the attempt profile because a build that changed is a dispatch that
+    changed: the objective, the ceiling arithmetic and the tool surface all live
+    in these modules, so a Task refused a third attempt under one build is owed
+    a first one under the next.
+    """
+    return build.verify().tree_digest
+
+
+def attempt_profile(claimed: Claimed, mission: packet_module.Packet, role: roster.Role) -> str:
+    """What this dispatch is, as one digest, so that a repeat can be recognised.
+
+    Ticket 165. `rk2hunt20`'s T6 ended on `budget` twice and was still at the
+    top of the ranking for a third identical attempt: the scheduler ranks a
+    Task, not a Task-and-how-it-was-sent, so "already tried and it did not fit"
+    is not a thing it can see. This is the sentence that makes it visible.
+
+    Everything that changes what the child is asked to do inside what ceiling:
+    the Task, the packet it reads, the role and model that read it, the ceiling
+    itself, the policy the ceiling is counted under and the build doing the
+    counting. A change to any of them is a genuinely different attempt and earns
+    a first retry again.
+
+    Not the recovery hint. The hint is what this runtime says *because* the
+    profile repeated, so a profile that included it would differ on the retry it
+    is the consequence of -- and the second budget end would look like a first
+    one forever.
+    """
+    described = {
+        "task": claimed.task_id,
+        "packet": hashlib.sha256(packet_module.encode(mission.as_dict())).hexdigest(),
+        "role": claimed.role,
+        "model": role.model,
+        "token_cap": claimed.token_cap,
+        "budget_policy": BUDGET_POLICY,
+        "build": _tree_digest(),
+        "runtime": list(_startup.KNOWN_RUNTIME),
+    }
+    return hashlib.sha256(
+        json.dumps(described, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def spent(result: "agent.AgentRunResult | None") -> dict:
+    """What one child's report says its run cost, keyed as the columns are.
+
+    Nothing rather than zero where no child answered, for the reason the facts
+    already give about the two totals: a run whose child never reported spent an
+    amount nobody measured, and a zero written here would be settled against.
+    """
+    if result is None:
+        return dict.fromkeys(SPEND)
+    return {
+        "uncached_input_tokens": result.uncached_input_tokens,
+        "cache_creation_input_tokens": result.cache_creation_input_tokens,
+        "cache_read_input_tokens": result.cache_read_input_tokens,
+        "answer_count": result.answer_count,
+        "budget_tokens": result.budget_tokens,
+        # Empty is a child that named no policy, and the column is left alone
+        # rather than told the run was counted under a word nobody used.
+        "budget_policy": result.budget_policy or None,
+        "error_detail": result.error_detail,
+    }
 
 #: Ticket 143. The other ending, for a Task that never reached an attempt
 #: because this runtime cannot dispatch it. `FINISH` settles an attempt and
@@ -819,6 +940,7 @@ class Claimed:
         self,
         playbooks: Sequence[playbook_module.Projection],
         vocabulary: Sequence[str] = (),
+        completion_only: bool = False,
     ) -> str:
         """The whole of what the child is told, and the shape of what it owes back.
 
@@ -855,7 +977,9 @@ class Claimed:
             f"Target: {self.method} {self.url}\n\n"
         )
         if self.kind == CONCLUDE and self.hypothesis_label is not None:
-            return self._selected(self._conclusion(head, vocabulary), playbooks)
+            return self._finishing(
+                self._selected(self._conclusion(head, vocabulary), playbooks), completion_only
+            )
         prompt = (
             f"{head}"
             "Send that one request with mcp__rk2__http_request and read the answer. "
@@ -894,7 +1018,7 @@ class Claimed:
                 "conditions above -- so a plan authored after it is a plan this run "
                 "never files."
             )
-        return self._selected(prompt, playbooks)
+        return self._finishing(self._selected(prompt, playbooks), completion_only)
 
     def _conclusion(self, head: str, vocabulary: Sequence[str] = ()) -> str:
         """Ticket 156. What a child is told when the measuring is already done.
@@ -954,6 +1078,36 @@ class Claimed:
         )
 
     @staticmethod
+    def _finishing(prompt: str, completion_only: bool) -> str:
+        """Ticket 165's second dispatch: the same Task, told to finish it.
+
+        The first attempt under this dispatch spent the whole ceiling and closed
+        nothing, and the ceiling is not a token budget -- a turn's request is the
+        whole prefix, so what it buys is turns. Sending the same instruction
+        again buys the same turns and spends them the same way, which is what
+        `rk2hunt20`'s T6 did twice.
+
+        So the retry is not a wider budget, it is a narrower job: the packet it
+        already has, no fresh looking, and the calls that end the Task. Said as
+        the last paragraph because it is the one that has to survive a model
+        skimming the middle.
+        """
+        if not completion_only:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            "This Task has already run out of tokens once, doing exactly this. Its "
+            "ceiling buys turns rather than tokens -- every turn re-sends the whole "
+            "transcript -- so this attempt is for finishing it and nothing else. "
+            "Work from the Mission packet you were given: it is the same packet, and "
+            "reading the world again to confirm it is how the last attempt ended with "
+            "nothing filed. Do not explore, do not re-read what the packet already "
+            "carries, and send no request that would only tell you what it says. Call "
+            "the verbs that submit what this Task owes, in the order named above, and "
+            "end. A partial answer that is filed beats a complete one that is not."
+        )
+
+    @staticmethod
     def _selected(prompt: str, playbooks: Sequence[playbook_module.Projection]) -> str:
         """The Playbooks, appended to whichever objective was built above."""
         if not playbooks:
@@ -990,6 +1144,13 @@ class Claimed:
                 "token_cap": self.token_cap,
                 "input_tokens": None,
                 "output_tokens": None,
+                # Ticket 165's numbers, absent for the same reason and filled
+                # from the child's report where there is one. `attempt_profile`
+                # is the exception: it describes the dispatch rather than the
+                # run, so it is known before the child starts and is written
+                # whether or not one answers.
+                **dict.fromkeys(SPEND),
+                "attempt_profile": None,
             },
         }
 
@@ -1781,6 +1942,7 @@ class Slice:
         try:
             with connection.transaction():
                 _actor(connection)
+                usage = spent(result)
                 connection.execute(
                     FINISH,
                     (
@@ -1788,6 +1950,11 @@ class Slice:
                         "aborted" if result is None else stopped_as(result.stop_reason),
                         None if result is None else result.input_tokens,
                         None if result is None else result.output_tokens,
+                        *(usage[name] for name in SPEND),
+                        # A session holds no Task, so there is no attempt to
+                        # profile: what ticket 165 counts is budget ends on one
+                        # Task under one unchanged dispatch.
+                        None,
                     ),
                 )
         except pg.DatabaseError as error:
@@ -1957,6 +2124,31 @@ class Slice:
             },
         }
 
+        # Ticket 165, and after the packet because the packet is part of it: two
+        # attempts that read different documents are two attempts, however alike
+        # the rest of the dispatch looks. Before the capability, because a Task
+        # this pass is about to end should not have one minted for it.
+        profile = attempt_profile(claimed, mission, role)
+        facts["agent_run"]["attempt_profile"] = profile
+        ended = self._budget_ends(ledger, connection, claimed, profile)
+        if ended is None:
+            return
+        if ended >= 2:
+            # `rk2hunt20`'s T6: two full-cap runs, still `pending`, still at the
+            # top of the ranking. A third identical attempt is the second one
+            # again, and the campaign pays for it out of the same capacity.
+            self._retire(
+                ledger,
+                connection,
+                claimed,
+                "budget",
+                f"{claimed.task_label} ended on its token ceiling twice under this "
+                f"dispatch and nothing about it has changed since, so a third would "
+                f"end the same way: budget_exhausted_twice, profile {profile[:12]}",
+            )
+            return
+        objective = claimed.objective(selected, vocabulary, completion_only=ended == 1)
+
         opened = self._authorize(ledger, connection, program_id, claimed, selected, facts)
         if opened is None:
             return
@@ -1971,8 +2163,7 @@ class Slice:
             try:
                 with self._heartbeat(ledger, connection, claimed, facts):
                     result = self._child(
-                        ledger, claimed, selected, vocabulary, mission, door, lifetime,
-                        program_id,
+                        ledger, claimed, objective, mission, door, lifetime, program_id,
                         # Always, now. This used to read the settings only where
                         # a tool image was described, on the argument that a
                         # machine serving no tool call needs no connection --
@@ -2013,6 +2204,7 @@ class Slice:
             facts["agent_run"]["stop_reason"] = stopped_as(result.stop_reason)
             facts["agent_run"]["input_tokens"] = result.input_tokens
             facts["agent_run"]["output_tokens"] = result.output_tokens
+            facts["agent_run"].update(spent(result))
             # Which verbs the child actually reached for, and which it was
             # refused. The launcher has collected both since ticket 86 and
             # nothing has ever read them: `AgentRunResult.as_dict` has no
@@ -2119,6 +2311,37 @@ class Slice:
         # attempt spent and the Task correctly not done.
         settled = performed.facts.get("test_run") is not None
         run["stop_reason"] = "completed" if settled else "error"
+
+    def _budget_ends(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed, profile: str
+    ) -> int | None:
+        """How often this exact dispatch has already run out of tokens. 165.
+
+        `None` is a read that failed, which stops the attempt: dispatching
+        anyway would be spending the ceiling on the question this read exists to
+        answer, and the retry that follows would be the same run a third time.
+        """
+        try:
+            ended = int(
+                connection.execute(BUDGET_ENDS, (claimed.task_id, profile)).scalar() or 0
+            )
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "budget",
+                f"what {claimed.task_label} has already spent under this dispatch "
+                f"could not be read: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        if ended:
+            ledger.hold(
+                "budget",
+                f"{claimed.task_label} has ended on its token ceiling {ended} time(s) "
+                f"under this dispatch; this attempt is "
+                + ("completion only" if ended == 1 else "not made"),
+            )
+        return ended
 
     def _retire(
         self,
@@ -2705,8 +2928,7 @@ class Slice:
         self,
         ledger: Ledger,
         claimed: Claimed,
-        playbooks: Sequence[playbook_module.Projection],
-        vocabulary: Sequence[str],
+        objective: str,
         mission: packet_module.Packet,
         door: agent.Egress,
         lifetime: float,
@@ -2731,7 +2953,7 @@ class Slice:
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
             agent_run_id=claimed.agent_run_id,
-            objective=claimed.objective(playbooks, vocabulary),
+            objective=objective,
             container=self.boundary,
             role=claimed.role,
             program_id=program_id,
@@ -3039,6 +3261,8 @@ class Slice:
                             stop_reason,
                             run.get("input_tokens"),
                             run.get("output_tokens"),
+                            *(run.get(name) for name in SPEND),
+                            run.get("attempt_profile"),
                         ),
                     ).scalar()
                 )
