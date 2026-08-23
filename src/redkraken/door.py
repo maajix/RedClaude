@@ -55,6 +55,19 @@ MODULE = f"{__package__}.door"
 #: it is printed where it is.
 READY = "rk2-door listening on "
 
+#: What the door names after its endpoint: the database it opened. Ticket 149 --
+#: `RK_PROXY_DATABASE_URL` is read once, when the container starts, and the door
+#: outlives the command that started it by design (ticket 82). A run against a
+#: second database therefore reaches a door that cannot see its Program, and it
+#: cannot even file the blocked Receipt that would say so, because the label
+#: counter it needs is keyed on a Program row that is not there. The door is the
+#: only thing that knows which database it opened, so it is the thing that says.
+#:
+#: The name and not the host and port: a door on the Agent network and a runtime
+#: on this machine reach one database by two addresses, and comparing those
+#: would refuse the arrangement that is working.
+SERVING = " serving "
+
 #: Where `start` puts what the door needs, inside the container.  Fixed paths for
 #: the reason `isolation` gives for its own: a path that means one thing inside
 #: and another outside is a path somebody will eventually read as the wrong one.
@@ -157,7 +170,9 @@ def main() -> int:
             authority=Path(authority) if authority else None,
             key=Path(key) if key else None,
             contained=True,
-            announce=lambda endpoint: print(f"{READY}{endpoint}", flush=True),
+            announce=lambda endpoint: print(
+                f"{READY}{endpoint}{SERVING}{settings.database}", flush=True
+            ),
         )
     )
 
@@ -234,7 +249,17 @@ def start(
             fence=environment.get(proxy.DATABASE_VARIABLE, ""),
             host_environment=host_environment,
         )
-        bound = _listening(engine, container.proxy_container, host_environment, timeout)
+        bound, serving = _listening(
+            engine, container.proxy_container, host_environment, timeout
+        )
+        wanted = pg.settings_from_url(environment[proxy.DATABASE_VARIABLE]).database
+        if serving != wanted:
+            raise isolation.Unavailable(
+                f"the door serves {serving or 'a database it did not name'} and this "
+                f"runtime serves {wanted}; the door reads its connection string once "
+                "at startup and outlives the command that started it, so it is still "
+                "the one a previous engagement began. Remove it and start it again."
+            )
         isolation.join(
             engine, container.network, container.proxy_container, proxy_host, host_environment
         )
@@ -503,12 +528,17 @@ def _run(
 
 def _listening(
     engine: str, name: str, host_environment: Mapping[str, str], timeout: float
-) -> str:
+) -> tuple[str, str]:
     """Wait for the door to say it is serving, or say what it said instead.
 
-    The refusal carries the door's own last line rather than a bare timeout,
-    because the usual reason a door never listens is a fence URL it could not
-    open, and that sentence is already written in the report it printed.
+    Answers where it is bound and which database it opened. The refusal carries
+    the door's own last line rather than a bare timeout, because the usual
+    reason a door never listens is a fence URL it could not open, and that
+    sentence is already written in the report it printed.
+
+    A door that announces no database is one from a build before ticket 149, and
+    an empty name is returned rather than guessed at: the caller refuses it, and
+    a door too old to say is exactly the stale door this question is asked about.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -516,7 +546,9 @@ def _listening(
         written = logs.stdout + logs.stderr
         for line in written.splitlines():
             if line.startswith(READY):
-                return line[len(READY) :].strip()
+                said = line[len(READY) :].strip()
+                bound, _, serving = said.partition(SERVING.strip())
+                return bound.strip(), serving.strip()
         if time.monotonic() >= deadline:
             said = written.strip().splitlines()
             raise isolation.Unavailable(

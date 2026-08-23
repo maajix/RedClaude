@@ -12249,6 +12249,41 @@ class ExecutionSliceTest(DatabaseCase):
         self.assertEqual("done", again["task_status"])
         self.assertTrue(again["accepted"])
 
+    def test_a_tool_run_closed_as_error_is_allowed_to_say_why(self):
+        """Ticket 149. `rk2hunt8` closed three Tool runs `error` and said nothing.
+
+        The cause was not the call site. 018 added `exit_code` and `exit_detail`
+        together and constrained both to an offline tool, which is right about
+        the code -- a run through the door starts no process -- and wrong about
+        the reason. The three that failed were online runs, so `offline_tool` was
+        NULL, so the one column that could have carried the account was the one
+        the CHECK forbade them.
+        """
+        forbids = self.runtime.execute(
+            "SELECT count(*) FROM pg_constraint WHERE conname = $1",
+            ("tool_runs_exit_detail_ck",),
+        ).scalar()
+
+        self.assertEqual(0, int(forbids), "a reason is every run's, not an offline tool's")
+
+    def test_the_exit_code_stays_an_offline_tools(self):
+        """The other half of the same constraint, and it is correct as it stands."""
+        kept = self.runtime.execute(
+            "SELECT count(*) FROM pg_constraint WHERE conname = $1",
+            ("tool_runs_exit_code_ck",),
+        ).scalar()
+
+        self.assertEqual(1, int(kept), "a run through the door starts no process")
+
+    def test_the_closing_that_errors_a_tool_run_records_a_reason(self):
+        """A status with no reason costs the next reader the whole investigation."""
+        body = self.runtime.execute(
+            "SELECT prosrc FROM pg_proc WHERE proname = 'close_tool_runs'"
+        ).scalar()
+
+        self.assertIn("exit_detail", str(body))
+        self.assertIn("still open", str(body))
+
     def test_a_second_slice_on_the_same_program_claims_nothing(self):
         ledger = Ledger()
         facts = self.attempt("grounded", Child(self.subject), ledger)
