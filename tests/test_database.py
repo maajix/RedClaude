@@ -15772,7 +15772,7 @@ TWIN = {
     "technologies": [("nginx", "1.24.0"), ("openssl", "3.0.13")],
     "identities": [
         {"ref": "guest", "class": "anonymous", "owns": ["application"]},
-        {"ref": "org", "class": "service", "owns": []},
+        {"ref": "org", "class": "privileged", "owns": []},
         {"ref": "member", "class": "user", "owns": ["GET /notes"], "member_of": "org"},
     ],
 }
