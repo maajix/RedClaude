@@ -43,7 +43,9 @@ import os
 import ssl
 import sys
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import NoReturn
 
@@ -96,6 +98,51 @@ REFUSAL = "startup_refusal"
 #: result document travels through a pipe and this is proof the run finished,
 #: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
+
+#: How much of a failed run's own account of itself crosses back, and what
+#: stands where the setup token would have been. The bound is on the
+#: diagnostic rather than on the failure: `error_detail` is what an operator
+#: reads when a Task closed without finishing, so it has to be non-empty and it
+#: has to be small enough that a CLI answering with a page of text cannot make
+#: it the biggest thing in the row.
+#:
+#: The redaction is one known secret rather than a rule corpus -- this process
+#: has no database to read `redaction_rules` from, and the one value it holds
+#: that must never be written down is the token it was handed. It replaces
+#: before it truncates, because a secret cut in half by a bound is a secret
+#: that survived whenever the bound moves.
+ERROR_DETAIL = 2048
+REDACTED = "[redacted]"
+
+#: The key the setup token travels under on the child's one job line, and the
+#: variable the CLI reads it from. The key is popped out of the job before
+#: anything else reads it and the variable is set after the startup assertion
+#: has measured the environment it was given, so what the assertion sees is the
+#: environment the supervisor built and what the CLI sees is that environment
+#: plus one value nothing else in this process ever writes down.
+OAUTH_TOKEN = "oauth_token"
+OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
+
+#: What one cached input token costs the agent-run ceiling, as a divisor, and
+#: the name of the policy that spends it. `cache-credit-v1` is a harness budget
+#: policy and not a dollar accounting: what it states is that a cached read is
+#: billed far below ordinary input, so a ceiling that counted a re-sent prefix
+#: at full price is a ceiling on turns rather than on tokens -- which is ticket
+#: 165, where six turns of a 40 000-token prefix spent a 250 000-token budget
+#: and no `conclude` Task ever finished.
+#:
+#: Named on every run it bounds, because the number is only readable against the
+#: policy it was computed under: a row recording 40 200 units says nothing until
+#: something says which arithmetic produced it.
+CACHE_CREDIT = 10
+BUDGET_POLICY = "cache-credit-v1"
+
+#: How a run whose stream ended without a terminal message is reported. Not
+#: `completed`, which is what an unreported stop already means, and not
+#: `error`, which is what a terminal message saying so means: three endings the
+#: runtime can tell apart are three endings an operator can act on, and a
+#: stream that simply stopped is the one nobody has an account of.
+UNTERMINATED = "aborted"
 
 #: How much of one response's header list a child may read. The body has had a
 #: ceiling since it was first answered and a header list without one is the same
@@ -1160,6 +1207,7 @@ def server(
     correlator: Correlator | None = None,
     transcripts: Transcripts | None = None,
     refresh: Refresh | None = None,
+    role: roster.Role | None = None,
 ):
     """Six reads, a request, two tool runs, a result, a Test, a Finding, a canary, a choice, a judgement.
 
@@ -1175,12 +1223,25 @@ def server(
     same properties again afterwards. Two checks of one statement, which is the
     arrangement, rather than two statements.
 
-    Every tool is built for every run, including the two only an orchestrator
-    may call. What a run may reach is the roster's allowlist and not this list,
-    for the reason `net.request` is served unconditionally: an allowlist that
-    varied with the job would be an allowlist the startup assertion could not
-    check against the roster. A worker's Slate is empty, which is the honest
-    answer for a run that was offered no choice.
+    Only the role's own tools are built, so what a run is offered is exactly
+    `allowed_tools` -- the same intersection of the roster's grants with what
+    this launch serves that the options value carries and the assertion checks.
+    Out of the roster and never out of the job: an allowlist that varied with
+    the job would be one the startup assertion could not check against
+    anything, while a frame that varies with the role is the role's own row
+    read twice.
+
+    Ticket 165's third open question is why it is not the allowlist alone. A
+    `conclude` run spent a third of its budget calling `get_validation_packet`
+    and `get_slate` and being told by its own gate that it held neither: the
+    tools were in front of the model because every tool was built for every
+    run. The gate stays exactly where it was -- it is the enforcement point and
+    this is context management -- and no role gains anything, because the list
+    kept here is the list the gate was already deciding from.
+
+    A caller naming no role is served everything it could serve. `run` always
+    names one: a launch whose role the roster does not know has no options value
+    and never reaches a transport at all.
     """
     reads = {
         "get_attack_surface": reader.attack_surface,
@@ -1214,19 +1275,33 @@ def server(
     # back as rows, and `Refresh` is what puts those rows into the document the
     # other five read.
     refreshing = Refresh(reader, channel) if refresh is None else refresh
-    tools = [_read(surface, name, answer) for name, answer in reads.items()]
-    tools.append(_refresh(surface, refreshing))
-    tools.append(_request(surface, door, naming))
-    tools.append(_tool_run(surface, channel, "run_tool"))
-    tools.append(_tool_run(surface, channel, "run_skill_script"))
-    tools.append(_propose(surface, submission))
-    tools.append(_finding(surface, proposing))
-    tools.append(_specification(surface, authoring))
-    tools.append(_callback(surface, minting))
-    tools.append(_slate(surface, picking))
-    tools.append(_pick(surface, picking))
-    tools.append(_packet(surface, judging))
-    tools.append(_judge(surface, judging))
+    # Named rather than appended, so that the role's grants decide which
+    # handlers are built rather than which of them survive being built. Each
+    # name here is the one its factory serves the tool under, and the two are
+    # held together by the roster: what this returns is compared against
+    # `allowed_tools` for every role, so a key that drifted from its factory is
+    # a tool served under the wrong grant and fails there.
+    builders = {
+        **{name: partial(_read, surface, name, answer) for name, answer in reads.items()},
+        "refresh_packet": partial(_refresh, surface, refreshing),
+        "http_request": partial(_request, surface, door, naming),
+        "run_tool": partial(_tool_run, surface, channel, "run_tool"),
+        "run_skill_script": partial(_tool_run, surface, channel, "run_skill_script"),
+        "submit_mission_result": partial(_propose, surface, submission),
+        "propose_finding": partial(_finding, surface, proposing),
+        "propose_test": partial(_specification, surface, authoring),
+        "mint_callback": partial(_callback, surface, minting),
+        "get_slate": partial(_slate, surface, picking),
+        "pick_task": partial(_pick, surface, picking),
+        "get_validation_packet": partial(_packet, surface, judging),
+        "submit_verdict": partial(_judge, surface, judging),
+    }
+    offered = (
+        set(builders)
+        if role is None
+        else {agent.BARE[name] for name in role.allowed_tools(agent.SERVED)}
+    )
+    tools = [build() for name, build in builders.items() if name in offered]
     return create_sdk_mcp_server(name=agent.SERVER, version=agent.SERVER_VERSION, tools=tools)
 
 
@@ -1880,6 +1955,13 @@ async def run(
     `agent.MANAGED_SETTINGS` in the process doing the asserting, which is this
     one, and a caller naming them would be a caller choosing what it sees.
     """
+    # First of all, and before the job is read for anything else: the setup
+    # token comes off the mapping rather than out of it. What is no longer
+    # there cannot be echoed by a handler, written into the launch directory,
+    # carried back in the run report or quoted in a traceback -- and the one
+    # copy that survives is the local below, which reaches the environment
+    # after the assertion and the redaction after a failure.
+    token = _setup_token(job)
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
     role = str(job.get("role") or "")
@@ -1926,7 +2008,16 @@ async def run(
         else options_for(
             job,
             runtime,
-            server(surface, reader, submission, door, choice, judgement, channel),
+            server(
+                surface,
+                reader,
+                submission,
+                door,
+                choice,
+                judgement,
+                channel,
+                role=gate.role,
+            ),
             launch,
             gate,
         )
@@ -1938,6 +2029,15 @@ async def run(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")
         )
     assert gate is not None
+    # Only now, and only into this process's own environment. The assertion has
+    # measured the environment the supervisor built and the configuration the
+    # CLI will load; putting the token in before that would have been the
+    # runtime asserting against an environment it had already edited. The SDK
+    # hands the CLI this environment plus `ClaudeAgentOptions.env`, which stays
+    # empty -- so the value is inherited by one process and named in no
+    # argument, no settings document and no options value.
+    if token is not None:
+        os.environ[OAUTH_VARIABLE] = token
 
     messages = (transport or query)(
         prompt=stated(reader.packet.bounds) + str(job["objective"]), options=options
@@ -1951,8 +2051,8 @@ async def run(
     text = ""
     answers = 0
     stop_reason = None
-    spent_in = 0
-    spent_out = 0
+    error_detail = None
+    spent = Spend()
     async for message in messages:
         if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == INIT:
             # A second announcement is a second startup, and the assertion was
@@ -1962,26 +2062,50 @@ async def run(
             surface.open()
         if isinstance(message, AssistantMessage):
             answers += 1
-            turn_in, turn_out = _usage(getattr(message, "usage", None))
-            spent_in += turn_in
-            spent_out += turn_out
-            # The ceiling stops the run. Not a warning and not a log line: the
-            # tokens past it are ones the Program did not reserve, and a session
-            # asked politely to stop is a session that decides whether to.
-            if ceiling is not None and spent_in + spent_out > ceiling:
+            spent = spent + _usage(getattr(message, "usage", None))
+            # The ceiling stops the run, incrementally and in budget units. Not
+            # a warning and not a log line: the tokens past it are ones the
+            # Program did not reserve, and a session asked politely to stop is a
+            # session that decides whether to. `max_turns` is a separate hard
+            # limit the pair enforces and is not folded in here -- one bound on
+            # how much a run may spend, one on how many times it may act.
+            if ceiling is not None and spent.budget > ceiling:
                 stop_reason = "budget"
                 break
         if isinstance(message, ResultMessage):
             text = str(getattr(message, "result", "") or "")[:ANSWER]
-            stop_reason = getattr(message, "stop_reason", None)
+            # `is_error` first and the subtype second, because the pair reports
+            # a failing API call as an error carrying the subtype `success`.
+            # A run that failed and said `success` was written down as one that
+            # had nothing to report, which `stopped_as` reads as `completed`.
+            if getattr(message, "is_error", False):
+                stop_reason = "error"
+                error_detail = _error_detail(message, token)
+            else:
+                stop_reason = getattr(message, "stop_reason", None)
             # The session's own totals, which is the number to report when there
             # is one: the per-turn sum is what this loop could see, and a turn
             # the SDK accounted for after the last message it sent is in the
-            # result and not in the sum. A result reporting nothing leaves the
-            # sum alone rather than overwriting a measurement with a zero.
-            result_in, result_out = _usage(getattr(message, "usage", None))
-            if result_in or result_out:
-                spent_in, spent_out = result_in, result_out
+            # result and not in the sum. A result reporting nothing in any of
+            # the four leaves the sum alone rather than overwriting a
+            # measurement with a zero.
+            result = _usage(getattr(message, "usage", None))
+            if result.measured:
+                spent = result
+            # The first terminal message ends the stream. It is the session's
+            # own account of how it finished, so everything after it belongs to
+            # a session that has already ended -- including a transport that
+            # fails on the way out, which would otherwise turn a run that
+            # succeeded into a traceback the supervisor reads as no result.
+            break
+    else:
+        # No terminal message at all: the stream simply stopped. Reached only
+        # when nothing broke out of the loop, so nothing here can overwrite a
+        # reason the run already had. Not `completed`, which is what an
+        # unreported stop already means, because then a run nobody has an
+        # account of and a run that ended cleanly would be the same row.
+        stop_reason = UNTERMINATED
+        error_detail = "the stream ended without a terminal result message"
     return {
         "role": gate.role.name,
         "sdk_version": runtime.get("sdk_version"),
@@ -1991,12 +2115,27 @@ async def run(
         "tools_served": list(surface.served),
         "denials": [denial.as_dict() for denial in gate.denials],
         "answers": answers,
+        # The same number `answers` counts, under the name the run row records
+        # it as. Ticket 165's cheapest open question: the child counted its own
+        # turns and dropped the number on the floor, so "six turns" was
+        # arithmetic done against a ceiling rather than something measured.
+        "answer_count": answers,
         "stop_reason": stop_reason,
+        "error_detail": error_detail,
         "text": text,
         "mission_result": submission.result,
         "mission_attempts": submission.attempts,
-        "input_tokens": spent_in,
-        "output_tokens": spent_out,
+        # The raw provider sum, kept as the telemetry it always was, beside the
+        # four categories it is made of and the units the reservation is spent
+        # in. The policy travels with the number because the number is only
+        # readable against it.
+        "input_tokens": spent.raw_input,
+        "output_tokens": spent.output,
+        "uncached_input_tokens": spent.uncached,
+        "cache_creation_input_tokens": spent.cache_creation,
+        "cache_read_input_tokens": spent.cache_read,
+        "budget_tokens": spent.budget,
+        "budget_policy": BUDGET_POLICY,
         "choice": choice.task,
         "pick_attempts": choice.attempts,
         "verdict": judgement.answer,
@@ -2036,15 +2175,118 @@ def _slate_entries(stated: object) -> list[Mapping[str, object]]:
         return []
 
 
-def _usage(stated: object) -> tuple[int, int]:
-    """One message's tokens, as the two numbers the run row records.
+def _setup_token(job: Mapping[str, object]) -> str | None:
+    """The setup token off the job, taken out of it where it can be.
 
-    Everything the model was charged for reading counts as input, cache included:
-    a cached read is cheaper, not free, and a ceiling that ignored the cache
-    would be a ceiling a long session walks straight through. A turn's numbers
-    are that turn's own request, prefix and all, which is what the Program is
-    charged for making it -- so the session's cost is the sum of the turns, and
-    the `ResultMessage` total replaces the sum when the SDK reports one.
+    Popped rather than read, because the guarantee is about what is left behind:
+    the job mapping goes on to be read for a packet, a capsule, an egress block
+    and an objective, and a secret that is still in it is a secret every one of
+    those readers could carry somewhere. Anything that is not a non-empty string
+    is nothing at all -- a job written before the token travelled is a job this
+    process runs without one, exactly as it did.
+    """
+    stated = (
+        job.pop(OAUTH_TOKEN, None)
+        if isinstance(job, MutableMapping)
+        else job.get(OAUTH_TOKEN)
+    )
+    return stated if isinstance(stated, str) and stated else None
+
+
+def _error_detail(message: object, secret: str | None) -> str:
+    """Why a terminal message says the run failed, bounded and redacted.
+
+    Built out of the message's own account of itself rather than out of its
+    prose: the subtype it reported, the HTTP status of the failing call where
+    the pair reported one, and the errors it listed. Non-empty by construction,
+    because a Tool run or a child that failed with no detail is a Task closed
+    for a reason nobody can read.
+
+    Redacted before it is cut, and cut to a bound rather than left at whatever
+    length the CLI answered with. The one secret this process holds is the
+    token it was handed, and a bound that happened to sever it would be a
+    redaction that works until the bound moves.
+    """
+    parts = [f"subtype={getattr(message, 'subtype', None) or 'unknown'}"]
+    status = getattr(message, "api_error_status", None)
+    if status is not None:
+        parts.append(f"api_error_status={status}")
+    parts.extend(str(one) for one in (getattr(message, "errors", None) or ()))
+    detail = "; ".join(parts)
+    if secret:
+        detail = detail.replace(secret, REDACTED)
+    return detail[:ERROR_DETAIL]
+
+
+@dataclass(frozen=True, slots=True)
+class Spend:
+    """What one message cost, in the four categories the provider bills it in.
+
+    Four numbers rather than two, because the three input categories are not
+    one price. A cached read is billed at roughly a tenth of ordinary input, so
+    a total that adds them at weight one is not a token budget at all -- it is a
+    turn budget worth `ceiling / context` turns, which is ticket 165. Kept
+    separate here and weighted once, in `budget`, so that what a row records
+    and what a ceiling is spent against come out of one statement.
+
+    `raw_input` is the sum as it was and stays the telemetry the run row already
+    carried: it is what the provider counted, and it is the number to read when
+    the question is how much this session actually made the model read.
+    """
+
+    uncached: int = 0
+    cache_creation: int = 0
+    cache_read: int = 0
+    output: int = 0
+
+    def __add__(self, other: "Spend") -> "Spend":
+        return Spend(
+            self.uncached + other.uncached,
+            self.cache_creation + other.cache_creation,
+            self.cache_read + other.cache_read,
+            self.output + other.output,
+        )
+
+    @property
+    def raw_input(self) -> int:
+        """Every input token the provider counted, at weight one."""
+        return self.uncached + self.cache_creation + self.cache_read
+
+    @property
+    def budget(self) -> int:
+        """What `cache-credit-v1` charges the reservation for this much reading.
+
+        Integer division rounding up, because a part of a cached token is a
+        token: rounding towards the Program would leave a ceiling something a
+        long session crosses a fraction at a time and is never charged for.
+        """
+        return (
+            self.uncached
+            + self.cache_creation
+            + (self.cache_read + CACHE_CREDIT - 1) // CACHE_CREDIT
+            + self.output
+        )
+
+    @property
+    def measured(self) -> bool:
+        """Whether anything was reported at all, in any one of the four."""
+        return bool(self.uncached or self.cache_creation or self.cache_read or self.output)
+
+
+def _usage(stated: object) -> Spend:
+    """One message's tokens, in the categories the provider billed them in.
+
+    Everything the model was charged for reading is counted, cache included --
+    but each category is kept as itself rather than summed on the way in, and
+    what weights them is `cache-credit-v1` where the ceiling is spent. A cached
+    read is cheaper, not free, and this is the reading that says by how much: at
+    four re-sends of a 40 000-token prefix the difference between "cheaper" and
+    "the same price" is most of the budget.
+
+    A turn's numbers are that turn's own request, prefix and all, which is what
+    the Program is charged for making it -- so the session's cost is the sum of
+    the turns, and the `ResultMessage` total replaces the sum when the SDK
+    reports one of its own.
 
     Nothing reported is zero: a message carrying no usage block still happened,
     and absent fields inside a block that is there are zero for the same reason.
@@ -2053,15 +2295,15 @@ def _usage(stated: object) -> tuple[int, int]:
     zero here is a session running unbounded.
     """
     if stated is None:
-        return (0, 0)
+        return Spend()
     if not isinstance(stated, Mapping):
         raise TypeError(f"usage is {type(stated).__name__}, not a mapping")
     usage = stated
-    return (
-        int(usage.get("input_tokens") or 0)
-        + int(usage.get("cache_read_input_tokens") or 0)
-        + int(usage.get("cache_creation_input_tokens") or 0),
-        int(usage.get("output_tokens") or 0),
+    return Spend(
+        uncached=int(usage.get("input_tokens") or 0),
+        cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
+        cache_read=int(usage.get("cache_read_input_tokens") or 0),
+        output=int(usage.get("output_tokens") or 0),
     )
 
 

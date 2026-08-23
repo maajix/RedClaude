@@ -15,8 +15,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, document, isolation, packet, pg, proxy
-from redkraken import roster, skill, store, tls
+from redkraken import _launch, _startup, agent, document, execution, isolation, packet
+from redkraken import pg, proxy, roster, skill, store, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -253,6 +253,59 @@ def job(launch_workspace, **overrides) -> dict:
     }
     fields.update(overrides)
     return fields
+
+
+def announcement():
+    """The one message a corroborated launch reads before anything else."""
+    return _launch.SystemMessage(_launch.INIT, {"apiKeySource": agent.EXPECTED_KEY_SOURCE})
+
+
+def turn(**usage):
+    """One assistant answer, billed in the categories the provider reports.
+
+    The usage block is the SDK's own shape and is passed through unread, so a
+    test states what the provider said rather than what this runtime makes of
+    it.
+    """
+    return _launch.AssistantMessage(content=[], model="opus", usage=dict(usage) or None)
+
+
+def terminal(**overrides):
+    """One `ResultMessage`, with the six fields the SDK gives no default."""
+    fields = {
+        "subtype": "success",
+        "duration_ms": 1,
+        "duration_api_ms": 1,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "session-1",
+    }
+    fields.update(overrides)
+    return _launch.ResultMessage(**fields)
+
+
+def concluded(messages, **overrides) -> dict:
+    """One whole child run over a scripted stream, and the report it returns.
+
+    The transport is the one thing a test cannot arrange honestly, for
+    `INIT_CHILD`'s reason: nothing this suite can do makes the real pair report
+    the usage a budget test needs to state. Everything else is the real run --
+    the assertion, the corroboration, the loop and the report it builds.
+    """
+
+    async def transport(**_):
+        yield announcement()
+        for message in messages:
+            yield message
+
+    return asyncio.run(
+        _launch.run(
+            job(fixtures.scratch(), **overrides),
+            environment={},
+            runtime=_launch.runtime_facts(),
+            transport=transport,
+        )
+    )
 
 
 def launched(
@@ -1153,6 +1206,84 @@ class ServedToolTest(unittest.TestCase):
         self.assertEqual(["get_hypotheses", "get_receipts"], surface.served)
 
 
+class RoleSurfaceTest(unittest.TestCase):
+    """What one role is served, which is what the roster grants it and no more.
+
+    Ticket 165's third open question. A `conclude` run spent a third of its
+    budget reaching for `get_validation_packet` and `get_slate` and being
+    refused by its own gate, because every tool was built for every run and the
+    allowlist was the only thing narrowing them. The allowlist is still the
+    authority; this is the frame around it, and it is derived from the same
+    roster row, so the two cannot come to disagree.
+    """
+
+    def offered(self, role: str) -> list[str]:
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            _launch.server(
+                _launch.Surface(),
+                packet.Reader(packet.Packet()),
+                _launch.Submission(),
+                role=roster.ROLES[role],
+            )
+        return sorted(served)
+
+    def granted(self, role: str) -> list[str]:
+        return sorted(
+            agent.BARE[name] for name in roster.ROLES[role].allowed_tools(agent.SERVED)
+        )
+
+    def test_every_role_is_offered_exactly_the_tools_the_roster_grants_it(self):
+        for name, compiled in roster.ROLES.items():
+            if not compiled.allowed_tools(agent.SERVED):
+                continue
+            with self.subTest(role=name):
+                self.assertEqual(self.granted(name), self.offered(name))
+
+    def test_a_hunter_can_neither_see_nor_call_another_roles_contract(self):
+        offered = self.offered("web_hunter")
+
+        self.assertNotIn("get_validation_packet", offered)
+        self.assertNotIn("get_slate", offered)
+        # And the gate stays the second line of defence rather than being
+        # replaced by the first: a call nothing offered is still refused by the
+        # roster, which is what a run's evidence needs if one is ever injected.
+        gate = roster.Gate("web_hunter")
+        for name in ("mcp__rk2__get_validation_packet", "mcp__rk2__get_slate"):
+            with self.subTest(tool=name):
+                self.assertIsNotNone(gate.decide(roster.Call(tool=name)))
+
+    def test_a_launch_that_names_no_role_is_served_everything_it_could_serve(self):
+        # The stand-in every handler test uses. Naming no role is not a wider
+        # grant: `run` always has one, because a launch that could not be
+        # described by a roster row never reaches a transport.
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            _launch.server(
+                _launch.Surface(), packet.Reader(packet.Packet()), _launch.Submission()
+            )
+
+        self.assertEqual(sorted(agent.BARE.values()), sorted(served))
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class RoleServerTest(unittest.TestCase):
+    """That the run builds its server for the role it was dispatched as."""
+
+    def test_the_child_serves_its_own_roles_tools_and_no_others(self):
+        with contextlib.ExitStack() as stack:
+            served = stack.enter_context(packaged())
+            concluded([terminal(stop_reason="end_turn")], role=SKILLED)
+
+        self.assertEqual(
+            sorted(
+                agent.BARE[name]
+                for name in roster.ROLES[SKILLED].allowed_tools(agent.SERVED)
+            ),
+            sorted(served),
+        )
+
+
 class ToolChannelTest(unittest.TestCase):
     """PH2-87: the one thing a child asks for rather than being given.
 
@@ -1561,6 +1692,13 @@ class FindingProposalTest(unittest.TestCase):
 
         self.assertEqual(3, proposal.attempts)
         self.assertEqual(1, proposal.refused)
+
+    def test_the_ceiling_on_refused_proposals_is_three(self):
+        # Ticket 163 names the number so that a fix elsewhere is not mistaken
+        # for raising it. Three is one more than the number of mistakes a child
+        # can correct by asking again, and what makes those two correctable is
+        # the vocabulary reaching the child -- not a fourth attempt.
+        self.assertEqual(3, _launch.REFUSED_PROPOSALS)
 
     def test_the_ceiling_answers_a_token_and_carries_nothing(self):
         # Not a raise and not a silence. The model is told what it spent and
@@ -2371,27 +2509,40 @@ class ChildTest(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     _launch._token_cap(stated)
 
-    def test_every_read_the_model_was_charged_for_counts_as_input(self):
-        # A cached read is cheaper, not free. A ceiling that ignored the cache
-        # is one a long session walks straight through.
-        self.assertEqual(
-            (600, 20),
-            _launch._usage(
-                {
-                    "input_tokens": 100,
-                    "cache_read_input_tokens": 300,
-                    "cache_creation_input_tokens": 200,
-                    "output_tokens": 20,
-                }
-            ),
+    def test_every_category_the_provider_billed_is_kept_as_itself(self):
+        # Ticket 165. A cached read is cheaper, not free, and the difference
+        # between "cheaper" and "the same price" is most of a long session's
+        # budget -- so the three input categories are kept apart and weighted
+        # where the ceiling is spent, not summed on the way in.
+        spent = _launch._usage(
+            {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 300,
+                "cache_creation_input_tokens": 200,
+                "output_tokens": 20,
+            }
         )
+
+        self.assertEqual(_launch.Spend(100, 200, 300, 20), spent)
+        self.assertEqual(600, spent.raw_input)
+        # 100 + 200 + ceil(300 / 10) + 20
+        self.assertEqual(350, spent.budget)
+
+    def test_a_part_of_a_cached_token_is_charged_as_a_whole_one(self):
+        # Rounding towards the Program would make a ceiling something a run
+        # crosses a fraction at a time and is never charged for.
+        self.assertEqual(1, _launch.Spend(cache_read=1).budget)
+        self.assertEqual(1, _launch.Spend(cache_read=10).budget)
+        self.assertEqual(2, _launch.Spend(cache_read=11).budget)
 
     def test_a_message_that_reports_no_usage_spends_nothing(self):
         # A message with no usage block still happened, and so does a block with
         # fields missing from it.
-        self.assertEqual((0, 0), _launch._usage(None))
-        self.assertEqual((0, 0), _launch._usage({}))
-        self.assertEqual((7, 0), _launch._usage({"input_tokens": 7}))
+        self.assertEqual(_launch.Spend(), _launch._usage(None))
+        self.assertEqual(_launch.Spend(), _launch._usage({}))
+        self.assertEqual(_launch.Spend(uncached=7), _launch._usage({"input_tokens": 7}))
+        self.assertFalse(_launch.Spend().measured)
+        self.assertTrue(_launch.Spend(cache_read=1).measured)
 
     def test_usage_this_process_cannot_read_is_not_quietly_zero(self):
         # The same reason `_token_cap` raises: a quiet zero here is a running
@@ -3116,6 +3267,303 @@ class BoundsTest(unittest.TestCase):
             "It ends when you stop.\n\nSay nothing.",
             seen[0],
         )
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class SetupTokenTest(unittest.TestCase):
+    """Where the setup token goes, and everywhere it does not.
+
+    It crosses on the child's one private job line and it reaches exactly one
+    place: this process's own environment, which the CLI inherits. The order is
+    the guarantee -- the assertion measures the environment the supervisor
+    built, and the variable is written after it has answered.
+    """
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop(_launch.OAUTH_VARIABLE, None)
+
+    def test_the_token_reaches_the_environment_and_leaves_the_job(self):
+        token = "sk-ant-oat01-carried"
+        carried = job(fixtures.scratch(), oauth_token=token)
+
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn")
+
+        report = asyncio.run(
+            _launch.run(
+                carried,
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertEqual(token, os.environ[_launch.OAUTH_VARIABLE])
+        self.assertNotIn(_launch.OAUTH_TOKEN, carried)
+        self.assertNotIn(token, json.dumps(report))
+
+    def test_a_job_with_no_token_writes_no_variable(self):
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn")
+
+        asyncio.run(
+            _launch.run(
+                job(fixtures.scratch()),
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertNotIn(_launch.OAUTH_VARIABLE, os.environ)
+
+    def test_a_refused_launch_never_reaches_the_environment(self):
+        # The whole of the ordering: a launch the assertion refuses is one that
+        # put nothing anywhere, so a refusal cannot leave a token behind in a
+        # process that goes on to do something else.
+        def transport(**_):
+            raise AssertionError("a transport was constructed for a refused launch")
+
+        with self.assertRaises(agent.StartupRefusal):
+            asyncio.run(
+                _launch.run(
+                    job(fixtures.scratch(), oauth_token="sk-ant-oat01-refused"),
+                    environment={},
+                    runtime={"sdk_version": None, "cli_version": None, "cli_path": None},
+                    transport=transport,
+                )
+            )
+
+        self.assertNotIn(_launch.OAUTH_VARIABLE, os.environ)
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class BudgetTest(unittest.TestCase):
+    """What the agent-run ceiling counts, and what a cached prefix costs it.
+
+    Ticket 165. Every `web_hunter` run in `rk2hunt17` and `rk2hunt20` ended on
+    `budget` at about 250 000 input tokens and thirty output, because each turn
+    charged the whole re-sent prefix at full price -- so the ceiling bought
+    `ceiling / context` turns and a `conclude` needs more than six of them.
+    `cache-credit-v1` is the reading that fixes it: a cached read counts a
+    tenth, which is what the provider bills it at.
+    """
+
+    def test_ten_cached_turns_finish_inside_a_ceiling_the_raw_sum_walks_through(self):
+        report = concluded(
+            [turn(cache_read_input_tokens=40000, output_tokens=20) for _ in range(10)]
+            + [terminal(stop_reason="end_turn")],
+            token_cap=250000,
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual(10, report["answer_count"])
+        # 400 000 tokens read, 40 200 units spent, and the run got to the end.
+        self.assertEqual(400000, report["cache_read_input_tokens"])
+        self.assertEqual(40200, report["budget_tokens"])
+
+    def test_ten_uncached_turns_of_the_same_size_still_cross_the_same_ceiling(self):
+        # The other half of the same reading: crediting the cache must not
+        # become a budget that no longer bounds anything. Uncached input is
+        # counted exactly as it was, so this run stops at the seventh turn.
+        report = concluded(
+            [turn(input_tokens=40000, output_tokens=20) for _ in range(10)]
+            + [terminal(stop_reason="end_turn")],
+            token_cap=250000,
+        )
+
+        self.assertEqual("budget", report["stop_reason"])
+        self.assertEqual(7, report["answer_count"])
+        self.assertEqual(280140, report["budget_tokens"])
+
+    def test_the_raw_numbers_the_answer_count_and_the_budget_units_agree(self):
+        report = concluded(
+            [
+                turn(
+                    input_tokens=1000,
+                    cache_creation_input_tokens=2000,
+                    cache_read_input_tokens=30001,
+                    output_tokens=40,
+                ),
+                turn(input_tokens=1000, cache_read_input_tokens=30000, output_tokens=40),
+                terminal(stop_reason="end_turn"),
+            ]
+        )
+
+        self.assertEqual(2000, report["uncached_input_tokens"])
+        self.assertEqual(2000, report["cache_creation_input_tokens"])
+        self.assertEqual(60001, report["cache_read_input_tokens"])
+        self.assertEqual(80, report["output_tokens"])
+        # `input_tokens` is the raw provider sum and stays what it was: the
+        # telemetry the row already carried, beside the units it is charged in.
+        self.assertEqual(64001, report["input_tokens"])
+        self.assertEqual(
+            report["uncached_input_tokens"]
+            + report["cache_creation_input_tokens"]
+            + report["cache_read_input_tokens"],
+            report["input_tokens"],
+        )
+        # 2000 + 2000 + ceil(60001 / 10) + 80. A part of a cached token is a
+        # token, so the division rounds up rather than towards the Program.
+        self.assertEqual(2000 + 2000 + 6001 + 80, report["budget_tokens"])
+        self.assertEqual("cache-credit-v1", report["budget_policy"])
+        # The turn count is measured rather than calculated, and it is the same
+        # number the run already counted.
+        self.assertEqual(report["answers"], report["answer_count"])
+        self.assertEqual(2, report["answer_count"])
+
+    def test_a_result_that_reports_its_own_categories_replaces_the_turn_sum(self):
+        report = concluded(
+            [
+                turn(input_tokens=100, cache_read_input_tokens=1000, output_tokens=10),
+                terminal(
+                    stop_reason="end_turn",
+                    usage={
+                        "input_tokens": 7,
+                        "cache_creation_input_tokens": 3,
+                        "cache_read_input_tokens": 90,
+                        "output_tokens": 1,
+                    },
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            (7, 3, 90, 1),
+            (
+                report["uncached_input_tokens"],
+                report["cache_creation_input_tokens"],
+                report["cache_read_input_tokens"],
+                report["output_tokens"],
+            ),
+        )
+        self.assertEqual(7 + 3 + 9 + 1, report["budget_tokens"])
+
+    def test_a_result_that_reports_one_category_still_replaces_the_turn_sum(self):
+        # Category-aware: a session whose whole request came out of the cache
+        # reports no uncached input and no output at all, and that is a
+        # measurement rather than a result that measured nothing.
+        report = concluded(
+            [
+                turn(input_tokens=100, output_tokens=10),
+                terminal(stop_reason="end_turn", usage={"cache_read_input_tokens": 500}),
+            ]
+        )
+
+        self.assertEqual(0, report["uncached_input_tokens"])
+        self.assertEqual(500, report["cache_read_input_tokens"])
+        self.assertEqual(50, report["budget_tokens"])
+
+    def test_a_result_that_reports_nothing_leaves_the_measurement_alone(self):
+        report = concluded(
+            [
+                turn(input_tokens=100, cache_read_input_tokens=1000, output_tokens=10),
+                terminal(stop_reason="end_turn", usage={}),
+            ]
+        )
+
+        self.assertEqual(100, report["uncached_input_tokens"])
+        self.assertEqual(1000, report["cache_read_input_tokens"])
+        self.assertEqual(10, report["output_tokens"])
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class TerminalTest(unittest.TestCase):
+    """How a run ends, and the three different things ending can mean.
+
+    The `success` error: the CLI reports an overloaded or failing API call as a
+    `ResultMessage` carrying `is_error=True` and the subtype `success`, and the
+    loop read neither -- so a run that failed was written down with the stop
+    reason the message happened to carry, which `stopped_as` reads as
+    `completed` when it carries none.
+    """
+
+    def test_the_first_terminal_message_ends_the_stream(self):
+        report = concluded(
+            [
+                terminal(stop_reason="end_turn", result="first"),
+                terminal(stop_reason="refusal", result="second"),
+            ]
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual("first", report["text"])
+
+    def test_terminal_success_survives_a_transport_that_fails_afterwards(self):
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn", result="done")
+            raise _launch.claude_agent_sdk.CLIConnectionError("the CLI went away")
+
+        report = asyncio.run(
+            _launch.run(
+                job(fixtures.scratch()),
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual("done", report["text"])
+        self.assertIsNone(report["error_detail"])
+
+    def test_an_error_stays_an_error_however_the_subtype_reads(self):
+        report = concluded(
+            [
+                terminal(
+                    subtype="success",
+                    is_error=True,
+                    api_error_status=529,
+                    stop_reason="end_turn",
+                    result="overloaded",
+                )
+            ]
+        )
+
+        self.assertEqual("error", report["stop_reason"])
+        self.assertIn("529", report["error_detail"])
+
+    def test_an_error_detail_is_bounded_and_never_carries_the_setup_token(self):
+        token = "sk-ant-oat01-" + "s" * 40
+        report = concluded(
+            [
+                terminal(
+                    subtype="error_during_execution",
+                    is_error=True,
+                    errors=[f"{token} rejected: " + "x" * 4000],
+                )
+            ],
+            oauth_token=token,
+        )
+
+        self.assertLessEqual(len(report["error_detail"]), 2048)
+        self.assertNotIn(token, report["error_detail"])
+        self.assertIn("[redacted]", report["error_detail"])
+        self.assertNotIn(token, json.dumps(report))
+
+    def test_success_an_error_and_silence_are_three_different_durable_results(self):
+        ended = {
+            "success": concluded([terminal(stop_reason="end_turn")]),
+            "error": concluded([terminal(subtype="success", is_error=True)]),
+            "silence": concluded([turn(output_tokens=1)]),
+        }
+
+        self.assertEqual(
+            ["aborted", "completed", "error"],
+            sorted(execution.stopped_as(one["stop_reason"]) for one in ended.values()),
+        )
+        for ending, report in ended.items():
+            with self.subTest(ending=ending):
+                self.assertIn(
+                    execution.stopped_as(report["stop_reason"]), execution.ACCEPTED_STOPS
+                )
+        self.assertIsNone(ended["success"]["error_detail"])
+        self.assertTrue(ended["error"]["error_detail"])
+        self.assertTrue(ended["silence"]["error_detail"])
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
