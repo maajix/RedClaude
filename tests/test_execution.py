@@ -36,6 +36,7 @@ from redkraken import (
     roster,
     store,
 )
+from redkraken import migrate
 from redkraken import outcome as outcome_module
 from redkraken.outcome import Ledger
 from tests import fixtures
@@ -60,6 +61,42 @@ SELECTED_PLAYBOOK = playbook.PLAYBOOKS["object-ownership"]
 FIRST = fixtures.FIRST
 
 CAPABILITY = "c0ffee" * 10 + "cafe"
+
+
+def seeded_classes() -> tuple[str, ...]:
+    """Every id the migration corpus seeds into `vulnerability_classes`.
+
+    Read out of the corpus rather than written down here, which is the whole
+    point of ticket 163: a list of words kept beside the table is a second copy
+    that goes stale, and the run this ticket is about was refused by words a
+    stale copy would not have carried. A migration that seeds a thirty-eighth
+    class puts it in this tuple, and the assertions below then demand it of the
+    objective without anybody editing them.
+    """
+    found: list[str] = []
+    for source in sorted(migrate.CORPUS.glob("*.sql")):
+        lines = source.read_text(encoding="utf-8").splitlines()
+        rows = False
+        for line in lines:
+            if line.startswith("INSERT INTO vulnerability_classes"):
+                rows = True
+                continue
+            # The statement ends where the indented rows do. Sliced on the
+            # indent rather than on the terminating semicolon, because one of
+            # the remediation sentences contains a semicolon of its own.
+            if rows and (not line.strip() or not line.startswith((" ", "\t"))):
+                rows = False
+            if not rows:
+                continue
+            named = re.match(r"\s*\('([a-z0-9_]+)'", line)
+            if named:
+                found.append(named.group(1))
+    assert found, "the corpus seeds no vulnerability class at all"
+    return tuple(sorted(found))
+
+
+#: The vocabulary as the database would answer `CLASSES`, in the same order.
+SEEDED_CLASSES = seeded_classes()
 
 #: The one described boundary every test here starts a child inside. The engine
 #: never runs: `Slice.launch` is replaced, and what is asserted is what the
@@ -320,6 +357,9 @@ class Recorder:
         # kept Playbook never reaches the question, and a case with none is
         # asking what a subject with no strategy at all reads like.
         self.near_misses = list(answers.get("near_misses", []))
+        # Ticket 163. The vocabulary a `conclude` child is shown, as the seeded
+        # table holds it. A test that wants the table empty or short says so.
+        self.classes = list(answers.get("classes", SEEDED_CLASSES))
         # How many live selections the sweep found their Playbook had expired
         # under. Zero is the ordinary pass; a catalogue that moved under a
         # running mission is what a case says otherwise to see.
@@ -531,6 +571,8 @@ class Recorder:
             return list(self.selections)
         if sql == execution.NEAR_MISSES:
             return list(self.near_misses)
+        if sql == execution.CLASSES:
+            return [(one,) for one in self.classes]
         if sql == execution.SWEEP_STALE:
             return [(self.marked,)]
         if sql == execution.ARM_WATCHES:
@@ -1062,6 +1104,91 @@ class ObjectiveTest(unittest.TestCase):
     def test_a_subject_nothing_was_selected_for_is_told_no_more_than_before(self):
         """Not a sentence about an empty list: an empty list is not a Playbook."""
         self.assertNotIn("Playbook", claimed().objective(()))
+
+
+class FindingVocabularyTest(unittest.TestCase):
+    """Ticket 163. The words a `conclude` child has to name one of.
+
+    `rk2hunt17` reached `conclude` twice, spent six runs and eighteen proposals
+    on synonyms of a class the vocabulary has no word for, and filed no Finding:
+    the objective said "a vulnerability class from this harness's vocabulary"
+    and the vocabulary was in a table the child has no route to. What is
+    asserted here is that the list travels with the objective and comes from
+    the table, so that seeding a thirty-eighth class cannot leave the prompt
+    describing thirty-seven.
+    """
+
+    def concluding(self, **overrides) -> str:
+        subject = claimed(
+            kind="conclude", role="web_hunter", hypothesis_label="H1", **overrides
+        )
+        return subject.objective((), SEEDED_CLASSES)
+
+    def dispatched(self, **answers) -> tuple[Recorder, Launcher]:
+        connection = Recorder(
+            started=(started_row(kind="conclude", role="web_hunter", hypothesis_label="H1"),),
+            **answers,
+        )
+        launcher = Launcher()
+        with compiled():
+            self.ledger, _ = attempt(connection, launcher)
+        return connection, launcher
+
+    def test_a_conclude_objective_carries_every_class_the_corpus_seeds(self):
+        text = self.concluding()
+        for one in SEEDED_CLASSES:
+            with self.subTest(one):
+                self.assertIn(one, text)
+
+    def test_the_vocabulary_the_child_reads_is_the_one_the_table_answered(self):
+        # The list is not built here: the pass asks `vulnerability_classes` for
+        # it and hands over what came back, which is what makes a class seeded
+        # by a later migration reach the prompt without anybody editing it.
+        connection, launcher = self.dispatched()
+
+        self.assertIn(execution.CLASSES, connection.statements)
+        for one in SEEDED_CLASSES:
+            with self.subTest(one):
+                self.assertIn(one, launcher.only.objective)
+        self.assertEqual([], self.ledger.violations)
+
+    def test_a_word_this_table_does_not_hold_is_offered_to_nobody(self):
+        # The class `rk2hunt17` kept reaching for, which is not in the table and
+        # must not be in the prompt either: the ticket is about showing the
+        # vocabulary, not about widening it.
+        self.assertNotIn("missing_security_headers", self.concluding())
+        self.assertNotIn("missing_security_headers", SEEDED_CLASSES)
+
+    def test_the_objective_says_what_to_do_when_no_word_on_the_list_fits(self):
+        # Six runs ended on three refusals each because the only move the prompt
+        # described was proposing again. A child that cannot name the weakness
+        # has an answer to give, and this is where it is told what it is.
+        text = self.concluding()
+
+        self.assertIn("do not reach for the nearest synonym", text)
+        self.assertIn("without a Finding", text)
+
+    def test_a_kind_that_proposes_no_finding_is_told_none_of_this(self):
+        # The list is 37 words in every objective that would never use them.
+        # A recon child reads what it needs and pays for what it reads.
+        connection = Recorder()
+        launcher = Launcher()
+        with compiled():
+            attempt(connection, launcher)
+
+        self.assertNotIn(execution.CLASSES, connection.statements)
+        self.assertNotIn("cleartext_transmission", launcher.only.objective)
+
+    def test_a_vocabulary_that_could_not_be_read_starts_no_child(self):
+        # A `conclude` child dispatched without it is the run this ticket is
+        # about: it calls the one tool the Task was opened for, is refused for a
+        # word nobody showed it, and leaves the Task exactly where it was.
+        connection, launcher = self.dispatched(classes=[])
+
+        self.assertEqual([], launcher.requests)
+        self.assertEqual(
+            [execution.INTEGRITY_FAILED], [one.code for one in self.ledger.violations]
+        )
 
 
 class SlateTest(unittest.TestCase):

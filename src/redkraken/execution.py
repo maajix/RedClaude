@@ -101,6 +101,10 @@ CLAIMED = tuple(name for name in REQUIRED if name != CERTIFICATE) + tuple(
 #: out at each is a kind that can be renamed in one place out of two.
 PERFORM = "perform"
 
+#: The kind that names a Finding rather than measuring one, named for the same
+#: reason: the dispatch branch and ticket 163's vocabulary read both ask for it.
+CONCLUDE = "conclude"
+
 MISSIONS = {
     "recon": "Map what this target exposes.",
     "hunt": "Look for one exploitable weakness in this target.",
@@ -362,6 +366,14 @@ SELECTED = (
     " WHERE s.task_id = $1::uuid AND s.dropped_because IS NULL"
     " ORDER BY s.rank"
 )
+
+#: Ticket 163. The words a `conclude` child is allowed to name, read from the
+#: table that defines them. Read per attempt rather than held as a Python
+#: constant for the reason the roster already gives for not making it an enum:
+#: a second copy of this table goes stale, and a migration that seeds a new
+#: class would leave the prompt describing the old vocabulary. `rk2hunt17` spent
+#: six runs and eighteen proposals guessing words that were never in it.
+CLASSES = "SELECT id FROM vulnerability_classes ORDER BY id"
 
 #: Ticket 164's answer to "nothing in the corpus is about this subject", which
 #: was true and unusable: it named no Playbook and no fact, so an operator
@@ -803,7 +815,11 @@ class Claimed:
             test_label=(None if len(row) < 16 or row[15] is None else str(row[15])),
         )
 
-    def objective(self, playbooks: Sequence[playbook_module.Projection]) -> str:
+    def objective(
+        self,
+        playbooks: Sequence[playbook_module.Projection],
+        vocabulary: Sequence[str] = (),
+    ) -> str:
         """The whole of what the child is told, and the shape of what it owes back.
 
         The target is named because the child cannot look it up: its packet
@@ -838,8 +854,8 @@ class Claimed:
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
         )
-        if self.kind == "conclude" and self.hypothesis_label is not None:
-            return self._selected(self._conclusion(head), playbooks)
+        if self.kind == CONCLUDE and self.hypothesis_label is not None:
+            return self._selected(self._conclusion(head, vocabulary), playbooks)
         prompt = (
             f"{head}"
             "Send that one request with mcp__rk2__http_request and read the answer. "
@@ -880,7 +896,7 @@ class Claimed:
             )
         return self._selected(prompt, playbooks)
 
-    def _conclusion(self, head: str) -> str:
+    def _conclusion(self, head: str, vocabulary: Sequence[str] = ()) -> str:
         """Ticket 156. What a child is told when the measuring is already done.
 
         The other kinds are asked to establish something. This one is asked to
@@ -893,7 +909,28 @@ class Claimed:
         that did that here would spend its turns re-measuring a claim the
         runtime has already settled -- and would end the run without ever
         calling the one tool the Task was opened for.
+
+        Ticket 163: the vocabulary is written out here rather than referred to.
+        "A vulnerability class from this harness's vocabulary" named a table the
+        child has no route to, so it guessed, and `propose_finding` refuses a
+        guess by name three times and then stops carrying proposals at all.
+        Thirty-seven short words cost less than one refused proposal, and they
+        come from the table on every attempt so that seeding a new class cannot
+        leave this paragraph describing the old list.
         """
+        classes = (
+            "\n\nThe classes are, and are only:\n"
+            f"{', '.join(vocabulary)}.\n\n"
+            "Name one of those ids exactly. A word that is not on that list is "
+            "refused for not being on it, however well it describes the weakness. "
+            "If none of them names this one, do not reach for the nearest synonym: "
+            "say so in mcp__rk2__submit_mission_result, naming the ids you weighed, "
+            "and let the run end without a Finding. That is an answer this harness "
+            "can act on; three refusals of three spellings of the same absent word "
+            "is not."
+            if vocabulary
+            else ""
+        )
         return (
             f"{head}"
             f"The claim {self.hypothesis_label} is supported. The runtime replayed "
@@ -910,7 +947,7 @@ class Claimed:
             "part of this a person cannot correct later without reopening the "
             "Finding. If seeing the target once would settle which class it is, "
             "send that one request with mcp__rk2__http_request first -- and if it "
-            "would not, do not send it.\n\n"
+            f"would not, do not send it.{classes}\n\n"
             "The runtime answers created, merged or refused. Merged means a Finding "
             "is already open on this cell and your claim was added to it, which is a "
             "result and not a rejection."
@@ -1893,6 +1930,13 @@ class Slice:
         if selected is None:
             return
 
+        # Read here for the same reason the Playbooks are: a vocabulary the
+        # child is shown after it has started is a vocabulary it proposed
+        # without.
+        vocabulary = self._vocabulary(ledger, connection, claimed)
+        if vocabulary is None:
+            return
+
         mission = self._packet(
             ledger,
             connection,
@@ -1927,7 +1971,8 @@ class Slice:
             try:
                 with self._heartbeat(ledger, connection, claimed, facts):
                     result = self._child(
-                        ledger, claimed, selected, mission, door, lifetime, program_id,
+                        ledger, claimed, selected, vocabulary, mission, door, lifetime,
+                        program_id,
                         # Always, now. This used to read the settings only where
                         # a tool image was described, on the argument that a
                         # machine serving no tool call needs no connection --
@@ -2224,6 +2269,48 @@ class Slice:
             "revocation",
             f"{tool_run['label']} closed as {outcome}; its capability no longer resolves",
         )
+
+    def _vocabulary(
+        self, ledger: Ledger, connection: pg.Connection, claimed: Claimed
+    ) -> tuple[str, ...] | None:
+        """The vulnerability classes a `conclude` child may name. Ticket 163.
+
+        Asked only where the objective uses it, because the other kinds propose
+        no Finding and a read they never spend is a read they should not make.
+        `None` is a refusal to dispatch: a `conclude` child sent out without the
+        vocabulary is the run `rk2hunt17` had six of -- it calls the one tool
+        the Task was opened for, is refused for a word nobody showed it, and
+        ends with the Task exactly where it started.
+        """
+        if claimed.kind != CONCLUDE:
+            return ()
+        try:
+            rows = connection.execute(CLASSES).rows
+        except pg.DatabaseError as error:
+            ledger.fail(
+                "vocabulary",
+                f"the vulnerability classes {claimed.task_label} has to name one of "
+                f"could not be read: {error}",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        classes = tuple(str(row[0]) for row in rows)
+        if not classes:
+            ledger.fail(
+                "vocabulary",
+                "vulnerability_classes is empty, so no Finding this Program proposes "
+                "could name a class; the schema is seeded by a migration",
+                code=INTEGRITY_FAILED,
+                source="database",
+            )
+            return None
+        ledger.hold(
+            "vocabulary",
+            f"{len(classes)} vulnerability class(es) travel in {claimed.task_label}'s "
+            "objective, so the child names one rather than guessing at one",
+        )
+        return classes
 
     def _playbooks(
         self,
@@ -2619,6 +2706,7 @@ class Slice:
         ledger: Ledger,
         claimed: Claimed,
         playbooks: Sequence[playbook_module.Projection],
+        vocabulary: Sequence[str],
         mission: packet_module.Packet,
         door: agent.Egress,
         lifetime: float,
@@ -2643,7 +2731,7 @@ class Slice:
         timeout = min(self.timeout, lifetime) if lifetime > 0 else self.timeout
         request = agent.AgentRunRequest(
             agent_run_id=claimed.agent_run_id,
-            objective=claimed.objective(playbooks),
+            objective=claimed.objective(playbooks, vocabulary),
             container=self.boundary,
             role=claimed.role,
             program_id=program_id,
