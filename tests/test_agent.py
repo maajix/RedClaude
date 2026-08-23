@@ -3250,6 +3250,77 @@ class BoundsTest(unittest.TestCase):
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class SetupTokenTest(unittest.TestCase):
+    """Where the setup token goes, and everywhere it does not.
+
+    It crosses on the child's one private job line and it reaches exactly one
+    place: this process's own environment, which the CLI inherits. The order is
+    the guarantee -- the assertion measures the environment the supervisor
+    built, and the variable is written after it has answered.
+    """
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop(_launch.OAUTH_VARIABLE, None)
+
+    def test_the_token_reaches_the_environment_and_leaves_the_job(self):
+        token = "sk-ant-oat01-carried"
+        carried = job(fixtures.scratch(), oauth_token=token)
+
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn")
+
+        report = asyncio.run(
+            _launch.run(
+                carried,
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertEqual(token, os.environ[_launch.OAUTH_VARIABLE])
+        self.assertNotIn(_launch.OAUTH_TOKEN, carried)
+        self.assertNotIn(token, json.dumps(report))
+
+    def test_a_job_with_no_token_writes_no_variable(self):
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn")
+
+        asyncio.run(
+            _launch.run(
+                job(fixtures.scratch()),
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertNotIn(_launch.OAUTH_VARIABLE, os.environ)
+
+    def test_a_refused_launch_never_reaches_the_environment(self):
+        # The whole of the ordering: a launch the assertion refuses is one that
+        # put nothing anywhere, so a refusal cannot leave a token behind in a
+        # process that goes on to do something else.
+        def transport(**_):
+            raise AssertionError("a transport was constructed for a refused launch")
+
+        with self.assertRaises(agent.StartupRefusal):
+            asyncio.run(
+                _launch.run(
+                    job(fixtures.scratch(), oauth_token="sk-ant-oat01-refused"),
+                    environment={},
+                    runtime={"sdk_version": None, "cli_version": None, "cli_path": None},
+                    transport=transport,
+                )
+            )
+
+        self.assertNotIn(_launch.OAUTH_VARIABLE, os.environ)
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
 class AnnouncementTest(unittest.TestCase):
     """What the runtime does with a CLI that announces itself more than once."""
 

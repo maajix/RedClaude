@@ -43,7 +43,7 @@ import os
 import ssl
 import sys
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import NoReturn
@@ -97,6 +97,15 @@ REFUSAL = "startup_refusal"
 #: result document travels through a pipe and this is proof the run finished,
 #: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
+
+#: The key the setup token travels under on the child's one job line, and the
+#: variable the CLI reads it from. The key is popped out of the job before
+#: anything else reads it and the variable is set after the startup assertion
+#: has measured the environment it was given, so what the assertion sees is the
+#: environment the supervisor built and what the CLI sees is that environment
+#: plus one value nothing else in this process ever writes down.
+OAUTH_TOKEN = "oauth_token"
+OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
 
 #: How much of one response's header list a child may read. The body has had a
 #: ceiling since it was first answered and a header list without one is the same
@@ -1909,6 +1918,13 @@ async def run(
     `agent.MANAGED_SETTINGS` in the process doing the asserting, which is this
     one, and a caller naming them would be a caller choosing what it sees.
     """
+    # First of all, and before the job is read for anything else: the setup
+    # token comes off the mapping rather than out of it. What is no longer
+    # there cannot be echoed by a handler, written into the launch directory,
+    # carried back in the run report or quoted in a traceback -- and the one
+    # copy that survives is the local below, which reaches the environment
+    # after the assertion and the redaction after a failure.
+    token = _setup_token(job)
     environment = dict(os.environ) if environment is None else dict(environment)
     runtime = runtime_facts() if runtime is None else dict(runtime)
     role = str(job.get("role") or "")
@@ -1976,6 +1992,15 @@ async def run(
             violations, "pre_spawn", runtime.get("sdk_version"), runtime.get("cli_version")
         )
     assert gate is not None
+    # Only now, and only into this process's own environment. The assertion has
+    # measured the environment the supervisor built and the configuration the
+    # CLI will load; putting the token in before that would have been the
+    # runtime asserting against an environment it had already edited. The SDK
+    # hands the CLI this environment plus `ClaudeAgentOptions.env`, which stays
+    # empty -- so the value is inherited by one process and named in no
+    # argument, no settings document and no options value.
+    if token is not None:
+        os.environ[OAUTH_VARIABLE] = token
 
     messages = (transport or query)(
         prompt=stated(reader.packet.bounds) + str(job["objective"]), options=options
@@ -2072,6 +2097,24 @@ def _slate_entries(stated: object) -> list[Mapping[str, object]]:
         return capsule.Capsule.from_dict(stated).slate()
     except capsule.CapsuleError:
         return []
+
+
+def _setup_token(job: Mapping[str, object]) -> str | None:
+    """The setup token off the job, taken out of it where it can be.
+
+    Popped rather than read, because the guarantee is about what is left behind:
+    the job mapping goes on to be read for a packet, a capsule, an egress block
+    and an objective, and a secret that is still in it is a secret every one of
+    those readers could carry somewhere. Anything that is not a non-empty string
+    is nothing at all -- a job written before the token travelled is a job this
+    process runs without one, exactly as it did.
+    """
+    stated = (
+        job.pop(OAUTH_TOKEN, None)
+        if isinstance(job, MutableMapping)
+        else job.get(OAUTH_TOKEN)
+    )
+    return stated if isinstance(stated, str) and stated else None
 
 
 def _usage(stated: object) -> tuple[int, int]:
