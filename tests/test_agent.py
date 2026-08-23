@@ -15,8 +15,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, document, isolation, packet, pg, proxy
-from redkraken import roster, skill, store, tls
+from redkraken import _launch, _startup, agent, document, execution, isolation, packet
+from redkraken import pg, proxy, roster, skill, store, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
 from tests.fixtures import EXPORTED, docker, unlatched
@@ -3461,6 +3461,102 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(100, report["uncached_input_tokens"])
         self.assertEqual(1000, report["cache_read_input_tokens"])
         self.assertEqual(10, report["output_tokens"])
+
+
+@unittest.skipIf(not INSTALLED, NEEDS_SDK)
+class TerminalTest(unittest.TestCase):
+    """How a run ends, and the three different things ending can mean.
+
+    The `success` error: the CLI reports an overloaded or failing API call as a
+    `ResultMessage` carrying `is_error=True` and the subtype `success`, and the
+    loop read neither -- so a run that failed was written down with the stop
+    reason the message happened to carry, which `stopped_as` reads as
+    `completed` when it carries none.
+    """
+
+    def test_the_first_terminal_message_ends_the_stream(self):
+        report = concluded(
+            [
+                terminal(stop_reason="end_turn", result="first"),
+                terminal(stop_reason="refusal", result="second"),
+            ]
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual("first", report["text"])
+
+    def test_terminal_success_survives_a_transport_that_fails_afterwards(self):
+        async def transport(**_):
+            yield announcement()
+            yield terminal(stop_reason="end_turn", result="done")
+            raise _launch.claude_agent_sdk.CLIConnectionError("the CLI went away")
+
+        report = asyncio.run(
+            _launch.run(
+                job(fixtures.scratch()),
+                environment={},
+                runtime=_launch.runtime_facts(),
+                transport=transport,
+            )
+        )
+
+        self.assertEqual("end_turn", report["stop_reason"])
+        self.assertEqual("done", report["text"])
+        self.assertIsNone(report["error_detail"])
+
+    def test_an_error_stays_an_error_however_the_subtype_reads(self):
+        report = concluded(
+            [
+                terminal(
+                    subtype="success",
+                    is_error=True,
+                    api_error_status=529,
+                    stop_reason="end_turn",
+                    result="overloaded",
+                )
+            ]
+        )
+
+        self.assertEqual("error", report["stop_reason"])
+        self.assertIn("529", report["error_detail"])
+
+    def test_an_error_detail_is_bounded_and_never_carries_the_setup_token(self):
+        token = "sk-ant-oat01-" + "s" * 40
+        report = concluded(
+            [
+                terminal(
+                    subtype="error_during_execution",
+                    is_error=True,
+                    errors=[f"{token} rejected: " + "x" * 4000],
+                )
+            ],
+            oauth_token=token,
+        )
+
+        self.assertLessEqual(len(report["error_detail"]), 2048)
+        self.assertNotIn(token, report["error_detail"])
+        self.assertIn("[redacted]", report["error_detail"])
+        self.assertNotIn(token, json.dumps(report))
+
+    def test_success_an_error_and_silence_are_three_different_durable_results(self):
+        ended = {
+            "success": concluded([terminal(stop_reason="end_turn")]),
+            "error": concluded([terminal(subtype="success", is_error=True)]),
+            "silence": concluded([turn(output_tokens=1)]),
+        }
+
+        self.assertEqual(
+            ["aborted", "completed", "error"],
+            sorted(execution.stopped_as(one["stop_reason"]) for one in ended.values()),
+        )
+        for ending, report in ended.items():
+            with self.subTest(ending=ending):
+                self.assertIn(
+                    execution.stopped_as(report["stop_reason"]), execution.ACCEPTED_STOPS
+                )
+        self.assertIsNone(ended["success"]["error_detail"])
+        self.assertTrue(ended["error"]["error_detail"])
+        self.assertTrue(ended["silence"]["error_detail"])
 
 
 @unittest.skipIf(not INSTALLED, NEEDS_SDK)

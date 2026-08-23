@@ -99,6 +99,21 @@ REFUSAL = "startup_refusal"
 #: not a transcript. What is kept of it is Promotion's business, not this pipe's.
 ANSWER = 1500
 
+#: How much of a failed run's own account of itself crosses back, and what
+#: stands where the setup token would have been. The bound is on the
+#: diagnostic rather than on the failure: `error_detail` is what an operator
+#: reads when a Task closed without finishing, so it has to be non-empty and it
+#: has to be small enough that a CLI answering with a page of text cannot make
+#: it the biggest thing in the row.
+#:
+#: The redaction is one known secret rather than a rule corpus -- this process
+#: has no database to read `redaction_rules` from, and the one value it holds
+#: that must never be written down is the token it was handed. It replaces
+#: before it truncates, because a secret cut in half by a bound is a secret
+#: that survived whenever the bound moves.
+ERROR_DETAIL = 2048
+REDACTED = "[redacted]"
+
 #: The key the setup token travels under on the child's one job line, and the
 #: variable the CLI reads it from. The key is popped out of the job before
 #: anything else reads it and the variable is set after the startup assertion
@@ -121,6 +136,13 @@ OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
 #: something says which arithmetic produced it.
 CACHE_CREDIT = 10
 BUDGET_POLICY = "cache-credit-v1"
+
+#: How a run whose stream ended without a terminal message is reported. Not
+#: `completed`, which is what an unreported stop already means, and not
+#: `error`, which is what a terminal message saying so means: three endings the
+#: runtime can tell apart are three endings an operator can act on, and a
+#: stream that simply stopped is the one nobody has an account of.
+UNTERMINATED = "aborted"
 
 #: How much of one response's header list a child may read. The body has had a
 #: ceiling since it was first answered and a header list without one is the same
@@ -2029,6 +2051,7 @@ async def run(
     text = ""
     answers = 0
     stop_reason = None
+    error_detail = None
     spent = Spend()
     async for message in messages:
         if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == INIT:
@@ -2051,7 +2074,15 @@ async def run(
                 break
         if isinstance(message, ResultMessage):
             text = str(getattr(message, "result", "") or "")[:ANSWER]
-            stop_reason = getattr(message, "stop_reason", None)
+            # `is_error` first and the subtype second, because the pair reports
+            # a failing API call as an error carrying the subtype `success`.
+            # A run that failed and said `success` was written down as one that
+            # had nothing to report, which `stopped_as` reads as `completed`.
+            if getattr(message, "is_error", False):
+                stop_reason = "error"
+                error_detail = _error_detail(message, token)
+            else:
+                stop_reason = getattr(message, "stop_reason", None)
             # The session's own totals, which is the number to report when there
             # is one: the per-turn sum is what this loop could see, and a turn
             # the SDK accounted for after the last message it sent is in the
@@ -2061,6 +2092,20 @@ async def run(
             result = _usage(getattr(message, "usage", None))
             if result.measured:
                 spent = result
+            # The first terminal message ends the stream. It is the session's
+            # own account of how it finished, so everything after it belongs to
+            # a session that has already ended -- including a transport that
+            # fails on the way out, which would otherwise turn a run that
+            # succeeded into a traceback the supervisor reads as no result.
+            break
+    else:
+        # No terminal message at all: the stream simply stopped. Reached only
+        # when nothing broke out of the loop, so nothing here can overwrite a
+        # reason the run already had. Not `completed`, which is what an
+        # unreported stop already means, because then a run nobody has an
+        # account of and a run that ended cleanly would be the same row.
+        stop_reason = UNTERMINATED
+        error_detail = "the stream ended without a terminal result message"
     return {
         "role": gate.role.name,
         "sdk_version": runtime.get("sdk_version"),
@@ -2076,6 +2121,7 @@ async def run(
         # arithmetic done against a ceiling rather than something measured.
         "answer_count": answers,
         "stop_reason": stop_reason,
+        "error_detail": error_detail,
         "text": text,
         "mission_result": submission.result,
         "mission_attempts": submission.attempts,
@@ -2145,6 +2191,31 @@ def _setup_token(job: Mapping[str, object]) -> str | None:
         else job.get(OAUTH_TOKEN)
     )
     return stated if isinstance(stated, str) and stated else None
+
+
+def _error_detail(message: object, secret: str | None) -> str:
+    """Why a terminal message says the run failed, bounded and redacted.
+
+    Built out of the message's own account of itself rather than out of its
+    prose: the subtype it reported, the HTTP status of the failing call where
+    the pair reported one, and the errors it listed. Non-empty by construction,
+    because a Tool run or a child that failed with no detail is a Task closed
+    for a reason nobody can read.
+
+    Redacted before it is cut, and cut to a bound rather than left at whatever
+    length the CLI answered with. The one secret this process holds is the
+    token it was handed, and a bound that happened to sever it would be a
+    redaction that works until the bound moves.
+    """
+    parts = [f"subtype={getattr(message, 'subtype', None) or 'unknown'}"]
+    status = getattr(message, "api_error_status", None)
+    if status is not None:
+        parts.append(f"api_error_status={status}")
+    parts.extend(str(one) for one in (getattr(message, "errors", None) or ()))
+    detail = "; ".join(parts)
+    if secret:
+        detail = detail.replace(secret, REDACTED)
+    return detail[:ERROR_DETAIL]
 
 
 @dataclass(frozen=True, slots=True)
