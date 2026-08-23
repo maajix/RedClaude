@@ -2007,6 +2007,22 @@ class CapsuleTest(unittest.TestCase):
         self.assertEqual(1, len(holds))
         self.assertIn("OS1 reached its turns ceiling", holds[0].detail)
 
+    def test_a_spent_campaign_says_where_its_successor_comes_from(self):
+        # Ticket 161's fourth criterion, which is a question rather than a bug:
+        # a session closed on `tokens` rotates on the next pass, not inside the
+        # one that closed it and not when an operator says so. `rk2hunt17` has
+        # one row at generation 1 with `rotated_from` null because `hunt.sh`
+        # stopped on `nothing_to_execute` and never ran that next pass, which is
+        # the stop reason's fault and not the rotation's.
+        connection = Recorder(
+            closed={"session": "OS1", "generation": 1, "reason": "tokens"}
+        )
+        self.choice(connection)
+
+        self.assertIn(
+            "the next pass opens the successor", self.stated("rotation")[0].detail
+        )
+
     def test_a_rotation_that_could_not_be_written_does_not_fail_the_pass(self):
         # The pass is over and everything it did is committed. The next pass's
         # open asks the same question, so the answer is reported and dropped.
