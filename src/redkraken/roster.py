@@ -945,7 +945,14 @@ _PAGE = (1, 200)
 #: element's subject, its ends and its sentence were named in the tool's prose
 #: and nowhere else, so a paragraph added beside that prose was enough to make a
 #: recon run stop writing them and every Observation it sent be dropped.
-_NAME = Argument("string", bounds=(1, 200))
+#:
+#: Bounded against the absurd and nothing narrower. A tighter bound was measured
+#: against the live target and refused a whole submission for one bad
+#: `observation_ref`, which is the cost the subschema comment above warns about:
+#: what the element is missing costs that element at promotion, and what the
+#: schema refuses costs every element sent beside it -- plus the turns a retry
+#: spends, which is the scarce thing in a run with a token ceiling.
+_NAME = Argument("string", bounds=(0, 2000))
 
 #: `new_entities` is one list for eight Entity types, so its shape is the union
 #: of four fields no two of those types share: `kind` is an Application's,
