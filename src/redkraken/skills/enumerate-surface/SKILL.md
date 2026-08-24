@@ -1,6 +1,6 @@
 ---
 description: Turn a scope root into typed, deduplicated Attack Surface. Use when a Program has hosts or roots nothing has been recorded against yet, or when a deploy changed and the recorded surface needs to be re-derived rather than trusted.
-bb:roles: ["recon"]
+bb:roles: ["web_hunter"]
 bb:tool_groups: ["exec.tool_run", "net.request", "state.propose", "state.read"]
 bb:evidence_profile: allowed_receipt_only
 bb:runtime-tools: ["jq"]

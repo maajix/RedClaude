@@ -25843,9 +25843,21 @@ class OfflineToolCommandTest(DatabaseCase):
         with cls.owner_connection.transaction():
             cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
             cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
-            for table in ("offline_tool_roles", "offline_tool_arguments", "offline_tools"):
+            # All four this class registered, and the outputs table `rkcopy`
+            # writes a row in. It purged `rkcat` and `rkcatold` only, so
+            # `rkcopy` and `rkgrep` outlived the class that made them: any
+            # later case reading the whole registry saw two tools no migration
+            # ships, and `SkillScriptRegistryTest` -- which asks exactly that --
+            # failed in a full run and passed on its own.
+            for table in (
+                "offline_tool_roles",
+                "offline_tool_arguments",
+                "offline_tool_outputs",
+                "offline_tools",
+            ):
                 cls.owner_connection.execute(
-                    f"DELETE FROM {table} WHERE tool IN ('rkcat', 'rkcatold')"
+                    f"DELETE FROM {table}"
+                    " WHERE tool IN ('rkcat', 'rkcatold', 'rkcopy', 'rkgrep')"
                 )
             cls.owner_connection.execute(
                 "DELETE FROM artifacts WHERE NOT EXISTS"
@@ -40459,20 +40471,26 @@ class PlaybookSelectionTest(DatabaseCase):
             self.assertIn(("error", "evidence_missing", self.SECOND), self.integrity())
 
     def test_a_skill_combination_no_role_can_load_is_reported(self):
-        # `recon` holds `enumerate-surface` and `web_hunter` holds
+        # `js_analyst` holds `analyse-source` and `web_hunter` holds
         # `use-identity`; nothing holds both, so this Playbook can never be
         # selected by anyone. 035 calls that an error rather than a warning --
         # dead corpus, the same class as a Playbook with no trigger -- and the
         # detail names the set so a roster gap reads differently from a typo.
+        #
+        # The pair was `enumerate-surface` and `use-identity` until ticket 178
+        # moved `enumerate-surface` to `web_hunter`, which holds both -- so the
+        # combination stopped being unloadable and the case stopped testing
+        # anything. Any two skills held by two different roles do; these two are
+        # the pair the roster keeps furthest apart.
         with self.scratch():
             identifier = self.row(self.SECOND)
             self.triggers(identifier, "object_identifier")
-            self.needs(identifier, "enumerate-surface", "use-identity")
+            self.needs(identifier, "analyse-source", "use-identity")
             self.proves(identifier)
 
             self.assertIn(
                 ("error", "playbook_unloadable",
-                 f"{self.SECOND} needs {{enumerate-surface,use-identity}}"),
+                 f"{self.SECOND} needs {{analyse-source,use-identity}}"),
                 self.integrity(),
             )
             self.assertEqual("role_lacks_skill", self.candidates()[self.SECOND])
@@ -41310,17 +41328,27 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # catalogue currently says and it is the more useful thing to be told
         # when it stops being true: a Playbook that two roles can load is a
         # Playbook whose Skill set no longer picks out who does this work, and a
-        # Playbook that none can is unreachable. `attack-surface` is the recon
-        # one, and `external-resources` and `supply-chain` are the js_analyst
-        # ones -- both read a served document for what it names rather than
-        # sending anything at the application, which is that role's whole job;
-        # every other topic here is web_hunter's.
+        # Playbook that none can is unreachable. `external-resources` and
+        # `supply-chain` are the js_analyst ones -- both read a served document
+        # for what it names rather than sending anything at the application,
+        # which is that role's whole job; every other topic here is
+        # web_hunter's, `attack-surface` included since ticket 178.
+        #
+        # It was recon's, and no recon Task ever selected it: its triggers are
+        # `read_method` and `unauthenticated_endpoint`, which are facts recon
+        # records rather than facts it is given, so they match nothing at recon
+        # time and match a hunt Task's subject afterwards. Measured in
+        # `rk2grade4`: twelve recon Tasks done, no selection row under any of
+        # them, and every row that does exist under a hunt or conclude Task
+        # dropped on `role_lacks_skill`. No production role loads no Playbook at
+        # all -- recon keeps `handle-untrusted-content` -- and this map is the
+        # place that would say so if a topic lost its reader.
         self.assertEqual(
             {
                 "agentic-ai": ["web_hunter"],
                 "api": ["web_hunter"],
                 "api-authorization": ["web_hunter"],
-                "attack-surface": ["recon"],
+                "attack-surface": ["web_hunter"],
                 "authentication": ["web_hunter"],
                 "browser-framing": ["web_hunter"],
                 "browser-messaging": ["web_hunter"],
@@ -41623,11 +41651,16 @@ class ApplicationSubjectFactsTest(DatabaseCase):
         # Criterion 6's second half. `playbook_candidates` filters on
         # `playbooks_by_trigger`, so a subject with no facts returns nothing at
         # all -- which is what every hunt Task in `rk2hunt17` got. What comes
-        # back is a row with a reason on it, and a reason is what an operator
-        # can act on; no row is what they had.
-        self.assertEqual(
-            {self.REACHED: "role_lacks_skill"}, self.candidates(self.application)
-        )
+        # back is a row, and a row is what an operator can act on; no row is
+        # what they had.
+        #
+        # Kept rather than dropped since ticket 178. The reason on it used to be
+        # `role_lacks_skill`, and the Playbook this reaches is `attack-surface`,
+        # whose Skill was recon's while its triggers only ever match after recon
+        # has run -- so the one Playbook this fixture proves the path with was
+        # also a Playbook nothing could ever select. A kept row is the stronger
+        # assertion: the path reaches a text a role may actually open.
+        self.assertEqual({self.REACHED: None}, self.candidates(self.application))
 
     def test_a_playbook_one_fact_short_says_which_fact(self):
         # The CMS Playbook against a Drupal site: `tech_cms` fired, the
