@@ -300,8 +300,8 @@ Code-Dauer: **5–8 Arbeitstage**, anschließend **2–6 Kalendertage** Grading.
   ```
 
 - [x] Kein Carbonyl, kein agent-browser, kein persistenter Browser-Daemon und kein beliebiges JavaScript; ADR 0004/0005 bleiben unverändert.
-- [ ] Ticket 101 nur für die fünf benötigten Capability-Zeilen implementieren.
-- [ ] Ticket 109 auf paarweise Vergleiche festlegen.
+- [x] Ticket 101 nur für die fünf benötigten Capability-Zeilen implementieren.
+- [x] Ticket 109 auf paarweise Vergleiche festlegen.
 - [ ] Ticket 84 nur für diese fünf High-Yield-Paare durchführen:
   1. `attack-surface` ↔ `artifact-exposure-pair`
   2. `object-ownership` ↔ `object-ownership-pair`

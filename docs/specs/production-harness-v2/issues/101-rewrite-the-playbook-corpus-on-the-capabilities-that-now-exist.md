@@ -4,7 +4,7 @@
 seven tickets before this one deliver, and the Playbooks the 131 researched
 techniques have no home in. This is the ticket the other seven exist for.
 
-**Blocked by:** 94 — Hand the response headers to the caller; 95 — A bounded string argument must say maxLength; 96 — Carry a request body; 97 — Settle what an Identity slot is; 98 — Let a playbook step reach the out-of-band channel; 99 — Let a playbook step drive the browser; 100 — Extend the vocabulary the corpus is missing.
+**Blocked by:** 94 — Hand the response headers to the caller; 95 — A bounded string argument must say maxLength; 96 — Carry a request body; 97 — Settle what an Identity slot is; 98 — Let a playbook step reach the out-of-band channel; 99 — Let a playbook step drive the browser; 100 — Extend the vocabulary the corpus is missing; 109 — `compare_responses` differences two Artifacts where eleven Playbooks ask for more.
 
 **Status:** ready-for-agent
 
@@ -116,3 +116,44 @@ of the catalogue". The first criterion above is the one exception the research
 itself carves out -- the section titled "What is already reachable and simply
 unused", which says of those eleven techniques that "nothing below needs a
 ticket; they need a playbook edit".
+
+## Comments
+
+**2026-08-24 -- Arbeitsblock 3 implemented this ticket for five Playbooks and
+five capability rows, and for nothing else.**
+
+The five are the High-Yield pairs ticket 84 grades: `attack-surface`,
+`object-ownership`, `browser-script`, `cookies` and `payment-workflows`. The five
+capability rows are A to E of
+`docs/research/playbook-state-of-the-art/09-capability-matrix.md`: a request
+body, response headers on the answer, the settled Identity slot, a browser
+mission from a Playbook step, and the wider browser action set.
+
+Row E is the one that was answered by subtraction. Arbeitsblock 3 adds no browser
+action, so every ask that needed one was removed rather than served, and `cookies`
+carried three of them: a step reporting the browser's own cookie jar, a
+navigation "captured with its network log", and a cross-site request from a
+second origin this lane does not host. Its fourth repair is row C -- it told the
+model to name the Identity slot in the plan, which tickets 97 and 131 settled the
+other way. `attack-surface` lost a sentence that said `jq` is the only tool in
+`offline_tools`, which stopped being true when the registry reached six programs;
+the true sentence is about the grant, since it executes as `recon` and `recon`
+holds `jq` alone. `browser-script` gained row D, the tool ticket 99 built.
+`payment-workflows` gained row A, the call that carries the edited number.
+`object-ownership` needed nothing.
+
+`20261105T000000Z` re-registers the four bodies that moved. No `bb:` field moved
+in any of them, so no class, trigger, evidence bar or fixture binding changed and
+all five still ship `draft`.
+
+Everything else in this ticket is untouched: the other forty-five Playbooks, the
+eleven already-reachable techniques, the `authentication.recovery_flow` emitter,
+the nine `owed:101` rows in `check_wiring`'s register, and the thirteen bodies
+ticket 109 handed over. The ticket stays `ready-for-agent` for all of it.
+
+**One thing the slice found and did not fix.** All five of these Playbooks gate
+`supported` on an Observation kind no runtime verb writes -- `content_match`,
+`credential_effect`, `header_policy_observed`, `reflected_input`, `state_change`
+-- which is ticket 166, measured there at 33 of 50 Playbooks. Their bodies are
+now true about what the harness can do; their `bb:evidence` bars are not
+reachable, and no edit inside this slice's scope makes them reachable.

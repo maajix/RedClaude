@@ -25,46 +25,52 @@ So this Playbook reads the attributes first and then goes and looks.
 
 ## 1. Get a session the way a browser gets one
 
-Follow `browser-evidence` and write one mission whose plan names the Identity
-slot and drives the subject, so the application issues its own cookie into the
-browser's jar. Do not craft one: a cookie this Playbook wrote is a cookie the
-server never scoped, and its attributes would be ours.
+Follow `browser-evidence` and write one mission that drives the subject, so the
+application issues its own cookie into the browser's jar. Do not craft one: a
+cookie this Playbook wrote is a cookie the server never scoped, and its
+attributes would be ours.
 
-`use-identity` still governs the credential: the slot is named in the plan, the
-proxy attaches it, and nothing here quotes it.
+The mission is started through `mcp__rk2__browse`, whose one argument is `steps`.
 
-## 2. Record what the server declared
+`use-identity` still governs the credential: the Task names the one Identity this
+run acts as, the door attaches it, the plan carries no slot of its own, and
+nothing here quotes it.
 
-Declare a step that reports the browser's own cookie jar for the origin, and
-record from its Artifact every attribute per cookie: name, `Domain`, `Path`,
-`Secure`, `HttpOnly`, `SameSite`, `Max-Age` or `Expires`. That is a
-`header_policy_observed` observation and it is the control: it is what the server
-says the scope is, and everything below is whether the browser agrees.
+## 2. Record the scope the browser applied
 
-The jar is where this comes from and not the exchange. A `Set-Cookie` on an
-Identity call stays in the sealed wire view, so a mission that could not report
-the jar has no control, and a run without the control is inconclusive rather than
-a scope finding read off a header nobody saw.
+No step reports the browser's own cookie jar, and the header that declares the
+scope does not reach this side: a `Set-Cookie` stays in the sealed wire view, so
+nothing here reads `Domain`, `Path`, `Secure`, `HttpOnly` or `SameSite` off the
+response that set them.
 
-Record the same for the cookie the application uses on its *intended* path. A
-target that scopes one cookie tightly and another loosely is the interesting
-case, and a run that recorded only the session cookie cannot see it.
+What the run records instead is the request side, and it is the stronger half
+anyway. Every request the mission makes has its own Receipt and its own stored
+transcript, and a transcript carrying the session cookie is the browser saying it
+judged that request to be inside the cookie's scope. That is the declared scope
+as the browser applied it, which is the thing the class is about; a flag read off
+a header would only be what the server wrote down.
+
+Record it for the cookie the application uses on its *intended* path first. That
+is the control: it says the session works and that the cookie travels where it is
+supposed to, and everything below is whether it also travels somewhere else.
 
 ## 3. Ask where the cookie actually goes
 
 Extend the same mission's plan to each place the declared scope admits but the
 application does not occupy:
 
-* a sibling host under the same registrable domain, when `Domain` names the
-  parent
-* a path beside the one the application uses, when `Path` is `/`
-* the plain-`http` origin of the same host, when `Secure` is absent
-* a cross-site request from another origin the Program's scope includes, when
-  `SameSite` is `None`
+* a sibling host under the same registrable domain
+* a path beside the one the application uses
+* the plain-`http` origin of the same host
 
-Each of those is one navigation or one request, captured with its network log.
-What is being recorded is a request the browser made carrying the session
-cookie -- not a header the response contained.
+Each of those is one `navigate` in the same plan, and what is recorded is the
+request the browser then made: its Receipt, its transcript, and whether the
+session cookie was on it. Not a header the response contained.
+
+A cross-site request from a second origin is not one of these. This lane hosts no
+origin of its own and will not host one, so a `SameSite` reading here is what the
+browser did on the origins the Program's scope already includes, and the
+cross-site half is described with its preconditions rather than sent.
 
 None of this leaves the Program's scope. A sibling host that scope does not
 include is out of bounds, and the honest end of that path is to record the
@@ -72,9 +78,10 @@ declared `Domain` as surface and stop.
 
 ## 4. Ask whether the target honours it there
 
-A cookie that arrives is not yet a session. In the same mission, have the browser
-read an identity route at the place the cookie reached, and record whether the
-application answered as the logged-in caller. That is the `credential_effect`,
+A cookie that arrives is not yet a session. In the same mission, `navigate` to an
+identity route at the place the cookie reached and `assert_text` on a marker only
+a logged-in answer carries, so the record says whether the application answered
+as the logged-in caller. That is the `credential_effect`,
 and it is what makes this a scope finding rather than a browser behaviour: the
 credential was honoured somewhere its own scope should not have carried it.
 

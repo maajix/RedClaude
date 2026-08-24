@@ -52,6 +52,11 @@ about both.
 Send the operation once with a value the rules admit -- one item, the listed
 quantity, the price the target published. Read the authoritative total again.
 
+The send is one call: `method`, `url`, `headers` and the `body` the route takes,
+through `mcp__rk2__http_request`. The body goes in the call rather than in a
+sentence describing it, because a total that moved is only evidence beside the
+bytes that moved it, and both are stored.
+
 This is the control and it is a `state_change`: it says the route accepts work,
 that the number reaches the total, and by how much. Without it, a total that
 does not move under the variant is equally well explained by a route that

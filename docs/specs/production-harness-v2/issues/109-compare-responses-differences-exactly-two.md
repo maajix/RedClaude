@@ -7,9 +7,9 @@ corpus that stops asking it to.
 **Blocked by:** 107 — A label minted after launch must be resolvable in the run
 that minted it.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The two ends of the mismatch are stated exactly.
+- [x] The two ends of the mismatch are stated exactly.
       `src/redkraken/skills/compare-responses/scripts/compare.py` refuses
       anything but a pair -- "compare takes exactly two artifacts" -- and the
       registry agrees: `offline_tool_arguments` declares `first` at position 0
@@ -20,7 +20,7 @@ that minted it.
       `browser-realtime:55`, `identity-lifecycle:63`, `routing:77`,
       `web-cache:71`, `workload-identities:68`, `jwt-jose:82`,
       `request-integrity:73`, `webauthn:60`.
-- [ ] The decision is named rather than assumed, because either answer is
+- [x] The decision is named rather than assumed, because either answer is
       defensible. Widening the script means `only_in_first` and
       `only_in_second` become an N-way answer, and the registry's own reason for
       the current shape has to be re-argued: "`first` and `second` are not
@@ -29,10 +29,10 @@ that minted it.
       and not a convenience" (`20260922T030000Z...:457-460`). Narrowing the
       corpus means eleven Playbooks say "a baseline against each arm, one call
       per arm", which is expressible today.
-- [ ] Ticket 101 is named as the owner of whichever half falls to the corpus.
+- [x] Ticket 101 is named as the owner of whichever half falls to the corpus.
       This ticket does not rewrite a Playbook body; it settles what the body may
       ask for.
-- [ ] The arity question is downstream of the label question and the ticket says
+- [x] The arity question is downstream of the label question and the ticket says
       so. `compare_responses` takes two `artifact`-kind arguments and, until
       tickets 106 and 107 land, a run cannot name even one Artifact it produced
       -- so widening the script first would buy nothing for any of the eleven.
@@ -106,3 +106,27 @@ tree: it is thirteen. The two the count misses are
 `src/redkraken/playbooks/api/playbook.md:62`. The corpus figure the ticket gives
 -- thirty-nine Playbook bodies -- is exactly right. Whoever does the rewrite
 should work from a fresh grep and not from the number eleven.
+
+## Comments
+
+**2026-08-24 -- closed on the decision, with nothing left in this ticket's own
+scope.**
+
+B stands and the script stays at two Artifacts. Nothing here widened
+`compare_responses`, nothing added an argument to `offline_tool_arguments`, and
+`compare.py` is the file it was.
+
+The thirteen bodies that ask for three or more arms are ticket 101's, which this
+ticket named as the owner before the decision was taken. Arbeitsblock 3
+implements 101 for five Playbooks only -- `attack-surface`, `object-ownership`,
+`browser-script`, `cookies` and `payment-workflows` -- and **not one of the five
+is among the thirteen**, so this settlement rewrote no body and the thirteen are
+still owed.
+
+The enabling fix the decision names is also still owed and is deliberately not
+built here: an answer from `compare_responses` carries no input digest, so k-1
+calls come back as k-1 answers nothing keys to an arm. Building it before the
+thirteen bodies are rewritten would be a field nobody reads. Whoever rewrites
+them builds it in the same pass; the smallest shape is the two input digests
+echoed in the script's own answer, which costs a script digest and a registry
+migration and no new authority.

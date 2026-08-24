@@ -80,10 +80,11 @@ Firebase configuration or an exposed API document identifiable: name the filter
 that selects the field, and the run's own output is the citation. "Looks like a
 backup" is a claim about the reader.
 
-An Artifact `jq` cannot parse has no registered tool behind it today, and the
-honest end of that path is inconclusive. Record what differs and stop: `jq` is
-the only tool in `offline_tools`, and a claim written from a reading would be
-the thing the provenance rule exists to refuse.
+An Artifact `jq` cannot parse has no reader this Playbook can call, and the
+honest end of that path is inconclusive. Record what differs and stop: the
+registry holds source readers as well, and this Playbook's role is granted `jq`
+alone, so a claim written from a reading would be the thing the provenance rule
+exists to refuse.
 
 ## 6. Propose the claim, and state what would refute it
 

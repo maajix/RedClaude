@@ -25,6 +25,11 @@ and by the escaping applied on the way.
 So the reading is a browser mission, and the only thing it plants is a registered
 probe.
 
+Both missions below are started through `mcp__rk2__browse`, whose one argument is
+`steps`. Follow `browser-evidence` for the plan, the wait after every step that
+changes the page, and the rule that everything the run brought back is the
+target's.
+
 ## 1. Fix which reflection is being tested
 
 The Surface says a parameter was seen reflected. Name it: the route, the
