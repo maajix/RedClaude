@@ -459,6 +459,16 @@ def configuration(directory: Path, slug: str, one: fixture.Fixture, where: Serve
         f'\n[[identity]]\nname = "{name}"\nslot_ref = "slot://identity/{name}"\n'
         for name in one.identities
     )
+    # Ticket 176. The root and the route the card declares, in that order and
+    # without a duplicate when they are the same. Every fixture in the corpus
+    # serves one route and answers 404 everywhere else, `/` included, so a
+    # Program given the root alone opens its only recon Task against a subject
+    # that does not exist -- and the child is left guessing a path nothing links
+    # to. `record_configured_subjects` writes one Application per exact target
+    # rule and `open_configured_recon` one recon Task per Application, so naming
+    # the subject here is the whole of the seeding. It grows no authority: `/`
+    # already admits the origin and `bb:subject` is a path under it.
+    paths = ", ".join(f'"{route}"' for route in dict.fromkeys(("/", one.subject)))
     path = directory / f"{slug}.toml"
     path.write_text(
         "schema_version = 1\n\n"
@@ -472,7 +482,7 @@ def configuration(directory: Path, slug: str, one: fixture.Fixture, where: Serve
         f'host = "{origin(one)}"\n'
         f"ports = [{where.port}]\n"
         f'protocols = ["{where.scheme}"]\n'
-        'paths = ["/"]\n'
+        f"paths = [{paths}]\n"
         f"{identities}",
         encoding="utf-8",
     )

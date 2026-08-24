@@ -559,7 +559,8 @@ class Configuration(unittest.TestCase):
         loaded, _ = config.load(self.written(compiled(one())))
         policy, refusals = scope.compile_policy(loaded)
         self.assertEqual([], list(refusals))
-        self.assertEqual(1, len(policy.rules))
+        # Two: the origin and the route the card declares. Ticket 176.
+        self.assertEqual(2, len(policy.rules))
 
     def test_the_scope_names_the_fixture_at_the_port_it_is_listening_on(self):
         loaded, _ = config.load(self.written(compiled(one())))
@@ -568,6 +569,20 @@ class Configuration(unittest.TestCase):
         self.assertEqual("object-ownership.localhost", included[0]["host"])
         self.assertEqual([44321], included[0]["ports"])
         self.assertEqual(["http"], included[0]["protocols"])
+
+    def test_the_scope_names_the_route_the_card_declares(self):
+        # Ticket 176. `record_configured_subjects` writes one Application per
+        # exact target rule and `open_configured_recon` one recon Task per
+        # Application, so this list is the whole of what a fresh Program is
+        # pointed at. Every fixture in the corpus serves one route and answers
+        # 404 at `/`, so the root alone opened the only recon Task against a
+        # subject that does not exist.
+        loaded, _ = config.load(self.written(compiled(one())))
+        self.assertEqual(["/", "/notes/2"], loaded.document["scope"]["include"][0]["paths"])
+
+    def test_a_card_whose_route_is_the_root_names_it_once(self):
+        loaded, _ = config.load(self.written(compiled(one(**{"bb:subject": "/"}))))
+        self.assertEqual(["/"], loaded.document["scope"]["include"][0]["paths"])
 
     def test_the_scope_may_not_name_the_address_the_fixture_is_bound_to(self):
         # The reason the two differ, held as a rule rather than as a comment:

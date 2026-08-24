@@ -2637,12 +2637,22 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual({"label": "RC1", "decision": "allowed", "status_code": 200}, facts["receipt"])
 
     def test_a_blocked_receipt_closes_the_tool_run_as_denied_and_says_so(self):
+        # Ticket 177. Recorded, and not a violation. A child reaching for a verb
+        # its Tool run does not carry is the boundary working; calling it an
+        # invalid configuration ended the pass, and `evaluation._repeat` then
+        # threw away the whole repeat -- including the variant that had already
+        # finished. A lane whose door mints no capability at all still fails, one
+        # call earlier, in `_authorize`.
         connection = Recorder(receipt=("RC1", "blocked", None))
         with compiled():
             ledger, facts = attempt(connection)
         self.assertEqual([(TOOL_RUN, "denied")], connection.sent(proxy.CLOSE_TOOL_RUN))
-        self.assertEqual(["proxy"], [item.source for item in ledger.violations])
+        self.assertEqual([], ledger.violations)
         self.assertEqual("blocked", facts["receipt"]["decision"])
+        self.assertIn(
+            "the door refused the child's request: RC1 is blocked",
+            [item.detail for item in ledger.assertions if item.ok],
+        )
 
     def test_a_capability_that_was_never_spent_closes_the_tool_run_as_error(self):
         connection = Recorder(receipt=None)

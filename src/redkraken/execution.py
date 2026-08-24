@@ -3226,11 +3226,22 @@ class Slice:
             "status_code": None if status is None else int(status),
         }
         if decision != "allowed":
-            ledger.fail(
+            # Ticket 177. A hold and not a failure. A child that asks for a verb
+            # its Tool run does not carry is the boundary working, not the
+            # operator misconfiguring it -- and `INVALID_CONFIGURATION` claimed
+            # the second. The claim was load-bearing: a violation ends the pass
+            # loop and `evaluation._repeat` then discards the whole repeat,
+            # every variant of it, so one refused request threw away a
+            # measurement that had already completed on the other half.
+            #
+            # Nothing quiet is introduced by this. A lane whose door cannot mint
+            # a capability at all still fails loudly in `_authorize`, one call
+            # earlier; what arrives here is a capability that was minted and a
+            # request that did not match it, which is a fact about the run and
+            # is on the Receipt either way. The Tool run still closes `denied`.
+            ledger.hold(
                 "egress",
                 f"the door refused the child's request: {label} is {decision}",
-                code=INVALID_CONFIGURATION,
-                source="proxy",
             )
             return "denied"
         ledger.hold("egress", f"{label} records a {status} answer through the door")
