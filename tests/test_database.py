@@ -43039,6 +43039,55 @@ class PlaybookEvaluationTest(DatabaseCase):
                 ),
             )
 
+    def test_an_evaluation_records_the_playbook_it_grades_and_no_other(self):
+        # Ticket 179. The case above proves the trigger refuses a foreign
+        # Playbook. This proves the selection never offers one, which is the
+        # half that decides whether an evaluation runs at all: the trigger
+        # refuses by raising, `record_playbook_selection` writes every row
+        # `select_playbooks` decided in one statement, and a raise on the second
+        # row takes the first one -- the graded one -- down with it.
+        #
+        # Measured in `rk2grade5` before the fix: four of five evaluations ended
+        # on "no Playbook could be selected for T3 ... evaluates
+        # playbooks/object-ownership/playbook.md, so it cannot also select
+        # playbooks/attack-surface/playbook.md" and filed nothing.
+        with self.scratch():
+            other = str(
+                self.connection.execute(
+                    "INSERT INTO playbooks (path, source_sha256, version, category, status,"
+                    " stale_after, risk, effects, baseline, specificity, provenance)"
+                    " VALUES ('playbooks/selftest-eval-rival/playbook.md', $1, $2,"
+                    " 'authorization', 'draft', '2099-01-01T00:00:00Z', 'constrained',"
+                    " 'read_only', 'none', 1, 'self test') RETURNING id::text",
+                    ("d" * 64, "e" * 64),
+                ).scalar()
+            )
+            # The same facts the graded Playbook triggers on, so the subject
+            # matches both and the selection has two candidates to decide.
+            self.connection.execute(
+                "INSERT INTO playbook_triggers (playbook_id, mode, fact)"
+                " SELECT $1::uuid, mode, fact FROM playbook_triggers WHERE playbook_id = $2::uuid",
+                (other, self.playbook_id),
+            )
+            surface = self.surface[self.OWN, "vulnerable"]
+
+            self.connection.execute(
+                "SELECT record_playbook_selection($1::uuid, $2::uuid)",
+                (surface["task"], surface["subject"]),
+            )
+            self.assertEqual(
+                [self.SHIPPED],
+                [
+                    row[0]
+                    for row in self.connection.execute(
+                        "SELECT p.path FROM playbook_selections s"
+                        " JOIN playbooks p ON p.id = s.playbook_id"
+                        " WHERE s.task_id = $1::uuid ORDER BY p.path",
+                        (surface["task"],),
+                    ).rows
+                ],
+            )
+
     # -- criterion 5: demotion, and the runs that survive it -------------------
 
     def test_editing_a_promoted_playbook_demotes_it_and_keeps_every_run(self):
