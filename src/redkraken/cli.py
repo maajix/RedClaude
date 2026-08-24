@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from redkraken import (
@@ -2217,7 +2217,17 @@ def _playbook_evaluate(arguments: argparse.Namespace) -> int:
             arguments.workspace,
             playbook=arguments.playbook,
             fixture_name=arguments.fixture,
-            work=_nothing if slice_ is None else slice_.attempt,
+            # Bound to the configuration the evaluation is about to write, not
+            # to one this command could have been given: a `perform` Task is run
+            # by the runtime itself and `replay.run` resolves the Program out of
+            # a configuration file. `rk run` has one on the command line; an
+            # evaluation writes one per repeat and per variant, so the slice is
+            # re-bound for each rather than built once without one.
+            work=(
+                (lambda path: _nothing)
+                if slice_ is None
+                else (lambda path: replace(slice_, configuration=path).attempt)
+            ),
             boundary=None if slice_ is None else slice_.boundary,
         ),
     )

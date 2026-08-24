@@ -66,7 +66,7 @@ from __future__ import annotations
 import contextlib
 import tempfile
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -290,10 +290,18 @@ class Subject:
     playbook_id: str
     playbook_sha256: str
     fixture: fixture.Fixture
-    #: `program.Execute`: what one open Program does. Carried here rather than
-    #: passed per repeat so the evaluator cannot substitute a different worker
-    #: between repeats of one measurement.
-    work: program.Execute
+    #: What one open Program does, asked for by the configuration it will run
+    #: under. Carried here rather than passed per repeat so the evaluator cannot
+    #: substitute a different worker between repeats of one measurement.
+    #:
+    #: A factory rather than a `program.Execute`, because one kind of Task is
+    #: performed by the runtime itself: `replay.run` resolves the Program and the
+    #: schema revision the Test was authored under out of a Program
+    #: configuration, and refuses a `perform` Task on a machine that names none.
+    #: An evaluation writes one configuration per repeat and per variant, so the
+    #: path is not knowable when the caller builds its worker and is knowable
+    #: here.
+    work: Callable[[Path], program.Execute]
     corpus: Path
     #: Decided once for the whole evaluation, not per repeat: two repeats that
     #: reached the fixture by different routes are not two samples of one
@@ -503,7 +511,9 @@ def route(ledger: Ledger, boundary: isolation.AgentContainer | None) -> Route | 
     return Route(name=DOOR, host=host)
 
 
-def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execute:
+def _graded_work(
+    subject: Subject, variant: str, where: Served, path: Path
+) -> program.Execute:
     """`subject.work`, with the Program prepared to be graded before it runs.
 
     Two preparations, both inside the wrapper: the Program is marked as an
@@ -529,11 +539,12 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
     changed since the first.
     """
     prepared = False
+    work = subject.work(path)
 
     def execute(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
         nonlocal prepared
         if prepared:
-            return subject.work(ledger, connection, program_id)
+            return work(ledger, connection, program_id)
         connection.execute(MARK, (program_id, subject.playbook_id, subject.fixture.name, variant))
         marked = tuple(connection.execute(MARKED, (program_id,)).rows[0])
         if marked != (subject.playbook_id, subject.fixture.name, variant):
@@ -587,7 +598,7 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
                 f"for {program_id}",
             )
         prepared = True
-        return subject.work(ledger, connection, program_id)
+        return work(ledger, connection, program_id)
 
     return execute
 
@@ -598,7 +609,7 @@ def evaluate(
     *,
     playbook: str,
     fixture_name: str,
-    work: program.Execute,
+    work: Callable[[Path], program.Execute],
     corpus: Path = migrate.CORPUS,
     fixtures: Mapping[str, fixture.Fixture] | None = None,
     boundary: isolation.AgentContainer | None = None,
@@ -860,7 +871,7 @@ def _repeat(
                 # Inside the `served` block, and one `_graded_work` for all of
                 # the passes: the fixture has to stay on the port the Program
                 # recorded, and the address is recorded once.
-                graded = _graded_work(subject, variant, where)
+                graded = _graded_work(subject, variant, where, path)
                 passes = 0
                 while True:
                     result = program.run(

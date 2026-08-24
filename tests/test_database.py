@@ -44137,7 +44137,7 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
             cls.workspace,
             playbook=options.pop("playbook", cls.SHIPPED),
             fixture_name=fixture_id,
-            work=cls.work,
+            work=lambda path: cls.work,
             **options,
         )
 
@@ -44509,7 +44509,9 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
             playbook_id=self.playbook_id,
             playbook_sha256=self.playbook_sha,
             fixture=fixture.FIXTURES[self.OUT],
-            work=lambda ledger, connection, program_id: attempted.append(program_id) or {},
+            work=lambda path: (
+                lambda ledger, connection, program_id: attempted.append(program_id) or {}
+            ),
             corpus=migrate.CORPUS,
             route=evaluation.Route(name=evaluation.LOOPBACK, host=evaluation.HOST),
         )
@@ -44522,9 +44524,9 @@ class PlaybookEvaluationCommandTest(DatabaseCase):
             with self.connection.transaction():
                 self.connection.execute("SET LOCAL ROLE rk2_owner")
                 self.connection.execute("SELECT set_actor('runtime', 'selftest')")
-                evaluation._graded_work(subject, "vulnerable", where)(
-                    ledger, self.connection, already
-                )
+                evaluation._graded_work(
+                    subject, "vulnerable", where, migrate.CORPUS
+                )(ledger, self.connection, already)
                 raise Rollback
         except Rollback:
             pass
@@ -44748,7 +44750,7 @@ class ContainedEvaluationTest(DatabaseCase):
                 cls.workspace,
                 playbook=cls.SHIPPED,
                 fixture_name=cls.FIXTURE,
-                work=cls.work,
+                work=lambda path: cls.work,
                 boundary=cls.boundary(),
             )
         except BaseException:

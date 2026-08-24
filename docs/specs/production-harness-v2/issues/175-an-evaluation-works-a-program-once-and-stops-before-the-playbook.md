@@ -56,6 +56,27 @@ measurement that found it and what it means for every grade taken before it.
       harness is willing to ask, because `chooser_cut_off` and `task_attempted`
       both mean "there is more to do" and neither ever ends a loop by itself.
 
+- [x] **The second refusal the loop reached, and it is the same shape.** With
+      the passes in place the run reached a Test and refused it:
+
+          TST1 cannot be performed: this machine names no Program configuration,
+          and the replay resolves the Program from one
+
+      A `perform` Task is run by the runtime itself. `replay.run` resolves the
+      Program and the schema revision the Test was authored under out of a
+      Program configuration file, and `execution.Slice.configuration` is where
+      that path lives. `rk run` has one on its command line and passes it;
+      `rk playbook evaluate` built its slice with `_slice(ledger, arguments)`
+      and no configuration at all, because an evaluation writes one per repeat
+      and per variant and none of them exists when the command starts.
+- [x] **So the worker is bound to the configuration it will run under.**
+      `evaluation.Subject.work` is now `Callable[[Path], program.Execute]` and
+      `_graded_work` asks for the Execute once, for the configuration this
+      repeat wrote. The command re-binds its slice per repeat with
+      `dataclasses.replace(slice_, configuration=path)`. Nothing else about the
+      slice moves, and a caller with no Agent boundary still hands the same
+      floor worker it always did.
+
 ## Why
 
 Ticket 84 is the campaign this command exists for, and ticket 78 put the door
