@@ -1981,6 +1981,53 @@ class VocabularyAgreementTest(unittest.TestCase):
                 self.assertTrue(declared, f"{table} seeds no vocabulary")
                 self.assertEqual(set(constant), declared)
 
+    def test_the_browser_vocabulary_is_the_registry_the_door_seeds(self):
+        # Ticket 99: the ten actions and the step ceiling belong to the registry
+        # 20260814T040000Z seeds, not to this side. `open_browser_run` refuses an
+        # eleventh action and a thirty-third step in the database, so a roster
+        # naming a word the registry does not seed serves a step every mission
+        # loses at the door, and a roster dropping one hides an action the door
+        # still runs.
+        def seeding(table: str) -> str:
+            """The one `INSERT INTO table`, its column list and its rows.
+
+            Not `seeded` above, which reads the literals following `VALUES` on
+            the line the statement opens. Both browser seeds write the column
+            list on a line of its own, so that helper finds nothing here.
+            """
+            opened = [
+                text[text.index(f"INSERT INTO {table}"):]
+                for text in self.migrations
+                if f"INSERT INTO {table}" in text
+            ]
+            self.assertEqual(len(opened), 1, f"{table} is seeded twice or never")
+            return opened[0][:opened[0].index(";")]
+
+        actions = seeding("browser_actions")
+        self.assertEqual(
+            set(roster.BROWSER_ACTIONS),
+            {
+                self.LITERAL.findall(line)[0]
+                for line in actions[actions.index("VALUES"):].splitlines()[1:]
+                if line.lstrip().startswith("(")
+            },
+        )
+
+        # The ceiling is one row of one table and carries no literal at all, so
+        # the column list is what says which of its numbers the steps are.
+        ceilings = seeding("browser_ceilings")
+        columns = [
+            name.strip()
+            for name in self.balanced(ceilings, ceilings.index("(")).lstrip("(").split(",")
+        ]
+        said = self.balanced(
+            ceilings, ceilings.index("(", ceilings.index("VALUES"))
+        ).lstrip("(")
+        self.assertEqual(
+            roster.BROWSER_STEPS[-1],
+            int(said.split(",")[columns.index("max_steps")]),
+        )
+
     def test_every_element_field_the_schema_closes_names_a_corpus_vocabulary(self):
         # The wiring itself, so that a seventh element list, a fifth entity field
         # or a later Contract's element cannot be added with a tuple nothing
@@ -2006,6 +2053,7 @@ class VocabularyAgreementTest(unittest.TestCase):
             roster.IMPACT_CLASSES,
             roster.REPORT_EFFECTS,
             roster.REPORT_MECHANISMS,
+            roster.BROWSER_ACTIONS,
         }
 
         # Only the fields that close a vocabulary. An element field may instead

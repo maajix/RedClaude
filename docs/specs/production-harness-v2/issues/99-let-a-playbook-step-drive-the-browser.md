@@ -9,7 +9,7 @@ nothing in this ticket waits on another capability.
 
 **Status:** ready-for-agent
 
-- [ ] A Playbook step can open a browser mission by a tool call. Today the only
+- [x] A Playbook step can open a browser mission by a tool call. Today the only
       entry point is the operator CLI -- `_browser_run` at `cli.py:2629` behind
       the parser at `cli.py:1135-1201`, which requires `--plan` as a JSON file
       on disk, `--agent-run`, `--image` and `--authority`. No browser Contract
@@ -17,13 +17,13 @@ nothing in this ticket waits on another capability.
       already names the tool the run would be opened under:
       `20260814T040000Z__a_browser_mission_runs_behind_the_door.sql:732` returns
       the constant `mcp__rk2__browse`.
-- [ ] `skills/browser-evidence/SKILL.md:63` stops being false. It tells the
+- [x] `skills/browser-evidence/SKILL.md:63` stops being false. It tells the
       model "Start the mission through `mcp__rk2__run_tool`", and that tool's
       enum is closed to four offline binaries -- `("jq", "js_map", "js_parse",
       "js_routes")` at `roster.py:784` -- so every one of the sixteen techniques
       in research file `06` is written for a Skill whose first instruction
       cannot be followed.
-- [ ] The Contract grants no capability the lane does not already have. The plan
+- [x] The Contract grants no capability the lane does not already have. The plan
       shape is at least as narrow as `browser_action_arguments`, the plan digest
       is taken before the run and checked against the result digest, and the
       `ROLES` table (`roster.py:902-997`) says which roles may open one. Every
@@ -31,7 +31,7 @@ nothing in this ticket waits on another capability.
       can reach them: `navigate` and `click` both carry `reaches_network`, and
       `click` carries `submits` (`…20260814T040000Z…:188-207`), which the
       migration calls the whole of how a mission acquires POST.
-- [ ] The Skill says that response headers are already on the record, which
+- [x] The Skill says that response headers are already on the record, which
       costs a paragraph and no code: the `message/http` transcript behind
       `response_agent_sha` carries CSP, CSP-Report-Only, COOP, COEP, CORP,
       Permissions-Policy, `Service-Worker-Allowed` and `Vary` per response,
@@ -89,7 +89,7 @@ nothing in this ticket waits on another capability.
       words -- `rk-probe` has "no script, no attribute a browser acts on and no
       content, so planting it changes what the document IS without changing what
       it DOES" -- and an element that fetches does something.
-- [ ] **The isolation gap the research names is recorded where a reader of this
+- [x] **The isolation gap the research names is recorded where a reader of this
       lane finds it.** Chromium runs `--no-sandbox` (`browser_driver.py:115-119`)
       because the container drops every capability and the two together need a
       capability set it does not have, so with the OS sandbox off a renderer
@@ -103,7 +103,7 @@ nothing in this ticket waits on another capability.
       thing needed to run Chromium with a sandbox. Restoring it is the one
       hardening step this lane has not taken, and this ticket either takes it or
       names the ticket that will.
-- [ ] What is refused stays refused and each refusal keeps its reason: no
+- [x] What is refused stays refused and each refusal keeps its reason: no
       `Page.setBypassCSP`, no `Runtime.addBinding` page-to-driver channel, no
       in-browser request interception, no action that hosts a second origin, and
       no model-authored JavaScript in the page -- the last because an expression
@@ -128,3 +128,36 @@ The ranked additions and the two decisions above are
 "Proposed additions", "The execution oracle question" and "Isolation and
 egress". Its ranking is by refused bug classes per unit of new power, and it
 notes that the first two additions grant no new power at all.
+
+## Comments
+
+**2026-08-24 -- Arbeitsblock 3 built the Contract half and parked the rest.**
+
+Six of the eleven criteria are done. `mcp__rk2__browse` is a Contract of its own
+group `exec.browser_run`, held by `web_hunter` alone, whose single argument is
+`steps`: one to thirty-two objects whose `action` is one of the registered ten
+and whose `arguments` are a bounded object. The Identity slot is not an argument
+-- the supervisor passes the one the Task claimed -- and the roster states a
+floor that `open_browser_run` then narrows per action, so nothing here can widen
+what the lane already refused. `browser.mission` is the operator path's own core,
+extracted and shared, so the CLI verb and the tool call open, gate, perform, file
+and close through one body of code and differ only in the actor they record.
+
+Five criteria are not done, and they are the ones that add power: probe outcome
+keys, `read_client_state`, a fragment on `navigate`, `send_message`, and the
+execution-oracle decision. Arbeitsblock 3 is bounded to offering the existing
+lane through a closed Contract with no authority growth, so none of them was
+started. The ticket stays `ready-for-agent` for exactly those five.
+
+The isolation criterion was answered by naming the ticket rather than by taking
+the work: ticket 174 owns the seccomp profile, and `browser_driver.py` says so
+beside the `--no-sandbox` flag itself.
+
+`check_wiring`'s register moved with the work: the `W10 browser-evidence` row is
+gone -- the Skill names a tool that runs a browser now, and its repetition
+paragraph names `compare-responses`, the one program `web_hunter` is actually
+granted -- and four W5 rows arrived in its place. A mission mints a
+`browser_run`, a `browser_step`, a `browser_step_result` and a
+`tool_run_artifact` label, and no read verb takes any of them back. Those are
+the W4 rows for the same four relations seen from the other side, so they are
+owed to ticket 129 with the read they are waiting for.

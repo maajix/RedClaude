@@ -1386,6 +1386,16 @@ class Slice:
     #: as well -- a run whose output could not be filed is a run that leaves no
     #: evidence -- so neither on its own serves anything.
     tools: isolation.ToolContainer | None = None
+    #: Ticket 99: the image a browser mission runs in, and the authority whose
+    #: leaf key the browser is told to pin. Its own image and not `tools`, for
+    #: the reason `browser.IMAGE_VARIABLE` is its own variable: one holds a
+    #: browser and its libraries and the other holds the registered binaries,
+    #: and pointing either at the other starts whichever answered. Optional
+    #: exactly as `tools` is -- a machine that names neither still runs every
+    #: child, and `mcp__rk2__browse` answers that there is no browser to run a
+    #: mission with.
+    browser: isolation.ToolContainer | None = None
+    authority: Path | None = None
     #: The Program configuration, for the one kind this runtime performs itself.
     #: `replay.run` loads it to resolve the Program and to bind the schema
     #: revision the Test was authored under, so a machine that names none can
@@ -3094,6 +3104,15 @@ class Slice:
                     root=self.artifacts,
                     runtime=runtime,
                     state=self.state,
+                    browser=self.browser,
+                    authority=self.authority,
+                    # Ticket 131's selection, carried rather than re-decided:
+                    # `open_browser_run` checks a live Lease on whatever slot it
+                    # is given, and the one this Agent run holds is the one the
+                    # Task was claimed under. `""` is the anonymous selection
+                    # and comes to `None`, which is a mission that acts as
+                    # nobody rather than one that names a slot it does not hold.
+                    identity_slot=claimed.identity_slot or None,
                 )
             ),
         )

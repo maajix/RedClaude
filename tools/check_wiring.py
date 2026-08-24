@@ -265,6 +265,20 @@ OWED_GAPS: dict[str, str] = {
     # than re-pointed. What is left is the one element side of this gate.
     "W5 relationships": "owed:129",
 
+    # Ticket 99 opened the browser lane to a model, and a mission mints four
+    # label classes nothing takes back: the run, its steps, their results and
+    # the stored streams attributed to a step. They are the W4 rows above seen
+    # from the other side -- `browser_runs`, `browser_steps`,
+    # `browser_step_results` and `tool_run_artifacts` are all on the agent read
+    # surface with no verb reading them -- so they are owed where the read is
+    # owed rather than to the ticket that made them reachable. What a run does
+    # get back is in the answer `browse` returns: the step list, the digests and
+    # the stored outputs. The gap is that a later turn cannot ask again.
+    "W5 browser_run": "owed:129",
+    "W5 browser_step": "owed:129",
+    "W5 browser_step_result": "owed:129",
+    "W5 tool_run_artifact": "owed:129",
+
     # W6. Twelve tables nothing inserts into and three views nothing selects.
     # `cross_program_exempt_fks`, `program_isolation_candidates` and `secret_dek`
     # are not among them: all three are read as harmless by the database audit
@@ -295,9 +309,12 @@ OWED_GAPS: dict[str, str] = {
     "W9 graphql rate_limiting.resource_cost": "owed:101",
     "W9 http-desync transport.certificate_trust": "owed:101",
 
-    # W10. The corpus instructs a browser mission through a tool that runs no
-    # browser. The other two readings this register carried are both gone, and
-    # both left by being answered rather than by being excused.
+    # W10. Three readings, no rows: this register's W10 section is empty, and
+    # each of the three left by being answered rather than by being excused.
+    #
+    # A browser mission instructed through a tool that runs no browser: ticket
+    # 99 served `mcp__rk2__browse` and `browser-evidence` now names it, so the
+    # row that owed it is removed rather than re-pointed.
     #
     # An identity on a request that carries none: ticket 97 settled that
     # `identity_slot` is a property of the Tool run rather than an argument and
@@ -312,7 +329,6 @@ OWED_GAPS: dict[str, str] = {
     # had carried "an exchange returns no Artifact label" as a premise in a
     # comment and would have gone on reporting all twenty forever. It reads
     # `_spend`'s answer now.
-    "W10 browser-evidence": "owed:99",
 }
 
 

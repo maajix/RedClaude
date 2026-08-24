@@ -16,7 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _launch, _startup, agent, document, execution, isolation, packet
+from redkraken import _launch, _startup, agent, browser, document, execution, isolation
+from redkraken import packet
 from redkraken import pg, proxy, roster, skill, store, tls
 from redkraken.outcome import EXIT_STARTUP_REFUSED, STARTUP_REFUSED
 from tests import ROOT, control_upstream, fixtures
@@ -1405,6 +1406,46 @@ class ToolChannelTest(unittest.TestCase):
             {"served": False, "reason": agent.UNKNOWN_CALL, "detail": mock.ANY},
             {**served, "detail": mock.ANY},
         )
+
+    def test_a_run_with_no_browser_is_refused_before_a_connection_is_opened(self):
+        # Ticket 99. The Contract is the role's and the image is the
+        # installation's, so a `web_hunter` on a machine that describes no
+        # browser holds a tool with nothing behind it. It is answered here for
+        # the reason `no_tool_image` is answered here: a refusal the model reads
+        # is a turn it can spend on something else, and a missing image is not a
+        # database question.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+
+        with mock.patch.object(agent.pg, "connect", side_effect=AssertionError("connected")):
+            served = serving({"verb": roster.BROWSE, "steps": [{"action": "navigate"}]})
+
+        self.assertEqual(
+            {"served": False, "reason": agent.NO_BROWSER, "detail": mock.ANY},
+            {**served, "detail": mock.ANY},
+        )
+
+    def test_the_supervisor_carries_the_plan_and_names_the_identity_itself(self):
+        # The steps cross as the model wrote them and the Identity slot does
+        # not: it is the one the Task claimed, which is what keeps a mission
+        # from choosing whose session it runs as.
+        tooling = replace(
+            self.tooling(),
+            browser=isolation.ToolContainer(image="rk2-browser"),
+            authority=Path("/authority"),
+            identity_slot="shopper",
+        )
+        _, serving = self.serving(tooling=tooling)
+        assert serving is not None
+        steps = [{"action": "navigate", "arguments": {"url": "https://example.test/"}}]
+
+        with mock.patch.object(agent.pg, "connect", return_value=mock.Mock()), \
+                mock.patch.object(browser, "served", return_value={"served": True}) as ran:
+            served = serving({"verb": roster.BROWSE, "steps": steps, "identity_slot": "admin"})
+
+        self.assertEqual({"served": True}, served)
+        self.assertEqual(steps, ran.call_args.kwargs["steps"])
+        self.assertEqual("shopper", ran.call_args.kwargs["identity_slot"])
 
     def test_the_supervisor_mints_the_correlator_the_child_asked_for(self):
         # PH2-98. Three things at once, because they are one property: the verb

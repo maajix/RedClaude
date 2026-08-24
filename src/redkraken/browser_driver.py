@@ -115,7 +115,9 @@ CONSOLE = "console"
 FLAGS = (
     # No setuid sandbox of Chromium's own: the Agent boundary is what confines
     # this process, and the two together need a capability set this container
-    # drops.
+    # drops. Ticket 174 owns the seccomp profile that would let Chromium's
+    # sandbox start beside the boundary rather than instead of it; until then
+    # the container is the only boundary a renderer compromise meets.
     "--no-sandbox",
     "--disable-gpu",
     # Send shared memory to TMPDIR instead of /dev/shm, which a hardened

@@ -32,7 +32,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from redkraken import artifact, browser_driver, config, isolation, migrate, pg, program, proxy, tls
+from redkraken import (
+    artifact,
+    browser_driver,
+    config,
+    isolation,
+    migrate,
+    pg,
+    program,
+    proxy,
+    tls,
+    tool,
+)
 from redkraken.outcome import (
     INVALID_CONFIGURATION,
     MISSING_DEPENDENCY,
@@ -49,7 +60,9 @@ __all__ = [
     "IMAGE_VARIABLE",
     "RUN",
     "image_from_environment",
+    "mission",
     "run",
+    "served",
 ]
 
 
@@ -181,102 +194,145 @@ def run(
             return _report(ledger, answers)
         run_id = str(rows[0][0])
 
-        # Everything that decides whether this mission may happen at all happens
-        # in the database, and the rows it writes are committed before anything
-        # starts: a mission that never comes back is a plan an operator can read.
-        try:
-            with connection.transaction():
-                connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
-                plan = json.loads(
-                    str(
-                        connection.execute(
-                            OPEN, (run_id, json.dumps(list(steps)), identity_slot)
-                        ).scalar()
-                    )
-                )
-        except pg.DatabaseError as error:
-            ledger.fail(
-                "plan",
-                f"the registry refused this mission: {_said(error)}",
-                code=INVALID_CONFIGURATION,
-                source="argument:--plan",
-            )
-            return _report(ledger, answers)
-
-        answers.tool_run = {
-            "label": plan["tool_run"],
-            "plan_sha256": plan["plan_sha256"],
-            "identity_slot": plan["identity_slot"],
-            "methods": plan["methods"],
-            "steps": len(plan["steps"]),
-            "status": "running",
-            "detail": None,
-            "result_digest": None,
-        }
-        ledger.hold(
-            "plan",
-            f"{plan['tool_run']} opened: {len(plan['steps'])} step(s), "
-            f"{', '.join(plan['methods'])}, {plan['timeout_seconds']}s at most",
+        return mission(
+            ledger,
+            answers,
+            connection,
+            keep,
+            container,
+            pin,
+            run_id=run_id,
+            steps=steps,
+            identity_slot=identity_slot,
+            actor=f"rk {RUN}",
         )
 
-        # From here the row is open and committed, so every way out closes it.
-        try:
-            gate = proxy.as_object(
-                _minted(connection, plan["tool_run_id"], f"rk {RUN}")
-            )
-        except pg.DatabaseError as error:
-            return _abandon(
-                ledger, answers, connection, plan,
-                f"the risk gate refused this mission: {_said(error)}",
-                name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
-            )
-        capability = gate.get("capability")
-        if not capability:
-            return _abandon(
-                ledger, answers, connection, plan,
-                f"the risk gate answered {gate.get('decision')} rather than allow",
-                name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
-            )
-        ledger.hold("capability", f"the risk gate allowed {plan['tool_run']}")
 
-        names = artifact_names(plan)
-        try:
-            answer = _perform(container, plan, names, str(capability), answers.program_id, pin)
-        except isolation.Unavailable as error:
-            return _abandon(
-                ledger, answers, connection, plan, str(error),
-                name="run", code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}",
-            )
-        except BaseException as error:
-            _closing(connection, plan, f"the supervisor could not run the browser: {error!r}")
-            raise
+def mission(
+    ledger: Ledger,
+    answers: "_Answers",
+    connection: pg.Connection,
+    keep: Store,
+    container: isolation.ToolContainer,
+    pin: str,
+    *,
+    run_id: str,
+    steps: Sequence[Mapping[str, object]],
+    identity_slot: str | None,
+    actor: str,
+) -> Report:
+    """One mission, from the plan the registry admits to the row it closes.
 
-        said, status, detail = _read(answer, plan)
-        try:
-            with connection.transaction():
-                connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
-                for recorded in said.get("steps", ()):
-                    _record(connection, answers.program_id, plan, recorded)
-                answers.outputs = [
-                    _keep_stream(connection, keep, answers.program_id, plan, kept, captured)
-                    for kept, captured in _streams(said, answer)
-                ]
-                closed = json.loads(
-                    str(connection.execute(CLOSE, (plan["tool_run_id"], status, detail)).scalar())
+    Split out of `run` for ticket 99 and not otherwise changed. `rk browser run`
+    resolves a Program out of a configuration file and an Agent run out of a
+    label; the supervisor answering `mcp__rk2__browse` already holds both, and a
+    second copy of everything below is how the operator path and the model path
+    come to mean two different things by one mission. So the resolving stays
+    where it differs and this is the part that must not.
+
+    `actor` is the one value the two callers disagree about, and it is a
+    parameter rather than a constant for the same reason: `set_actor` is what an
+    event is attributed to, and a mission a model asked for that recorded itself
+    as an operator command would be a row that lies about who acted.
+    """
+    # Everything that decides whether this mission may happen at all happens
+    # in the database, and the rows it writes are committed before anything
+    # starts: a mission that never comes back is a plan an operator can read.
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (actor,))
+            plan = json.loads(
+                str(
+                    connection.execute(
+                        OPEN, (run_id, json.dumps(list(steps)), identity_slot)
+                    ).scalar()
                 )
-        except pg.DatabaseError as error:
-            # The close refused what the container reported -- an outcome the
-            # registry does not admit, or a success that performed half its plan.
-            # The mission is closed as the error it is, with the words the
-            # database used, rather than left open for a checker to find.
-            return _abandon(
-                ledger, answers, connection, plan,
-                f"what the browser reported was refused: {_said(error)}",
-                name="outcome", code=INVALID_CONFIGURATION, source="browser_run",
             )
-        except BaseException as error:
-            _closing(connection, plan, f"the output could not be filed: {error!r}")
-            raise
+    except pg.DatabaseError as error:
+        ledger.fail(
+            "plan",
+            f"the registry refused this mission: {_said(error)}",
+            code=INVALID_CONFIGURATION,
+            source="argument:--plan",
+        )
+        return _report(ledger, answers)
+
+    answers.tool_run = {
+        "label": plan["tool_run"],
+        "plan_sha256": plan["plan_sha256"],
+        "identity_slot": plan["identity_slot"],
+        "methods": plan["methods"],
+        "steps": len(plan["steps"]),
+        "status": "running",
+        "detail": None,
+        "result_digest": None,
+    }
+    ledger.hold(
+        "plan",
+        f"{plan['tool_run']} opened: {len(plan['steps'])} step(s), "
+        f"{', '.join(plan['methods'])}, {plan['timeout_seconds']}s at most",
+    )
+
+    # From here the row is open and committed, so every way out closes it.
+    try:
+        gate = proxy.as_object(
+            _minted(connection, plan["tool_run_id"], actor)
+        )
+    except pg.DatabaseError as error:
+        return _abandon(
+            ledger, answers, connection, actor, plan,
+            f"the risk gate refused this mission: {_said(error)}",
+            name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
+        )
+    capability = gate.get("capability")
+    if not capability:
+        return _abandon(
+            ledger, answers, connection, actor, plan,
+            f"the risk gate answered {gate.get('decision')} rather than allow",
+            name="capability", code=INVALID_CONFIGURATION, source="risk_gate",
+        )
+    ledger.hold("capability", f"the risk gate allowed {plan['tool_run']}")
+
+    names = artifact_names(plan)
+    try:
+        answer = _perform(container, plan, names, str(capability), answers.program_id, pin)
+    except isolation.Unavailable as error:
+        return _abandon(
+            ledger, answers, connection, actor, plan, str(error),
+            name="run", code=MISSING_DEPENDENCY, source=f"environment:{IMAGE_VARIABLE}",
+        )
+    except BaseException as error:
+        _closing(connection, actor, plan, f"the supervisor could not run the browser: {error!r}")
+        raise
+
+    said, status, detail = _read(answer, plan)
+    try:
+        with connection.transaction():
+            connection.execute("SELECT set_actor('runtime', $1)", (actor,))
+            answers.steps = [
+                _record(connection, answers.program_id, plan, recorded)
+                for recorded in said.get("steps", ())
+            ]
+            answers.outputs = [
+                _keep_stream(connection, keep, answers.program_id, plan, kept, captured)
+                for kept, captured in _streams(said, answer)
+            ]
+            closed = json.loads(
+                str(connection.execute(CLOSE, (plan["tool_run_id"], status, detail)).scalar())
+            )
+    except pg.DatabaseError as error:
+        # The close refused what the container reported -- an outcome the
+        # registry does not admit, or a success that performed half its plan.
+        # The mission is closed as the error it is, with the words the
+        # database used, rather than left open for a checker to find.
+        return _abandon(
+            ledger, answers, connection, actor, plan,
+            f"what the browser reported was refused: {_said(error)}",
+            name="outcome", code=INVALID_CONFIGURATION, source="browser_run",
+        )
+    except BaseException as error:
+        _closing(connection, actor, plan, f"the output could not be filed: {error!r}")
+        raise
 
     answers.tool_run.update(
         status=closed["status"], detail=detail, result_digest=closed["result_digest"]
@@ -301,6 +357,95 @@ def run(
             source="browser_run",
         )
     return _report(ledger, answers)
+
+
+def served(
+    connection: pg.Connection,
+    root: Path,
+    container: isolation.ToolContainer,
+    authority: Path,
+    *,
+    program_id: str,
+    agent_run_id: str,
+    steps: Sequence[Mapping[str, object]],
+    identity_slot: str | None,
+) -> dict:
+    """Answer one `mcp__rk2__browse` call: open, run, file and close, mid-run.
+
+    `tool.serve` beside the same three moments, and this is the browser's. What
+    the two share is the half that must not exist twice, which is `mission`
+    above; what differs is the resolving -- an operator command reads a Program
+    out of a configuration file and an Agent run out of a label, and a
+    supervisor that has already started a child holds both.
+
+    What comes back is an answer for a model, so it is bounded and it is the
+    record rather than the container's account of it. The step outcomes carry
+    the `scope_class` the door decided, never the one the browser reported; the
+    Artifacts are labels into the store rather than bytes; and the two digests
+    are what makes a second run of the same plan comparable to this one.
+
+    A refusal is answered rather than raised, for `tool.serve`'s reason: a plan
+    the registry would not open is a call that failed, which the model can
+    correct, and an exception out of here would reach it as the supervisor
+    failing.
+    """
+    ledger = Ledger()
+    answers = _Answers(RUN)
+    answers.program_id = program_id
+    keep = Store(Path(root))
+    connection.execute(BIND, (program_id,))
+    try:
+        pin = tls.authority(authority).pin()
+    except (tls.Missing, tls.Unusable) as error:
+        return {"served": False, "reason": tool.RUN_FAILED, "detail": str(error)}
+
+    mission(
+        ledger,
+        answers,
+        connection,
+        keep,
+        container,
+        pin,
+        run_id=agent_run_id,
+        steps=steps,
+        identity_slot=identity_slot,
+        actor=tool.SERVED_BY,
+    )
+    if answers.tool_run is None:
+        # `open_browser_run` refused before a row existed: an action this
+        # browser does not perform, an argument it does not declare, a value
+        # outside its kind, a Halted Program or an Identity lease this run does
+        # not hold. The sentence the database refused in is the whole of what a
+        # model needs to correct the plan, and `ledger` is holding it.
+        return {
+            "served": False,
+            "reason": tool.REFUSED_CALL,
+            "detail": _refusal(ledger),
+        }
+    run = answers.tool_run
+    return {
+        "served": run["status"] == "success",
+        "tool_run": run["label"],
+        "status": run["status"],
+        "detail": run["detail"],
+        "plan_sha256": run["plan_sha256"],
+        "result_digest": run["result_digest"],
+        "identity_slot": run["identity_slot"],
+        "methods": run["methods"],
+        "steps": answers.steps,
+        "outputs": [
+            {name: item[name] for name in ("stream", "output_name", "ordinal", "label", "byte_size")}
+            for item in answers.outputs
+        ],
+    }
+
+
+def _refusal(ledger: Ledger) -> str:
+    """The sentence the mission was refused in, out of what the ledger holds."""
+    return next(
+        (violation.detail for violation in ledger.violations),
+        "the registry refused this mission",
+    )
 
 
 def artifact_names(plan: Mapping[str, object]) -> dict[str, str]:
@@ -331,6 +476,11 @@ class _Answers:
     program_id: str | None = None
     tool_run: dict | None = None
     outputs: list = field(default_factory=list)
+    #: What each step reported, filled by `_record` with the `scope_class` the
+    #: container may not answer for. Read by `served` and not by `_report`: the
+    #: operator command already prints the step rows through `rk state`, and a
+    #: model has no table to read them out of.
+    steps: list = field(default_factory=list)
 
 
 def _report(ledger: Ledger, answers: _Answers) -> Report:
@@ -447,8 +597,14 @@ def _record(
     program_id: str,
     plan: Mapping[str, object],
     recorded: Mapping[str, object],
-) -> None:
-    """One step's outcome, with the part of it the container may not answer for."""
+) -> dict:
+    """One step's outcome, with the part of it the container may not answer for.
+
+    The row is written and the same outcome is handed back, because two parties
+    want it and only one of them can read the table: `served` answers a model
+    with what each step reported, and `scope_class` -- the one key the container
+    is not allowed to supply -- exists only after this function has filled it in.
+    """
     outcome = dict(recorded["outcome"])
     if recorded["action"] == "navigate":
         outcome["scope_class"] = _classified(connection, program_id, plan, recorded["ordinal"])
@@ -461,6 +617,12 @@ def _record(
             int(recorded.get("network_requests") or 0),
         ),
     )
+    return {
+        "ordinal": int(recorded["ordinal"]),
+        "action": str(recorded["action"]),
+        "outcome": outcome,
+        "network_requests": int(recorded.get("network_requests") or 0),
+    }
 
 
 def _classified(
@@ -545,6 +707,7 @@ def _abandon(
     ledger: Ledger,
     answers: _Answers,
     connection: pg.Connection,
+    actor: str,
     plan: Mapping[str, object],
     detail: str,
     *,
@@ -558,13 +721,15 @@ def _abandon(
     fault rather than as history, so the row is closed as an error carrying the
     reason -- which is a true account of what happened to it.
     """
-    _closing(connection, plan, detail)
+    _closing(connection, actor, plan, detail)
     answers.tool_run.update(status="error", detail=detail)
     ledger.fail(name, detail, code=code, source=source)
     return _report(ledger, answers)
 
 
-def _closing(connection: pg.Connection, plan: Mapping[str, object], detail: str) -> None:
+def _closing(
+    connection: pg.Connection, actor: str, plan: Mapping[str, object], detail: str
+) -> None:
     """Close an open mission on the way out of a failure, best effort.
 
     Deliberately silent when it fails: the caller is already carrying a reason
@@ -573,7 +738,7 @@ def _closing(connection: pg.Connection, plan: Mapping[str, object], detail: str)
     """
     try:
         with connection.transaction():
-            connection.execute("SELECT set_actor('runtime', $1)", (f"rk {RUN}",))
+            connection.execute("SELECT set_actor('runtime', $1)", (actor,))
             connection.execute(CLOSE, (plan["tool_run_id"], "error", detail))
     except (pg.ConnectionError_, pg.DatabaseError, OSError):
         return

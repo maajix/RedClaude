@@ -40,7 +40,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from redkraken import _startup, callback, capsule as capsule_module, isolation
+from redkraken import _startup, browser, callback, capsule as capsule_module, isolation
 from redkraken import packet as packet_module, pg, roster, skill
 from redkraken import state as state_module, store, tool as tool_module
 from redkraken.outcome import STARTUP_REFUSED, Ledger, Report, Violation, report
@@ -149,7 +149,7 @@ SERVER_VERSION = "0.1.0"
 #: role the roster grants the group to.
 SERVED_GROUPS = (
     "state.read", "state.propose", "net.request", "validate.judge", "exec.tool_run",
-    "state.conclude",
+    "state.conclude", "exec.browser_run",
 )
 
 #: The one group served in part, and exactly which of its members. `sched.pick`
@@ -249,6 +249,12 @@ REFUSED_STATEMENT = "refused_statement"
 #: that one is a run with no supervisor at all, this one is a supervisor an
 #: installation gave no tool image.
 NO_TOOL_IMAGE = "no_tool_image"
+#: The same state one image over. Its own word rather than `NO_TOOL_IMAGE`,
+#: because they are two different absences and a child told the wrong one would
+#: go looking for the wrong thing: a browser image carries a browser and its
+#: libraries and nothing this harness registers as a tool, and a mission also
+#: needs the certificate authority whose leaf key the browser is told to pin.
+NO_BROWSER = "no_browser"
 
 #: The one thing crossing this channel that is not a tool a model can call. Every
 #: other verb here is a `roster.CONTRACTS` name because a child asked for it by
@@ -544,6 +550,24 @@ class Tooling:
     container: isolation.ToolContainer | None = None
     root: Path | None = None
     state: pg.Settings | None = None
+    #: Ticket 99. The browser is its own image and its own container
+    #: description, not the tool one: `browser.IMAGE_VARIABLE` names an image
+    #: holding a browser and its libraries and nothing this harness registers
+    #: as a tool, and pointing one at the other would start whichever of them
+    #: answered. The door travels inside it exactly as it does for a tool run.
+    browser: isolation.ToolContainer | None = None
+    #: Where the run's certificate authority is, so the supervisor can take the
+    #: leaf public key the browser is told to pin. Not the CA file the child
+    #: trusts: the pin is over the signing key, which only the authority
+    #: directory holds. Optional with the image above -- an installation that
+    #: names neither answers `no_browser` and runs no mission.
+    authority: Path | None = None
+    #: The slot the Task selected, which `open_browser_run` checks a live lease
+    #: for. Carried rather than chosen here for ticket 131's reason: a Task acts
+    #: as exactly one Identity, the scheduler leased it under this Agent run,
+    #: and a mission that picked its own would be a second answer to a question
+    #: the Task already answered. `None` is the anonymous selection.
+    identity_slot: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1457,6 +1481,7 @@ class _Tools:
         if verb not in (
             roster.RUN_TOOL,
             roster.RUN_SKILL_SCRIPT,
+            roster.BROWSE,
             roster.PROPOSE_FINDING,
             roster.PROPOSE_TEST,
             roster.MINT_CALLBACK,
@@ -1500,6 +1525,24 @@ class _Tools:
                           "store, so there is nothing to run a registered tool with",
             }
 
+        # And the same sentence one image over, before the connection for the
+        # same reason. A browser mission needs three things this machine may not
+        # describe -- an image with a browser in it, the authority whose leaf key
+        # the browser pins, and a store to file what it captured -- and a
+        # database that answered perfectly would not supply any of them.
+        if verb == roster.BROWSE and (
+            self._tooling.browser is None
+            or self._tooling.authority is None
+            or self._tooling.root is None
+        ):
+            return {
+                "served": False,
+                "reason": NO_BROWSER,
+                "detail": "this installation describes no browser image, no certificate "
+                          "authority or no Artifact store, so there is nothing to run a "
+                          "browser mission with",
+            }
+
         try:
             connection = self._open()
         except (pg.ConnectionError_, OSError) as error:
@@ -1538,6 +1581,9 @@ class _Tools:
         if verb == roster.PARK_FOR_HUMAN:
             return self._park(connection, call)
 
+        if verb == roster.BROWSE:
+            return self._browse(connection, call)
+
         if verb == roster.RUN_TOOL:
             named: str | None = str(call.get("tool") or "")
         else:
@@ -1570,6 +1616,38 @@ class _Tools:
             ),
             excerpt=packet_module.DEFAULT_EXCERPT,
         )
+
+    def _browse(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Run one browser mission for the child and answer what it saw.
+
+        The steps and nothing else, because everything else about a mission is
+        not the child's to name. The Program is bound on the connection, the
+        Agent run is the one this object was built for, and the Identity is the
+        one its Task selected -- three fields a plan carrying them would be a
+        plan choosing a caller, a Program or a run other than its own.
+
+        A refusal comes back as a refusal. `open_browser_run` decides the plan
+        against the action registry, the argument schema, the value kinds, the
+        Halt and the Identity lease, and the sentence it refuses in is what a
+        model needs to correct the plan inside the same run.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        steps = arguments.get("steps")
+        try:
+            return browser.served(
+                connection,
+                self._tooling.root,
+                self._tooling.browser,
+                self._tooling.authority,
+                program_id=self._program_id,
+                agent_run_id=self._agent_run_id,
+                steps=list(steps) if isinstance(steps, (list, tuple)) else [],
+                identity_slot=self._tooling.identity_slot,
+            )
+        except (pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
 
     def _propose(
         self, connection: pg.Connection, given: object

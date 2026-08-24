@@ -291,15 +291,15 @@ Dauer: weitere **4–6 Arbeitstage**.
 
 Code-Dauer: **5–8 Arbeitstage**, anschließend **2–6 Kalendertage** Grading.
 
-- [ ] Ticket 99: die bestehende proxied `headless-shell` Browser mission über einen geschlossenen Contract anbieten.
-- [ ] Ausschließlich die vorhandenen registrierten Aktionen nutzen:
+- [x] Ticket 99: die bestehende proxied `headless-shell` Browser mission über einen geschlossenen Contract anbieten.
+- [x] Ausschließlich die vorhandenen registrierten Aktionen nutzen:
 
   ```text
   navigate, wait_for, fill, inject, click,
   assert_text, assert_absent, probe, capture_dom, screenshot
   ```
 
-- [ ] Kein Carbonyl, kein agent-browser, kein persistenter Browser-Daemon und kein beliebiges JavaScript; ADR 0004/0005 bleiben unverändert.
+- [x] Kein Carbonyl, kein agent-browser, kein persistenter Browser-Daemon und kein beliebiges JavaScript; ADR 0004/0005 bleiben unverändert.
 - [ ] Ticket 101 nur für die fünf benötigten Capability-Zeilen implementieren.
 - [ ] Ticket 109 auf paarweise Vergleiche festlegen.
 - [ ] Ticket 84 nur für diese fünf High-Yield-Paare durchführen:

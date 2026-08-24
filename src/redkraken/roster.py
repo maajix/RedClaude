@@ -418,6 +418,32 @@ TEST_ACTION_KINDS = ("request",)
 #: to the checker and not to the other enum.
 TEST_REQUEST_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 
+#: `browser_actions.action`, seeded by
+#: `20260814T040000Z__a_browser_mission_runs_behind_the_door.sql`. Ten and
+#: never an eleventh from this side: the registry is changed by migration
+#: because "an action the runtime could add is an action the plan could
+#: invent, and the plan is written by a model". Stated a second time here for
+#: `TEST_REQUEST_METHODS`' reason -- a served schema is a compile-time promise
+#: and cannot read a table -- and held to the seed by `SchemaAgreementTest`.
+BROWSER_ACTIONS = (
+    "navigate",
+    "wait_for",
+    "fill",
+    "inject",
+    "click",
+    "assert_text",
+    "assert_absent",
+    "probe",
+    "capture_dom",
+    "screenshot",
+)
+
+#: `browser_ceilings.max_steps`, the one row of section 4 of the same file. The
+#: schema is where a plan is refused for being too long; this is where it is
+#: refused before it is sent, which is the difference between a run that spends
+#: a turn discovering the ceiling and one that was told.
+BROWSER_STEPS = (1, 32)
+
 #: The impact a Test may state it would have, from `impact_classes` in
 #: `20260816T000000Z__impact_is_authorized_before_it_is_proved.sql`. THREE OF
 #: SIX, and the missing three are the point: `degrade_availability`,
@@ -942,6 +968,16 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "net.request": ("mcp__rk2__http_request",),
     "exec.tool_run": ("mcp__rk2__run_tool", "mcp__rk2__run_skill_script"),
+    # A GROUP OF ITS OWN AND NOT A THIRD MEMBER OF `exec.tool_run`. A group is
+    # the unit a role holds, and `exec.tool_run` is held by `recon`,
+    # `js_analyst` and `web_hunter` -- so a browser member in there would hand
+    # a third role a verb that reaches the network and a second one a verb that
+    # can submit a form, which is authority ticket 99 was not given. What the
+    # two groups run is not the same class either: an offline tool reads
+    # Artifacts this Program already holds and touches nothing, while a mission
+    # navigates and clicks, and `browser_actions.reaches_network` and
+    # `.submits` are the registry's own words for that difference.
+    "exec.browser_run": ("mcp__rk2__browse",),
     "validate.judge": ("mcp__rk2__get_validation_packet", "mcp__rk2__submit_verdict"),
 }
 
@@ -1867,6 +1903,71 @@ CONTRACTS: dict[str, Contract] = {
             ),
         },
     ),
+    # Ticket 99. The lane was built, paid for and reachable from the operator
+    # CLI alone; this is the door a Playbook step knocks on, and it opens onto
+    # exactly what was already there. `open_browser_run` is the one authority:
+    # it resolves every action against `browser_actions`, every argument name
+    # against `browser_action_arguments`, every value against its kind's
+    # pattern and length, derives the method set from `submits`, asks the Halt
+    # and checks the Identity lease -- all before a container exists. This
+    # declaration is the floor in front of that, not a second opinion about it.
+    #
+    # No capability is added. The ten actions are the ten the registry already
+    # seeds, and there is no eleventh here or anywhere: no Carbonyl (ADR 0004),
+    # no agent-browser (ADR 0005), no persistent daemon, no model-authored
+    # JavaScript. `probe` names a row of `browser_probes` whose payload and
+    # whose expression are a migration's, which is why a `probe` argument is a
+    # name and never text.
+    #
+    # `identity_slot` is not an argument here for the reason it is not one on
+    # `mcp__rk2__http_request`: it is a property of the Tool run. The browser's
+    # slot is passed to `open_browser_run` by the supervisor, out of the Task's
+    # own selected Identity, and an argument for it would be a per-call answer
+    # to a question the row answers once.
+    "mcp__rk2__browse": Contract(
+        "exec.browser_run",
+        ACT,
+        writes=(
+            "tool_runs",
+            "browser_runs",
+            "browser_steps",
+            "browser_step_results",
+            "tool_run_artifacts",
+            "receipts",
+            "artifacts",
+            "artifact_refs",
+        ),
+        arguments={
+            "steps": Argument(
+                "array",
+                required=True,
+                # The ceiling the registry already holds, said here so a plan
+                # too long is refused as it is sent rather than after the
+                # runtime has opened a connection to be told.
+                bounds=BROWSER_STEPS,
+                element={
+                    "action": Argument("string", required=True, enum=BROWSER_ACTIONS),
+                    # Names and text, and the narrowing is the registry's.
+                    # `browser_argument_kinds` bounds a url at 1024, a text at
+                    # 512, a selector at 256, a probe name at 32 and an integer
+                    # at five digits, and applies the action's own pattern after
+                    # its kind's -- five different bounds that one JSON Schema
+                    # over an open object cannot state. So this states the two
+                    # things that are true of every kind at once: a key is an
+                    # argument name of the shape the registry's CHECK admits,
+                    # and a value is text with no control character in it,
+                    # inside the widest of the five bounds. Everything below
+                    # that is refused by `open_browser_run` before a container
+                    # starts, with the argument named.
+                    "arguments": Argument(
+                        "object",
+                        items_pattern=_ARGUMENT_NAME,
+                        values_pattern="^[^\\x00-\\x1f\\x7f]{1,1024}\\Z",
+                    ),
+                },
+            ),
+        },
+    ),
     "mcp__rk2__get_validation_packet": Contract(
         "validate.judge",
         READ,
@@ -1956,6 +2057,14 @@ COMPOSE_FINDING_REPORT = "mcp__rk2__compose_finding_report"
 #: verb twice.
 PARK_FOR_HUMAN = "mcp__rk2__park_for_human"
 
+#: Ticket 99's, spelled here for the reason all of the above are: the supervisor
+#: dispatches on the verb name. It is also the one name in this list the
+#: database already held before the Contract existed -- `rk2_browser_tool()`
+#: returns exactly this string, and `authorize_egress_request` reads it twice to
+#: decide what a request off a browser capability may be -- so a spelling that
+#: drifted here would be a mission judged by the rules for something else.
+BROWSE = "mcp__rk2__browse"
+
 #: Built-in tools no role holds, each with the reason it holds none. Together
 #: with the roles below this partitions the observed inventory exactly: a tool
 #: that is neither granted nor refused here is a tool this roster has not
@@ -2039,8 +2148,15 @@ ROLES: dict[str, Role] = {
         # from a validated Finding to the impact specification, the severity
         # band and the composed report, and the three verbs of that walk are
         # authority no other role has a Task that would put it in front of.
+        # `exec.browser_run` is ticket 99's and this role's alone, for the
+        # reason `state.conclude` is: the browser is how a hunt takes evidence
+        # a raw exchange cannot produce, and the two other roles that hold
+        # `exec.tool_run` hold no Task that would put them in front of a
+        # rendered page. `recon` maps a surface and `js_analyst` reads bytes
+        # already filed; neither clicks anything.
         tool_groups=(
             "state.read", "state.propose", "state.conclude", "net.request", "exec.tool_run",
+            "exec.browser_run",
         ),
         max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:

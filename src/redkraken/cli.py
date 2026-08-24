@@ -2311,12 +2311,24 @@ def _slice(
     # is nothing to run one with. The door is this boundary, because a tool that
     # declares the proxy adapter is put on the Agent topology and there is no
     # second one to put it on.
+    #
+    # Ticket 99 adds the browser beside it, read the same way and refused the
+    # same way: a machine that names no browser image or no certificate
+    # authority still runs every child, and `mcp__rk2__browse` answers that
+    # there is no browser to run a mission with. The authority is the
+    # supervisor's own directory rather than the CA file the child trusts,
+    # because the pin the browser is given is over the signing key.
     image = tool.image_from_environment()
+    browsing = browser.image_from_environment()
     return execution.Slice(
         boundary=boundary,
         state=agent,
         artifacts=artifact.root_from_environment(arguments.artifacts),
         tools=None if image is None else isolation.ToolContainer(image=image, door=boundary),
+        browser=(
+            None if browsing is None else isolation.ToolContainer(image=browsing, door=boundary)
+        ),
+        authority=_path(AUTHORITY, getattr(arguments, "authority", None)),
         configuration=configuration,
         # Read and not refused, for the reason the store and the image are not
         # refused: this is the address one kind needs, and a machine with no

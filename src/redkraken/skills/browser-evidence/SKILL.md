@@ -1,8 +1,8 @@
 ---
 description: Take evidence through a scripted browser mission that runs behind the proxy. Use when the behaviour under test needs a rendered page, a script-driven request, or a stored session that a raw exchange cannot produce.
-allowed-tools: ["Skill", "mcp__rk2__get_artifact", "mcp__rk2__get_attack_surface", "mcp__rk2__get_evidence", "mcp__rk2__get_hypotheses", "mcp__rk2__get_receipts", "mcp__rk2__run_skill_script", "mcp__rk2__run_tool", "mcp__rk2__submit_mission_result"]
+allowed-tools: ["Skill", "mcp__rk2__browse", "mcp__rk2__get_artifact", "mcp__rk2__get_attack_surface", "mcp__rk2__get_evidence", "mcp__rk2__get_hypotheses", "mcp__rk2__get_receipts", "mcp__rk2__run_skill_script", "mcp__rk2__submit_mission_result"]
 bb:roles: ["web_hunter"]
-bb:tool_groups: ["exec.tool_run", "state.propose", "state.read"]
+bb:tool_groups: ["exec.browser_run", "exec.tool_run", "state.propose", "state.read"]
 bb:evidence_profile: browser_run_evidence
 ---
 
@@ -14,9 +14,10 @@ happened is a digest, and a mission with only the second is a screenshot.
 ## 1. Write the plan before running it
 
 Every step is a declared action with declared arguments. The plan digest is
-taken over the identity slot and the ordered steps, so two runs of one mission
-share it whatever they found -- which is what makes a differing result digest
-evidence about the target rather than evidence that somebody edited the plan.
+taken over the Identity slot the Task names and the ordered steps, so two runs
+of one mission share it whatever they found -- which is what makes a differing
+result digest evidence about the target rather than evidence that somebody
+edited the plan.
 
 Ten actions exist and the plan is written out of them: `navigate`, `wait_for`,
 `fill`, `inject`, `click`, `assert_text`, `assert_absent`, `probe`,
@@ -24,7 +25,7 @@ Ten actions exist and the plan is written out of them: `navigate`, `wait_for`,
 is refused before the container starts, and so is an argument the action does
 not declare.
 
-Complete this step with the ordered steps and the Identity slot, if any.
+Complete this step with the ordered steps.
 
 ## 2. Put a wait after everything that changes the page
 
@@ -60,9 +61,25 @@ front of both.
 
 ## 3. Run it once, behind the door
 
-Start the mission through `mcp__rk2__run_tool`. Every request the page makes
+Start the mission through `mcp__rk2__browse`. Its one argument is `steps`, the
+ordered plan. The Identity slot is not an argument: the run acts as the one
+Identity the Task names, and the plan digest is taken over that slot and these
+steps together. Every request the page makes
 goes through the same proxy under the same scope decision as a hand-written
 exchange, and each one has its own Receipt. There is no second egress here.
+
+The response headers of everything the page loaded are on the record already.
+Each response is kept as a `message/http` transcript under its own hash, and the
+transcript carries the headers a client-side reading needs: CSP and
+CSP-Report-Only, COOP, COEP, CORP, Permissions-Policy, Service-Worker-Allowed
+and Vary. No step has to fetch a page a second time to cite what it was served
+with.
+
+Two headers are absent from that view on purpose. `Set-Cookie` and the target's
+authentication headers are wire-only: the door strips them before the transcript
+is written, and an Identity's value is injected at the door and never handed to
+the browser. So a cookie reading here reads the request side and what the page
+then did, never the raw header, and it says which of the two it read.
 
 While this Skill is loaded you do not hold `mcp__rk2__http_request`. That is
 deliberate: a hand-crafted exchange run beside a browser mission produces a
@@ -164,10 +181,11 @@ the right price to learn what a page does. It is the wrong price to do the same
 thing again.
 
 Once the first mission has shown what the page does, the repetition is not a
-mission. It is a Tool run through `mcp__rk2__run_tool`, or a Skill script over
-the Artifacts already stored, or -- if the repetition is a raw exchange -- a
-separate Task under a Skill that holds `mcp__rk2__http_request`. Whichever it
-is, run only what the role's roster already grants. A second browser mission
+mission. It is `mcp__rk2__run_skill_script` over the Artifacts already stored --
+`compare-responses` holds one stored exchange against another without a
+container -- or, if the repetition is a raw exchange, a separate Task under a
+Skill that holds `mcp__rk2__http_request`. Whichever it is, run only what the
+role's roster already grants. A second browser mission
 that differs from the first only in a literal is a screenshot with a receipt.
 
 ## Where this text came from
