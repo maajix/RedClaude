@@ -260,6 +260,13 @@ NO_TOOL_IMAGE = "no_tool_image"
 #: the roster's.
 NAME_TRANSCRIPTS = "rk2__name_transcripts"
 
+#: Ticket 119, and the third thing on this channel no model says. The SDK names
+#: its session in the init message and only the child reads that message; the
+#: row belongs to the supervisor, which is the side holding a connection. So the
+#: identifier crosses back once, immediately after init, under a name outside
+#: the `mcp__rk2__` shape for the reason `NAME_TRANSCRIPTS` gives.
+BIND_SESSION = "rk2__bind_session"
+
 #: How one refusal is made durable: the Program this session speaks for, and the
 #: one call that closes the run. Everything the cleanup does -- the run, its
 #: Task, the session binding, the Identity Leases and the Event -- happens
@@ -333,6 +340,15 @@ UNDO = "ROLLBACK TO SAVEPOINT rk2_verb"
 #: rather than here, because `rk2_runtime`'s row level security is `USING (true)`
 #: and a Receipt label is a small integer that exists under most Programs.
 TRANSCRIPTS = "SELECT receipt_transcript_labels($1)"
+
+#: Ticket 119: the write half of a lifecycle whose unbind half has shipped since
+#: 0022. Eleven statements in the corpus retire an `agent_sessions` binding and
+#: until this one nothing made one, so "unbinds its session" -- which this
+#: module's own prose has claimed since it was written -- was a no-op on an
+#: empty table. The Agent run is this side's, like everywhere else on the
+#: dispatch; the session identifier is the child's, because the SDK tells only
+#: the child.
+BIND_SDK_SESSION = "SELECT open_agent_session($1::uuid, $2)"
 
 #: The second thing crossing this channel that is not a `roster.CONTRACTS` call
 #: made by a model -- except that this one is, and the difference is worth the
@@ -435,6 +451,13 @@ class Egress:
     program_id: str
     proxy_url: str
     certificate: str = isolation.CA_FILE
+    #: Ticket 136: the Identity slot this run's Tool row was opened under, which
+    #: since ticket 131 is a decision the Task made rather than the empty string
+    #: it always was. Carried so the answer to a request can say who spent it:
+    #: the door resolves this from the row and the child has no other way to
+    #: learn it. Empty is a run acting as no Identity, which is the same word
+    #: `resolve_egress_identity` uses for it.
+    identity: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -442,6 +465,7 @@ class Egress:
             "program_id": self.program_id,
             "proxy_url": self.proxy_url,
             "certificate": self.certificate,
+            "identity": self.identity,
         }
 
     @classmethod
@@ -463,7 +487,13 @@ class Egress:
         }
         if not all(values.values()):
             return None
-        return cls(**values, certificate=str(document.get("certificate") or isolation.CA_FILE))
+        return cls(
+            **values,
+            certificate=str(document.get("certificate") or isolation.CA_FILE),
+            # Not one of the three a run is refused for missing: a job that
+            # names no Identity is a run acting as none, which is most of them.
+            identity=str(document.get("identity") or ""),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1436,6 +1466,7 @@ class _Tools:
             roster.COMPOSE_FINDING_REPORT,
             roster.PARK_FOR_HUMAN,
             NAME_TRANSCRIPTS,
+            BIND_SESSION,
         ):
             return {"served": False, "reason": UNKNOWN_CALL, "detail": f"{verb} is not served"}
 
@@ -1491,6 +1522,9 @@ class _Tools:
 
         if verb == NAME_TRANSCRIPTS:
             return self._transcripts(connection, call)
+
+        if verb == BIND_SESSION:
+            return self._session(connection, call)
 
         if verb == roster.OPEN_IMPACT_TASK:
             return self._impact(connection, call)
@@ -1692,6 +1726,33 @@ class _Tools:
             return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
         document = json.loads(str(answered))
         return document if isinstance(document, Mapping) else {}
+
+    def _session(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Bind the SDK session a child just reported to the run it is.
+
+        Ticket 119. The one arm here whose answer nothing reads: a child sends
+        this and goes on with its objective, because what it is reporting is a
+        fact about itself rather than a request for anything. The answer is
+        still a document with a reason in it, for the same purpose every other
+        arm's has -- an operator reading the channel can see whether the row was
+        written, and the child cannot be made to care either way.
+
+        The Agent run is this side's, like everywhere else on this dispatch. A
+        child naming the run its session belongs to would be a child attributing
+        its own tool calls to somebody else's work.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        try:
+            connection.execute(BIND, (self._program_id,))
+            bound = connection.execute(
+                BIND_SDK_SESSION,
+                (self._agent_run_id, str(arguments.get("session_id") or "")),
+            ).scalar()
+        except (pg.DatabaseError, pg.ConnectionError_, OSError) as error:
+            return {"served": False, "reason": UNREACHABLE_STATE, "detail": str(error)}
+        return {"served": True, "session": str(bound)}
 
     def _impact(
         self, connection: pg.Connection, given: object

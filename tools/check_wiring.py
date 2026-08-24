@@ -270,7 +270,6 @@ OWED_GAPS: dict[str, str] = {
     # are not among them: all three are read as harmless by the database audit
     # and excluded by name in `producer_gaps`, above `BY_DESIGN`, rather than
     # owed here.
-    "W6 agent_sessions": "owed:119",
     "W6 artifacts_due_for_purge": "owed:122",
     "W6 report_queue": "owed:105",
 
@@ -1011,6 +1010,12 @@ class Surface:
 BOUNDARIES = (
     ("tool.serve", "tool.py", "serve", "isolation.py", "ToolProcess"),
     ("_launch._spend", "_launch.py", "_spend", "proxy.py", "Answer"),
+    # Ticket 136: `_spend` narrows two sources, not one. The answer is built
+    # from what came back and from what the request was spent with, and the
+    # Identity is only in the second -- the door resolves it from the Tool run
+    # row and never states it on the wire, so a gate reading `Answer` alone
+    # could not have noticed that the child was never told who it was.
+    ("_launch._spend egress", "_launch.py", "_spend", "agent.py", "Egress"),
 )
 
 #: Where one exchange's answer is built. `mcp__rk2__http_request` is served by

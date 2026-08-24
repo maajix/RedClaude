@@ -98,6 +98,18 @@ BOUNDARIES = (
         "proxy.Answer",
         declared("proxy.py", "Answer"),
     ),
+    # Ticket 136. The second source of the same answer: what the request was
+    # spent with, which is where the Identity is. The door knows it -- it
+    # resolves the slot from the Tool run row -- and never says it on the wire,
+    # so the only place a child can learn who it was acting as is the block the
+    # runtime handed it.
+    Boundary(
+        "_launch._spend egress",
+        "_launch.py",
+        "_spend",
+        "agent.Egress",
+        declared("agent.py", "Egress"),
+    ),
     Boundary(
         "tool.serve",
         "tool.py",

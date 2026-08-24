@@ -12,6 +12,7 @@ import time
 import types
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -1529,6 +1530,29 @@ class ToolChannelTest(unittest.TestCase):
             [call.args for call in connection.execute.call_args_list],
         )
 
+    def test_the_supervisor_binds_the_sdk_session_the_child_reported(self):
+        # Ticket 119. The first writer `agent_sessions` has ever had: eleven
+        # statements in the corpus retire a binding, and until this arm nothing
+        # made one. The identifier crosses because only the child reads the init
+        # message; the Agent run does not, because a child naming the run its
+        # session belongs to would be attributing its calls to other work.
+        _, serving = self.serving(tooling=self.tooling())
+        assert serving is not None
+        connection = mock.Mock()
+        connection.execute.return_value.scalar.return_value = "0198c0de-0000-7000-8000-00000000000f"
+
+        with mock.patch.object(agent.pg, "connect", return_value=connection):
+            served = serving({"verb": agent.BIND_SESSION, "session_id": "sess-9"})
+
+        self.assertIs(True, served["served"])
+        statement, parameters = connection.execute.call_args_list[-1].args
+        self.assertEqual(agent.BIND_SDK_SESSION, statement)
+        self.assertEqual("sess-9", parameters[1])
+
+    def test_binding_a_session_is_not_a_verb_a_model_can_say(self):
+        self.assertNotIn(agent.BIND_SESSION, roster.CONTRACTS)
+        self.assertFalse(agent.BIND_SESSION.startswith("mcp__"))
+
     def test_naming_transcripts_is_not_a_verb_a_model_can_say(self):
         # It is not in `roster.CONTRACTS` and it does not have the shape a tool
         # name has, which is what keeps `agent.SERVED` and the startup assertion
@@ -1982,6 +2006,42 @@ class RequestToolTest(unittest.TestCase):
         self.assertEqual(200, answer["status"])
         self.assertEqual("RC1", answer["receipt"])
         self.assertEqual("hello", answer["body"])
+
+    def test_the_answer_names_the_class_the_door_graded_and_who_spent_it(self):
+        """Ticket 136, both halves, on the answer a model actually reads.
+
+        The scope class comes back from the door, which is the only party that
+        grades it; the Identity comes off the block this run was started with,
+        which is the only party that knows it. A request served against a
+        fixture and one served against the target are the same bytes and two
+        different things to conclude, and a differential taken under two
+        accounts is unreadable if neither answer says which one it was.
+        """
+        door = replace(self.door, identity="tenant-a")
+        graded = proxy.Answer(
+            status=200, body=b"hello", receipt="RC1", decision=None, detail=None,
+            scope_class="fixture",
+        )
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=door)
+            with self.spending(answer=graded):
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/a"})
+
+        self.assertEqual("fixture", answer["scope_class"])
+        self.assertEqual("tenant-a", answer["identity"])
+
+    def test_an_unauthenticated_run_says_it_spent_no_identity(self):
+        # The ordinary hunt. The empty string is the door's own word for a run
+        # acting as no Identity, and it is a written answer rather than a
+        # missing key: "nobody" is a fact a model can act on and an absent key
+        # is one it cannot.
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending():
+                answer = self.answer(handler, {"method": "GET", "url": "http://x.test/a"})
+
+        self.assertEqual("", answer["identity"])
+        self.assertIsNone(answer["scope_class"])
 
     def test_the_headers_the_call_named_are_what_the_capability_is_spent_with(self):
         # `headers` is declared on the contract, so it reaches the wire: a
@@ -3812,6 +3872,38 @@ class InitRefusalTest(unittest.TestCase):
         self.assertEqual((0, []), (self.surface.opened, self.surface.served))
         self.assertEqual(1, stream.closed)
 
+    def test_the_init_message_is_read_for_the_session_the_sdk_named(self):
+        """Ticket 119: the identifier, off the same dict and in the same pass.
+
+        It is announced once, in this message, so a second read of the stream to
+        find it would be a read of a message that has already gone by. An SDK
+        that names none leaves the empty string, which is a run nothing can be
+        bound to rather than a run to refuse -- corroboration is about the
+        credential and this value is not one.
+        """
+        surface = _launch.Surface()
+        stream = Stream(
+            self.announcement(
+                apiKeySource=agent.EXPECTED_KEY_SOURCE, session_id="sess-9"
+            )
+        )
+
+        answered = asyncio.run(
+            _launch._corroborate(stream, surface, _launch.runtime_facts())
+        )
+
+        self.assertEqual((agent.EXPECTED_KEY_SOURCE, "sess-9"), answered)
+
+    def test_an_sdk_that_names_no_session_leaves_the_run_unbound(self):
+        surface = _launch.Surface()
+        stream = Stream(self.announcement(apiKeySource=agent.EXPECTED_KEY_SOURCE))
+
+        _, session = asyncio.run(
+            _launch._corroborate(stream, surface, _launch.runtime_facts())
+        )
+
+        self.assertEqual("", session)
+
     def test_the_launch_that_reaches_init_refuses_there_and_returns_nothing(self):
         stream = Stream(self.announcement(apiKeySource="ANTHROPIC_API_KEY"))
 
@@ -3828,6 +3920,40 @@ class InitRefusalTest(unittest.TestCase):
         self.assertEqual("init", raised.exception.phase)
         self.assertEqual([agent.AUTH_SOURCE_UNEXPECTED], codes(raised.exception.violations))
         self.assertEqual(1, stream.closed)
+
+
+class SessionBindingTest(unittest.TestCase):
+    """Ticket 119: what the child does with the session identifier it read."""
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def call(self, verb: str, arguments) -> dict:
+            self.calls.append((verb, dict(arguments)))
+            return {"served": True}
+
+    def test_the_identifier_crosses_the_channel_the_launch_already_opened(self):
+        # The row is the supervisor's -- this process holds no connection -- and
+        # the identifier is the child's, because the SDK tells only the child.
+        # So it goes up the one pipe that exists, once, right after init.
+        channel = self.Recorder()
+
+        _launch._bind_session(channel, "sess-9")
+
+        self.assertEqual([(agent.BIND_SESSION, {"session_id": "sess-9"})], channel.calls)
+
+    def test_a_run_with_nothing_to_bind_says_nothing(self):
+        # No channel is an installation that answers no calls at all; no
+        # identifier is an SDK that named none. Neither is a failure, and a
+        # child that sent a bind with an empty string would be asking the
+        # supervisor to write a row about nothing.
+        channel = self.Recorder()
+
+        _launch._bind_session(None, "sess-9")
+        _launch._bind_session(channel, "")
+
+        self.assertEqual([], channel.calls)
 
 
 class LatchTest(unittest.TestCase):

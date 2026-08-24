@@ -8,14 +8,14 @@ writer that fills it or the migration that removes it.
 
 **Status:** ready-for-agent
 
-- [ ] The state of the design is written down before anything moves. 022 adds
+- [x] The state of the design is written down before anything moves. 022 adds
       seven hook-identity columns to `tool_runs`
       (`0022_hooks_and_receipts.sql:187-218`: `tool_use_id`, `session_id`,
       `sdk_agent_id`, `sdk_agent_type`, `mcp_server`, `args_sha256`,
       `result_sha256`, alongside `transport`), and creates `agent_sessions`
       (`:151-175`) to carry the SDK session a run was bound to. Neither has a
       writer.
-- [ ] The mechanism by which they became unreachable is stated, because it is
+- [x] The mechanism by which they became unreachable is stated, because it is
       not simply an omission. `0022:235` adds
       `tool_runs_hook_identity_ck CHECK ((transport = 'runtime') = (tool_use_id
       IS NULL))`, and every writer of `tool_runs` passes the literal
@@ -30,7 +30,7 @@ writer that fills it or the migration that removes it.
       `tool_runs_tool_use_id_uq` (`0022:254`) -- the SDK idempotency key, whose whole purpose
       is that a re-delivered hook callback cannot open a second receipt --
       indexes a column that is always NULL.
-- [ ] The hook layer that exists is described as what it is. `gate_hooks`
+- [x] The hook layer that exists is described as what it is. `gate_hooks`
       (`src/redkraken/_launch.py:968`) registers all four of
       `agent.GATE_EVENTS` (`src/redkraken/agent.py:98`) and has both the
       `tool_use_id` and the delegated `agent_id`/`agent_type` in hand in its
@@ -39,7 +39,7 @@ writer that fills it or the migration that removes it.
       not recorded, which is the same defect 022's own prose says it exists to
       prevent: "a hook-layer table outside the event log is the exact thing this
       ticket exists to prevent" (`0022:149-150`).
-- [ ] The cost on the `agent_sessions` side is named. Eight SQL statements
+- [x] The cost on the `agent_sessions` side is named. Eight SQL statements
       `UPDATE agent_sessions SET unbound_at` (`0041_refusal_lifecycle.sql:49`,
       `20260813T190000Z...:456`, `20260814T020000Z...:286`,
       `20260816T000000Z...:1410`, `20260913T000000Z...:403` among them) and
@@ -57,7 +57,7 @@ writer that fills it or the migration that removes it.
       `result_sha256` as `null` on every row. If the design is deferred, those
       grants come off with it, because a granted always-NULL column tells the
       model the harness knows something it does not.
-- [ ] `agent_runs.parent_run_id` is decided in the same pass. It has an FK, no
+- [x] `agent_runs.parent_run_id` is decided in the same pass. It has an FK, no
       writer and no reader: the subagent parent edge is never recorded, and
       `gate_hooks`'s `SubagentStart` callback is exactly where it would be.
 
@@ -217,3 +217,35 @@ rather than trust either number. And `bind_agent_session` already exists in this
 tree at `src/redkraken/state.py:338` meaning something else entirely -- it binds a
 **Postgres** session to a Program with `set_config('rk2.program_id', ...)` -- so
 the verb that binds an **SDK** session must not be given that name.
+
+## What shipped, 2026-08-24: the binding, and only the binding
+
+`20261103T000000Z__the_sdk_session_a_run_is_bound_to.sql` adds
+`open_agent_session(p_agent_run uuid, p_session_id text, p_sdk_agent_id text
+DEFAULT '', p_sdk_agent_type text DEFAULT NULL)`. It takes the Task off the run
+rather than from the caller -- a caller that could name a Task could attribute a
+session's calls to other work -- refuses an empty session id, refuses a run that
+is already finished, and is idempotent through the live-binding partial index:
+a session that announces itself twice returns the same row instead of failing
+the run.
+
+The supervisor side is three small things. `_corroborate` now returns
+`(api_key_source, session_id)` from the same init `SystemMessage` it already
+blocked on. `_bind_session` sends the new `rk2__bind_session` verb over the
+Channel ticket 102 grew, and does nothing when either half is missing. The
+child's `_Tools` dispatch answers it by running `BIND` and then the verb.
+
+Proved by `tests/test_database.AgentSessionBindingTest` (the row, the same row
+twice, the event, the empty identifier, the finished run),
+`tests/test_agent.SessionBindingTest` and the `_corroborate` cases in
+`tests/test_agent.py`. `check_wiring.py`'s OWED register drops
+`"W6 agent_sessions": "owed:119"`.
+
+### Still unbuilt, deliberately
+
+Criterion 5 -- taking the seven always-NULL hook columns off `rk2_state` and the
+three `null` keys out of `v_records` -- is **not** in this change. It belongs to
+the deferred half, it is a grant change on the agent's read surface rather than
+part of the binding, and this pass was scoped to the binding. The migration
+header records the deferral and its reason so the next reader does not re-derive
+it. `agent_runs.parent_run_id` stays NULL with it.

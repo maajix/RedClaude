@@ -259,15 +259,33 @@ Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:
 
 Dauer: weitere **4–6 Arbeitstage**.
 
-- [ ] Ticket 131 zuerst:
+- [x] Ticket 131 zuerst:
   - jede Task erhält genau eine `selected_identity_entity_id` innerhalb desselben Program;
   - auch Anonymous wird ausdrücklich gewählt;
   - A/B-Prüfungen werden als zwei Tasks über dieselbe Hypothesis abgebildet;
   - die Task-Identity-Projektion enthält genau die gewählte Identity.
-- [ ] Ticket 133 danach: `multiple_test_identities` bedeutet zwei verschiedene nicht-anonyme Identities; fehlende Voraussetzungen müssen als typisierte Gründe sichtbar bleiben.
-- [ ] Ticket 136 nach dem Kern von 131: jede Door-Antwort nennt die Scope-Klasse und die tatsächlich verwendete Identity.
-- [ ] Ticket 119: den vom SDK gemeldeten Session-Identifier nach Init über den vorhandenen Supervisor-Channel an den Agent run binden.
+- [x] Ticket 133 danach: `multiple_test_identities` bedeutet zwei verschiedene nicht-anonyme Identities; fehlende Voraussetzungen müssen als typisierte Gründe sichtbar bleiben.
+- [x] Ticket 136 nach dem Kern von 131: jede Door-Antwort nennt die Scope-Klasse und die tatsächlich verwendete Identity.
+- [x] Ticket 119: den vom SDK gemeldeten Session-Identifier nach Init über den vorhandenen Supervisor-Channel an den Agent run binden.
 - [ ] Ticket 120 bleibt außerhalb dieses Meilensteins; Hook-Receipts sind für den ersten authentifizierten Produktionslauf nicht erforderlich.
+
+**Gemessen am 24.08.2026, lokaler Integrationszweig, kein Remote-Push:**
+
+- Vollständige Suite: **3996 Tests, OK, 101 übersprungen** (`unittest discover`,
+  unter `flock -w 3600 /tmp/rk2-db.lock`).
+- `rk db verify`: **96 Assertions, 0 Verletzungen**.
+- Die vier Gates enden mit rc=0; `git diff --check` ist sauber.
+- Identity-Vertikalsmoke auf einer frisch migrierten Datenbank: eine Hypothesis,
+  die zwei Identities nennt, ergibt **zwei hunt Tasks -- eine je Identity**, jede
+  mit genau einer `task_identities`-Zeile und Identity im selben Program; die
+  recon Task wählt ausdrücklich `_anonymous`. `rk run` meldet die typisierten
+  Gründe: mit einem Account `multiple_test_identities (one_account_configured),
+  which gates 7 Playbook(s)`, mit zwei Accounts nur noch `tenant_boundary`.
+- Drei neue Migrationen: `20261101T000000Z` (131), `20261102T000000Z` (133),
+  `20261103T000000Z` (119).
+- Ticket 119 ist nur zur Hälfte gebaut: die Session-Bindung. Die Hook-Receipt-
+  Hälfte bleibt zurückgestellt, mit dem Grund im Migrationskopf, und die
+  Always-NULL-Spalten bleiben vorerst auf der Read-Surface.
 
 ## Arbeitsblock 3 — Browser und fünf High-Yield-Playbooks
 

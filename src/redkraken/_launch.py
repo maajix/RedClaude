@@ -1638,6 +1638,14 @@ def _spend(
         "receipt": answer.receipt,
         "decision": answer.decision,
         "detail": answer.detail,
+        # Ticket 136, both of them. The class is the door's own grade of this
+        # request, so an exchange against a fixture cannot be read as one
+        # against the target; the Identity is what the run was opened under, so
+        # the two halves of a differential are legible as two halves rather than
+        # as one call made twice. The empty string is a run acting as no
+        # Identity, which is what an ordinary unauthenticated hunt is.
+        "scope_class": answer.scope_class,
+        "identity": door.identity,
         "byte_size": len(answer.body),
         "truncated": len(answer.body) > len(excerpt),
         "headers": headers,
@@ -2192,7 +2200,8 @@ async def run(
     messages = (transport or query)(
         prompt=stated(reader.packet.bounds) + str(job["objective"]), options=options
     )
-    api_key_source = await _corroborate(messages, surface, runtime)
+    api_key_source, session_id = await _corroborate(messages, surface, runtime)
+    _bind_session(channel, session_id)
 
     # What the claim reserved for this run, or nothing when it reserved nothing.
     # Read the same way the cap is: off the job, because this process has no
@@ -2517,13 +2526,42 @@ def _gate(role: str, subagent_cap: object) -> roster.Gate | None:
         return None
 
 
-async def _corroborate(messages, surface: Surface, runtime: Mapping[str, object]) -> str:
+def _bind_session(channel: Channel | None, session_id: str) -> None:
+    """Tell the supervisor which SDK session this run is speaking on.
+
+    Ticket 119. The row is the supervisor's to write -- this process holds no
+    database connection -- and the identifier is the child's to report, because
+    the SDK names it in a message only this side reads. So it goes up the
+    channel the launch already opened, once, immediately after the init message
+    it was read out of.
+
+    Best effort, and deliberately so. A run with no channel is a run whose
+    installation answers no calls at all; a supervisor that refuses the bind
+    has said something about a row, not about this session; and either way the
+    work this child was started to do is unaffected. A refusal that ended the
+    run here would make an attribution record a precondition for the thing it
+    is a record of.
+    """
+    if channel is None or not session_id:
+        return
+    channel.call(agent.BIND_SESSION, {"session_id": session_id})
+
+
+async def _corroborate(
+    messages, surface: Surface, runtime: Mapping[str, object]
+) -> tuple[str, str]:
     """Read up to the init message and open the tool surface, or refuse.
 
     Returns the credential source the CLI reported rather than the one this
     runtime required. They are equal by the time it returns -- that is the
     whole check -- but a run that reports what it read is carrying evidence,
     and one that reports its own expectation is carrying an assumption.
+
+    And the SDK's session identifier, read off the same dict in the same pass:
+    it is announced once, in this message, and a second read of the stream to
+    find it would be a second read of a message that has already gone by. The
+    empty string is an SDK that named none, which is a run nothing can be bound
+    to rather than a run to refuse.
 
     The transport is closed on refusal rather than left to be collected. A
     child whose authentication this runtime could not corroborate is one that
@@ -2534,12 +2572,13 @@ async def _corroborate(messages, surface: Surface, runtime: Mapping[str, object]
         if message is None:
             await _refuse(messages, agent.uncorroborated(ABSENT), runtime)
         if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == INIT:
-            source = (getattr(message, "data", None) or {}).get("apiKeySource")
+            data = getattr(message, "data", None) or {}
+            source = data.get("apiKeySource")
             violations = agent.corroboration(source)
             if violations:
                 await _refuse(messages, violations, runtime)
             surface.open()
-            return str(source)
+            return str(source), str(data.get("session_id") or "")
         if type(message).__name__ not in BEFORE_INIT:
             await _refuse(messages, agent.uncorroborated(PREMATURE), runtime)
 

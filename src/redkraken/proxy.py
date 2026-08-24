@@ -197,6 +197,16 @@ DECISION = "X-RedKraken-Decision"
 #: the string the door sent and not a second wording of it.
 DETAIL = "X-RedKraken-Detail"
 
+#: Ticket 136: which class the policy graded this request at, on every answer
+#: this door gives. The door has always decided it -- it is on the Receipt, in
+#: the reason line and in the transport branch -- and the decision died here: a
+#: model reading its own answer could not tell a request served against the
+#: target from one served against a fixture, and those are two different things
+#: to conclude from the same bytes. Under the internal prefix like the other
+#: three, so `describes_this_hop` keeps it off a target and out of the header
+#: list the child reads as the target's own.
+SCOPE = "X-RedKraken-Scope"
+
 #: Everything the decision header is allowed to say. Tokens rather than the
 #: refusal's own prose: a caller branches on this value, and a reason reworded in
 #: a later ticket would silently change what it branched to. The prose goes to
@@ -3335,6 +3345,7 @@ class Handler(BaseHTTPRequestHandler):
             headers=agent_back,
             receipt=label,
             reason=agent_reason,
+            scope_class=authorization.scope_class,
         )
         # After the answer, deliberately. The measurement is a second handshake
         # with the same target, and making the caller wait for it would put the
@@ -3446,6 +3457,11 @@ class Handler(BaseHTTPRequestHandler):
             body=b"",
             receipt=written,
             headers=_retry_after(refusal.retry_at),
+            # The same expression the Receipt above is filed with, for the same
+            # reason the decision token is read off the reason: the answer and
+            # the row say one thing. `denied` is a refusal taken before the
+            # policy was asked, which is itself the news.
+            scope_class=authorization.scope_class if authorization else "denied",
         )
 
     def _answer(
@@ -3458,6 +3474,7 @@ class Handler(BaseHTTPRequestHandler):
         receipt: str | None = None,
         detail: str | None = None,
         reason: str | None = None,
+        scope_class: str | None = None,
     ) -> None:
         """One answer to the caller, with the Receipt's name on it when there is one.
 
@@ -3483,6 +3500,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(DETAIL, detail)
         if receipt:
             self.send_header(RECEIPT, receipt)
+        if scope_class:
+            self.send_header(SCOPE, scope_class)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -3822,6 +3841,9 @@ class Answer:
     decision: str | None
     detail: str | None
     headers: tuple[tuple[str, str], ...] = ()
+    #: Ticket 136: the class the policy graded this request at. Absent only from
+    #: an answer no door gave -- a hop that failed before the fence saw it.
+    scope_class: str | None = None
 
 
 def _answered(answer: http.client.HTTPResponse) -> Answer:
@@ -3856,6 +3878,7 @@ def _answered(answer: http.client.HTTPResponse) -> Answer:
         receipt=answer.headers.get(RECEIPT),
         decision=answer.headers.get(DECISION),
         detail=answer.headers.get(DETAIL),
+        scope_class=answer.headers.get(SCOPE),
         headers=tuple(
             (name, value)
             for name, value in answer.headers.items()

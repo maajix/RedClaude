@@ -1233,6 +1233,40 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(200, receipt["status_code"])
         self.assertEqual("target", receipt["scope_class"])
         self.assertEqual(64, len(receipt["query_sha256"]))
+        # Ticket 136: the same word on the answer. It was on the Receipt and in
+        # the reason line the whole time, and a model reading its own answer
+        # could not tell a request served against the target from one served
+        # against a fixture -- which are two different things to conclude from
+        # the same bytes.
+        self.assertEqual("target", response.headers[proxy.SCOPE])
+
+    def test_a_fixture_answer_says_it_was_a_fixture(self):
+        # The reading the last one is only worth having beside: the class is not
+        # a constant on this path. Same bytes, same status, different grade.
+        self.fence.recorded_fixture = proxy.FixtureAddress(
+            address="10.9.0.7", scope_class="fixture"
+        )
+
+        response = self.through("http://target.example.test/v1/notes")
+        response.read()
+
+        self.assertEqual("fixture", response.headers[proxy.SCOPE])
+
+    def test_a_refusal_names_the_class_it_was_refused_at(self):
+        # And the refusal, which is the answer an operator reads most often.
+        # `denied` and not `target`: the capability was refused before the
+        # policy graded anything, so what the answer says is that nothing was
+        # graded -- which is the same word the blocked Receipt is filed under.
+        self.fence.body_allowed = False
+
+        response = self.through(
+            "http://target.example.test/v1/notes", method="POST", body=b"delete=all"
+        )
+        response.read()
+
+        self.assertEqual(407, response.status)
+        self.assertEqual("denied", response.headers[proxy.SCOPE])
+        self.assertEqual("denied", self.fence.blocked[0]["receipt"]["scope_class"])
 
     def test_the_callers_headers_are_sent_and_a_forged_control_header_is_not(self):
         # `http_request` declares `headers`, so a hunter that asks for a header
@@ -3367,10 +3401,12 @@ class TunnelTest(unittest.TestCase):
         self.assertEqual(b'{"note":"target answered"}', returned)
         self.assertNotIn(proxy.AUTHORIZATION.lower(), names)
         self.assertNotIn(proxy.PROGRAM.lower(), names)
-        # One control header comes back, and it is the Receipt's label. The
-        # decision and the detail are refusal-only, and this was not a refusal.
+        # Two control headers come back: the Receipt's label and, since ticket
+        # 136, the class this request was graded at. The decision and the detail
+        # are refusal-only, and this was not a refusal.
         self.assertEqual(
-            [proxy.RECEIPT.lower()], [name for name in names if name.startswith("x-redkraken-")]
+            [proxy.RECEIPT.lower(), proxy.SCOPE.lower()],
+            sorted(name for name in names if name.startswith("x-redkraken-")),
         )
         self.assertNotIn(CAPABILITY, text)
         self.assertNotIn(CAPABILITY.encode(), returned)

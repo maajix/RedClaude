@@ -314,10 +314,17 @@ STARTED = (
     " (SELECT w.max_concurrent_subagents FROM scheduler_weights w WHERE w.active),"
     " (SELECT br.tokens FROM budget_reservations br"
     "   WHERE br.agent_run_id = ar.id AND br.settled_at IS NULL),"
-    " h.label, ts.label"
+    " h.label, ts.label,"
+    # Ticket 131. The one Identity this Task selected, as the door's two
+    # readings of it: the slot name a request is opened under, and the class
+    # that decides whether it is opened under one at all. A LEFT JOIN because
+    # the column is NOT NULL and a missing row would be a claim this runtime
+    # could not describe rather than one it should refuse to describe.
+    " coalesce(i.slot_name, ''), coalesce(i.class, 'anonymous')"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
+    " LEFT JOIN identities i ON i.entity_id = t.selected_identity_entity_id"
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN hypotheses h ON h.id = t.hypothesis_id AND h.program_id = t.program_id"
     " LEFT JOIN tests ts ON ts.id = t.test_id AND ts.program_id = t.program_id"
@@ -928,6 +935,25 @@ class Claimed:
     token_cap: int | None
     hypothesis_label: str | None = None
     test_label: str | None = None
+    #: Ticket 131: the slot name of the one Identity this Task selected, and its
+    #: class. `_anonymous`/`anonymous` is a choice like any other -- a Task that
+    #: acts as nobody says so, rather than leaving the question open.
+    identity_slot_name: str = ""
+    identity_class: str = "anonymous"
+
+    @property
+    def identity_slot(self) -> str:
+        """What the Tool run's args carry, which is not quite the selection.
+
+        The empty string is the door's own word for "this run acts as no
+        Identity" -- `resolve_egress_identity` resolves it to nothing and says
+        so -- and the anonymous Identity is exactly that run with a row behind
+        it. Writing `_anonymous` here instead would name a slot the door would
+        then look for a live Lease on, and would escalate every unauthenticated
+        hunt to `approval_required` through `net_borrowed_identity`, which
+        grades any non-empty slot as a borrowed account.
+        """
+        return "" if self.identity_class == "anonymous" else self.identity_slot_name
 
     @classmethod
     def from_row(cls, row) -> Claimed:
@@ -959,6 +985,14 @@ class Claimed:
             # transaction, so handing it the id would be handing it a value it
             # would look the name up from anyway.
             test_label=(None if len(row) < 16 or row[15] is None else str(row[15])),
+            # Ticket 131. Defaulted rather than indexed blindly for the reason
+            # the two above are: `STARTED` is not the only shape a row of this
+            # class is built from, and a fixture one column short should read as
+            # the anonymous run it describes.
+            identity_slot_name=("" if len(row) < 17 or row[16] is None else str(row[16])),
+            identity_class=(
+                "anonymous" if len(row) < 18 or row[17] is None else str(row[17])
+            ),
         )
 
     def objective(
@@ -2357,7 +2391,11 @@ class Slice:
             self.configuration,
             agent_run=claimed.agent_run_label,
             test=claimed.test_label,
-            identity_slot=None,
+            # Ticket 131: the Task's own selection here too, so that a replay
+            # and an egress Tool run opened for the same Task cannot act as two
+            # different callers. `None` is what an anonymous selection comes to,
+            # which is what every perform Task carries today.
+            identity_slot=claimed.identity_slot or None,
             proxy_url=self.proxy_url,
             ca_file=self.boundary.certificate,
         )
@@ -2893,7 +2931,15 @@ class Slice:
                             {
                                 "url": claimed.url,
                                 "method": claimed.method,
-                                "identity_slot": "",
+                                # Ticket 131. The Task's own selection, written
+                                # before the digest is taken -- which is the
+                                # whole of why it is the Task's and not the
+                                # door's: `gate_tool_call` grades an empty slot
+                                # `constrained` and a filled one
+                                # `approval_required`, and a slot chosen after a
+                                # human answered would spend a real account
+                                # outside the answer that was given.
+                                "identity_slot": claimed.identity_slot,
                                 "body_allowed": _body_allowed(selected),
                             }
                         ),
@@ -2933,6 +2979,11 @@ class Slice:
             capability=str(capability),
             program_id=program_id,
             proxy_url=self.boundary.proxy_url,
+            # Ticket 136: the same value the Tool run's args were opened with,
+            # and read from the same place, so the answer a child gets back
+            # names the Identity the door resolved rather than a second opinion
+            # about which one this run should have spent.
+            identity=claimed.identity_slot,
         )
         return tool_run_id, door, lifetime
 

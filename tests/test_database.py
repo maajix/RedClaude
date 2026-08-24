@@ -3175,8 +3175,16 @@ class ProgramRunTest(DatabaseCase):
             for result in full_records
             if result.facts["record"]["document"]["type"] == "identity"
         ]
-        self.assertEqual(1, len(identities))
-        [full] = identities
+        # Two: the configured `member`, and the anonymous slot ticket 131 mints
+        # for the Program's first Task. The anonymous one is on the surface for
+        # the same reason the configured one is -- it is an Identity a Task can
+        # be acting as, and the child reads what it acts as.
+        self.assertEqual(2, len(identities))
+        [full] = [
+            result
+            for result in identities
+            if result.facts["record"]["document"]["descriptor"] == "member"
+        ]
         document = full.facts["record"]["document"]
         self.assertEqual("member", document["descriptor"])
         self.assertEqual("user", document["identity_class"])
@@ -3238,13 +3246,16 @@ class ProgramRunTest(DatabaseCase):
                 ("entity.created", "entities", "runtime"),
                 ("entity.updated", "entities", "runtime"),
                 ("task.opened", None, "runtime"),
+                # Ticket 131: the anonymous Identity the first Task acts as.
+                ("entity.created", "entities", "runtime"),
+                ("entity.updated", "entities", "runtime"),
                 ("task.created", "tasks", "runtime"),
             ],
             [event[:3] for event in after_open],
         )
-        self.assertEqual(8, len(after_resume))
-        self.assertEqual(("run.resumed", None, "runtime"), after_resume[7][:3])
-        payload = json.loads(after_resume[7][3])
+        self.assertEqual(10, len(after_resume))
+        self.assertEqual(("run.resumed", None, "runtime"), after_resume[9][:3])
+        payload = json.loads(after_resume[9][3])
         self.assertEqual(1, payload["configuration_revision"])
         # Zero because `tasks_unclaimed` counts Tasks taken back off a dead
         # lease, not Tasks waiting: the recon Task this open wrote was never
@@ -3286,7 +3297,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(program.STOPPED_REFUSED, changed.facts["stop_reason"])
         self.assertEqual(1, changed.facts["configuration"]["revision"])
         self.assertEqual([1], [revision for revision, _, _ in self.revisions(program_id)])
-        self.assertEqual(7, len(self.events(program_id)))
+        self.assertEqual(9, len(self.events(program_id)))
 
     def test_a_change_the_operator_accepts_becomes_the_next_revision(self):
         # The other side of criterion 3: an explicit revision, never a silent
@@ -3321,9 +3332,15 @@ class ProgramRunTest(DatabaseCase):
                 "entity.created",
                 "entity.updated",
                 "task.opened",
+                # Ticket 131: the Task selects an Identity, and this Program
+                # configured none, so its anonymous slot is minted here.
+                "entity.created",
+                "entity.updated",
                 "task.created",
                 "program.configured",
                 "entity.updated",
+                "entity.updated",
+                # The re-scope pass now has a third Entity to classify.
                 "entity.updated",
                 "run.resumed",
             ],
@@ -3355,7 +3372,7 @@ class ProgramRunTest(DatabaseCase):
         self.assertEqual(EXIT_INVALID_CONFIGURATION, result.exit_code)
         self.assertEqual("retired", result.facts["lifecycle"])
         self.assertEqual(program_id, result.facts["program_id"])
-        self.assertEqual(7, len(self.events(program_id)))
+        self.assertEqual(9, len(self.events(program_id)))
 
     def test_a_database_that_is_not_ready_is_refused_before_anything_is_written(self):
         # Criterion 5, the first half, at the last point it can still be true:
@@ -3752,11 +3769,18 @@ class FirstTaskTest(DatabaseCase):
 
     @classmethod
     def identity_of(cls, program_id: str) -> str:
-        """The Entity the configured Identity projects, which is nothing to map."""
+        """The Entity the configured Identity projects, which is nothing to map.
+
+        The configured one and not the anonymous one: ticket 131 has every Task
+        name the Identity it acts as, so the Program's first Task mints the
+        anonymous row and a Program that has opened one holds two Identity
+        Entities rather than one.
+        """
         return str(
             cls.connection.execute(
-                "SELECT id::text FROM entities"
-                " WHERE program_id = $1::uuid AND type = 'identity'",
+                "SELECT e.id::text FROM entities e"
+                "  JOIN identities i ON i.entity_id = e.id"
+                " WHERE e.program_id = $1::uuid AND i.class <> 'anonymous'",
                 (program_id,),
             ).scalar()
         )
@@ -4343,6 +4367,10 @@ class ScopeEvaluatorTest(DatabaseCase):
                 "entity.created",
                 "entity.updated",
                 "task.opened",
+                # Ticket 131: the first Task selects an Identity, and a Program
+                # that configured none mints its anonymous slot here.
+                "entity.created",
+                "entity.updated",
                 "task.created",
             ],
             [name for name, _ in events],
@@ -4567,12 +4595,13 @@ class StateReadTest(DatabaseCase):
             first.facts["record"]["digest"], second.facts["record"]["digest"]
         )
         # The second Program holds its configured Identity beside the technology
-        # and the Application 083 recorded from its one exact inclusion, and the
-        # `recon` Task opened against that Application. The first holds
+        # and the Application 083 recorded from its one exact inclusion, the
+        # anonymous Identity ticket 131 mints for that Program's first Task, and
+        # the `recon` Task opened against that Application. The first holds
         # everything else this case wrote. Neither count includes the other
         # Program's colliding labels.
         self.assertEqual(
-            [("entity", 3), ("task", 1)],
+            [("entity", 4), ("task", 1)],
             [
                 (item["kind"], item["count"])
                 for item in second.facts["state"]["kinds"]
@@ -12072,11 +12101,12 @@ class ExecutionSliceTest(DatabaseCase):
         # so a packet existing at all is the claim: what the child may read was
         # bounded by row level security rather than by this runtime's own reach.
         # Its surface is what that connection could see of this Program, which
-        # is the application and the endpoint and nothing of the other three.
+        # is the application, the endpoint and -- since ticket 131 -- the
+        # anonymous Identity the Task acts as, and nothing of the other three.
         sections = self.facts["packet"]["sections"]
 
         self.assertEqual(set(packet.SECTIONS), set(sections))
-        self.assertEqual(2, sections["surface"])
+        self.assertEqual(3, sections["surface"])
         self.assertEqual(0, sections["receipts"])
 
     def test_what_one_child_reads_is_bounded_by_both_configured_ceilings(self):
@@ -12796,8 +12826,11 @@ class SurfacePromotionTest(DatabaseCase):
         self.assertEqual(3, len(promoted["relationships"]))
         self.assertEqual(1, len(promoted["observations"]))
         self.assertEqual(
+            # Three Identities rather than the promotion's two: the configured
+            # slot, the one this recon result proposed, and the anonymous slot
+            # ticket 131 mints for the Program's first Task.
             {"domain": 2, "host": 1, "service": 1, "application": 1, "endpoint": 1,
-             "parameter": 1, "technology": 1, "identity": 2},
+             "parameter": 1, "technology": 1, "identity": 3},
             {
                 str(row[0]): int(row[1])
                 for row in self.rows(
@@ -13104,8 +13137,13 @@ class SurfacePromotionTest(DatabaseCase):
             )
         }
 
+        # `_anonymous` is `configured` and not `proposed`: the Program's own
+        # anonymous slot is minted by the runtime from the Program, not offered
+        # by an agent, and criterion 5 is about telling those two apart.
         self.assertEqual(
-            {"member": "configured", "anonymous-visitor": "proposed"}, origins
+            {"member": "configured", "anonymous-visitor": "proposed",
+             "_anonymous": "configured"},
+            origins,
         )
 
     def test_an_agent_may_not_propose_an_identity_that_holds_a_secret(self):
@@ -18674,10 +18712,14 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                     (program_id, cls.slate_member),
                 ).scalar()
             )
+            # The Identity moves with the claim, ticket 131: the Task acts as
+            # the Identity the Hypothesis is about, and the Task's own column is
+            # what says so.
             cls.connection.execute(
-                "UPDATE tasks SET hypothesis_id = $2::uuid"
+                "UPDATE tasks SET hypothesis_id = $2::uuid,"
+                "                 selected_identity_entity_id = $3::uuid"
                 " WHERE program_id = $1::uuid AND kind = 'hunt'",
-                (program_id, hypothesis),
+                (program_id, hypothesis, cls.slate_member),
             )
         cls.bind("held")
         cls.offered_held = cls.offer()
@@ -18979,31 +19021,43 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                 (program_id, seeded),
             )
         )
+        # Ticket 131: each Task names the Identity its claim is about. Two
+        # different Identities is what makes this pair a subject hold and not an
+        # Identity hold -- and it is what stops the derivation pass opening a
+        # third and a fourth Task for the Identities these two would otherwise
+        # leave uncovered.
+        first = cls.identity("doubled", "slate-doubled-first")
+        second = cls.identity("doubled", "slate-doubled-second")
         cls.as_owner(
-            "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid"
+            "UPDATE tasks SET kind = 'hunt', hypothesis_id = $3::uuid,"
+            "                 selected_identity_entity_id = $4::uuid"
             " WHERE program_id = $1::uuid AND label = $2",
             (
                 program_id,
                 seeded,
                 cls.hypothesis(
                     "doubled", subject, "one member reads another's note",
-                    identity=cls.identity("doubled", "slate-doubled-first"),
+                    identity=first,
                 ),
+                first,
             ),
         )
         cls.doubled_second = str(
             cls.scalar(
                 "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
-                " hypothesis_id, expected_information_gain, potential_impact)"
-                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, 0.4, 0.4)"
+                " hypothesis_id, selected_identity_entity_id,"
+                " expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, $4::uuid,"
+                " 0.4, 0.4)"
                 " RETURNING label",
                 (
                     program_id,
                     subject,
                     cls.hypothesis(
                         "doubled", subject, "a third member reads it too",
-                        identity=cls.identity("doubled", "slate-doubled-second"),
+                        identity=second,
                     ),
+                    second,
                 ),
             )
         )
@@ -23029,8 +23083,10 @@ class LeaseTest(DatabaseCase):
             )
             cls.connection.execute(
                 "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
-                " hypothesis_id, expected_information_gain, potential_impact)"
-                " SELECT $1::uuid, 'hunt', 'pending', $2::uuid, h.id, 0.9, 0.9"
+                " hypothesis_id, selected_identity_entity_id,"
+                " expected_information_gain, potential_impact)"
+                " SELECT $1::uuid, 'hunt', 'pending', $2::uuid, h.id,"
+                "        h.identity_a_entity_id, 0.9, 0.9"
                 "   FROM hypotheses h WHERE h.program_id = $1::uuid",
                 (cls.identifiers["alive"], rival),
             )
@@ -23111,11 +23167,17 @@ class LeaseTest(DatabaseCase):
                     (program_id, endpoint, identity),
                 ).scalar()
             )
+            # Ticket 131: the Task names the Identity it acts as. Left unset it
+            # would default to the Program's anonymous slot, and the derivation
+            # pass would then open a second Task for the Identity the claim
+            # names -- which is the differential, not this fixture's subject.
             cls.connection.execute(
                 "INSERT INTO tasks (program_id, kind, status, subject_entity_id,"
-                " hypothesis_id, expected_information_gain, potential_impact)"
-                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, 0.5, 0.5)",
-                (program_id, endpoint, hypothesis),
+                " hypothesis_id, selected_identity_entity_id,"
+                " expected_information_gain, potential_impact)"
+                " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid, $4::uuid,"
+                " 0.5, 0.5)",
+                (program_id, endpoint, hypothesis, identity),
             )
 
     @classmethod
@@ -23536,7 +23598,7 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
     `anonymous` is that ordinary hunt, twice over: two Tasks whose Hypotheses
     name nobody both act as the Program's one anonymous Identity, so the second
     cannot start while the first holds it. `paired` is a Hypothesis naming two
-    Identities, which is criterion 1's "every". `hypothesisless` is criterion
+    Identities, which ticket 131 made two Tasks. `hypothesisless` is criterion
     1's "including on a Task that names no hypothesis". `legacy` is the Task
     that predates the clamp, which is the one way to be clamped and name
     nothing. `reprojected` moves a Task's Hypothesis under it and then tries to
@@ -23644,36 +23706,63 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
 
     @classmethod
     def arrange_paired(cls):
-        """A Hypothesis about two Identities is two Leases, not one.
+        """A claim about two Identities is two Tasks, one Lease each.
 
-        Criterion 1's "every". 024's arm (i) asks only whether the run holds
-        something, so a run holding one of the two it acts as reads as clean
-        there; arm (b) of this ticket's check is what asks per Identity.
+        Ticket 131. 20260908T010000Z had one Task act as both Identities at
+        once, which is the defect 131 opens with: a run opened under two of them
+        can say which one it spent no better than a run opened under none. So an
+        A/B check is two Tasks over the one Hypothesis, each naming its own
+        half. Only the first is written here; the second is what the derivation
+        opens, because "one claim, two Identities, two Tasks" is a thing the
+        ranking pass has to do on its own.
+
+        What keeps the halves apart afterwards is 20260916T000000Z's subject
+        hold and no longer the Identity: they are two runs against one endpoint,
+        so they take their turns. The reason is read back here because it is the
+        one that moved.
         """
         [label] = cls.seed("paired", 1, kind="hunt")
         first = cls.identity("paired", "tenant-a")
         second = cls.identity("paired", "tenant-b")
-        cls.attach(
-            "paired", label, cls.hypothesis_for("paired", label, identities=(first, second))
-        )
+        hypothesis = cls.hypothesis_for("paired", label, identities=(first, second))
+        cls.attach("paired", label, hypothesis)
+        # What it acts as before anybody chooses, and after the Hypothesis has
+        # arrived: the anonymous Identity, not the Hypothesis's two. A Task
+        # inherits nothing here. The Hypothesis says which Identities the claim
+        # is about; which one this run acts as is the Task's own answer.
+        cls.paired_before_choice = cls.acts_as("paired", label)
+        cls.select("paired", label, first)
         cls.paired_acts_as = cls.acts_as("paired", label)
 
         cls.bind("paired")
         cls.paired_headroom = cls.headroom("paired")
         offered = cls.offer()
-        cls.paired_claimed = str(cls.call("SELECT claim_task($1)", (str(offered[0]["task_label"]),)))
-        cls.paired_leases = cls.leases_of("paired", cls.paired_claimed)
-        # One clock across both halves is 024's, and it is asked again here
-        # because this ticket is what writes more than one Identity Lease per
-        # claim: two rows written from `now()` in one statement expire together
-        # or arm (a) of `check_lease_liveness` has something to say.
-        cls.paired_expiries = int(
+        # The other half, opened by the derivation rather than by this file.
+        other = cls.other_half("paired", label)
+        cls.paired_other_acts_as = cls.acts_as("paired", other)
+        cls.paired_tasks_over_one_claim = int(
             cls.scalar(
-                "SELECT count(DISTINCT l.expires_at) FROM identity_leases l"
-                " JOIN agent_runs a ON a.id = l.holder_agent_run_id"
-                " WHERE a.program_id = $1::uuid AND l.released_at IS NULL",
-                (cls.identifiers["paired"],),
+                "SELECT count(*) FROM tasks"
+                " WHERE program_id = $1::uuid AND hypothesis_id = $2::uuid",
+                (cls.identifiers["paired"], hypothesis),
             )
+        )
+        cls.paired_offered = tuple(str(entry["task_label"]) for entry in offered)
+
+        cls.paired_claimed = str(cls.call("SELECT claim_task($1)", (label,)))
+        cls.paired_leases = cls.leases_of("paired", cls.paired_claimed)
+        # Why the other half waits, while the first is in flight. Under
+        # 20260908T010000Z it was `identity_held`, because the one Task held
+        # both Identities; it is now the subject hold, which is a statement
+        # about the endpoint the two halves share and not about who they are.
+        cls.paired_second_reason = cls.claimable("paired", other)
+        # One clock per claim is 024's, and it is asked again here because two
+        # runs of one Program now hold one Identity each: arm (a) of
+        # `check_lease_liveness` is what says each Lease expires with the Task
+        # Lease it was written beside.
+        cls.paired_lease_problems = tuple(
+            str(row[0])
+            for row in cls.as_owner("SELECT problem FROM check_lease_liveness()").rows
         )
 
     @classmethod
@@ -23766,6 +23855,10 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
             "reprojected", label,
             cls.hypothesis_for("reprojected", label, identities=(rotated,)),
         )
+        # Ticket 131: the Hypothesis arriving no longer moves this, because the
+        # Task's Identity is the Task's own column. The choice is what moves it.
+        cls.reprojected_after_hypothesis = cls.acts_as("reprojected", label)
+        cls.select("reprojected", label, rotated)
         cls.reprojected_after = cls.acts_as("reprojected", label)
 
         cls.bind("reprojected")
@@ -23826,6 +23919,32 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
             "UPDATE tasks SET hypothesis_id = $3::uuid"
             " WHERE program_id = $1::uuid AND label = $2",
             (cls.identifiers[name], label, hypothesis),
+        )
+
+    @classmethod
+    def select(cls, name: str, label: str, identity: str):
+        """Choose which of the claim's Identities this Task acts as.
+
+        Ticket 131's write, from the operator's side: the Hypothesis names the
+        Identities a claim is about, and this says which one a given run spends.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET selected_identity_entity_id = $3::uuid"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.identifiers[name], label, identity),
+        )
+
+    @classmethod
+    def other_half(cls, name: str, label: str) -> str:
+        """The Task the derivation opened for the claim's other Identity."""
+        return str(
+            cls.scalar(
+                "SELECT k.label FROM tasks k"
+                "  JOIN tasks t ON t.program_id = k.program_id"
+                "             AND t.hypothesis_id = k.hypothesis_id"
+                " WHERE k.program_id = $1::uuid AND t.label = $2 AND k.label <> $2",
+                (cls.identifiers[name], label),
+            )
         )
 
     @classmethod
@@ -23919,12 +24038,39 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
     def test_the_claim_holds_a_lease_for_the_identity_it_acts_as(self):
         self.assertEqual(("_anonymous",), self.anonymous_leases)
 
-    def test_a_task_that_acts_as_two_identities_holds_two_leases(self):
-        self.assertEqual(("tenant-a", "tenant-b"), self.paired_acts_as)
-        self.assertEqual(("tenant-a", "tenant-b"), self.paired_leases)
+    def test_a_task_acts_as_exactly_the_one_identity_it_selected(self):
+        # The Hypothesis names two; this Task spends one, and holds a Lease on
+        # that one alone.
+        self.assertEqual(("tenant-a",), self.paired_acts_as)
+        self.assertEqual(("tenant-a",), self.paired_leases)
 
-    def test_the_leases_one_claim_writes_expire_together(self):
-        self.assertEqual(1, self.paired_expiries)
+    def test_a_hypothesis_naming_identities_does_not_choose_for_the_task(self):
+        # Not "tenant-a": until somebody chooses, an unauthenticated hunt is
+        # what a Task is, whatever its claim happens to be about.
+        self.assertEqual(("_anonymous",), self.paired_before_choice)
+
+    def test_an_a_b_check_is_two_tasks_over_the_one_hypothesis(self):
+        self.assertEqual(2, self.paired_tasks_over_one_claim)
+        self.assertEqual(("tenant-b",), self.paired_other_acts_as)
+        # And the Identity is no longer what holds the second half back: the
+        # two are one endpoint's worth of work, taken in turns.
+        self.assertEqual("subject_held", self.paired_second_reason)
+
+    def test_the_lease_each_claim_writes_expires_with_its_own_task(self):
+        self.assertEqual((), self.paired_lease_problems)
+
+    def test_a_task_cannot_act_as_another_program_s_identity(self):
+        # 0017's rule 3 on the new column: the Identity a Task spends is one of
+        # its own Program's, and the pair of columns in the reference is what
+        # says so rather than a check somebody has to remember to write.
+        refused = self.owner_refusal(
+            "UPDATE tasks SET selected_identity_entity_id ="
+            "   (SELECT i.entity_id FROM identities i"
+            "     WHERE i.program_id = $2::uuid AND i.slot_name = 'tenant-a')"
+            " WHERE id = (SELECT id FROM tasks WHERE program_id = $1::uuid LIMIT 1)",
+            (self.identifiers["hypothesisless"], self.identifiers["paired"]),
+        )
+        self.assertIn("violates foreign key constraint", refused)
 
     # -- criterion 2 -----------------------------------------------------------
 
@@ -23960,8 +24106,9 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
 
     # -- the projection --------------------------------------------------------
 
-    def test_pointing_a_task_at_a_hypothesis_moves_what_it_acts_as(self):
+    def test_choosing_an_identity_moves_what_the_task_acts_as(self):
         self.assertEqual(("_anonymous",), self.reprojected_at_insert)
+        self.assertEqual(("_anonymous",), self.reprojected_after_hypothesis)
         self.assertEqual(("rotated",), self.reprojected_after)
         self.assertEqual(("rotated",), self.reprojected_leases)
 
@@ -36611,6 +36758,7 @@ class ClaimFixture:
         falsifier: str = "a header that says otherwise",
         supported: bool = True,
         observed: str = "header_policy_observed",
+        identities: tuple[str, ...] = (),
     ) -> str:
         """One proposed claim, and what the derivation will read off it.
 
@@ -36619,13 +36767,18 @@ class ClaimFixture:
         are the four rules `rk2_gradable_claims` asks about that a fixture can
         arrange -- the property class, whether the rationale is whole, whether
         anything supports it, and which kind of Observation does.
+
+        `identities` is the fifth thing the derivation reads, since ticket 131:
+        which Identities the claim is about, and therefore how many Tasks it is.
         """
         program_id = cls.identifiers[name]
         hypothesis = str(
             cls.scalar(
                 "INSERT INTO hypotheses (program_id, subject_entity_id,"
-                " property_class, statement, rationale)"
-                " VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb) RETURNING id::text",
+                " property_class, statement, rationale, identity_a_entity_id,"
+                " identity_b_entity_id)"
+                " VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid, $7::uuid)"
+                " RETURNING id::text",
                 (
                     program_id,
                     subject,
@@ -36638,6 +36791,8 @@ class ClaimFixture:
                             "falsifier": falsifier,
                         }
                     ),
+                    identities[0] if len(identities) > 0 else None,
+                    identities[1] if len(identities) > 1 else None,
                 ),
             )
         )
@@ -36721,7 +36876,7 @@ class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
         cls.runtime = pg.connect(cls.harness.runtime)
 
         cls.identifiers = {}
-        for name in ("derives", "refuses", "capped"):
+        for name in ("derives", "refuses", "capped", "differs"):
             # `UNSEEDED` rather than `SCOPED` for the reason the two scheduler
             # cases above give: 083 opens a recon Task against every exact
             # inclusion, and "the Tasks are what this derivation made" would
@@ -36738,6 +36893,7 @@ class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
         cls.arrange_derives()
         cls.arrange_refuses()
         cls.arrange_capped()
+        cls.arrange_differs()
 
     @classmethod
     def tearDownClass(cls):
@@ -36837,6 +36993,45 @@ class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
                 (str(before),),
             )
 
+    @classmethod
+    def arrange_differs(cls):
+        """Ticket 131: one claim about two Identities is two Tasks.
+
+        A differential is the difference between two answers, and one Tool run
+        is many exchanges under one Identity -- so the claim "these two see
+        different things" can only be settled by two runs. The derivation is
+        where that stops being an instruction in a Playbook and becomes rows.
+
+        Two passes, for `derives`' reason and one more: neither half may look
+        like a claim nothing names yet, or every pass would open the pair again.
+        """
+        subject, receipt = cls.grounds("differs")
+        first = cls.identity("differs", "tenant-a")
+        second = cls.identity("differs", "tenant-b")
+        cls.claim(
+            "differs", subject, receipt, "about two tenants",
+            "transport.header_policy", identities=(first, second),
+        )
+        cls.differs_pass = cls.pass_over("differs")
+        cls.differs_hunts = cls.hunts("differs")
+        cls.differs_acts_as = cls.selected("differs")
+        cls.differs_again = cls.pass_over("differs")
+        cls.differs_after = cls.hunts("differs")
+
+    @classmethod
+    def selected(cls, name: str) -> tuple[str, ...]:
+        """The Identity each hunt Task of a Program acts as, by slot name."""
+        return tuple(
+            str(row[0])
+            for row in cls.as_owner(
+                "SELECT i.slot_name FROM tasks t"
+                "  JOIN identities i ON i.entity_id = t.selected_identity_entity_id"
+                " WHERE t.program_id = $1::uuid AND t.kind = 'hunt'"
+                " ORDER BY i.slot_name",
+                (cls.identifiers[name],),
+            ).rows
+        )
+
     # -- what the passes had to do --------------------------------------------
 
     def test_a_whole_claim_is_graded_testable_by_the_pass(self):
@@ -36871,6 +37066,19 @@ class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
         self.assertEqual(1, self.refusing_pass["claims_graded"])
         self.assertEqual(1, self.refusing_pass["hunts_derived"])
         self.assertEqual(1, len(self.refused_hunts))
+
+    def test_a_claim_about_two_identities_becomes_one_task_for_each(self):
+        self.assertEqual(2, self.differs_pass["hunts_derived"])
+        self.assertEqual(("tenant-a", "tenant-b"), self.differs_acts_as)
+
+    def test_neither_half_of_a_differential_is_derived_twice(self):
+        self.assertEqual(0, self.differs_again["hunts_derived"])
+        self.assertEqual(self.differs_hunts, self.differs_after)
+
+    def test_a_claim_about_nobody_is_one_task_acting_as_the_anonymous_identity(self):
+        # The other side of the same rule, read off the plain scenario: a claim
+        # naming no Identity is one Task, and it does name what it acts as.
+        self.assertEqual(("_anonymous",), self.selected("derives"))
 
     def test_the_ceiling_defers_the_rest_rather_than_dropping_them(self):
         """Three claims, one Task a pass, and a fourth pass with nothing left."""
@@ -40817,11 +41025,14 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                         f"slot://identity/{CORPUS_SLUG}-{slot}",
                     ),
                 )
-                # The organisation an account belongs to. It is not a test
-                # account, so it must not count towards
-                # `multiple_test_identities`, which leaves `privileged` and
-                # `anonymous` -- and `anonymous` means "presents no credential",
-                # which a tenant that owns accounts does not.
+                # The organisation an account belongs to, classed
+                # `privileged`: `anonymous` means "presents no credential",
+                # which a tenant that owns accounts does not, and those are the
+                # two classes left. Since ticket 133 it counts towards
+                # `multiple_test_identities` like any other account, which
+                # changes nothing here -- the two `user` accounts above already
+                # carry that fact, and this case is about which Playbook each
+                # Surface picks rather than about the count.
                 #
                 # It was `service` until ticket 112 closed the class to three
                 # values and did not carry this row with it, which left this
@@ -41401,8 +41612,12 @@ class ApplicationSubjectFactsTest(DatabaseCase):
     def test_an_application_with_no_endpoint_still_says_what_it_is(self):
         # Recon finds a site before it finds a route, and the shape of the
         # Application is a fact about the Application rather than about
-        # anything under it.
-        self.assertEqual({"api_surface"}, self.facts(self.routeless))
+        # anything under it. `anonymous_identity_available` rides along on
+        # every subject of a Program that holds an anonymous slot, which since
+        # ticket 131 is every Program that has opened a Task.
+        self.assertEqual(
+            {"api_surface", "anonymous_identity_available"}, self.facts(self.routeless)
+        )
 
     def test_the_selection_reaches_a_playbook_for_an_application_subject(self):
         # Criterion 6's second half. `playbook_candidates` filters on
@@ -41448,6 +41663,354 @@ class ApplicationSubjectFactsTest(DatabaseCase):
             },
             self.near(self.application),
         )
+
+
+ACCOUNT_SLUG = "selftest-two-accounts"
+
+
+class IdentityFactTest(DatabaseCase):
+    """Ticket 133: two accounts are two accounts, whatever their class.
+
+    0032 counted `class = 'user'` when every configured slot projected as
+    `user`, so the filter decided nothing. Ticket 112 made the class real and
+    the filter started deciding: an operator who labels one of two slots
+    `privileged` -- correctly, because it is an admin account -- drops the count
+    to one and takes seven Playbooks out of reach without a word being said.
+
+    One Program and one Application, and the configurations are written inside
+    transactions that are thrown away: what changes between the cases is the
+    Program's identity rows, which is a small write and a whole re-open of a
+    Program otherwise.
+
+    The gaps are read beside the fact each time, because the second half of the
+    ticket is that a Program which lacks one of these can be told why.
+    """
+
+    settings_for = "migrate"
+
+    #: The account shapes, as `(slot, class)`. `privileged` is the shape the
+    #: ticket is about; `anonymous` is the control that must not count, and is
+    #: what every Program has held since ticket 131 minted one for its first
+    #: Task.
+    ACCOUNT = "SELECT add_entity($1::uuid, 'identity', '', $2, 80, $3)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opened = program.run(
+            cls.harness.runtime,
+            write(SCOPED.replace('name = "matrix-web"', f'name = "{ACCOUNT_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.reported = {
+            str(assertion.name): str(assertion.detail) for assertion in opened.assertions
+        }
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.subject = str(
+                cls.connection.execute(
+                    "SELECT add_entity($1::uuid, 'application', '', 'host', $2, 80, $3)::text",
+                    (cls.program_id, HOST, f"application:{BASE_URL}"),
+                ).scalar()
+            )
+            cls.connection.execute(
+                "INSERT INTO applications (entity_id, base_url, kind)"
+                " VALUES ($1::uuid, $2, 'web')",
+                (cls.subject, BASE_URL),
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (ACCOUNT_SLUG,))
+        super().tearDownClass()
+
+    @contextlib.contextmanager
+    def configured(self, *accounts: tuple[str, str]):
+        """One identity configuration, kept only for the length of the case."""
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                for slot, class_ in accounts:
+                    entity = str(
+                        self.connection.execute(
+                            "SELECT add_entity($1::uuid, 'identity', '', 'host', $2, 80, $3)::text",
+                            (self.program_id, HOST, f"identity:{slot}"),
+                        ).scalar()
+                    )
+                    self.connection.execute(
+                        "INSERT INTO identities (entity_id, program_id, slot_name,"
+                        " class, secret_ref) VALUES ($1::uuid, $2::uuid, $3, $4, $5)",
+                        (
+                            entity,
+                            self.program_id,
+                            f"{ACCOUNT_SLUG}-{slot}",
+                            class_,
+                            # NULL for `anonymous` and a reference for the rest:
+                            # the schema requires credential material on every
+                            # class but that one, which is the whole of what
+                            # this view means by an account.
+                            None if class_ == "anonymous" else f"slot://identity/{slot}",
+                        ),
+                    )
+                yield
+                raise Rollback
+        except Rollback:
+            pass
+
+    def facts(self) -> set[str]:
+        return {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT fact FROM subject_facts"
+                " WHERE program_id = $1::uuid AND subject_entity_id = $2::uuid",
+                (self.program_id, self.subject),
+            ).rows
+        }
+
+    def gaps(self) -> dict[str, str]:
+        return {
+            str(row[0]): str(row[1])
+            for row in self.connection.execute(
+                "SELECT fact, reason FROM program_identity_gaps($1::uuid)",
+                (self.program_id,),
+            ).rows
+        }
+
+    def gated(self, fact: str) -> tuple[str, ...]:
+        [row] = self.connection.execute(
+            "SELECT gated_playbooks FROM program_identity_gaps($1::uuid)"
+            " WHERE fact = $2",
+            (self.program_id, fact),
+        ).rows
+        return tuple(sorted(str(row[0]).strip("{}").split(",")))
+
+    # -- the arithmetic --------------------------------------------------------
+
+    def test_two_user_accounts_carry_the_fact(self):
+        # The control: what the count has always said, and must go on saying.
+        with self.configured(("first", "user"), ("second", "user")):
+            self.assertIn("multiple_test_identities", self.facts())
+
+    def test_a_user_and_a_privileged_account_carry_the_fact(self):
+        # The ticket. Before this change the same two rows read as one account,
+        # and the seven Playbooks below went quiet.
+        with self.configured(("first", "user"), ("admin", "privileged")):
+            self.assertIn("multiple_test_identities", self.facts())
+            self.assertNotIn("multiple_test_identities", self.gaps())
+
+    def test_two_privileged_accounts_carry_the_fact(self):
+        # Two admins are still two accounts. The class says what an account can
+        # reach, not whether it is one.
+        with self.configured(("admin", "privileged"), ("root", "privileged")):
+            self.assertIn("multiple_test_identities", self.facts())
+
+    def test_one_account_beside_the_anonymous_identity_does_not(self):
+        # The class that is not an account. Every Program mints one of these for
+        # its first Task since ticket 131, so a count that admitted it would
+        # hand the fact to every Program that configured a single slot.
+        with self.configured(("first", "user"), ("_anonymous", "anonymous")):
+            self.assertNotIn("multiple_test_identities", self.facts())
+            self.assertIn("anonymous_identity_available", self.facts())
+
+    # -- and what an operator is told ------------------------------------------
+
+    def test_one_account_is_a_typed_reason_and_not_a_silence(self):
+        with self.configured(("first", "user")):
+            self.assertEqual("one_account_configured", self.gaps()["multiple_test_identities"])
+
+    def test_no_account_at_all_is_a_different_reason(self):
+        # Two configurations an operator would fix differently: one slot to
+        # provision, or a second one to add.
+        with self.configured(("_anonymous", "anonymous")):
+            self.assertEqual("no_account_configured", self.gaps()["multiple_test_identities"])
+            self.assertEqual("no_privileged_identity", self.gaps()["privileged_identity_available"])
+
+    def test_an_invalidated_account_stops_counting(self):
+        with self.configured(("first", "user"), ("second", "user")):
+            self.connection.execute(
+                "UPDATE identities SET invalidated_at = now()"
+                " WHERE program_id = $1::uuid AND slot_name = $2",
+                (self.program_id, f"{ACCOUNT_SLUG}-second"),
+            )
+            self.assertNotIn("multiple_test_identities", self.facts())
+            self.assertEqual("one_account_configured", self.gaps()["multiple_test_identities"])
+
+    def test_the_open_run_says_what_this_configuration_puts_out_of_reach(self):
+        # Where an operator actually meets this: the moment the configuration is
+        # written. `rk program open` is the only step that reads the identity
+        # document, so it is the only step that can say what the document costs.
+        self.assertIn("identities", self.reported)
+        self.assertIn("multiple_test_identities", self.reported["identities"])
+        self.assertIn("Playbook(s)", self.reported["identities"])
+
+    def test_the_gap_names_what_it_costs(self):
+        # The news is the seven Playbooks, not the missing fact: a fact is a
+        # word in a view and a Playbook is work that did not happen.
+        with self.configured(("first", "user")):
+            self.assertEqual(
+                (
+                    "playbooks/api-authorization/playbook.md",
+                    "playbooks/api/playbook.md",
+                    "playbooks/browser-realtime/playbook.md",
+                    "playbooks/graphql/playbook.md",
+                    "playbooks/grpc/playbook.md",
+                    "playbooks/logging/playbook.md",
+                    "playbooks/object-ownership/playbook.md",
+                ),
+                self.gated("multiple_test_identities"),
+            )
+
+
+SESSION_SLUG = "selftest-sdk-session"
+
+
+class AgentSessionBindingTest(DatabaseCase):
+    """Ticket 119: the write half of a binding whose unbind half already shipped.
+
+    Eleven statements in the corpus retire an `agent_sessions` binding -- eight
+    `UPDATE ... SET unbound_at` and three deletes -- and until this verb nothing
+    in `src/` ever inserted one. So "a finishing run unbinds its session", which
+    the supervisor's own prose has claimed since it was written, was a no-op on
+    an empty table.
+
+    One Program, one Task, one run, and the three answers the verb has: the row,
+    the same row again, and the refusal for a run that has already finished.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+        opened = program.run(
+            cls.harness.runtime,
+            write(UNSEEDED.replace('name = "matrix-web"', f'name = "{SESSION_SLUG}"')),
+        )
+        assert opened.ok, opened.violations
+        cls.program_id = opened.facts["program_id"]
+        cls.task, cls.agent_run = cls.arrange()
+        cls.runtime.execute(agent.BIND, (cls.program_id,))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (SESSION_SLUG,))
+        super().tearDownClass()
+
+    @classmethod
+    def arrange(cls, role: str = "recon", kind: str = "recon") -> tuple[str, str]:
+        """One claimed Task and the Agent run the supervisor opened for it.
+
+        The role decides the kind (0019 grants each role one), and the kind is
+        what `tasks_live_dedup_idx` separates two otherwise identical Tasks by,
+        so a second arrangement asks for a second role.
+        """
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            task = str(
+                cls.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, status, attempts, claimed_at,"
+                    " lease_expires_at) VALUES ($1::uuid, $2, 'claimed', 1, now(),"
+                    " now() + interval '10 minutes') RETURNING id::text",
+                    (cls.program_id, kind),
+                ).scalar()
+            )
+            run = str(
+                cls.connection.execute(
+                    "INSERT INTO agent_runs (program_id, task_id, role, model, effort,"
+                    " mission_packet) VALUES ($1::uuid, $2::uuid, $3, 'operator', 'low',"
+                    " $4::jsonb) RETURNING id::text",
+                    (cls.program_id, task, role, json.dumps({"objective": "Say nothing."})),
+                ).scalar()
+            )
+        return task, run
+
+    def bind(self, run: str, session: str) -> str:
+        with self.runtime.transaction():
+            return str(
+                self.runtime.execute(
+                    "SELECT open_agent_session($1::uuid, $2)", (run, session)
+                ).scalar()
+            )
+
+    def refusal(self, run: str, session: str) -> str:
+        try:
+            self.bind(run, session)
+        except pg.DatabaseError as refused:
+            return str(refused)
+        raise AssertionError("not refused")
+
+    def bindings(self, run: str) -> list[tuple[str, ...]]:
+        return [
+            tuple("" if field is None else str(field) for field in row)
+            for row in self.connection.execute(
+                "SELECT s.session_id, s.sdk_agent_id, s.task_id::text,"
+                "       s.unbound_at IS NULL"
+                "  FROM agent_sessions s WHERE s.agent_run_id = $1::uuid",
+                (run,),
+            ).rows
+        ]
+
+    def test_the_session_the_sdk_reported_becomes_a_row_against_the_run(self):
+        bound = self.bind(self.agent_run, "sess-1")
+
+        self.assertEqual(36, len(bound))
+        # The Task comes off the run and not from the caller: a caller that
+        # could name one could attribute this session's calls to other work.
+        self.assertEqual([("sess-1", "", self.task, "True")], self.bindings(self.agent_run))
+
+    def test_the_binding_is_one_row_however_often_it_is_reported(self):
+        # The caller is a supervisor reading a stream, and a session that
+        # announces itself twice is a startup this runtime already counts on its
+        # own terms. A second bind must not be the thing that fails the run.
+        first = self.bind(self.agent_run, "sess-1")
+        again = self.bind(self.agent_run, "sess-1")
+
+        self.assertEqual(first, again)
+        self.assertEqual(1, len(self.bindings(self.agent_run)))
+
+    def test_the_row_is_accounted_for_by_the_event_log(self):
+        # 0022's own rule about this table: a row written outside the log is a
+        # provenance record with no provenance.
+        self.bind(self.agent_run, "sess-1")
+
+        [[events]] = self.connection.execute(
+            "SELECT count(*) FROM events"
+            " WHERE program_id = $1::uuid AND type = 'session.bound'",
+            (self.program_id,),
+        ).rows
+        self.assertGreaterEqual(int(events[0] if isinstance(events, tuple) else events), 1)
+
+    def test_a_session_identifier_of_nothing_is_refused(self):
+        self.assertIn("needs the session identifier", self.refusal(self.agent_run, ""))
+
+    def test_a_run_that_has_already_finished_takes_no_binding(self):
+        # The binding exists so a live session's calls can be attributed. A run
+        # that is closed has nothing left to attribute, so this is a refusal
+        # rather than a row.
+        _, finished = self.arrange("js_analyst", "analyze")
+        with self.connection.transaction():
+            self.connection.execute("SET LOCAL ROLE rk2_owner")
+            self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            self.connection.execute(
+                "UPDATE agent_runs SET finished_at = now(), stop_reason = 'completed'"
+                " WHERE id = $1::uuid",
+                (finished,),
+            )
+
+        self.assertIn("is not a live run", self.refusal(finished, "sess-2"))
+        self.assertEqual([], self.bindings(finished))
 
 
 #: The four Programs an evaluation of one Playbook against two fixture pairs

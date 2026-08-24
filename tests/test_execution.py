@@ -162,6 +162,8 @@ def started_row(**overrides) -> tuple:
         subject.token_cap,
         subject.hypothesis_label,
         subject.test_label,
+        subject.identity_slot_name,
+        subject.identity_class,
     )
 
 
@@ -2430,6 +2432,37 @@ class AttemptTest(unittest.TestCase):
             json.loads(args),
         )
 
+    def test_the_tool_run_carries_the_identity_the_task_selected(self):
+        """Ticket 131, on the wire.
+
+        The Task's selection is what the door is told the run acts as, and the
+        door keys everything on it: `resolve_egress_identity` refuses a named
+        slot with no live Lease, and `net_borrowed_identity` escalates any
+        non-empty one. So a selection that never reached the args would be a
+        run acting as one Identity and declaring another.
+        """
+        connection = Recorder(
+            started=(started_row(identity_slot_name="tenant-a", identity_class="user"),)
+        )
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+        self.assertEqual("tenant-a", json.loads(args)["identity_slot"])
+
+    def test_an_anonymous_selection_reaches_the_door_as_no_identity_at_all(self):
+        # `_anonymous` is a row, not a slot the door can open: naming it here
+        # would send every unauthenticated hunt through the borrowed-account
+        # escalation and leave it waiting for an approval nobody owes.
+        connection = Recorder(
+            started=(
+                started_row(identity_slot_name="_anonymous", identity_class="anonymous"),
+            )
+        )
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+        self.assertEqual("", json.loads(args)["identity_slot"])
+
     def test_an_attempt_is_opened_body_bearing_when_a_playbook_mutates(self):
         """Ticket 96's first rule, at the moment it is decided.
 
@@ -2491,6 +2524,28 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual(PROGRAM, door.program_id)
         self.assertEqual(BOUNDARY.proxy_url, door.proxy_url)
         self.assertEqual(isolation.CA_FILE, door.certificate)
+        # Ticket 136: and who it is spending as, which is the Task's own
+        # selection rather than a second decision taken here. Empty is the
+        # anonymous run this fixture describes.
+        self.assertEqual("", door.identity)
+
+    def test_the_child_is_told_which_identity_its_capability_is_spent_as(self):
+        # The other half of the same value: what the Tool run's args say and
+        # what the block hands the child are one selection read once, so an
+        # answer naming an Identity and a door injecting another is not a state
+        # this runtime can produce.
+        launcher = Launcher()
+        connection = Recorder(
+            started=(started_row(identity_slot_name="tenant-a", identity_class="user"),)
+        )
+        with compiled():
+            attempt(connection, launcher)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+        door = launcher.only.egress
+        assert door is not None
+
+        self.assertEqual("tenant-a", door.identity)
+        self.assertEqual("tenant-a", json.loads(args)["identity_slot"])
 
     def test_a_machine_naming_a_tool_image_and_a_store_can_answer_a_tool_call(self):
         # PH2-87. Both parts, because a run whose output could not be filed is a

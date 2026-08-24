@@ -113,6 +113,22 @@ LOCK_CLASS = 20260809
 #: eight properties of this connection, defaulting to whoever is asking.
 RUNTIME_ASSERTION = "check_runtime_connection(text)"
 
+#: Ticket 133: the identity facts this configuration does not carry, in the one
+#: word each that says what to configure, and the number of Playbooks each one
+#: gates. Reported here because this is the moment the configuration is written:
+#: an operator who labels one of two slots `privileged` has just moved seven
+#: Playbooks out of reach, and the only other place that could be noticed is a
+#: Playbook selection that quietly kept less than it used to.
+#:
+#: Gaps that gate nothing are left out. `tenant_boundary` gates no Playbook in
+#: the corpus today, and a report that named it would be telling an operator to
+#: go and configure something no document asks for.
+IDENTITY_GAPS = (
+    "SELECT fact, reason, cardinality(gated_playbooks)"
+    "  FROM program_identity_gaps($1::uuid)"
+    " WHERE cardinality(gated_playbooks) > 0"
+)
+
 #: What a resume writes into its event, so a reader can tell an idle restart
 #: from one that swept a Program clean.
 RESUME_EVENT = "run.resumed"
@@ -626,9 +642,33 @@ def _open_program(
             f"{seeded['tasks_opened']} recon Task(s) opened",
         )
         ledger.hold("program", summary)
+        _report_identity_gaps(ledger, connection, str(program_id))
 
     if answer == REVISE:
         ledger.hold("configuration_revision", f"recorded revision {next_revision} for {slug}")
+
+
+def _report_identity_gaps(ledger: Ledger, connection: pg.Connection, program_id: str) -> None:
+    """Which Playbooks this Program's identity configuration puts out of reach.
+
+    Ticket 133. A held line rather than a refusal, because none of it is wrong:
+    a Program with one account is a Program that cannot take a differential, and
+    that is a decision an operator is allowed to make. What they are not allowed
+    to be is unaware of it -- a Playbook that stops being offered says nothing
+    at all today, which is the failure mode ticket 112's own header argues
+    against.
+    """
+    rows = connection.execute(IDENTITY_GAPS, (program_id,)).rows
+    if not rows:
+        return
+    ledger.hold(
+        "identities",
+        "this configuration carries no "
+        + "; ".join(
+            f"{row[0]} ({row[1]}), which gates {int(row[2])} Playbook(s)"
+            for row in rows
+        ),
+    )
 
 
 def _refuse_unless_sound(ledger: Ledger, connection: pg.Connection, slug: str) -> None:
