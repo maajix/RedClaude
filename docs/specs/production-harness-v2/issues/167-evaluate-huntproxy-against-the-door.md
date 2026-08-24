@@ -332,3 +332,57 @@ A partial yes is also a real result. **Adopt the shape for one named job** --
 the plugin contract as the model for an executable Playbook step -- is a smaller
 claim, has fifty unselected Playbooks behind it as motivation, and would sit
 next to tickets 98 and 99 rather than next to the door.
+
+## Answer, 2026-08-24: the audited-reveal bullet is already satisfied
+
+The fourth bullet of section 3 -- *"Sensitive headers are redacted from
+inspection tools but available locally for authenticated work; explicit reveals
+are audited"* -- was promoted into ticket 172 as a measurement before it could
+become a build. The measurement is done, and the answer is that this tree
+already satisfies the sentence and satisfies it more strictly than the sentence
+asks. Nothing is copied, and the bullet is closed rather than pending.
+
+- **One reveal path exists and it is the operator's.** `rk artifact open`,
+  declared at `src/redkraken/cli.py:1032-1038` -- *"decrypt one wire artifact to
+  a file, deliberately and audited"* -- adapted at `src/redkraken/cli.py:3002`,
+  implemented by `artifact.open_wire` at `src/redkraken/artifact.py:768`. It is
+  not a Contract and not a tool: `roster.py`, `evidence.py` and `replay.py`
+  contain no occurrence of `artifact_seal`, `request_wire_sha` or
+  `response_wire_sha`. The evidence export (`src/redkraken/cli.py:2847-2853`)
+  and the legacy import (`:2881-2886`) each say why they hold no key.
+- **The scrubbing half was already verified in section 3 and holds.**
+  `proxy._scrubbed` (`src/redkraken/proxy.py:766`), reached from
+  `project_identity_request` (`:719`) and `project_identity_response` (`:677`)
+  over `_renderings` (`:780`), with `response_for_agent` (`:663`) dropping the
+  wire-only headers first and `proxy.wire_view` (`:880`) hashing the sealed view
+  separately, which is what makes `CONTEXT.md:650-653` true.
+- **Authorization is demanded before the lookup**, so a refused caller learns
+  nothing about which labels have a seal behind them
+  (`src/redkraken/artifact.py:822-838`), and the refusal is itself an audit row
+  (`:824-831`).
+- **Refusals are recorded as loudly as successes**
+  (`src/redkraken/artifact.py:1228-1234`), which is the half the sentence does
+  not ask for: a trail with only the successes answers *"who opened this"* and
+  cannot answer *"who tried"*.
+- **The audit row is written before the bytes are released**, and the comment at
+  `src/redkraken/artifact.py:942-948` says which failure state that ordering
+  chooses; the release row is at `:949-959`.
+- **The record carries no secret**: `value_len` and a four-byte keyed
+  fingerprint, never the value
+  (`src/redkraken/migrations/0024_secret_keying.sql:105-109`, `:130-131`), with
+  the report carrying the path, length, hash, fingerprint and the operator's
+  stated reason and nothing else (`src/redkraken/artifact.py:977-989`) and the
+  plaintext going to a file opened `O_EXCL` at mode `0o600` (`:1268-1276`).
+- **The row names the exchange it was opened out of**, since ticket 123, found
+  by joining the plaintext hash back to the Receipt rather than carried down
+  from a caller (`src/redkraken/artifact.py:290-305`, `:873`, and
+  `src/redkraken/migrations/20260925T030000Z__a_secret_read_names_the_exchange.sql:58-69`).
+
+No criterion above is ticked by this. None of this ticket's criteria covered the
+fourth bullet -- it lives in section 3's prose, which is a list of ideas and not
+a deliverable -- so this section closes the bullet and leaves the criteria as
+they were. Ticket 172 keeps the number and has been rewritten around the three
+gaps the measurement turned up on the way, all of which are this tree's own and
+none of which came from HuntProxy: the peer columns of `secret_access_log` that
+nothing writes and no comment explains, the trail that no operator verb reads,
+and rules 3 and 4 of `check_wire_artifact_secrecy` having no negative control.

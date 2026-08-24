@@ -8,7 +8,7 @@
 
 - [ ] What Cybermes is, is written down before it is judged, from the repository rather than from its README: publisher, licence, age, commit count, contributor count, checkout size, what is vendored and what is a dependency. The README's claims and the repository's own numbers are recorded separately when they disagree, because at least one of them already does.
 - [ ] `hermes-agent` on PyPI is identified: publisher, version, licence, what it actually is, and whether it is a model runtime, a wrapper around a vendor CLI, or a name with nothing behind it. Cybermes pins it at `hermes-agent>=0.1.0` in `requirements.txt` and every claim about the "reasoning loop" rests on it. Nothing else in this ticket is worth measuring until this is answered, because a wrapper around the same SDK `_launch.py` constructs is a very different subject from a second agent runtime.
-- [ ] `tools/smart_pipe.py` is measured against what this harness already does with a bounded stream, on the same input. The other side of the table is `isolation.py:689` `max_output_bytes`, `isolation.py:705` `truncated`, and the packet's stated subtraction (`packet.py:17-21`). Facts kept, facts dropped, tokens spent -- the same shape ticket 90's criterion 6 used, so the two results are comparable.
+- [x] `tools/smart_pipe.py` is measured against what this harness already does with a bounded stream, on the same input. The other side of the table is `isolation.py:689` `max_output_bytes`, `isolation.py:705` `truncated`, and the packet's stated subtraction (`packet.py:17-21`). Facts kept, facts dropped, tokens spent -- the same shape ticket 90's criterion 6 used, so the two results are comparable.
 - [ ] The `skills/` corpus is counted exactly and sampled: how many directories, what a single one contains, and whether any of them is executable or graded. The other side is `src/redkraken/playbooks` (50 directories) and `src/redkraken/fixtures` (55), and the question is not how many but how many have ever been graded against a fixture that was authored without reference to them -- which is ticket 84's whole subject.
 - [ ] The evidence chain is traced end to end on the other side and written down as a sentence: which process observes a fact, which process writes it, and whether anything stands between the model's assertion and the report. `tools/aggregate_reports.py` reads `reports/<target>/findings/*.md`; establish by reading it who writes those files and whether severity and CVSS are read off a wire record or off prose.
 - [ ] The egress question is answered with the compose file open: `docker-compose.yml` declares `network_mode: host`. Confirm it, and state what a request made under it leaves behind. Set that against `isolation.py:1076` (`network create --internal`), `isolation.py:1329` (refusal unless the Agent network is internal), `isolation.py:786` (`--network none` for a tool with no network row) and `proxy.py:1`.
@@ -252,3 +252,124 @@ idea for offline tool output**, measured against byte truncation on a real
 stream first, versioned and attributable if it wins, and dropped if it does not.
 That is a smaller claim than adopting a framework and it is the only one in this
 ticket that a measurement could turn into a build.
+
+## Answer, 2026-08-24: the one candidate does not survive measurement
+
+Section 3 named exactly one idea worth copying, and the operator promoted it out
+of this ticket into 173 so that it could be built rather than argued about. The
+first phase of 173 was a measurement and no code, and the measurement killed the
+premise it was meant to test. 173 is deleted, no implementation ticket replaces
+it, and what follows is everything 173 established, kept here because the ticket
+that raised the idea is where the answer to it belongs.
+
+**The registry has six rows, and five of them already name a parser.** The
+registry is `offline_tools`
+(`src/redkraken/migrations/20260814T030000Z__an_offline_tool_becomes_evidence.sql:119`),
+and every row in it arrives through one of three inserts: `jq` at
+`20260814T030000Z:159-164`, then `js_parse`, `js_routes` and `js_map` at
+`src/redkraken/migrations/20260814T050000Z__source_becomes_a_grounded_conclusion.sql:436-450`,
+then `compare_responses` and `extract_paths` at
+`src/redkraken/migrations/20260922T030000Z__a_skill_script_is_a_program_the_harness_ships.sql:443-455`.
+The `analyser` column is added at `20260814T050000Z:121-122`, and it is not
+optional for the shapes that matter: `20260922T030000Z:55` makes it mandatory for
+a Skill script and `:74` makes it mandatory for a stdin-fed tool. The three `js*`
+rows all name `jsscan.py` and the two Skill halves name `compare.py` and
+`extract_paths.py`. The database goes further than the registry does and refuses
+a recorded path from a tool whose row names no analyser
+(`20260814T050000Z:386-389`), so a run of an analyser is held to its own answer.
+
+That leaves exactly one row with no analyser, `jq`, and `jq`'s stdout is JSON
+produced by a filter the caller wrote. The caller has already selected; a scorer
+over that output would be a second selection over the first. So the count of
+registered tools a ranked view would buy anything for is zero, and it is zero not
+by accident but because this harness reads a parser wherever a parser can be
+written. A scoring heuristic over a raw stream is what one falls back to when no
+parser exists, and here one always exists.
+
+**There are two truncations, not one, and a ranked view could only ever replace
+the smaller of them.** Section 1 above described a single truncation and that
+description was imprecise, which is worth correcting on the record. The first
+truncation is the bound on the process: `isolation.py:689` declares
+`max_output_bytes` as one of the ceilings, `isolation.py:968-976` is the read loop
+that applies it while the process is still running (`:973` counts every byte
+produced, `:974` computes the room left, `:976` keeps only what fits),
+`isolation.py:977-979` breaks and marks `overflowed` when the tool prints past it,
+and `isolation.py:705` is the `truncated` property that reports the difference.
+`tool.py:20-21` states why it is enforced there: the ceilings are held "while the
+process is still running, because a bound applied to output already read is not a
+bound". What survives that bound is the Artifact.
+
+The second truncation is the head handed to the model: `tool.py:533-534` cuts
+`answer.stdout.data[:excerpt]` and the same for stderr, `agent.py:1537` passes
+`excerpt=packet_module.DEFAULT_EXCERPT`, and that constant is `4096` at
+`packet.py:90`. What the child then receives is the head plus a bare boolean
+(`tool.py:547-548`). For a `jq` run that filled its 1,048,576-byte bound, the
+model reads 4,096 bytes and is told `true` about the other 1,044,480.
+
+Only the second of those two is a thing a ranked view could ever have replaced.
+The first cannot be, and the distinction is the whole safety of the design: a
+ranker that read the live pipe would be a bound applied to output already read,
+which `tool.py:20-21` says is not a bound at all, and it would make the process
+ceiling a function of a scoring function. Any future proposal in this shape has to
+start from that sentence.
+
+**The case the idea was invented for is already answered by this tree.** The
+motivating example is a stream whose interesting line is line 40,000, and reading
+past the head is already somebody's job. `packet.py:1329-1337` decided it on
+purpose: reading past `DEFAULT_EXCERPT` of any Artifact is a Tool run and not a
+packet read, and "the route that reads all of an Artifact exists and answers a
+bounded summary instead of a window -- `run_skill_script` hands the program the
+whole thing untruncated". `_launch.py:1211-1218` states the same thing to the
+child in the same words: the script "is handed each Artifact whole -- nothing is
+truncated on the way in". So the harness's existing answer to line 40,000 is not a
+better window over the first 4 KB. It is: write a program that reads all 40,000
+lines and answers a question about them. A ranked view is the generic version of
+that program, for the case where nobody has written the specific one, and this
+registry has no tool in that case.
+
+**Nothing may be copied, and there is still nowhere here to copy it to.**
+Cybermes is PolyForm Noncommercial 1.0.0, and its `ATTRIBUTION.md` puts the
+vendored `knowledge/` tree under GPL-2.0-or-later and CC BY-NC 4.0 among others.
+This repository still ships no LICENSE file of its own, so any copying would be
+into an unlicensed tree and there is no stated licence here for a PolyForm term to
+be compatible with. A scoring table is code, a regular expression is code, and a
+threshold lifted from a file is code. The only thing that ever crossed was the
+English sentence already written in section 3 -- keep the raw, show a ranked
+subset, state the count of the remainder -- and `tools/smart_pipe.py` was not
+opened while 173 was worked. Nothing from that repository has been executed on
+this machine.
+
+**Conclusion: declined.** The candidate in section 3 is not adopted, no
+implementation ticket exists for it, and no schema migration is written. A ranked
+view that buys zero registered tools anything would still cost a reproducibility
+obligation forever, because from the moment a model is handed a subset of a
+stream, every conclusion drawn from that stream depends on which subset, and
+"which subset" has to be answerable a month later from rows rather than from
+memory. This tree pays that price twice already, for `tool_runs.analyser_sha256`
+(`20260814T050000Z:162-177`) and for the Playbook projection digest
+(`playbook.py:36`), and both times the versioned thing was doing work no cheaper
+mechanism could do. This one is not.
+
+The condition under which this is worth revisiting is narrow and nameable: **a
+scanner-shaped tool with no parser is added to `offline_tools`** -- a subfinder,
+httpx, katana, ffuf, nuclei or nmap shape, something that emits many lines of
+which few matter and for which no analyser can reasonably be written. That
+addition is a migration with a version pattern, a network decision and an argument
+grammar, and it is the trigger. Until such a row exists, the measurement has no
+subject and the idea has no beneficiary.
+
+**What this discharges in the criteria above, and what it does not.** Criterion 3
+is discharged, but as a refusal rather than as a table: the comparison it asked
+for cannot be computed, because `tools/smart_pipe.py` may not be opened on licence
+grounds and because no registered tool produces the unparsed stream the comparison
+needs as its input. The other side of that table was measured anyway and is
+written out above -- `isolation.py:689`, `isolation.py:705` and the stated
+subtraction at `packet.py:17-21` -- and the answer to the question the criterion
+served is that byte truncation is not the harness's answer to a long stream in the
+first place. Criterion 2, the identification of `hermes-agent`, is untouched by
+this and remains open. So do criteria 1, 4, 5, 6 and 9, and criterion 7's second
+half: whether a bug bounty payout makes a use commercial, which decides whether
+Cybermes may be run here at all, is a separate question from whether anything may
+be copied and this answer settles only the copying. Criterion 8, the ADR, remains
+open as well: a decline of one named idea is not yet the recorded decision about
+the project as a whole, and that decision is what closes this ticket.
