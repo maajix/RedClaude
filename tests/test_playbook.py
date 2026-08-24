@@ -443,14 +443,27 @@ class Corpus(unittest.TestCase):
                 self.assertTrue(any(role == "control" for role, _ in supported))
                 self.assertTrue(any(role == "variant" for role, _ in supported))
 
-    def test_the_shipped_playbook_names_the_control_its_own_class_needs(self):
+    def test_the_shipped_playbook_names_a_control_a_verb_can_actually_write(self):
         # `object-ownership` pins both kinds, where the catalogue-wide case
-        # above pins only the roles: a refusal under the second Identity is
-        # evidence of a boundary only if that session was working, and
-        # `credential_effect` is the observation that says it was.
+        # above pins only the roles. It pinned `credential_effect` on the
+        # control until 2026-08-24 -- a refusal under the second Identity is
+        # evidence of a boundary only if that session was working, and that kind
+        # is the observation which says it was. The reading was right and the
+        # row was unreachable: ticket 166 measured that no runtime verb writes
+        # that kind, `enforce_playbook_evidence` raises on the transition, and
+        # so this Playbook could never reach `supported` at all.
+        #
+        # So the bar is the strongest one a verb can meet. `close_test_replay`
+        # writes `response_invariant` for a leg whose assertions did not differ
+        # and `response_differential` for one that did, and the control leg of
+        # this Playbook's own Test is the one that proves the second session
+        # answered. What is lost is that the bar no longer distinguishes "the
+        # session worked" from "this leg did not differ"; ticket 166 owns
+        # putting that distinction back, either by teaching the replay to class
+        # a control leg or by writing the kind from somewhere else.
         supported = {(row.role, row.kind) for row in self.one.evidence
                      if row.to_status == "supported"}
-        self.assertIn(("control", "credential_effect"), supported)
+        self.assertIn(("control", "response_invariant"), supported)
         self.assertIn(("variant", "response_differential"), supported)
 
     def test_every_playbook_says_what_would_refute_it(self):

@@ -10,7 +10,7 @@ this tree serves.
 
 **Status:** ready-for-agent
 
-- [ ] **The bar is real and it is enforced.** `enforce_playbook_evidence()`
+- [x] **The bar is real and it is enforced.** `enforce_playbook_evidence()`
       (`src/redkraken/migrations/0032_playbooks.sql:529`) fires
       `BEFORE INSERT ON hypothesis_transitions` (`:547-549`) and raises on the
       first row `playbook_evidence_unmet()` (`:509`) returns. That function
@@ -18,7 +18,7 @@ this tree serves.
       `o.kind` against `playbook_evidence.observation_kind` for the selected,
       undropped Playbook. A missing kind is not a warning; the transition
       raises.
-- [ ] **`playbooks/object-ownership/playbook.md` is the measured case.** Its
+- [x] **`playbooks/object-ownership/playbook.md` is the measured case.** Its
       `bb:evidence` line (`:14`) carries
       `{"to_status": "supported", "role": "control", "kind": "credential_effect", "polarity": "supports", "min_count": 1}`,
       seeded as `('supported', 'control', 'credential_effect', 'supports', 1)`
@@ -28,7 +28,7 @@ this tree serves.
       the second Identity is only evidence of an enforced boundary if that
       Identity's session was working at the time" (`:614-617`). The reasoning is
       sound. The row is still unreachable.
-- [ ] **The replay path can write exactly two kinds.** `close_test_replay`
+- [x] **The replay path can write exactly two kinds.** `close_test_replay`
       derives an Observation's kind purely from the assertions that name the
       action -- `CASE WHEN EXISTS (... x ->> 'kind' IN ('status_differs',
       'body_differs') AND v_action.ordinal IN (...)) THEN
@@ -43,7 +43,7 @@ this tree serves.
       `20260816T000000Z...:1072` and `:1082`), so the only kinds any replay can
       ever attach to a claim are `response_invariant` and
       `response_differential`.
-- [ ] **The other writer is shut by then.** `rk2_promote_hypotheses` is the only
+- [x] **The other writer is shut by then.** `rk2_promote_hypotheses` is the only
       other function that writes `hypothesis_evidence`, and it refuses an
       evidence edge once the claim it converges on is past `proposed`:
       `IF v_status IS NOT NULL AND v_status <> 'proposed' THEN v_reason :=
@@ -54,7 +54,7 @@ this tree serves.
       A claim with a Test running is `testing`, not `proposed`. So by the time
       the replay is the thing moving the claim to `supported`, the proposal path
       can no longer add the row the Playbook is waiting for.
-- [ ] **Consequence: 33 of 50 Playbooks are unsatisfiable, measured.** Reading
+- [x] **Consequence: 33 of 50 Playbooks are unsatisfiable, measured.** Reading
       every `bb:evidence` line under `src/redkraken/playbooks/*/playbook.md`:
       33 name at least one of the six kinds no runtime writer produces --
       `credential_effect` (17 Playbooks), `content_match` (9), `state_change`
@@ -73,7 +73,7 @@ this tree serves.
       (`src/redkraken/migrations/20261001T000000Z__a_control_arrival_is_what_makes_silence_a_finding.sql:543-555`
       is the live one), but it writes no `hypothesis_evidence` edge, so the kind
       exists and still cannot count towards a bar.
-- [ ] **Consequence for ticket 103's own evidence, stated plainly.**
+- [x] **Consequence for ticket 103's own evidence, stated plainly.**
       `tests/test_vertical.py`'s walk has exactly one arranged row.
       `the_control_the_playbook_asks_for()` (`:272-302`) writes the
       `credential_effect` Observation and its `control` evidence edge as owner,
@@ -83,7 +83,7 @@ this tree serves.
       report are all read off rows the walk itself wrote through served verbs.
       The one row is arranged because this ticket's gap makes it impossible to
       earn, not because the walk took a shortcut anywhere else.
-- [ ] **Two candidate fixes, neither chosen here.** Either `close_test_replay`
+- [x] **Two candidate fixes, neither chosen here.** Either `close_test_replay`
       learns to class a control action as `credential_effect` -- the information
       is present, since the plan already gives each action a role and the
       control leg is the one that proves the Identity was working -- or
@@ -122,3 +122,36 @@ vocabulary and has an `allowed_provenance` some writer could satisfy
 (`0018_vocabularies.sql:219-236`, and `content_match` takes `{tool_run}` rather
 than a Receipt); what is missing is a verb that writes the row and its evidence
 edge, not a provenance the row could carry.
+
+## Comments
+
+**2026-08-24 -- the second fix, taken for five Playbooks and no others.**
+
+Arbeitsblock 3 grades five High-Yield pairs, and reading this ticket against them
+said every one of the five was unsatisfiable: `attack-surface` wanted
+`content_match`, `object-ownership` `credential_effect`, `browser-script`
+`reflected_input`, `cookies` `header_policy_observed` and `credential_effect`,
+`payment-workflows` `state_change`. A 1650-run campaign against those five would
+have returned five `fail` verdicts and measured this ticket rather than the
+Playbooks -- `playbook_test_verdict` reads `discriminating_tp`, which counts
+claims at `status = 'supported'`, which is the transition
+`enforce_playbook_evidence` raises on.
+
+So fix two is taken for the five: `20261106T000000Z` narrows their fifteen
+`playbook_evidence` rows to `response_invariant` and `response_differential`, the
+two kinds `close_test_replay` writes, and re-freezes the five documents. The
+`control` role is untouched in all five, so the rule this corpus exists for --
+no claim from a single reading -- still holds.
+
+What it costs is stated in the migration and in
+`tests/test_playbook.py`'s pinned case, which moved with it: a control row
+naming `credential_effect` said the second session was working, and one naming
+`response_invariant` says the control leg did not differ. The second is weaker.
+
+**This ticket stays open**, and what is left is the larger half. Twenty-eight to
+thirty-two Playbooks still carry an unreachable bar, and fix one -- teaching
+`close_test_replay` to class a control leg as `credential_effect` -- is still the
+better answer for the seventeen that want that kind, because it puts the
+distinction back rather than dropping it. Deciding it for the whole corpus was
+not this block's to do; deciding it for five Playbooks it was about to spend 330
+million budget units grading was.
