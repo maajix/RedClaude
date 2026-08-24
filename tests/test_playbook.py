@@ -453,17 +453,20 @@ class Corpus(unittest.TestCase):
         # that kind, `enforce_playbook_evidence` raises on the transition, and
         # so this Playbook could never reach `supported` at all.
         #
-        # So the bar is the strongest one a verb can meet. `close_test_replay`
-        # writes `response_invariant` for a leg whose assertions did not differ
-        # and `response_differential` for one that did, and the control leg of
-        # this Playbook's own Test is the one that proves the second session
-        # answered. What is lost is that the bar no longer distinguishes "the
-        # session worked" from "this leg did not differ"; ticket 166 owns
-        # putting that distinction back, either by teaching the replay to class
-        # a control leg or by writing the kind from somewhere else.
+        # So the bar is the strongest one a verb can meet, and the kind is the
+        # same on both legs. `close_test_replay` reads the kind off the Test
+        # specification, not off the outcome: an action any `status_differs` or
+        # `body_differs` assertion names -- as its `action` or as its `against`
+        # -- is `response_differential`, and a comparison names both of its
+        # legs. So a Playbook whose whole method is a comparison writes that one
+        # kind for the control as well. What is lost is that the bar no longer
+        # distinguishes "the session worked" from "this leg was compared";
+        # ticket 166 owns putting that distinction back, either by teaching the
+        # replay to class a control leg or by writing the kind from somewhere
+        # else.
         supported = {(row.role, row.kind) for row in self.one.evidence
                      if row.to_status == "supported"}
-        self.assertIn(("control", "response_invariant"), supported)
+        self.assertIn(("control", "response_differential"), supported)
         self.assertIn(("variant", "response_differential"), supported)
 
     def test_every_playbook_says_what_would_refute_it(self):

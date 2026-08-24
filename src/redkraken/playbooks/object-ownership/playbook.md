@@ -11,7 +11,7 @@ bb:baseline: stable_session
 bb:status: draft
 bb:stale_after: 2027-02-15
 bb:provenance: Written for ticket 45 against the object-ownership leaf of the ticket 18 vocabulary; no upstream card, no third-party list.
-bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_invariant", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
+bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_differential", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_differential", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
 bb:references: ["why-two-identities.md"]
 ---
 

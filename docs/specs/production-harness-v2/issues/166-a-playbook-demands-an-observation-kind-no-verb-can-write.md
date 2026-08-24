@@ -155,3 +155,40 @@ better answer for the seventeen that want that kind, because it puts the
 distinction back rather than dropping it. Deciding it for the whole corpus was
 not this block's to do; deciding it for five Playbooks it was about to spend 330
 million budget units grading was.
+
+**2026-08-24 -- the narrowing was wrong in detail, and the detail is the ticket.**
+
+`20261106T000000Z` put `response_invariant` on the `control` row of four of the
+five. `tests.test_vertical` refused it:
+
+    playbook playbooks/object-ownership/playbook.md requires 1 x
+    (role=control, kind=response_invariant) for supported, found 0
+
+The `CASE` this ticket quotes above was read one clause short.
+`v_action.ordinal IN ((x ->> 'action')::numeric::integer, (x ->> 'against')::numeric::integer)`
+matches an assertion's `against` as well as its `action`, so a comparison marks
+**both** of its legs `response_differential`. `response_invariant` is written
+only for an action that no `status_differs` or `body_differs` assertion names at
+all. A control leg that a differential is measured against is never invariant.
+
+`20261107T000000Z` corrects the five to `response_differential` on every row,
+which is the shape `client-side-path-traversal` and `web-cache` already ship,
+and re-freezes the five documents again.
+
+**A second wall, found on the way, and larger than the first.** The kind is
+derived from the Test *specification*, not from the outcome, so one specification
+writes the same kinds whether its assertions hold or fail. Eighteen Playbooks --
+`agentic-ai`, `api`, `client-side-path-traversal`, `deployment`,
+`deserialization`, `file-resolution`, `file-upload`, `graphql`, `grpc`,
+`nosql-injection`, `orm`, `realtime`, `request-integrity`, `request-parsing`,
+`sql-injection`, `ssrf-url-routing`, `web-cache`, `workload-identities` -- name
+`response_invariant` and `response_differential` on the *same role* across their
+two outcomes. Each of those asks one specification to write two different kinds
+for one action, so exactly one of `supported` and `refuted` is reachable and the
+other raises. That set contains all thirteen this ticket called satisfiable, so
+the honest count is that **no Playbook in the corpus could reach both of its
+outcomes**, and the five graded ones are the only five that now can.
+
+Still this ticket's, still open: the twenty-five Playbooks outside the five, and
+the choice between teaching `close_test_replay` to class a control leg and
+finishing the corpus edit.
