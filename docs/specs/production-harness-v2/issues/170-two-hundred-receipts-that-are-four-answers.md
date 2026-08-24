@@ -32,6 +32,20 @@ its ADR.
 
 **Status:** ready-for-agent
 
+**Operator decision, 2026-08-24: keep this ticket, and do not run phase zero
+yet.** The census below is the reason. The largest real Program this tree holds
+is eighteen Receipts, which already fits under both ceilings, so the compile-side
+threshold cannot be cleared by any data that exists today, and a phase zero run now
+would measure the fixtures rather than the work. That is a shortage of Receipts,
+not a defect in the idea, which is what separates this ticket from 173 -- 173 was
+retired because its idea bought nothing on this codebase at any volume.
+
+The trigger is a data volume, not a date: run phase zero when one Program holds
+enough exchanges that the ungrouped view no longer fits under the packet's
+32,768-byte ceiling. A hunt that enumerates or replays broadly is what produces
+that. Until then this ticket is parked on purpose, and the reader-side gate B is
+the only half still worth measuring first when it is.
+
 ## Phase zero -- the prototype that is allowed to close this ticket
 
 Four criteria, and they come before every criterion in the next section. The
