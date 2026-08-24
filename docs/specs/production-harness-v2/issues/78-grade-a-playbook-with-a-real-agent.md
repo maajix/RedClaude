@@ -2,7 +2,7 @@
 
 **What to build:** A route by which the Agent that does the work in `rk playbook evaluate` reaches a synthetic fixture the way it reaches a real target -- through the door, with a Receipt per request -- without giving the door a way to dial the machine it runs on.
 
-**Blocked by:** 46 — Evaluate and promote one Playbook.
+**Blocked by:** 46 — Evaluate and promote one Playbook; 175 — An evaluation works a Program once and stops before the Playbook.
 
 **Status:** resolved
 

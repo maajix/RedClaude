@@ -2,7 +2,7 @@
 
 **What to build:** The graded runs the corpus migrations deferred: every in-scope Playbook hash evaluated against its bound fixtures through the door route, with the verdicts filed and whatever passes promoted at the text it ships.
 
-**Blocked by:** ticket 78, which built the door route this grades over.
+**Blocked by:** 78 — Grade a Playbook with a real Agent behind the door.
 
 **Status:** ready-for-human
 

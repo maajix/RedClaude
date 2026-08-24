@@ -199,6 +199,20 @@ burst = 50
 window_seconds = 3600
 """
 
+#: How many passes one graded Program is worked for. `rk run` performs one pass
+#: and reports the word a driver loop reads; an engagement is that loop run by an
+#: operator, and a Program worked once is a Program stopped after recon. That is
+#: not a Playbook grade: the claim recon proposes is `proposed`, the ranking pass
+#: is what makes it `testable` and derives the hunt Task, and the Playbook is
+#: selected when that Task is dispatched. So the evaluation drives the same loop.
+#:
+#: A ceiling rather than "until it stops", because `chooser_cut_off` and
+#: `task_attempted` are both "there is more to do" and a Program that keeps
+#: answering one of them would never return. `[budgets]` above is the real bound
+#: -- 400000 tokens and 200 requests per Program -- and this is the bound on the
+#: number of times the harness is willing to ask.
+PASSES = 12
+
 
 @dataclass(frozen=True, slots=True)
 class Route:
@@ -507,9 +521,19 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
     the fixture, so the address has to be recorded before the work starts. It is
     written after the marker rather than before it because the database will
     only accept it for a Program that is already an evaluation.
+
+    Both preparations happen on the first pass and no other. `_repeat` works one
+    Program until its Slate is empty, so this callable is invoked once per pass;
+    `open_fixture_address` writes a row and does not merge one, and a second
+    write of the same address would refuse the pass over a fact that has not
+    changed since the first.
     """
+    prepared = False
 
     def execute(ledger: Ledger, connection: pg.Connection, program_id: str) -> dict:
+        nonlocal prepared
+        if prepared:
+            return subject.work(ledger, connection, program_id)
         connection.execute(MARK, (program_id, subject.playbook_id, subject.fixture.name, variant))
         marked = tuple(connection.execute(MARKED, (program_id,)).rows[0])
         if marked != (subject.playbook_id, subject.fixture.name, variant):
@@ -562,6 +586,7 @@ def _graded_work(subject: Subject, variant: str, where: Served) -> program.Execu
                 f"{origin(subject.fixture)}:{where.port} is dialled at {where.host} "
                 f"for {program_id}",
             )
+        prepared = True
         return subject.work(ledger, connection, program_id)
 
     return execute
@@ -824,7 +849,7 @@ def _repeat(
     subject: Subject,
     index: int,
 ) -> Repeat | None:
-    """One repeat: every variant opened and worked, then counted."""
+    """One repeat: every variant opened and worked to an empty Slate, then counted."""
     programs: dict[str, str] = {}
     for variant in subject.variants:
         try:
@@ -832,11 +857,28 @@ def _repeat(
                 path = configuration(
                     workspace, subject.slug(variant, index), subject.fixture, where
                 )
-                result = program.run(
-                    settings,
-                    path,
-                    corpus=subject.corpus,
-                    execute=_graded_work(subject, variant, where),
+                # Inside the `served` block, and one `_graded_work` for all of
+                # the passes: the fixture has to stay on the port the Program
+                # recorded, and the address is recorded once.
+                graded = _graded_work(subject, variant, where)
+                passes = 0
+                while True:
+                    result = program.run(
+                        settings, path, corpus=subject.corpus, execute=graded
+                    )
+                    passes += 1
+                    stopped = result.facts.get("stop_reason")
+                    if result.violations or passes >= PASSES:
+                        break
+                    if stopped in (
+                        program.STOPPED_NOTHING_TO_EXECUTE,
+                        program.STOPPED_AWAITING_DECISION,
+                    ):
+                        break
+                ledger.hold(
+                    "passes",
+                    f"repeat {index} of {subject.fixture.name} ({variant}) was worked "
+                    f"{passes} pass(es) and stopped on {stopped}",
                 )
         except tls.Unusable as unusable:
             # A fixture that configures its own handshake needs an authority to
