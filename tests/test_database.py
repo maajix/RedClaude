@@ -18504,6 +18504,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             ("picked", AFFORDABLE),
             ("stale", AFFORDABLE),
             ("spent", SLATE_TIGHT),
+            ("reserved", AFFORDABLE),
             ("held", AFFORDABLE),
             ("contended", AFFORDABLE),
             ("roster", AFFORDABLE),
@@ -18532,6 +18533,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.arrange_picked()
         cls.arrange_stale()
         cls.arrange_spent()
+        cls.arrange_reserved()
         cls.arrange_held()
         cls.arrange_contended()
         cls.arrange_model_and_effort()
@@ -18689,6 +18691,47 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         # budget. What a refused claim must not have added is a second.
         cls.after_unaffordable = cls.counted("spent")
         cls.offer_when_poor = cls.offer()
+
+    @classmethod
+    def arrange_reserved(cls):
+        """A choice whose Program can no longer set aside one more run.
+
+        Ticket 181, and the state `browser-script` reached in canary seven: the
+        slate was offered while a run was still affordable, the orchestrator
+        spent the margin by choosing from it, and the claim then found
+        `tokens_free` below `run_tokens`. That is not this Task being too
+        expensive -- `unaffordable` above is that, and it still raises -- it is
+        the Program having no room for a run of any size, which is the same
+        answer the slate walk gives by finding nothing claimable.
+
+        `programs.run_token_budget` is raised rather than the ledger spent down.
+        What has to be true is `run_tokens > tokens_free`, and moving the
+        smaller of the two is one statement instead of an Agent run large enough
+        to eat a whole budget. `arrange_spent` above spends the ledger because
+        the number it is about is what the ledger holds.
+        """
+        cls.seed("reserved", 3)
+        cls.bind("reserved")
+        offered = cls.offer()
+        cls.reserved_task = offered[0]["task_label"]
+        cls.call("SELECT pick_task($1)", (cls.reserved_task,))
+        cls.as_owner(
+            "UPDATE programs SET run_token_budget = $2 WHERE id = $1::uuid",
+            (cls.identifiers["reserved"], 1_000_000_000),
+        )
+        cls.reserved_reason = cls.claimable("reserved", cls.reserved_task)
+        cls.reserved_claim = cls.call("SELECT claim_task()")
+        # A claim that answered NULL must not have opened a run or moved a Task,
+        # which is what separates "there was nothing to claim" from "something
+        # was claimed and then given up on".
+        cls.reserved_counts = cls.counted("reserved")
+        cls.reserved_pick = int(
+            cls.scalar(
+                "SELECT count(*) FROM task_picks"
+                " WHERE program_id = $1::uuid AND NOT consumed",
+                (cls.identifiers["reserved"],),
+            )
+        )
 
     @classmethod
     def arrange_held(cls):
@@ -19462,6 +19505,16 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         self.assertEqual(100000, self.left_before)
         self.assertEqual(50000, self.left_after)
         self.assertIn("is no longer claimable: unaffordable", self.unaffordable)
+
+    def test_a_spent_token_budget_ends_the_claim_without_raising(self):
+        # Ticket 181. The predicate still refuses, and the claim reports an idle
+        # queue rather than raising: a Program that cannot reserve one more run
+        # has nothing to claim, and the raise threw away the repeat that carried
+        # the work the budget did fund.
+        self.assertEqual("program_tokens_reserved", self.reserved_reason)
+        self.assertIsNone(self.reserved_claim)
+        self.assertEqual((0, 0), self.reserved_counts)
+        self.assertEqual(1, self.reserved_pick)
 
     def test_a_task_whose_identity_was_leased_is_refused_after_being_offered(self):
         self.assertIn("is no longer claimable: identity_held", self.identity_held)

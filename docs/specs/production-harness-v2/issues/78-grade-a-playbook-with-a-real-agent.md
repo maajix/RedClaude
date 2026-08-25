@@ -2,7 +2,7 @@
 
 **What to build:** A route by which the Agent that does the work in `rk playbook evaluate` reaches a synthetic fixture the way it reaches a real target -- through the door, with a Receipt per request -- without giving the door a way to dial the machine it runs on.
 
-**Blocked by:** 46 — Evaluate and promote one Playbook; 175 — An evaluation works a Program once and stops before the Playbook; 176 — An evaluation points every Program at a route its fixture does not serve; 177 — A door refusal of one request throws away a whole repeat; 178 — A graded Playbook names a Skill its own role cannot open; 179 — An evaluation selects a second Playbook and loses the first; 180 — A replay is refused a budget it cannot spend.
+**Blocked by:** 46 — Evaluate and promote one Playbook; 175 — An evaluation works a Program once and stops before the Playbook; 176 — An evaluation points every Program at a route its fixture does not serve; 177 — A door refusal of one request throws away a whole repeat; 178 — A graded Playbook names a Skill its own role cannot open; 179 — An evaluation selects a second Playbook and loses the first; 180 — A replay is refused a budget it cannot spend; 181 — A spent budget throws away the work it funded.
 
 **Status:** resolved
 
