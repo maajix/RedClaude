@@ -29579,6 +29579,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refuse_a_specification_nobody_should_store()
         cls.refuse_a_replay_the_conditions_do_not_admit()
         cls.open_a_replay_the_token_budget_cannot_fund()
+        cls.ask_the_preview_about_the_playbook_bar()
         cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
 
     def test_a_replay_is_not_refused_a_token_ceiling_it_cannot_spend(self):
@@ -29589,6 +29590,86 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         # program_tokens_reserved" and lost the repeat that carried it.
         self.assertEqual("program_tokens_reserved", self.starved_reason)
         self.assertIn("tool_run_id", self.starved)
+
+    @classmethod
+    def ask_the_preview_about_the_playbook_bar(cls):
+        """Ticket 182: the two halves of the bar, asked about one claim.
+
+        `enforce_playbook_evidence` is a second trigger on the same insert as
+        `enforce_hypothesis_transition`, named to sort before it, and 0032 calls
+        the two "a conjunction". `hypothesis_transition_refusal` was written as
+        the body of the base trigger alone, so it answered one half and returned
+        NULL for a transition the other half raises on.
+
+        `close_test_replay` asks that function rather than attempting the
+        transition, exactly so a conclusion the machine will not take becomes an
+        `inconclusive` Test run instead of an exception. A NULL it could not
+        trust turned the downgrade into a raise, and the raise took the whole
+        close with it: no Test run, the Tool run left `running`, the claim left
+        `testing`. That is the wreck `settle_one_that_holds_and_cannot_say_so`
+        above says no check reports and no retry can leave; in `rk2grade8` it
+        cost the campaign, because `rk run` reads `check_test_replays` before
+        every pass and four evaluations then did no work at all.
+
+        The Playbook is the shipped one that measured it. `attack-surface` asks
+        for a control `response_differential` before `supported`, this claim has
+        no Observation of that kind, and a real selection row is all it takes to
+        put the claim under that Playbook's bar.
+        """
+        hypothesis = cls.unsupported["hypothesis"]
+        subject = cls.unsupported["subject"]
+        # The hunt Task the claim is worked under. `claim_waiting` writes the
+        # claim and its transition and no Task, and `playbook_evidence_unmet`
+        # reaches the Playbook through one, so the chain has to exist before the
+        # bar can be asked about it.
+        cls.as_owner(
+            "INSERT INTO tasks (program_id, kind, status, hypothesis_id,"
+            " subject_entity_id)"
+            " VALUES ($1::uuid, 'hunt', 'pending', $2::uuid, $3::uuid)",
+            (cls.program_id, hypothesis, subject),
+        )
+        cls.as_owner(
+            "INSERT INTO playbook_selections"
+            " (program_id, task_id, subject_entity_id, playbook_id,"
+            "  playbook_sha256, rank)"
+            " SELECT t.program_id, t.id, t.subject_entity_id, p.id,"
+            "        p.source_sha256, 1"
+            "   FROM tasks t, playbooks p"
+            "  WHERE t.hypothesis_id = $1::uuid AND p.path = $2",
+            (hypothesis, "playbooks/attack-surface/playbook.md"),
+        )
+        # The chain, asserted rather than assumed: a selection that matched no
+        # Task would leave the bar with nothing to read, and the preview would
+        # answer NULL for the reason this ticket is about rather than in spite
+        # of it.
+        cls.barred_rows = int(
+            cls.connection.execute(
+                "SELECT count(*) FROM playbook_evidence_unmet($1::uuid, 'supported')",
+                (hypothesis,),
+            ).scalar()
+        )
+        # No Receipt and no Agent run: 007 would refuse this one too, and the
+        # answer has to be the Playbook's because that is the trigger that fires
+        # first and so the sentence a writer would actually be given.
+        cls.barred = cls.connection.execute(
+            "SELECT hypothesis_transition_refusal($1::uuid, 'testing', 'supported',"
+            " 'runtime', NULL, NULL)",
+            (hypothesis,),
+        ).scalar()
+
+    def test_the_refusal_preview_asks_the_playbook_bar_as_well(self):
+        # Ticket 182. Non-NULL is the whole point -- a NULL here is what
+        # `close_test_replay` trusted and what turned a downgrade into a raise --
+        # and the sentence is `enforce_playbook_evidence`'s own, because the
+        # preview calls the function the trigger calls.
+        self.assertIsNotNone(self.barred)
+        # The role is not pinned: the bar has an unmet row for the control and
+        # one for the variant, `LIMIT 1` takes whichever the plan hands back
+        # first, and the trigger picks the same way. What is pinned is the rest
+        # of the sentence, which is the trigger's own format string.
+        self.assertEqual(2, self.barred_rows)
+        self.assertIn("playbooks/attack-surface/playbook.md requires 1 x", str(self.barred))
+        self.assertIn("kind=response_differential) for supported, found 0", str(self.barred))
 
     # -- the three outcomes ----------------------------------------------------
 
