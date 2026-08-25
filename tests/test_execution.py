@@ -2880,6 +2880,88 @@ class PerformTest(unittest.TestCase):
         )
         self.assertEqual("error", facts["agent_run"]["stop_reason"])
 
+    #: What `_conclude` writes for a Test that ran and could not reach its
+    #: conclusion: the failed `run` assertion and the violation behind it, both
+    #: carrying one sentence. Quoted from canary nine, `attack-surface` against
+    #: `artifact-exposure-pair` in `rk2grade9` on 2026-08-25.
+    WITHHELD = (
+        "TST1 holds over 3 action(s); the claim is inconclusive, because playbook "
+        "playbooks/attack-surface/playbook.md requires 1 x "
+        "(role=control, kind=response_differential) for supported, found 0"
+    )
+
+    def withholding(self, test_run):
+        """One attempt whose replay reported the verdict `_conclude` fails on."""
+        connection = Recorder(
+            started=(started_row(kind="perform", role="performer", test_label="TST1"),)
+        )
+        withheld = outcome_module.Report(
+            "test replay",
+            assertions=(
+                outcome_module.Assertion(name="run", ok=False, detail=self.WITHHELD),
+            ),
+            violations=(
+                outcome_module.Violation(
+                    code="invalid_configuration",
+                    source="test_run",
+                    detail=self.WITHHELD,
+                ),
+            ),
+            facts={"test_run": test_run},
+        )
+        with compiled():
+            with mock.patch.object(
+                execution.replay_module, "run", return_value=withheld
+            ):
+                return attempt(
+                    connection,
+                    Launcher(),
+                    configuration=Path("/tmp/program.toml"),
+                    proxy_url=self.DOOR,
+                )
+
+    def test_a_settled_test_that_reached_no_conclusion_does_not_refuse_the_pass(self):
+        """Ticket 183, measured on canary nine.
+
+        `_conclude` spends `INVALID_CONFIGURATION` on a Test that settled
+        `inconclusive` and on a conclusion the epistemic machine withheld, which
+        is what `rk test replay` owes an operator who has to run it again. Here
+        the Test run is the Task's ending, so the same sentence is a
+        measurement. Carried as a violation it ends the pass loop and
+        `evaluation._repeat` discards the whole repeat, every variant of it --
+        ticket 177's fault, one layer up.
+        """
+        ledger, facts = self.withholding({"label": "TR1", "outcome": "holds"})
+
+        self.assertEqual([], ledger.violations)
+        self.assertEqual("completed", facts["agent_run"]["stop_reason"])
+
+    def test_the_verdict_it_could_not_reach_is_still_in_the_pass(self):
+        # Demoted, not dropped. The sentence naming what the Test would have
+        # needed is the one document worth keeping, so it is held under the name
+        # `_conclude` gave it and stays whole on `facts["replay"]`, where the
+        # replay's own report keeps it as the violation it is.
+        ledger, facts = self.withholding({"label": "TR1", "outcome": "holds"})
+        held = [item for item in ledger.assertions if item.name == "run"]
+
+        self.assertEqual([True], [item.ok for item in held])
+        self.assertEqual([self.WITHHELD], [item.detail for item in held])
+        self.assertEqual(
+            [self.WITHHELD],
+            [violation["detail"] for violation in facts["replay"]["violations"]],
+        )
+
+    def test_a_replay_that_died_before_settling_keeps_every_refusal_it_raised(self):
+        # The other writer of a `test_run` violation is `_abandon`, reached when
+        # `close_test_replay` was itself refused -- and that transaction rolls
+        # back, so there is no Test run. Nothing about that is a measurement.
+        ledger, facts = self.withholding(None)
+
+        self.assertEqual(
+            [self.WITHHELD], [violation.detail for violation in ledger.violations]
+        )
+        self.assertEqual("error", facts["agent_run"]["stop_reason"])
+
     def test_the_capability_is_sent_to_this_machine_and_not_to_the_agent_network(self):
         """Ticket 153, measured live before it was fixed.
 

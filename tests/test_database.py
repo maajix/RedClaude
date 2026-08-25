@@ -18504,6 +18504,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             ("picked", AFFORDABLE),
             ("stale", AFFORDABLE),
             ("spent", SLATE_TIGHT),
+            ("outgrown", SLATE_TIGHT),
             ("reserved", AFFORDABLE),
             ("held", AFFORDABLE),
             ("contended", AFFORDABLE),
@@ -18534,6 +18535,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         cls.arrange_stale()
         cls.arrange_spent()
         cls.arrange_reserved()
+        cls.arrange_outgrown()
         cls.arrange_held()
         cls.arrange_contended()
         cls.arrange_model_and_effort()
@@ -18700,9 +18702,11 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         slate was offered while a run was still affordable, the orchestrator
         spent the margin by choosing from it, and the claim then found
         `tokens_free` below `run_tokens`. That is not this Task being too
-        expensive -- `unaffordable` above is that, and it still raises -- it is
-        the Program having no room for a run of any size, which is the same
-        answer the slate walk gives by finding nothing claimable.
+        expensive -- `unaffordable` is that, and `arrange_outgrown` below
+        covers it -- it is the Program having no room for a run of any size,
+        which is the same answer the slate walk gives by finding nothing
+        claimable. Ticket 184 ends an unnamed claim on either reason; a claim
+        that names its Task still raises on both.
 
         `programs.run_token_budget` is raised rather than the ledger spent down.
         What has to be true is `run_tokens > tokens_free`, and moving the
@@ -18730,6 +18734,44 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                 "SELECT count(*) FROM task_picks"
                 " WHERE program_id = $1::uuid AND NOT consumed",
                 (cls.identifiers["reserved"],),
+            )
+        )
+
+    @classmethod
+    def arrange_outgrown(cls):
+        """A choice this Task's own cost outgrew, claimed the way the runtime claims.
+
+        Ticket 184, and the state `object-ownership` reached in canary nine.
+        The same race as `arrange_reserved` above and the same remedy; only the
+        refusal differs. `arrange_spent` reaches `unaffordable` too, but it
+        names its Task -- which is the whole reason ticket 181 believed this arm
+        was protected -- so nothing until now claimed on this reason the way
+        `execution.CLAIM` does, with no argument at all.
+
+        The ledger is spent rather than `run_token_budget` raised, because
+        `unaffordable` is a statement about what the ledger holds against this
+        Task's `estimated_cost`. That is `arrange_spent`'s arrangement, reused
+        after a pick.
+        """
+        cls.seed("outgrown", 3)
+        cls.bind("outgrown")
+        offered = cls.offer()
+        cls.outgrown_task = offered[0]["task_label"]
+        cls.call("SELECT pick_task($1)", (cls.outgrown_task,))
+        cls.as_owner(
+            "INSERT INTO agent_runs (program_id, role, model, effort, mission_packet,"
+            " input_tokens, output_tokens)"
+            " VALUES ($1::uuid, 'orchestrator', 'operator', 'low', '{}', $2, $3)",
+            (cls.identifiers["outgrown"], *SLATE_SPEND),
+        )
+        cls.outgrown_reason = cls.claimable("outgrown", cls.outgrown_task)
+        cls.outgrown_claim = cls.call("SELECT claim_task()")
+        cls.outgrown_counts = cls.counted("outgrown")
+        cls.outgrown_pick = int(
+            cls.scalar(
+                "SELECT count(*) FROM task_picks"
+                " WHERE program_id = $1::uuid AND NOT consumed",
+                (cls.identifiers["outgrown"],),
             )
         )
 
@@ -19515,6 +19557,28 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         self.assertIsNone(self.reserved_claim)
         self.assertEqual((0, 0), self.reserved_counts)
         self.assertEqual(1, self.reserved_pick)
+
+    def test_a_task_this_ones_cost_outgrew_ends_an_unnamed_claim_too(self):
+        # Ticket 184, the fifth door into ticket 181's fault and the one the
+        # runtime actually walks through: `execution.CLAIM` is
+        # `SELECT claim_task()` and names nothing. The pick stays on the books
+        # unconsumed, so the work the budget did fund is still filed.
+        self.assertEqual("unaffordable", self.outgrown_reason)
+        self.assertIsNone(self.outgrown_claim)
+        # One Agent run, and the fixture opened it to spend the budget down --
+        # the same reading `arrange_spent` takes of the same arrangement. What a
+        # claim that answered NULL must not have done is add a second or move a
+        # Task.
+        self.assertEqual((0, 1), self.outgrown_counts)
+        self.assertEqual(1, self.outgrown_pick)
+
+    def test_a_named_claim_still_raises_on_the_cost_it_cannot_meet(self):
+        # The other half of 184, and the reading ticket 181 got wrong without
+        # checking: criterion 3's refusal is arranged with `claim_task($1)`, so
+        # the `p_task_label IS NULL` clause excludes it however long the reason
+        # list grows. Asserted here as well as there, because what makes that
+        # test keep passing is now a property of this list.
+        self.assertIn("is no longer claimable: unaffordable", self.unaffordable)
 
     def test_a_task_whose_identity_was_leased_is_refused_after_being_offered(self):
         self.assertIn("is no longer claimable: identity_held", self.identity_held)

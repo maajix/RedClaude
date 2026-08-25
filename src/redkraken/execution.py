@@ -2410,17 +2410,46 @@ class Slice:
             ca_file=self.boundary.certificate,
         )
         facts["replay"] = performed.as_dict()
-        # Carried whole rather than summarised. The replay keeps its own ledger
-        # because it is an operator command in its own right, and a pass that
-        # reported only "it failed" would be hiding the one document that says
-        # which precondition, which action or which assertion it was.
-        ledger.assertions.extend(performed.assertions)
-        ledger.violations.extend(performed.violations)
         # `test_run` is written by `close_test_replay` in the transaction that
         # settles the claim, so its presence is the whole question: a replay
         # that opened and died leaves a Tool run and no Test run, which is this
         # attempt spent and the Task correctly not done.
         settled = performed.facts.get("test_run") is not None
+        # Carried whole rather than summarised. The replay keeps its own ledger
+        # because it is an operator command in its own right, and a pass that
+        # reported only "it failed" would be hiding the one document that says
+        # which precondition, which action or which assertion it was.
+        #
+        # Ticket 183. One exception, and it is the verdict itself. `_conclude`
+        # spends `INVALID_CONFIGURATION` on a Test that settled `inconclusive`
+        # and on a conclusion the epistemic machine withheld. That is right for
+        # `rk test replay`, where an operator asked for a Test and has to run it
+        # again, and it claims the wrong thing here: this method's own contract
+        # is that the Task's ending is the Test run and not the verdict in it,
+        # and `settled` is already the test of that. A settled Test that could
+        # not reach its conclusion is the measurement the Task was minted to
+        # take. Left as a violation it ends the pass loop and `evaluation._repeat`
+        # then discards the whole repeat, every variant of it, exactly as ticket
+        # 177's refused request did -- so a playbook whose bar a fixture cannot
+        # meet would void the measurement that says so.
+        #
+        # Only that one sentence is demoted, and it is demoted whole rather than
+        # dropped: `_conclude` is the sole writer of a `run` assertion and the
+        # sole writer of a `test_run` violation once a Test run exists, so the
+        # pair moves together and no assertion is left without the violation
+        # behind it. A replay that died before settling keeps every violation it
+        # raised, including the `test_run` one `_abandon` writes when
+        # `close_test_replay` itself was refused.
+        for assertion in performed.assertions:
+            if settled and not assertion.ok and assertion.name == "run":
+                ledger.hold(assertion.name, assertion.detail)
+            else:
+                ledger.assertions.append(assertion)
+        ledger.violations.extend(
+            violation
+            for violation in performed.violations
+            if not (settled and violation.source == "test_run")
+        )
         run["stop_reason"] = "completed" if settled else "error"
 
     def _budget_ends(
