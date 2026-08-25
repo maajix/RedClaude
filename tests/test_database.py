@@ -29525,7 +29525,17 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refuse_what_a_run_may_not_cite()
         cls.refuse_a_specification_nobody_should_store()
         cls.refuse_a_replay_the_conditions_do_not_admit()
+        cls.open_a_replay_the_token_budget_cannot_fund()
         cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
+
+    def test_a_replay_is_not_refused_a_token_ceiling_it_cannot_spend(self):
+        # Ticket 180. The same Task, asked the two questions in the same state:
+        # a claim that would start a model is refused, and the replay that
+        # starts none opens. Measured in `rk2grade6`, where four of five
+        # evaluations ended on "the budget refuses this replay:
+        # program_tokens_reserved" and lost the repeat that carried it.
+        self.assertEqual("program_tokens_reserved", self.starved_reason)
+        self.assertIn("tool_run_id", self.starved)
 
     # -- the three outcomes ----------------------------------------------------
 
@@ -29913,6 +29923,46 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         )
 
     # -- criterion 2's conditions ---------------------------------------------
+
+    @classmethod
+    def open_a_replay_the_token_budget_cannot_fund(cls):
+        """Ticket 180. A replay spends no tokens, so a token ceiling is not its ceiling.
+
+        `budget_refusal_for` answers `program_tokens_reserved` as soon as fewer
+        than one agent run's worst case is free, and `rk2_replay_plan` used to
+        refuse on any answer it gave. A replay starts no model, so that refused
+        a zero-token operation for not being able to afford a whole run. The
+        per-run ceiling is raised past the whole budget here, which is the same
+        state a Program is in after it has spent most of its tokens on passes.
+        """
+        hypothesis, _ = cls.claim_waiting("the orders API answers for a neighbour")
+        stored = cls.stored(
+            hypothesis,
+            specification(
+                [{"id": "funded", "kind": "status_equals", "action": 1, "status": 200}]
+            ),
+        )
+        was = cls.connection.execute(
+            "SELECT run_token_budget FROM programs WHERE id = $1::uuid", (cls.program_id,)
+        ).scalar()
+        cls.as_owner(
+            "UPDATE programs SET run_token_budget = 1000000000 WHERE id = $1::uuid",
+            (cls.program_id,),
+        )
+        try:
+            run = cls.replay_run()
+            cls.starved_reason = cls.connection.execute(
+                "SELECT budget_refusal_for(t.*) FROM tasks t"
+                " JOIN agent_runs a ON a.task_id = t.id WHERE a.id = $1::uuid",
+                (run,),
+            ).scalar()
+            cls.starved = cls.called(cls.OPEN, (run, stored, None))
+        finally:
+            cls.as_owner(
+                "UPDATE programs SET run_token_budget = $1 WHERE id = $2::uuid",
+                (was, cls.program_id),
+            )
+        committed(cls.connection, cls.CLOSE, (cls.starved["tool_run_id"], "skipped", "abandoned"))
 
     @classmethod
     def refuse_a_replay_the_conditions_do_not_admit(cls):
