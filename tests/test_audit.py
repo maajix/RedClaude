@@ -73,7 +73,7 @@ class AuditGateTest(unittest.TestCase):
             "  stories                230   decisions 19  testing 24  scope 9"
             "  notes 6  regressions 7\n"
             "  verification           216   tests 211  gates 5  owed 1\n"
-            "  tickets                205   resolved 172  audited 63  deferred criteria 11\n"
+            "  tickets                206   resolved 173  audited 63  deferred criteria 11\n"
             "  area: runtime          144   anchors 1\n"
             "  area: agents            38   anchors 2\n"
             "  area: skills             7   anchors 1\n"
