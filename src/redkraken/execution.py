@@ -176,6 +176,23 @@ QUOTA = "SELECT advance_lane_quota('runtime')"
 OFFER = "SELECT * FROM offer_slate()"
 CLAIM = "SELECT claim_task()"
 
+#: Why an empty Slate is empty, in the scheduler's own words. Ticket 208.
+#: `claimable_for` is the predicate `offer_slate` filters on, so asking it
+#: directly is reading the reason rather than guessing at one -- and the reasons
+#: are worlds apart: a campaign with nothing left to do and a campaign holding
+#: 685 Tasks it has no lane budget to fund both answered "no Task is ready", and
+#: an operator was told the first when it was the second.
+#:
+#: Grouped and not listed. The point is which wall the pass hit, and a Program
+#: can have hundreds of Tasks behind one.
+UNREADY = (
+    "SELECT claimable_for(t, w) AS reason, count(*) AS tasks"
+    "  FROM tasks t"
+    "  CROSS JOIN (SELECT * FROM scheduler_weights WHERE active) w"
+    " WHERE t.status = 'pending' AND t.program_id = rk2_program_required()"
+    " GROUP BY 1 ORDER BY 2 DESC, 1"
+)
+
 #: The decision between the offer and the claim. `open_orchestrator_session`
 #: opens the Task-less Agent run the choice is made in and answers the two
 #: ceilings the child has no database to read; `record_choice` writes what came
@@ -1517,7 +1534,7 @@ class Slice:
             return
         facts["slate"] = offered
         if not offered:
-            ledger.hold("slate", "no Task is ready; nothing was claimed")
+            ledger.hold("slate", self._unready(connection))
             return
 
         chosen = self._choose(ledger, connection, program_id, offered)
@@ -1772,6 +1789,38 @@ class Slice:
                     source="database",
                 )
                 return None
+
+    @staticmethod
+    def _unready(connection: pg.Connection) -> str:
+        """The empty Slate, with the wall the pass hit named on it.
+
+        Ticket 208. "no Task is ready; nothing was claimed" was the whole of
+        what an operator got, and it reads as a campaign that finished. On
+        `rk2here` it was a campaign holding 685 pending Tasks whose two working
+        lanes had each spent all but one run's worth of a 200,000,000-token
+        ceiling -- so `hunt.sh` printed "no work left" and stopped, and 1.6
+        billion tokens of the Program's own budget sat unspent behind a lane
+        deckel nobody could see from the report.
+
+        The sentence keeps its opening words: that half is a true statement
+        about the Slate and three cases in the suite read it. What follows is
+        the reason, or nothing where the pass genuinely has no pending Task to
+        have a reason about.
+
+        Held and never failed, and a read that raises is swallowed for the same
+        reason: this is a sentence about a pass that already ended, and a
+        Program whose empty Slate could not be explained is not a Program whose
+        pass went wrong.
+        """
+        sentence = "no Task is ready; nothing was claimed"
+        try:
+            with connection.transaction():
+                rows = connection.execute(UNREADY).rows
+        except pg.DatabaseError:
+            return sentence
+        if not rows:
+            return f"{sentence}; no Task is pending"
+        return f"{sentence}; " + ", ".join(f"{int(count)} {reason}" for reason, count in rows)
 
     # -- the decision ------------------------------------------------------
 

@@ -481,6 +481,10 @@ class Recorder:
         )
         # Ticket 143. What `retire_task` answers: the status the Task ended at.
         self.retired = answers.get("retired", "abandoned")
+        # Ticket 208. Empty by default: a fake whose Slate is empty and
+        # whose queue is empty is the ordinary "nothing left to do", and
+        # a case about a wall the pass hit says which wall.
+        self.unready = answers.get("unready", ())
         # What the weights row says one Mission packet may cost. An empty list
         # is a scheduler with no active row, which is a real state and the one
         # the module answers with its own defaults.
@@ -668,6 +672,11 @@ class Recorder:
             return [(self.refusal_closed,)]
         if sql == proxy.PARK_TOOL_RUN:
             return [("PD1",)]
+        # Ticket 208: asked only when the Slate came back empty, and answered
+        # with the shape rather than with a scenario. A fake that answered rows
+        # here would be inventing a reason the scheduler never gave.
+        if sql == execution.UNREADY:
+            return list(self.unready)
         if sql == proposal.INSERT:
             return [(PROPOSAL, "PR1", proposal.STAGED)]
         # Two writers put rows in `proposal_drops`: the staging trigger, before
@@ -1498,6 +1507,34 @@ class SlateTest(unittest.TestCase):
         self.assertIsNone(facts["task"])
         self.assertNotIn(execution.CLAIM, connection.statements)
         self.assertEqual([], launcher.requests)
+
+    def slate_sentence(self, **answers) -> str:
+        connection = Recorder(slate=0, **answers)
+        ledger, _ = attempt(connection, Launcher())
+        return [one.detail for one in ledger.assertions if one.name == "slate"][-1]
+
+    def test_an_empty_slate_says_which_wall_the_pass_hit(self):
+        # Ticket 208. `rk2here` held 685 pending Tasks whose two working lanes
+        # had each spent all but one run's worth of their token ceiling, and the
+        # pass said "no Task is ready" -- which reads as a campaign that
+        # finished. `claimable_for` is the predicate the offer filters on, so
+        # the reason was there to be asked for the whole time.
+        said = self.slate_sentence(
+            unready=[("lane_tokens_reserved", 653), ("hunt.no_address", 6)]
+        )
+
+        self.assertIn("no Task is ready", said)
+        self.assertIn("653 lane_tokens_reserved", said)
+        self.assertIn("6 hunt.no_address", said)
+
+    def test_a_program_with_nothing_pending_says_that_instead(self):
+        # The other empty Slate, and the one the sentence used to mean: there is
+        # no wall, there is no Task. An operator reading this one has a campaign
+        # that is actually done.
+        said = self.slate_sentence()
+
+        self.assertIn("no Task is ready", said)
+        self.assertIn("no Task is pending", said)
 
     def test_the_offered_slate_is_carried_out_of_the_attempt_entry_by_entry(self):
         # A slate reduced to a count is a slate nobody was offered. The
