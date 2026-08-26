@@ -1753,6 +1753,26 @@ class ExchangeTest(unittest.TestCase):
         # different fact and is recorded as one.
         self.assertIn("ts_egress", filed)
         self.assertEqual(PINNED, filed["pinned_ips"])
+        # And it names the run it was authorised under. A dial towards a host
+        # that never answers takes the whole timeout, which is long enough for
+        # that run to close underneath the request -- and the capability stops
+        # resolving the moment it does. Resolved once, when it was live, and
+        # said here, the row cannot become egress with nothing behind it.
+        self.assertEqual(
+            "22222222-2222-2222-2222-222222222222", filed["tool_run_id"]
+        )
+
+    def test_a_refusal_made_before_any_authorization_names_no_run(self):
+        # The other side of the line above. Nothing was decided, so there is no
+        # run to name, and a door that filled one in would be inventing the
+        # attribution the standing check reads.
+        self.fence.revoked_after = 0
+
+        self.through("http://target.example.test/v1/notes").read()
+
+        filed = self.fence.blocked[0]["receipt"]
+        self.assertNotIn("tool_run_id", filed)
+        self.assertEqual("denied", filed["scope_class"])
 
     def test_an_address_the_program_withdrew_is_refused_before_the_socket(self):
         # Criterion 2's second half, and the half the shape check cannot make:
@@ -3681,6 +3701,26 @@ class ControlPlaneTest(unittest.TestCase):
             # cannot sign for is refused before anything about a capability is
             # asked. Which is the whole point -- the carried one was answered.
             self.assertEqual(405, status)
+
+
+class MediaTypeTest(unittest.TestCase):
+    """Ticket 186: what the target said it sent, as the Receipt records it."""
+
+    def test_the_type_is_kept_and_everything_after_it_is_not(self):
+        for name, (header, media) in {
+            "a type with a charset": ("application/javascript; charset=utf-8",
+                                      "application/javascript"),
+            "a type on its own": ("application/json", "application/json"),
+            "a type the target shouted": ("TEXT/JAVASCRIPT", "text/javascript"),
+            "a type with room around it": ("  text/html ; x=1", "text/html"),
+            # Null stays null. A target that declared nothing has said nothing,
+            # which is not the same as having said `text/plain`.
+            "no header at all": (None, None),
+            "a header with nothing in it": ("", None),
+            "a header that is only a parameter": ("; charset=utf-8", None),
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(media, proxy._media(header))
 
 
 if __name__ == "__main__":

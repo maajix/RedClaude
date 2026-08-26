@@ -53,8 +53,9 @@ from dataclasses import dataclass
 #: part of that contract: an answer that names request paths names them there,
 #: and the runtime files them against the run. Version 2 added the `method` a
 #: literal names in front of its own path, and narrowed `paths` to what
-#: `groundable` admits -- see both below.
-VERSION = "rk2-jsscan 2"
+#: `groundable` admits -- see both below. Version 3 reads the body of an HTTP
+#: message when it is handed one, and says so in `carrier_bytes`.
+VERSION = "rk2-jsscan 3"
 
 #: The one file `js_map` may write, and it is the name the registry declares as
 #: a declared output. Bare, because the workspace is where the runtime mounts it
@@ -935,6 +936,43 @@ def answer(question: str, raw: bytes, text: str, rest: list[str]) -> dict:
         raise Refused(f"the source to recover is named by index, not {rest[0]!r}") from None
 
 
+#: What `proxy.transcript` writes in front of a response, and the separator it
+#: puts between the head and the body. Every Artifact the door files is one of
+#: these -- `artifacts.content_type` is `message/http` for all of them -- so a
+#: bundle this Program fetched arrives wrapped, and the wrapping is written by
+#: this installation rather than guessed at.
+CARRIER = b"HTTP/1."
+CARRIER_BREAK = b"\r\n\r\n"
+
+
+def carried_body(raw: bytes) -> tuple[bytes, int]:
+    """The bytes to analyse, and how many an HTTP carrier took in front of them.
+
+    Zero means the input was not a response and is returned whole, which is the
+    case for anything `js_map` recovered and for anything an operator filed by
+    hand. One code path for all three.
+
+    The reason is not tidiness. Measured on a transcript whose headers were
+    written to be read as JavaScript, `js_parse` reported `/api/fake` among the
+    file's path literals -- the string came from `X-Quote: he said "/api/fake"
+    loudly`, which is a header the *target* chose. `path_literals` says what the
+    file holds, and a target that can write into that answer can write into the
+    surface a Program records. `js_routes` was already immune, because a header
+    line is not a call, and that is the difference the grounding rule buys.
+
+    Deliberately strict about what a response is. A bundle may begin with
+    anything, and a rule that cut at the first blank line would discard the top
+    of any file whose banner comment contains one. The start line and the CRLF
+    separator together are what `transcript` writes and what nothing else does.
+    """
+    if not raw.startswith(CARRIER):
+        return raw, 0
+    cut = raw.find(CARRIER_BREAK)
+    if cut < 0:
+        return raw, 0
+    return raw[cut + len(CARRIER_BREAK):], cut + len(CARRIER_BREAK)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] == "--version":
         sys.stdout.write(VERSION + "\n")
@@ -956,9 +994,10 @@ def main(argv: list[str]) -> int:
     # an analysis that refused one would refuse exactly the minified files this
     # exists to read; the hash below is of the bytes, so what was analysed is
     # still named exactly.
-    text = raw.decode("utf-8", "replace")
+    body, carrier = carried_body(raw)
+    text = body.decode("utf-8", "replace")
     try:
-        found = answer(question, raw, text, argv[3:])
+        found = answer(question, body, text, argv[3:])
     except Refused as error:
         sys.stderr.write(f"{error}\n")
         return 3
@@ -967,7 +1006,12 @@ def main(argv: list[str]) -> int:
         {
             "tool": question,
             "analyser": VERSION,
+            # Of the bytes as read and never of the body. This is what the
+            # Tool run recorded as its input and what `check_source_citation`
+            # holds a citation against, so a digest of what was analysed would
+            # name something no row has.
             "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "carrier_bytes": carrier,
             **found,
         },
         sys.stdout,

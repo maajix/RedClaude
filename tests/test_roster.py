@@ -1287,6 +1287,17 @@ class SchemaAgreementTest(unittest.TestCase):
         r"'(?P<model>[\w.-]+)', '(?P<effort>\w+)', (?P<loads_skills>true|false)\)"
     )
 
+    #: A clamp a later migration turns on. A role added after 019 states its
+    #: clamp in the row that creates it; a role that was already there and
+    #: starts acting as an account has that said in an UPDATE instead, and a
+    #: test reading only INSERTs would let the schema and this module disagree
+    #: for exactly as long as nobody looked -- which is how ticket 191 left
+    #: `recon` clamped in the database and unclamped here.
+    CLAMP_UPDATE = re.compile(
+        r"UPDATE roles SET clamp_to_identity_leases = (?P<clamp>true|false)\s*"
+        r"WHERE role = '(?P<role>\w+)'"
+    )
+
     @classmethod
     def setUpClass(cls):
         migrations = ROOT / "src" / "redkraken" / "migrations"
@@ -1317,6 +1328,14 @@ class SchemaAgreementTest(unittest.TestCase):
                 start = text.index(";", where)
         return found
 
+    def clamp_updates(self) -> dict[str, bool]:
+        """Every later change to the clamp, which is not shipped in a row."""
+        found: dict[str, bool] = {}
+        for text in self.later:
+            for match in self.CLAMP_UPDATE.finditer(text):
+                found[match["role"]] = match["clamp"] == "true"
+        return found
+
     def added_mappings(self) -> list[re.Match]:
         """Every role/kind pair a later migration adds."""
         found = []
@@ -1340,6 +1359,7 @@ class SchemaAgreementTest(unittest.TestCase):
             *self.ROWS.finditer(self.statement("INSERT INTO roles")),
             *self.added_rows(self.LATER_ROWS),
         ]
+        clamped = self.clamp_updates()
         stated = {}
         for row in rows:
             role = roster.ROLES[row["role"]]
@@ -1348,7 +1368,7 @@ class SchemaAgreementTest(unittest.TestCase):
                 (row["invocable_by"],),
                 row["executes_tasks"] == "true",
                 int(row["max_concurrent"]),
-                row["clamp"] == "true",
+                clamped.get(row["role"], row["clamp"] == "true"),
             )
             with self.subTest(role=row["role"]):
                 self.assertEqual(

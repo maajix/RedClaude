@@ -157,6 +157,7 @@
     "src/redkraken/replay.py": "the replay lane, which re-sends a recorded exchange through the door",
     "src/redkraken/_launch.py": "the child, which speaks to the model through the door like any other client",
     "src/redkraken/ui.py": "the operator console, listening on loopback and dialling nothing",
+    "src/redkraken/graph.py": "the campaign drawn as a graph, listening on loopback and dialling nothing",
     "src/redkraken/evaluation.py": "the evaluation's fixture server, which serves the target an evaluation attacks"
   }
 }

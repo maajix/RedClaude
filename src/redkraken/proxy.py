@@ -3265,6 +3265,14 @@ class Handler(BaseHTTPRequestHandler):
             "path": request.path_raw,
             "query_sha256": query_sha256(url),
             "status_code": status,
+            # Ticket 186. The media type the target declared for what it sent
+            # back. Read off the Agent view for the reason `onward` is, and
+            # recorded because the door is the only party that ever sees it: the
+            # Artifact behind this Receipt is the whole message and is filed as
+            # `message/http`, so without this column nothing downstream can tell
+            # a bundle from a page -- which is what decides whether these bytes
+            # are application source this Program fetched.
+            "response_content_type": _media(_header(agent_back, "Content-Type")),
             "ts_arrival": arrival.isoformat(),
             "ts_egress": egress.isoformat(),
             "waited_ms": int((datetime.now(timezone.utc) - egress).total_seconds() * 1000),
@@ -3401,6 +3409,18 @@ class Handler(BaseHTTPRequestHandler):
             "scope_class": authorization.scope_class if authorization else "denied",
             "intercepted": True,
         }
+        if authorization is not None:
+            # The run this attempt was authorised under, said here rather than
+            # resolved from the capability again. A capability resolves only
+            # while its run is open, and a connect towards a host that never
+            # answers takes as long as the timeout allows -- so a run whose
+            # last request met a dead target closes while that request is still
+            # on the wire, and by the time the refusal is written the capability
+            # names nothing. Written from the authorization, the row keeps the
+            # run it really belongs to instead of reading as egress nobody
+            # asked for. It is only ever the door saying what it already
+            # decided: the agent cannot reach this field.
+            receipt["tool_run_id"] = authorization.tool_run_id
         if egress is not None:
             receipt["ts_egress"] = egress.isoformat()
             receipt["waited_ms"] = int(
@@ -3542,6 +3562,21 @@ def _header(headers: list[tuple[str, str]], name: str) -> str | None:
     """
     wanted = name.lower()
     return next((value for header, value in headers if header.lower() == wanted), None)
+
+
+def _media(value: str | None) -> str | None:
+    """A `Content-Type` reduced to the media type it names, lowercased.
+
+    Parameters dropped, because `application/javascript` and
+    `application/javascript; charset=utf-8` are one answer to the question this
+    is asked for -- whether what came back is application source -- and keeping
+    the charset would make that a question about two strings. Null stays null: a
+    target that declared no type has said nothing, which is not the same as
+    having said `text/plain`.
+    """
+    if value is None:
+        return None
+    return value.split(";", 1)[0].strip().lower() or None
 
 
 def _authority(host: str, port: int, protocol: str | None) -> str:

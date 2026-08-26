@@ -144,6 +144,71 @@ Order, therefore: grade a slice so the ranking has something behind it, hunt
 for the rest, and let what the hunt breaks decide which further Playbooks are
 worth 324 runs each.
 
+## What the five high-yield pairs measured
+
+The slice this ticket authorised was run on 2026-08-25 as canary 12, database
+`rk2grade12`, over a detached worktree of `808a8a2a` at
+`out/grading-freeze-20260825T134359Z.json` -- `dirty: False`, source sha256
+`ed1707522cc5`, 197 migrations. Five evaluations, all exit 0, no violations, 30
+Programs, which is 5 x 3 repeats x 2 Programs per own-pair repeat exactly.
+`check_test_replays` reported 0 problems and `rk db verify` 97 assertions with 0
+violations.
+
+**Criterion 2 holds for every run filed.** All 15 `playbook_test_runs` carry
+`route = 'door'`, every one has Tool runs -- 157 across the fifteen, fewest 4,
+most 15 -- and `check_playbook_tests` reports no `test_run_reached_nothing`
+against any of them. The route ticket 78 built carried the whole slice.
+
+**The corpus scored nothing on it.** `discriminating_tp` is 0 on all fifteen
+runs. So are `false_positives`, `admitted_secure`, `ungrounded` and
+`out_of_scope`. `attack-surface`, `browser-script`, `cookies` and
+`payment-workflows` filed no claim at all across three repeats each;
+`object-ownership` filed 1, 1 and 3 and discriminated none of them. 0 Findings,
+34 Test runs (26 `refutes`, 8 `holds`), 139 Tasks done and none errored.
+
+All fifteen rows are `side = 'in'`, which is what a high-yield pair is: 0036's
+`playbook_fixture_binding` computes the side from `playbook_outputs x
+fixture_classes` and refuses the caller's opinion of it. No `out` row can exist
+until a Playbook is graded against the rest of its binding, so the
+false-positive number above is a structural zero rather than a measured one.
+Each evaluation says as much in its own verdict: `untested: 54 fixture(s) in the
+binding have no run at this text`.
+
+### Why the four scored nothing
+
+`check_playbook_tests` warns `test_run_froze_no_skills` against exactly the four
+Playbooks that filed no claim, and not against `object-ownership`. The freeze is
+not a record of what an Agent did with a Skill; migration
+`20260914T000000Z__a_fixture_is_reached_by_address_not_by_name` fills
+`playbook_test_run_skills` from `playbook_selection_skills` for selections on
+the vulnerable Program `WHERE s.dropped_because IS NULL`. An empty freeze
+therefore says the Playbook was never selected and kept on that Program, which
+is upstream of anything it could have claimed.
+
+`playbook_selections` says which:
+
+| Playbook | selections | frozen Skills | claims |
+| --- | --- | --- | --- |
+| `object-ownership` | 6 kept, 1 dropped `role_lacks_skill` | 6 | 1, 1, 3 |
+| `attack-surface` | 2 kept | 0 | 0 |
+| `browser-script` | none | 0 | 0 |
+| `cookies` | none | 0 | 0 |
+| `payment-workflows` | none | 0 | 0 |
+
+Three of the five were never offered to an Agent on any Program in the canary.
+`payment-workflows` declares the same two Skills as `object-ownership` --
+`compare-responses` and `use-identity` -- so this is not a role that lacks a
+Skill; that reason was recorded once, against the one Playbook that was
+selected six other times. `attack-surface` was kept twice and still froze
+nothing, which the freeze's own `s.program_id = p_vulnerable` clause admits: a
+selection on the control half is not one of these.
+
+Why selection never offered the three is not traced here and is not this
+ticket's to answer. What the slice establishes is that the zero is not a
+detection result: four of the five Playbooks were never in a position to detect
+anything, so no larger campaign on the same corpus will read differently until
+selection does.
+
 ### What stays open
 
 `ready-for-human` is unchanged. The decision is which spend to authorise; the

@@ -159,11 +159,17 @@ class WorkableTest(unittest.TestCase):
         self.assertFalse(answer)
         self.assertIn("halted", said)
 
-    def test_a_question_waiting_on_a_human_stops_the_run(self):
+    def test_a_question_waiting_on_a_human_is_said_and_does_not_stop_the_run(self):
+        # Ticket 206. The question is about the one Task it parked, and that
+        # Task is `parked` and out of every ready set -- so a Program refused
+        # for it is a Program refused on behalf of Tasks nobody asked anything
+        # about. The gate that decides who may act is `call_risk_rules` at the
+        # door, one call at a time, and it still parks and asks for each.
         answer, said = self.workable(pending=[{"question_code": "scope"}])
 
-        self.assertFalse(answer)
+        self.assertTrue(answer)
         self.assertIn("waiting on a human", said)
+        self.assertIn("workable", said)
 
     def test_a_closed_program_is_held_rather_than_failed(self):
         answer, said = self.workable(lifecycle="closed")
@@ -473,6 +479,26 @@ class StopReasonTest(unittest.TestCase):
         self.assertEqual(
             program.STOPPED_TASK_ATTEMPTED,
             self.stopped(execution={"choice": {"cut_off": "budget"}, "task": {"label": "T1"}}),
+        )
+
+    def test_an_attempt_that_was_made_outranks_a_question_waiting_on_a_human(self):
+        # Ticket 206. An open question parks the one Task it is about and leaves
+        # the rest of the queue alone, so a pass that worked one of the rest did
+        # work -- and a driver loop told `awaiting_decision` stops the campaign
+        # for a question that stopped one Task. Measured on `rk2here`: one open
+        # decision, one parked Task, 635 pending ones nothing would look at.
+        self.assertEqual(
+            program.STOPPED_TASK_ATTEMPTED,
+            self.stopped(pending=[{"task": "T1"}], execution={"task": {"label": "T2"}}),
+        )
+
+    def test_a_question_is_still_the_word_for_a_pass_that_did_no_work(self):
+        # And the other half of it: once the queue holds nothing but the parked
+        # Task, the pass has nothing to report except the question, which is
+        # exactly when a driver loop should stop and fetch a human.
+        self.assertEqual(
+            program.STOPPED_AWAITING_DECISION,
+            self.stopped(pending=[{"task": "T1"}], execution={"task": None}),
         )
 
     def test_a_refusal_and_a_pending_decision_both_outrank_it(self):

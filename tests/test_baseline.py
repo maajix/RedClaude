@@ -49,7 +49,7 @@ class BaselineCliTest(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(
-            "baseline ok: classifications=10 regressions=7 adapters=10 artifacts=223 frozen\n",
+            "baseline ok: classifications=10 regressions=7 adapters=11 artifacts=223 frozen\n",
             result.stdout,
         )
 

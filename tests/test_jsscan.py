@@ -465,4 +465,86 @@ class VersionTest(unittest.TestCase):
     """Ticket 92 criterion 9: the answer shape moved, so the version moved."""
 
     def test_the_analyser_reports_the_shape_it_now_prints(self):
-        self.assertEqual("rk2-jsscan 2", jsscan.VERSION)
+        self.assertEqual("rk2-jsscan 3", jsscan.VERSION)
+
+
+class CarrierTest(unittest.TestCase):
+    """Ticket 186: every Artifact the door files is a whole HTTP message."""
+
+    BUNDLE = (
+        b'const p="/api/v2/orders";fetch(p);'
+        b'fetch("/api/real");'
+        b'//# sourceMappingURL=app.js.map\n'
+    )
+    HEAD = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/javascript; charset=utf-8\r\n"
+        b"\r\n"
+    )
+
+    def test_a_response_is_read_from_its_body(self):
+        body, carrier = jsscan.carried_body(self.HEAD + self.BUNDLE)
+
+        self.assertEqual(self.BUNDLE, body)
+        self.assertEqual(len(self.HEAD), carrier)
+
+    def test_anything_that_is_not_a_response_is_read_whole(self):
+        # A recovered original, a request transcript, a bundle whose own text
+        # holds a blank line, and a start line with no separator at all. The
+        # last two are the reasons the rule is the start line *and* the CRLF
+        # break rather than "skip to the first blank line".
+        for name, raw in {
+            "a recovered original": b"var x=1;",
+            "a request transcript": b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody",
+            "a bundle with a blank line": b'const a=1;\r\n\r\nfetch("/late");',
+            "a start line and no break": b"HTTP/1.1 200 OK\r\nX: y",
+        }.items():
+            with self.subTest(name):
+                self.assertEqual((raw, 0), jsscan.carried_body(raw))
+
+    def test_a_response_with_no_body_analyses_nothing_rather_than_its_head(self):
+        body, carrier = jsscan.carried_body(b"HTTP/1.1 204 No Content\r\nX: y\r\n\r\n")
+
+        self.assertEqual(b"", body)
+        self.assertEqual(33, carrier)
+
+    def test_reading_a_body_again_changes_nothing(self):
+        once, _ = jsscan.carried_body(self.HEAD + self.BUNDLE)
+
+        self.assertEqual((once, 0), jsscan.carried_body(once))
+
+    def test_a_header_the_target_wrote_is_not_a_path_the_file_holds(self):
+        """The measurement this ticket turns on.
+
+        `path_literals` says what the file holds. Before the carrier was read,
+        a target could put a quoted path in a response header and have it
+        reported as one of them -- surface a Program records, chosen by the
+        party being measured.
+        """
+        hostile = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/javascript\r\n"
+            b'X-Quote: he said "/api/fake" loudly\r\n'
+            b"\r\n"
+        ) + self.BUNDLE
+
+        body, _ = jsscan.carried_body(hostile)
+        found = [item["value"] for item in jsscan.parse(body, body.decode())["path_literals"]]
+
+        self.assertIn("/api/real", found)
+        self.assertNotIn("/api/fake", found)
+
+    def test_the_grounded_answer_never_needed_the_carrier(self):
+        """And why `js_routes` is the one the Skill's step names.
+
+        A header line is not a call, so the route answer was immune to the
+        above with or without this change. The regression to hold is that
+        reading the body did not cost it anything.
+        """
+        whole = self.HEAD + self.BUNDLE
+        body, _ = jsscan.carried_body(whole)
+
+        self.assertEqual(
+            jsscan.routes(whole, whole.decode())["paths"],
+            jsscan.routes(body, body.decode())["paths"],
+        )

@@ -329,6 +329,13 @@ OWED_GAPS: dict[str, str] = {
     # had carried "an exchange returns no Artifact label" as a premise in a
     # comment and would have gone on reporting all twenty forever. It reads
     # `_spend`'s answer now.
+
+    # W11. One reading, no rows. The gap this check was written from --
+    # `enumerate-surface` staged for `recon` and granted to nobody -- was
+    # registered against ticket 188 for as long as it took to write the
+    # migration, and `20261126T000000Z` re-granted it. The row is removed
+    # rather than re-pointed, which is what this register asks of a gap that
+    # is gone.
 }
 
 
@@ -521,6 +528,10 @@ class Catalogue:
     programs: dict[str, str]
     program_arguments: dict[str, dict[str, str]]
     program_roles: dict[str, frozenset[str]]
+    #: Every Skill grant the corpus leaves standing, as `(role, skill)`. The
+    #: database's own answer to which role may load which Skill, which is what
+    #: `skills_ungranted_for` decides a claim by.
+    role_skills: frozenset[tuple[str, str]]
 
 
 def statement(sql: str, start: int) -> str:
@@ -579,6 +590,7 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
     programs: dict[str, str] = {}
     arguments: dict[str, dict[str, str]] = {}
     program_roles: dict[str, set[str]] = {}
+    role_skills: set[tuple[str, str]] = set()
 
     for path in sorted(root.glob("*.sql")):
         sql = path.read_text(encoding="utf-8")
@@ -678,6 +690,32 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
                 surface.update(literals(NAMED_RELATIONS.search(text).group(1)))
             else:
                 seeded = True
+        # The Skill grants, applied in order for `state_read_surface`'s reason:
+        # `20261108T000000Z` deletes one and inserts another in the same file,
+        # and a reader that took them as a set would report a grant the corpus
+        # has already withdrawn.
+        moves = [
+            (found.start(), "add", statement(sql, found.start()))
+            for found in re.finditer(r"INSERT\s+INTO\s+role_skills\b", code, re.I)
+        ]
+        moves.extend(
+            (found.start(), "remove", statement(sql, found.start()))
+            for found in re.finditer(r"DELETE\s+FROM\s+role_skills\b", code, re.I)
+        )
+        for _, kind, text in sorted(moves, key=lambda move: move[0]):
+            if kind == "add":
+                role_skills.update(rows(text, 2))
+            else:
+                # `DELETE ... WHERE role = 'r' AND skill_name = 's'`, which is
+                # the only shape the corpus writes. A wider predicate would
+                # remove more than this reads, so anything else is left alone
+                # rather than guessed at -- and W11 then reports the grant that
+                # is really gone, which is the safe direction to be wrong in.
+                found = re.search(
+                    r"role\s*=\s*'([^']+)'\s+AND\s+skill_name\s*=\s*'([^']+)'", text, re.I
+                )
+                if found:
+                    role_skills.discard((found.group(1), found.group(2)))
         for table, into in (
             ("property_classes", classes),
             ("property_class_families", families),
@@ -747,6 +785,7 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
         programs=programs,
         program_arguments=arguments,
         program_roles={name: frozenset(roles) for name, roles in program_roles.items()},
+        role_skills=frozenset(role_skills),
     )
 
 
@@ -1778,9 +1817,63 @@ def instruction_gaps(wiring: Wiring) -> list[Gap]:
     return gaps
 
 
-#: The ten, in order, each with the reading that produces it. A tuple rather than
-#: ten calls in `check`, because the report and the refusal both walk it and a
-#: check added to one and not the other would be a check nobody reads.
+def skill_grant_gaps(wiring: Wiring) -> list[Gap]:
+    """W11: the Skill a role is staged is the Skill that role was granted.
+
+    One fact with two owners. A Skill's `bb:roles` line is what
+    `roster.Role.skills` is derived from, and `agent.stage_skills` writes that
+    tuple into the child's launch directory -- so the frontmatter decides what
+    the model can open. `role_skills` is a table maintained by hand in
+    migrations, and `skills_ungranted_for` decides by it -- so the table decides
+    whether a Task that requires the Skill can be claimed at all.
+
+    Nothing compared them, and they drifted twice in opposite directions inside
+    three months: `20261116T000000Z` fixed a Skill that named the wrong role on
+    a comment saying the table still held a row `20261108T000000Z` had deleted
+    eight days earlier. The database's own `check_skill_registry` cannot ask
+    this, because the frontmatter is not in the database; a file reader can, and
+    is the only thing that can.
+
+    The staged-and-ungranted direction is the one that costs work: the Task is
+    refused as unclaimable and leaves the queue without a word. The other
+    direction is a grant nobody uses, reported because a table that names a role
+    the corpus does not stage is the same disagreement read backwards.
+    """
+    granted: dict[str, set[str]] = {}
+    for role, name in wiring.catalogue.role_skills:
+        granted.setdefault(role, set()).add(name)
+    staged: dict[str, set[str]] = {}
+    for body in wiring.corpus:
+        if body.kind == "skill":
+            for role in body.front.get("bb:roles", []):
+                staged.setdefault(role, set()).add(body.name)
+
+    gaps = []
+    for role in sorted(set(granted) | set(staged)):
+        for name in sorted(staged.get(role, set()) - granted.get(role, set())):
+            gaps.append(
+                Gap(
+                    "W11",
+                    f"{role} {name}",
+                    f"{name} names {role} in bb:roles and role_skills does not grant it,"
+                    f" so a {role} Task requiring it is refused as unclaimable",
+                )
+            )
+        for name in sorted(granted.get(role, set()) - staged.get(role, set())):
+            gaps.append(
+                Gap(
+                    "W11",
+                    f"{role} {name}",
+                    f"role_skills grants {name} to {role} and {name} does not name {role}"
+                    " in bb:roles, so it is never staged for the child",
+                )
+            )
+    return gaps
+
+
+#: The eleven, in order, each with the reading that produces it. A tuple rather
+#: than eleven calls in `check`, because the report and the refusal both walk it
+#: and a check added to one and not the other would be a check nobody reads.
 CHECKS = (
     ("W1", "contracts served", served_gaps),
     ("W2", "arguments consumed", argument_gaps),
@@ -1792,6 +1885,7 @@ CHECKS = (
     ("W8", "write targets", write_target_gaps),
     ("W9", "vocabulary", vocabulary_gaps),
     ("W10", "corpus instructions", instruction_gaps),
+    ("W11", "skill grants", skill_grant_gaps),
 )
 
 
@@ -1890,6 +1984,8 @@ def report(wiring: Wiring, gaps: list[Gap]) -> str:
               f"  unmakeable {len(catalogue.unmakeable)}",
         "W10": f"corpus bodies {len(wiring.corpus)}  tool mentions {mentions}"
                f"  roles derived {derived}",
+        "W11": f"grants {len(catalogue.role_skills)}  staged "
+               f"{sum(len(body.front.get('bb:roles', [])) for body in wiring.corpus)}",
     }
     lines = ["wiring"]
     lines.extend(

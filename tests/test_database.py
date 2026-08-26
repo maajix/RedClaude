@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
+import hashlib
 import html
 import http.client
 import inspect
@@ -76,6 +78,7 @@ from redkraken import (
     evidence,
     execution,
     fixture,
+    graph,
     header,
     identity,
     integrity,
@@ -164,6 +167,38 @@ DATABASE = os.environ.get("RK_TEST_DATABASE", "rk2_selftest")
 RESTORED = f"{DATABASE}_restored"
 
 REASON = "set RK_TEST_SUPERUSER_URL to a disposable PostgreSQL 18 superuser connection string"
+
+#: The cluster lock, which is `hunt.sh`'s. The six `rk2_*` roles are
+#: cluster-global and `_build` re-provisions every one of them with a password
+#: it generated for the run, so this module rotates the credentials of every
+#: other database on the same server. A live engagement that loses its login
+#: mid-lap leaves a Tool run open against a third-party target, which is the one
+#: state worth a whole lock to avoid -- and the hunt loop has taken this lock
+#: since it was written, against a suite that never took the other side of it.
+LOCK_PATH = os.environ.get("RK_TEST_CLUSTER_LOCK", "/tmp/rk2-db.lock")
+LOCK_REASON = f"another session holds {LOCK_PATH}; a hunt is running on this cluster"
+LOCK: int | None = None
+
+#: Deleting the bytes a purged Program's rows named, without taking the purge
+#: down with them. `artifacts.sha256` is content-addressed, so a digest one
+#: Program's Receipts named is a digest another Program's Receipts may name too,
+#: and an unguarded delete raises `receipts_response_agent_sha_fkey` -- inside
+#: the same transaction as the `DELETE FROM programs` above it, which rolls the
+#: purge back. The class's Programs then survive `tearDownClass`, and every
+#: later class that asserts `violations == []` reads its fixtures as a standing
+#: violation of whatever the fixtures were built to be.
+#:
+#: Fourteen teardowns wrote this delete unguarded. Three of them were measured
+#: failing this way -- `CandidateFindingTest` on `test_replays`,
+#: `ExecutionSliceTest` on `execution_closure`, `ProxyEgressTest` -- and the
+#: rest are the same statement waiting for the same collision.
+UNREFERENCED_ARTIFACTS = (
+    "DELETE FROM artifacts AS a WHERE a.sha256 = ANY($1::text[])"
+    "   AND NOT EXISTS (SELECT 1 FROM artifact_references r WHERE r.sha256 = a.sha256)"
+    "   AND NOT EXISTS (SELECT 1 FROM receipts r"
+    "                    WHERE a.sha256 IN (r.request_agent_sha, r.response_agent_sha,"
+    "                                       r.request_wire_sha, r.response_wire_sha))"
+)
 
 #: The second gate, for the one case here that needs a container as well as a
 #: server. Separate from `REASON` because a server is the price of this module
@@ -291,15 +326,28 @@ HARNESS: Harness | None = None
 
 
 def setUpModule() -> None:
-    global HARNESS
-    if SUPERUSER_URL:
-        HARNESS = _build()
+    global HARNESS, LOCK
+    if not SUPERUSER_URL:
+        return
+    LOCK = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        # Non-blocking on purpose. Waiting would mean a suite that sits silent
+        # for the length of a sitting; skipping says which server is busy and
+        # leaves the operator a choice between the two.
+        fcntl.flock(LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(LOCK)
+        LOCK = None
+        raise unittest.SkipTest(LOCK_REASON)
+    HARNESS = _build()
 
 
 def tearDownModule() -> None:
     if HARNESS is not None:
         for name in (DATABASE, RESTORED):
             _drop(HARNESS.admin, name)
+    if LOCK is not None:
+        os.close(LOCK)
 
 
 def harness() -> Harness:
@@ -1606,14 +1654,22 @@ CONTROLS = (
         # flight. The Task is opened before the flip, so the projection does not
         # run for it and the run is executing as nothing. Arm (b) needs a live
         # Task Lease and this one has none.
+        #
+        # `analyze` rather than `recon`, and `js_analyst` rather than `recon`.
+        # `20261121T000000Z` clamped the recon role, which made this control's
+        # flip a no-op: the Task was projected onto an Identity at INSERT, the
+        # arm's `NOT EXISTS (task_identities)` was false, and the control stopped
+        # breaking anything. It went unnoticed because ticket 201's defect had
+        # this check red across the whole database anyway. The lane has to be one
+        # nothing clamps yet, and `js_analyst` is the one the scheduler runs.
         "standing:identity_clamp",
         "DO $ctl$ DECLARE p uuid;"
         " BEGIN"
         "   PERFORM set_actor('runtime', 'selftest');"
         "   INSERT INTO programs (slug, name) VALUES ('clamped-selftest', 'Self test')"
         "     RETURNING id INTO p;"
-        "   INSERT INTO tasks (program_id, kind, status) VALUES (p, 'recon', 'claimed');"
-        "   UPDATE roles SET clamp_to_identity_leases = true WHERE role = 'recon';"
+        "   INSERT INTO tasks (program_id, kind, status) VALUES (p, 'analyze', 'claimed');"
+        "   UPDATE roles SET clamp_to_identity_leases = true WHERE role = 'js_analyst';"
         " END $ctl$",
     ),
     Control(
@@ -1622,14 +1678,30 @@ CONTROLS = (
         # restore or a hand-written row can leave half of -- and 024's arm (i)
         # is satisfied by one Lease however many the Task acts as, so this is
         # the half of criterion 1 that only this check asks.
+        #
+        # Ticket 201: the Identity has to be a named one. The projection gives
+        # every clamped Task the anonymous Identity, and an anonymous Identity
+        # is exempt now -- `identities` says it has no `secret_ref`, so there is
+        # nothing about it for a run to hold. A control that named nobody would
+        # be a control the check is right not to fire on.
         "standing:identity_clamp",
-        "DO $ctl$ DECLARE p uuid;"
+        "DO $ctl$ DECLARE p uuid; e uuid; k uuid;"
         " BEGIN"
         "   PERFORM set_actor('runtime', 'selftest');"
         "   INSERT INTO programs (slug, name) VALUES ('unheld-selftest', 'Self test')"
         "     RETURNING id INTO p;"
+        "   INSERT INTO entities (program_id, type, dedup_key, metadata)"
+        "        VALUES (p, 'identity', 'unheld-selftest-slot', '{}'::jsonb)"
+        "     RETURNING id INTO e;"
+        "   INSERT INTO identities (entity_id, slot_name, class, secret_ref)"
+        "        VALUES (e, 'unheld-selftest', 'user', 'op://selftest/unheld');"
         "   INSERT INTO tasks (program_id, kind, status, lease_expires_at)"
-        "        VALUES (p, 'hunt', 'running', now() + interval '5 minutes');"
+        "        VALUES (p, 'hunt', 'running', now() + interval '5 minutes')"
+        "     RETURNING id INTO k;"
+        "   PERFORM set_config('rk2.identity_projection', 'on', true);"
+        "   INSERT INTO task_identities (task_id, identity_entity_id, program_id)"
+        "        VALUES (k, e, p);"
+        "   PERFORM set_config('rk2.identity_projection', 'off', true);"
         " END $ctl$",
     ),
     Control(
@@ -2109,7 +2181,7 @@ CONTROLS = (
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
         "                          offline_tool, tool_version, finished_at)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
-        "                'jq', 'jq-1.7.1', now());"
+        "                'jq', 'rk2-jq 1 (jq-1.7.1)', now());"
         " END $ctl$",
     ),
     Control(
@@ -2136,7 +2208,7 @@ CONTROLS = (
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
         "                          offline_tool, tool_version, finished_at)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'success', 'runtime',"
-        "                'js_parse', 'rk2-jsscan 2', now());"
+        "                'js_parse', 'rk2-jsscan 3', now());"
         " END $ctl$",
     ),
     Control(
@@ -2162,7 +2234,7 @@ CONTROLS = (
         "   INSERT INTO tool_runs (program_id, agent_run_id, tool, args, status, transport,"
         "                          offline_tool, tool_version, analyser_sha256)"
         "        VALUES (p, r, 'mcp__rk2__run_tool', '{}'::jsonb, 'running', 'runtime',"
-        f"                'js_parse', 'rk2-jsscan 2', {repeat('b')})"
+        f"                'js_parse', 'rk2-jsscan 3', {repeat('b')})"
         "     RETURNING id INTO t;"
         "   INSERT INTO artifacts (sha256, byte_size, visibility) VALUES"
         f"        ({repeat('c')}, 1, 'agent_visible') ON CONFLICT DO NOTHING;"
@@ -4015,13 +4087,16 @@ class FirstTaskTest(DatabaseCase):
         # claimed", and an operator's first run ended there with no way to say
         # why.
         #
-        # Its `priority` is NULL, and that is 026's answer rather than a gap
-        # here: nothing has stated what this subject is worth yet, and a Task
-        # scored 0 would be a different claim from one never scored. It sorts
-        # last among ranked Tasks, which on a Program that has none is first.
+        # It is offered UNENTITLED, and that is two tickets rather than a gap
+        # here. Ticket 199's `chain` profile floors `recon` at zero slots so that
+        # it competes on priority instead of holding a reserved lane, which makes
+        # every recon Task unentitled by construction. Ticket 203 is why it is on
+        # the slate at all: `offer_slate` seats each lane's best candidate before
+        # it truncates, so a lane with no floor is still a lane rather than a
+        # kind that cannot be seen.
         self.assertEqual(1, len(self.offered))
         self.assertEqual(
-            ("recon", self.subject["label"], True),
+            ("recon", self.subject["label"], False),
             (self.offered[0]["kind"], self.offered[0]["subject"], self.offered[0]["entitled"]),
         )
         # And the pass said nothing was wrong on the way there. `_offer` reports
@@ -4945,7 +5020,7 @@ class MissionPacketTest(DatabaseCase):
             # Programs takes the references and leaves the blobs. They are only
             # deletable now that nothing holds them.
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                UNREFERENCED_ARTIFACTS,
                 (pg.quote_array([cls.seeded[name]["artifact"] for name in ("a", "b")]),),
             )
         super().tearDownClass()
@@ -5551,7 +5626,7 @@ class ArtifactStoreTest(DatabaseCase):
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{ARTIFACT_SLUG}-%",)
             )
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                UNREFERENCED_ARTIFACTS,
                 ("{" + ",".join(cls.hashes()) + "}",),
             )
         super().tearDownClass()
@@ -7431,7 +7506,7 @@ class SealedWireArtifactTest(DatabaseCase):
                 "DELETE FROM artifact_seal WHERE sha256 = $1", (artifact.digest(WIRE),)
             )
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                UNREFERENCED_ARTIFACTS,
                 ("{" + ",".join((artifact.digest(WIRE), artifact.digest(REDACTED))) + "}",),
             )
             cls.connection.execute("DELETE FROM secret_access_log")
@@ -7442,7 +7517,24 @@ class SealedWireArtifactTest(DatabaseCase):
         with pg.connect(cls.harness.migrate) as owner:
             with owner.transaction():
                 owner.execute("SET LOCAL ROLE rk2_owner")
-                owner.execute("DELETE FROM secret_kek")
+                # Only the generations nothing is sealed under. A KEK
+                # generation is cluster-wide and another class's rows name the
+                # same one, so the unqualified delete raised
+                # `artifact_seal_kek_gen_fkey` on a row this class did not
+                # write. The four tables are the four that reference
+                # `secret_kek(gen)`; there is no fifth, and a fifth would fail
+                # here loudly rather than silently.
+                owner.execute(
+                    "DELETE FROM secret_kek k"
+                    " WHERE NOT EXISTS (SELECT 1 FROM artifact_seal x"
+                    "                    WHERE x.kek_gen = k.gen)"
+                    "   AND NOT EXISTS (SELECT 1 FROM secret_dek x"
+                    "                    WHERE x.kek_gen = k.gen)"
+                    "   AND NOT EXISTS (SELECT 1 FROM identity_slots x"
+                    "                    WHERE x.kek_gen = k.gen)"
+                    "   AND NOT EXISTS (SELECT 1 FROM program_header_slots x"
+                    "                    WHERE x.kek_gen = k.gen)"
+                )
         super().tearDownClass()
 
     @classmethod
@@ -7895,13 +7987,37 @@ class SealedWireArtifactTest(DatabaseCase):
         # And the check every command ends by running. A sealed artifact is
         # reachable through no reference, so a gate that only followed labels
         # would pass a database whose ciphertext was gone.
+        #
+        # Read against this class's own digests rather than against `ok`.
+        # `integrity.artifacts` verifies every reference in the database on
+        # purpose -- "a hash that names nothing is a broken record whoever
+        # recorded it" -- and every class in this module shares one database
+        # while holding its own `scratch()` store. So a global answer here is a
+        # sentence about other classes' roots, and the only question this store
+        # can be asked is whether what was filed in it is sound.
         with pg.connect(self.harness.migrate) as connection:
             result = integrity.verify(connection, self.harness.expected, store=self.root)
 
-        self.assertTrue(result.ok, result.violations)
-        self.assertEqual([], result.facts["artifacts"]["broken"])
-        self.assertTrue(result.facts["artifacts"]["sound"])
-        self.assertGreaterEqual(result.facts["artifacts"]["verified"], 2)
+        artifacts = result.facts["artifacts"]
+        # `get` and not `[...]`: `integrity._headers` reports an unreadable seal
+        # with a label and a detail and no digest, so a broken list that includes
+        # one has entries of two shapes.
+        broken = {item.get("sha256") for item in artifacts["broken"]} - {None}
+        self.assertEqual([], sorted(broken & self.recorded_here()))
+        self.assertGreaterEqual(len(self.recorded_here()), 2)
+
+    def recorded_here(self) -> set[str]:
+        """Every digest this class filed, plaintext and ciphertext alike."""
+        return {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT sha256 FROM artifact_references WHERE program_id = ANY($1::uuid[])"
+                " UNION"
+                " SELECT ciphertext_sha256 FROM artifact_seal"
+                "  WHERE scope_kind = 'program' AND scope_id = ANY($1::uuid[])",
+                ("{" + ",".join(self.identifiers.values()) + "}",),
+            ).rows
+        }
 
     def test_a_missing_envelope_fails_the_gate_that_holds_no_key(self):
         # The negative control for it, and the reason the seal is verified at
@@ -8266,7 +8382,7 @@ class ProxyEgressTest(DatabaseCase):
             cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (f"{PROXY_SLUG}-%",))
             if stored:
                 cls.connection.execute(
-                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    UNREFERENCED_ARTIFACTS,
                     ("{" + ",".join(stored) + "}",),
                 )
         keep = Store(cls.root)
@@ -10635,14 +10751,20 @@ class ProxyEgressTest(DatabaseCase):
         )
 
         self.assertTrue(result.ok, result.violations)
-        self.assertEqual(
-            [f"{label} did not reach the desktop channel and will be retried: no session bus"],
-            [
-                item.detail
-                for item in result.assertions
-                if item.name == "notification" and label in item.detail
-            ],
-        )
+        # Membership and a set, not a list: `decisions.sweep` sweeps every
+        # Program in the database and decision labels restart per Program, so
+        # another case's `D1` is swept beside this one's and reports the
+        # identical sentence. Both halves are still asserted -- this label
+        # reported the refusal, and nothing reported anything else about it.
+        refused = (f"{label} did not reach the desktop channel"
+                   " and will be retried: no session bus")
+        said = [
+            item.detail
+            for item in result.assertions
+            if item.name == "notification" and label in item.detail
+        ]
+        self.assertIn(refused, said)
+        self.assertEqual({refused}, set(said))
         self.assertEqual((1, False), self.attempted(notification))
         self.assertEqual(
             "no session bus",
@@ -11941,7 +12063,7 @@ class ExecutionSliceTest(DatabaseCase):
             )
             if stored:
                 cls.connection.execute(
-                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    UNREFERENCED_ARTIFACTS,
                     ("{" + ",".join(stored) + "}",),
                 )
         keep = Store(cls.root)
@@ -17429,8 +17551,14 @@ class NegativeKnowledgeTest(DatabaseCase):
     def test_the_record_a_hunter_reads_names_its_negative_knowledge(self):
         record = proxy.as_object(
             self.owned(
+                # Label AND statement. `v_records` carries no Program column --
+                # it is scoped by RLS on the tables under it -- and `owned` reads
+                # it as `rk2_owner`, which those policies do not bind. Claim
+                # labels restart per Program, so a suite that has already run
+                # another case answers a label alone with two rows.
                 "SELECT record FROM v_records WHERE kind = 'hypothesis'"
-                "   AND label = (SELECT label FROM hypotheses WHERE id = $1::uuid)",
+                "   AND (label, record ->> 'statement')"
+                "     = (SELECT label, statement FROM hypotheses WHERE id = $1::uuid)",
                 (self.settled,),
             )
         )
@@ -18258,10 +18386,18 @@ class SchedulerFixture:
                 (program_id, HOST, f"identity:{slot}"),
             ).scalar()
         )
+        # `user` and a `secret_ref`, which is what "named" means. It was
+        # `anonymous` and no ref, which passes `identities`'
+        # `CHECK (class = 'anonymous' OR secret_ref IS NOT NULL)` without having
+        # to invent a secret -- and made every Identity these scenarios build a
+        # credential-less one. `20261201T000000Z` stopped leasing an Identity
+        # with nothing to hold, so from that file on the rival, paired and
+        # reprojected scenarios were all asserting exclusivity over the absence
+        # of a credential, which is the one thing it does not mean.
         cls.as_owner(
-            "INSERT INTO identities (entity_id, program_id, slot_name, class)"
-            " VALUES ($1::uuid, $2::uuid, $3, 'anonymous')",
-            (entity, program_id, slot),
+            "INSERT INTO identities (entity_id, program_id, slot_name, class,"
+            " secret_ref) VALUES ($1::uuid, $2::uuid, $3, 'user', $4)",
+            (entity, program_id, slot, f"slot://identity/{slot}"),
         )
         return entity
 
@@ -18991,8 +19127,18 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
             # same question at the same moment the claim is: PH2-75's criterion
             # 2 is that the two agree, and one slate taken before any of this
             # was claimed could agree with all five claims by being stale.
-            cls.offered_before[kind] = tuple(
-                str(row["kind"]) for row in cls.offer()
+            slate = cls.offer()
+            cls.offered_before[kind] = tuple(str(row["kind"]) for row in slate)
+            # Whichever Task of this kind the slate holds, rather than the one
+            # seeded above. `cls.finding` mints a testable Hypothesis of its
+            # own for each of the two Findings it builds, and `rank_pass`
+            # derives a hunt Task for every testable claim no hunt Task names
+            # -- so the Program has three hunts and the seeded one is not
+            # always the best of them. What this fixture is about is the role a
+            # kind is claimed as, which is the same for all three.
+            offered = next(
+                str(row["task_label"]) for row in slate
+                if str(row["kind"]) == kind
             )
             # The shipped predicate rather than a second spelling of its join:
             # a fixture that counted the population itself could not disagree
@@ -19006,7 +19152,7 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
                     (program_id,),
                 )
             )
-            run = cls.call("SELECT claim_task($1)", (by_kind[kind],))
+            run = cls.call("SELECT claim_task($1)", (offered,))
             cls.claimed_runs[kind] = cls.as_owner(
                 "SELECT a.id::text AS id, a.role, a.model, a.effort,"
                 "       r.model AS roster_model, r.effort AS roster_effort"
@@ -19495,10 +19641,17 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         self.assertEqual(1, len({row["expires_at"] for row in self.first}))
 
     def test_only_what_the_lane_has_room_for_is_entitled(self):
-        # The recon Lane's floor is one slot and its role admits one at a time,
-        # so exactly the top entry is what the Lane is currently short of.
+        # Six recon Tasks and a recon Lane floored at zero, so the Lane is
+        # short of nothing and no entry is entitled. It used to be the top one:
+        # ticket 199's `chain` profile floors recon at 0 rather than 1, on the
+        # reading that a floor is a priority class and recon does not need one
+        # to compete. This is what that reads as on the slate, and it is the
+        # measurement ticket 203 starts from -- a lane nothing entitles is a
+        # lane that is offered only because `offer_slate` seats every lane
+        # before it fills the rest.
         self.assertEqual(
-            [True, False, False, False, False], [row["entitled"] for row in self.first]
+            [False, False, False, False, False],
+            [row["entitled"] for row in self.first],
         )
 
     def test_a_full_lane_offers_nothing(self):
@@ -19756,9 +19909,17 @@ class SlateClaimTest(SchedulerFixture, DatabaseCase):
         # which of the pending kinds the ranker puts first is its own question
         # and not this ticket's.
         self.assertEqual(
+            # `hunt` outlives its own claim because the Program has three
+            # hunt Tasks and not one: each `cls.finding` above mints a testable
+            # Hypothesis for the Finding to be a finding of, and `rank_pass`
+            # derives a hunt Task for every testable claim no hunt Task names.
+            # It goes at the analyze pass and not later because that is the
+            # third subagent run, and `global_subagent_cap` refuses a fourth --
+            # which is why `validate` and `report`, the two roles that start no
+            # subagent, are all that is left.
             {"recon": {"recon", "hunt", "analyze", "validate", "report"},
              "hunt": {"hunt", "analyze", "validate", "report"},
-             "analyze": {"analyze", "validate", "report"},
+             "analyze": {"hunt", "analyze", "validate", "report"},
              "validate": {"validate", "report"},
              "report": {"report"}},
             {kind: set(offered) for kind, offered in self.offered_before.items()},
@@ -20100,7 +20261,13 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         cls.offer()
         cls.capped_run = str(cls.call("SELECT claim_task()"))
         taken = cls.claimed_by("capped", cls.capped_run)
-        [cls.capped_left] = [label for label in labels if label != taken]
+        # Not necessarily one of the two seeded above. Opening a Program leaves
+        # a recon Task of its own, and since `20261129T000000Z` a Task nobody
+        # estimated carries its kind's prior -- 0.35 for recon -- which outranks
+        # the 0.1 and 0.2 these two promise. What this scenario needs is a Task
+        # the total no longer covers, and whichever of these two the claim left
+        # is one.
+        cls.capped_left = next(label for label in labels if label != taken)
         cls.capped_reason = cls.claimable("capped", cls.capped_left)
         # Named rather than left to the walk, so the refusal is about this Task
         # and not about a slate that ran out of entries.
@@ -20121,7 +20288,9 @@ class BudgetReservationTest(SchedulerFixture, DatabaseCase):
         cls.offer()
         cls.metered_run = str(cls.call("SELECT claim_task()"))
         taken = cls.claimed_by("metered", cls.metered_run)
-        [cls.metered_left] = [label for label in labels if label != taken]
+        # The bootstrap recon Task outranks both of these, for the reason
+        # `arrange_capped` states.
+        cls.metered_left = next(label for label in labels if label != taken)
         cls.metered_reason = cls.claimable("metered", cls.metered_left)
         cls.metered_refusal = cls.refusal("SELECT claim_task($1)", (cls.metered_left,))
         # Re-offered after the claim, because the slate and the claim have to
@@ -21698,13 +21867,31 @@ class TaskRankingTest(SchedulerFixture, DatabaseCase):
 
     # -- criterion 6: missing estimates and bounded fallbacks ------------------
 
-    def test_a_task_with_a_missing_estimate_sinks_and_is_offered_last(self):
+    def test_a_task_with_a_missing_estimate_takes_its_kinds_prior(self):
+        """Ticket 196 replaced the sink with a floor, and this is the floor.
+
+        Criterion 6 was written while `value_for` returned NULL if either half of
+        the estimate was missing, so the Task with one half taken away sorted
+        last and was offered last. `20261129T000000Z` reads the kind's prior for
+        the missing half instead, because a queue in which every Task is unranked
+        is a queue sorted by age -- measured on `rk2here` as 480 Tasks with no
+        priority at all, and four tenths of a second of creation order deciding
+        eight hours of a live campaign.
+
+        So the Task is ranked rather than sunk, and what it is ranked AT is
+        arithmetic a reader can check: `recon`'s gain prior of 0.50 stands in for
+        the estimate that was removed, this Task's own impact of 0.20 stays, and
+        under the shipped `w_gain 0.4 / w_impact 0.6` that is 0.32 -- ahead of
+        the 0.10 the fully estimated Task below it promised. A prior outranking a
+        low measurement is what a prior being the average of its kind means.
+        """
         unestimated = self.missing[-1]
-        self.assertIsNone(self.missing_components[unestimated]["priority"])
-        self.assertIsNone(self.missing_components[unestimated]["direct_value"])
-        self.assertEqual(unestimated, self.missing_order[-1])
+        row = self.missing_components[unestimated]
+        self.assertIsNotNone(row["priority"])
+        self.assertEqual(0.32, round(float(str(row["direct_value"])), 6))
+        self.assertEqual(unestimated, self.missing_order[0])
         self.assertEqual(
-            unestimated, [row["task_label"] for row in self.missing_slate][-1]
+            unestimated, [entry["task_label"] for entry in self.missing_slate][0]
         )
 
     def test_the_other_components_are_still_measured_for_it(self):
@@ -23269,9 +23456,16 @@ class LeaseTest(DatabaseCase):
                     (program_id, HOST, "identity:lease-holder"),
                 ).scalar()
             )
+            # `user` and a `secret_ref`. It was `anonymous`, which passes
+            # `identities`' `CHECK (class = 'anonymous' OR secret_ref IS NOT
+            # NULL)` without inventing a secret -- and since
+            # `20261201T000000Z` an anonymous Identity is not leased at all,
+            # so a scenario named for the Lease nothing may take was building
+            # an Identity there was nothing to take.
             cls.connection.execute(
-                "INSERT INTO identities (entity_id, program_id, slot_name, class)"
-                " VALUES ($1::uuid, $2::uuid, 'lease-holder', 'anonymous')",
+                "INSERT INTO identities (entity_id, program_id, slot_name, class,"
+                " secret_ref) VALUES ($1::uuid, $2::uuid, 'lease-holder', 'user',"
+                " 'slot://identity/lease-holder')",
                 (identity, program_id),
             )
             hypothesis = str(
@@ -23804,21 +23998,24 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
         cls.bind("anonymous")
         offered = cls.offer()
         cls.anonymous_offered = tuple(str(entry["task_label"]) for entry in offered)
-        # Criterion 3, measured where it is decidable: two free slots, one free
-        # Identity. Without the clamp in the view this reads 2, and both hunts
-        # start.
+        # Criterion 3, measured where it is decidable: two free slots and
+        # nothing to run out of. It read 1 until `20261204T000000Z`, because
+        # `free` counted the anonymous Identity as one credential -- so a
+        # Program that acts as nobody could start one hunt of the two its role
+        # admits. Nobody is not a supply.
         cls.headroom_before = cls.headroom("anonymous")
         cls.anonymous_claimed = str(cls.call("SELECT claim_task($1)", (cls.anonymous_offered[0],)))
         cls.headroom_after = cls.headroom("anonymous")
         cls.anonymous_leases = cls.leases_of("anonymous", cls.anonymous_claimed)
-        # Criterion 4. The refusal is `identity_held` and not `lane_full`
-        # because the two Tasks want the same Identity, which is the thing the
-        # clamp is about; the lane arm would have said the same thing about a
-        # Program that had simply run out of slots.
-        cls.anonymous_refusal = cls.refusal(
-            "SELECT claim_task($1)", (cls.anonymous_offered[1],)
+        # Criterion 4, as ticket 201 leaves it. The second hunt is claimed and
+        # not refused: both Tasks act as the anonymous Identity, and there is
+        # nothing about the absence of a credential for the second run to be
+        # denied the use of. What bounds them now is the lane, which is the
+        # only thing here that is a bound.
+        cls.anonymous_both = str(
+            cls.call("SELECT claim_task($1)", (cls.anonymous_offered[1],))
         )
-        cls.anonymous_second = cls.claimable("anonymous", cls.anonymous_offered[1])
+        cls.headroom_full = cls.headroom("anonymous")
         cls.anonymous_runs = cls.counted("anonymous")[1]
 
     @classmethod
@@ -23923,6 +24120,23 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
             with cls.connection.transaction():
                 cls.connection.execute("SET LOCAL ROLE rk2_owner")
                 cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                # The Task has to be one the projection has never run for,
+                # and since `20261121T000000Z` clamped the recon role there is
+                # no such recon Task: it is projected onto `_anonymous` at
+                # INSERT, so the flip below was a no-op and this scenario
+                # stopped describing anything. Unclamping, touching `kind` --
+                # which is what `task_identities_derive` fires on -- and
+                # clamping again puts the Task back in the state a Task opened
+                # before the clamp is in, inside the transaction that is thrown
+                # away anyway.
+                cls.connection.execute(
+                    "UPDATE roles SET clamp_to_identity_leases = false WHERE role = 'recon'"
+                )
+                cls.connection.execute(
+                    "UPDATE tasks SET kind = kind"
+                    " WHERE program_id = $1::uuid AND label = $2",
+                    (cls.identifiers["legacy"], label),
+                )
                 cls.connection.execute(
                     "UPDATE roles SET clamp_to_identity_leases = true WHERE role = 'recon'"
                 )
@@ -23979,9 +24193,16 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
         cls.reprojected_after = cls.acts_as("reprojected", label)
 
         cls.bind("reprojected")
-        offered = cls.offer()
+        # This Task by name, and not whichever entry the slate put first. Each
+        # `hypothesis_for` above mints a testable claim, and `rank_pass` derives
+        # a hunt Task for every testable claim no hunt Task names -- so the
+        # Program holds more hunts than the one seeded here, and the first entry
+        # is not reliably the one this scenario is about.
+        cls.reprojected_offered = tuple(
+            str(entry["task_label"]) for entry in cls.offer()
+        )
         cls.reprojected_claimed = str(
-            cls.call("SELECT claim_task($1)", (str(offered[0]["task_label"]),))
+            cls.call("SELECT claim_task($1)", (label,))
         )
         cls.reprojected_leases = cls.leases_of("reprojected", cls.reprojected_claimed)
         replacement = cls.hypothesis_for(
@@ -24152,8 +24373,13 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
 
     # -- criterion 1 -----------------------------------------------------------
 
-    def test_the_claim_holds_a_lease_for_the_identity_it_acts_as(self):
-        self.assertEqual(("_anonymous",), self.anonymous_leases)
+    def test_the_claim_holds_no_lease_on_being_nobody(self):
+        # `20261201T000000Z`. The Task acts as `_anonymous` -- the projection
+        # above says so -- and takes no Lease on it, because an Identity with
+        # no `secret_ref` is the absence of a credential and there is nothing
+        # to hold exclusively. The positive form of criterion 1 is the paired
+        # scenario below, where the Identities are named.
+        self.assertEqual((), self.anonymous_leases)
 
     def test_a_task_acts_as_exactly_the_one_identity_it_selected(self):
         # The Hypothesis names two; this Task spends one, and holds a Lease on
@@ -24202,24 +24428,27 @@ class IdentityClampTest(SchedulerFixture, DatabaseCase):
     # -- criterion 3 -----------------------------------------------------------
 
     def test_the_clamp_bounds_the_lane_by_the_identities_it_can_hold(self):
-        # Two slots, one Identity: the lane reports what it can actually
-        # start, which is the whole of `clamp_to_identity_leases` being an
-        # input.
-        self.assertEqual(1, self.headroom_before)
-        self.assertEqual(0, self.headroom_after)
-        # And is not a second subtraction: two free Identities against two free
+        # Two slots and no credential to run out of, so the slots are the whole
+        # answer: 2, then 1 after the first claim, then 0 after the second.
+        self.assertEqual(2, self.headroom_before)
+        self.assertEqual(1, self.headroom_after)
+        self.assertEqual(0, self.headroom_full)
+        # And where the Identities are named the clamp is still an input, and
+        # still not a second subtraction: two free Identities against two free
         # slots is two.
         self.assertEqual(2, self.paired_headroom)
 
     # -- criterion 4 -----------------------------------------------------------
 
-    def test_the_second_hunt_for_one_identity_does_not_start(self):
+    def test_two_hunts_that_act_as_nobody_both_start(self):
+        # Ticket 201's correction. This used to assert `identity_held` on the
+        # second, which made `WaveMeasurementTest`'s four concurrent anonymous
+        # hunters impossible and was the defect that ticket opens with. A
+        # named Identity is still held exclusively -- `rival_refusal` and
+        # `identity_held` in the scheduler class are where that is asserted.
         self.assertEqual(2, len(self.anonymous_offered))
-        self.assertIn("identity_held", self.anonymous_refusal)
-        self.assertEqual("identity_held", self.anonymous_second)
-        # One run, not two: the refusal left nothing behind that a heartbeat
-        # would keep alive.
-        self.assertEqual(1, self.anonymous_runs)
+        self.assertNotEqual(self.anonymous_claimed, self.anonymous_both)
+        self.assertEqual(2, self.anonymous_runs)
 
     # -- the projection --------------------------------------------------------
 
@@ -24390,7 +24619,12 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         labels = cls.seed(name, 2)
         cls.bind(name)
         cls.offer()
-        run = str(cls.call("SELECT claim_task()"))
+        # This Task by name. An argument-free claim takes the best-ranked Task
+        # of the Program, and opening a Program leaves a recon Task of its own
+        # that -- since `20261129T000000Z` gave an unestimated Task its kind's
+        # prior -- outranks both of these. What this case needs is one of its
+        # own two claimed and the other left pending.
+        run = str(cls.call("SELECT claim_task($1)", (labels[0],)))
         claimed = str(cls.claimed_by(name, run))
         [other] = [label for label in labels if label != claimed]
         run_id, task_id = cls.opened_run(name, run)
@@ -24545,12 +24779,36 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
             (asked,),
         ).rows[0]
 
+        # `20261208T000000Z`, and the sequence an orchestrator actually runs:
+        # `park_for_human` ends the Agent run on the way in, and the pass then
+        # runs its ordinary closing over the run it was holding. Called here
+        # rather than left out because leaving it out is what hid the fault --
+        # every reader below asks about a Task the runtime parked and nothing
+        # asked about the same Task one statement later.
+        cls.closing_the_parked_run = cls.call(
+            "SELECT finish_task_attempt($1::uuid)", (run,)
+        )
+        cls.after_closing = cls.as_owner(
+            "SELECT t.status AS task,"
+            "       t.pending_decision_id = d.id AS task_names_the_question,"
+            "       t.attempts,"
+            "       t.finished_at IS NULL AS task_unfinished"
+            "  FROM tasks t"
+            "  JOIN pending_decisions d ON d.id = t.pending_decision_id"
+            " WHERE t.id = $1::uuid",
+            (task,),
+        ).dicts()[0]
+
         # Criterion 3, before anything is answered: the parked Task is refused
         # by the scheduler's own predicate, its neighbour is not, and the next
         # pass takes the neighbour.
         cls.parked_refusal = cls.claimable("parked", claimed)
         cls.sibling_refusal = cls.claimable("parked", sibling)
         cls.offer()
+        # Before the next claim, not after it: the recon lane admits one at a
+        # time, so whichever Task that claim takes leaves every other recon
+        # Task reading `lane_full` -- which is the lane and not the park.
+        cls.sibling_claimable = cls.claimable("parked", cls.parked_sibling)
         cls.next_task = cls.claimed_by("parked", cls.call("SELECT claim_task()"))
 
         # Criterion 6, on the connection that compiles what a model is handed.
@@ -24558,10 +24816,15 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
             "SELECT answer FROM pending_decisions WHERE label = $1", (cls.parked_label,)
         )
         cls.runtime_reading_the_queue = cls.refusal("SELECT program FROM v_decision_queue")
+        # Scoped by Program, and not by label alone. `pending_decisions_rk2_runtime`
+        # is `USING (true)` -- the runtime is the harness and reads every Program
+        # by design -- and labels restart per Program, so a suite that has already
+        # run another case's fixture answers this with two rows.
         cls.runtime_reading_the_question = str(
             cls.call(
-                "SELECT question_code FROM pending_decisions WHERE label = $1",
-                (cls.parked_label,),
+                "SELECT question_code FROM pending_decisions"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (cls.identifiers["parked"], cls.parked_label),
             )
         )
 
@@ -24790,6 +25053,37 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         self.assertTrue(parked["task_unfinished"])
         self.assertEqual(int(self.attempts_when_claimed), int(parked["attempts"]))
 
+    def test_the_pass_closing_its_run_leaves_the_parked_task_parked(self):
+        """`20261208T000000Z`, seven milliseconds after the park.
+
+        The pass that parked a Task then closes the run it was holding, and
+        `finish_task_attempt` used to ask whether the Task was settled with
+        `parked` missing from the list. So the last arm ran, put the row back on
+        the queue and left `pending_decision_id` where it was -- and
+        `answer_decision` then refused every answer with `task_no_longer_parked`.
+        Measured on `rk2here` as a campaign that could move in neither
+        direction.
+        """
+        closed = self.after_closing
+
+        self.assertEqual("parked", str(closed["task"]))
+        self.assertTrue(closed["task_names_the_question"])
+        self.assertTrue(closed["task_unfinished"], "waiting on a person, not ended")
+        # The attempt stays spent for the reason the claim spent it: a child ran
+        # and reached a tool call. What the closing must not do is spend a
+        # second one.
+        self.assertEqual(int(self.attempts_when_claimed), int(closed["attempts"]))
+
+    def test_the_closing_reports_the_status_the_task_is_actually_in(self):
+        # `pending` here is the same fault read out of the answer instead of out
+        # of the row: an orchestrator that logged what it was told would record
+        # a Task back on the queue.
+        answered = self.closing_the_parked_run
+        if isinstance(answered, str):
+            answered = json.loads(answered)
+
+        self.assertEqual("parked", str(answered["task_status"]))
+
     def test_parking_returns_both_halves_of_the_lease(self):
         self.assertTrue(self.after_parking["lease_returned"])
         self.assertEqual(0, int(self.after_parking["identities_held"]))
@@ -24827,7 +25121,16 @@ class OperatorDecisionTest(SchedulerFixture, DatabaseCase):
         # The lane slot the parked run held is part of this: a run that ended
         # without freeing it would leave the Program with a claimable Task and
         # no capacity to claim it with.
-        self.assertEqual(self.parked_sibling, self.next_task)
+        #
+        # Not the sibling by name. Opening a Program leaves a recon Task of its
+        # own, and since `20261129T000000Z` a Task nobody estimated carries its
+        # kind's prior -- 0.35 for recon -- which outranks both of these. What
+        # criterion 3 says is that the pass carried on and did not come back to
+        # the parked Task, and that the sibling is claimable rather than stuck
+        # behind it; which of the two unparked Tasks the ranker reached first is
+        # the ranker's business.
+        self.assertNotEqual(self.parked_task, self.next_task)
+        self.assertIsNone(self.sibling_claimable)
 
     # -- criterion 4: three verbs, and no fourth path ---------------------------
 
@@ -24989,12 +25292,59 @@ OFFLINE_OBSERVATION = "content_match"
 #: so the summary is what tells one insert's row from the other's.
 OFFLINE_CLAIM = "a claim about what the tool printed"
 
+#: The digest of the analyser the registry names for jq. `20261127T000000Z`
+#: gave jq an analyser -- `jqrun.py`, shipped beside `tool.py` -- and
+#: `open_offline_tool_run` refuses a call that supplies none. Read off the file
+#: the harness stages rather than written down, because a literal here would be
+#: a second copy of a number the harness computes.
+JQ_ANALYSER = hashlib.sha256(
+    (tool.ANALYSERS / "jqrun.py").read_bytes()
+).hexdigest()
+
 
 def committed(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
     """One attributed write, committed, whose one value is needed back."""
     with connection.transaction():
         connection.execute("SELECT set_actor('runtime', 'selftest')")
         return str(connection.execute(sql, parameters).scalar())
+
+
+def _set_analyser(owner: pg.Connection, tool_name: str, value: str | None) -> None:
+    """One registry row's analyser, written as the role that owns the table."""
+    with owner.transaction():
+        owner.execute("SET LOCAL ROLE rk2_owner")
+        owner.execute("SELECT set_actor('runtime', 'selftest')")
+        owner.execute(
+            "UPDATE offline_tools SET analyser = $2 WHERE tool = $1",
+            (tool_name, value),
+        )
+
+
+def refusal_without_analyser(
+    connection: pg.Connection, tool_name: str, sql: str, parameters: tuple = ()
+) -> str:
+    """What one statement raised while the registry named no analyser.
+
+    `20261127T000000Z` gave jq an analyser and asserts that every enabled tool
+    has one, so "the registry says this tool runs no analyser" is no longer a
+    state the shipped corpus is ever in -- and the two arms that refuse a
+    disagreement about it became unreachable rather than wrong.
+
+    Committed and put back rather than rolled back, because the row is written
+    by the role that owns the table and the call is made by the runtime, and
+    the two are different connections: a change one of them has not committed
+    is a change the other cannot see. The suite is single-threaded, and the
+    `finally` is what keeps the window to this call.
+    """
+    with pg.connect(harness().migrate) as owner:
+        previous = owner.execute(
+            "SELECT analyser FROM offline_tools WHERE tool = $1", (tool_name,)
+        ).scalar()
+        _set_analyser(owner, tool_name, None)
+        try:
+            return refusal_message(connection, sql, parameters)
+        finally:
+            _set_analyser(owner, tool_name, str(previous))
 
 
 def refusal_message(connection: pg.Connection, sql: str, parameters: tuple = ()) -> str:
@@ -25257,7 +25607,7 @@ class OfflineToolRunTest(DatabaseCase):
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{OFFLINE_SLUG}-%",)
             )
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                UNREFERENCED_ARTIFACTS,
                 (
                     "{"
                     + ",".join(
@@ -25326,15 +25676,16 @@ class OfflineToolRunTest(DatabaseCase):
         arguments: dict,
         *,
         run: str | None = None,
-        version: str = "jq-1.7.1",
+        version: str = "rk2-jq 1 (jq-1.7.1)",
         name: str = "jq",
     ) -> tuple:
-        """One call on `open_offline_tool_run`, as its four parameters."""
-        return (run or cls.recon, name, version, json.dumps(arguments))
+        """One call on `open_offline_tool_run`, as its five parameters."""
+        return (run or cls.recon, name, version, json.dumps(arguments),
+                JQ_ANALYSER if name == "jq" else None)
 
     # -- criterion 1: everything decided before the row exists ------------------
 
-    OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb)"
+    OPEN = "SELECT open_offline_tool_run($1::uuid, $2, $3, $4::jsonb, $5)"
 
     @classmethod
     def refuse_before_the_row_exists(cls):
@@ -25370,7 +25721,9 @@ class OfflineToolRunTest(DatabaseCase):
         cls.bind("halted")
         held = offline_reference(cls.connection, cls.identifiers["halted"], OFFLINE_INPUT)
         cls.refusals["halted"] = cls.refuse(
-            cls.OPEN, (halted, "jq", "jq-1.7.1", json.dumps({"filter": ".host", "input": held}))
+            cls.OPEN,
+            (halted, "jq", "rk2-jq 1 (jq-1.7.1)",
+             json.dumps({"filter": ".host", "input": held}), JQ_ANALYSER),
         )
         cls.bind("main")
 
@@ -25605,8 +25958,15 @@ class OfflineToolRunTest(DatabaseCase):
         # and the executable is the registry's file rather than a name a PATH
         # would resolve. The one input appears under `/input` by its label,
         # which is the only place `isolation.run_tool` will mount anything.
+        # `20261127T000000Z` put the analyser in front of the tool: the
+        # container runs the harness-shipped `jqrun.py`, which is handed the
+        # registry key and then the arguments and calls jq itself. The tool's
+        # own path is no longer in the argv at all, which is the point -- what
+        # runs is the file whose digest is on the run.
         self.assertEqual(
-            ["/usr/bin/jq", ".host", f"/input/{self.input_label}"], self.plan["argv"]
+            ["/usr/local/bin/python3", "/input/jqrun.py", "jq", ".host",
+             f"/input/{self.input_label}"],
+            self.plan["argv"],
         )
         self.assertEqual("none", self.plan["network"])
         self.assertEqual(
@@ -25643,7 +26003,7 @@ class OfflineToolRunTest(DatabaseCase):
         status, tool_name, version, exit_code, args, started, open_still = self.opened
 
         self.assertEqual("running", str(status))
-        self.assertEqual(("jq", "jq-1.7.1"), (str(tool_name), str(version)))
+        self.assertEqual(("jq", "rk2-jq 1 (jq-1.7.1)"), (str(tool_name), str(version)))
         self.assertIsNone(exit_code)
         self.assertTrue(started)
         self.assertTrue(open_still)
@@ -26408,7 +26768,7 @@ class SourceCitationTest(DatabaseCase):
                 "DELETE FROM programs WHERE slug LIKE $1", (f"{SOURCE_SLUG}-%",)
             )
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                UNREFERENCED_ARTIFACTS,
                 (
                     "{"
                     + ",".join(
@@ -26441,7 +26801,7 @@ class SourceCitationTest(DatabaseCase):
         return (
             cls.run_id,
             name,
-            "rk2-jsscan 2",
+            "rk2-jsscan 3",
             json.dumps(arguments),
             cls.analyser if hash_ == "" else hash_,
         )
@@ -26558,15 +26918,17 @@ class SourceCitationTest(DatabaseCase):
             ),
             no_hash=refusal_message(cls.connection, cls.OPEN, cls.opening(source, hash_=None)),
             bad_hash=refusal_message(cls.connection, cls.OPEN, cls.opening(source, hash_="not a hash")),
-            # `jq` names no analyser, so a hash supplied for it is the same
-            # disagreement seen from the other side.
-            hash_without_analyser=refusal_message(
+            # The same disagreement seen from the other side: the registry
+            # names no analyser and the runtime supplies a hash. Arranged
+            # rather than found, because every enabled tool names one now.
+            hash_without_analyser=refusal_without_analyser(
                 cls.connection,
+                "jq",
                 cls.OPEN,
                 (
                     cls.run_id,
                     "jq",
-                    "jq-1.7.1",
+                    "rk2-jq 1 (jq-1.7.1)",
                     json.dumps({"filter": ".host", "input": cls.labels["bundle"]}),
                     cls.analyser,
                 ),
@@ -26660,9 +27022,11 @@ class SourceCitationTest(DatabaseCase):
             cls.PATH,
             (cls.identifiers["main"], analysis["tool_run_id"], answer, "/api/v1/login"),
         )
-        # `jq` reads the same bytes and produces the same kind of output, and
-        # the one difference is the one that counts: the registry gives it no
-        # analyser, so its answer is whatever the image prints.
+        # `jq` reads the same bytes and produces the same kind of output.
+        # It used to be the tool with no analyser, which was the difference
+        # this comparison rested on; `20261127T000000Z` gave it one, so what
+        # separates them now is the answer each analyser produces rather than
+        # whether there is an analyser at all.
         query = json.loads(
             committed(
                 cls.connection,
@@ -26672,15 +27036,20 @@ class SourceCitationTest(DatabaseCase):
                         cls.connection, cls.identifiers["main"], role="recon", kind="recon"
                     ),
                     "jq",
-                    "jq-1.7.1",
+                    "rk2-jq 1 (jq-1.7.1)",
                     json.dumps({"filter": ".host", "input": cls.labels["bundle"]}),
-                    None,
+                    JQ_ANALYSER,
                 ),
             )
         )
         cls.file_the_answer(query["tool_run_id"])
-        cls.refusals["not_an_analyser"] = refusal_message(
+        # The run exists and its registry row is emptied for the length of
+        # one thrown-away transaction, which is the only state in which a
+        # request path named off a jq answer is a path named by something that
+        # is not an analyser.
+        cls.refusals["not_an_analyser"] = refusal_without_analyser(
             cls.connection,
+            "jq",
             cls.PATH,
             (cls.identifiers["main"], query["tool_run_id"], answer, "/api/v1/login"),
         )
@@ -26976,8 +27345,9 @@ class SourceCitationTest(DatabaseCase):
                 tuple(str(value) for value in row)
                 for row in self.connection.execute(
                     "SELECT metadata ->> 'element' FROM observations"
-                    " WHERE metadata ->> 'proposal' = $1",
-                    (self.staged.label,),
+                    " WHERE program_id = $1::uuid"
+                    "   AND metadata ->> 'proposal' = $2",
+                    (self.identifiers["main"], self.staged.label),
                 ).rows
             ],
         )
@@ -27175,7 +27545,7 @@ class JsAnalystCommandTest(DatabaseCase):
         printed = self.printed(answer)
 
         self.assertTrue(answer.ok, answer.violations)
-        self.assertEqual(("js_parse", "rk2-jsscan 2"), (printed["tool"], printed["analyser"]))
+        self.assertEqual(("js_parse", "rk2-jsscan 3"), (printed["tool"], printed["analyser"]))
         # The analyser names the bytes it read, and they are the bytes the row
         # says it was given: the two halves of the citation, agreeing.
         self.assertEqual(artifact.digest(SOURCE_BUNDLE), printed["source_sha256"])
@@ -27503,7 +27873,7 @@ class BrowserMissionTest(DatabaseCase):
             cls.connection.execute("SET LOCAL app.purging = 'on'")
             cls.connection.execute("DELETE FROM programs WHERE slug = $1", (BROWSER_SLUG,))
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                UNREFERENCED_ARTIFACTS,
                 (
                     "{"
                     + ",".join(
@@ -28343,7 +28713,7 @@ class BrowserCommandTest(DatabaseCase):
                     "DELETE FROM programs WHERE slug = $1", (f"{BROWSER_SLUG}-command",)
                 )
                 cls.connection.execute(
-                    "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                    UNREFERENCED_ARTIFACTS,
                     ("{" + ",".join(kept) + "}",),
                 )
             # Nothing is discarded from a Store here, unlike the cases that keep
@@ -29394,8 +29764,15 @@ class ReplayFixture:
                 (cls.slug + "%",),
             )
             cls.connection.execute("DELETE FROM programs WHERE slug LIKE $1", (cls.slug + "%",))
+            # Only the bytes nobody else is standing on. A sha this Program's
+            # Receipts named is content-addressed, so another Program's Receipts
+            # may name the same one, and an unguarded delete raises
+            # `receipts_response_agent_sha_fkey` -- which rolls back the purge
+            # above with it. The Programs then survive, and this class writes two
+            # replay runs with no Receipt on purpose, so every later class that
+            # asserts `violations == []` reads them as `replay_run_without_receipts`.
             cls.connection.execute(
-                "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                UNREFERENCED_ARTIFACTS,
                 ("{" + ",".join(kept) + "}",),
             )
         cls.owner_connection.close()
@@ -29890,7 +30267,8 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refusals["agent_lane"] = cls.refuse(
             "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
             " VALUES ($1::uuid, $2::uuid,"
-            "         (SELECT id FROM receipts WHERE label = $3), 8, 'variant')",
+            "         (SELECT id FROM receipts"
+            "           WHERE program_id = $1::uuid AND label = $3), 8, 'variant')",
             (cls.program_id, run, agent_receipt),
         )
         # And the same two faults offered to `record_test_action`, which is where
@@ -30002,7 +30380,8 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refusals["foreign_artifact"] = cls.refuse(
             "INSERT INTO test_run_receipts (program_id, test_run_id, receipt_id, ordinal, role)"
             " VALUES ($1::uuid, $2::uuid,"
-            "         (SELECT id FROM receipts WHERE label = $3), 7, 'variant')",
+            "         (SELECT id FROM receipts"
+            "           WHERE program_id = $1::uuid AND label = $3), 7, 'variant')",
             (cls.program_id, closed["test_run_id"], sealed),
         )
 
@@ -30354,7 +30733,9 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
 
     def test_a_request_the_door_refused_is_a_replay_receipt_too(self):
         [[lane, decision, purpose]] = self.rows(
-            "SELECT lane, decision, purpose FROM receipts WHERE label = $1", (self.blocked,)
+            "SELECT lane, decision, purpose FROM receipts"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (self.program_id, self.blocked),
         )
 
         self.assertEqual(("replay", "blocked", "target_traffic"), (lane, decision, purpose))
@@ -30983,7 +31364,7 @@ class LiveDoorFixture:
             cls.connection.execute("DELETE FROM programs WHERE slug = $1", (cls.slug,))
             if stored:
                 cls.connection.execute(
-                    "DELETE FROM artifacts WHERE sha256 = ANY($1::text[])",
+                    UNREFERENCED_ARTIFACTS,
                     ("{" + ",".join(stored) + "}",),
                 )
         keep = Store(cls.root)
@@ -31175,8 +31556,8 @@ class ReplayCommandTest(LiveDoorFixture, DatabaseCase):
         lanes = self.rows(
             "SELECT r.lane, count(*) FROM receipts r"
             "  JOIN tool_runs tr ON tr.id = r.tool_run_id"
-            " WHERE tr.label = $1 GROUP BY r.lane",
-            (self.held.facts["tool_run"]["label"],),
+            " WHERE tr.program_id = $1::uuid AND tr.label = $2 GROUP BY r.lane",
+            (self.program_id, self.held.facts["tool_run"]["label"]),
         )
 
         self.assertEqual([("replay", 3)], [(str(row[0]), int(row[1])) for row in lanes])
@@ -31249,8 +31630,8 @@ class ReplayCommandTest(LiveDoorFixture, DatabaseCase):
             "SELECT tr.status, (SELECT outcome FROM test_runs t"
             "                    WHERE t.id = tp.test_run_id)"
             "  FROM tool_runs tr JOIN test_replays tp ON tp.tool_run_id = tr.id"
-            " WHERE tr.label = $1",
-            (self.untrusted.facts["tool_run"]["label"],),
+            " WHERE tr.program_id = $1::uuid AND tr.label = $2",
+            (self.program_id, self.untrusted.facts["tool_run"]["label"]),
         )
         self.assertEqual("error", status)
         self.assertEqual("inconclusive", outcome)
@@ -36230,6 +36611,12 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
     PIVOT_WORTH = "0.20"
     ISOLATED_WORTH = "0.30"
 
+    #: What `value_for` answers for a hunt Task nobody has estimated. Ticket 196
+    #: (`20261129T000000Z`) sets `gain_prior` and `impact_prior` for `hunt` to
+    #: 0.70 apiece, and `w_gain + w_impact = 1` is a CHECK -- so the weighting
+    #: cannot move it and the one number stands for both halves.
+    HUNT_PRIOR = 0.7
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -36386,11 +36773,21 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
     def rank_once_the_band_is_stated(cls):
         """(1) Somebody states what the member is worth, and criterion 5 holds.
 
-        The pass derives and withdraws nothing -- the frontier has not moved --
-        and both candidates now carry half of `high`, because two pending Tasks
-        could each reach that member. Their priority is still NULL: an unlock is
-        not an estimate, and a Task nobody has said anything about does not get
-        ranked because something downstream of it would be valuable.
+        The pass withdraws nothing -- the frontier has not moved -- and both
+        candidates now carry half of `high`, because two pending claims could
+        each reach that member.
+
+        It DERIVES four, and the four are the lag `20261120T000000Z` put here.
+        `rank_pass` runs `derive_chain_unlocks` before `derive_hypothesis_hunts`,
+        and ticket 191 mints one hunt Task per (claim, Identity state). So the
+        pass before this one wrote the rows for the candidate Task it minted
+        itself, and then minted a second Task for each claim's other state --
+        which this pass is the first to see. Eight rows for two claims: two
+        states each, two chains each.
+
+        The share stays a half through it, because `chain_unlock_for` divides by
+        distinct CLAIMS and not by Tasks. Two states of one claim are two ways to
+        run one Test, not two Tests.
         """
         cls.stated = cls.called(
             cls.SEVERITY,
@@ -36555,14 +36952,35 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
 
     @classmethod
     def task_of(cls, hypothesis: str) -> str:
-        """The label of the one hunt Task about a claim."""
+        """The label of the first hunt Task about a claim.
+
+        First and no longer only. `20261120T000000Z` made the frontier a
+        (claim, Identity) pair rather than a claim, so a claim naming nobody
+        owes one hunt Task per state this Program can work -- anonymous and
+        each provisioned account. This case is about the ranking components a
+        chain unlock moves, and those are a property of the claim, so the
+        states carry the same numbers and one of them answers for both.
+        """
         return str(
             cls.connection.execute(
                 "SELECT label FROM tasks"
-                " WHERE program_id = $1::uuid AND kind = 'hunt' AND hypothesis_id = $2::uuid",
+                " WHERE program_id = $1::uuid AND kind = 'hunt' AND hypothesis_id = $2::uuid"
+                " ORDER BY label LIMIT 1",
                 (cls.program_id, hypothesis),
             ).scalar()
         )
+
+    @classmethod
+    def tasks_of(cls, hypothesis: str) -> set[str]:
+        """Every hunt Task about a claim -- one per Identity state, per 191."""
+        return {
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT label FROM tasks"
+                " WHERE program_id = $1::uuid AND kind = 'hunt' AND hypothesis_id = $2::uuid",
+                (cls.program_id, hypothesis),
+            )
+        }
 
     #: Every column of a ranked Task this case reads, kept in one list because
     #: three of the assertions are about a component being EQUAL across the three
@@ -36699,13 +37117,14 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
 
     def test_a_stated_band_is_shared_between_the_tasks_that_could_reach_it(self):
         self.assertEqual("high", self.stated["severity"])
-        self.assertEqual(0, self.pass_after_the_band["unlocks_derived"])
+        self.assertEqual(4, self.pass_after_the_band["unlocks_derived"])
         self.assertEqual(0, self.pass_after_the_band["unlocks_withdrawn"])
 
-        # 0.75 for `high`, halved because two pending Tasks could each obtain the
-        # capability. Two chains waiting on the same Task do not double it: the
-        # sum is over distinct members, because what is unlocked is the member
-        # and the chains are two routes to the one thing.
+        # 0.75 for `high`, halved because two pending claims could each obtain
+        # the capability. Two chains waiting on the same Task do not double it:
+        # the sum is over distinct members, because what is unlocked is the
+        # member and the chains are two routes to the one thing. Nor do the two
+        # Identity states of one claim, for the same reason one hop lower down.
         for name, _ in self.CANDIDATES:
             self.assertEqual(
                 round(self.BAND_WEIGHT / 2, 6),
@@ -36727,14 +37146,30 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
     # -- criterion 5: an unlock constrains a value, it does not replace one ------
 
     def test_an_unlock_cannot_rank_a_task_nobody_has_estimated(self):
+        """The unlock is worth something, and the Task's own value ignores it.
+
+        `20261129T000000Z` gave a Task nobody estimated its kind's prior rather
+        than NULL, so the shape criterion 5 was first written against -- an
+        unranked Task with a positive unlock -- no longer exists, and asserting
+        the NULL back would be asserting that ticket 196 did not happen.
+
+        What criterion 5 says survives it whole, and is what is asserted here:
+        the direct value is the hunt prior of 0.70 both before and after the band
+        was stated, so stating a band moved the unlock and did not move the
+        estimate. An unlock constrains a value; it still does not replace one.
+        """
         for name, _ in self.CANDIDATES:
             self.assertGreater(
                 self.component(self.scored_before_estimates, "chain_unlock_value", name), 0
             )
-            self.assertIsNone(
-                self.component(self.scored_before_estimates, "direct_value", name)
+            self.assertEqual(
+                self.HUNT_PRIOR,
+                self.component(self.scored_before_estimates, "direct_value", name),
             )
-            self.assertIsNone(self.component(self.scored_before_estimates, "priority", name))
+            self.assertEqual(
+                self.component(self.scored_before_a_band, "direct_value", name),
+                self.component(self.scored_before_estimates, "direct_value", name),
+            )
 
     def test_the_chain_unlock_is_the_whole_of_the_unlock_and_stays_under_the_cap(self):
         # 026's unlock term and this one share `unlock_value` and `w_unlock`, so
@@ -36825,21 +37260,27 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
     # -- criterion 4: what the chains stop supporting ---------------------------
 
     def test_a_candidate_that_leaves_the_surface_gives_its_share_back(self):
-        self.assertEqual(2, self.pass_after_a_subject_left["unlocks_withdrawn"])
+        # Four and not two: `beta` is one claim in two Identity states, so it is
+        # two hunt Tasks, and each held a row per chain. The counts through the
+        # rest of this case are all this same doubling.
+        self.assertEqual(4, self.pass_after_a_subject_left["unlocks_withdrawn"])
         self.assertEqual(0, self.pass_after_a_subject_left["unlocks_derived"])
         self.assertEqual(
             "abandoned", self.scored_when_one_left[self.task["beta"]]["status"]
         )
         self.assertEqual(
-            [(self.task["alpha"], self.line["chain"], self.MISSING,
-              self.member["third"]["finding"]),
-             (self.task["alpha"], self.long["chain"], self.MISSING,
-              self.member["third"]["finding"])],
-            sorted(self.rows_when_one_left),
+            {(self.line["chain"], self.MISSING, self.member["third"]["finding"]),
+             (self.long["chain"], self.MISSING, self.member["third"]["finding"])},
+            {row[1:] for row in self.rows_when_one_left},
+        )
+        self.assertEqual(
+            self.tasks_of(self.candidate["alpha"]["hypothesis"]),
+            {row[0] for row in self.rows_when_one_left},
         )
 
-        # One pending Task can reach the member now, so it is worth the whole
-        # band to it rather than half of one.
+        # One pending CLAIM can reach the member now, so it is worth the whole
+        # band to it rather than half of one -- and worth the whole of it to
+        # each of that claim's two states, because they are one Test.
         self.assertEqual(
             self.BAND_WEIGHT,
             self.component(self.scored_when_one_left, "chain_unlock_value", "alpha"),
@@ -36852,18 +37293,18 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
         # alone would not have noticed -- rejecting a Finding leaves its stamp
         # row exactly where it was.
         self.assertEqual({"line": True, "long": True}, self.sound_without_the_pivot)
-        self.assertEqual(2, self.pass_without_the_pivot["unlocks_withdrawn"])
+        self.assertEqual(4, self.pass_without_the_pivot["unlocks_withdrawn"])
         self.assertEqual(0, self.pass_without_the_pivot["unlocks_derived"])
         self.assertEqual([], self.rows_without_the_pivot)
         self.assertEqual(
             0.0, self.component(self.scored_without_the_pivot, "chain_unlock_value", "alpha")
         )
 
-        # And back: two rows again, the whole band again, and no second candidate
-        # Task minted for a hypothesis that already has one.
-        self.assertEqual(2, self.pass_when_the_pivot_returned["unlocks_derived"])
+        # And back: the same four rows again, the whole band again, and no second
+        # candidate Task minted for a hypothesis that already has one.
+        self.assertEqual(4, self.pass_when_the_pivot_returned["unlocks_derived"])
         self.assertEqual(0, self.pass_when_the_pivot_returned["unlock_candidates"])
-        self.assertEqual(2, len(self.rows_when_the_pivot_returned))
+        self.assertEqual(4, len(self.rows_when_the_pivot_returned))
         self.assertEqual(
             self.BAND_WEIGHT,
             self.component(self.scored_when_the_pivot_returned, "chain_unlock_value", "alpha"),
@@ -36875,7 +37316,7 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
         # soundness sentence, an unsound chain drops out of it, and every row
         # under it is the complement of a frontier it is no longer in.
         self.assertEqual({"line": False, "long": False}, self.sound_at_the_end)
-        self.assertEqual(2, self.pass_after_the_member_went["unlocks_withdrawn"])
+        self.assertEqual(4, self.pass_after_the_member_went["unlocks_withdrawn"])
         self.assertEqual(0, self.pass_after_the_member_went["unlocks_derived"])
         self.assertEqual([], self.rows_at_the_end)
 
@@ -36918,7 +37359,7 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
             )
         )
 
-        self.assertEqual({"candidates": 0, "derived": 0, "withdrawn": 2},
+        self.assertEqual({"candidates": 0, "derived": 0, "withdrawn": 4},
                          payload["chain_unlocks"])
 
     def test_the_standing_check_holds_over_every_pass_this_case_ran(self):
@@ -38279,9 +38720,21 @@ class ReportProjectionTest(ReportFixture, DatabaseCase):
             [("template_empty", self.FORGED, "no blocks")],
             self.form_problems["no_blocks_at_all"],
         )
-        self.assertEqual(
-            [("step_slot_unfilled", f"{self.label} step 1", "nowhere")],
+        # Membership and not equality for this one arm. The forge moves a row of
+        # the global `report_mechanisms` table, `check_report_projection()`
+        # reports every Program, and Finding labels restart per Program -- so
+        # another case's `F1` with a step under it is reported beside this one's
+        # and is not distinguishable from it by name. What is still asserted is
+        # both halves: this case's step is named, and nothing else is reported
+        # for any other reason.
+        self.assertIn(
+            ("step_slot_unfilled", f"{self.label} step 1", "nowhere"),
             self.form_problems["a_slot_that_appeared_later"],
+        )
+        self.assertEqual(
+            {("step_slot_unfilled", "nowhere")},
+            {(rule, detail) for rule, _obj, detail
+             in self.form_problems["a_slot_that_appeared_later"]},
         )
 
     def test_the_standing_checks_hold_over_everything_this_case_rendered(self):
@@ -41566,37 +42019,40 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
 
     # -- the three claims ------------------------------------------------------
 
-    def test_every_playbook_is_loadable_by_exactly_one_production_role(self):
+    def test_every_playbook_names_the_production_roles_that_can_load_it(self):
         # The roles come out of `role_skills`, which is the roster the harness
         # runs. A Playbook loadable by nothing is dead corpus -- 035 makes it an
         # integrity error -- and one loadable only by a role no Agent runs is
         # the same thing with a longer explanation.
         #
-        # Exactly one, rather than at least one, because that is what the
-        # catalogue currently says and it is the more useful thing to be told
-        # when it stops being true: a Playbook that two roles can load is a
-        # Playbook whose Skill set no longer picks out who does this work, and a
-        # Playbook that none can is unreachable. `external-resources` and
-        # `supply-chain` are the js_analyst ones -- both read a served document
-        # for what it names rather than sending anything at the application,
-        # which is that role's whole job; every other topic here is
-        # web_hunter's, `attack-surface` included since ticket 178.
+        # The whole map rather than a count, because what is useful to be told
+        # is WHICH role moved. One role per Playbook is still the shape of the
+        # catalogue: a Playbook two roles can load is usually a Playbook whose
+        # Skill set no longer picks out who does this work, and one none can load
+        # is unreachable. `external-resources` and `supply-chain` are the
+        # js_analyst ones -- both read a served document for what it names rather
+        # than sending anything at the application, which is that role's whole
+        # job; every other topic here is web_hunter's.
         #
-        # It was recon's, and no recon Task ever selected it: its triggers are
-        # `read_method` and `unauthenticated_endpoint`, which are facts recon
-        # records rather than facts it is given, so they match nothing at recon
-        # time and match a hunt Task's subject afterwards. Measured in
-        # `rk2grade4`: twelve recon Tasks done, no selection row under any of
-        # them, and every row that does exist under a hunt or conclude Task
-        # dropped on `role_lacks_skill`. No production role loads no Playbook at
-        # all -- recon keeps `handle-untrusted-content` -- and this map is the
-        # place that would say so if a topic lost its reader.
+        # `attack-surface` is the one exception, and it is a decision rather than
+        # a drift. Ticket 178 moved it to web_hunter alone because no recon Task
+        # ever selected it -- its triggers are `read_method` and
+        # `unauthenticated_endpoint`, facts recon records rather than facts it is
+        # given, so they match nothing at recon time; measured in `rk2grade4` as
+        # twelve recon Tasks done with no selection row under any of them.
+        # Ticket 193 gave `enumerate-surface` back to recon anyway, for the
+        # stronger reason that a role which stages a Skill has to be able to open
+        # it, and this Playbook names that Skill. So both roles load it: recon
+        # because it maps the root, web_hunter because it hunts what the map
+        # found. No production role loads no Playbook at all -- recon keeps
+        # `handle-untrusted-content` -- and this map is the place that would say
+        # so if a topic lost its reader.
         self.assertEqual(
             {
                 "agentic-ai": ["web_hunter"],
                 "api": ["web_hunter"],
                 "api-authorization": ["web_hunter"],
-                "attack-surface": ["web_hunter"],
+                "attack-surface": ["recon", "web_hunter"],
                 "authentication": ["web_hunter"],
                 "browser-framing": ["web_hunter"],
                 "browser-messaging": ["web_hunter"],
@@ -46402,6 +46858,56 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
                 self.assertIn(shown["state"], (panels.READY, panels.EMPTY))
                 self.assertEqual("", shown["detail"])
 
+    def test_every_read_the_graph_draws_from_runs_against_the_live_schema(self):
+        # The same thing the panels are asked above, for the other surface. Its
+        # three statements reach twenty-one tables across a dozen migrations,
+        # and the canvas would draw an empty graph for a statement that failed
+        # exactly as convincingly as for a Program with nothing in it.
+        drawn, kind = graph.surface(self.harness.runtime, self.slug)
+        answered = json.loads(drawn)
+
+        self.assertEqual(graph.JSON, kind)
+        self.assertNotIn("error", answered)
+        self.assertTrue(answered["nodes"])
+        self.assertEqual(0, answered["omitted"])
+
+    def test_the_graph_reads_one_node_and_one_address_off_the_live_schema(self):
+        # The two statements the whole-graph read does not cover. A node is
+        # asked for by the id the graph itself handed out, because an id this
+        # test made up would prove the statement parses and nothing else.
+        first = json.loads(graph.surface(self.harness.runtime, self.slug)[0])
+        seat = next(n for n in first["nodes"] if n["kind"] == "finding")
+
+        shown = json.loads(graph.node(self.harness.runtime, self.slug, seat["id"])[0])
+        pinned = json.loads(
+            graph.node(self.harness.runtime, self.slug, f"{graph.PINNED}127.0.0.1")[0]
+        )
+
+        self.assertNotIn("error", shown)
+        self.assertEqual(seat["id"], shown["finding"]["id"])
+        # The key rather than the rows. What proof a Finding has is the
+        # fixture's business; that the join behind it ran is this test's.
+        self.assertIn("proof", shown)
+        # An address nothing was pinned to is an answer of nothing, not a
+        # failure: what is asserted is that the statement ran.
+        self.assertNotIn("error", pinned)
+        self.assertEqual("127.0.0.1", pinned["address"]["address"])
+
+    def test_the_graph_reads_nothing_of_the_program_it_was_not_opened_over(self):
+        # There is no Program argument on any route, so isolation here is the
+        # same question the console answers: a graph opened over one slug draws
+        # that Program's rows and not its neighbour's. Asked as two sets that do
+        # not meet rather than as an empty one, because the neighbour is not
+        # empty -- opening a Program writes the Entities its scope names, so a
+        # graph that drew everything would still look plausible over there.
+        mine = json.loads(graph.surface(self.harness.runtime, self.slug)[0])
+        theirs = json.loads(graph.surface(self.harness.runtime, self.NEIGHBOUR)[0])
+
+        self.assertNotIn("error", theirs)
+        self.assertTrue(mine["nodes"])
+        self.assertTrue(theirs["nodes"])
+        self.assertEqual(set(), {n["id"] for n in mine["nodes"]} & {n["id"] for n in theirs["nodes"]})
+
     def test_the_areas_this_ticket_names_are_the_panels_and_the_two_other_reads(self):
         # Lifecycle, integrity, Slates, Agent runs, Tool runs, Leases, budgets,
         # Findings, chains and reports are panels; Tasks, Surface, Hypotheses and
@@ -46409,10 +46915,12 @@ class OperatorConsoleTest(ReportFixture, DatabaseCase):
         # operator's queue. Nothing in the criterion is unreachable from here.
         # `wave` is ticket 80's and not 60's, and it is here rather than in a
         # set of its own because a panel this console does not show is a
-        # measurement nobody reads.
+        # measurement nobody reads. `faults` is the same argument again: the
+        # failures are already in `agent_runs`, `tool_runs` and `events`, and a
+        # reason nobody has a page for is a reason nobody reads.
         self.assertEqual(
-            {"program", "checks", "slates", "agent_runs", "tool_runs", "leases",
-             "budgets", "findings", "chains", "reports", "wave"},
+            {"program", "checks", "faults", "slates", "agent_runs", "tool_runs",
+             "leases", "budgets", "findings", "chains", "reports", "wave"},
             set(self.before),
         )
         self.assertIn("records", dict(ui.NAVIGATION).values())
@@ -47556,7 +48064,17 @@ def surveyed(hand: Hand) -> dict:
 #: registry named. `tool.run` probes the version before it opens a run and holds
 #: the answer against the registry's pattern, so a stand-in that skipped the
 #: probe would skip the one check that says the image is the tool.
-CAMPAIGN_VERSIONS = {"/usr/bin/jq": "jq-1.7"}
+#: What the stand-in image answers a version probe with, keyed on the ANALYSER
+#: and not on the executable. `20261127T000000Z` gave every offline tool a
+#: harness-shipped analyser, so `offline_tools.executable` is
+#: `/usr/local/bin/python3` for all six of them and the script beside it is the
+#: only thing in the argv that says which tool is being asked. Each string is
+#: what that analyser's own `--version` prints, and each has to satisfy the
+#: registry's `version_pattern` -- `open_offline_tool_run` holds it against one.
+CAMPAIGN_VERSIONS = {
+    "jqrun.py": "rk2-jq 1 (jq-1.7)",
+    "jsscan.py": "rk2-jsscan 3",
+}
 
 
 class Contained:
@@ -47607,9 +48125,13 @@ class Contained:
     # -- what each kind of child answers ---------------------------------------
 
     def version(self, argv: tuple[str, ...]) -> isolation.ToolProcess:
-        said = CAMPAIGN_VERSIONS.get(argv[0])
+        # `tool._version` builds `(executable, analyser.path, *version_argv)`,
+        # so the name that identifies the tool is the second element wherever
+        # the registry names an analyser -- which since 20261127 is everywhere.
+        name = Path(argv[1] if len(argv) > 1 else argv[0]).name
+        said = CAMPAIGN_VERSIONS.get(name)
         if said is None:
-            raise isolation.Unavailable(f"no campaign image holds {argv[0]}")
+            raise isolation.Unavailable(f"no campaign image holds {name}")
         return _said(said.encode())
 
     def filtered(self, inputs: dict, stdin: bytes | None = None) -> isolation.ToolProcess:
@@ -47871,8 +48393,25 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         # Identity under another would be an installation with two keys.
         cls.root_secret = seal.Root(f"{cls.slug}-root", SECRET)
         cls.standing_weights = int(cls.connection.execute(STANDING_WEIGHTS).scalar())
+        #: The runs the two lane commands manufacture, kept so that
+        #: `close_lane_runs` can end what `claimed_agent_run` began.
+        cls.lane_runs = {}
         cls.ceilings(CAMPAIGN_WEIGHTS)
+        try:
+            cls.arrange()
+        except BaseException:
+            # `tearDownClass` does not run when `setUpClass` raises, and the
+            # active weights row is the one thing this case changes that is not
+            # its own. Left standing it hands every class after this one a
+            # `session_max_turns` of 2, which is not a failure they can read --
+            # `OrchestratorRotationTest` reports a session inside its ceilings as
+            # spent on turns and says nothing about where the 2 came from.
+            cls.ceilings(cls.standing_weights)
+            raise
 
+    @classmethod
+    def arrange(cls):
+        """Everything after the weights row, so that a failure can put it back."""
         cls.target, _ = counterparty(LiveTarget)
         cls.authority = tls.authority(scratch() / "campaign-authority")
         cls.fence = proxy.Fence(pg.connect(cls.harness.proxy))
@@ -47985,7 +48524,7 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
             )
             if stored:
                 cls.connection.execute(
-                    "DELETE FROM artifacts WHERE sha256 = ANY($1)",
+                    UNREFERENCED_ARTIFACTS,
                     ("{" + ",".join(stored) + "}",),
                 )
         # The weights row goes back before the next case runs, because it is the
@@ -48249,15 +48788,35 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         at again is a decision, and a restart that made it would be the harness
         deciding what to believe.
         """
+        # Before the recovery rather than after it: what `close_lane_runs` ends
+        # is fixture debris holding a live half-hour Lease, which recovery would
+        # leave standing anyway, and the assertion at the foot of this method is
+        # about a slate the debris would otherwise make empty.
+        cls.close_lane_runs(name)
         resumed = program.run(cls.harness.runtime, cls.configurations[name])
         assert resumed.ok, (name, list(resumed.violations))
         if between is not None:
             between()
         pending = cls.pending(name)
         ledger, facts = cls.supervisor(name, Hand(cls.SCRIPT))
-        assert not list(ledger.violations), (name, list(ledger.violations))
-        assert (facts["task"] is not None) == (pending > 0), (name, pending, facts)
+        assert not cls.unanswered(ledger), (name, list(ledger.violations))
+        assert (facts["task"] is not None) == (pending > 0), (name, pending)
         return facts
+
+    #: What `execution._unauthorized` files rather than refuses. From the
+    #: investigation onwards a campaign holds a provisioned Identity, and
+    #: `20261120T000000Z` mints the second state of every recon Task the moment
+    #: it does -- so a pass after that point claims a Task that acts as somebody
+    #: and `call_risk_rules:net_borrowed_identity` answers `ask`. The pass files
+    #: the question and stops, which is the campaign asking a person rather than
+    #: a restart that failed to recover, and `undecided` already models the same
+    #: state one layer up.
+    ASKED = "for a human to answer"
+
+    @classmethod
+    def unanswered(cls, ledger: Ledger) -> list:
+        """Everything the pass reported that is not it stopping to ask."""
+        return [one for one in ledger.violations if cls.ASKED not in str(one.detail)]
 
     @classmethod
     def interrupt(cls, name: str) -> list[dict]:
@@ -48292,7 +48851,7 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         """
         for passes in range(DRAIN):
             ledger, facts = cls.supervisor(name, Hand(cls.SCRIPT))
-            assert not list(ledger.violations), (name, list(ledger.violations))
+            assert not cls.unanswered(ledger), (name, list(ledger.violations))
             if facts["task"] is None:
                 return passes
         raise AssertionError(f"{name} was still claiming Tasks after {DRAIN} passes")
@@ -48312,11 +48871,105 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
             cls.connection, cls.owner_connection, cls.identifiers[name],
             role=role, kind=kind,
         )
+        cls.lane_runs.setdefault(name, []).append(run)
         return str(
             cls.connection.execute(
                 "SELECT label FROM agent_runs WHERE id = $1::uuid", (run,)
             ).scalar()
         )
+
+    @classmethod
+    def replay_run(cls) -> str:
+        """A replay's holding run, remembered so the lane can be given back.
+
+        `ReplayFixture.replay_run` manufactures a claimed `recon` Task per
+        replay and never ends it, which every other case in this module can
+        afford because none of them runs the scheduler afterwards. This one
+        does. Ticket 199's `chain` profile caps `recon` at the role's one
+        concurrent slot, and the investigation performs seven replays -- so
+        without this the lane is held shut from the first of them and every
+        pass after the investigation is offered an empty slate with two dozen
+        recon Tasks pending behind it.
+
+        Recorded and closed by `close_lane_runs`, symmetrically with the runs
+        the two lane commands manufacture.
+        """
+        run = super().replay_run()
+        where = cls.focused()
+        if where is not None:
+            cls.lane_runs.setdefault(where, []).append(run)
+        return run
+
+    #: Runs manufactured before the two campaigns exist, so that the inherited
+    #: `setUpClass` above can perform replays of its own without this.
+    lane_runs: dict = {}
+
+    @classmethod
+    def focused(cls) -> str | None:
+        """Which campaign `focus` last pointed the inherited moves at, if any.
+
+        None while the inherited fixture is building its own Program, which is
+        not a campaign and has no lane anything here will read.
+        """
+        return next(
+            (n for n, i in getattr(cls, "identifiers", {}).items() if i == cls.program_id),
+            None,
+        )
+
+    @classmethod
+    def close_lane_runs(cls, name: str) -> None:
+        """Put back what `claimed_agent_run` manufactured, once the command is done.
+
+        `claimed_agent_run` writes a Task straight into `claimed` with a
+        half-hour Lease, because the two lane commands need a run that is holding
+        one and `claim_task` needs a slate this fixture is not exercising. What
+        it does not do is end it, and a campaign that calls it once per lane
+        command per pass accumulates them: measured here as eight `recon` Tasks
+        and one `analyze`, every one `claimed`, Lease live, with its single Agent
+        run still open.
+
+        That is a lane held shut. `scheduler_lane_state.live_slots` counts Tasks
+        in `claimed` or `running` whatever is behind them, and ticket 199's
+        `chain` profile caps `recon` at the role's one concurrent slot -- so the
+        first manufactured Task takes the only slot and the campaign is offered
+        an empty slate from then on, with two dozen recon Tasks pending behind
+        it.
+
+        Ended by hand, symmetrically with how it was begun. The product path
+        never produces this state -- `claim_task` refuses a full lane -- so there
+        is no verb whose job is to undo it, and reaching for `finish_task_attempt`
+        here would be asking a real verb to clean up after a fabrication.
+        """
+        runs = cls.lane_runs.pop(name, [])
+        if not runs:
+            return
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            # `release_leases` asks `rk2_program_required`, which reads the
+            # setting rather than the row -- bypassing RLS as the owner does not
+            # exempt a function from being told which Program it is acting for.
+            cls.owner_connection.execute(
+                "SELECT set_config('rk2.program_id', $1, true)", (cls.identifiers[name],)
+            )
+            for run in runs:
+                cls.owner_connection.execute("SELECT release_leases($1::uuid)", (run,))
+                cls.owner_connection.execute(
+                    "UPDATE agent_runs SET finished_at = now(),"
+                    "       stop_reason = 'completed'"
+                    " WHERE id = $1::uuid AND finished_at IS NULL",
+                    (run,),
+                )
+                # `abandoned` and not `done`: `enforce_task_completion` refuses
+                # `done` for a Task no proposal of which was promoted, and this
+                # Task never carried work to promote. Abandoned is what it is --
+                # opened by the fixture to hold a Lease, and let go unfinished.
+                cls.owner_connection.execute(
+                    "UPDATE tasks SET status = 'abandoned', lease_expires_at = NULL,"
+                    "       abandoned_reason = 'superseded', finished_at = now()"
+                    "  WHERE id = (SELECT task_id FROM agent_runs WHERE id = $1::uuid)",
+                    (run,),
+                )
 
     @classmethod
     def analyse(cls, name: str) -> Report:
@@ -48344,6 +48997,7 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
                 arguments={"filter": ".", "input": put.facts["artifact"]["label"]},
             )
         assert queried.ok, (name, queried.violations)
+        cls.close_lane_runs(name)
         return queried
 
     @classmethod
@@ -48372,6 +49026,7 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
                 door=door or cls.boundary,
             )
         assert walked.ok == served, (name, [str(one) for one in walked.violations])
+        cls.close_lane_runs(name)
         return walked
 
     # -- the three commits no supervisor makes ---------------------------------
@@ -48722,6 +49377,7 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
 
             record["facts"] = cls.restart(name, between=asked_again)
             made.append(record)
+        cls.close_lane_runs(name)
         return {"finding": claim["finding"], "replay": claim["replay"], "stops": made}
 
     # -- the investigation each campaign performs ------------------------------
@@ -48838,8 +49494,18 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
         "chain_steps": "SELECT DISTINCT s.depth, p.transition FROM chain_steps s"
                        "  JOIN pivot_stamps p ON p.id = s.stamp_id"
                        " WHERE s.program_id = $1::uuid ORDER BY 1, 2",
+        # Every question but the one a recon pass asks about borrowing a
+        # credential. From the investigation onwards each campaign holds a
+        # provisioned Identity, `20261120T000000Z` keeps deriving the second
+        # state of every subject it has mapped, and `call_risk_rules` answers
+        # `ask` to each -- so how many `credential_needed` questions a campaign
+        # accumulated says how many passes it had left over after the phases
+        # above, which is the schedule and not the knowledge. The questions the
+        # investigation itself asks are what this row is for and they are all
+        # still here.
         "decisions": "SELECT DISTINCT question_code, question, answered_at IS NOT NULL"
-                     "  FROM pending_decisions WHERE program_id = $1::uuid ORDER BY 1, 2",
+                     "  FROM pending_decisions WHERE program_id = $1::uuid"
+                     "   AND question_code <> 'credential_needed' ORDER BY 1, 2",
     }
 
     STAMPS = "SELECT transition FROM pivot_stamps WHERE program_id = $1::uuid"
@@ -49130,9 +49796,17 @@ class CampaignRecoveryTest(ReportFixture, DatabaseCase):
                 # ceilings are low enough that the pass which opened it ran into
                 # one before the campaign ended -- so this is every session,
                 # and a session left open would be one nothing bounded.
-                reasons = {str(row[0]) for row in self.rows_for(name, self.ROTATIONS)}
-                self.assertNotEqual(set(), reasons)
-                self.assertEqual(set(), reasons - self.CEILINGS)
+                reasons = [str(row[0]) for row in self.rows_for(name, self.ROTATIONS)]
+                self.assertNotEqual([], reasons)
+                # Every session but possibly the last, which the campaign may
+                # simply have ended inside: a pass that parks a question for a
+                # human spends a turn and stops, so whether the final session
+                # ran into a ceiling before the phases ran out is a matter of
+                # how many turns the last phase happened to take. What is a
+                # statement about the ceilings is that nothing else ever ends a
+                # session, and that the one that may be open is the last one.
+                self.assertEqual(set(), set(reasons[:-1]) - self.CEILINGS)
+                self.assertIn(reasons[-1], self.CEILINGS | {"None"})
 
     def test_every_attempt_was_made_by_a_worker_of_its_own(self):
         for name in self.identifiers:

@@ -92,6 +92,13 @@ class CorpusTest(unittest.TestCase):
         # `retire_task` is the same argued shape: it emits task.retired and the
         # Task update names that event. Both save and restore the prior cause;
         # no ordinary writer is allowed to add a third setter.
+        #
+        # The third file is not a third setter. Ticket 191 gives `open_task` a
+        # fifth argument, and `CREATE OR REPLACE` restates the whole body --
+        # this line with it. So the number of files carrying the string grew
+        # while the number of verbs setting the cause did not. That is the rule
+        # the list was always a proxy for, and the loop below is the rule
+        # itself: appending a name to the list can no longer buy a third verb.
         setters = [
             item.identity
             for item in self.migrations
@@ -101,9 +108,23 @@ class CorpusTest(unittest.TestCase):
             [
                 "20260831T000000Z__a_program_opens_the_first_task_of_its_own_scope",
                 "20261019T000000Z__an_undispatchable_task_ends_itself",
+                "20261120T000000Z__both_states_or_the_measurement_is_half_a_measurement",
             ],
             setters,
         )
+        for item in self.migrations:
+            for name, body in re.findall(
+                r"CREATE OR REPLACE FUNCTION\s+(?:public\.)?(\w+)\s*\(.*?"
+                r"\$(?:fn|function)\$(.*?)\$(?:fn|function)\$",
+                item.sql,
+                re.DOTALL,
+            ):
+                if "set_config('app.caused_by_event_id'" in body:
+                    self.assertIn(
+                        name,
+                        ("open_task", "retire_task"),
+                        f"{item.identity} sets the causing event inside {name}",
+                    )
 
     def test_the_emitter_binds_the_actor_to_the_writing_transaction(self):
         # RK-REG-004: a session-wide actor context outlives the write it

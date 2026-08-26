@@ -323,13 +323,18 @@ def run(
 def _workable(ledger: Ledger, state: _State) -> bool:
     """Whether this Program is in a state anything may be attempted against.
 
-    Four refusals rather than one, because they are four different facts and
+    Three refusals rather than one, because they are three different facts and
     an operator reading "nothing happened" deserves to know which. A closed or
     retired Program is not a fault at all, which is why it is held rather than
     failed: the run resumed it correctly and there is nothing left to work on.
     A Halt is the same shape and says so in the operator's own words: the
     scheduler would refuse every Task anyway, and this is where that refusal
     gets a name instead of an empty slate.
+
+    An open question is the fourth fact and the one that is not a refusal --
+    ticket 206. It is recorded here because an operator wants it in the answer,
+    and it stops nothing, because it is about one Task and not about the
+    Program.
     """
     if ledger.violations:
         return False
@@ -340,11 +345,21 @@ def _workable(ledger: Ledger, state: _State) -> bool:
         )
         return False
     if state.pending:
+        # Held and not returned on. An open question belongs to the one Task it
+        # parked -- `park_authorized_tool_run` moves that Task to `parked`, out
+        # of the queue and out of every ready set -- so refusing the whole
+        # Program for it stops work nobody has any question about. Measured on
+        # `rk2here`: one open decision, one parked Task, and 635 pending Tasks
+        # the pass would not look at. The gate that decides who may act is
+        # `call_risk_rules` at the door, one call at a time, and it is untouched
+        # by this: another Task that needs the same permission parks and asks
+        # too. What changes is only that the questions accumulate for one
+        # sitting of a human's attention instead of stopping the campaign each.
         ledger.hold(
             "execution",
-            f"{len(state.pending)} decision(s) are waiting on a human; nothing was claimed",
+            f"{len(state.pending)} decision(s) are waiting on a human; "
+            "their Tasks are parked and the rest of the queue is workable",
         )
-        return False
     if state.lifecycle != "open":
         ledger.hold("execution", f"the Program is {state.lifecycle}; nothing was claimed")
         return False
@@ -378,9 +393,14 @@ def _report(ledger: Ledger, state: _State) -> Report:
     """Everything the command answers, and the one word a driver loop reads.
 
     The stop reason is decided from the pass's own facts and in this order:
-    a refusal outranks everything, a question waiting on a human outranks the
-    work, an attempt that was made is what the run is about, and only then the
-    two ways of having made none. Ticket 161 is the fourth of those --
+    a refusal outranks everything, an attempt that was made is what the run is
+    about, and only then the three ways of having made none -- of which a
+    question waiting on a human is the first, because it is the one an operator
+    can do something about. Ticket 206 put it there: while it outranked the
+    work, every pass of a campaign holding one open question reported
+    `awaiting_decision` whether it had worked a Task or not, and a driver loop
+    reading that word stopped a campaign with 635 workable Tasks in it.
+    Ticket 161 is another of those --
     `nothing_to_execute` is what a genuinely empty Slate answers, and a chooser
     that ran out of room before it read a Slate with entries on it answers
     `chooser_cut_off`, because the next pass opens a new session and the work
@@ -392,10 +412,10 @@ def _report(ledger: Ledger, state: _State) -> Report:
     chooser = (execution.get("choice") or {}).get("cut_off")
     if ledger.violations:
         stop_reason = STOPPED_REFUSED
-    elif pending:
-        stop_reason = STOPPED_AWAITING_DECISION
     elif attempted:
         stop_reason = STOPPED_TASK_ATTEMPTED
+    elif pending:
+        stop_reason = STOPPED_AWAITING_DECISION
     elif chooser:
         stop_reason = STOPPED_CHOOSER_CUT_OFF
     else:

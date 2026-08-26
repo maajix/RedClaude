@@ -392,9 +392,69 @@ WAVE = Read(
     total="SELECT count(*) FROM wave_report($1)",
 )
 
+#: Everything that did not go to plan, newest first, from the three places the
+#: schema already forces a reason to be written down. It holds no query the
+#: other panels do not already have the columns for: `agent_runs` and
+#: `tool_runs` are here again, filtered to their failures and carrying the
+#: detail column their own panel leaves out because a list of every run cannot
+#: afford it. A campaign's failures are a handful of rows and the reason is the
+#: whole point of looking, so this is the one read that shows them.
+#:
+#: `stop_reason` is filtered by what it is not, rather than by a list of the
+#: reasons that count as trouble: `completed` and `stop_condition` are the two
+#: ways a run ends having done its job, and everything else -- `error`,
+#: `aborted`, `refusal`, `budget`, `parked` -- is something an operator watching
+#: a live hunt wants to see. Written that way round so a stop reason added
+#: later arrives on this panel instead of being silently absent from it.
+#:
+#: Blocked Receipts are deliberately not here. A refused request is the Scope
+#: Policy working, and a campaign produces them by the hundred, so a panel that
+#: carried them would bury the handful of rows this one exists to surface.
+FAULTS = Read(
+    name="faults",
+    caption="every run that did not finish its work, and what it said about why",
+    columns=("at", "kind", "what", "detail"),
+    rows=(
+        "SELECT occurred_at::text, kind, what, detail"
+        "  FROM ("
+        "    SELECT coalesce(a.finished_at, a.started_at) AS occurred_at,"
+        "           'agent_run' AS kind,"
+        "           concat_ws(' ', a.label, a.role, a.stop_reason) AS what,"
+        "           coalesce(a.error_detail, '') AS detail"
+        "      FROM agent_runs a"
+        "     WHERE a.program_id = $1"
+        "       AND a.stop_reason IS NOT NULL"
+        "       AND a.stop_reason NOT IN ('completed', 'stop_condition')"
+        "    UNION ALL"
+        "    SELECT coalesce(tr.finished_at, tr.started_at), 'tool_run',"
+        "           concat_ws(' ', tr.label, tr.tool, tr.status),"
+        "           coalesce(nullif(btrim(tr.exit_detail), ''), tr.hook_error, '')"
+        "      FROM tool_runs tr"
+        "     WHERE tr.program_id = $1 AND tr.status IN ('error', 'denied')"
+        "    UNION ALL"
+        "    SELECT e.recorded_at, 'event', e.type, left(e.payload::text, 500)"
+        "      FROM events e"
+        "     WHERE e.program_id = $1"
+        "       AND e.type IN ('agent.refused', 'budget.exhausted', 'rate_limit.hit')"
+        "  ) faults"
+        " ORDER BY occurred_at DESC"
+        " LIMIT $2"
+    ),
+    total=(
+        "SELECT (SELECT count(*) FROM agent_runs"
+        "         WHERE program_id = $1 AND stop_reason IS NOT NULL"
+        "           AND stop_reason NOT IN ('completed', 'stop_condition'))"
+        "     + (SELECT count(*) FROM tool_runs"
+        "         WHERE program_id = $1 AND status IN ('error', 'denied'))"
+        "     + (SELECT count(*) FROM events"
+        "         WHERE program_id = $1"
+        "           AND type IN ('agent.refused', 'budget.exhausted', 'rate_limit.hit'))"
+    ),
+)
+
 READS = (
-    PROGRAM, CHECKS, FINDINGS, CHAINS, REPORTS, SLATES, AGENT_RUNS, TOOL_RUNS, LEASES,
-    BUDGETS, WAVE,
+    PROGRAM, CHECKS, FAULTS, FINDINGS, CHAINS, REPORTS, SLATES, AGENT_RUNS, TOOL_RUNS,
+    LEASES, BUDGETS, WAVE,
 )
 NAMES = tuple(read.name for read in READS)
 BY_NAME = {read.name: read for read in READS}

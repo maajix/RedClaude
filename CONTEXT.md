@@ -799,6 +799,16 @@ happened rather than that there is nothing there. What it shows is rows the
 database computed; it never computes a claim about a campaign.
 _Avoid_: Widget, card, tile, section
 
+**Graph**:
+The second local surface over one Program: its Entities, Observations,
+Hypotheses and Findings drawn as nodes, and the bytes behind any of them shown
+on the node itself. Not the console. It holds the runtime's connection and
+nothing else, answers GET and has no verb, so a Halt cannot be lifted from here
+and nothing on it is an action. It runs a script where the console runs none,
+which is why it is a second command on a second port rather than a page over
+there. What it draws is bounded and it says how much it left out.
+_Avoid_: Map, visualisation, dashboard, network diagram
+
 **Credential vector**:
 An environment variable, settings key or provider switch that replaces,
 prevents, reroutes or redirects the CLI's subscription-authenticated request

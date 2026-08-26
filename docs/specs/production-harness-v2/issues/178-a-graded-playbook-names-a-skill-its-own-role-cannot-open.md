@@ -55,7 +55,7 @@ and its Skill was held by recon alone -- so no role could ever select it.
       is enumeration of an unmapped root, which is what recon is for and what
       the Skill's own step 4 stops at.
 - [x] **Moved, not added.**
-      `test_every_playbook_is_loadable_by_exactly_one_production_role` holds the
+      `test_every_playbook_names_the_production_roles_that_can_load_it` holds the
       corpus to one role per Playbook, and a grant that let both roles load this
       one is exactly what it exists to catch: "a Playbook that two roles can
       load is a Playbook whose Skill set no longer picks out who does this
@@ -108,8 +108,10 @@ select is indistinguishable, in the verdict, from a Playbook that finds nothing
 Three test expectations moved with the corpus, each because it was written
 against the state this ticket corrects:
 
-- `test_every_playbook_is_loadable_by_exactly_one_production_role`:
-  `attack-surface` maps to `web_hunter`.
+- `test_every_playbook_names_the_production_roles_that_can_load_it`:
+  `attack-surface` maps to `web_hunter`. (Ticket 193 later gave the Skill back
+  to recon as well, so the entry is now both roles and the test's name says
+  roles rather than one role.)
 - `test_the_selection_reaches_a_playbook_for_an_application_subject`: the row it
   reaches is kept rather than dropped on `role_lacks_skill`.
 - `test_a_skill_combination_no_role_can_load_is_reported` asked for

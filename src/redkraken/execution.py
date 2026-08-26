@@ -486,10 +486,15 @@ LIFETIME = (
 #: what the child's one request actually did. The child reports too, and its
 #: report is not evidence: the Receipt is written by the fence, on the fence's
 #: own connection, and is the row a promoted Observation has to cite.
+#: Every Receipt the door wrote under one Tool run, newest first. All of them
+#: and not the newest alone: how the run closes turns on whether anything
+#: actually refused it, and one run may make several requests -- a refusal and,
+#: separately, a target that did not answer. `_exchange` reads the first row for
+#: what the run ended on and the rest for that question.
 EXCHANGE = (
-    "SELECT label, decision, status_code FROM receipts"
+    "SELECT label, decision, status_code, reason FROM receipts"
     " WHERE program_id = $1::uuid AND tool_run_id = $2::uuid"
-    " ORDER BY ts_arrival DESC LIMIT 1"
+    " ORDER BY ts_arrival DESC"
 )
 
 CAUSE = "SELECT set_cause($1::uuid, $2::uuid)"
@@ -1039,9 +1044,25 @@ class Claimed:
             return self._finishing(
                 self._selected(self._conclusion(head, vocabulary), playbooks), completion_only
             )
+        # Ticket 188. One sentence, and for `recon` it was the wrong one. Every
+        # kind got "send that one request", which is what a hunt against a
+        # single claim does and the opposite of what mapping a surface is: 17
+        # recon runs on `rk2here` called `http_request` exactly once each and
+        # submitted, and 11 of the answers were redirects nobody followed. The
+        # Skill that says what a walk is made of is named here rather than left
+        # to the child to notice, because a Skill is offered and the measurement
+        # is that this one never was opened.
+        opening = (
+            "That target is where this Task starts and not where it ends. Load the "
+            "Skill enumerate-surface before the first request, then walk what it "
+            "describes with mcp__rk2__http_request: this Task is graded on the "
+            "surface it leaves behind, and a run that sent one request and stopped "
+            "mapped one URL. "
+            if self.kind == "recon"
+            else "Send that one request with mcp__rk2__http_request and read the answer. "
+        )
         prompt = (
-            f"{head}"
-            "Send that one request with mcp__rk2__http_request and read the answer. "
+            f"{head}{opening}"
             "Then call mcp__rk2__submit_mission_result once, with one observation per "
             "thing you actually established, each citing the Receipt the request "
             "answered with. Nothing you write becomes canonical until the runtime "
@@ -3040,7 +3061,12 @@ class Slice:
         `ask` is filed rather than treated as a refusal, by the same call the
         proxy uses: the answer is that a person decides this one, and a runtime
         that closed it as denied would have decided it -- in the direction that
-        leaves no question behind.
+        leaves no question behind. Ticket 206: filing it is also all this
+        reports, because a pass that asked is a pass that worked.
+
+        Every other verdict is a refusal and stays one. `forbidden` and a gate
+        that answered nothing at all are both a Task this Program may not do,
+        and an operator has a configuration to go and look at.
         """
         label = tool_run["label"]
         if decision == ASK:
@@ -3060,12 +3086,24 @@ class Slice:
                     source="database",
                 )
                 return
-            ledger.fail(
+            # Held and not failed -- ticket 206, the half of it inside the pass.
+            # `outcome.AWAITING_DECISION` says what this is: the gate answered
+            # `ask`, the question is filed, and nothing has gone wrong. Filing
+            # it as a refused configuration made `_report` call the whole pass
+            # `refused` and `rk run` exit 3, so a driver loop counted a campaign
+            # asking a person toward its consecutive-fault streak and stopped
+            # after three of them. The pass did claim a Task, dispatch it and
+            # park it -- `closure.task_status` reads `parked` -- and that is
+            # work, not a fault. The question is durable and the next pass
+            # reports it under `pending_decisions`.
+            #
+            # `rk proxy send` still refuses on the same event and should: there
+            # the operator asked for one response and this is the command
+            # answering that it sent none.
+            ledger.hold(
                 "authorization",
                 f"{label} is {gate.get('risk_class')}/ask by {gate.get('rule')}: "
                 f"filed as {pending} for a human to answer",
-                code=INVALID_CONFIGURATION,
-                source="database",
             )
             return
         self._close(ledger, connection, claimed, tool_run, "denied")
@@ -3268,6 +3306,29 @@ class Slice:
             # earlier; what arrives here is a capability that was minted and a
             # request that did not match it, which is a fact about the run and
             # is on the Receipt either way. The Tool run still closes `denied`.
+            #
+            # Except where nothing refused it. `denied` is the word for a request
+            # the door turned away; a target that did not answer is the target's
+            # state, and this run's own `decision` column still says the gate
+            # allowed it. A run whose every block is a target fault therefore
+            # claims a refusal nobody made -- which is precisely what arm (i) of
+            # `check_receipt_integrity` refuses, and that gate runs in `rk run`
+            # before anything is written. So one unreachable host used to stop
+            # every later run of the campaign until the row was corrected by
+            # hand. `error` is the word 20260812T000000Z put on the rows this
+            # produced before, and it is the word for them here.
+            #
+            # Read over every Receipt and not the newest, because arm (i) is:
+            # one run that really was refused and separately met an unreachable
+            # target closed as denied for a reason that is on the record.
+            blocked = [row for row in rows if str(row[1]) == "blocked"]
+            if blocked and all(str(row[3]) in proxy.TARGET_FAULT for row in blocked):
+                ledger.hold(
+                    "egress",
+                    f"the target did not answer: {label} is {decision}"
+                    f" for {rows[0][3]}",
+                )
+                return "error"
             ledger.hold(
                 "egress",
                 f"the door refused the child's request: {label} is {decision}",

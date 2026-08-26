@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -390,6 +391,94 @@ class WiringReadingTest(unittest.TestCase):
                 for role in executing.values()
                 if role is not None
             )
+        )
+
+    def test_a_withdrawn_grant_is_not_a_grant(self):
+        # The reading W11 rests on, and the shape the corpus really writes:
+        # `20261108T000000Z` deletes one row and inserts another in the same
+        # file. A reader that took these statements as a set would report a
+        # grant the corpus has already withdrawn, and W11 would then agree with
+        # the frontmatter about a row the database does not hold. Read from a
+        # corpus of its own rather than from the tree, so it stays a statement
+        # about the reader after the next migration moves a grant.
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "0001_grant.sql").write_text(
+                "INSERT INTO role_skills (role, skill_name) VALUES\n"
+                "    ('recon',      'enumerate-surface'),\n"
+                "    ('js_analyst', 'analyse-source');\n",
+                encoding="utf-8",
+            )
+            (Path(root) / "0002_move.sql").write_text(
+                "-- INSERT INTO role_skills (role, skill_name)"
+                " VALUES ('recon', 'analyse-source');\n"
+                "DELETE FROM role_skills WHERE role = 'recon'"
+                " AND skill_name = 'enumerate-surface';\n"
+                "INSERT INTO role_skills (role, skill_name)"
+                " VALUES ('web_hunter', 'enumerate-surface');\n",
+                encoding="utf-8",
+            )
+            held = check_wiring.read_catalogue(Path(root)).role_skills
+
+        # The delete is applied where it is written, the multi-row insert is
+        # read whole, and a statement inside a comment grants nothing.
+        self.assertEqual(
+            {
+                ("js_analyst", "analyse-source"),
+                ("web_hunter", "enumerate-surface"),
+            },
+            set(held),
+        )
+
+    def test_the_two_sources_agree_about_every_skill(self):
+        # W11 over the tree as it ships. The drift this check was written from
+        # -- `enumerate-surface` staged for `recon` and granted to nobody --
+        # was live when it was written and `20261126T000000Z` closed it, so
+        # what the tree owes now is silence.
+        self.assertEqual([], check_wiring.skill_grant_gaps(self.wiring))
+
+    def test_a_skill_staged_for_a_role_that_was_never_granted_it_is_reported(self):
+        # The direction that costs work: the frontmatter stages the file and
+        # the table refuses the claim, so a Task requiring the Skill leaves the
+        # queue as unclaimable without a word anywhere. Built by taking the
+        # grant out of the reading rather than by editing the corpus, so the
+        # case is about the check and not about today's rows.
+        without = dataclasses.replace(
+            self.wiring,
+            catalogue=dataclasses.replace(
+                self.wiring.catalogue,
+                role_skills=self.wiring.catalogue.role_skills
+                - {("recon", "enumerate-surface")},
+            ),
+        )
+
+        found = check_wiring.skill_grant_gaps(without)
+
+        self.assertIn("W11 recon enumerate-surface", [gap.key for gap in found])
+        self.assertIn(
+            "role_skills does not grant it",
+            next(gap.detail for gap in found if gap.subject == "recon enumerate-surface"),
+        )
+
+    def test_a_grant_the_corpus_stages_for_nobody_is_reported_too(self):
+        # The other direction: a row in the table naming a role whose Skills
+        # never name it back. A grant nobody uses rather than work that is
+        # dropped, and reported because it is the same disagreement read
+        # backwards.
+        extra = dataclasses.replace(
+            self.wiring,
+            catalogue=dataclasses.replace(
+                self.wiring.catalogue,
+                role_skills=self.wiring.catalogue.role_skills
+                | {("js_analyst", "use-identity")},
+            ),
+        )
+
+        found = check_wiring.skill_grant_gaps(extra)
+
+        self.assertIn("W11 js_analyst use-identity", [gap.key for gap in found])
+        self.assertIn(
+            "never staged for the child",
+            next(gap.detail for gap in found if gap.subject == "js_analyst use-identity"),
         )
 
 

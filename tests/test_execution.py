@@ -448,7 +448,9 @@ class Recorder:
             },
         )
         self.beats = list(answers.get("heartbeats", [beat]))
-        self.receipt = answers.get("receipt", ("RC1", "allowed", 200))
+        #: `(label, decision, status_code, reason)`, or a list of them where a
+        #: test needs one Tool run to have made several requests.
+        self.receipt = answers.get("receipt", ("RC1", "allowed", 200, None))
         self.promotion = answers.get(
             "promotion",
             {
@@ -648,7 +650,9 @@ class Recorder:
             beat = min(len(self.sent(sql)) - 1, len(self.beats) - 1)
             return [(json.dumps(self.beats[beat]),)]
         if sql == execution.EXCHANGE:
-            return [self.receipt] if self.receipt else []
+            if not self.receipt:
+                return []
+            return list(self.receipt) if isinstance(self.receipt, list) else [self.receipt]
         if sql == execution.PROMOTE:
             return [(json.dumps(self.promotion),)]
         if sql == execution.FINGERPRINT:
@@ -2643,7 +2647,7 @@ class AttemptTest(unittest.TestCase):
         # threw away the whole repeat -- including the variant that had already
         # finished. A lane whose door mints no capability at all still fails, one
         # call earlier, in `_authorize`.
-        connection = Recorder(receipt=("RC1", "blocked", None))
+        connection = Recorder(receipt=("RC1", "blocked", None, "required header missing"))
         with compiled():
             ledger, facts = attempt(connection)
         self.assertEqual([(TOOL_RUN, "denied")], connection.sent(proxy.CLOSE_TOOL_RUN))
@@ -2653,6 +2657,45 @@ class AttemptTest(unittest.TestCase):
             "the door refused the child's request: RC1 is blocked",
             [item.detail for item in ledger.assertions if item.ok],
         )
+
+    def test_a_target_that_did_not_answer_closes_the_tool_run_as_error(self):
+        # `denied` is the word for a request the door turned away. A run whose
+        # every block is a target fault claims a refusal nobody made, which is
+        # what arm (i) of `check_receipt_integrity` refuses -- and that gate runs
+        # in `rk run` before anything is written, so one unreachable host stopped
+        # every later run of the campaign. Measured on the here engagement:
+        # TR25 and TR26, both `GET https://spot.account.here.com/`.
+        for reason in ("target unreachable", "target unresolved"):
+            with self.subTest(reason=reason):
+                connection = Recorder(receipt=[("RC1", "blocked", None, reason)])
+                with compiled():
+                    ledger, facts = attempt(connection)
+                self.assertEqual(
+                    [(TOOL_RUN, "error")], connection.sent(proxy.CLOSE_TOOL_RUN)
+                )
+                self.assertEqual([], ledger.violations)
+                self.assertEqual("blocked", facts["receipt"]["decision"])
+                self.assertIn(
+                    f"the target did not answer: RC1 is blocked for {reason}",
+                    [item.detail for item in ledger.assertions if item.ok],
+                )
+
+    def test_a_refusal_under_a_target_fault_still_closes_the_tool_run_as_denied(self):
+        # The case arm (i)'s own comment preserves: one run may make several
+        # requests, and a run that really was refused and separately met an
+        # unreachable target closed as denied for a reason that is on the record.
+        # Newest first, so the run ended on the fault and was refused before it.
+        connection = Recorder(
+            receipt=[
+                ("RC2", "blocked", None, "target unreachable"),
+                ("RC1", "blocked", None, "required header missing"),
+            ]
+        )
+        with compiled():
+            ledger, facts = attempt(connection)
+        self.assertEqual([(TOOL_RUN, "denied")], connection.sent(proxy.CLOSE_TOOL_RUN))
+        self.assertEqual([], ledger.violations)
+        self.assertEqual("RC2", facts["receipt"]["label"])
 
     def test_a_capability_that_was_never_spent_closes_the_tool_run_as_error(self):
         connection = Recorder(receipt=None)
@@ -3136,7 +3179,15 @@ class RefusalTest(unittest.TestCase):
         # Parked, not closed: `park_for_human` ends the run with words this
         # runtime does not have, and a close here would erase them.
         self.assertEqual([], connection.sent(proxy.CLOSE_TOOL_RUN))
-        self.assertEqual(1, len(ledger.violations))
+        # Ticket 206: recorded, and not as a violation. A pass that filed a
+        # question did what the gate told it to, so a refused pass here made
+        # `rk run` exit 3 for a working harness -- and a driver loop counting
+        # exits stopped the campaign after three of them.
+        self.assertEqual([], ledger.violations)
+        self.assertIn(
+            "for a human to answer",
+            [one.detail for one in ledger.assertions if one.name == "authorization"][-1],
+        )
         self.assertEqual([], launcher.requests)
         self.closed(connection)
 

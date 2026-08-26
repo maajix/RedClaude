@@ -131,6 +131,10 @@ class Response:
     status: int
     body: str
     content_type: str = "text/html; charset=utf-8"
+    #: The entity tag for this body, where the route has one. Empty means the
+    #: route does not offer conditional reads, which is every route whose body
+    #: is cheap; `graph`'s `/data.json` is the one that is not.
+    etag: str = ""
 
     def encoded(self) -> bytes:
         return self.body.encode("utf-8")

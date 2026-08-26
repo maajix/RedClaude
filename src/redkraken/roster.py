@@ -2127,6 +2127,11 @@ ROLES: dict[str, Role] = {
         tool_groups=("state.read", "state.propose", "net.request", "exec.tool_run"),
         # Two recons on one surface collide on the same deduplication cell.
         max_concurrent=1,
+        # Ticket 191: a recon Task now names the state it walks in, and a lane
+        # that acts as an account holds it for as long as it acts. 0019 shipped
+        # `false` here because recon only ever walked as nobody; 20261120T000000Z
+        # is where the schema says `true`, and this is the same statement.
+        clamp_to_identity_leases=True,
     ),
     "web_hunter": Role(
         name="web_hunter",
@@ -2212,6 +2217,12 @@ ROLES: dict[str, Role] = {
         builtin_tools=(),
         tool_groups=(),
         max_concurrent=1,
+        # Ticket 192: the replay Lane sends real requests to a real target, and
+        # a lane that acts as an account holds its Lease for as long as it acts.
+        # 0019's `CHECK (runs_as <> 'renderer' OR NOT clamp_to_identity_leases)`
+        # was written about the reporter, which sends nothing; 20261124T000000Z
+        # is where it is dropped and this is the same statement.
+        clamp_to_identity_leases=True,
     ),
     "reporter": Role(
         name="reporter",

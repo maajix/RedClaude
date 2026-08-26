@@ -26,6 +26,7 @@ from redkraken import (
     evaluation,
     evidence,
     execution,
+    graph,
     header,
     identity,
     isolation,
@@ -1935,6 +1936,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lift.set_defaults(run=_resume)
 
+    drawing = commands.add_parser(
+        "graph",
+        help="the live surface of one Program, drawn",
+    )
+    drawing_operations = drawing.add_subparsers(
+        dest="operation", required=True, metavar="operation"
+    )
+
+    picture = drawing_operations.add_parser(
+        "serve",
+        help=f"draw one Program's Surface, claims and proof as a graph (${DATABASE_URL})",
+        description=(
+            "Open the campaign's own graph on this machine: the Entities, the "
+            "edges between them, the Observations that produced them and the "
+            "claims that rest on those. Read only and as the runtime, so this "
+            "holds no verb and no operator connection -- which is what lets it "
+            "run the one script `rk ui` refuses. Loopback only, and every route "
+            "on it is a GET."
+        ),
+    )
+    _add_url(picture, RUNTIME)
+    picture.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        metavar="path",
+        help="the configuration naming the one Program this graph is about",
+    )
+    _add_root(
+        picture,
+        "where the Artifact bytes live, so the proof pane can show the bytes "
+        f"behind a claim (default: ${ARTIFACTS.variable})",
+    )
+    picture.add_argument(
+        "--host",
+        default=graph.DEFAULT_HOST,
+        metavar="address",
+        help=f"the address to listen on (default: {graph.DEFAULT_HOST})",
+    )
+    picture.add_argument(
+        "--port",
+        type=int,
+        default=graph.DEFAULT_PORT,
+        metavar="port",
+        help=f"the port to listen on (default: {graph.DEFAULT_PORT})",
+    )
+    picture.set_defaults(run=_graph_serve)
+
     database = commands.add_parser("db", help="create, migrate, verify and move the database")
     operations = database.add_subparsers(dest="operation", required=True, metavar="operation")
 
@@ -2440,6 +2489,39 @@ def _ui_serve(arguments: argparse.Namespace) -> int:
                 host=arguments.host,
                 port=arguments.port,
                 limit=arguments.limit,
+            ),
+        )
+    )
+
+
+def _graph_serve(arguments: argparse.Namespace) -> int:
+    """One connection string, because this surface is one role.
+
+    Which is the whole difference from `rk ui serve` above and the reason the
+    two are two commands. The console is three roles at once and holds the one
+    that can lift a Halt; this is the runtime, reading, and nothing else -- so
+    there is no operator string to give it and no verb it could reach if there
+    were.
+
+    The artifact store is not refused when it is absent, unlike everywhere else
+    it is asked for. A command that files bytes has nowhere to put them without
+    it; this one only reads them, so a missing store costs the proof pane and
+    not the graph, and the pane says so rather than the command refusing to
+    draw anything.
+    """
+    ledger = Ledger()
+    runtime = _url(ledger, RUNTIME, arguments.url, graph.COMMAND)
+    if runtime is None:
+        return _render(report(graph.COMMAND, ledger))
+    return _render(
+        _guarded(
+            graph.COMMAND,
+            lambda: graph.serve(
+                runtime,
+                arguments.config,
+                host=arguments.host,
+                port=arguments.port,
+                artifacts=artifact.root_from_environment(arguments.artifacts),
             ),
         )
     )
