@@ -34,6 +34,19 @@ while :; do
     lap=$((lap + 1))
     printf '=== lap %d %s ===\n' "$lap" "$(date -Is)" | tee -a "$LOG"
 
+    # Retire the questions whose deadline passed, before the pass that would
+    # refuse over them. `check_control_surface` rule 3 reports a past-deadline
+    # question as `decision_past_deadline_unswept`, the standing check turns that
+    # into `integrity_failed`, and every `rk run` refuses while it holds -- so a
+    # campaign nobody swept stops dead four hours after its last question, which
+    # is what happened to `rk2here` at 00:49 on 2026-08-27. The sweeper is a
+    # companion the harness has always assumed and no driver ever started.
+    # Inline rather than a daemon: it is one statement, it wants no second
+    # process to reap, and a sweep is only ever needed where a pass is about to
+    # be made. Its exit code is not the lap's -- a sweeper that cannot reach the
+    # database is a fault `rk run` reports for itself a line later.
+    rk decision sweep 2>&1 | tee -a "$LOG" || true
+
     pass_log="$(mktemp)"
     rk run --config "$CONFIG" 2>&1 | tee -a "$LOG" "$pass_log"
     rc="${PIPESTATUS[0]}"
