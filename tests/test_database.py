@@ -7451,6 +7451,30 @@ REDACTED = (
 SECRET = bytes(range(32, 64))
 OTHER_SECRET = bytes(range(64, 96))
 
+#: The key generation a class has to put on record before it can write a seal,
+#: in material a real root produces rather than in filler bytes.
+#:
+#: Ticket 213. `secret_kek` is installation-wide and `ensure_active_secret_kek`
+#: hands the first generation it finds to every later caller without ever
+#: adopting a second proposal, so a class that committed a `root_check` no
+#: `seal.Root` can derive left every door class after it in the same run
+#: refusing with "the key does not match this installation" -- `ReplayTestRunTest`
+#: and `EvidenceBundleTest` are the two that establish one, and
+#: `ReplayCommandTest` and `ProxyEgressTest` are the two that read it. Which
+#: class runs first is the class list, so the pair passed alone and failed in
+#: company.
+#:
+#: The salt is arbitrary and the check is not: it is what every class holding
+#: `SECRET` derives for that salt at generation 1, computed here rather than
+#: written down so the two cannot drift apart.
+KEK_SALT = bytes.fromhex("61" * 32)
+ESTABLISH_KEK = (
+    "INSERT INTO secret_kek (gen, salt, root_check)"
+    f" VALUES (1, decode('{KEK_SALT.hex()}', 'hex'),"
+    f" decode('{seal.Root('selftest', SECRET).check(KEK_SALT, generation=1).hex()}', 'hex'))"
+    " ON CONFLICT (gen) DO NOTHING"
+)
+
 
 class SealedWireArtifactTest(DatabaseCase):
     """PH2-07: the wire view kept whole, kept encrypted, and kept out of reach.
@@ -30378,11 +30402,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         assert stranger.ok, stranger.violations
         wire = artifact.digest(b"the wire bytes another Program paid for")
         agent_view = artifact.digest(b"the redacted view that Program holds")
-        cls.as_owner(
-            "INSERT INTO secret_kek (gen, salt, root_check)"
-            " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
-            " ON CONFLICT (gen) DO NOTHING"
-        )
+        cls.as_owner(ESTABLISH_KEK)
         cls.as_owner(
             "INSERT INTO artifacts (sha256, byte_size, visibility, encrypted)"
             " VALUES ($1, 41, 'credential_bearing', true), ($2, 36, 'agent_visible', false)"
@@ -39066,9 +39086,7 @@ class EvidenceBundleTest(ReportFixture, DatabaseCase):
         """The sealed counterpart of one Agent view, and the Receipt naming it."""
         cls.sealed_sha = artifact.digest(cls.SEALED.encode())
         cls.as_the_owner_says([
-            ("INSERT INTO secret_kek (gen, salt, root_check)"
-             " VALUES (1, decode(repeat('61', 32), 'hex'), decode(repeat('62', 16), 'hex'))"
-             " ON CONFLICT (gen) DO NOTHING", ()),
+            (ESTABLISH_KEK, ()),
             ("INSERT INTO artifacts (sha256, byte_size, content_type, visibility, encrypted)"
              " VALUES ($1, $2::bigint, 'message/http', 'credential_bearing', true)"
              " ON CONFLICT (sha256) DO NOTHING",
