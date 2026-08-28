@@ -794,7 +794,11 @@ class Mission:
             }""",
             (step["message_body"],),
         )
-        return {"matched": bool(posted)}
+        # `postMessage` queues an event and has no handler result.  Calling the
+        # outcome `matched` would turn a successful dispatch into evidence that
+        # a listener accepted the body, which this deliberately non-oracular
+        # action cannot know.
+        return {"dispatched": bool(posted)}
 
     def capture_dom(self, step):
         markup = self._page(

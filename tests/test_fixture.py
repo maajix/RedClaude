@@ -310,6 +310,37 @@ class Corpus(unittest.TestCase):
                 self.assertIn(tell, answers["vulnerable"][1])
                 self.assertNotIn(tell, answers["secure"][1])
 
+    def test_ticket_100s_surface_facts_have_fixture_surfaces(self):
+        scim = fixture.FIXTURES["object-property-write-pair"]
+        pipeline = fixture.FIXTURES["tenant-isolation-pair"]
+        self.assertIn("scim_surface", scim.facts)
+        self.assertIn("pipeline_surface", pipeline.facts)
+
+        # The facts are application-scoped controls, so both halves must expose
+        # the same surface. A metadata-only declaration with no served shape
+        # would make a future trigger test pass against a target that is not
+        # actually SCIM or a workload pipeline.
+        scim_answers = []
+        pipeline_answers = []
+        for variant in evaluation.PAIR:
+            with evaluation.served(scim, variant) as where:
+                scim_answers.append(
+                    self.exchange(
+                        where, "GET", "/scim/v2/ServiceProviderConfig", None, {}
+                    )
+                )
+            with evaluation.served(pipeline, variant) as where:
+                pipeline_answers.append(
+                    self.exchange(where, "GET", "/internal/tokens", None, {})
+                )
+        self.assertEqual(scim_answers[0], scim_answers[1])
+        self.assertEqual(200, scim_answers[0][0])
+        self.assertIn(b"ServiceProviderConfig", scim_answers[0][1])
+        self.assertEqual(pipeline_answers[0], pipeline_answers[1])
+        self.assertEqual(200, pipeline_answers[0][0])
+        self.assertIn(b'"alpha"', pipeline_answers[0][1])
+        self.assertIn(b'"beta"', pipeline_answers[0][1])
+
     def exchange(
         self, where, method: str, path: str, body: bytes | None, headers: dict
     ) -> tuple[int, bytes]:

@@ -70,7 +70,9 @@ nothing in this ticket waits on another capability.
       outcome keys and the client-state read, because without a listener
       inventory it is a message sent into the dark. It is the first action that
       fabricates an event the target did not cause, and the body is owned by a
-      migration exactly as a probe's payload is.
+      migration exactly as a probe's payload is. Its outcome is
+      `dispatched`, not `matched`: `postMessage` has no handler result, so this
+      action never claims that a listener accepted the body.
 - [x] **The execution oracle is decided in this ticket rather than assumed.**
       The research verdict is "it works, and its added value is narrower than it
       looks": for markup injected into the document the mission is looking at,

@@ -74,6 +74,12 @@ that failure rather than fix it.
       empty in-pair side, and `playbook_test_verdict` then stops at `untested`
       however many runs are spent -- which is exactly the hole ticket 88 was
       opened to close for one Playbook.
+- [x] Every surface fact added is presented by a fixture with that real
+      application surface. `object-property-write-pair` serves a stable SCIM
+      ServiceProviderConfig on both halves and carries `scim_surface`;
+      `tenant-isolation-pair` issues build-runner workload tokens on both halves
+      and carries `pipeline_surface`. These are trigger/control facts, not
+      additional differing ground truth.
 - [x] Nothing degrades quietly, and the ticket relies on that rather than on a
       test. The catalogue is loaded by migration into `playbooks` plus five
       child tables with foreign keys, so an unknown class, trigger, kind or
@@ -125,8 +131,9 @@ Migration `20261215T000000Z__four_readings_the_vocabulary_could_not_spell` adds:
 | `session_handling.cookie_parsing` | `cookie-parsing-pair` |
 | `injection.parser_differential` | `parser-differential-pair` |
 
-and the two surface facts `scim_surface` and `pipeline_surface`. No observation
-kind was added.
+and the two surface facts `scim_surface` and `pipeline_surface`. The first is
+presented by `object-property-write-pair`, the second by the existing
+workload-token `tenant-isolation-pair`. No observation kind was added.
 
 Three things the work found that the ticket did not predict.
 
@@ -136,9 +143,12 @@ Three things the work found that the ticket did not predict.
    `pipeline_surface`. The rule is textual -- it reads
    `pg_get_viewdef('subject_facts')` looking for the atom's own name, which is
    why 049 through 055 spell every name out instead of assembling it -- so the
-   view is restated whole with four rows added to the same `VALUES` map the
+   view is restated whole with normalized mappings added to the same `VALUES` map the
    `tech_` atoms use, and the fact descriptions were reworded to say what the
-   branch actually computes.
+   branch actually computes. Technology names are normalized across case,
+   whitespace and underscores, and the pipeline map includes CI runners plus
+   the AWS, GCP, Azure/Entra and Kubernetes workload-identity spellings the
+   research asks for.
 2. **`tools/check_wiring.py` read one of the four new classes and not the other
    three.** `statement()` at `check_wiring.py:544` finds the end of a seeding
    statement with `sql.find(";", start)`, with no regard for quoting, and the
@@ -159,10 +169,11 @@ Three things the work found that the ticket did not predict.
    there. Shipping a class and a Playbook written against it in one step is a
    Playbook nothing graded, which is the failure this ticket exists to avoid.
 
-Two facts with no fixture presenting them is the residue, and it is stated in
-the migration header rather than skipped: a trigger no evaluation exercises is
-the same unused-vocabulary shape as an emitterless class, smaller because a fact
-cannot be a verdict, and inherited by ticket 101 on purpose.
+The review residue is closed before ticket 101: the cookie fixture no longer
+claims `repeated_parameter_name` (that fact means the same name in two carriers,
+not twice inside one Cookie header), both new application facts have honest
+fixture presentations, and `send_message` reports `dispatched` rather than
+claiming a listener matched a body whose handling it cannot observe.
 
 Measured:
 

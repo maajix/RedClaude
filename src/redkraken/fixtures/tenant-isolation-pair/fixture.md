@@ -3,12 +3,18 @@ description: An internal metrics route served twice from one source, both verify
 bb:kind: own_pair
 bb:classes: ["authorization.tenant_isolation"]
 bb:subject: /internal/metrics
-bb:facts: ["header_parameter", "tenant_boundary", "unknown_auth_endpoint"]
+bb:facts: ["header_parameter", "pipeline_surface", "tenant_boundary", "unknown_auth_endpoint"]
 bb:identities: ["alpha-runner", "beta-runner"]
 bb:provenance: Written for ticket 50 against the ticket 18 class description, from what the class says rather than from any Playbook's steps; no upstream corpus.
 ---
 
 # The token says which workload; the header says which project
+
+This is the fixture that presents the application-scoped `pipeline_surface`.
+The two identities are build runners, `/internal/tokens` issues their workload
+tokens, and `/internal/metrics` is the resource those federated identities
+reach. The fact describes that shared surface; the differing tenant decision
+below is what the fixture grades.
 
 `GET /internal/tokens` hands out two workload tokens, one for project `alpha`
 and one for `beta`, the same two on both variants. `GET /internal/metrics` is the

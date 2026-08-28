@@ -41,6 +41,14 @@ def _record() -> dict:
 #: application's, and the secure variant says so by name.
 WRITABLE = ("display_name", "email")
 
+#: A stable, passive SCIM capability document on both variants.  Its presence
+#: is why the fixture may honestly carry the application-scoped `scim_surface`
+#: fact; the property-write differential remains on `/account`.
+SCIM_CONFIGURATION = {
+    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
+    "patch": {"supported": True},
+}
+
 
 def _session(header: str | None) -> str | None:
     for part in (header or "").split(";"):
@@ -79,7 +87,13 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
             )
 
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's spelling
-            if urlsplit(self.path).path != "/account":
+            path = urlsplit(self.path).path
+            if path == "/scim/v2/ServiceProviderConfig":
+                self.answer(
+                    200, SCIM_CONFIGURATION, kind="application/scim+json"
+                )
+                return
+            if path != "/account":
                 self.answer(404, {"error": "no such route"})
                 return
             if _session(self.headers.get("Cookie")) is None:
@@ -136,10 +150,16 @@ def handler(variant: str) -> type[BaseHTTPRequestHandler]:
                 self.answer(400, {"error": "a request carries a JSON object"})
                 return None
 
-        def answer(self, status: int, document: dict, cookie: str | None = None) -> None:
+        def answer(
+            self,
+            status: int,
+            document: dict,
+            cookie: str | None = None,
+            kind: str = "application/json",
+        ) -> None:
             payload = json.dumps(document).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(payload)))
             if cookie is not None:
                 self.send_header("Set-Cookie", cookie)

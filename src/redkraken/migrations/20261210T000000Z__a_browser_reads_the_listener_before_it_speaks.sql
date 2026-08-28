@@ -94,14 +94,14 @@ CREATE TABLE browser_messages (
 INSERT INTO browser_messages (message, body, description) VALUES
     ('listener_inventory_probe',
      '{"redkraken":"listener_inventory_probe"}'::jsonb,
-     'a harmless body for asking whether an inventoried same-origin message listener reacts');
+     'a harmless body dispatched after a same-origin message listener inventory');
 
 INSERT INTO browser_actions
     (action, reaches_network, submits, outcome_keys, description) VALUES
     ('read_client_state', false, false, '{entries}',
      'store one passive registry-named client-state inventory as a JSON Artifact'),
-    ('send_message', true, true, '{matched}',
-     'post one registry-owned body to the current window immediately after listener inventory');
+    ('send_message', true, true, '{dispatched}',
+     'dispatch one registry-owned body to the current window immediately after listener inventory without claiming that a handler accepted it');
 
 INSERT INTO browser_action_arguments
     (action, name, value_kind, required, pattern, description) VALUES

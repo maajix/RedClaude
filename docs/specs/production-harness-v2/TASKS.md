@@ -37,23 +37,27 @@ ein davon unabhängiger Control-Surface-Blocker und muss vor dem nächsten Canar
 beantwortet oder superseded werden. Während der Pause wird keine Live-Runtime
 verändert.
 
-1. Release-Kette: **99 → 100 → 101 → 84 → 65**.
+1. Release-Kette: **101 → 84 → 65**. Tickets 99 und 100 sind abgeschlossen.
 2. Sicherheits- und Betriebsgrenzen: **174 → 190 → 188 → 195 → 200**.
 3. Wiring und Produktdebt: **129 → 105 → 120 → 122 → 116**, danach der
    verbleibende `ready-for-agent`-Backlog nach Unlock-Wert. Ticket 210 ist
    vorgezogen und `resolved`: `check_wiring` beendete ein Seeding-Statement am
    ersten `;` im Rohtext und übersah dadurch die fünf nicht-evidentiellen
-   `observation_kinds`. Der Reader liest das Ende jetzt in der Maske. Keine
-   Zahl im Gate-Report hat sich bewegt; das Loch war echt und leer.
+   `observation_kinds`. Der Reader liest das Ende jetzt in der Maske. Der
+   Nachreview fand keinen funktionalen Befund; 26 Wiring-Tests und alle vier
+   Repository-Gates sind grün. Keine Zahl im Gate-Report hat sich bewegt; das
+   Loch war echt und leer.
 
-Ticket 99 ist gestartet. Zuerst kommen probe-eigene Outcome-Schlüssel,
-`read_client_state` und Fragment-Navigation; `send_message` bleibt hinter der
-Listener-Inventur. Der Execution-Oracle wird als ADR entschieden und nicht
-stillschweigend als aktive Browser-Fähigkeit eingeführt.
-
-Ticket 100 beginnt erst, wenn Ticket 99 seine isolierte reale Datenbankabnahme
-bestanden hat und als `resolved` dokumentiert ist. Bis dahin wird keine zweite
-Migration der Release-Kette auf den ungeprüften Stand gestapelt.
+Tickets 99 und 100 sind implementiert und als `resolved` dokumentiert. Der
+Nachreview hat den Browser-Vertrag präzisiert: `send_message` bestätigt nur die
+erfolgte Zustellung an `postMessage`, nicht die Reaktion eines Listeners. Bei
+Ticket 100 sind die SCIM- und Pipeline-Fakten nun durch reale Fixture-Oberflächen
+belegt; die fachlich falsche Cookie-Zuordnung zu `repeated_parameter_name` ist
+entfernt. Die gemeinsame statische und Fixture-Abnahme ist grün: 37 Browser- und
+Migrationstests, 56 Fixture-Tests, 26 Wiring-Tests und alle vier Repository-Gates.
+Der neue datenbankspezifische Alias-Test bleibt für die nächste isolierte reale
+Datenbankabnahme vorgemerkt; die gemeinsam genutzten PostgreSQL-Rollen wurden im
+Nachreview nicht erneut verändert.
 
 Ticket 101 ist keine weitere Fünf-Playbook-Scheibe. Abnahmeziel sind alle 50
 Playbooks: konkrete Voraussetzungen, Angriffshypothese, Baseline/Variant/Control,

@@ -2,8 +2,9 @@
 -- 20261215T000000Z__four_readings_the_vocabulary_could_not_spell.sql
 --                                                                  (ticket 100)
 --
--- Four Property classes and two surface facts, each class arriving with the
--- fixture that grades it.
+-- Four Property classes and two surface facts. Each class arrives with the
+-- fixture that grades it, and each new fact is presented by a fixture whose
+-- application really has that surface.
 --
 -- The counts this file works from were read back out of a database with every
 -- migration applied and all fifty Playbooks loaded, not from the migration that
@@ -56,12 +57,11 @@
 -- declares gives `playbook_fixture_binding` an empty in-pair side, and
 -- `playbook_test_verdict` then stops at `untested` however many runs are spent.
 --
--- The two surface facts do not, and the reason is stated rather than skipped.
--- `scim_surface` and `pipeline_surface` are preconditions for 03 #10, 03 #15
--- and 07 #11, and the Playbooks that would fire on them are ticket 101's. A
--- fact no fixture presents is a trigger no evaluation exercises, which is the
--- same unused-vocabulary shape as an emitterless class -- smaller, because a
--- fact cannot be a verdict, and recorded here so it is inherited deliberately.
+-- `scim_surface` is presented by `object-property-write-pair`, whose application
+-- exposes the same passive SCIM ServiceProviderConfig on both halves.
+-- `pipeline_surface` is presented by `tenant-isolation-pair`, whose two build
+-- runners use workload tokens. The surface is a stable trigger/control in both
+-- pairs; the class named by each fixture remains the only differing truth.
 --
 -- No new observation kind. `callback_interaction` exists, is evidential and is
 -- backed by `{callback}` alone; the stale refusal that says otherwise is ticket
@@ -117,10 +117,11 @@ ON CONFLICT (id) DO NOTHING;
 -- atoms are two rows in the same `VALUES` map the `tech_` atoms use, and the
 -- view is restated whole because `CREATE OR REPLACE VIEW` has no other option.
 --
--- The technology names are the ones recon actually files. A SCIM endpoint is
--- identified as `scim`; a pipeline is identified by the runner that serves it.
--- Neither fact invents a shape the graph cannot already hold, which is the
--- point of deriving them here rather than adding an `applications.kind`.
+-- Technology names are an open set. Normalize case, surrounding whitespace,
+-- spaces and underscores before matching so ordinary recon spellings such as
+-- `GitHub Actions`, `github_actions` and `SCIM 2.0` do not silently miss. The
+-- pipeline map also names the workload-identity providers 03 #15 and 07 #11
+-- require, rather than equating that surface with three CI runners.
 
 CREATE OR REPLACE VIEW subject_facts AS
 WITH endpoint AS (
@@ -218,10 +219,21 @@ UNION ALL SELECT subj.program_id, subj.entity_id, known.fact
                        -- spell, spelled out here for the reason 049
                        -- through 055 give above: the fact_not_computed
                        -- rule reads this text for the atom's name.
-                       ('scim',          'scim_surface'),
-                       ('github-actions','pipeline_surface'),
-                       ('gitlab-ci',     'pipeline_surface'),
-                       ('jenkins',       'pipeline_surface'),
+                       ('scim',                                'scim_surface'),
+                       ('scim-2.0',                            'scim_surface'),
+                       ('github-actions',                      'pipeline_surface'),
+                       ('gitlab-ci',                           'pipeline_surface'),
+                       ('jenkins',                             'pipeline_surface'),
+                       ('circleci',                            'pipeline_surface'),
+                       ('buildkite',                           'pipeline_surface'),
+                       ('azure-pipelines',                     'pipeline_surface'),
+                       ('aws-iam-oidc',                        'pipeline_surface'),
+                       ('aws-sts-web-identity',                'pipeline_surface'),
+                       ('gcp-workload-identity',               'pipeline_surface'),
+                       ('google-workload-identity-federation', 'pipeline_surface'),
+                       ('azure-workload-identity',             'pipeline_surface'),
+                       ('entra-workload-identity',             'pipeline_surface'),
+                       ('kubernetes-service-account',          'pipeline_surface'),
                        ('oauth',         'tech_oauth'),
                        ('saml',          'tech_saml'),
                        ('soap',          'tech_soap'),
@@ -290,7 +302,7 @@ UNION ALL SELECT subj.program_id, subj.entity_id, known.fact
                        ('vite',          'tech_build_manifest'),
                        ('rollup',        'tech_build_manifest'),
                        ('parcel',        'tech_build_manifest')) AS known(name, fact)
-            ON known.name = lower(t.name)
+            ON known.name = regexp_replace(lower(btrim(t.name)), '[[:space:]_]+', '-', 'g')
 -- program shape
 -- Ticket 133: two accounts are two accounts, whatever their class. 032 counted
 -- `class = 'user'` at a time when every configured slot projected as one, so
@@ -337,11 +349,11 @@ INSERT INTO fixtures (id, kind, path, source_sha256, ground_truth_sha256) VALUES
  ('cookie-parsing-pair', 'own_pair',
   'fixtures/cookie-parsing-pair/fixture.md',
   '999c285e611ce376f8181d5ad026dc61710b3eba05071cccd2b130c80159755f',
-  '7c132634ef1eea91f100217a89296c859a63961aa6bf686e2ce4abb80e5a8229'),
+  '65f6026cb69226dc48f57fd8675b5333c5000d2717e78cf0b8f9040ff5a42f87'),
  ('object-property-write-pair', 'own_pair',
   'fixtures/object-property-write-pair/fixture.md',
-  'e2fd732f12b777481439beaf1a96ad59741e8b091bd80b64471e714d12e42056',
-  '675c38eea752e8726be21eb33cd206729b238e3c22b367f89dd6b3d3f45e4d84'),
+  '775fecdab6b5897937f20de79110113681c2a8ca0aa7eb66ced18b4cead4a593',
+  '207115a42f09b2d4b774810c13f76ca5d8bf0776cc96344d985e1d09633feda4'),
  ('parser-differential-pair', 'own_pair',
   'fixtures/parser-differential-pair/fixture.md',
   '75a4ae24f0079ec4c436951015bd0fc0c6501c98d09b9d205f33ec566edc33af',
@@ -355,6 +367,13 @@ ON CONFLICT (id) DO UPDATE SET
     path                = excluded.path,
     source_sha256       = excluded.source_sha256,
     ground_truth_sha256 = excluded.ground_truth_sha256;
+
+-- This existing workload-identity fixture is the honest presentation of the
+-- new application-scoped pipeline fact. Its source did not move; its ground
+-- truth document did because the fact is now explicit.
+UPDATE fixtures
+   SET ground_truth_sha256 = 'ae947bb0b4456c284acf06e8565110bf96a24722d9ae8de695deecfe186b3162'
+ WHERE id = 'tenant-isolation-pair';
 
 -- One class each, for 050's reason: a fixture claiming two classes cannot say
 -- which of them a Playbook that fired on it read. Each fixture document argues
@@ -391,6 +410,14 @@ BEGIN
     SELECT count(*) INTO n FROM fixtures;
     IF n <> 59 THEN
         RAISE EXCEPTION 'ticket 100: % fixtures, expected 59', n;
+    END IF;
+
+    SELECT count(*) INTO n FROM fixtures
+     WHERE id = 'tenant-isolation-pair'
+       AND ground_truth_sha256 =
+           'ae947bb0b4456c284acf06e8565110bf96a24722d9ae8de695deecfe186b3162';
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'ticket 100: the workload fixture did not acquire pipeline_surface';
     END IF;
 
     -- And the rule the ticket exists to enforce, as a statement rather than as

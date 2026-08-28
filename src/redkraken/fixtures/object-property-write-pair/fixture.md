@@ -3,12 +3,18 @@ description: An account record the caller owns, edited through one PATCH, served
 bb:kind: own_pair
 bb:classes: ["authorization.object_property_write"]
 bb:subject: /account
-bb:facts: ["authenticated_endpoint", "body_parameter", "json_request", "state_changing_method"]
+bb:facts: ["authenticated_endpoint", "body_parameter", "json_request", "scim_surface", "state_changing_method"]
 bb:identities: ["alice"]
 bb:provenance: Written for ticket 100 against the class description this migration adds, from what the class says rather than from any Playbook's steps; no upstream corpus.
 ---
 
 # The caller owns the object and not every property of it
+
+The same application exposes `GET /scim/v2/ServiceProviderConfig` on both
+variants, with the SCIM 2.0 ServiceProviderConfig schema and PATCH support. That
+stable capability document is why this fixture presents the application-scoped
+`scim_surface`; it is a trigger/control fact and not the property-write
+differential graded below.
 
 `POST /session` issues a session for `alice`. `GET /account` returns her record.
 `PATCH /account` writes what the body names.

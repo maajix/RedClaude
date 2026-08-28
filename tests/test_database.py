@@ -28456,7 +28456,7 @@ class BrowserMissionTest(DatabaseCase):
         self.assertEqual(
             {"redkraken": "listener_inventory_probe"}, message["message_body"]
         )
-        self.assertEqual(["matched"], message["outcome_keys"])
+        self.assertEqual(["dispatched"], message["outcome_keys"])
         # And the ceilings the container runs under come from the same place.
         self.assertGreater(int(self.plan["timeout_seconds"]), 0)
         self.assertGreater(int(self.plan["max_artifact_bytes"]), 0)
@@ -42356,6 +42356,47 @@ class ApplicationSubjectFactsTest(DatabaseCase):
             ).rows
         }
 
+    def facts_for_technology(self, name: str) -> set[str]:
+        """Facts one ordinary recon spelling gives one otherwise empty app.
+
+        The dedup keys carry a prefix of their own. Deriving them from the
+        spelling alone collides with whatever this class already arranged --
+        `Drupal` is the case that found it -- and the collision raises inside
+        the INSERT rather than returning the empty fact set the caller expects.
+        """
+        found: set[str] = set()
+        token = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SET LOCAL ROLE rk2_owner")
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                application = self.entity(
+                    "application", f"application:{BASE_URL}/spelling/{token}"
+                )
+                self.connection.execute(
+                    "INSERT INTO applications (entity_id, base_url, kind)"
+                    " VALUES ($1::uuid, $2, 'api')",
+                    (application, f"{BASE_URL}/spelling/{token}"),
+                )
+                technology = self.entity(
+                    "technology", f"technology:{BASE_URL}:spelling:{token}"
+                )
+                self.connection.execute(
+                    "INSERT INTO technologies (entity_id, name) VALUES ($1::uuid, $2)",
+                    (technology, name),
+                )
+                self.connection.execute(
+                    "INSERT INTO relationships"
+                    " (program_id, src_entity_id, dst_entity_id, type)"
+                    " VALUES ($1::uuid, $2::uuid, $3::uuid, 'runs')",
+                    (self.program_id, application, technology),
+                )
+                found = self.facts(application)
+                raise Rollback
+        except Rollback:
+            return found
+        raise AssertionError("the fact fixture transaction did not roll back")
+
     def candidates(self, subject: str) -> dict[str, str | None]:
         return {
             str(row[0]): None if row[1] is None else str(row[1])
@@ -42406,6 +42447,12 @@ class ApplicationSubjectFactsTest(DatabaseCase):
         self.assertEqual(
             {"api_surface", "anonymous_identity_available"}, self.facts(self.routeless)
         )
+
+    def test_new_application_facts_accept_recon_spellings_and_workload_providers(self):
+        self.assertIn("scim_surface", self.facts_for_technology("SCIM 2.0"))
+        self.assertIn("pipeline_surface", self.facts_for_technology("GitHub Actions"))
+        self.assertIn("pipeline_surface", self.facts_for_technology("AWS IAM OIDC"))
+        self.assertNotIn("pipeline_surface", self.facts_for_technology("Drupal"))
 
     def test_the_selection_reaches_a_playbook_for_an_application_subject(self):
         # Criterion 6's second half. `playbook_candidates` filters on

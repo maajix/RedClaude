@@ -3,7 +3,7 @@ description: An account route behind a session cookie, served twice from one sou
 bb:kind: own_pair
 bb:classes: ["session_handling.cookie_parsing"]
 bb:subject: /account
-bb:facts: ["authenticated_endpoint", "cookie_parameter", "read_method", "repeated_parameter_name"]
+bb:facts: ["authenticated_endpoint", "cookie_parameter", "read_method"]
 bb:identities: ["alice", "bob"]
 bb:provenance: Written for ticket 100 against the class description this migration adds, from what the class says rather than from any Playbook's steps; no upstream corpus.
 ---

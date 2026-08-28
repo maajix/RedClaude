@@ -162,7 +162,7 @@ class BrowserDriverTest(unittest.TestCase):
             mission(debugger)._client_state("message_listeners"),
         )
 
-    def test_send_message_posts_only_the_registry_body_to_the_current_origin(self):
+    def test_send_message_reports_dispatch_not_a_listener_match(self):
         body = {"redkraken": "listener_inventory_probe"}
 
         def called(parameters):
@@ -181,7 +181,7 @@ class BrowserDriverTest(unittest.TestCase):
         run.results.append(
             {"action": "read_client_state", "outcome": {"entries": 1}}
         )
-        self.assertEqual({"matched": True}, run.send_message({"message_body": body}))
+        self.assertEqual({"dispatched": True}, run.send_message({"message_body": body}))
 
     def test_send_message_refuses_an_empty_listener_inventory(self):
         debugger = Debugger({})
