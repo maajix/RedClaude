@@ -2002,14 +2002,14 @@ class VocabularyAgreementTest(unittest.TestCase):
                 self.assertEqual(set(constant), declared)
 
     def test_the_browser_vocabulary_is_the_registry_the_door_seeds(self):
-        # Ticket 99: the ten actions and the step ceiling belong to the registry
-        # 20260814T040000Z seeds, not to this side. `open_browser_run` refuses an
-        # eleventh action and a thirty-third step in the database, so a roster
+        # Ticket 99: the twelve actions and the step ceiling belong to the
+        # registry migrations, not to this side. `open_browser_run` refuses a
+        # thirteenth action and a thirty-third step in the database, so a roster
         # naming a word the registry does not seed serves a step every mission
         # loses at the door, and a roster dropping one hides an action the door
         # still runs.
-        def seeding(table: str) -> str:
-            """The one `INSERT INTO table`, its column list and its rows.
+        def seedings(table: str) -> list[str]:
+            """Every `INSERT INTO table`, with its column list and rows.
 
             Not `seeded` above, which reads the literals following `VALUES` on
             the line the statement opens. Both browser seeds write the column
@@ -2020,22 +2020,23 @@ class VocabularyAgreementTest(unittest.TestCase):
                 for text in self.migrations
                 if f"INSERT INTO {table}" in text
             ]
-            self.assertEqual(len(opened), 1, f"{table} is seeded twice or never")
-            return opened[0][:opened[0].index(";")]
+            self.assertTrue(opened, f"{table} is never seeded")
+            return [text[:text.index(";")] for text in opened]
 
-        actions = seeding("browser_actions")
+        actions = "\n".join(seedings("browser_actions"))
         self.assertEqual(
             set(roster.BROWSER_ACTIONS),
             {
                 self.LITERAL.findall(line)[0]
-                for line in actions[actions.index("VALUES"):].splitlines()[1:]
+                for line in actions.splitlines()
                 if line.lstrip().startswith("(")
+                and self.LITERAL.findall(line)
             },
         )
 
         # The ceiling is one row of one table and carries no literal at all, so
         # the column list is what says which of its numbers the steps are.
-        ceilings = seeding("browser_ceilings")
+        [ceilings] = seedings("browser_ceilings")
         columns = [
             name.strip()
             for name in self.balanced(ceilings, ceilings.index("(")).lstrip("(").split(",")

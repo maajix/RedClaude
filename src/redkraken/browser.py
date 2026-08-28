@@ -123,6 +123,7 @@ ARTIFACT_FILES = {
     "capture_dom": "dom-{ordinal}.html",
     "screenshot": "screenshot-{ordinal}.png",
     "probe": "probe-{ordinal}.json",
+    "read_client_state": "client-state-{ordinal}.json",
 }
 
 #: The class a navigation is recorded as when the door filed no Receipt naming

@@ -2308,9 +2308,11 @@ CONTROLS = (
         "     RETURNING id INTO t;"
         "   INSERT INTO browser_runs (tool_run_id, program_id, plan_sha256)"
         "        VALUES (t, p, repeat('a', 64));"
-        "   INSERT INTO browser_steps (tool_run_id, ordinal, program_id, action, arguments)"
+        "   INSERT INTO browser_steps"
+        "        (tool_run_id, ordinal, program_id, action, arguments, outcome_keys)"
         "        VALUES (t, 1, p, 'navigate',"
-        "                '{\"url\":\"https://app.example.com/api/orders\"}'::jsonb);"
+        "                '{\"url\":\"https://app.example.com/api/orders\"}'::jsonb,"
+        "                '{http_status,scope_class,document_loaded}');"
         "   INSERT INTO browser_step_results"
         "        (tool_run_id, ordinal, program_id, outcome, network_requests)"
         "        VALUES (t, 1, p, '{\"http_status\":200,\"scope_class\":\"target\","
@@ -2323,9 +2325,11 @@ CONTROLS = (
         # cookie jar hands the Agent the credential the door exists to keep from
         # it. Registered, not run -- what the check finds is the registration.
         "standing:browser_runs",
-        "INSERT INTO browser_probes (probe, payload, javascript, verdicts, description)"
+        "INSERT INTO browser_probes"
+        " (probe, payload, javascript, verdicts, description, outcome_keys)"
         " VALUES ('cookie_reader', NULL, 'return document.cookie;',"
-        "         '{present,absent}', 'a self test probe that reads what it may not')",
+        "         '{present,absent}', 'a self test probe that reads what it may not',"
+        "         '{verdict}')",
     ),
     Control(
         # The registry is the runtime's. A model that can read `browser_probes`
@@ -27784,7 +27788,7 @@ BROWSER_OUTCOMES = {
     2: {"matched": True},
     3: {"matched": True},
     4: {"matched": True},
-    5: {"verdict": "reflected"},
+    5: {"verdict": "reflected", "node_count": 1, "marker_in_text": False},
     6: {"captured": True},
     7: {"captured": True},
 }
@@ -27994,12 +27998,6 @@ class BrowserMissionTest(DatabaseCase):
                 cls.OPEN,
                 cls.opening([{"action": "navigate", "arguments": {"url": "file:///etc/passwd"}}]),
             ),
-            fragment=cls.refuse(
-                cls.OPEN,
-                cls.opening(
-                    [{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE + "#top"}}]
-                ),
-            ),
             out_of_scope=cls.refuse(
                 cls.OPEN,
                 cls.opening([{"action": "navigate", "arguments": {"url": BROWSER_OUT_OF_SCOPE}}]),
@@ -28018,10 +28016,45 @@ class BrowserMissionTest(DatabaseCase):
                 ),
             ),
             empty_plan=cls.refuse(cls.OPEN, cls.opening([])),
+            message_without_inventory=cls.refuse(
+                cls.OPEN,
+                cls.opening(
+                    [{"action": "send_message", "arguments": {
+                        "message": "listener_inventory_probe"
+                    }}]
+                ),
+            ),
             # The Identity half of criterion 3: a slot the Program does not hold
             # is refused here rather than at the door, because the capability the
             # door spends is minted from a run that never opened.
             unheld_identity=cls.refuse(cls.OPEN, cls.opening(BROWSER_PLAN, slot="member")),
+        )
+        cls.fragment = cls.called(
+            cls.OPEN,
+            cls.opening(
+                [{"action": "navigate", "arguments": {"url": BROWSER_IN_SCOPE + "#top"}}]
+            ),
+        )
+        cls.called(
+            cls.CLOSE,
+            (cls.fragment["tool_run_id"], "error", "the fragment plan was only compiled"),
+        )
+        cls.message_plan = cls.called(
+            cls.OPEN,
+            cls.opening(
+                [
+                    {"action": "read_client_state", "arguments": {
+                        "kind": "message_listeners"
+                    }},
+                    {"action": "send_message", "arguments": {
+                        "message": "listener_inventory_probe"
+                    }},
+                ]
+            ),
+        )
+        cls.called(
+            cls.CLOSE,
+            (cls.message_plan["tool_run_id"], "error", "the message plan was only compiled"),
         )
 
     @classmethod
@@ -28110,8 +28143,19 @@ class BrowserMissionTest(DatabaseCase):
                     0,
                 ),
             ),
+            # Complete on purpose: the probe now owns three outcome keys, and a
+            # one-key outcome would be refused for being short before it ever
+            # reached the verdict. `outcome_missing_a_key` is the short one.
             verdict_the_probe_does_not_give=cls.refuse(
-                cls.STEP, (cls.tool_run, 5, json.dumps({"verdict": "exploited"}), 0)
+                cls.STEP,
+                (
+                    cls.tool_run,
+                    5,
+                    json.dumps(
+                        {"verdict": "exploited", "node_count": 0, "marker_in_text": False}
+                    ),
+                    0,
+                ),
             ),
             step_that_is_not_in_the_plan=cls.refuse(
                 cls.STEP, (cls.tool_run, 8, json.dumps({"captured": True}), 0)
@@ -28217,7 +28261,10 @@ class BrowserMissionTest(DatabaseCase):
         # the other reflected. Everything else is held identical on purpose --
         # two digests that differed for a second reason would say nothing about
         # which of the two the digest is sensitive to.
-        escaped = {**BROWSER_OUTCOMES, 5: {"verdict": "escaped"}}
+        escaped = {
+            **BROWSER_OUTCOMES,
+            5: {"verdict": "escaped", "node_count": 0, "marker_in_text": True},
+        }
         for ordinal, outcome in sorted(escaped.items()):
             committed(
                 cls.connection,
@@ -28345,6 +28392,7 @@ class BrowserMissionTest(DatabaseCase):
             ("value_that_is_not_text", "is given as text"),
             ("unknown_probe", "no probe named"),
             ("empty_plan", "has between 1 and"),
+            ("message_without_inventory", "immediately follows"),
         ):
             with self.subTest(name):
                 self.assertIn(expected, self.refusals[name])
@@ -28354,10 +28402,9 @@ class BrowserMissionTest(DatabaseCase):
         # mission whose first step is out of scope would spend a real capability
         # to be told no. The scope is read once, here, and the run never opens.
         self.assertIn("navigates outside the current scope", self.refusals["out_of_scope"])
-        # And the same policy on a URL that is in scope but not canonical: a
-        # fragment is not sent, so a plan carrying one describes a navigation
-        # nobody can check against the Receipt it produces.
-        self.assertIn("is not a well formed", self.refusals["fragment"])
+        # A fragment is browser-local and the compiled scope lookup deliberately
+        # classifies the same scheme, host, port and path the Receipt records.
+        self.assertTrue(self.fragment["plan_sha256"])
 
     def test_an_identity_the_program_does_not_hold_never_reaches_the_door(self):
         self.assertIn("Identity lease refused", self.refusals["unheld_identity"])
@@ -28400,7 +28447,16 @@ class BrowserMissionTest(DatabaseCase):
         self.assertTrue(inject["payload"])
         self.assertTrue(probe["javascript"])
         self.assertIn("reflected", probe["verdicts"])
+        self.assertEqual(
+            ["verdict", "node_count", "marker_in_text"], probe["outcome_keys"]
+        )
         self.assertNotIn("payload", dict(BROWSER_PLAN[2]["arguments"]))
+        state, message = self.message_plan["steps"]
+        self.assertEqual(["entries"], state["outcome_keys"])
+        self.assertEqual(
+            {"redkraken": "listener_inventory_probe"}, message["message_body"]
+        )
+        self.assertEqual(["matched"], message["outcome_keys"])
         # And the ceilings the container runs under come from the same place.
         self.assertGreater(int(self.plan["timeout_seconds"]), 0)
         self.assertGreater(int(self.plan["max_artifact_bytes"]), 0)

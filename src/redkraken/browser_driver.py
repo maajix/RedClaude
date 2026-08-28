@@ -632,6 +632,10 @@ class Mission:
             raise Refused(
                 f"the probe {step['arguments']['probe']} returned no readable JSON: {error}"
             ) from error
+        if not isinstance(body, dict):
+            raise Refused(
+                f"the probe {step['arguments']['probe']} did not return a JSON object"
+            )
         verdict = body.get("verdict")
         if verdict not in step["verdicts"]:
             raise Refused(
@@ -645,7 +649,152 @@ class Mission:
             step["ordinal"],
             step["arguments"]["probe"],
         )
-        return {"verdict": verdict}
+        keys = step["outcome_keys"]
+        missing = [key for key in keys if key not in body]
+        extra = [key for key in body if key not in keys]
+        if missing or extra:
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(sorted(missing)))
+            if extra:
+                detail.append("undeclared " + ", ".join(sorted(extra)))
+            raise Refused(
+                f"the probe {step['arguments']['probe']} returned the wrong outcome shape: "
+                + "; ".join(detail)
+            )
+        return {key: body[key] for key in keys}
+
+    def _origin(self):
+        """The current document's origin, as data rather than page-authored code."""
+        origin = self._page("function () { return window.location.origin; }")
+        if not isinstance(origin, str) or not origin.startswith(("http://", "https://")):
+            raise Refused("client state is available only for an http or https document")
+        return origin
+
+    @staticmethod
+    def _cookie(cookie):
+        """The attributes a cookie reading may reveal, never its value."""
+        name = str(cookie.get("name") or "")
+        if name.startswith("__Host-"):
+            prefix = "__Host-"
+        elif name.startswith("__Secure-"):
+            prefix = "__Secure-"
+        else:
+            prefix = None
+        return {
+            "name": name,
+            "domain": cookie.get("domain"),
+            "path": cookie.get("path"),
+            "httpOnly": bool(cookie.get("httpOnly")),
+            "secure": bool(cookie.get("secure")),
+            "sameSite": cookie.get("sameSite"),
+            "prefix": prefix,
+        }
+
+    def _client_state(self, kind):
+        origin = self._origin()
+        if kind in ("local_storage", "session_storage"):
+            answer = self.debugger.call(
+                "DOMStorage.getDOMStorageItems",
+                {
+                    "storageId": {
+                        "securityOrigin": origin,
+                        "isLocalStorage": kind == "local_storage",
+                    }
+                },
+                self.session,
+            )
+            return [
+                {"key": str(item[0]), "value": str(item[1])}
+                for item in answer.get("entries", ())
+                if isinstance(item, list) and len(item) == 2
+            ]
+        if kind == "indexeddb_names":
+            answer = self.debugger.call(
+                "IndexedDB.requestDatabaseNames",
+                {"securityOrigin": origin},
+                self.session,
+            )
+            return [str(name) for name in answer.get("databaseNames", ())]
+        if kind == "cookies":
+            answer = self.debugger.call("Storage.getCookies", {}, self.session)
+            return [self._cookie(cookie) for cookie in answer.get("cookies", ())]
+        if kind == "service_workers":
+            self.debugger.drain(0.1)
+            registrations = []
+            versions = []
+            for event in self.debugger.events:
+                if event["method"] == "ServiceWorker.workerRegistrationUpdated":
+                    registrations.extend(event["params"].get("registrations", ()))
+                elif event["method"] == "ServiceWorker.workerVersionUpdated":
+                    versions.extend(event["params"].get("versions", ()))
+            return [
+                {
+                    "registrationId": item.get("registrationId"),
+                    "scopeURL": item.get("scopeURL"),
+                    "isDeleted": bool(item.get("isDeleted")),
+                }
+                for item in registrations
+            ] + [
+                {
+                    "registrationId": item.get("registrationId"),
+                    "scriptURL": item.get("scriptURL"),
+                    "status": item.get("status"),
+                    "runningStatus": item.get("runningStatus"),
+                }
+                for item in versions
+            ]
+        if kind == "message_listeners":
+            window = self.debugger.call(
+                "Runtime.evaluate", {"expression": "window"}, self.session
+            )["result"]
+            answer = self.debugger.call(
+                "DOMDebugger.getEventListeners",
+                {"objectId": window["objectId"]},
+                self.session,
+            )
+            return [
+                {
+                    "type": listener.get("type"),
+                    "useCapture": bool(listener.get("useCapture")),
+                    "passive": bool(listener.get("passive")),
+                    "once": bool(listener.get("once")),
+                    "scriptId": listener.get("scriptId"),
+                    "lineNumber": listener.get("lineNumber"),
+                    "columnNumber": listener.get("columnNumber"),
+                }
+                for listener in answer.get("listeners", ())
+                if listener.get("type") == "message"
+            ]
+        raise Refused(f"this driver does not read client state of kind {kind}")
+
+    def read_client_state(self, step):
+        kind = step["arguments"]["kind"]
+        entries = self._client_state(kind)
+        if len(entries) > 99999:
+            raise Refused(f"the {kind} inventory is too large to record canonically")
+        raw = json.dumps({"kind": kind, "entries": entries}, sort_keys=True).encode()
+        self._kept(step["artifact"], raw, "client_state", step["ordinal"], kind)
+        return {"entries": len(entries)}
+
+    def send_message(self, step):
+        """Post the registry's body to this page, after listener inventory."""
+        if (
+            not self.results
+            or self.results[-1].get("action") != "read_client_state"
+            or not self.results[-1].get("outcome", {}).get("entries")
+        ):
+            raise Refused(
+                "send_message requires a preceding non-empty message listener inventory"
+            )
+        posted = self._page(
+            """function (body) {
+                window.postMessage(body, window.location.origin);
+                return true;
+            }""",
+            (step["message_body"],),
+        )
+        return {"matched": bool(posted)}
 
     def capture_dom(self, step):
         markup = self._page(
@@ -794,12 +943,20 @@ def tail(log, count=2000):
 
 
 def attach(debugger):
-    """One page, attached to, with the four domains a mission reads."""
+    """One page, attached to, with the domains a mission reads."""
     target = debugger.call("Target.createTarget", {"url": "about:blank"})["targetId"]
     session = debugger.call(
         "Target.attachToTarget", {"targetId": target, "flatten": True}
     )["sessionId"]
-    for domain in ("Page", "Runtime", "Network", "Log"):
+    for domain in (
+        "Page",
+        "Runtime",
+        "Network",
+        "Log",
+        "DOMStorage",
+        "IndexedDB",
+        "ServiceWorker",
+    ):
         debugger.call(f"{domain}.enable", session=session)
     return session
 

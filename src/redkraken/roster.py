@@ -434,6 +434,8 @@ BROWSER_ACTIONS = (
     "assert_text",
     "assert_absent",
     "probe",
+    "read_client_state",
+    "send_message",
     "capture_dom",
     "screenshot",
 )
@@ -1912,8 +1914,9 @@ CONTRACTS: dict[str, Contract] = {
     # and checks the Identity lease -- all before a container exists. This
     # declaration is the floor in front of that, not a second opinion about it.
     #
-    # No capability is added. The ten actions are the ten the registry already
-    # seeds, and there is no eleventh here or anywhere: no Carbonyl (ADR 0004),
+    # The original ten actions are the lane the registry already seeded; ticket
+    # 99 adds two bounded registry actions, and there is no thirteenth here or
+    # anywhere: no Carbonyl (ADR 0004),
     # no agent-browser (ADR 0005), no persistent daemon, no model-authored
     # JavaScript. `probe` names a row of `browser_probes` whose payload and
     # whose expression are a migration's, which is why a `probe` argument is a
