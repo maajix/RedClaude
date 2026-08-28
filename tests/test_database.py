@@ -29959,15 +29959,24 @@ class ReplayFixture:
         headers: str | None = None,
         request_body: str | None = None,
         query: str | None = None,
+        document: str | None = None,
     ) -> str:
         """One exchange the door would have written, by the label it names it with.
 
-        `response_agent_sha` is what a body assertion compares, and it is a
+        `response_body_sha256` is what a body assertion compares, and it is a
         digest rather than the bytes for the reason the column is: what a Test
         asks is whether two answers were the same, and two digests answer that
-        without the runtime holding either page. The bytes are registered first
-        because the column is a foreign key into the store, and a Receipt naming
-        a page nobody kept is a Receipt no reader could check the Test against.
+        without the runtime holding either page.
+
+        `response_agent_sha` is the whole message and answers the other
+        question, the one a comparison asks first: did anyone keep this answer
+        at all. It defaults to the same bytes because most cases here have no
+        reason to tell the two apart. `document` is for the cases that do -- it
+        is the whole message, so a case can hand two Receipts one body and two
+        documents and say which of the two digests the arm reads. The bytes it
+        names are registered first because that column is a foreign key into the
+        store, and a Receipt naming a page nobody kept is a Receipt no reader
+        could check the Test against.
 
         `identity` is who the request went out as, and is null unless a caller
         says otherwise: an anonymous exchange is what most of this file is about
@@ -29993,27 +30002,29 @@ class ReplayFixture:
         version the door could not have decided under, and 39 reads the stamp's
         scope version straight off the transition Receipt.
         """
+        whole = body if document is None else document
         if body is not None:
-            cls.bodies[artifact.digest(body.encode())] = body
+            cls.bodies[artifact.digest(whole.encode())] = whole
             with cls.connection.transaction():
                 cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
                 cls.connection.execute(
                     "INSERT INTO artifacts (sha256, byte_size, content_type, visibility)"
                     " VALUES ($1, $2::bigint, 'text/plain', 'agent_visible')"
                     " ON CONFLICT (sha256) DO NOTHING",
-                    (artifact.digest(body.encode()), len(body.encode())),
+                    (artifact.digest(whole.encode()), len(whole.encode())),
                 )
         return committed(
             cls.owner_as_runtime(),
             "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
             "                      method, scheme, host, port, path, status_code,"
-            "                      response_agent_sha, ts_arrival, scope_class, scope_version,"
+            "                      response_agent_sha, response_body_sha256,"
+            "                      ts_arrival, scope_class, scope_version,"
             "                      identity_entity_id,"
             "                      request_headers_sha256, request_body_sha256,"
             "                      query_sha256)"
             " SELECT $1::uuid, $2::uuid, $3, 'allowed',"
             "        'allowed as target under scope version ' || p.scope_version, $4, 'https',"
-            "        'app.example.com', 443, $5, $6::integer, $7, now(), 'target',"
+            "        'app.example.com', 443, $5, $6::integer, $7, $12, now(), 'target',"
             "        p.scope_version, $8::uuid,"
             "        rk2_planned_headers_sha256($9::jsonb),"
             "        rk2_planned_body_sha256(to_jsonb($10::text)),"
@@ -30023,8 +30034,9 @@ class ReplayFixture:
             (
                 cls.program_id, tool_run, lane, method.upper(),
                 path or f"/api/orders/{ordinal}", status,
-                None if body is None else artifact.digest(body.encode()),
+                None if body is None else artifact.digest(whole.encode()),
                 identity, headers, request_body, query,
+                None if body is None else artifact.digest(body.encode()),
             ),
         )
 
@@ -30046,6 +30058,7 @@ class ReplayFixture:
         test: str,
         *,
         answers: dict[int, tuple[int, str | None]],
+        documents: dict[int, str] | None = None,
         cleanup: str = "done",
     ) -> dict:
         """One whole replay of one stored Test: open it, answer it, close it.
@@ -30054,6 +30067,10 @@ class ReplayFixture:
         ordinal absent from it is an action that produced no Receipt -- which is
         the only way a run reaches the close with an assertion it cannot
         evaluate.
+
+        `documents` is the whole message for an ordinal whose answer is not
+        wholly its body, and is what a case states when it needs the two
+        response digests to differ.
 
         Separate from `walked` because 037 replays a Test that already exists:
         a reproduction is a second run of the Finding's own Test, and a helper
@@ -30066,7 +30083,8 @@ class ReplayFixture:
                 continue
             status, body = answer
             receipt = cls.receipted(
-                plan["tool_run_id"], int(action["ordinal"]), status=status, body=body
+                plan["tool_run_id"], int(action["ordinal"]), status=status, body=body,
+                document=(documents or {}).get(int(action["ordinal"])),
             )
             committed(cls.connection, cls.RECORD, (plan["tool_run_id"], action["ordinal"], receipt))
         closed = cls.called(cls.CLOSE, (plan["tool_run_id"], cleanup, None))
@@ -30079,6 +30097,7 @@ class ReplayFixture:
         spec: str,
         *,
         answers: dict[int, tuple[int, str | None]],
+        documents: dict[int, str] | None = None,
         cleanup: str = "done",
         subject: str | None = None,
     ) -> dict:
@@ -30089,7 +30108,9 @@ class ReplayFixture:
             "hypothesis": hypothesis,
             "subject": subject,
             "test": test,
-            **cls.performed(test, answers=answers, cleanup=cleanup),
+            **cls.performed(
+                test, answers=answers, documents=documents, cleanup=cleanup
+            ),
         }
 
 
@@ -30116,6 +30137,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.settle_one_that_refutes()
         cls.leave_one_inconclusive()
         cls.settle_one_that_holds_and_cannot_say_so()
+        cls.hold_a_control_whose_two_answers_share_a_body()
         cls.refuse_a_request_the_door_would_not_send()
         cls.refuse_what_a_run_may_not_cite()
         cls.refuse_a_specification_nobody_should_store()
@@ -30282,6 +30304,33 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
                   "action": 2, "status": 200}]
             ),
             answers={1: (200, "order one"), 2: (200, "order two")},
+        )
+
+    @classmethod
+    def hold_a_control_whose_two_answers_share_a_body(cls):
+        """Ticket 101: the simplest control there is, and it used to refute.
+
+        "Send the same request twice and the two answers agree" is the baseline
+        half of twenty Playbooks. `body_equals` compared `response_agent_sha`,
+        which is the whole message, so a `Date` header that ticks over between
+        the two sends was enough to fail it -- and a failed control leaves the
+        Test refuting a claim about the target when what it measured was a
+        clock.
+
+        The two Receipts here carry one body and two whole messages, which is
+        exactly what that looks like on the row.
+        """
+        cls.stable = cls.walked(
+            "the orders API answers one request the same way twice",
+            specification(
+                [{"id": "the-answers-agree", "kind": "body_equals",
+                  "action": 1, "against": 2}]
+            ),
+            answers={1: (200, "order one"), 2: (200, "order one")},
+            documents={
+                1: "HTTP/1.1 200 OK\r\nDate: Mon, 01 Jan 2029 00:00:01 GMT\r\n\r\norder one",
+                2: "HTTP/1.1 200 OK\r\nDate: Mon, 01 Jan 2029 00:00:02 GMT\r\n\r\norder one",
+            },
         )
 
     @classmethod
@@ -31111,6 +31160,23 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         self.assertEqual("holds", self.held["closed"]["outcome"])
         self.assertEqual([], self.held["closed"]["failed"])
         self.assertEqual("supported", self.held["closed"]["hypothesis_status"])
+
+    def test_a_body_comparison_reads_the_body_and_not_the_whole_message(self):
+        """Ticket 101: two sends, one body, two documents, and the control holds."""
+        self.assertEqual("holds", self.stable["closed"]["outcome"])
+        self.assertEqual([], self.stable["closed"]["failed"])
+
+        [[documents, bodies]] = self.rows(
+            "SELECT count(DISTINCT r.response_agent_sha),"
+            "       count(DISTINCT r.response_body_sha256)"
+            "  FROM test_replay_actions a JOIN receipts r ON r.id = a.receipt_id"
+            " WHERE a.tool_run_id = $1::uuid AND a.ordinal IN (1, 2)",
+            (self.stable["plan"]["tool_run_id"],),
+        )
+
+        # Two whole messages and one body: without the second column this arm
+        # had nothing to compare that a clock could not move.
+        self.assertEqual((2, 1), (int(documents), int(bodies)))
 
     def test_a_run_with_a_failed_assertion_refutes_and_names_it(self):
         self.assertEqual("refutes", self.refuted["closed"]["outcome"])
