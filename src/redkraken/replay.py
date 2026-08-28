@@ -358,7 +358,7 @@ class _Door:
             program_id=self.program_id,
             method=str(request["method"]),
             headers=headers,
-            body=b"" if body is None else str(body).encode("utf-8"),
+            body=None if body is None else str(body).encode("utf-8"),
             timeout=self.timeout,
             trust=self.trust,
         )

@@ -2111,8 +2111,10 @@ class RequestToolTest(unittest.TestCase):
         UTF-8, because that is what the string already is by the time it has
         come through JSON, and encoding it back the same way is the only
         spelling that puts on the wire the bytes the caller meant. A call that
-        names no body sends none, which is every request this handler made
-        before the argument existed.
+        names no body sends none -- `None` and not `b""`, because a request
+        that framed no body and a request that framed an empty one are two
+        different requests at the target and only the caller knows which it
+        meant.
         """
         with contextlib.ExitStack() as stack:
             handler = self.served(stack, door=self.door)
@@ -2131,7 +2133,7 @@ class RequestToolTest(unittest.TestCase):
         self.assertEqual(
             '{"user":"admin","note":"café"}'.encode("utf-8"), calls[0][1]["body"]
         )
-        self.assertEqual(b"", calls[1][1]["body"])
+        self.assertIsNone(calls[1][1]["body"])
         # The request's body and the response's excerpt are two different things
         # under one word, and the handler returns the second while sending the
         # first. A single name for both would have answered the caller with what
@@ -2149,6 +2151,23 @@ class RequestToolTest(unittest.TestCase):
             handler = self.served(stack, door=self.door)
             with self.spending() as calls:
                 self.answer(handler, {"method": "POST", "url": "http://x.test/a", "body": 7})
+
+        self.assertIsNone(calls[0][1]["body"])
+
+    def test_a_body_stated_as_the_empty_string_is_a_body_and_not_an_absence(self):
+        """The other half of the one above, and the reason it is `None` there.
+
+        An empty body is a body: it reaches the target with `Content-Length: 0`,
+        and `authorize_egress_request` grades a request that carries one apart
+        from a request that carries none. Collapsing the two here would spend a
+        capability on a request the caller did not write.
+        """
+        with contextlib.ExitStack() as stack:
+            handler = self.served(stack, door=self.door)
+            with self.spending() as calls:
+                self.answer(
+                    handler, {"method": "POST", "url": "http://x.test/a", "body": ""}
+                )
 
         self.assertEqual(b"", calls[0][1]["body"])
 

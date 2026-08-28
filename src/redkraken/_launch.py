@@ -1035,10 +1035,10 @@ DESCRIPTIONS = {
         "with their Content-Type given as a header. Do not set Content-Length: "
         "the door measures the bytes it forwards and states that number itself, "
         "and a chunked request body is refused rather than re-framed. Whether "
-        "this run may send a body at all was decided when it was opened, from "
-        "the effects the Playbooks chosen for its Task declare; a run whose "
-        "reading is entirely read-only is refused a body at the door, with a "
-        "Receipt saying so."
+        "this run may send a body at all was decided when it was opened from "
+        "the Playbooks chosen for its Task. A body is framing rather than a "
+        "mutating effect: a read-only Playbook may use one for a reading, while "
+        "a run with no selected Playbook is refused one at the door."
     ),
     # The element lists carry `roster._ELEMENTS` now, so every closed vocabulary
     # this tool used to spell out is served as an enum instead and is checked on
@@ -1595,7 +1595,7 @@ def _spend(
     url: str,
     method: str,
     headers: Mapping[str, str],
-    body: bytes = b"",
+    body: bytes | None = None,
     transcripts: Transcripts | None = None,
 ) -> dict:
     """One exchange through the door, as the four facts a model can act on.
@@ -1789,8 +1789,13 @@ def _headers(given: object) -> dict[str, str]:
     return {str(name): str(value) for name, value in given.items()}
 
 
-def _body(given: object) -> bytes:
+def _body(given: object) -> bytes | None:
     """The bytes a call asked to be sent after its headers, or none at all.
+
+    `None` and `b""` are two different requests and this is where they part: a
+    call that stated no body framed none, and a call that stated `""` framed an
+    empty one. Both reach the target, one with no length header and one with
+    `Content-Length: 0`, and `authorize_egress_request` grades them apart.
 
     UTF-8, because that is what the string the model wrote already is by the
     time it has come through JSON, and encoding it back the same way is the
@@ -1804,7 +1809,7 @@ def _body(given: object) -> bytes:
     contract's bounds, and what this handler acts on is what arrived rather
     than what was promised.
     """
-    return str(given).encode("utf-8") if isinstance(given, str) else b""
+    return str(given).encode("utf-8") if isinstance(given, str) else None
 
 
 def _slate(surface: Surface, choice: Choice):

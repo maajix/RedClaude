@@ -103,6 +103,14 @@ records the harness-first ordering to avoid.
       recorded under another ordinal, and method plus route already does that;
       `_Door.send` reads the spec directly, so no gap exists between plan and
       wire for a model to write into. No change to `record_test_action`.
+
+      **Reversed by ticket 214.** This reasoning holds for the state this ticket
+      shipped and stops holding the moment two actions can differ below the
+      route -- which is what this ticket made possible. 214 adds the columns
+      "there is nothing to compare against without" and answers the identity
+      injection by digesting the view the caller stated, before it. The
+      criterion is left as it was written rather than rewritten: it was the
+      decision taken here, and 214 is where it was taken back.
 - [x] **`_Door.send` passes them through.** `replay.py:342-351` forwards
       `headers=` and `body=` to `proxy.spend`.
 - [x] **The replay lane declares its own body, and ticket 96's rule is left

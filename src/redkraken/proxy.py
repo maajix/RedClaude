@@ -842,6 +842,34 @@ def query_sha256(url: str) -> str | None:
     return digest(query.encode("utf-8")) if query else None
 
 
+def stated_headers_sha256(headers: list[tuple[str, str]]) -> str:
+    """The digest of the headers the caller stated, in one canonical spelling.
+
+    Lowercase name, colon, space, value, newline, sorted, UTF-8. The case a
+    client writes is not a fact about the request, and the order it writes them
+    in is not either, so neither may move the digest.
+
+    `Accept-Encoding: identity` is supplied when the caller named no
+    `Accept-Encoding`, because `http.client` supplies it on the wire when the
+    caller does not -- the same reason and the same one name as the default
+    beside `agent_headers`. Without it a plan that never mentioned the header
+    could not match the request it produced, for any request at all.
+
+    The stated view and not the wire view: this is asked of `forwardable`, so a
+    header that describes this hop is already gone, and it is read before the
+    Identity injection replaces the names a lease owns. What was sent is
+    `request_wire_sha`; this answers which arm was performed.
+
+    Kept in step with `rk2_planned_headers_sha256`, which is the same
+    canonicalisation written out of a Test's plan. A drift between them is a
+    replay that can never record its own Receipt.
+    """
+    stated = [(name.lower(), value) for name, value in headers]
+    if not any(name == "accept-encoding" for name, _ in stated):
+        stated.append(("accept-encoding", "identity"))
+    return digest("".join(f"{name}: {value}\n" for name, value in sorted(stated)).encode("utf-8"))
+
+
 def redirected(url: str, location: str | None) -> str | None:
     """Where a redirect points, canonicalised, or nothing when it points nowhere.
 
@@ -2352,7 +2380,7 @@ class Handler(BaseHTTPRequestHandler):
             # capability is now recorded as the framing it is.
             body = self._body()
             authorization = self.server.fence.authorize(
-                program_id, control.capability, self.command, request, bool(body)
+                program_id, control.capability, self.command, request, body is not None
             )
             slot = self.server.fence.reserve(program_id, control.capability, request)
         except Refused as refusal:
@@ -2597,17 +2625,32 @@ class Handler(BaseHTTPRequestHandler):
         except scope.PolicyError as error:
             raise Refused("malformed request", error.detail) from error
 
-    def _body(self) -> bytes:
-        """What the caller sent, bounded, or a refusal.
+    def _body(self) -> bytes | None:
+        """What the caller sent, bounded, or a refusal. `None` where it sent none.
 
         A chunked request body is refused rather than re-framed: the Receipt
         names a hash of exactly what was forwarded, and a proxy that re-chunks
         is recording bytes that differ from the ones it read.
+
+        No `Content-Length` and no body are two different requests, and this is
+        the only place that can still tell them apart: a caller that states
+        `Content-Length: 0` has framed an empty body, and a caller that states
+        no length has framed no body at all. Collapsing them here would put a
+        `Content-Length: 0` on a GET that never carried one, which is a byte the
+        target reads and the Receipt would not have known about.
+
+        A `Content-Length` that is present and empty is refused rather than read
+        as zero. It states a framing and gives no length, and the two readings
+        of it -- no body, and a body of none -- are exactly the pair this method
+        exists to keep apart.
         """
         if (self.headers.get("Transfer-Encoding") or "").strip():
             raise Refused("unsupported framing", "a chunked request body is not forwarded")
+        stated = self.headers.get("Content-Length")
+        if stated is None:
+            return None
         try:
-            length = int(self.headers.get("Content-Length") or 0)
+            length = int(stated)
         except ValueError as error:
             raise Refused("unsupported framing", "the request length cannot be read") from error
         if length < 0 or length > CEILING:
@@ -2680,7 +2723,7 @@ class Handler(BaseHTTPRequestHandler):
         addresses: tuple[str, ...],
         target: str,
         headers: list[tuple[str, str]],
-        body: bytes,
+        body: bytes | None,
         client_certificate: identity.ClientCertificate | None,
     ) -> tuple[int, str, list[tuple[str, str]], bytes]:
         """Contact the authorized target and read what it answered, or refuse.
@@ -2724,7 +2767,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 for name, value in headers:
                     connection.putheader(name, value)
-                connection.endheaders(body or None)
+                connection.endheaders(body)
                 answer = connection.getresponse()
                 returned = answer.read(CEILING + 1)
                 status = answer.status
@@ -2888,7 +2931,7 @@ class Handler(BaseHTTPRequestHandler):
         authorization: Authorization,
         capability: str,
         request: scope.Request,
-        body: bytes,
+        body: bytes | None,
         arrival: datetime,
         url: str,
         addresses: tuple[str, ...],
@@ -2896,7 +2939,7 @@ class Handler(BaseHTTPRequestHandler):
         """Send the authorized request, record the exchange, answer the caller."""
         authority = _authority(request.host, request.port, request.protocol)
         agent_headers = [("Host", authority), *forwardable(self.headers)]
-        if body:
+        if body is not None:
             agent_headers.append(("Content-Length", str(len(body))))
         if not any(name.lower() == "accept-encoding" for name, _ in agent_headers):
             # `http.client` adds this one when the caller does not, and a
@@ -3038,13 +3081,17 @@ class Handler(BaseHTTPRequestHandler):
         # put bytes in front of a parser. It has one now, so the Agent's view of
         # its own request is scrubbed against the same values the response is
         # scrubbed against, and the wire view stays the bytes that went.
-        agent_body = body
+        # `None` is the request that framed no body, and the transcripts are
+        # bytes: the difference between it and an empty body is the
+        # `Content-Length` line above, which both views already carry.
+        wire_body = body or b""
+        agent_body = wire_body
         if binding is not None:
             agent_headers, agent_body = project_identity_request(
-                agent_headers, body, binding.session.secrets(url)
+                agent_headers, agent_body, binding.session.secrets(url)
             )
         sent = transcript(line, agent_headers, agent_body)
-        wire_sent = transcript(line, wire_headers, body)
+        wire_sent = transcript(line, wire_headers, wire_body)
         wire_received = transcript(f"HTTP/1.1 {status} {reason}", back, returned)
         store = self.server.store
         if binding is not None:
@@ -3135,7 +3182,7 @@ class Handler(BaseHTTPRequestHandler):
                 (
                     wire_sent,
                     sent,
-                    wire_view(line, wire_headers, body, exchange=exchange),
+                    wire_view(line, wire_headers, wire_body, exchange=exchange),
                     request_sha,
                     "target_request",
                 ),
@@ -3264,6 +3311,11 @@ class Handler(BaseHTTPRequestHandler):
             "port": request.port,
             "path": request.path_raw,
             "query_sha256": query_sha256(url),
+            "request_headers_sha256": stated_headers_sha256(forwardable(self.headers)),
+            # Null where the request framed no body at all, which is not the
+            # same row as a body of no bytes -- `_body` keeps the two apart and
+            # this is where the Receipt records which one was sent.
+            "request_body_sha256": digest(body) if body is not None else None,
             "status_code": status,
             # Ticket 186. The media type the target declared for what it sent
             # back. Read off the Agent view for the reason `onward` is, and
@@ -3273,6 +3325,9 @@ class Handler(BaseHTTPRequestHandler):
             # a bundle from a page -- which is what decides whether these bytes
             # are application source this Program fetched.
             "response_content_type": _media(_header(agent_back, "Content-Type")),
+            # The answer's body alone, where `response_agent_sha` names the
+            # whole message. A body-level differential is read against this one.
+            "response_body_sha256": digest(agent_returned),
             "ts_arrival": arrival.isoformat(),
             "ts_egress": egress.isoformat(),
             "waited_ms": int((datetime.now(timezone.utc) - egress).total_seconds() * 1000),
@@ -4221,7 +4276,7 @@ def spend(
     program_id: str,
     method: str = "GET",
     headers: Mapping[str, str] | None = None,
-    body: bytes = b"",
+    body: bytes | None = None,
     timeout: float = TIMEOUT,
     trust: ssl.SSLContext | None = None,
 ) -> Answer:
@@ -4242,9 +4297,13 @@ def spend(
 
     The body is bytes and not a string, because what a caller means to send is
     a byte sequence and the encoding it chose is already spent by the time it
-    reaches here. Whether the door will accept one is not asked here: the door
-    re-decides every request against live policy, and a client that decided for
-    itself which of its requests may carry a body would be the second opinion
+    reaches here. `None` is not `b""`: no body and an empty body are two
+    requests at the target, and which one this is is decided in `_through`
+    rather than by `http.client`, whose own default would frame an empty body
+    on every body-less POST. Whether the door will accept one is not asked
+    here: the door re-decides every request against live policy, and a client
+    that decided for itself which of its requests may carry a body would be the
+    second opinion
     this whole arrangement exists to not have.
     """
     return _through(
@@ -4272,7 +4331,7 @@ def _through(
     trust: ssl.SSLContext | None,
     *,
     headers: Mapping[str, str] | None = None,
-    body: bytes = b"",
+    body: bytes | None = None,
 ) -> Answer:
     """The request itself, with the capability on the hop that reaches the door.
 
@@ -4290,20 +4349,54 @@ def _through(
 
     The body rides the same hop as the headers that describe it, which on the
     tunnelled shape is inside the tunnel, so the door reads it as the request
-    it terminated rather than as anything the CONNECT carried. `http.client`
-    frames it with a `Content-Length` it measures itself, which is the only
-    length that could be right here: `_carried` has already dropped whatever
-    the caller said the length was, because a length this client did not
-    measure is a length nothing on this hop may state.
+    it terminated rather than as anything the CONNECT carried. The length is
+    measured here and never taken from the caller: `_carried` has already
+    dropped whatever the caller said it was, because a length this client did
+    not measure is a length nothing on this hop may state.
+
+    Header by header rather than through `request(body=...)`, for the one thing
+    that call cannot express. `_get_content_length` answers `0` for a `None`
+    body on POST, PUT and PATCH -- RFC 7230 §3.3.2, and the stdlib says so in
+    its own comment -- so `request()` would frame an empty body on every
+    body-less POST this client makes. The door reads the wire and would grade
+    that as a body the caller never wrote, and a Tool run opened for no body
+    would be refused its own request.
+
+    Everything else `request()` does is kept, including the part that is easy
+    to drop: `putrequest` writes `Accept-Encoding: identity` unless it is told
+    not to, and `_send_request` tells it not to exactly when the caller names
+    the header itself. Written out here, because a caller that named one would
+    otherwise send two -- and the second is a header no plan can state, so the
+    Receipt digest could never match the arm that was planned. The `Host` line
+    needs no such care: `_carried` drops the caller's, because `host` is
+    hop-by-hop.
     """
     host, port = listener
     control = {AUTHORIZATION: f"RedKraken {capability}", PROGRAM: program_id}
     carried = _carried(headers)
+
+    def dispatch(
+        client: http.client.HTTPConnection, target: str, sending: Mapping[str, str]
+    ) -> Answer:
+        """One request on an open connection, with the body framed or not at all."""
+        client.putrequest(
+            method.upper(),
+            target,
+            skip_accept_encoding=any(
+                name.lower() == "accept-encoding" for name in sending
+            ),
+        )
+        for name, value in sending.items():
+            client.putheader(name, value)
+        if body is not None:
+            client.putheader("Content-Length", str(len(body)))
+        client.endheaders(body)
+        return _answered(client.getresponse())
+
     if trust is None:
         client = http.client.HTTPConnection(host, port, timeout=timeout)
         try:
-            client.request(method.upper(), url, body=body, headers={**carried, **control})
-            return _answered(client.getresponse())
+            return dispatch(client, url, {**carried, **control})
         finally:
             client.close()
 
@@ -4321,8 +4414,7 @@ def _through(
         client = http.client.HTTPConnection(request.host, request.port, timeout=timeout)
         client.sock = secured
         try:
-            client.request(method.upper(), origin_form(url), body=body, headers=carried)
-            return _answered(client.getresponse())
+            return dispatch(client, origin_form(url), carried)
         finally:
             client.close()
     finally:

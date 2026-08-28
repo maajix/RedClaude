@@ -2465,10 +2465,10 @@ class AttemptTest(unittest.TestCase):
                 "url": "https://app.example.com/login",
                 "method": "GET",
                 "identity_slot": "",
-                # Ticket 96. The selected Playbook is `read_only`, so this
-                # attempt was not opened to put bytes in front of a parser and
-                # the door refuses a request that tries to.
-                "body_allowed": False,
+                # A body is request framing rather than a mutating effect. The
+                # selected Playbook is read-only but may still need one for a
+                # reading such as a JSON filter or GraphQL selection.
+                "body_allowed": True,
             },
             json.loads(args),
         )
@@ -2523,6 +2523,15 @@ class AttemptTest(unittest.TestCase):
         *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
 
         self.assertEqual("mutates_object", mutating.effects)
+        self.assertIs(True, json.loads(args)["body_allowed"])
+
+    def test_a_read_only_playbook_may_send_a_reading_with_a_body(self):
+        connection = Recorder()
+        with compiled():
+            attempt(connection)
+        *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
+
+        self.assertEqual("read_only", SELECTED_PLAYBOOK.effects)
         self.assertIs(True, json.loads(args)["body_allowed"])
 
     def test_one_mutating_playbook_among_readings_opens_the_attempt_for_a_body(self):

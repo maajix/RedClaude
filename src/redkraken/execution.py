@@ -3646,25 +3646,23 @@ def _actor(connection: pg.Connection) -> None:
 def _body_allowed(selected: Sequence[playbook_module.Projection]) -> bool:
     """Whether this attempt may put bytes in front of the target's parser.
 
-    Ticket 96's first rule, computed where the Tool run's authority is written
-    down rather than where a request is made. A Playbook declares what it does
-    to a target in `bb:effects`, the vocabulary is four words, and
-    `read_only` is the one of them that describes a reading. So a run whose
-    whole selection is readings is opened without a body and the door refuses
-    one, and a run carrying a single Playbook that admits to changing a
-    session, an object or an account is opened with one.
+    A body is framing, not an effect. GraphQL selections, JSON filters, gRPC
+    frames and form-encoded searches can all be readings even though their
+    protocol puts bytes after the headers. `bb:effects` continues to state what
+    a Playbook may change and continues to feed the risk floor; using it as a
+    body switch would silently make those read-only techniques impossible.
 
-    The maximum and not the minimum, because the selection is what this attempt
-    may do and not what each of its Playbooks does in turn: one Playbook that
-    submits a form makes the attempt one that submits a form, whatever the other
-    four alongside it only read.
+    The grant still comes from the selection rather than from the later call:
+    selecting at least one Playbook opens the attempt for the request shapes its
+    procedure may require. The door records that grant on the Tool run and
+    refuses a body when no Playbook was selected.
 
     No Playbook at all is a run under the Task's own instructions and nothing
     else, and that is opened read-only. A corpus that said nothing about this
     subject has not said that bytes may be sent to it, and the honest reading of
     silence on a permission is that it was not granted.
     """
-    return any(one.effects != "read_only" for one in selected)
+    return bool(selected)
 
 
 def _rotation(value: object) -> Mapping[str, object] | None:

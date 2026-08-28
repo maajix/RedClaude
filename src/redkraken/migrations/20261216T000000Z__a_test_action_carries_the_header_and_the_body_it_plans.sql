@@ -34,8 +34,10 @@
 --      Playbooks are allowed to do.
 --
 -- On that third point, and on ticket 96's rule specifically. `body_allowed` is
--- computed for the agent's Tool run from `bb:effects`, in `execution.py`, and
--- that stays exactly as it is. The reason ticket 96 gave for binding it -- "a
+-- computed for the agent's Tool run from the selected Playbooks in
+-- `execution.py`. A request body is framing and not, by itself, a mutating
+-- effect: read-only GraphQL and JSON-filter requests need one too. The reason
+-- ticket 96 gave for binding it -- "a
 -- Tool run opened to carry a body chooses its bytes after the row was written"
 -- -- is a statement about a model's argument, and it is not true of a Test: the
 -- bytes are in the spec, the spec is digested into `tests.spec_sha256`, that

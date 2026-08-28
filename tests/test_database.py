@@ -9028,14 +9028,19 @@ class ProxyEgressTest(DatabaseCase):
         self.assertEqual(("agent", "blocked", "capability refused"), (lane, decision, reason))
 
     def test_a_body_a_tool_run_allowed_reaches_the_target_and_is_in_the_receipt(self):
-        """The permitted path, all the way through, with no new column recording it.
+        """The permitted path, all the way through, recorded by an existing column.
 
         `receipts.request_agent_sha` has named the hash of the whole request
         document since there were Receipts, and `transcript` has always been the
         start line, the headers, a blank line and the body. So the assertion is
         that the artifact the existing column points at holds the bytes the
-        target read, which is what makes a second `request_body_sha256` a hash of
-        bytes already hashed.
+        target read.
+
+        `request_body_sha256` was added afterwards and answers a different
+        question: not "what did the door send", which this Artifact answers, but
+        "is this Receipt the answer to the arm that was planned" -- and a digest
+        of the whole document cannot be compared against a plan that states only
+        the body.
         """
         capability, tool_run, _ = self.writing("body", method="POST")
         sent = b"note=the+body+the+model+wrote"
@@ -29951,6 +29956,9 @@ class ReplayFixture:
         identity: str | None = None,
         method: str = "GET",
         path: str | None = None,
+        headers: str | None = None,
+        request_body: str | None = None,
+        query: str | None = None,
     ) -> str:
         """One exchange the door would have written, by the label it names it with.
 
@@ -29969,6 +29977,14 @@ class ReplayFixture:
         that ordinal, because most cases here perform the default plan.
         `record_test_action` compares both against the action being recorded, so
         a case stating its own actions states its own answers to them.
+
+        `headers`, `request_body` and `query` are what the action being answered
+        planned, and default to what the default plan plans: no header block, no
+        body and no query.
+        The two digests are computed by the same functions the comparison reads
+        them with rather than spelled here, because a helper standing in for the
+        door has to write what the door writes and a third spelling of the
+        canonical form is a third place it can drift.
 
         The scope version is read off the Program rather than written as `1`.
         Every case here but one opens its Program once and never moves it, so
@@ -29992,18 +30008,23 @@ class ReplayFixture:
             "INSERT INTO receipts (program_id, tool_run_id, lane, decision, reason,"
             "                      method, scheme, host, port, path, status_code,"
             "                      response_agent_sha, ts_arrival, scope_class, scope_version,"
-            "                      identity_entity_id)"
+            "                      identity_entity_id,"
+            "                      request_headers_sha256, request_body_sha256,"
+            "                      query_sha256)"
             " SELECT $1::uuid, $2::uuid, $3, 'allowed',"
             "        'allowed as target under scope version ' || p.scope_version, $4, 'https',"
             "        'app.example.com', 443, $5, $6::integer, $7, now(), 'target',"
-            "        p.scope_version, $8::uuid"
+            "        p.scope_version, $8::uuid,"
+            "        rk2_planned_headers_sha256($9::jsonb),"
+            "        rk2_planned_body_sha256(to_jsonb($10::text)),"
+            "        encode(sha256(convert_to($11::text, 'UTF8')), 'hex')"
             "   FROM programs p WHERE p.id = $1::uuid"
             " RETURNING label",
             (
                 cls.program_id, tool_run, lane, method.upper(),
                 path or f"/api/orders/{ordinal}", status,
                 None if body is None else artifact.digest(body.encode()),
-                identity,
+                identity, headers, request_body, query,
             ),
         )
 
@@ -30100,6 +30121,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refuse_a_specification_nobody_should_store()
         cls.refuse_a_replay_the_conditions_do_not_admit()
         cls.declare_whether_the_plan_carries_a_body()
+        cls.refuse_a_receipt_that_answers_a_sibling_arm()
         cls.open_a_replay_the_token_budget_cannot_fund()
         cls.ask_the_preview_about_the_playbook_bar()
         cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
@@ -30714,6 +30736,70 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
             committed(cls.connection, cls.CLOSE, (opened["tool_run_id"], "skipped", "abandoned"))
 
     @classmethod
+    def refuse_a_receipt_that_answers_a_sibling_arm(cls):
+        """Two arms on one route, told apart by one axis each.
+
+        `record_test_action` compares the route, and 211 let two actions differ
+        without changing it: a header block, a body, and -- since the door has
+        always digested it -- a query. Two arms that differ only there are the
+        arms a differential is read between, so a run that could record one
+        under the other's ordinal could produce a differential out of one
+        exchange performed twice.
+
+        Each axis gets both halves. The Receipt that answers arm 1 is recorded
+        as action 1 and accepted, and the same Receipt offered as action 2 is
+        refused -- so the refusal is about the axis and not about a Receipt this
+        replay could never have produced.
+
+        A claim each, because a second replay of one claim is refused while the
+        first is in flight.
+        """
+        cls.swapped = {}
+        for axis, arm_one, arm_two in (
+            ("query",
+             {"url": f"{BASE}/9?probe=a"},
+             {"url": f"{BASE}/9?probe=b"}),
+            ("headers",
+             {"url": f"{BASE}/9", "headers": {"X-Arm": "one"}},
+             {"url": f"{BASE}/9", "headers": {"X-Arm": "two"}}),
+            ("body",
+             {"url": f"{BASE}/9", "headers": {"Content-Type": "text/plain"},
+              "body": "one"},
+             {"url": f"{BASE}/9", "headers": {"Content-Type": "text/plain"},
+              "body": "two"}),
+        ):
+            hypothesis, _ = cls.claim_waiting(f"the orders API reads the {axis} of a request")
+            stored = cls.stored(
+                hypothesis,
+                specification(
+                    [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                    actions=[
+                        {"ordinal": 1, "role": "baseline", "kind": "request",
+                         "method": "POST"} | arm_one,
+                        {"ordinal": 2, "role": "variant", "kind": "request",
+                         "method": "POST"} | arm_two,
+                        {"ordinal": 3, "role": "control", "kind": "request",
+                         "method": "GET", "url": f"{BASE}/3"},
+                    ],
+                ),
+            )
+            opened = cls.called(cls.OPEN, (cls.replay_run(), stored, None))
+            answer = cls.receipted(
+                opened["tool_run_id"], 1,
+                method="POST",
+                path="/api/orders/9",
+                headers=(json.dumps(arm_one["headers"]) if "headers" in arm_one else None),
+                request_body=arm_one.get("body"),
+                query=("probe=a" if axis == "query" else None),
+            )
+            cls.called(cls.RECORD, (opened["tool_run_id"], 1, answer))
+            cls.swapped[axis] = cls.refuse(
+                cls.RECORD, (opened["tool_run_id"], 2, answer)
+            )
+            committed(cls.connection, cls.CLOSE,
+                      (opened["tool_run_id"], "skipped", "abandoned"))
+
+    @classmethod
     def refuse_a_replay_the_conditions_do_not_admit(cls):
         # A url the current scope does not admit, refused before anything is sent.
         hypothesis, _ = cls.claim_waiting("the admin console is reachable")
@@ -31132,6 +31218,21 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
                       self.refusals["wrong_request"])
         self.assertIn("action 2 states GET https://app.example.com/api/orders/2",
                       self.refusals["wrong_request"])
+
+    def test_a_receipt_that_answers_a_sibling_arm_is_refused_on_the_axis_that_differs(self):
+        """Ticket 211's other half: the axes an action may state and a Receipt holds.
+
+        The route is identical on both arms, so nothing above this comparison
+        could have refused any of the three -- and the message names the axis,
+        because a reader told only "refused" would have to diff two plans to
+        find out which one moved.
+        """
+        self.assertIn("answers a different query than action 2 states",
+                      self.swapped["query"])
+        self.assertIn("carries different headers than action 2 states",
+                      self.swapped["headers"])
+        self.assertIn("carries a different body than action 2 states",
+                      self.swapped["body"])
 
     def test_the_refused_rows_are_not_there(self):
         [[cited]] = self.rows(
@@ -31763,6 +31864,38 @@ class ReplayCommandTest(LiveDoorFixture, DatabaseCase):
         )
 
         self.assertEqual([("replay", 3)], [(str(row[0]), int(row[1])) for row in lanes])
+
+    def test_the_door_and_the_plan_spell_one_header_digest_for_the_same_arm(self):
+        """The drift guard between `stated_headers_sha256` and its SQL twin.
+
+        The same canonical form is written twice, once in Python where the door
+        records it and once in SQL where a plan is compared against it, so a
+        change to one is a replay that can never record its own Receipt. This is
+        the case that says so, and it says it end to end: the three actions of
+        this walk name no headers at all, the request still reached the target
+        carrying `Accept-Encoding: identity` because `http.client` adds it, and
+        the digest the door wrote has to be the digest the plan produces.
+
+        Pinned to the literal as well as to the SQL function. Two spellings
+        compared only against each other can be wrong together; the literal is
+        the third party, and it is the digest of the one line a request with no
+        stated headers canonicalises to.
+        """
+        digests = self.rows(
+            "SELECT r.request_headers_sha256, r.request_body_sha256, r.query_sha256,"
+            "       rk2_planned_headers_sha256(NULL) FROM receipts r"
+            "  JOIN tool_runs tr ON tr.id = r.tool_run_id"
+            " WHERE tr.program_id = $1::uuid AND tr.label = $2",
+            (self.program_id, self.held.facts["tool_run"]["label"]),
+        )
+
+        stated = "8ec3bcd85980cc3dcccf76a2d027942d57b412a3685a420eaa76adb0069aefa2"
+        self.assertEqual(3, len(digests))
+        for row in digests:
+            self.assertEqual(stated, str(row[0]))
+            self.assertEqual(stated, str(row[3]))
+            self.assertIsNone(row[1])
+            self.assertIsNone(row[2])
 
     def test_the_run_it_filed_names_the_three_roles_in_the_planned_order(self):
         roles = self.rows(

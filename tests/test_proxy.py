@@ -1896,6 +1896,93 @@ class ExchangeTest(unittest.TestCase):
         # request with none would be asking the schema the wrong question.
         self.assertEqual([True], [asked for *_, asked in self.fence.authorized])
 
+    def test_a_post_this_client_was_given_no_body_for_frames_none(self):
+        """The stdlib default that would have made every body-less POST a body.
+
+        `HTTPConnection._get_content_length` answers `0` for a `None` body on
+        POST, PUT and PATCH -- RFC 7230 §3.3.2 -- so `request()` writes
+        `Content-Length: 0` on a request this client was handed no bytes for.
+        The door reads the wire, so it would grade that as an empty body and
+        refuse the request of any Tool run not opened for one. This is the arm
+        that says the length is written here or not at all.
+        """
+        self.fence.body_allowed = False
+
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+            method="POST",
+        )
+
+        self.assertEqual(200, answer.status)
+        method, _, seen = self.target.seen[0]
+        self.assertEqual("POST", method)
+        self.assertEqual([], [value for name, value in seen if name == "content-length"])
+        self.assertEqual([False], [asked for *_, asked in self.fence.authorized])
+        self.assertIsNone(self.fence.allowed[0]["receipt"]["request_body_sha256"])
+
+    def test_the_query_the_door_digests_is_the_one_the_plan_side_reads(self):
+        """The other half of a comparison whose two halves live in two languages.
+
+        `record_test_action` compares the Receipt's `query_sha256` against the
+        digest of `rk2_test_query`, so the door's `urlsplit(url).query` and that
+        function's regex have to answer the same string for every url a plan may
+        state. Neither side can see the other, so both are held against this
+        list: the migration pins the same six urls to the same six answers on
+        apply, and a change to either that moves an answer breaks one of the two.
+        """
+        expected = {
+            "https://app.example.com/a": None,
+            "https://app.example.com/a?": None,
+            "https://app.example.com/a?b=1": b"b=1",
+            "https://app.example.com/a?b=1&c=2": b"b=1&c=2",
+            "https://app.example.com:8443/a?b=1": b"b=1",
+            "https://app.example.com/a#b?c=1": None,
+        }
+
+        self.assertEqual(
+            [
+                None if query is None else hashlib.sha256(query).hexdigest()
+                for query in expected.values()
+            ],
+            [proxy.query_sha256(url) for url in expected],
+        )
+
+    def test_a_stated_accept_encoding_crosses_once_and_is_the_digest_the_plan_spells(self):
+        """The other arm of the header digest, and the one `putrequest` can break.
+
+        `putrequest` writes `Accept-Encoding: identity` unless it is told not
+        to. A caller that names the header itself and is not suppressed sends
+        two, and the second is a header no plan can state -- so the digest on
+        the Receipt would name an arm nobody planned and `record_test_action`
+        would refuse every Receipt for it.
+
+        Pinned to the literal rather than to the SQL function, which lives in a
+        database this case has none of. The literal is the same third party both
+        sides are held against: `sha256(b"accept-encoding: gzip\n")`, which is
+        also what `rk2_planned_headers_sha256('{"Accept-Encoding": "gzip"}')`
+        answers.
+        """
+        answer = proxy.spend(
+            self.server.server_address,
+            "http://target.example.test/v1/notes",
+            capability=CAPABILITY,
+            program_id=PROGRAM_ID,
+            headers={"Accept-Encoding": "gzip"},
+        )
+
+        self.assertEqual(200, answer.status)
+        *_, seen = self.target.seen[0]
+        self.assertEqual(
+            ["gzip"], [value for name, value in seen if name == "accept-encoding"]
+        )
+        self.assertEqual(
+            "46e1727a2350e8e270b7f132190e1b80314c73cfee55549c7cc2fb24d3885dd9",
+            self.fence.allowed[0]["receipt"]["request_headers_sha256"],
+        )
+
     def test_a_body_on_a_tool_run_that_was_not_opened_for_one_is_refused(self):
         """Ticket 96's first rule, from the side that has to hold it.
 
@@ -1934,6 +2021,33 @@ class ExchangeTest(unittest.TestCase):
         self.assertEqual(200, response.status)
         self.assertEqual([False], [asked for *_, asked in self.fence.authorized])
         self.assertEqual(1, len(self.fence.allowed))
+
+    def test_a_body_of_no_bytes_is_a_body_and_is_asked_about_as_one(self):
+        """The third case, and the one a `Content-Length` decides.
+
+        A caller that stated `Content-Length: 0` framed an empty body, and a
+        caller that stated no length framed none. Both carry no bytes, so the
+        header is the only place the difference lives -- and the decision is
+        about which request was made, not about how many bytes it moved. The
+        target is told the same thing the door was asked.
+        """
+        self.fence.body_allowed = True
+
+        response = self.through(
+            "http://target.example.test/v1/notes", method="POST", body=b""
+        )
+        response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual([True], [asked for *_, asked in self.fence.authorized])
+        *_, seen = self.target.seen[-1]
+        self.assertEqual(
+            ["0"], [value for name, value in seen if name == "content-length"]
+        )
+        self.assertEqual(
+            hashlib.sha256(b"").hexdigest(),
+            self.fence.allowed[0]["receipt"]["request_body_sha256"],
+        )
 
     def test_the_argument_ceiling_and_the_doors_ceiling_are_two_numbers(self):
         # They bound different things and neither is derived from the other. The
