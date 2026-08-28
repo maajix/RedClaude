@@ -29,6 +29,44 @@ Begrenzte, beaufsichtigte, anonyme Read-only-Hunts sind vertretbar, und mit dem
 Abschluss von Arbeitsblock 1 auch ein beaufsichtigter Hunt mit reproduzierbarem
 Finding und Report. Die beiden Vorbehalte stehen bei Freigabe B.
 
+## Aktuelle Ticket-Reihenfolge — 27.08.2026
+
+Der Live-Hunt pausiert bis zum Reset des ausgeschöpften Claude-Wochenlimits.
+Der beobachtete 429 erklärt den Provider-Stopp; die offene D21-Entscheidung ist
+ein davon unabhängiger Control-Surface-Blocker und muss vor dem nächsten Canary
+beantwortet oder superseded werden. Während der Pause wird keine Live-Runtime
+verändert.
+
+1. Release-Kette: **99 → 100 → 101 → 84 → 65**.
+2. Sicherheits- und Betriebsgrenzen: **174 → 190 → 188 → 195 → 200**.
+3. Wiring und Produktdebt: **129 → 105 → 120 → 122 → 116**, danach der
+   verbleibende `ready-for-agent`-Backlog nach Unlock-Wert.
+
+Ticket 99 ist gestartet. Zuerst kommen probe-eigene Outcome-Schlüssel,
+`read_client_state` und Fragment-Navigation; `send_message` bleibt hinter der
+Listener-Inventur. Der Execution-Oracle wird als ADR entschieden und nicht
+stillschweigend als aktive Browser-Fähigkeit eingeführt.
+
+Ticket 100 beginnt erst, wenn Ticket 99 seine isolierte reale Datenbankabnahme
+bestanden hat und als `resolved` dokumentiert ist. Bis dahin wird keine zweite
+Migration der Release-Kette auf den ungeprüften Stand gestapelt.
+
+Ticket 101 ist keine weitere Fünf-Playbook-Scheibe. Abnahmeziel sind alle 50
+Playbooks: konkrete Voraussetzungen, Angriffshypothese, Baseline/Variant/Control,
+zugelassene Payload-Familien, Verzweigungen, Abbruchbedingungen, passende Skills
+und ausschließlich Evidenz, die Runtime-Verben tatsächlich erzeugen. Ticket 166
+ist deshalb eine harte Querabhängigkeit. Quellen sind sowohl das lokale
+`/home/majix/hacking-wiki` (insbesondere 131 Web-, 30 Infrastruktur- und 15
+Windows/AD-Seiten) als auch aktuelle Primärquellen und Originalforschung im
+Internet; jede übernommene Technik behält ihre Provenienz.
+
+Die abgeleitete Wissenssicht wird als Google OKF v0.2 Bundle gebaut und gegen
+die kanonische `GoogleCloudPlatform/open-knowledge-format`-Spezifikation
+validiert. Das vorhandene Wiki ist dafür eine Quelle, aber noch kein
+Konformitätsbeweis: fehlendes Root-`okf_version`, fehlende `type`-Felder und die
+noch nicht durchgängig vorhandenen v0.2-Familien für `sources`, `generated`,
+`verified`, `status` und `stale_after` werden nicht stillschweigend übergangen.
+
 ## Arbeitsblock 0 — Stabiler Abschluss und früher Pilot
 
 Dauer mit drei parallelen Implementierungssträngen plus Lead: **4–6 Arbeitstage**.

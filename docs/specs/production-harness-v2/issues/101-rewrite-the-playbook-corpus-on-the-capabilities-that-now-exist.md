@@ -8,6 +8,42 @@ techniques have no home in. This is the ticket the other seven exist for.
 
 **Status:** ready-for-agent
 
+- [ ] **The rewrite uses the operator's pentest corpus and current external
+      research, with provenance.** The local source is
+      `/home/majix/hacking-wiki`: its index currently carries 326 concept pages,
+      including 131 Web, 30 Infrastructure/Network and 15 Windows/AD/Lateral
+      pages. Each Playbook receives the relevant local references instead of a
+      wholesale copy of payload prose. Current web research is checked against
+      versioned OWASP WSTG scenarios, ASVS 5.0.0 requirements, the OWASP API
+      Security Top 10 2023, PortSwigger Web Security Academy and original
+      PortSwigger Research; infrastructure methodology is checked against NIST
+      SP 800-115 and the live MITRE ATT&CK Enterprise matrix. A source ledger
+      records source version/date, technique, Playbook destination, whether the
+      harness can execute it, the permitted payload family and the evidence
+      writer. A link list without that mapping does not satisfy this criterion.
+- [ ] **All fifty Playbooks, not only the five High-Yield pairs, carry an
+      executable testing shape.** Each one states prerequisites, attack
+      hypothesis, baseline, variant, control, allowed payload family, branches,
+      stop conditions and the evidence bar for both `supported` and `refuted`.
+      Tool operation belongs in a referenced Skill; target-specific ordering
+      belongs in a Test; active bodies stay registry-owned. Any evidence kind
+      with no runtime writer blocks the Playbook through ticket 166 rather than
+      being left as unreachable prose.
+- [ ] **The knowledge view conforms to Google Open Knowledge Format v0.2.** A
+      dedicated bundle declares `okf_version: "0.2"` at its root and exposes
+      every shipped Playbook, Skill and maintained reference as a linked
+      concept without weakening the closed `bb:` execution schema. Concepts
+      carry `type`, `title`, `description`, `sources` with stable IDs and
+      per-claim footnote attribution, `generated`, `verified`, `status` and an
+      intentional `stale_after`; actor strings follow OKF's
+      `<producer>/<version>`, `human:<id>` and `process:<id>` convention.
+      Unknown OKF extensions round-trip, indexes support progressive disclosure
+      and links form the Playbook → Skill → Reference graph. The bundle is
+      validated in tests against the canonical GoogleCloudPlatform
+      `open-knowledge-format` v0.2 specification. The existing
+      `/home/majix/hacking-wiki` is input, not proof of conformance: its shape is
+      OKF-like, but its root currently lacks `okf_version` and many imported
+      Notion pages lack `type` and the v0.2 trust/provenance families.
 - [ ] **Part of this work needed no new capability and is done first.** The
       research names 11 techniques that are reachable today with `method`, `url`
       and `headers` alone or with the ten already-registered browser actions,
