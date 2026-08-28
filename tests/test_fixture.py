@@ -274,6 +274,58 @@ class Corpus(unittest.TestCase):
         with self.assertRaises(TypeError):
             fixture.FIXTURES["invented"] = None  # type: ignore[index]
 
+    def test_ticket_100s_four_pairs_differ_where_their_class_says_they_do(self):
+        # The four fixtures ticket 100 shipped, exercised on the route their
+        # ground truth is about. `Serving.test_the_two_variants_of_a_pair_differ`
+        # makes this claim for a corpus it wrote itself; this one makes it for
+        # the corpus an installed `rk` actually grades against, and it is the one
+        # check that fails if one of the four applications stops disagreeing
+        # with itself.
+        for name, method, path, body, headers, tell in (
+            (
+                "cookie-parsing-pair", "GET", "/account", None,
+                {"Cookie": "session=s-alice-4f2c; session=s-bob-9d17"}, b"bob",
+            ),
+            (
+                "object-property-write-pair", "PATCH", "/account",
+                b'{"display_name": "A", "role": "admin"}',
+                {"Cookie": "session=s-alice-4f2c"}, b'"role": "admin"',
+            ),
+            (
+                "parser-differential-pair", "POST", "/orders",
+                b'{"amount": 1, "amount": 9999}',
+                {"Cookie": "session=s-alice-4f2c"}, b'"charged": 9999',
+            ),
+            (
+                "unclaimed-reference-pair", "GET", "/assets/status", None, {},
+                b"NoSuchBucket",
+            ),
+        ):
+            with self.subTest(fixture=name):
+                answers = {}
+                for variant in evaluation.PAIR:
+                    with evaluation.served(fixture.FIXTURES[name], variant) as where:
+                        answers[variant] = self.exchange(where, method, path, body, headers)
+                self.assertNotEqual(answers["vulnerable"], answers["secure"])
+                self.assertIn(tell, answers["vulnerable"][1])
+                self.assertNotIn(tell, answers["secure"][1])
+
+    def exchange(
+        self, where, method: str, path: str, body: bytes | None, headers: dict
+    ) -> tuple[int, bytes]:
+        """One request against a served variant, closed the way `Serving` closes one."""
+        connection = http.client.HTTPConnection(where.host, where.port, timeout=5)
+        try:
+            sending = {"Connection": "close", **headers}
+            if body is not None:
+                sending["Content-Type"] = "application/json"
+                sending["Content-Length"] = str(len(body))
+            connection.request(method, path, body=body, headers=sending)
+            answer = connection.getresponse()
+            return answer.status, answer.read()
+        finally:
+            connection.close()
+
     def test_the_compiler_never_executes_what_it_digests(self):
         # `compile_corpus` reads and hashes. A corpus that will not compile must
         # still be a corpus nobody ran, and the way to state that is a fixture

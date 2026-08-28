@@ -299,7 +299,7 @@ OBSERVATION_KINDS = {
 #: and a second structure saying so is a second thing to keep true; the corpus
 #: test derives the families back out and checks them against
 #: `property_class_families`. Long, and that is the point: a hunter picking the
-#: nearest of fifty-seven declared classes is doing what the vocabulary is for,
+#: nearest of sixty-one declared classes is doing what the vocabulary is for,
 #: while a hunter inventing a fifty-eighth loses the Hypothesis and every
 #: evidence edge that named it.
 PROPERTY_CLASSES = (
@@ -311,6 +311,7 @@ PROPERTY_CLASSES = (
     "authorization.edge_rule",
     "authorization.function_access",
     "authorization.object_ownership",
+    "authorization.object_property_write",
     "authorization.parallel_route",
     "authorization.state_transition",
     "authorization.tenant_isolation",
@@ -339,6 +340,7 @@ PROPERTY_CLASSES = (
     "injection.model_instruction",
     "injection.object_graph",
     "injection.parameter_precedence",
+    "injection.parser_differential",
     "injection.path",
     "injection.query_field",
     "injection.query_language",
@@ -346,10 +348,12 @@ PROPERTY_CLASSES = (
     "injection.request_forgery",
     "injection.stored_file",
     "injection.template",
+    "injection.unclaimed_reference",
     "injection.url_authority",
     "rate_limiting.per_identity",
     "rate_limiting.per_origin",
     "rate_limiting.resource_cost",
+    "session_handling.cookie_parsing",
     "session_handling.cookie_scope",
     "session_handling.cross_origin_read",
     "session_handling.csrf",

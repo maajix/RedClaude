@@ -295,10 +295,17 @@ OWED_GAPS: dict[str, str] = {
     # W8. The declared write target with neither a writer nor a handler.
     "W8 report_queue": "owed:105",
 
-    # W9. Five declared property classes nothing emits, and the four Playbook
-    # bodies that name one as though it did. Ticket 100 established that the
-    # classes exist and that the missing half is an emitter, and put that work on
-    # ticket 101.
+    # W9. Nine declared property classes nothing emits, and the four Playbook
+    # bodies that name one as though it did. Ticket 100 established that five of
+    # them exist and that the missing half is an emitter, and put that work on
+    # ticket 101. The other four are ticket 100's own: it added the leaves the
+    # vocabulary could not spell, each with the fixture that grades it, and left
+    # the emitter to the same ticket for the same reason -- a class shipped with
+    # a Playbook written against it in one step is a Playbook nothing graded.
+    "W9 authorization.object_property_write": "owed:101",
+    "W9 injection.parser_differential": "owed:101",
+    "W9 injection.unclaimed_reference": "owed:101",
+    "W9 session_handling.cookie_parsing": "owed:101",
     "W9 authentication.recovery_flow": "owed:101",
     "W9 information_disclosure.identifier_oracle": "owed:101",
     "W9 rate_limiting.per_origin": "owed:101",
