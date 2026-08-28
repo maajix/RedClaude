@@ -535,6 +535,125 @@ class WiringReadingTest(unittest.TestCase):
         )
 
 
+    # -- W12, the Test a Playbook says it will perform ------------------------
+
+    @staticmethod
+    def playbook(name: str, evidence: list[dict], text: str = "") -> check_wiring.Body:
+        """One synthetic Playbook, so the case is about the check and not the corpus.
+
+        The corpus is rewritten by the ticket this check was written for, so a
+        case that took its example from a shipped body would stop being about
+        the reading the day that body changed.
+        """
+        return check_wiring.Body(
+            name=name, kind="playbook", front={"bb:evidence": evidence},
+            text=text or "A baseline, a variant and a control walk into a Test.",
+        )
+
+    def asked(self, *bodies: check_wiring.Body) -> list[check_wiring.Gap]:
+        return check_wiring.test_shape_gaps(
+            dataclasses.replace(self.wiring, corpus=bodies)
+        )
+
+    def test_a_refutation_is_graded_on_a_kind_the_replay_lane_can_write(self):
+        # The exact half. `close_test_replay` takes the Observation kind from
+        # the specification, so a role carries one kind whichever way the run
+        # comes out, and a Playbook asking for `response_invariant` on refuted
+        # and something else on supported has written a refutation it cannot
+        # reach.
+        found = self.asked(self.playbook("probe", [
+            {"to_status": "refuted", "role": "variant", "kind": "response_invariant"},
+            {"to_status": "supported", "role": "variant", "kind": "response_differential"},
+        ]))
+
+        self.assertEqual(["W12 probe variant refuted"], [gap.key for gap in found])
+        self.assertIn("the refuted leg is unreachable", found[0].detail)
+
+    def test_the_rule_is_not_narrowed_to_the_kind_that_is_commonest(self):
+        # The reading the first draft got wrong. Of the thirty-one bodies this
+        # finds in the shipped corpus the supported leg asks for
+        # `response_differential` in sixteen, so a check written against that
+        # one kind would have found half of them and called the corpus clean.
+        for kind in ("state_change", "credential_effect", "error_detail",
+                     "content_match", "timing_differential", "callback_interaction"):
+            with self.subTest(kind=kind):
+                found = self.asked(self.playbook("probe", [
+                    {"to_status": "refuted", "role": "variant",
+                     "kind": "response_invariant"},
+                    {"to_status": "supported", "role": "variant", "kind": kind},
+                ]))
+
+                self.assertEqual(["W12 probe variant refuted"], [gap.key for gap in found])
+
+    def test_two_legs_that_ask_for_one_kind_are_not_reported(self):
+        # A Test whose variant is graded invariant either way is a Test the lane
+        # can settle, and the roles are not compared across each other: a
+        # control asking for something else is a different action.
+        found = self.asked(self.playbook("probe", [
+            {"to_status": "refuted", "role": "variant", "kind": "response_invariant"},
+            {"to_status": "supported", "role": "variant", "kind": "response_invariant"},
+            {"to_status": "supported", "role": "control", "kind": "response_differential"},
+        ]))
+
+        self.assertEqual([], found)
+
+    def test_a_body_that_declares_no_evidence_list_is_reported(self):
+        found = self.asked(check_wiring.Body(
+            name="probe", kind="playbook", front={},
+            text="A baseline, a variant and a control.",
+        ))
+
+        self.assertEqual(["W12 probe evidence"], [gap.key for gap in found])
+
+    def test_the_prose_reading_reports_itself_as_a_heuristic(self):
+        # W12b. It measures vocabulary and the rule it stands in for is
+        # `rk2_test_spec_problem`'s, so the sentence it emits has to say both --
+        # a reader who takes this for the enforcement will go looking for the
+        # wrong thing when a spec is refused.
+        found = self.asked(self.playbook(
+            "probe",
+            [{"to_status": "supported", "role": "variant", "kind": "response_differential"}],
+            text="Send the request, then send it again without the header.",
+        ))
+
+        self.assertEqual(["W12 probe roles"], [gap.key for gap in found])
+        self.assertTrue(found[0].detail.startswith("heuristic: "))
+        self.assertIn("baseline, variant, control", found[0].detail)
+        self.assertIn("rk2_test_spec_problem at propose_test", found[0].detail)
+
+    def test_a_role_named_inside_a_longer_word_is_not_a_role_named(self):
+        # `controlled` is not `control`. A substring match would read this body
+        # as naming one of the three and pass over it.
+        found = self.asked(self.playbook(
+            "probe",
+            [{"to_status": "supported", "role": "variant", "kind": "response_differential"}],
+            text="A baseline, a variant, and a controlled comparison.",
+        ))
+
+        self.assertEqual(["W12 probe roles"], [gap.key for gap in found])
+        self.assertIn("never names control", found[0].detail)
+
+    def test_what_the_shipped_corpus_owes_is_counted_and_registered(self):
+        # The number this gate was switched on with, so that the rewrite has
+        # something to measure itself against. Thirty-one bodies grade an
+        # unreachable refutation and thirty-five never name all three roles;
+        # fifteen of the fifty name them all.
+        found = check_wiring.test_shape_gaps(self.wiring)
+        unreachable = [gap for gap in found if gap.subject.endswith(" refuted")]
+        unnamed = [gap for gap in found if gap.subject.endswith(" roles")]
+
+        self.assertEqual(31, len(unreachable))
+        self.assertEqual(35, len(unnamed))
+        self.assertEqual(len(found), len(unreachable) + len(unnamed))
+        # And every one of them is on the register, against the ticket that owes
+        # the rewrite. The other direction -- a row with no gap -- is
+        # `register_errors`' and is asked in `WiringRegisterTest`.
+        self.assertEqual(
+            {"owed:101"},
+            {check_wiring.OWED_GAPS.get(gap.key) for gap in found},
+        )
+
+
 class TicketThirtyEightTest(unittest.TestCase):
     """The defect this gate is proven against, which is a sentence in a resolved ticket."""
 

@@ -9,8 +9,8 @@ producer, a consumer or a caller, or a recorded reason why not.
 
 Four audits reached that conclusion independently and each ended with a section
 naming the queries a gate would run. This is those four sections reconciled into
-one set of ten, and the mapping is recorded here so that neither numbering has
-to be repeated afterwards:
+one set of ten, plus the two later tickets added, and the mapping is recorded
+here so that neither numbering has to be repeated afterwards:
 
 W1  every Contract is served or declared unserved with a reason -- 21 G1;
 W2  every declared argument is consumed end to end -- 21 G2;
@@ -34,6 +34,12 @@ W10 a Playbook or Skill body names only tools the executing role holds,
     arguments those tools declare, offline programs granted to that role, and no
     artifact the same body earlier described fetching over the wire -- 22's eight
     checks.
+W11 a Skill granted to a role is a Skill that names that role, so what the
+    roster grants is what the launch stages -- ticket 87's.
+W12 a Playbook grades each outcome of its Test on an Observation kind the
+    replay lane writes for it, and its prose names the three roles a Test action
+    may carry -- ticket 101's. The first half is exact and the second is a
+    heuristic that says so in every sentence it emits.
 
 ## What is answered here and what is answered by the database
 
@@ -343,6 +349,88 @@ OWED_GAPS: dict[str, str] = {
     # migration, and `20261126T000000Z` re-granted it. The row is removed
     # rather than re-pointed, which is what this register asks of a gap that
     # is gone.
+
+    # W12a. Thirty-one Playbooks grade a refutation on an Observation kind that
+    # cannot be written for the Test they state: `response_invariant` on a role
+    # whose supported leg asks for something else, when `close_test_replay`
+    # takes the kind from the specification and so writes one kind per role
+    # whichever way the run comes out. Sixteen of the supported legs ask for
+    # `response_differential` and fifteen ask for one of six other kinds, which
+    # is why the check is not narrowed to the first. Ticket 101 rewrites all
+    # fifty bodies and every row here goes with the body it names.
+    "W12 agentic-ai variant refuted": "owed:101",
+    "W12 api-authorization variant refuted": "owed:101",
+    "W12 authentication variant refuted": "owed:101",
+    "W12 browser-realtime variant refuted": "owed:101",
+    "W12 client-side-path-traversal variant refuted": "owed:101",
+    "W12 cms variant refuted": "owed:101",
+    "W12 command-directory-injection variant refuted": "owed:101",
+    "W12 deployment variant refuted": "owed:101",
+    "W12 deserialization variant refuted": "owed:101",
+    "W12 exceptional-conditions variant refuted": "owed:101",
+    "W12 file-resolution variant refuted": "owed:101",
+    "W12 file-upload variant refuted": "owed:101",
+    "W12 graphql variant refuted": "owed:101",
+    "W12 grpc variant refuted": "owed:101",
+    "W12 identity-lifecycle variant refuted": "owed:101",
+    "W12 identity-parsing variant refuted": "owed:101",
+    "W12 jwt-jose variant refuted": "owed:101",
+    "W12 nosql-injection variant refuted": "owed:101",
+    "W12 oauth variant refuted": "owed:101",
+    "W12 orm variant refuted": "owed:101",
+    "W12 race-conditions variant refuted": "owed:101",
+    "W12 request-integrity variant refuted": "owed:101",
+    "W12 request-parsing variant refuted": "owed:101",
+    "W12 routing variant refuted": "owed:101",
+    "W12 sql-injection variant refuted": "owed:101",
+    "W12 ssrf-url-routing variant refuted": "owed:101",
+    "W12 structured-injection variant refuted": "owed:101",
+    "W12 web-cache variant refuted": "owed:101",
+    "W12 webauthn variant refuted": "owed:101",
+    "W12 webhooks variant refuted": "owed:101",
+    "W12 workload-identities variant refuted": "owed:101",
+
+    # W12b. Thirty-five Playbooks never name all three Test roles in their own
+    # prose, so a reader is told to build a Test in sentences that do not say
+    # what a Test must carry. Heuristic rows: the exact rule is
+    # `rk2_test_spec_problem`'s and fires at `propose_test`, and a Playbook that
+    # describes a control without using the word is counted here anyway. Ticket
+    # 101 is where the words are written.
+    "W12 api roles": "owed:101",
+    "W12 attack-surface roles": "owed:101",
+    "W12 authentication roles": "owed:101",
+    "W12 browser-framing roles": "owed:101",
+    "W12 browser-messaging roles": "owed:101",
+    "W12 browser-script roles": "owed:101",
+    "W12 client-side-path-traversal roles": "owed:101",
+    "W12 cms roles": "owed:101",
+    "W12 cookies roles": "owed:101",
+    "W12 deployment roles": "owed:101",
+    "W12 exceptional-conditions roles": "owed:101",
+    "W12 external-resources roles": "owed:101",
+    "W12 file-upload roles": "owed:101",
+    "W12 http-desync roles": "owed:101",
+    "W12 identity-lifecycle roles": "owed:101",
+    "W12 identity-parsing roles": "owed:101",
+    "W12 information-disclosure roles": "owed:101",
+    "W12 jwt-jose roles": "owed:101",
+    "W12 kubernetes roles": "owed:101",
+    "W12 logging roles": "owed:101",
+    "W12 oauth roles": "owed:101",
+    "W12 race-conditions roles": "owed:101",
+    "W12 request-integrity roles": "owed:101",
+    "W12 request-parsing roles": "owed:101",
+    "W12 routing roles": "owed:101",
+    "W12 secrets roles": "owed:101",
+    "W12 spreadsheet-injection roles": "owed:101",
+    "W12 ssrf-url-routing roles": "owed:101",
+    "W12 ssti roles": "owed:101",
+    "W12 structured-injection roles": "owed:101",
+    "W12 supply-chain roles": "owed:101",
+    "W12 web-cache roles": "owed:101",
+    "W12 webauthn roles": "owed:101",
+    "W12 webhooks roles": "owed:101",
+    "W12 workload-identities roles": "owed:101",
 }
 
 
@@ -1891,8 +1979,118 @@ def skill_grant_gaps(wiring: Wiring) -> list[Gap]:
     return gaps
 
 
-#: The eleven, in order, each with the reading that produces it. A tuple rather
-#: than eleven calls in `check`, because the report and the refusal both walk it
+#: The three roles a Test action may carry, and the one place this gate spells
+#: them. `rk2_test_roles()` is the database's copy
+#: (`20260815T000000Z__a_test_runs_through_the_replay_lane.sql:145`) and
+#: `rk2_test_spec_problem` refuses a specification that leaves one of them out
+#: (`20261216T000000Z:309-315`).
+TEST_ROLES = ("baseline", "variant", "control")
+
+#: A role named as a word in the prose. Bounded, because `controlled` is not
+#: `control` and a substring match would read one as the other.
+ROLE_WORD = {role: re.compile(rf"\b{role}\b", re.IGNORECASE) for role in TEST_ROLES}
+
+
+def test_shape_gaps(wiring: Wiring) -> list[Gap]:
+    """W12: a Playbook states a Test the replay lane can store and settle.
+
+    Two readings of one question, and they are not the same kind of reading.
+    The first is exact and is the work of this check; the second is a heuristic
+    and says so in every sentence it emits, because the enforcement it stands in
+    for is real and lives in the database.
+
+    ## W12a -- the evidence a Playbook asks for, against the Observation the
+    ## replay lane writes
+
+    `close_test_replay` derives an Observation's kind from the *specification*
+    and not from the outcome
+    (`20261107T000000Z__a_comparison_writes_one_kind_and_the_bar_now_asks_for_it.sql:13-30`):
+    an action a differencing assertion names, as its `action` or as its
+    `against`, carries `response_differential` whichever way the run came out,
+    and `response_invariant` is written only for an action no comparison names.
+
+    So one role carries one kind per Test. A `bb:evidence` list that asks for
+    `response_invariant` on a role for `refuted` and something else on the same
+    role for `supported` is asking for two kinds off one action, and the
+    refuted leg of it can never be satisfied -- the Playbook grades a refutation
+    it cannot reach.
+
+    The rule is not narrowed to `response_differential`, and that is the whole
+    reading. Of the thirty-one bodies this finds, the supported leg asks for
+    `response_differential` in sixteen and for `credential_effect`,
+    `state_change`, `error_detail`, `content_match`, `timing_differential` or
+    `callback_interaction` in the other fifteen. A check written against the
+    kind the mechanism happens to write would have found half of them.
+
+    ## W12b -- the shape rule, which is prose, read as prose
+
+    `rk2_test_spec_problem` refuses a specification that performs fewer than
+    three actions or more than thirty-two, and one that leaves out any of
+    `baseline`, `variant` and `control` (`20261216T000000Z:270-278`, `:309-315`).
+    That is the real enforcement and it fires at `propose_test`, which is where
+    a Playbook's procedure becomes a row.
+
+    What a Playbook says about it is prose, and a prose parser is approximate by
+    construction. This one asks the narrowest question it can answer: does the
+    body name all three roles, as words. A body that does not is a body whose
+    reader is told to build a Test in sentences that never mention what a Test
+    must carry, and the refusal it earns arrives from the database with no
+    sentence in the Playbook to explain it.
+
+    **What this cannot see, stated rather than implied.** A Playbook may
+    describe a control without using the word -- "and the same request without
+    the header" is a control -- so a body this check passes over is not a body
+    it has verified, and a body it reports may already be correct in substance.
+    It measures vocabulary, not procedure. The exact half of that question is
+    the database's, and this gate does not restate it.
+    """
+    gaps = []
+    for body in wiring.corpus:
+        if body.kind != "playbook":
+            continue
+        evidence = body.front.get("bb:evidence")
+        if not isinstance(evidence, list):
+            gaps.append(
+                Gap("W12", f"{body.name} evidence",
+                    f"{body.name} declares no bb:evidence list, so nothing states what"
+                    " either outcome of its Test is graded on")
+            )
+            continue
+        rows = [row for row in evidence if isinstance(row, dict)]
+        supported = {
+            row.get("role"): row.get("kind")
+            for row in rows
+            if row.get("to_status") == "supported"
+        }
+        for row in rows:
+            if row.get("to_status") != "refuted" or row.get("kind") != "response_invariant":
+                continue
+            role, other = row.get("role"), supported.get(row.get("role"))
+            if other is None or other == "response_invariant":
+                continue
+            gaps.append(
+                Gap("W12", f"{body.name} {role} refuted",
+                    f"{body.name} grades a refutation on a {role} Observation of kind"
+                    f" response_invariant and grades supported on {other} for the same"
+                    " role, and close_test_replay writes one kind per role from the"
+                    " specification -- so the refuted leg is unreachable")
+            )
+
+        absent = [role for role in TEST_ROLES if not ROLE_WORD[role].search(body.text)]
+        if absent:
+            gaps.append(
+                Gap("W12", f"{body.name} roles",
+                    f"heuristic: {body.name} never names {', '.join(absent)} and a Test"
+                    " performs at least one action in each of baseline, variant and"
+                    " control. This reads vocabulary and not procedure -- a control"
+                    " described without the word is invisible to it -- and the rule"
+                    " itself is enforced by rk2_test_spec_problem at propose_test")
+            )
+    return gaps
+
+
+#: The twelve, in order, each with the reading that produces it. A tuple rather
+#: than twelve calls in `check`, because the report and the refusal both walk it
 #: and a check added to one and not the other would be a check nobody reads.
 CHECKS = (
     ("W1", "contracts served", served_gaps),
@@ -1906,6 +2104,7 @@ CHECKS = (
     ("W9", "vocabulary", vocabulary_gaps),
     ("W10", "corpus instructions", instruction_gaps),
     ("W11", "skill grants", skill_grant_gaps),
+    ("W12", "test shapes", test_shape_gaps),
 )
 
 
@@ -1983,6 +2182,16 @@ def report(wiring: Wiring, gaps: list[Gap]) -> str:
     emitted = {name for body in wiring.corpus for name in body.front.get("bb:outputs", [])}
     mentions = sum(len(set(TOOL_TOKEN.findall(body.text))) for body in wiring.corpus)
     derived = sum(1 for role in wiring.executing.values() if role is not None)
+    books = [body for body in wiring.corpus if body.kind == "playbook"]
+    playbooks = len(books)
+    evidence = sum(
+        len(body.front["bb:evidence"]) for body in books
+        if isinstance(body.front.get("bb:evidence"), list)
+    )
+    roled = sum(
+        1 for body in books
+        if all(word.search(body.text) for word in ROLE_WORD.values())
+    )
     measured = {
         "W1": f"contracts {len(surface.contracts)}  served {len(surface.served)}"
               f"  built {len(surface.built)}",
@@ -2006,6 +2215,8 @@ def report(wiring: Wiring, gaps: list[Gap]) -> str:
                f"  roles derived {derived}",
         "W11": f"grants {len(catalogue.role_skills)}  staged "
                f"{sum(len(body.front.get('bb:roles', [])) for body in wiring.corpus)}",
+        "W12": f"playbooks {playbooks}  evidence rows {evidence}"
+               f"  naming three roles {roled}",
     }
     lines = ["wiring"]
     lines.extend(
