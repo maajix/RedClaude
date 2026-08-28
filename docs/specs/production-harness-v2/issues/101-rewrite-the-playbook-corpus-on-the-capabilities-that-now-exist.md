@@ -4,7 +4,7 @@
 seven tickets before this one deliver, and the Playbooks the 131 researched
 techniques have no home in. This is the ticket the other seven exist for.
 
-**Blocked by:** 94 — Hand the response headers to the caller; 95 — A bounded string argument must say maxLength; 96 — Carry a request body; 97 — Settle what an Identity slot is; 98 — Let a playbook step reach the out-of-band channel; 99 — Let a playbook step drive the browser; 100 — Extend the vocabulary the corpus is missing; 109 — `compare_responses` differences two Artifacts where eleven Playbooks ask for more.
+**Blocked by:** 94 — Hand the response headers to the caller; 95 — A bounded string argument must say maxLength; 96 — Carry a request body; 97 — Settle what an Identity slot is; 98 — Let a playbook step reach the out-of-band channel; 99 — Let a playbook step drive the browser; 100 — Extend the vocabulary the corpus is missing; 109 — `compare_responses` differences two Artifacts where eleven Playbooks ask for more; 210 — The gate stops reading at the first semicolon it should have skipped.
 
 **Status:** ready-for-agent
 
