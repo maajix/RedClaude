@@ -189,3 +189,28 @@ Measured:
   `check_playbook_integrity()` returns **no errors**, and the vocabulary reads
   back **61 classes, 57 surface facts, 59 fixtures**. The scratch database was
   dropped; no Hunt database was migrated.
+
+### `cookie-parsing-pair` presents a reading no identity-carrying plan can run
+
+Found during ticket 101's ledger pass. Recorded here, not fixed: the fixture is
+honest and the test that drives it is correct.
+
+`tests/test_fixture.py:286` sends `Cookie: session=s-alice-4f2c; session=s-bob-9d17`
+and asserts the vulnerable half answers `bob`. The whole reading IS that second
+crumb. But `identity.Session.inject` (`src/redkraken/identity.py:330`) gives a
+leased Identity ownership of `Cookie` and of every header it declares for the
+origin:
+
+```python
+owned = {name.lower() for name, _ in static} | {"cookie"}
+answer = [(name, value) for name, value in headers if name.lower() not in owned]
+```
+
+A plan-stated `Cookie` is therefore dropped before the wire whenever the request
+carries an `identity_slot`. The test does not see this because it exchanges
+directly against the served fixture rather than through `proxy.spend`.
+
+So the fixture grades a technique the harness can only perform identity-less. The
+constraint belongs in the Playbook, not in the fixture: ticket 101's D14 makes the
+identity-less plan a stated sentence in every step whose differential lives in
+`Cookie` or in `Authorization`. No change is owed here.
