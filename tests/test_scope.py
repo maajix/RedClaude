@@ -420,6 +420,15 @@ class CanonicalFormTest(unittest.TestCase):
             ("/api//x", "/api//x", "/api/x"),
             ("/api/", "/api/", "/api/"),
             ("/api\\..\\x", "/api\\..\\x", "/x"),
+            # Ticket 212. A `;`-delimited path parameter is stripped by servlet
+            # containers before they resolve, so it belongs in the spelling that
+            # says where a path lands and not in the one that says what was
+            # asked for.
+            ("/public/..;/admin", "/public/..;/admin", "/admin"),
+            ("/public/..;a=b/admin", "/public/..;a=b/admin", "/admin"),
+            ("/public/%2e%2e;/admin", "/public/%2e%2e;/admin", "/admin"),
+            ("/a/b;jsessionid=x/c", "/a/b;jsessionid=x/c", "/a/b/c"),
+            ("/a/b;x", "/a/b;x", "/a/b"),
         ):
             with self.subTest(given):
                 self.assertEqual((raw, normed), scope.path_variants(given))
@@ -695,6 +704,32 @@ class VerdictTest(unittest.TestCase):
 
         self.assertEqual(scope.DENIED, verdict.scope_class)
         self.assertEqual("excluded", verdict.reason)
+
+    def test_a_path_parameter_does_not_walk_out_of_an_authorised_prefix(self):
+        # Ticket 212. `/public/..;/admin` used to be identical in both spellings
+        # and both under `/public/`, so the inclusion admitted it -- and the door
+        # sends the path verbatim, so a container that strips the parameter
+        # before resolving served `/admin` under a receipt citing `/public/`.
+        policy = compiled(
+            SCOPED.replace('paths = ["/v1/"]', 'paths = ["/public/"]')
+            + '\n[[scope.exclude]]\nhost = "api.example.net"\nports = [443]\n'
+              'protocols = ["https"]\npaths = ["/admin"]\n'
+        )
+        for path in ("/public/..;/admin", "/public/..;a=b/admin",
+                     "/public/%2e%2e;/admin"):
+            with self.subTest(path):
+                self.assertEqual(
+                    scope.DENIED,
+                    scope.decide(policy, f"https://api.example.net{path}").scope_class,
+                )
+        # And the control that keeps the fold from being a refusal machine: a
+        # session parameter walks nowhere and is still served.
+        self.assertEqual(
+            scope.TARGET,
+            scope.decide(
+                policy, "https://api.example.net/public/x;jsessionid=1"
+            ).scope_class,
+        )
 
     def test_a_question_this_grammar_has_no_word_for_is_refused(self):
         # The two coverage polarities are the wide readings, so a caller that

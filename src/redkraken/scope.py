@@ -337,6 +337,18 @@ def normalize_port(value: object, protocol: str) -> int:
     return value
 
 
+def _without_parameters(path: str) -> str:
+    """Each segment up to its first `;`, which is where a container cuts it.
+
+    Servlet containers and several frameworks strip `;`-delimited path
+    parameters before resolving, so `/public/..;/admin` is served as `/admin`.
+    Folding them here is what makes the normalised spelling say where a path
+    lands rather than how it was written, which is the only thing an inclusion
+    is safe to be matched on.
+    """
+    return "/".join(segment.split(";", 1)[0] for segment in path.split("/"))
+
+
 def path_variants(path: object) -> tuple[str, str]:
     """A path in both spellings a prefix rule is matched against.
 
@@ -345,6 +357,11 @@ def path_variants(path: object) -> tuple[str, str]:
     exclusion fires if *either* spelling is under its prefix, so `/admin/../x`
     cannot escape a `/admin/` exclusion, while an inclusion needs *both*, so the
     same trick cannot smuggle a request into an authorised prefix.
+
+    "Where it lands" is the target's reading and not this file's preference, so
+    the normalised form folds percent-encoding, backslashes and `;`-delimited
+    path parameters. The raw form is untouched: it is what was asked for, and
+    the exclusion polarity depends on it staying verbatim.
     """
     if not isinstance(path, str):
         raise PolicyError("malformed_path", "a path must be text")
@@ -358,9 +375,14 @@ def path_variants(path: object) -> tuple[str, str]:
     # traversal would walk out of an exclusion while the receipt cited the
     # inclusion. A path that is still changing after this many passes is refused
     # rather than decoded further: nothing legitimate encodes that deeply.
+    #
+    # The parameter fold is inside this loop and not after it, for the same
+    # reason the decode is a loop at all: `%3b` is a `;` one pass later, so a
+    # fold that ran once at the end would be reading a spelling the door had
+    # already stopped decoding.
     decoded = raw
     for _ in range(_DECODE_PASSES + 1):  # the last pass is the one that confirms
-        once = unquote(decoded)
+        once = _without_parameters(unquote(decoded))
         if once == decoded:
             break
         decoded = once
