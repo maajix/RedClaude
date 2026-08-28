@@ -59,8 +59,18 @@ HTTP, for object-property write, for cache deception, or for takeability of a
 dangling resource).
 
 **Adding or removing a playbook breaks a hard-coded list.**
-`tests/test_playbook.py:491-545` enumerates all 50 names; a second test maps the
-37 playbooks that carry references. Both have to be edited with the change.
+`tests/test_playbook.py:491-545` enumerates all 50 names; a second test,
+`test_every_reference_is_attached_to_the_one_playbook_that_absorbed_it`
+(`tests/test_playbook.py:563-635`), maps the **31** playbooks that carry
+references to their 74 reference filenames. Both have to be edited with the
+change.
+
+The number in the first version of this line was 37 and it was never right.
+Counted from the compiled corpus -- `sum(1 for p in playbook.PLAYBOOKS.values()
+if p.references)` -- 31 playbooks carry references and 31 `references/`
+directories exist, holding 74 files. Ticket 101 records the discrepancy and
+this is where it is settled, because a corrected count in a ticket and a stale
+one in the file the ticket cites is the same defect one layer along.
 
 ## C0. The vocabulary is bigger than the first reading said
 
