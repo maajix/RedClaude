@@ -35,6 +35,8 @@ BASELINE_FILES = {
     "v1-dispositions.json",
     "spec-verification.tsv",
     "technique-intake.tsv",
+    "technique-ledger.jsonl",
+    "technique-sources.tsv",
     "multiagent-modes.tsv",
     "final-review.tsv",
 }
