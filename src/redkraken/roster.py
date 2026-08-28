@@ -1194,6 +1194,19 @@ _TEST_SPEC_PARTS: dict[str, "Argument"] = {
             "kind": Argument("string", enum=TEST_ACTION_KINDS),
             "method": Argument("string", enum=TEST_REQUEST_METHODS),
             "url": Argument("string", bounds=(1, 2000)),
+            # Ticket 211, spelled exactly as `mcp__rk2__http_request` spells
+            # them, because a Test that plans a request the request tool could
+            # make and this contract could not state is a technique the corpus
+            # can describe and never grade. Neither is required: an action
+            # carries them only when its differential lives there. The reasons
+            # behind the two patterns and the 64 KiB ceiling are written down
+            # once, at that declaration, and are not restated here.
+            "headers": Argument(
+                "object",
+                items_pattern="^[A-Za-z][A-Za-z0-9-]{0,63}\\Z",
+                values_pattern="^[\\x20-\\x7e]{0,1024}\\Z",
+            ),
+            "body": Argument("string", bounds=(0, 65536)),
         },
     ),
     "assertions": Argument(

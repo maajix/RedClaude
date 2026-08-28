@@ -340,12 +340,25 @@ class _Door:
     trust: ssl.SSLContext | None
 
     def send(self, request: Mapping[str, object]) -> proxy.Answer:
+        # Ticket 211. Both are absent from most requests and from every setup
+        # step, and absent is not the same as empty: no header block at all
+        # leaves the door to state the whole of it, and an empty body is a
+        # body, which `authorize_egress_request` grades differently.
+        stated = request.get("headers")
+        headers = (
+            {str(name): str(value) for name, value in stated.items()}
+            if isinstance(stated, Mapping)
+            else None
+        )
+        body = request.get("body")
         return proxy.spend(
             self.listener,
             str(request["url"]),
             capability=self.capability,
             program_id=self.program_id,
             method=str(request["method"]),
+            headers=headers,
+            body=b"" if body is None else str(body).encode("utf-8"),
             timeout=self.timeout,
             trust=self.trust,
         )

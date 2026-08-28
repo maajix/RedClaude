@@ -30075,6 +30075,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refuse_what_a_run_may_not_cite()
         cls.refuse_a_specification_nobody_should_store()
         cls.refuse_a_replay_the_conditions_do_not_admit()
+        cls.declare_whether_the_plan_carries_a_body()
         cls.open_a_replay_the_token_budget_cannot_fund()
         cls.ask_the_preview_about_the_playbook_bar()
         cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
@@ -30446,6 +30447,35 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
     @classmethod
     def refuse_a_specification_nobody_should_store(cls):
         hypothesis, _ = cls.claim_waiting("the orders API is written down wrong")
+
+        def headed(headers: object) -> str:
+            """One specification whose second action states that header block."""
+            return specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": 1, "role": "baseline", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/1"},
+                    {"ordinal": 2, "role": "variant", "kind": "request",
+                     "method": "POST", "url": f"{BASE}/2", "headers": headers},
+                    {"ordinal": 3, "role": "control", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/3"},
+                ],
+            )
+
+        def bodied(body: object) -> str:
+            """The same, for a body."""
+            return specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                actions=[
+                    {"ordinal": 1, "role": "baseline", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/1"},
+                    {"ordinal": 2, "role": "variant", "kind": "request",
+                     "method": "POST", "url": f"{BASE}/2", "body": body},
+                    {"ordinal": 3, "role": "control", "kind": "request",
+                     "method": "GET", "url": f"{BASE}/3"},
+                ],
+            )
+
         cases = {
             "no_control": specification(
                 [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
@@ -30514,6 +30544,26 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
             "encoded_dot": specification(
                 [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
                 setup=[{"method": "GET", "url": f"{BASE}/%2e%2e/admin"}],
+            ),
+            # Ticket 211's ten. An action may now state a header block and a
+            # body, so every rule that keeps them honest is broken once here.
+            # The two that matter most are `header_injection`, which is the
+            # whole reason a value is bounded to printable ASCII, and
+            # `body_in_setup`, which proves the widening stopped where it said
+            # it would.
+            "headers_not_object": headed(["a", "b"]),
+            "header_name": headed({"Bad Name": "v"}),
+            "hop_by_hop": headed({"Host": "evil.example.com"}),
+            "reserved_prefix": headed({"X-Redkraken-Trace": "1"}),
+            "header_twice": headed({"Content-Type": "a", "content-type": "b"}),
+            "header_value_type": headed({"Accept": 5}),
+            "header_injection": headed({"X-Note": "a\r\nEvil: 1"}),
+            "header_value_long": headed({"X-Note": "a" * 1025}),
+            "body_not_string": bodied(5),
+            "body_long": bodied("a" * 65537),
+            "body_in_setup": specification(
+                [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                setup=[{"method": "POST", "url": f"{BASE}/login", "body": "x"}],
             ),
         }
         # Both readings of each one. The constraint answers whether the row is
@@ -30598,6 +30648,52 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         committed(cls.connection, cls.CLOSE, (cls.starved["tool_run_id"], "skipped", "abandoned"))
 
     @classmethod
+    def declare_whether_the_plan_carries_a_body(cls):
+        """Ticket 211: the Tool run states what the plan will send.
+
+        The positive control for the widened action, and the arm that proves the
+        widening reaches the wire. `rk2_open_replay` reads the body off the spec
+        exactly as it reads the distinct methods, because
+        `authorize_egress_request` refuses a body from every tool but the browser
+        unless the Tool run's args say one may be carried -- and args that say
+        nothing are args that say no. Two claims rather than one, because a
+        second replay of one claim is refused while the first is in flight.
+        """
+        cls.args = {}
+        for name, action in (
+            ("carries", {"ordinal": 2, "role": "variant", "kind": "request",
+                         "method": "POST", "url": f"{BASE}/2",
+                         "headers": {"Content-Type": "application/json"},
+                         "body": '{"filter": {"quantity": {"gt": 0}}}'}),
+            ("carries_none", {"ordinal": 2, "role": "variant", "kind": "request",
+                              "method": "GET", "url": f"{BASE}/2"}),
+        ):
+            hypothesis, _ = cls.claim_waiting(f"the orders API {name} a document")
+            stored = cls.stored(
+                hypothesis,
+                specification(
+                    [{"id": "one", "kind": "status_equals", "action": 2, "status": 200}],
+                    actions=[
+                        {"ordinal": 1, "role": "baseline", "kind": "request",
+                         "method": "GET", "url": f"{BASE}/1"},
+                        action,
+                        {"ordinal": 3, "role": "control", "kind": "request",
+                         "method": "GET", "url": f"{BASE}/3"},
+                    ],
+                ),
+            )
+            opened = cls.called(cls.OPEN, (cls.replay_run(), stored, None))
+            cls.args[name] = json.loads(
+                str(
+                    cls.connection.execute(
+                        "SELECT args FROM tool_runs WHERE id = $1::uuid",
+                        (opened["tool_run_id"],),
+                    ).scalar()
+                )
+            )
+            committed(cls.connection, cls.CLOSE, (opened["tool_run_id"], "skipped", "abandoned"))
+
+    @classmethod
     def refuse_a_replay_the_conditions_do_not_admit(cls):
         # A url the current scope does not admit, refused before anything is sent.
         hypothesis, _ = cls.claim_waiting("the admin console is reachable")
@@ -30660,7 +30756,11 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         for name in ("no_control", "no_assertion", "unknown_action", "repeated_identifier",
                      "compares_with_itself", "unknown_kind", "invented_part",
                      "lowercase_method", "relative_url", "invented_precondition",
-                     "dot_segment", "encoded_dot"):
+                     "dot_segment", "encoded_dot",
+                     "headers_not_object", "header_name", "hop_by_hop",
+                     "reserved_prefix", "header_twice", "header_value_type",
+                     "header_injection", "header_value_long", "body_not_string",
+                     "body_long", "body_in_setup"):
             with self.subTest(case=name):
                 self.assertNotEqual("", self.refusals[f"spec:{name}"])
 
@@ -30682,9 +30782,35 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
                                          " may have",
                 "dot_segment": "action 2 states a path that resolves somewhere else",
                 "encoded_dot": "setup request 1 states a path that resolves somewhere else",
+                "headers_not_object": "action 2 states headers that are not an object",
+                "header_name": "action 2 states no header name in Bad Name",
+                "hop_by_hop": "action 2 states Host, which the door owns"
+                              " and would strip",
+                "reserved_prefix": "action 2 states X-Redkraken-Trace, which is"
+                                   " reserved for the door",
+                "header_twice": "action 2 states one header name twice in two cases",
+                "header_value_type": "action 2 states a value for Accept that is"
+                                     " not a string",
+                "header_injection": "action 2 states a value for X-Note that is"
+                                    " not printable ascii",
+                "header_value_long": "action 2 states a value for X-Note longer"
+                                     " than a header value may be",
+                "body_not_string": "action 2 states a body that is not a string",
+                "body_long": "action 2 states a body longer than a body may be",
+                "body_in_setup": "setup request 1 carries no key named body",
             },
             self.said,
         )
+
+    def test_a_plan_that_states_a_body_opens_a_run_that_may_carry_one(self):
+        # The positive control for every refusal above: the same widened action,
+        # spelled correctly, is stored and reaches an open Tool run.
+        self.assertIs(True, self.args["carries"]["body_allowed"])
+
+    def test_a_plan_that_states_no_body_opens_a_run_that_may_not(self):
+        # And the property is read off the plan rather than granted to the lane:
+        # a Test that sends no document opens a run the door will refuse one from.
+        self.assertIs(False, self.args["carries_none"]["body_allowed"])
 
     def test_the_digest_is_the_identity_and_cannot_disagree_with_the_test(self):
         self.assertNotEqual("", self.refusals["spec:digest"])
