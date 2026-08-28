@@ -37,7 +37,24 @@ ein davon unabhängiger Control-Surface-Blocker und muss vor dem nächsten Canar
 beantwortet oder superseded werden. Während der Pause wird keine Live-Runtime
 verändert.
 
-1. Release-Kette: **101 → 84 → 65**. Tickets 99 und 100 sind abgeschlossen.
+1. Release-Kette: **101 → 84 → 65**. Tickets 99, 100 und 211 sind
+   abgeschlossen. Ticket 211 war der Kette vorangestellt worden, weil die
+   Replay-Bahn Methode und URL sendete und sonst nichts
+   (`replay.py:342-351`) und `close_test_replay` der einzige Schreiber eines
+   `testing → supported`-Übergangs ist: eine Technik, deren Unterschied in
+   einem Request-Header oder -Body liegt, war ausführbar und nicht beweisbar.
+   Gemessen am 101er-Ledger endeten 130 von 268 erreichbaren Techniken dort.
+   Eine Test-Action trägt jetzt `headers` und `body`, `rk2_open_replay`
+   deklariert `body_allowed` aus der Spezifikation, und `_body_allowed`
+   (`execution.py:3646`) bleibt unangetastet — die Agent-Bahn wird nicht
+   geweitet und kein Playbook ändert seine `bb:effects`.
+   Ticket 212 ist mitgelaufen und `resolved`: `scope.path_variants` faltet
+   jetzt das `;`-Parametersegment, sodass `/public/..;/admin` unter
+   `/public/` nicht mehr zugelassen wird. Ticket 213 ist offen und blockiert
+   nichts: `ReplayCommandTest` und `ProxyEgressTest` scheitern nur dann in
+   `setUpClass`, wenn sie sich die Datenbank mit den übrigen
+   `test_database.py`-Klassen teilen; gegen einen sauberen Baum gemessen und
+   damit keine Regression aus 211.
 2. Sicherheits- und Betriebsgrenzen: **174 → 190 → 188 → 195 → 200**.
 3. Wiring und Produktdebt: **129 → 105 → 120 → 122 → 116**, danach der
    verbleibende `ready-for-agent`-Backlog nach Unlock-Wert. Ticket 210 ist
