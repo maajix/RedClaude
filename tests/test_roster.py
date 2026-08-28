@@ -645,6 +645,42 @@ class AuthorityTest(unittest.TestCase):
                 self.assertTrue(roster.ROLES[name].executes_tasks)
                 self.assertNotIn("sched.pick", roster.ROLES[name].tool_groups)
 
+    def test_the_role_that_runs_a_task_may_ask_for_it_to_be_parked(self):
+        """PH2-101: a stop condition names a verb instead of describing one.
+
+        `park_for_human` sat in `sched.pick` from 023, which is a group
+        `_check_authority` keeps off every role that executes a Task. So the one
+        role that could ever have a Task to park was the one role that could not
+        ask, and the fifty Playbooks had prose where a stop condition belongs.
+
+        `sched.park` is the group the verb is in now, with one member, held by
+        the orchestrator and by the role that hunts. It is not a scheduling
+        grant: `park_task_for_human` refuses a Task that is not the calling
+        run's own, so the widest thing a hunter can do with it is stop itself.
+        """
+        park = roster.CONTRACTS[roster.PARK_FOR_HUMAN]
+
+        self.assertEqual("sched.park", park.group)
+        self.assertEqual((roster.PARK_FOR_HUMAN,), roster.TOOL_GROUPS["sched.park"])
+        self.assertNotIn(roster.PARK_FOR_HUMAN, roster.TOOL_GROUPS["sched.pick"])
+
+        holding = {
+            name for name, role in roster.ROLES.items()
+            if roster.PARK_FOR_HUMAN in role.tools
+        }
+
+        self.assertEqual({"orchestrator", "web_hunter"}, holding)
+        # And the partition the old placement enforced is still enforced: the
+        # role that runs the Task holds the parking verb and none of the four
+        # scheduling ones.
+        hunter = roster.ROLES["web_hunter"]
+        self.assertTrue(hunter.executes_tasks)
+        self.assertNotIn("sched.pick", hunter.tool_groups)
+        self.assertEqual(
+            frozenset(),
+            frozenset(roster.TOOL_GROUPS["sched.pick"]) & hunter.tools,
+        )
+
     def test_the_reporter_runs_no_model(self):
         reporter = roster.ROLES["reporter"]
 

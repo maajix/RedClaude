@@ -149,25 +149,24 @@ SERVER_VERSION = "0.1.0"
 #: role the roster grants the group to.
 SERVED_GROUPS = (
     "state.read", "state.propose", "net.request", "validate.judge", "exec.tool_run",
-    "state.conclude", "exec.browser_run",
+    "state.conclude", "exec.browser_run", "sched.park",
 )
 
 #: The one group served in part, and exactly which of its members. `sched.pick`
-#: is five tools built by four tickets: the three here are the Slate the
-#: orchestrator is offered, the choice it makes on it and the ask that stops the
-#: work for a person, and the other two -- validation and a report -- are
-#: requests ticket 105 serves. Those two are the whole of what this tree
-#: declares and no launch serves, which is the count ticket 104 corrected: it
-#: read three until `park_for_human` joined the list above. Naming the members
-#: is what keeps the difference visible: a group is served whole unless there is
-#: a list saying which part, and the list is checked below against the group it
-#: claims to be part of, so a tool that later moved to another authority class
-#: fails the compile here rather than arriving quietly on the orchestrator's
-#: allowlist.
+#: is four tools built by three tickets: the two here are the Slate the
+#: orchestrator is offered and the choice it makes on it, and the other two --
+#: validation and a report -- are requests ticket 105 serves. Those two are the
+#: whole of what this tree declares and no launch serves. The ask that stops the
+#: work for a person used to be a third name here; ticket 101 moved it to
+#: `sched.park`, which has one member and is therefore served whole above. That
+#: move is exactly the case the check below exists for: naming the members is
+#: what keeps the difference visible, because a group is served whole unless
+#: there is a list saying which part, and the list is checked against the group
+#: it claims to be part of, so a tool that later moved to another authority
+#: class fails the compile here rather than arriving quietly on the
+#: orchestrator's allowlist.
 SERVED_MEMBERS = {
-    "sched.pick": (
-        "mcp__rk2__get_slate", "mcp__rk2__pick_task", "mcp__rk2__park_for_human",
-    )
+    "sched.pick": ("mcp__rk2__get_slate", "mcp__rk2__pick_task")
 }
 
 #: Everything this launch actually serves. The roster says what a role may

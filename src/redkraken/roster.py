@@ -970,8 +970,27 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "mcp__rk2__pick_task",
         "mcp__rk2__request_validation",
         "mcp__rk2__request_report",
-        "mcp__rk2__park_for_human",
     ),
+    # A GROUP OF ITS OWN AND NOT A FIFTH MEMBER OF `sched.pick`. Ticket 104
+    # built this verb so that a run could ask for the Task it is running to
+    # wait for a person, and a run is the thing that executes a Task -- so the
+    # role that needs it is a role `sched.pick` may never reach.
+    # `_check_authority` refuses a role that executes tasks and chooses which
+    # tasks run, and refuses one that proposes results and schedules the work
+    # they justify. Both refusals are right, and neither of them is about
+    # parking: scheduling is reading a slate and choosing from it, and asking
+    # for the Task already in hand to stop is not a choice about what runs
+    # next.
+    #
+    # Holding it is not authority over anyone else's work.
+    # `park_task_for_human` compares the Task named against the Task of the
+    # calling agent run and refuses otherwise
+    # (`20261028T000000Z__a_model_asks_to_be_parked_and_the_task_waits.sql`
+    # `:400-405`), and the sentence a model writes travels as a claim -- the
+    # question the operator reads stays a projection of
+    # `render_decision_question`. Ticket 11's rule that this verb returns into
+    # no agent context is untouched, because parking closes the run.
+    "sched.park": ("mcp__rk2__park_for_human",),
     "net.request": ("mcp__rk2__http_request",),
     "exec.tool_run": ("mcp__rk2__run_tool", "mcp__rk2__run_skill_script"),
     # A GROUP OF ITS OWN AND NOT A THIRD MEMBER OF `exec.tool_run`. A group is
@@ -1740,7 +1759,7 @@ CONTRACTS: dict[str, Contract] = {
         writes=("report_queue",),
     ),
     "mcp__rk2__park_for_human": Contract(
-        "sched.pick",
+        "sched.park",
         REQUEST,
         writes=("pending_decisions",),
         arguments={
@@ -2071,8 +2090,10 @@ OPEN_IMPACT_TASK = "mcp__rk2__open_impact_task"
 STATE_SEVERITY = "mcp__rk2__state_severity"
 COMPOSE_FINDING_REPORT = "mcp__rk2__compose_finding_report"
 
-#: Ticket 104's, and the odd one of the set: its Contract has been in
-#: `sched.pick` since 023 and the dispatch is what it never had. Spelled beside
+#: Ticket 104's, and the odd one of the set: its Contract sat in `sched.pick`
+#: from 023 until ticket 101 moved it, because the group was chosen when the
+#: dispatch this verb needed did not exist and nobody could call it. It is
+#: `sched.park` now, alone, for the reason spelled at the group. Spelled beside
 #: the others because it is the same dispatch and the same rule about naming a
 #: verb twice.
 PARK_FOR_HUMAN = "mcp__rk2__park_for_human"
@@ -2132,7 +2153,7 @@ ROLES: dict[str, Role] = {
         # target. No Skill: a technique is executed by the role that holds the
         # task, and the SDK reads an empty skill list as every skill, so the
         # tool is absent rather than granted with a bound that does not bind.
-        tool_groups=("state.read", "sched.pick"),
+        tool_groups=("state.read", "sched.pick", "sched.park"),
         max_concurrent=1,
     ),
     "recon": Role(
@@ -2179,9 +2200,14 @@ ROLES: dict[str, Role] = {
         # `exec.tool_run` hold no Task that would put them in front of a
         # rendered page. `recon` maps a surface and `js_analyst` reads bytes
         # already filed; neither clicks anything.
+        # `sched.park` is ticket 101's addition and the only scheduling-shaped
+        # group an executing role holds. It is one verb and it reaches one
+        # Task: the one this run is already executing. A Playbook whose stop
+        # condition is "a person decides" had prose to offer before this and a
+        # verb to name after it.
         tool_groups=(
             "state.read", "state.propose", "state.conclude", "net.request", "exec.tool_run",
-            "exec.browser_run",
+            "exec.browser_run", "sched.park",
         ),
         max_concurrent=2,
         # Clamped further at run time by the number of free identity leases:
