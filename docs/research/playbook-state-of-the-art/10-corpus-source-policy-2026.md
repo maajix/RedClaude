@@ -5,7 +5,20 @@ not yet the 50-row Playbook mapping that the ticket must produce.
 
 ## Local operator corpus
 
-The operator's read-only source is `/home/majix/hacking-wiki`. Its index at
+The operator's read-only sources are three directories, and the priority
+between them is the operator's own instruction rather than a property of the
+material.
+
+**Primary intake, by operator direction:**
+`/home/majix/Downloads/Pentest Docs` and
+`/home/majix/Downloads/Personal-Knowledge-Base`. These are the operator's raw
+personal notes. The operator stated the caveat when naming them: neither is
+deduplicated and neither has been quality-checked. So a claim taken from them
+is a lead, and the rewrite carries it only with the same provenance and stop
+condition it would demand of any other source. Ticket 101's mining pass drew
+444 of its local citations from this pair.
+
+**Secondary intake:** `/home/majix/hacking-wiki`. Its index at
 2026-08-27 lists 326 concept pages: 131 Web Attacks, 20 Authentication/JWT, 30
 Infrastructure/Network, 15 Windows/AD/Lateral, 12 Crypto/TLS and smaller Cloud,
 AI and methodology groups. The wiki schema carries source and confidence fields
