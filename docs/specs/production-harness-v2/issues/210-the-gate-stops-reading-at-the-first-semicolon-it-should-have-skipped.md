@@ -7,7 +7,7 @@ already builds the mask that answers this correctly; the reader has to use it.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## What was measured
 
@@ -76,24 +76,24 @@ Every one of the twelve call sites already has `code` in scope.
 
 ## Acceptance criteria
 
-- [ ] `statement()` finds the end of a statement in the mask and slices the
+- [x] `statement()` finds the end of a statement in the mask and slices the
       original, so a semicolon inside a comment, a string literal or a
       dollar-quoted body no longer ends it. All twelve call sites pass the mask
       they already hold.
-- [ ] A test in `tests/test_wiring.py` covers the three shapes directly against
+- [x] A test in `tests/test_wiring.py` covers the three shapes directly against
       `statement()`: a semicolon inside a `--` comment, one inside a `'literal'`,
       and one inside a `$$ body $$`. Each asserts the rows after it are read.
-- [ ] A test asserts `evidential` reads all sixteen observation kinds out of the
+- [x] A test asserts `evidential` reads all sixteen observation kinds out of the
       shipped corpus, with the five non-evidential ones present and `False`.
       This is the shipped-corpus check that would have failed before the fix.
-- [ ] `catalogue.evidential.get(kind, True)` at `check_wiring.py:1697` keeps its
+- [x] `catalogue.evidential.get(kind, True)` at `check_wiring.py:1697` keeps its
       default, or the reason it is safe once the reader is honest is written
       down beside it. The default is what turned a truncated read into a pass.
-- [ ] `check_wiring` still ends rc=0 on the corpus as it stands, and its W9
+- [x] `check_wiring` still ends rc=0 on the corpus as it stands, and its W9
       summary line is compared against the pre-fix one in the resolution
       comment: if any count moves, the movement is a finding this gate owed and
       is either fixed or given a register row.
-- [ ] The other three gates end rc=0 and `tests.test_wiring` is green.
+- [x] The other three gates end rc=0 and `tests.test_wiring` is green.
 
 ## Notes
 
@@ -104,3 +104,52 @@ Nothing here changes what the corpus seeds. If the honest read turns up gaps the
 gate should have reported all along, they are the point of the ticket, not scope
 creep -- record them, and split anything that needs a migration into its own
 ticket rather than widening this one.
+
+## Comments
+
+**2026-08-28 -- The mask already knew. The reader now asks it.**
+
+`statement()` takes the mask as well as the file. The end of the statement is
+found in the mask, where a semicolon inside a comment, a literal or a
+dollar-quoted body is a space; the content is still sliced out of the original,
+which is the half of the old docstring that was right. All twelve call sites
+already held `code` and now pass it.
+
+Red first, against the tree as it stood:
+
+```
+TypeError: statement() takes 2 positional arguments but 3 were given
+AssertionError: 16 != 11
+```
+
+The second is the one worth keeping: the gate read eleven observation kinds out
+of a corpus that seeds sixteen, and every one it saw was evidential, because
+the five it lost are the five non-evidential ones.
+
+Two tests in `tests/test_wiring.WiringReadingTest`:
+
+- `test_a_semicolon_the_mask_already_knows_about_does_not_end_a_statement` asks
+  all three shapes in one statement, and also asserts the statement stops before
+  the `INSERT` that follows it -- reading two as one would turn a later
+  migration's correction into a second opinion.
+- `test_every_observation_kind_the_corpus_seeds_reaches_the_reading` is the
+  shipped-corpus check: 16 kinds, 11 evidential, and the five non-evidential
+  ones named and `False`.
+
+**The report did not move.** Every count in `check_wiring`'s summary is
+character-for-character what it was before the fix, `W9 vocabulary 13 owed
+property classes 61 emitted 50 unmakeable 2` included, and the register is still
+56 rows. That is the honest outcome and not a disappointment: only one statement
+in the corpus was being truncated, W9's other readings never depended on it, and
+no shipped Playbook names a non-evidential kind at a settling role. The hole was
+real and it was empty.
+
+`catalogue.evidential.get(kind, True)` keeps its default, with the reason
+written beside it: what it now covers is a name that is not an observation kind
+at all, which the database refuses on its own, so the gate reports the one
+problem a body really has instead of two. Before this fix the same default was
+answering for five kinds a truncated read had hidden, which is what made the
+rule dead rather than lenient.
+
+Measured: `tests.test_wiring` **26 tests, OK**. All four gates rc=0.
+`git diff --check` clean. No migration, no database.

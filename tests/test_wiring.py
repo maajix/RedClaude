@@ -393,6 +393,59 @@ class WiringReadingTest(unittest.TestCase):
             )
         )
 
+    def test_a_semicolon_the_mask_already_knows_about_does_not_end_a_statement(self):
+        # Ticket 210. A seeded statement used to end at the first semicolon in
+        # the raw file, so a semicolon inside a comment, a literal or a
+        # dollar-quoted body cut every row written after it out of the gate's
+        # reading -- and the gate then passed, because a row it never saw is a
+        # row it cannot disagree with. All three shapes are asked here, in the
+        # one statement, because the mask that answers them is one mask.
+        sql = (
+            "INSERT INTO property_classes (id, name) VALUES\n"
+            " -- a section comment; with a semicolon in it\n"
+            " ('first',  'a description; and its second half'),\n"
+            " ('second', $tag$a body; and its second half$tag$),\n"
+            " ('third',  'no semicolon at all');\n"
+            "INSERT INTO property_classes (id, name) VALUES ('fourth', 'next');\n"
+        )
+
+        code = check_wiring.masked(sql, check_wiring.segments(sql))
+        text = check_wiring.statement(sql, code, 0)
+
+        self.assertEqual(
+            [("first",), ("second",), ("third",)], check_wiring.rows(text, 1)
+        )
+        # The statement ends where the mask says and not one row later: the
+        # second `INSERT` is a correction the corpus may write, and reading the
+        # two as one would make a later migration a second opinion.
+        self.assertNotIn("fourth", text)
+        # And the content is still taken off the original, which is the half of
+        # the docstring that was right: the mask blanks the literals a seeding
+        # statement is entirely made of.
+        self.assertIn("a description; and its second half", text)
+
+    def test_every_observation_kind_the_corpus_seeds_reaches_the_reading(self):
+        # What the truncated read cost, measured against the shipped corpus:
+        # `0018_vocabularies.sql:216` seeds sixteen kinds, and the gate saw
+        # eleven. The five it lost sit below the `-- non-evidential: surface
+        # facts. Real observations, provenance and all; they` comment whose
+        # semicolon ended the statement, and they are exactly the five the
+        # check reading this map exists to ask about.
+        evidential = self.wiring.catalogue.evidential
+
+        self.assertEqual(16, len(evidential))
+        self.assertEqual(11, sum(evidential.values()))
+        self.assertEqual(
+            {
+                "artifact_captured": False,
+                "endpoint_discovered": False,
+                "identity_established": False,
+                "parameter_discovered": False,
+                "technology_identified": False,
+            },
+            {name: value for name, value in sorted(evidential.items()) if not value},
+        )
+
     def test_a_withdrawn_grant_is_not_a_grant(self):
         # The reading W11 rests on, and the shape the corpus really writes:
         # `20261108T000000Z` deletes one row and inserts another in the same

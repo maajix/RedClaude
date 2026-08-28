@@ -541,14 +541,20 @@ class Catalogue:
     role_skills: frozenset[tuple[str, str]]
 
 
-def statement(sql: str, start: int) -> str:
+def statement(sql: str, code: str, start: int) -> str:
     """One statement from where it begins to its semicolon, quotes and all.
 
-    Taken off the original rather than off the mask, because what a seeding
-    statement says is in its string literals and the mask is exactly the thing
-    that removes them.
+    Sliced out of the original rather than out of the mask, because what a
+    seeding statement says is in its string literals and the mask is exactly the
+    thing that removes them. Ended in the mask, though, and for the same reason:
+    a semicolon inside a comment, a literal or a dollar-quoted body ends
+    nothing, and reading the end off the raw file cut `0018`'s `observation_kinds`
+    seed at its own section comment and hid five rows from W9 -- silently, which
+    is the direction a gate must never be wrong in. The mask is the same length
+    as the file it was taken from, so a position in one is a position in the
+    other.
     """
-    stop = sql.find(";", start)
+    stop = code.find(";", start)
     return sql[start:] if stop < 0 else sql[start:stop]
 
 
@@ -681,11 +687,11 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
         # file. A statement with no `VALUES` names nothing: it seeds the surface
         # from the live catalogue, which is the half of W4 no file can answer.
         moves = [
-            (found.start(), "add", statement(sql, found.start()))
+            (found.start(), "add", statement(sql, code, found.start()))
             for found in re.finditer(r"INSERT\s+INTO\s+state_read_surface\b", code, re.I)
         ]
         moves.extend(
-            (found.start(), "remove", statement(sql, found.start()))
+            (found.start(), "remove", statement(sql, code, found.start()))
             for found in re.finditer(r"DELETE\s+FROM\s+state_read_surface\b", code, re.I)
         )
         for _, kind, text in sorted(moves, key=lambda move: move[0]):
@@ -702,11 +708,11 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
         # and a reader that took them as a set would report a grant the corpus
         # has already withdrawn.
         moves = [
-            (found.start(), "add", statement(sql, found.start()))
+            (found.start(), "add", statement(sql, code, found.start()))
             for found in re.finditer(r"INSERT\s+INTO\s+role_skills\b", code, re.I)
         ]
         moves.extend(
-            (found.start(), "remove", statement(sql, found.start()))
+            (found.start(), "remove", statement(sql, code, found.start()))
             for found in re.finditer(r"DELETE\s+FROM\s+role_skills\b", code, re.I)
         )
         for _, kind, text in sorted(moves, key=lambda move: move[0]):
@@ -728,29 +734,29 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
             ("property_class_families", families),
         ):
             for found in re.finditer(rf"INSERT\s+INTO\s+{table}\b", code, re.I):
-                into.update(row[0] for row in rows(statement(sql, found.start()), 1))
+                into.update(row[0] for row in rows(statement(sql, code, found.start()), 1))
         for found in re.finditer(r"INSERT\s+INTO\s+transport_makeability\b", code, re.I):
-            for row in rows(statement(sql, found.start()), 2):
+            for row in rows(statement(sql, code, found.start()), 2):
                 if row[1] == "unmakeable":
                     unmakeable.add(row[0])
         for found in re.finditer(r"INSERT\s+INTO\s+observation_kinds\b", code, re.I):
-            text = statement(sql, found.start())
+            text = statement(sql, code, found.start())
             for opening in re.finditer(r"\(\s*'([a-z0-9_]+)'\s*,\s*'[^']*'\s*,\s*(true|false)", text):
                 evidential[opening.group(1)] = opening.group(2) == "true"
         for found in re.finditer(r"INSERT\s+INTO\s+offline_tools\b", code, re.I):
-            text = statement(sql, found.start())
+            text = statement(sql, code, found.start())
             declared = INSERT_COLUMNS.search(text)
             named = [column.strip() for column in declared.group(2).split(",")] if declared else []
             for row in rows(text[declared.end():] if declared else text, 1):
                 programs[row[0]] = "skill" if "skill" in named else "tool"
         for found in re.finditer(r"INSERT\s+INTO\s+offline_tool_arguments\b", code, re.I):
-            for row in rows(statement(sql, found.start()), 2):
+            for row in rows(statement(sql, code, found.start()), 2):
                 arguments.setdefault(row[0], {})[row[1]] = ""
         for found in re.finditer(r"INSERT\s+INTO\s+offline_tool_roles\b", code, re.I):
-            for row in rows(statement(sql, found.start()), 2):
+            for row in rows(statement(sql, code, found.start()), 2):
                 program_roles.setdefault(row[0], set()).add(row[1])
         for found in re.finditer(r"INSERT\s+INTO\s+standing_checks\b", code, re.I):
-            standing.update(CALL.findall(statement(sql, found.start())))
+            standing.update(CALL.findall(statement(sql, code, found.start())))
 
     # An argument's kind is the third literal of its row and the second is its
     # name, so the kinds are read in a second pass over the same statements to
@@ -759,7 +765,7 @@ def read_catalogue(root: Path = MIGRATIONS) -> Catalogue:
         sql = path.read_text(encoding="utf-8")
         code = masked(sql, segments(sql))
         for found in re.finditer(r"INSERT\s+INTO\s+offline_tool_arguments\b", code, re.I):
-            text = statement(sql, found.start())
+            text = statement(sql, code, found.start())
             for opening in re.finditer(
                 r"\(\s*'([a-z0-9_]+)'\s*,\s*'([a-z0-9_]+)'\s*,\s*\d+\s*,\s*[^,]+,\s*'([a-z]+)'", text
             ):
@@ -1694,6 +1700,13 @@ def vocabulary_gaps(wiring: Wiring) -> list[Gap]:
     for body in wiring.corpus:
         for expectation in body.front.get("bb:evidence", []):
             kind, role = expectation.get("kind"), expectation.get("role")
+            # The default stays `True`, and it is only defensible now that the
+            # reading is honest: until ticket 210 it silently answered for the
+            # five non-evidential kinds a truncated statement had hidden, which
+            # made this whole rule dead. What it covers today is a name that is
+            # not an observation kind at all, and that is a database's refusal
+            # to make, not this gate's guess -- passing it here reports the one
+            # problem the body really has instead of two.
             if catalogue.evidential.get(kind, True) or role == "context":
                 continue
             gaps.append(

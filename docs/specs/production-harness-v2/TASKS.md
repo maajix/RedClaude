@@ -39,13 +39,12 @@ verändert.
 
 1. Release-Kette: **99 → 100 → 101 → 84 → 65**.
 2. Sicherheits- und Betriebsgrenzen: **174 → 190 → 188 → 195 → 200**.
-3. Wiring und Produktdebt: **210 → 129 → 105 → 120 → 122 → 116**, danach der
-   verbleibende `ready-for-agent`-Backlog nach Unlock-Wert. 210 steht vorn,
-   weil es ein Gate betrifft, das still durchlässt: `check_wiring` beendet ein
-   Seeding-Statement am ersten `;` im Rohtext und übersieht dadurch heute die
-   fünf nicht-evidentiellen `observation_kinds`. Kein Playbook fällt aktuell
-   darauf, aber jedes Ticket, das Vokabular ergänzt, wird von diesem Gate
-   abgenommen.
+3. Wiring und Produktdebt: **129 → 105 → 120 → 122 → 116**, danach der
+   verbleibende `ready-for-agent`-Backlog nach Unlock-Wert. Ticket 210 ist
+   vorgezogen und `resolved`: `check_wiring` beendete ein Seeding-Statement am
+   ersten `;` im Rohtext und übersah dadurch die fünf nicht-evidentiellen
+   `observation_kinds`. Der Reader liest das Ende jetzt in der Maske. Keine
+   Zahl im Gate-Report hat sich bewegt; das Loch war echt und leer.
 
 Ticket 99 ist gestartet. Zuerst kommen probe-eigene Outcome-Schlüssel,
 `read_client_state` und Fragment-Navigation; `send_message` bleibt hinter der
