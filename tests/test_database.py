@@ -41843,6 +41843,63 @@ class PlaybookSelectionTest(DatabaseCase):
             ),
         )
 
+    # -- the corpus moving under a frozen selection ----------------------------
+
+    def cancel_reason(self, task: str) -> str | None:
+        """Why `rank_pass` would retire this Task, or None to rank it."""
+        answer = self.connection.execute(
+            "SELECT cancel_reason_for(t, w) FROM tasks t CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.id = $1::uuid",
+            (task,),
+        ).scalar()
+        return None if answer is None else str(answer)
+
+    def move(self, **columns) -> None:
+        """Move the shipped Playbook out from under everything frozen onto it."""
+        for column, value in columns.items():
+            self.connection.execute(
+                f"UPDATE playbooks SET {column} = $1 WHERE path = $2",
+                (value, self.SHIPPED),
+            )
+
+    def test_a_task_whose_playbook_moved_is_cancelled_for_the_corpus(self):
+        """Ticket 218: the digest the selection froze is no longer carried.
+
+        `_perform` refuses this Task (`execution.py:2800-2812`) and is right to,
+        but the refusal costs a whole pass and spends an attempt, so before this
+        the queue drained itself three passes per Task under
+        `attempts_exhausted` -- a reason naming work that was never tried.
+        """
+        with self.scratch():
+            self.move(source_sha256="c" * 64)
+            self.assertEqual("corpus_moved", self.cancel_reason(self.tasks["matching"]))
+
+    def test_a_projection_that_moved_alone_is_the_same_refusal(self):
+        """`execution.py:2803` compares both, so both are read here.
+
+        The same document under a projection the model would read differently is
+        still not the document the freeze named.
+        """
+        with self.scratch():
+            self.move(version="c" * 64)
+            self.assertEqual("corpus_moved", self.cancel_reason(self.tasks["matching"]))
+
+    def test_a_task_holding_only_a_dropped_selection_is_left_alone(self):
+        """`SELECTED` reads `dropped_because IS NULL`, so nothing refuses this.
+
+        `tasks["second"]` dropped its only Playbook, so `kept` comes back empty
+        and the digest is never compared. Cancelling it here would end work the
+        runtime was willing to do, for a document it was never going to read.
+        """
+        with self.scratch():
+            self.move(source_sha256="c" * 64)
+            self.assertNotEqual("corpus_moved", self.cancel_reason(self.tasks["second"]))
+
+    def test_a_corpus_that_did_not_move_ranks_the_task(self):
+        """The negative that makes the three above mean anything."""
+        with self.scratch():
+            self.assertNotEqual("corpus_moved", self.cancel_reason(self.tasks["matching"]))
+
     def refusal_in_place(self, sql: str, parameters: tuple) -> str:
         """A refusal expected inside an open `scratch()` transaction.
 

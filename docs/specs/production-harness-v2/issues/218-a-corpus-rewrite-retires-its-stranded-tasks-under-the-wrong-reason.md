@@ -7,7 +7,7 @@ for what actually happened rather than spending three passes to call it
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** needs-review
 
 ## What was measured
 
@@ -94,23 +94,51 @@ PURPOSE An engagement should survive a corpus rewrite without spending a pass
 RULE    capability before catalogue.
 ```
 
-Whether the new reason should also cover `playbook_version` drift or only
-`source_sha256` is the open question: `execution.py:2802` refuses on either, and
-a version-only mismatch is the same document under a changed projection.
+The open question -- whether to cover `playbook_version` drift or only
+`source_sha256` -- is answered by reading both, because `execution.py:2803`
+refuses on either and a version-only mismatch is the same document under a
+projection the model would read differently.
+
+## What was built
+
+`20261221T000000Z__a_task_whose_playbook_moved_says_so.sql` adds one predicate
+to `cancel_reason_for`, between `budget_exhausted` and `attempts_exhausted`.
+Before the attempt counter on purpose: a stranded Task that has also reached
+three attempts should carry the reason that binds.
+
+Measured on `rk2here` after applying it:
+
+```
+    reason    | count
+ (rankable)   |   757
+ corpus_moved |     7
+```
+
+Seven, not the twelve pending Tasks that hold a moved selection. The other
+five hold nothing but `dropped_because` rows, which `SELECTED`
+(`execution.py:389-394`) never hands to the model, so `_perform` compares no
+digest and never refuses them. Cancelling those would end work the runtime was
+willing to do.
 
 ## Acceptance criteria
 
-- [ ] **A stranded Task is cancelled in the pass that ranks it**, not three
+- [x] **A stranded Task is cancelled in the pass that ranks it**, not three
       passes later, and `abandoned_reason` names the corpus rather than the
       attempt counter.
-- [ ] **The count is measured either side.** Same command as above: stranded
+- [x] **The count is measured either side.** Same command as above: stranded
       Tasks and their attempt sum, before and after one pass, on a database
       where the corpus really moved.
-- [ ] **A finished Task keeps its frozen digest.** The audit reading of a
+- [x] **A finished Task keeps its frozen digest.** The audit reading of a
       completed run is what the freeze is for.
 - [ ] **The refusal at `execution.py:2800-2812` still fires** for an active
       stale selection that reached execution anyway. This ticket widens no door.
-- [ ] **`hunt.sh`'s exception can come out.** The engagement script carries a
+      Left open, and the reason is that nothing tested it before this ticket
+      either: `grep -rn 'at the digest the selection froze' tests/` finds only
+      the case written here, against `cancel_reason_for` rather than against
+      `_perform`. Nothing on that path was edited, so the refusal is unchanged
+      by inspection -- but unchanged by inspection is not the same claim as
+      covered, and writing the missing case is its own ticket.
+- [x] **`hunt.sh`'s exception can come out.** The engagement script carries a
       `STRANDED` counter today; when the scheduler cancels these at ranking
       time, no lap refuses and the exception is dead code. Removing it is how
       this ticket proves itself.
