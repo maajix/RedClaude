@@ -135,3 +135,50 @@ Criterion 2 says `validation_queue` is "filled by `rk finding validate`
 into that table. It is filled by the SQL verb `request_validation`, which
 `validation.py:65` calls. That is the fact that makes serving the Contract cheap,
 so it is worth stating the right way round.
+
+## What the unserved Contract costs, measured 2026-08-29
+
+This ticket's blocker is gone. "102 — Nothing in this tree has ever created a
+Finding" was true when it was written; the `rk2here` engagement now holds four.
+All four are `candidate`, and the database says in its own words why each one
+will stay that way:
+
+```
+ label | severity |                    was_fehlt
+-------+----------+--------------------------------------------------
+ F1    | info     | nothing asked for the Finding F1 to be validated
+ F2    | info     | nothing asked for the Finding F2 to be validated
+ F3    | info     | nothing asked for the Finding F3 to be validated
+ F4    | info     | nothing asked for the Finding F4 to be validated
+```
+
+That sentence is `rk2_validation_refusal`, and what it is refusing over is the
+empty `validation_queue` this Contract exists to fill. The consequence over the
+whole Program:
+
+- `validate` Tasks ever opened: **0**, in any status.
+- `report` Tasks ever opened: **0**.
+- `js_analyst` Agent runs in six hours of hunting: **0**, against 30
+  orchestrator, 16 `web_hunter` and 11 `performer`.
+- `conclude` Tasks: 2 done, 2 abandoned -- the contrast that makes the
+  mechanism, because `state.conclude` is served whole and its Tasks exist.
+
+So the campaign hunts, proposes Findings and settles claims, and every Finding
+it opens stops at `candidate` forever. There is one way out and it is the
+operator's: `rk finding validate` calls `request_validation` through
+`validation.py:65` and then `open_validation_session`, which is exactly the
+hand-off the migration describes at
+`20260815T180000Z__a_blind_validator_answers_from_the_packet.sql:632-634` --
+"`request_validation` is the orchestrator's step ... and `open_validation` is
+the runtime's". Today the orchestrator's step has no tool, so a person takes it
+or nobody does.
+
+The comment this ticket was opened against still reads the same way and is now
+the last unbuilt half of a shipped feature (`src/redkraken/agent.py:155-167`):
+
+> the other two -- validation and a report -- are requests ticket 105 serves.
+> Those two are the whole of what this tree declares and no launch serves.
+
+Nothing in this measurement changes the decision taken 2026-08-22. It prices
+the delay: a hunt that cannot ask for validation is a hunt whose output an
+operator has to finish by hand, one Finding at a time.
