@@ -18,7 +18,7 @@ from concurrent import futures
 from pathlib import Path
 from unittest import mock
 
-from redkraken import _startup, browser_driver, isolation, tls
+from redkraken import _startup, browser, browser_driver, isolation, tls
 from tests import SOURCE, fixtures
 from tests.fixtures import docker
 
@@ -641,6 +641,21 @@ class ToolPlanTest(unittest.TestCase):
                     isolation.Unavailable, f"not under {isolation.TOOL_INPUTS}"
                 ):
                     isolation._staged(self.staging(), {path: b"x"}, ())
+
+    def test_a_seccomp_profile_that_is_not_a_file_is_refused_before_launch(self):
+        # PH2-174 criterion 2. The profile is package data, so the way it goes
+        # missing is a wheel built without it -- and the engine's own message
+        # for that arrives on a container's stderr, where it reads as one
+        # mission that failed rather than as an installation that cannot run
+        # any of them.
+        container = isolation.ToolContainer(image="rk2-tool-image-that-is-never-started")
+        with self.assertRaisesRegex(isolation.Unavailable, "seccomp profile is not a readable file"):
+            isolation.run_tool(
+                container,
+                ("/bin/true",),
+                ceilings=self.ceilings(),
+                seccomp=str(self.staging() / "no-such-profile.json"),
+            )
 
     def test_a_declared_output_that_is_not_a_bare_filename_is_refused(self):
         for name in ("../../etc/passwd", "/etc/passwd", "sub/report.json", ".."):
@@ -1540,6 +1555,168 @@ class BrowserEgressFlagTest(unittest.TestCase):
             and any(item.startswith("--proxy-bypass-list=") for item in argv),
             argv,
         )
+
+
+#: What is asked of the container the profile is passed to, run inside the browser
+#: image. Three questions in one document, because starting chromium is the
+#: expensive part and asking the other two beside it costs nothing:
+#:
+#: * did chromium start at all, and did it put anything in a user namespace that
+#:   is not this container's -- which is the whole of what the profile is for;
+#: * is the container's own effective capability set still empty and is
+#:   `no_new_privileges` still on;
+#: * and is `chroot` from the container's own namespace still refused -- the
+#:   question that separates "the profile allows the call" from "the profile
+#:   granted the capability", which it does not.
+SANDBOX_PROBE = """
+import ctypes, json, os, signal, subprocess, time, urllib.request
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def field(name):
+    return open("/proc/self/status").read().split(name)[1].split("\\n")[0].strip()
+
+
+def refused_a_chroot():
+    # In a child, because the answer we want is the errno and the cost of being
+    # wrong about it is a chrooted process that cannot read /proc afterwards.
+    read, write = os.pipe()
+    if os.fork() == 0:
+        os.close(read)
+        ctypes.set_errno(0)
+        rc = libc.chroot(b"/tmp")
+        os.write(write, json.dumps([rc, ctypes.get_errno()]).encode())
+        os._exit(0)
+    os.close(write)
+    with os.fdopen(read) as handle:
+        said = handle.read()
+    os.wait()
+    return json.loads(said)
+
+
+# The scratch rather than the workspace: this case declares no output, so
+# `run_tool` mounts no workspace, and the profile is not evidence anyway.
+profile = os.path.join(os.environ["TMPDIR"], "profile")
+os.makedirs(profile, exist_ok=True)
+log = open(os.path.join(os.environ["TMPDIR"], "browser.log"), "w+b")
+browser = subprocess.Popen(
+    [%(chromium)r, "--remote-debugging-port=%(port)d",
+     "--remote-debugging-address=127.0.0.1", "--user-data-dir=" + profile,
+     *%(flags)r, "about:blank"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+)
+direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+deadline = time.monotonic() + 60.0
+started = False
+while time.monotonic() < deadline and browser.poll() is None:
+    try:
+        with direct.open("http://127.0.0.1:%(port)d/json/version", timeout=1.0):
+            started = True
+            break
+    except Exception:
+        time.sleep(0.2)
+
+mine = os.readlink("/proc/self/ns/user")
+contained = []
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    try:
+        if b"headless-shell" not in open("/proc/" + entry + "/cmdline", "rb").read():
+            continue
+        if os.readlink("/proc/" + entry + "/ns/user") != mine:
+            contained.append(os.readlink("/proc/" + entry + "/root"))
+    except OSError:
+        continue
+
+log.flush()
+log.seek(0)
+print(json.dumps({
+    "started": started,
+    "caps": field("CapEff:"),
+    "no_new_privs": field("NoNewPrivs:"),
+    "chroot": refused_a_chroot(),
+    "contained": contained,
+    "said": log.read().decode("utf-8", "replace")[-800:],
+}))
+browser.kill()
+"""
+
+
+@unittest.skipUnless(LIVE, REASON)
+class BrowserSandboxTest(unittest.TestCase):
+    """PH2-174: chromium's own sandbox, started beside the container's denials.
+
+    The lane ran with `--no-sandbox` because the engine's default seccomp
+    profile allows `clone` into a new namespace, `unshare` and `chroot` only to
+    a container holding `CAP_SYS_ADMIN` or `CAP_SYS_CHROOT`, and `hardened`
+    drops both -- so the rules compile away and chromium's zygote cannot build
+    the namespace it puts a renderer in. The reason written in the tree was that
+    the capability set was what stood in the way. It was not: this case is what
+    says so, by running the same container with the same denials and a profile
+    that changes only that layer.
+
+    Its own network rather than the proxy adapter, because nothing here asks a
+    question about routing -- `BrowserContainerIsolationTest` above is where the
+    browser's way out is measured, and a door started for this case would be a
+    second answer to a question it does not ask.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("docker") is None:
+            raise unittest.SkipTest("docker is not on PATH")
+        if docker("image", "inspect", fixtures.BROWSER_IMAGE, check=False).returncode:
+            raise unittest.SkipTest(
+                f"{fixtures.BROWSER_REASON}; {fixtures.BROWSER_IMAGE} is absent"
+            )
+
+    def test_the_driver_asks_for_no_sandbox_of_its_own(self):
+        # The flag is gone rather than conditional: a driver that could be told
+        # to drop the sandbox is a driver one plan can run unsandboxed.
+        self.assertNotIn("--no-sandbox", browser_driver.FLAGS)
+
+    def test_the_profile_sandboxes_the_renderer_and_grants_no_capability(self):
+        answer = isolation.run_tool(
+            isolation.ToolContainer(image=fixtures.BROWSER_IMAGE),
+            (
+                "python3",
+                "-c",
+                SANDBOX_PROBE
+                % {
+                    "chromium": browser_driver.CHROMIUM,
+                    "port": browser_driver.DEBUG_PORT,
+                    "flags": list(browser_driver.FLAGS),
+                },
+            ),
+            ceilings=isolation.Ceilings(
+                timeout_seconds=180.0,
+                # The ceilings the browser really runs under, so a renderer that
+                # could not start under them would be telling us something.
+                memory_mb=1024,
+                cpu_quota=2.0,
+                pids_limit=256,
+                max_output_bytes=8192,
+            ),
+            scratch_mb=browser.SCRATCH_MB,
+            seccomp=str(Path(browser.__file__).parent / browser.SECCOMP),
+        )
+
+        self.assertTrue(answer.succeeded, answer.stderr.data)
+        facts = json.loads(answer.stdout.data)
+        self.assertTrue(facts["started"], facts["said"])
+        # Something is in a user namespace this container did not make, and it is
+        # chrooted out of the filesystem: that pair is chromium's layer one.
+        self.assertTrue(facts["contained"], facts["said"])
+        self.assertTrue(
+            all(root.startswith("/proc/") for root in facts["contained"]),
+            facts["contained"],
+        )
+        # And none of the four denials the ticket refuses to trade has moved.
+        self.assertEqual("0000000000000000", facts["caps"])
+        self.assertEqual("1", facts["no_new_privs"])
+        self.assertEqual([-1, 1], facts["chroot"])
 
 
 if __name__ == "__main__":

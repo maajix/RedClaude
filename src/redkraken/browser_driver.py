@@ -113,12 +113,15 @@ CONSOLE = "console"
 
 #: The chromium flags this harness has proven, and the reason for each.
 FLAGS = (
-    # No setuid sandbox of Chromium's own: the Agent boundary is what confines
-    # this process, and the two together need a capability set this container
-    # drops. Ticket 174 owns the seccomp profile that would let Chromium's
-    # sandbox start beside the boundary rather than instead of it; until then
-    # the container is the only boundary a renderer compromise meets.
-    "--no-sandbox",
+    # No `--no-sandbox` here, and the absence is the point: ticket 174 measured
+    # that Chromium's own sandbox starts under every denial this container
+    # already had, so a renderer compromise meets a user namespace and a chroot
+    # of Chromium's own before it meets the container. What that took is a
+    # syscall policy rather than a capability -- `browser.SECCOMP`, passed by
+    # `isolation.run_tool` -- so a mission started any other way has no such
+    # policy and Chromium will refuse to run at all rather than run open. That
+    # refusal arrives here as `the browser opened no debugger` carrying
+    # Chromium's own sentence about it, which is the answer an operator needs.
     "--disable-gpu",
     # Send shared memory to TMPDIR instead of /dev/shm, which a hardened
     # container does not have enough of.

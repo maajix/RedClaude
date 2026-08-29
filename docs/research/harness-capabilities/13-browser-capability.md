@@ -435,9 +435,13 @@ in the URL, which Chromium's own proxy documentation states ("Chrome does not
 implement this, and will not use any credentials embedded in the proxy
 settings") - which is why the shim exists at all.
 
-**Process isolation, honestly stated.** Chromium runs `--no-sandbox`
-(`browser_driver.py:115-120`) because the container drops every capability, and
-the two together need a capability set it does not have. Site Isolation still
+**Process isolation, honestly stated.** Chromium ran `--no-sandbox` because the
+container drops every capability and the two together were thought to need a
+capability set it does not have. Ticket 174 measured that and it was not so: the
+blocker was the engine's default seccomp profile alone, which gates `clone` into
+a new namespace, `unshare` and `chroot` on capabilities `--cap-drop ALL` removes.
+Chromium now runs sandboxed under `src/redkraken/browser_seccomp.json`, and the
+container's own capability set is still empty. Site Isolation still
 puts cross-site documents in different renderer processes inside the container,
 which is what Chromium's Site Isolation page describes as its defence against
 compromised renderers, UXSS and Spectre - but with the OS sandbox off, a
@@ -451,10 +455,10 @@ this should be measured against is Playwright's: running as root "will disable
 the Chromium sandbox", `seccomp_profile.json` "is needed to run Chromium with
 sandbox", and for untrusted sites they recommend a separate user together with
 that profile; Puppeteer's troubleshooting page says running without a sandbox is
-"strongly discouraged". **Our tree runs unprivileged and unsandboxed with a
-hardened container; a seccomp profile that would let Chromium's own sandbox
-start is not found in this tree, and restoring it is the one hardening step this
-lane has not taken.**
+"strongly discouraged". **Our tree runs unprivileged and sandboxed inside a
+hardened container; the seccomp profile that lets Chromium's own sandbox start
+is `src/redkraken/browser_seccomp.json`, and ticket 174 is where the measurement
+behind it is written down.**
 
 **Profile lifetime.** The profile lives at `/work/profile`
 (`browser_driver.py:62`), which is a bind mount of a per-run staging directory
