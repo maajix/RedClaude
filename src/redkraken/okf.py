@@ -46,7 +46,7 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from . import playbook, skill
+from . import document, playbook, skill
 
 #: Where a corpus path is rooted. `Playbook.path` and `Reference.path` are
 #: written relative to the installed package -- `playbooks/<name>/playbook.md`
@@ -83,10 +83,6 @@ BUILT_AT = "2026-08-28T00:00:00Z"
 ACTOR = "process:redkraken-okf"
 
 OKF_VERSION = "0.2"
-
-#: The two reserved filenames of section 11. Everything else under the root is a
-#: concept document and is held to the `type` rule.
-RESERVED = ("index.md", "log.md")
 
 FENCE = "---"
 
@@ -495,10 +491,13 @@ def build(
             ],
         )
     )
+    # Section 9, quoted: "Log files carry no frontmatter." A reserved name is
+    # not a concept, and a `type: Log` block here would be a concept wearing
+    # one. Section 11's third rule is what makes it a fault rather than a
+    # preference: a reserved filename follows the structure of section 8 or 9
+    # when it is present, and a frontmatter block is not that structure.
     files["log.md"] = (
-        _front([("type", "Log"), ("title", _quote("redKraken corpus bundle history"))])
-        + "\n\n"
-        + "\n".join(
+        "\n".join(
             [
                 "# Bundle history",
                 "",
@@ -565,22 +564,269 @@ FOOTNOTE_DEF = re.compile(r"^\[\^([^\]]+)\]:", re.MULTILINE)
 SOURCE_ID = re.compile(r"^\s+- id:\s*(\S+)\s*$", re.MULTILINE)
 
 
-def validate(files: Mapping[str, str]) -> tuple[str, ...]:
-    """Every way this bundle fails v0.2, or an empty tuple.
+#: The seven shapes `_front` writes, and therefore the only seven a block in
+#: this bundle may carry. Measured over `build()` rather than guessed -- every
+#: one of the 2136 frontmatter lines it emits falls into them, and none outside:
+#:
+#:   1046  `key: <plain>`                      `type: Log`
+#:    301  `key: [a, b, c]`                    `tags: [injection, read_only]`
+#:    281  `key: "..."`                        `okf_version: "0.2"`
+#:    252  four spaces, `key: value`           `    resource: /references/x.md`
+#:    140  `key: { k: v, k: v }`               `generated: { by: ..., at: ... }`
+#:     84  two spaces, `- key: value`          `  - id: agentic-ai--llm`
+#:     32  `key:`, which opens a block sequence `sources:`
+#:
+#: A key is lower case with underscores, optionally namespaced once by a colon,
+#: which is what admits the fourteen `bb:` extension keys alongside `okf_version`.
+OKF_KEY = re.compile(r"^[a-z][a-z0-9_]*(?::[a-z][a-z0-9_]*)?$")
 
-    The first three checks are section 11's conformance rules, which are the
-    only hard ones. Everything after them is a rule ticket 101 asked for by
-    name, checked here rather than left as a claim in a document: a bundle that
-    says it carries provenance and does not is worse than one that says nothing.
+#: The escapes YAML defines inside a double-quoted scalar. `_quote` writes two
+#: of them; the rest are here because the grammar belongs to the format rather
+#: than to today's emitter.
+OKF_ESCAPE = re.compile(r'\\(?:[\\"/bfnrt0]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})')
+
+
+def _plain(value: str) -> str:
+    """Why this is not a plain scalar two parsers would read the same way."""
+    if not value:
+        return "has no value"
+    if value[0] in document.INDICATORS:
+        return f"opens with {value[0]!r}, which YAML reads as structure"
+    if ": " in value or value.endswith(":"):
+        return "carries a colon YAML would read as a second key"
+    if " #" in value:
+        return "carries a comment introducer"
+    return ""
+
+
+def _quoted(value: str) -> str:
+    """Why this is not a closed double-quoted scalar."""
+    if len(value) < 2 or not value.endswith('"'):
+        return "opens a quote it never closes"
+    # Every defined escape is removed first, so what is left is what a parser
+    # would still have to interpret: a lone backslash, or a quote that ends the
+    # scalar in the middle of it.
+    body = OKF_ESCAPE.sub("", value[1:-1])
+    if "\\" in body:
+        return "carries a backslash escape YAML does not define"
+    if '"' in body:
+        return "closes its quote early"
+    return ""
+
+
+#: The four characters YAML calls flow indicators. Inside a flow collection
+#: they end the scalar wherever they stand and not only where it opens, so
+#: `[a[b]` and `[a]b]` are both refused by a parser and both waved through by a
+#: check that reads the first character. Section 7.3.3 of the YAML spec.
+FLOW_INDICATORS = ",[]{}"
+
+
+def _flow_plain(value: str) -> str:
+    """Why this is not a plain scalar a flow collection may hold."""
+    fault = _plain(value)
+    if fault:
+        return fault
+    for indicator in FLOW_INDICATORS:
+        if indicator in value:
+            return f"carries {indicator!r}, which ends a scalar inside a flow collection"
+    return ""
+
+
+def _flow_sequence(value: str) -> str:
+    """Why this is not a flow sequence of plain scalars."""
+    if not value.endswith("]"):
+        return "opens a flow sequence it never closes"
+    inner = value[1:-1]
+    if not inner.strip():
+        return "is an empty flow sequence, which this emitter never writes"
+    for position, element in enumerate(inner.split(",")):
+        want = element.strip()
+        if not want:
+            # `[a,,b]` and `[a, b,]` both land here, and both are the reason a
+            # comma count is not a substitute for reading the elements.
+            return "holds an empty element"
+        if element != (want if position == 0 else f" {want}"):
+            return "separates its elements by something other than a comma and a space"
+        fault = _flow_plain(want)
+        if fault:
+            return f"holds an element that {fault}"
+    return ""
+
+
+def _flow_mapping(value: str) -> str:
+    """Why this is not a flow mapping of `key: value` pairs."""
+    if not value.endswith("}"):
+        return "opens a flow mapping it never closes"
+    inner = value[1:-1].strip()
+    if not inner:
+        return "is an empty flow mapping, which this emitter never writes"
+    for pair in inner.split(", "):
+        key, separator, held = pair.partition(": ")
+        if not separator:
+            return f"holds {pair!r}, which is not a `key: value` pair"
+        if not OKF_KEY.match(key):
+            return f"holds {key!r}, which is not a key"
+        fault = _quoted(held) if held.startswith('"') else _flow_plain(held)
+        if fault:
+            return f"holds a value that {fault}"
+    return ""
+
+
+def _value(value: str) -> str:
+    """Why this value is outside the four shapes a value may take."""
+    if value.startswith("["):
+        return _flow_sequence(value)
+    if value.startswith("{"):
+        return _flow_mapping(value)
+    if value.startswith('"'):
+        return _quoted(value)
+    return _plain(value)
+
+
+def frontmatter_faults(name: str, text: str) -> tuple[str, ...]:
+    """Every way this block leaves the sub-grammar above, in line order.
+
+    Section 11 asks whether a concept's frontmatter is parseable YAML, and this
+    answers it without a YAML parser, because the runtime carries no
+    third-party dependency and this module is not the place to acquire one.
+    The repository has paid this wall three times already and decided the same
+    way each time: `document.frontmatter`, `check_wiring.frontmatter` -- "No
+    YAML: this gate is standard library only" -- and `_frontmatter` below.
+
+    It is a closed sub-grammar and not a list of suspicions. The seven forms
+    are admitted and everything else is refused, so a shape nobody anticipated
+    is refused rather than waved through; a plausibility check would still pass
+    `type: [a,,b]`. Block scalars, anchors, aliases, tags and merge keys need
+    no rule of their own: each opens with a character `_plain` already refuses,
+    or spells a key `OKF_KEY` already refuses.
+
+    The direction is one way and deliberately so. What passes here is valid
+    YAML; valid YAML does not have to pass here. That is the right bias for a
+    checker over one generator's output, and the positive corpus in
+    `tests/test_okf.py` is what keeps the admitted half honest.
+
+    Key and value split at the first `": "` -- colon *and* space, or a colon
+    ending the line -- and never at the first colon. That is YAML's own rule,
+    and it is why `bb:category: injection` carries the key `bb:category` and
+    why `stale_after: 2027-02-15T00:00:00Z` is one plain scalar. `_frontmatter`
+    below splits at the first colon instead and therefore sees a single `bb`
+    key. The two views differ on purpose and both are kept.
+    """
+    if not text.startswith(FENCE + "\n"):
+        return (f"{name}: no frontmatter block opens the file",)
+    end = text.find(f"\n{FENCE}\n", len(FENCE))
+    if end < 0:
+        return (f"{name}: the frontmatter block is never closed",)
+    block = text[len(FENCE) + 1 : end]
+    if not block:
+        return (f"{name}: the frontmatter block is empty",)
+
+    faults: list[str] = []
+    seen: set[str] = set()
+    sequence = ""
+    for number, line in enumerate(block.split("\n"), start=2):
+        where = f"{name} line {number}"
+        if "\t" in line:
+            faults.append(f"{where}: a tab is not indentation two parsers agree about")
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        rest = line[indent:]
+
+        if indent == 0:
+            sequence = ""
+            key, separator, value = rest.partition(": ")
+            if not separator:
+                if not rest.endswith(":") or len(rest) < 2:
+                    faults.append(f"{where}: is not `key: value`")
+                    continue
+                key, value = rest[:-1], ""
+            if not OKF_KEY.match(key):
+                faults.append(f"{where}: {key!r} is not a key")
+                continue
+            if key in seen:
+                # Which of the two a parser keeps is a property of the parser,
+                # which is exactly why this refuses. `document.frontmatter`
+                # holds the same line for the same reason.
+                faults.append(f"{where}: {key} is stated twice")
+            seen.add(key)
+            if not value:
+                sequence = key
+                continue
+            fault = _value(value)
+            if fault:
+                faults.append(f"{where}: {key} {fault}")
+            continue
+
+        if not sequence:
+            faults.append(f"{where}: is indented under no block sequence")
+            continue
+        if indent == 2:
+            if not rest.startswith("- "):
+                faults.append(f"{where}: is indented two spaces and opens no sequence entry")
+                continue
+            rest = rest[2:]
+        elif indent != 4:
+            faults.append(f"{where}: is indented {indent} spaces, and this bundle uses 0, 2 or 4")
+            continue
+        elif rest.startswith("- "):
+            faults.append(f"{where}: opens a sequence entry four spaces in")
+            continue
+        key, separator, value = rest.partition(": ")
+        if not separator:
+            faults.append(f"{where}: is not `key: value`")
+            continue
+        if not OKF_KEY.match(key):
+            faults.append(f"{where}: {key!r} is not a key")
+            continue
+        fault = _value(value)
+        if fault:
+            faults.append(f"{where}: {key} {fault}")
+    return tuple(faults)
+
+
+#: Section 9: a log is a flat list of date-grouped entries, newest first, and
+#: the date heading is ISO 8601 `YYYY-MM-DD`.
+LOG_DATE = re.compile(r"^## (\d{4}-\d{2}-\d{2})$", re.MULTILINE)
+
+
+def validate(files: Mapping[str, str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """What makes this bundle non-conforming, and what only makes it worse.
+
+    Two tuples, because they carry two different powers.
+
+    `faults` is section 11 and nothing else: every non-reserved `.md` holds a
+    parseable frontmatter block, every block carries a non-empty `type`, and
+    the two reserved names keep the structure of sections 8 and 9. A consumer
+    may refuse a bundle over one of those.
+
+    `advisories` is everything else this bundle is held to -- the actor
+    spelling, the lifecycle family, the absolute instant, a link that lands, a
+    root index at all, `okf_version` on it when it is there, and a footnote and
+    its source finding each other. The specification is explicit that a consumer "MUST NOT
+    reject documents with unrecognized fields", and the module docstring above
+    says the same: every constraint past the three is soft guidance. Returning
+    them separately is what stops this gate from refusing a conforming bundle
+    over a rule the format never made.
+
+    Soft does not mean unwatched. `tests/test_okf.py` demands both tuples
+    empty, because a rule nobody enforces is a rule that rots quietly.
     """
     faults: list[str] = []
+    advisories: list[str] = []
 
     if "index.md" not in files:
-        faults.append("the bundle has no root index.md")
+        # Section 8 says an index "MAY appear in any directory, including the
+        # bundle root". A missing one is a bundle that discloses less, not a
+        # bundle that fails.
+        advisories.append("the bundle has no root index.md")
     else:
+        # Section 12 lists `okf_version` among the fields a root index MAY
+        # carry, and section 11's three hard rules do not ask for it. A bundle
+        # that omits it is one a consumer cannot version-check, which is worth
+        # reporting and is not a conformance failure.
         front = _frontmatter(files["index.md"])
         if front is None or front.get("okf_version") != f'"{OKF_VERSION}"':
-            faults.append(f'root index.md does not declare okf_version: "{OKF_VERSION}"')
+            advisories.append(f'root index.md does not declare okf_version: "{OKF_VERSION}"')
 
     for name, text in sorted(files.items()):
         base = name.rsplit("/", 1)[-1]
@@ -597,13 +843,24 @@ def validate(files: Mapping[str, str]) -> tuple[str, ...]:
                 faults.append(f"{name}: an index with no links discloses nothing")
             continue
         if base == "log.md":
-            if front is None or front.get("type") != "Log":
-                faults.append(f"{name}: the reserved log carries no type: Log")
+            # Section 9, quoted: "Log files carry no frontmatter." A block here
+            # would be a concept wearing a reserved name.
+            if front is not None:
+                faults.append(f"{name}: the reserved log carries a frontmatter block")
+            dates = LOG_DATE.findall(text)
+            if not dates:
+                faults.append(f"{name}: the reserved log carries no ISO 8601 date heading")
+            elif dates != sorted(dates, reverse=True):
+                faults.append(f"{name}: the reserved log is not newest first")
             continue
 
         if front is None:
             faults.append(f"{name}: no parseable frontmatter block")
             continue
+        # Rule one of section 11 in full. `_frontmatter` proves a block is
+        # *there*; only the grammar proves it *parses*, and the two are not the
+        # same question.
+        faults.extend(frontmatter_faults(name, text))
         if not front.get("type"):
             faults.append(f"{name}: no non-empty type, which is the one required key")
             continue
@@ -611,30 +868,33 @@ def validate(files: Mapping[str, str]) -> tuple[str, ...]:
         generated = front.get("generated", "")
         actor = generated.partition("by:")[2].partition(",")[0].strip()
         if not actor:
-            faults.append(f"{name}: generated carries no actor")
+            advisories.append(f"{name}: generated carries no actor")
         elif not ACTOR_FORM.match(actor):
-            faults.append(f"{name}: {actor!r} is not an OKF actor spelling")
+            advisories.append(f"{name}: {actor!r} is not an OKF actor spelling")
 
         status = front.get("status", "")
         if status not in ("draft", "stable", "deprecated"):
-            faults.append(f"{name}: status {status!r} is outside the lifecycle family")
+            advisories.append(f"{name}: status {status!r} is outside the lifecycle family")
         stale = front.get("stale_after", "")
         if not stale.endswith("Z") or "T" not in stale:
-            faults.append(f"{name}: stale_after {stale!r} is not an absolute instant")
+            advisories.append(f"{name}: stale_after {stale!r} is not an absolute instant")
 
         body = text[text.find(f"\n{FENCE}\n", len(FENCE)) + len(FENCE) + 2 :]
         declared = set(SOURCE_ID.findall(text[: text.find(f"\n{FENCE}\n", len(FENCE))]))
         defined = set(FOOTNOTE_DEF.findall(body))
         used = set(FOOTNOTE_USE.findall(body)) - defined
         # Both directions. A footnote with no source is an attribution pointing
-        # at nothing; a source no claim cites is a citation nobody made.
+        # at nothing; a source no claim cites is a citation nobody made. Both
+        # are defects in this bundle and neither is one of section 11's three
+        # rules, so they are reported and do not decide conformance -- the
+        # repository's own test still holds this list empty.
         for orphan in sorted(used - declared):
-            faults.append(f"{name}: footnote [^{orphan}] matches no sources[].id")
+            advisories.append(f"{name}: footnote [^{orphan}] matches no sources[].id")
         for unused in sorted(declared - defined):
-            faults.append(f"{name}: source id {unused} is declared and never cited")
+            advisories.append(f"{name}: source id {unused} is declared and never cited")
 
         for target in LINK.findall(text):
             if target.lstrip("/") not in files:
-                faults.append(f"{name}: bundle-relative link {target} resolves to nothing")
+                advisories.append(f"{name}: bundle-relative link {target} resolves to nothing")
 
-    return tuple(faults)
+    return tuple(faults), tuple(advisories)

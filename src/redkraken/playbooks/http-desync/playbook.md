@@ -1,7 +1,7 @@
 ---
-description: Ask what protocol and cipher the target itself negotiates rather than what the interception proxy negotiated with it, by requesting one measurement on the lane whose receipt is admissible for that question and comparing it against what the deployment advertises to callers.
+description: Ask what a deployment advertises about its own transport and whether the advertisement is the deployment's policy or one fleet member's, by reading the subject twice unchanged and differencing the pair against a route on the same origin the front end serves differently.
 bb:category: transport
-bb:outputs: ["transport.tls_configuration"]
+bb:outputs: ["transport.header_policy", "transport.tls_configuration"]
 bb:triggers_all: ["read_method", "spa_surface", "tech_edge_proxy"]
 bb:skills: ["compare-responses"]
 bb:risk: constrained
@@ -9,12 +9,12 @@ bb:effects: read_only
 bb:baseline: none
 bb:status: draft
 bb:stale_after: 2027-05-15
-bb:provenance: Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by step 6, because 025 records request framing as unmakeable behind the interception proxy and enforces that refusal in a trigger.
-bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "transport_parameters_observed", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "transport_parameters_observed", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "transport_parameters_observed", "polarity": "supports", "min_count": 1}]
+bb:provenance: Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by the last section, because 025 records request framing as unmakeable behind the interception proxy and enforces that refusal in a trigger. Rewritten for ticket 101 against the merged technique ledger, which holds one executable reading, two blocked ones and two refusals for this slug. The one that executes is a header-policy reading, and bb:outputs gains transport.header_policy under D3 so that this Playbook has a step its own harness can perform -- the alternative leaves it describing only readings the harness refuses. The evidence rows move off transport_parameters_observed, which the ledger established has no agent-reachable writer by any path. The repair swapped the roles -- the identical repeat is the control, the differing sibling the variant.
+bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_differential", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
 bb:references: ["http-attacks-http-2-downgrading.md", "http-attacks-request-smuggling-and-http-desync.md", "proxy-tunnels.md"]
 ---
 
-# Ask the wire, because everything else in this harness is the proxy talking
+# Ask the deployment what it says about its own transport
 
 Every ordinary request this harness sends is decoded and re-encoded on the way
 out. The bytes the target frames, the protocol it agreed to speak and the
@@ -22,167 +22,168 @@ certificate it presented are all things the interception proxy saw and the
 reading did not, and a reading that reported them would be describing its own
 door.
 
-That is not a gap in this Playbook, it is this Playbook's subject. One lane in
-this harness exists to make an unintercepted measurement, and one class of claim
-is admissible from it: what the target negotiated. Everything else the v1 pack
-under this name contained -- smuggling, desync, coalescing, tunnelling -- is
-refused, and step 6 says why with the mechanism attached.
+That is not a gap in this Playbook, it is this Playbook's subject. What a
+reading here can hold is what the deployment tells callers about itself, in
+headers that survive to the agent view, read twice so that an advertisement is
+a policy rather than one fleet member's configuration. What it cannot hold is
+the measurement the slug is named for, and section 3 says exactly why rather
+than leaving it to be rediscovered.
 
 The subject is a read on an application shell with a terminating front end in
-front of it: many parallel requests for one document is where a disagreement
-about the protocol shows up at all. The whole reading is one measurement, one
-repeat and two ordinary reads.
+front of it. The whole executable reading is three requests.
 
-## 1. Say what the deployment advertises, from two ordinary reads
+## 1. Read the advertisement, twice, against a route that differs
 
-Send the subject twice, through the ordinary path, presenting nothing. Record
-from the answers alone:
+Send the arms with `mcp__rk2__http_request`, presenting nothing, and propose
+the reading with `mcp__rk2__propose_test`. Three actions, in plan order and
+never re-ordered.
 
-* the protocol each response was delivered over, as this harness saw it
-* `Alt-Svc`, if it is there, which is the deployment telling callers what else
-  it will speak
-* `Strict-Transport-Security`, if it is there
+* action 1, role baseline, the subject
+* action 2, role control, the same url again, unchanged
+* action 3, role variant, a route on the same origin the front end serves
+  differently
 
-None of these is a claim yet. All three are what the deployment says about
-itself, and the point of writing them down first is that step 4 compares them
-against what the target actually did.
+Two assertions. `body_equals` on action 2 against action 1 says the deployment
+answers one way, so what it advertises is its policy rather than one member's;
+that arm is named by no differing assertion, which is what leaves it a
+response_invariant in the role this Playbook's bar asks it for.
+`body_differs` on action 3 against action 1 is the reading, and it is
+load-bearing rather than decorative -- without an arm that is known to differ,
+an invariance is equally well explained by a comparison that never fires.
 
-Twice rather than once for the same reason step 3 repeats the measurement. A
-fleet whose members are configured differently advertises differently, and an
-advertisement that moved between two sends is not the deployment's policy but one
-member's. Where the two reads disagree on any of the three, this reading has
-nothing stable to compare a measurement against and the verdict is
-`inconclusive`, saying which of the three moved.
+Neither assertion can see the three values recorded next. Both body kinds read
+the stored response body digest alone, so the delivery protocol, `Alt-Svc` and
+`Strict-Transport-Security` sit outside every assertion a Test can state, and
+they travel instead as the agent-filed edge named at the end of this section.
 
-Complete this step with the three values, and with the word `absent` for each
-one that is not there. An absent header is a measurement; a guessed one is not.
+Record from the answers alone, for each of the two identical sends, the
+protocol the response was delivered over, `Alt-Svc` if it is there, and
+`Strict-Transport-Security` if it is there. Write the word absent for each one
+that is not present. An absent header is a measurement; a guessed one is not.
+Neither of those two names is stripped from the agent view, so both survive to
+the reading, and a value that moved between the two sends is one member's
+configuration rather than the deployment's.
 
-## 2. Request the measurement
+The writer is `close_test_replay`. It takes the Observation kind from the
+specification rather than from the outcome, so the repeated control arm carries
+`response_invariant` whichever way the run comes out and the differing sibling
+route carries `response_differential`, and it is the only runtime writer that
+carries a Hypothesis from testing to supported. Beside it, an agent-filed
+`header_policy_observed` edge names each of the three values or its absence,
+and `promote_proposal` writes that one from the read's own Receipt.
 
-One measurement, on the lane that does not intercept.
+## 2. State the claim, and state what would refute it
 
-A measurement is not a request the reading composes. It is asked for by purpose,
-it goes out unintercepted, and what comes back is a receipt carrying what the
-target negotiated: the version, the cipher, the protocol chosen by ALPN, and
-whether the chain and the hostname verified.
+The Hypothesis is `transport.header_policy` on the subject, and it has to be
+that one. A supporting edge filed on this Playbook's other declared class is
+refused where it is written, because that class is probe-only and admits one
+Observation kind that nothing on the agent's side can produce -- so even the
+invariant the Test just wrote would be rejected at insert. Section 3 is where
+that wall is set out.
 
-The receipt is admissible for this claim only if it is citable, and citable is a
-property the database computes rather than the reading asserts: an unintercepted
-exchange, allowed by the scope policy, whose version was recorded and whose chain
-and hostname both verified. A receipt that fails any of those describes something
-other than the target's transport, and an observation citing it is refused where
-it is written.
+It is supported when the two identical reads are byte-identical and the sibling
+route differed from them, which is what both assertions state and all that they
+state. It is refuted when either fails -- the repeated read is not byte-identical,
+so the deployment has no single advertisement and the premise a comparison rests
+on is not there, or the sibling came back identical, so nothing distinguishes
+this deployment's routes at all. Both legs of the variant are
+`response_differential`, because one role writes one kind whichever way the
+reading goes.
 
-If no citable receipt can be obtained, stop at step 6's last paragraph. The
-verdict is `inconclusive`, it names the missing capability, and it routes to an
-operator. That is the honest end of this reading and it is a common one.
+The three recorded values are not in either assertion and no Test can compare
+them. They are carried by the agent-filed `header_policy_observed` edge alone,
+and a report that reads a difference between the two sends off that edge says
+so in those words.
 
-## 3. Repeat the measurement
+Anything else is inconclusive -- a subject that answers nothing, a front end
+that rewrites both reads into one page. Where the two reads disagree, say which
+of the three moved. Do not average them and do not take the second.
 
-One more, identical, and this is the control.
+Where the question is which channel policy headers a page carries to a framing
+context rather than what a deployment says about its transport, the Playbook is
+`browser-framing`. Where the question is whether the front end and the
+application resolve one path differently, the class is
+`authorization.edge_rule` and the Playbook is `deployment`.
 
-A handshake is a negotiation, and a negotiation can go two ways on two
-connections -- a front end fleet whose members are configured differently, a
-session resumed rather than established, a cipher preference that depends on
-what was offered. Two measurements agreeing is what makes the first one a
-property of the target. Two measurements disagreeing is a finding about the
-deployment's consistency and is reported as `inconclusive` here, because this
-Playbook's claim is about what the target negotiates and there turned out to be
-two answers.
+The gate is `rk2_finding_refusal` and what it wants is the settling transition
+`close_test_replay` wrote for the Test above.
 
-## 4. Compare the measurement against the advertisement
+Open the claim with `mcp__rk2__propose_finding`, citing both Receipts, the
+three values from each and the word absent where one was missing. This section
+proposes no Test of its own and grades nothing.
 
-Run `compare-responses` over the two ordinary reads, which is what settles that
-the advertisement is the deployment's and not one member's. Then set the
-measurement's fields beside the three values step 1 recorded, and cite both.
+## 3. The measurement this Playbook was named for, and the certificate
 
-What is being looked for is a disagreement between the two, and there are two
-shapes of it worth naming:
+This section is a lead and cannot be graded. It records two blocked readings so
+that neither is re-proposed as a documentation gap, and the cause in both is
+this harness rather than the target.
 
-* the front end offers a protocol by `Alt-Svc` that the measurement shows it does
-  not negotiate, or negotiates only one hop in
-* the negotiated version or cipher is below what the deployment's own policy
-  header implies it requires
+The unintercepted measurement exists and no reading here may cite it. The door
+takes it automatically after the first https exchange with a target, once per
+target for as long as the process is up, so there is no argument that requests
+one and no way to repeat one. Its Receipt is on the internal lane, which a
+proposal element may not cite and which the state policy hides from the agent
+role outright. The record the agent can read projects none of the negotiated
+fields, and the one Observation kind a probe-only transport claim will accept
+demands both a citable Receipt of that lane and metadata the proposal writer
+hard-codes past. Three walls, and lifting any one of them alone changes
+nothing.
 
-There is deliberately no third shape about the certificate. A receipt whose chain
-or hostname did not verify is not citable at all -- both are conjuncts of the
-generated column -- so a reading can never hold one to report it from, and what
-the certificate says is `transport.certificate_trust`, a different leaf with its
-own `allowed_fields` that this Playbook does not output.
+`transport.certificate_trust` is worse and is worth its own sentence. Every
+certificate field a client behind this door can see belongs to the run's own
+authority, because the door mints a leaf per host, so a reading that reported
+one would be reporting this installation. The verified-chain and
+verified-hostname fields on the measurement Receipt are conjuncts of the
+citability column, so a Receipt whose chain did not verify is not citable at
+all and no reading can ever hold one to report from. That class stays
+unemitted, and this is why it is not cheap to close.
 
-Every field asserted has to be one the receipt carries. The observation is
-checked field by field against the receipt's wire-side columns at the moment it
-is written, so a value the reading inferred, remembered from the ordinary path or
-read off this harness's own certificate is rejected there rather than believed.
+A reading that finds itself wanting either of these stops, says which
+capability was missing in those words, and routes to an operator. That is a
+better outcome than a claim the evidence cannot carry, and until those routes
+exist it is the only honest one available here.
 
-## 5. State the claim, and state what would refute it
+## 4. Framing, tunnelling and a position on the wire
 
-The Hypothesis is `transport.tls_configuration` on the subject. It is supported
-when a citable receipt shows a negotiated version, cipher or protocol weaker than
-what the deployment advertises or than what its own policy header implies, and a
-second citable receipt shows the same thing. It is refuted when the two citable
-receipts agree with each other and with the advertisement -- which is what a
-correctly configured front end looks like, and is worth recording as such.
+This section is a lead and cannot be graded. It records the refusals the v1
+pack under this name was mostly made of, each with the reason that travels with
+it.
 
-Anything else is inconclusive: no citable receipt, two receipts that disagree, a
-deployment that advertises nothing to compare against.
+`transport.request_framing` cannot be written down. It is registered unmakeable
+and the guard that enforces that is a trigger the database always runs, so the
+claim is refused where it is first written rather than found not to work.
+Independently, the two framing headers are both hop-by-hop and dropped before
+the wire, there is no length argument because the door re-measures the document
+it re-serialises, and a header value is printable ASCII so no line break can be
+spelled into one. A body is a model-authored string and chunk framing can be
+typed into it, which is precisely the hazard -- the door's recomputed length
+and the typed framing would disagree, and that disagreement is the ambiguous
+framing this corpus refuses to construct. The second reason is the one that
+settles it either way. The remainder prefixes the next request on that
+connection, the next request belongs to somebody who is not part of this
+engagement, and a technique with no bounded blast radius has no undo.
 
-Two neighbours are close, and both are other Playbooks.
+Nothing here tunnels or coalesces. The method enum holds no tunnel verb, there
+is no argument that expresses a request-target form, and a caller-written host
+header never reaches the target because it is hop-by-hop and the wire headers
+are rebuilt without it -- so the whole virtual-host family is excluded by
+construction rather than by policy. A machine-in-the-middle position is refused
+by decision for the same reason a tunnel is. The destination or the position is
+the whole point, and both are outside what the Program granted.
 
-* Where the question is whether the front end and the application resolve one
-  path differently, the class is `authorization.edge_rule` and the Playbook is
-  `deployment`.
-* Where the question is which channel policy headers a page carries, the class is
-  `transport.header_policy` and the Playbook is `browser-framing`.
+Where a hop routes on a caller-supplied authority and a second component builds
+a url from a different one, the class is `injection.parameter_precedence` and
+the Playbook is `request-parsing`. Where a caller-supplied parameter decides
+what the server fetches, it is `injection.request_forgery`. Where the question
+is what a front end stored and handed to the next caller, it is
+`information_disclosure.cached_response`, which web-cache asks with a read that
+reaches nobody else. Request-target mangling is performable here, because the
+door forwards dot segments and repeated slashes verbatim, but it is not this
+Playbook's -- it lands in the authorization or the caching family and neither
+is in the transport family this category confines it to.
 
-Cite the receipt, by label, and the fields it recorded. Quote the advertisement
-from step 1 beside them.
+This Playbook is read_only, holds no session and sends three reads to one
+deployment. It does not scan a port, renegotiate, offer a restricted parameter
+set, or open many connections to see which of them answer differently.
 
-## 6. The ceiling
-
-This Playbook is `read_only`, holds no session, and sends two ordinary reads and
-two measurements to one deployment.
-
-It does not desynchronise anything, and this is the refusal the v1 pack under
-this name was mostly made of. No request in it carries two length headers, a
-chunked body with a trailing length, a header the front end and the application
-would frame differently, a request line the front end would rewrite, or anything
-else whose effect lands on the next connection. Two reasons, and the second is
-the one that settles it. The next connection belongs to somebody who is not part
-of this engagement, so a technique that poisons it has no bounded blast radius
-and no undo -- and separately, 025 records request framing as unmakeable through
-this harness at all: the proxy parses and re-serialises every request, so the
-bytes the target frames are the proxy's rather than the reading's, and a
-smuggling result would describe the proxy. That refusal is a trigger on the
-Hypothesis table, not advice: the class cannot be written down.
-
-A request may now carry a body, and that changes nothing above. Ticket 96 gave
-`http_request` a `body` argument, so a reading can put bytes in front of the
-target's parser where it could not before, and the two things a desync needs are
-still both absent. The framing headers are not arguments: `Content-Length` is the
-door's own measurement of the document the door itself re-serialises, and a
-`Transfer-Encoding: chunked` request body is refused at the door with a blocked
-Receipt rather than forwarded and found not to work. So the refusal here is a
-refusal and not a limitation that a later ticket quietly lifted, and a reading
-that wants to test framing should read this paragraph as the answer rather than
-spend an attempt discovering it.
-
-It does not tunnel and it does not coalesce. It sends no `CONNECT`, no
-absolute-form request line, and no request whose authority names a host other
-than the one the Task scoped. A reading that got a front end to forward on its
-behalf has reached something the Program did not grant, whatever the answer was.
-
-It does not audit the endpoint. It does not scan a port, offer a deliberately
-restricted parameter set, renegotiate, or open many connections to see which of
-them get a different answer -- the two measurements in step 3 are two, and they
-are two because a negotiation needs a repeat to be a property rather than an
-event.
-
-It does not compose the measurement itself. The measurement lane is a purpose the
-runtime honours, and the claim rests on a receipt the database judged citable.
-Where the runtime this Playbook is executing under has no route to that lane, the
-reading does not substitute the ordinary path, does not read this harness's own
-socket, and does not report what the proxy negotiated. The verdict is
-`inconclusive`, it says which capability was missing in those words, and it stops
--- which is a better outcome than a claim the evidence cannot carry, and, until
-that route exists, the only honest one available here.
+3 of 4 steps cannot be graded.

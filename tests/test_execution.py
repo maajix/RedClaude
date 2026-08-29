@@ -2551,7 +2551,7 @@ class AttemptTest(unittest.TestCase):
         *_, args = connection.sent(execution.OPEN_TOOL_RUN)[0]
 
         self.assertEqual("read_only", SELECTED_PLAYBOOK.effects)
-        self.assertEqual("mutates_session", mutating.effects)
+        self.assertEqual("mutates_account", mutating.effects)
         self.assertIs(True, json.loads(args)["body_allowed"])
 
     def test_an_attempt_with_no_playbook_at_all_is_not_opened_for_a_body(self):

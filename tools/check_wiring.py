@@ -308,87 +308,18 @@ OWED_GAPS: dict[str, str] = {
     # vocabulary could not spell, each with the fixture that grades it, and left
     # the emitter to the same ticket for the same reason -- a class shipped with
     # a Playbook written against it in one step is a Playbook nothing graded.
-    "W9 authorization.object_property_write": "owed:101",
-    "W9 injection.parser_differential": "owed:101",
     "W9 injection.unclaimed_reference": "owed:101",
-    "W9 session_handling.cookie_parsing": "owed:101",
-    "W9 authentication.recovery_flow": "owed:101",
-    "W9 information_disclosure.identifier_oracle": "owed:101",
-    "W9 rate_limiting.per_origin": "owed:101",
-    "W9 rate_limiting.resource_cost": "owed:101",
+    # W9 fires twice for one absence: once for the class the catalogue declares
+    # and nothing emits, and once more for each body that names it in prose. The
+    # ticket 101 rewrite made the second fire, because a Playbook that will not
+    # produce a verdict now says which class it is declining and why. Both
+    # spellings are the same owed emitter.
+    "W9 attack-surface injection.unclaimed_reference": "owed:101",
     "W9 transport.certificate_trust": "owed:101",
-    "W9 api rate_limiting.per_origin": "owed:101",
-    "W9 authentication authentication.recovery_flow": "owed:101",
-    "W9 graphql rate_limiting.resource_cost": "owed:101",
     "W9 http-desync transport.certificate_trust": "owed:101",
 
-    # W10. Three readings, no rows: this register's W10 section is empty, and
-    # each of the three left by being answered rather than by being excused.
-    #
-    # A browser mission instructed through a tool that runs no browser: ticket
-    # 99 served `mcp__rk2__browse` and `browser-evidence` now names it, so the
-    # row that owed it is removed rather than re-pointed.
-    #
-    # An identity on a request that carries none: ticket 97 settled that
-    # `identity_slot` is a property of the Tool run rather than an argument and
-    # rewrote the twenty bodies that instructed one, so the twenty rows that
-    # owed it are removed rather than re-pointed.
-    #
-    # An analysis of bytes the same body just told the model to fetch: ticket
-    # 106 put `request_artifact` and `response_artifact` on the answer to
-    # `mcp__rk2__http_request`, so a body that says fetch and then analyse is
-    # now naming a call the run can make. The twenty rows that owed it are gone
-    # for the same reason -- and the check itself changed with them, because it
-    # had carried "an exchange returns no Artifact label" as a premise in a
-    # comment and would have gone on reporting all twenty forever. It reads
-    # `_spend`'s answer now.
 
-    # W11. One reading, no rows. The gap this check was written from --
-    # `enumerate-surface` staged for `recon` and granted to nobody -- was
-    # registered against ticket 188 for as long as it took to write the
-    # migration, and `20261126T000000Z` re-granted it. The row is removed
-    # rather than re-pointed, which is what this register asks of a gap that
-    # is gone.
 
-    # W12a. Thirty-one Playbooks grade a refutation on an Observation kind that
-    # cannot be written for the Test they state: `response_invariant` on a role
-    # whose supported leg asks for something else, when `close_test_replay`
-    # takes the kind from the specification and so writes one kind per role
-    # whichever way the run comes out. Sixteen of the supported legs ask for
-    # `response_differential` and fifteen ask for one of six other kinds, which
-    # is why the check is not narrowed to the first. Ticket 101 rewrites all
-    # fifty bodies and every row here goes with the body it names.
-    "W12 agentic-ai variant refuted": "owed:101",
-    "W12 api-authorization variant refuted": "owed:101",
-    "W12 authentication variant refuted": "owed:101",
-    "W12 browser-realtime variant refuted": "owed:101",
-    "W12 client-side-path-traversal variant refuted": "owed:101",
-    "W12 cms variant refuted": "owed:101",
-    "W12 command-directory-injection variant refuted": "owed:101",
-    "W12 deployment variant refuted": "owed:101",
-    "W12 deserialization variant refuted": "owed:101",
-    "W12 exceptional-conditions variant refuted": "owed:101",
-    "W12 file-resolution variant refuted": "owed:101",
-    "W12 file-upload variant refuted": "owed:101",
-    "W12 graphql variant refuted": "owed:101",
-    "W12 grpc variant refuted": "owed:101",
-    "W12 identity-lifecycle variant refuted": "owed:101",
-    "W12 identity-parsing variant refuted": "owed:101",
-    "W12 jwt-jose variant refuted": "owed:101",
-    "W12 nosql-injection variant refuted": "owed:101",
-    "W12 oauth variant refuted": "owed:101",
-    "W12 orm variant refuted": "owed:101",
-    "W12 race-conditions variant refuted": "owed:101",
-    "W12 request-integrity variant refuted": "owed:101",
-    "W12 request-parsing variant refuted": "owed:101",
-    "W12 routing variant refuted": "owed:101",
-    "W12 sql-injection variant refuted": "owed:101",
-    "W12 ssrf-url-routing variant refuted": "owed:101",
-    "W12 structured-injection variant refuted": "owed:101",
-    "W12 web-cache variant refuted": "owed:101",
-    "W12 webauthn variant refuted": "owed:101",
-    "W12 webhooks variant refuted": "owed:101",
-    "W12 workload-identities variant refuted": "owed:101",
 
     # W12b. Thirty-five Playbooks never name all three Test roles in their own
     # prose, so a reader is told to build a Test in sentences that do not say
@@ -396,41 +327,6 @@ OWED_GAPS: dict[str, str] = {
     # `rk2_test_spec_problem`'s and fires at `propose_test`, and a Playbook that
     # describes a control without using the word is counted here anyway. Ticket
     # 101 is where the words are written.
-    "W12 api roles": "owed:101",
-    "W12 attack-surface roles": "owed:101",
-    "W12 authentication roles": "owed:101",
-    "W12 browser-framing roles": "owed:101",
-    "W12 browser-messaging roles": "owed:101",
-    "W12 browser-script roles": "owed:101",
-    "W12 client-side-path-traversal roles": "owed:101",
-    "W12 cms roles": "owed:101",
-    "W12 cookies roles": "owed:101",
-    "W12 deployment roles": "owed:101",
-    "W12 exceptional-conditions roles": "owed:101",
-    "W12 external-resources roles": "owed:101",
-    "W12 file-upload roles": "owed:101",
-    "W12 http-desync roles": "owed:101",
-    "W12 identity-lifecycle roles": "owed:101",
-    "W12 identity-parsing roles": "owed:101",
-    "W12 information-disclosure roles": "owed:101",
-    "W12 jwt-jose roles": "owed:101",
-    "W12 kubernetes roles": "owed:101",
-    "W12 logging roles": "owed:101",
-    "W12 oauth roles": "owed:101",
-    "W12 race-conditions roles": "owed:101",
-    "W12 request-integrity roles": "owed:101",
-    "W12 request-parsing roles": "owed:101",
-    "W12 routing roles": "owed:101",
-    "W12 secrets roles": "owed:101",
-    "W12 spreadsheet-injection roles": "owed:101",
-    "W12 ssrf-url-routing roles": "owed:101",
-    "W12 ssti roles": "owed:101",
-    "W12 structured-injection roles": "owed:101",
-    "W12 supply-chain roles": "owed:101",
-    "W12 web-cache roles": "owed:101",
-    "W12 webauthn roles": "owed:101",
-    "W12 webhooks roles": "owed:101",
-    "W12 workload-identities roles": "owed:101",
 }
 
 
@@ -1999,8 +1895,6 @@ def test_shape_gaps(wiring: Wiring) -> list[Gap]:
     and says so in every sentence it emits, because the enforcement it stands in
     for is real and lives in the database.
 
-    ## W12a -- the evidence a Playbook asks for, against the Observation the
-    ## replay lane writes
 
     `close_test_replay` derives an Observation's kind from the *specification*
     and not from the outcome
@@ -2022,7 +1916,6 @@ def test_shape_gaps(wiring: Wiring) -> list[Gap]:
     `callback_interaction` in the other fifteen. A check written against the
     kind the mechanism happens to write would have found half of them.
 
-    ## W12b -- the shape rule, which is prose, read as prose
 
     `rk2_test_spec_problem` refuses a specification that performs fewer than
     three actions or more than thirty-two, and one that leaves out any of

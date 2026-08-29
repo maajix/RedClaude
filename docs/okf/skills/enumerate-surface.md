@@ -32,4 +32,12 @@ Runtime tools it reaches through `run_tool`:
 
 ## Playbooks that load it
 
+- [api](/playbooks/api.md)
+- [api-authorization](/playbooks/api-authorization.md)
 - [attack-surface](/playbooks/attack-surface.md)
+- [authentication](/playbooks/authentication.md)
+- [exceptional-conditions](/playbooks/exceptional-conditions.md)
+- [external-resources](/playbooks/external-resources.md)
+- [information-disclosure](/playbooks/information-disclosure.md)
+- [oauth](/playbooks/oauth.md)
+- [request-parsing](/playbooks/request-parsing.md)

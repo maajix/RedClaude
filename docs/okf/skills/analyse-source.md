@@ -73,7 +73,6 @@ Runtime tools it reaches through `run_tool`:
 
 ## Playbooks that load it
 
-- [external-resources](/playbooks/external-resources.md)
 - [supply-chain](/playbooks/supply-chain.md)
 
 ## Maintainer references

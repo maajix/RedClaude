@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "sql-injection"
-description: "Ask whether a query parameter is concatenated into a SQL statement rather than bound to it, by sending one request as two arms whose payloads differ only in a clause the database evaluates and differencing the two stored responses against a neutral baseline."
+description: "Ask whether a query parameter is concatenated into a statement rather than bound to it, by sending arms whose values differ only in a clause the engine evaluates and differencing them against a length-matched twin and a baseline checked for stability first, in SQL and in the two neighbouring query languages the same shape reads."
 resource: ../../../src/redkraken/playbooks/sql-injection/playbook.md
 tags: [injection, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: 4413bd5b31231faceb33fa79bdde7608cb9a02cf033c658a71ba124a3e018602
-bb:sha256: b262e279d54e33100001b80eeb603bedbcdedd9bd8e7ddbc992b4cd7fa16270d
+bb:version: adf3f3af12448829e21f7e2d7bef8698ef09ff102a9f2a4f639e80ddde3b768c
+bb:sha256: 255e0cd4086a71b2aff0b29a16a1a67f941ffa51407b3ff71d888ef5bf6d1e66
 sources:
   - id: sql-injection--sqli-advanced-sqli-techniques
     resource: /references/sql-injection--sqli-advanced-sqli-techniques.md
@@ -67,7 +67,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a query parameter is concatenated into a SQL statement rather than bound to it, by sending one request as two arms whose payloads differ only in a clause the database evaluates and differencing the two stored responses against a neutral baseline.
+# Ask whether a query parameter is concatenated into a statement rather than bound to it, by sending arms whose values differ only in a clause the engine evaluates and differencing them against a length-matched twin and a baseline checked for stability first, in SQL and in the two neighbouring query languages the same shape reads.
 
 ## What it concludes about
 
@@ -90,13 +90,13 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
 - to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 53 as the v2 replacement for v1's sql-injection pack against the query_language leaf of the ticket 18 vocabulary; the pack's twelve pages are attached as maintainer references and every extraction, union and escalation step in them is refused by step 6.
+Written for ticket 53 as the v2 replacement for v1's sql-injection pack against the query_language leaf of the ticket 18 vocabulary; the pack's twelve pages are attached as maintainer references and every extraction, union and escalation step in them is refused by section 8. Rewritten for ticket 101 against the merged technique ledger, which carries eighteen readings and five standing refusals for this slug. One frontmatter key moved and it is a repair -- the refuted leg of the variant asked for response_invariant while its supported leg asked for response_differential, and close_test_replay derives one kind per role from the specification, so the refuted leg was a bar nothing could clear. Repaired again in review -- the differing assertions named the control, which would have left the control row unmet, so they now name the baseline; and section 5 is restated as a lead, since a park closes the run and no assertion reads a correlator or a clock. Sections 3 and 4 gained a baseline and an assertion in round 3.
 
 ## Maintainer references
 

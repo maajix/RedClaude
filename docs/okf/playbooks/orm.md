@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "orm"
-description: "Ask whether a query parameter names a stored field or a relation to the ORM that builds the statement, by sending one request with a field the caller was never offered and differencing the response against a request naming a field that does not exist."
+description: "Ask which column, relation or comparison the caller chose, by sending one query parameter as a name the interface offers, as a real name it never offered, and as a fictional name of the same shape, and reading which pair the query builder tells apart."
 resource: ../../../src/redkraken/playbooks/orm/playbook.md
 tags: [injection, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: fcb36f805ace0a76a8e9363f5b19155d6ef3cbfdd0dda51b054a0ccf07f92503
-bb:sha256: cb456b677ac45005b7026cc2eed7f8f20e5f9d2a99d72f5d06aa4c2b549e6593
+bb:version: 8afb7a093765183abe6144bbd69f103cf9efaeac9b1f7896ba8c06f54df93c82
+bb:sha256: 4d6ef4c89f84c03932ec9ebde1f0236f5ed9c11f79e75402d9e223513bbc6d74
 ---
 
-# Ask whether a query parameter names a stored field or a relation to the ORM that builds the statement, by sending one request with a field the caller was never offered and differencing the response against a request naming a field that does not exist.
+# Ask which column, relation or comparison the caller chose, by sending one query parameter as a name the interface offers, as a real name it never offered, and as a fictional name of the same shape, and reading which pair the query builder tells apart.
 
 ## What it concludes about
 
@@ -41,13 +41,13 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
 - to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 53 as the v2 replacement for v1's orm page, against a new query_field leaf added by ticket 53 because an ORM injection changes which column the query names rather than what the query says; no upstream card.
+Written for ticket 53 as the v2 replacement for v1's orm page, against a new query_field leaf added by ticket 53 because an ORM injection changes which column the query names rather than what the query says; no upstream card. Rewritten for ticket 101 against the merged ledger, which carries four procedures and one refusal for this slug, and every procedure closes a Test because the whole differential is one parameter value in the request line. One key moved. The refuted variant leg moves from response_invariant to response_differential, the kind the supported leg of the same role names, because close_test_replay derives a kind from the specification rather than from the outcome, so one role writes one kind whichever way the reading comes out and a refuted leg naming a second kind is a leg nothing can ever write. The control role keeps response_invariant, which the unchanged repeat produces where sections 2 and 3 now plan that repeat as a control action rather than as a second baseline send.
 
 ## The authoritative document
 

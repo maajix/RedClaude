@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "kubernetes"
-description: "Ask whether an operational endpoint meant for the platform that runs an application answers callers of the application's own ingress, by requesting the endpoint with nothing presented and reading whether what comes back describes the workload rather than the application."
+description: "Ask whether an operational endpoint meant for the platform that runs an application answers callers of the application's own ingress, by reading with a tool whether the unauthenticated body describes the workload rather than the application, and by asking at most three of that platform's convention route names against a fabricated name of the same shape."
 resource: ../../../src/redkraken/playbooks/kubernetes/playbook.md
 tags: [information_disclosure, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -10,15 +10,15 @@ stale_after: 2027-05-15T00:00:00Z
 bb:category: information_disclosure
 bb:outputs: [information_disclosure.workload_metadata]
 bb:triggers_all: [read_method, tech_orchestrator, unknown_auth_endpoint]
-bb:skills: [compare-responses, handle-untrusted-content]
+bb:skills: [browser-evidence, compare-responses, handle-untrusted-content]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: cc9fe1b123c3cb821dfc9bc3db166aa4a5011545d1061df8e846db4690896cf3
-bb:sha256: f4539409f24e4d1200d6dd2ff7f7b26f85387de8e778440f4714df5b50c2ba5e
+bb:version: b33a38c5f26278de2548341609525366158cedb20dba3e979f545a4b21dbfbce
+bb:sha256: 588a9f513e5f1c0c9d73801ec006046a09112176e3b2fa75a83025b33dce1cb3
 ---
 
-# Ask whether an operational endpoint meant for the platform that runs an application answers callers of the application's own ingress, by requesting the endpoint with nothing presented and reading whether what comes back describes the workload rather than the application.
+# Ask whether an operational endpoint meant for the platform that runs an application answers callers of the application's own ingress, by reading with a tool whether the unauthenticated body describes the workload rather than the application, and by asking at most three of that platform's convention route names against a fabricated name of the same shape.
 
 ## What it concludes about
 
@@ -36,6 +36,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Skills it loads
 
+- [browser-evidence](/skills/browser-evidence.md)
 - [compare-responses](/skills/compare-responses.md)
 - [handle-untrusted-content](/skills/handle-untrusted-content.md)
 
@@ -47,7 +48,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 55 as the v2 replacement for v1's kubernetes page against a new workload_metadata leaf added by ticket 55; the v1 page carried no attachments, and its cluster enumeration, its service-account theft and its node reconnaissance are refused by step 6.
+Written for ticket 55 as the v2 replacement for v1's kubernetes page against a new workload_metadata leaf added by ticket 55; the v1 page carried no attachments, and its cluster enumeration, its service-account theft and its node reconnaissance are refused by the closing section. Rewritten for ticket 101 against the merged ledger's four readings for this slug. One is a procedure, one is a lead that stops at an Observation because content_match is agent-filed, and two are named in the closing section as refused. browser-evidence joins the skills because the non-JSON reader is a browse mission and a browse run is the tool_run that content_match cites.
 
 ## The authoritative document
 

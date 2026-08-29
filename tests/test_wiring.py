@@ -633,25 +633,20 @@ class WiringReadingTest(unittest.TestCase):
         self.assertEqual(["W12 probe roles"], [gap.key for gap in found])
         self.assertIn("never names control", found[0].detail)
 
-    def test_what_the_shipped_corpus_owes_is_counted_and_registered(self):
-        # The number this gate was switched on with, so that the rewrite has
-        # something to measure itself against. Thirty-one bodies grade an
-        # unreachable refutation and thirty-five never name all three roles;
-        # fifteen of the fifty name them all.
-        found = check_wiring.test_shape_gaps(self.wiring)
-        unreachable = [gap for gap in found if gap.subject.endswith(" refuted")]
-        unnamed = [gap for gap in found if gap.subject.endswith(" roles")]
-
-        self.assertEqual(31, len(unreachable))
-        self.assertEqual(35, len(unnamed))
-        self.assertEqual(len(found), len(unreachable) + len(unnamed))
-        # And every one of them is on the register, against the ticket that owes
-        # the rewrite. The other direction -- a row with no gap -- is
-        # `register_errors`' and is asked in `WiringRegisterTest`.
-        self.assertEqual(
-            {"owed:101"},
-            {check_wiring.OWED_GAPS.get(gap.key) for gap in found},
-        )
+    def test_what_the_shipped_corpus_owed_is_paid_and_off_the_register(self):
+        # The gate was switched on against a corpus owing sixty-six of these:
+        # thirty-one bodies grading an unreachable refutation and thirty-five
+        # never naming all three roles, with fifteen of the fifty naming them
+        # all. Ticket 101 rewrote every body against the mined ledger and
+        # closed all sixty-six. The count stays a test rather than a deletion,
+        # because a corpus that regresses is a corpus nobody notices without
+        # one, and it is spelled as the gaps themselves so a failure names the
+        # Playbook rather than only the arithmetic.
+        self.assertEqual([], [gap.key for gap in check_wiring.test_shape_gaps(self.wiring)])
+        # And nothing on the register still claims one of them. The other
+        # direction -- a row with no gap -- is `register_errors`' and is asked
+        # in `WiringRegisterTest`.
+        self.assertEqual([], [key for key in check_wiring.OWED_GAPS if key.startswith("W12 ")])
 
 
 class TicketThirtyEightTest(unittest.TestCase):

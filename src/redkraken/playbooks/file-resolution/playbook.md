@@ -1,5 +1,5 @@
 ---
-description: Ask whether a path-valued parameter resolves outside the directory a route serves, by sending two arms that name two different documents outside it and one that normalises back inside, and differencing the stored responses against a baseline that was itself invariant.
+description: Ask where a path-valued parameter's read landed rather than what its string contained, by naming two different documents outside the directory a route serves, climbing to find where it roots the path, asking whether its guard strips once or to a fixed point, and asking whether the resolved name reaches a stream API at all.
 bb:category: injection
 bb:outputs: ["injection.path"]
 bb:triggers_all: ["authenticated_endpoint", "path_valued_parameter", "read_method"]
@@ -9,169 +9,181 @@ bb:effects: read_only
 bb:baseline: stable_session
 bb:status: draft
 bb:stale_after: 2027-04-15
-bb:provenance: Written for ticket 54 as the v2 replacement for v1's file-resolution pack against the path leaf of the ticket 18 vocabulary; the pack's three pages are attached as maintainer references and their wrapper chains, their filter chains and their read-until-you-find-a-key advice are refused by step 7.
-bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_invariant", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
+bb:provenance: Written for ticket 54 as the v2 replacement for v1's file-resolution pack against the path leaf of the ticket 18 vocabulary; the pack's three pages are attached as maintainer references and their chains and their read-until-you-find-a-key advice are refused by the last section. Rewritten for ticket 101 against the merged ledger, which carries five readings and three refusals for this slug; three of the five are new. One key moved. The refuted variant row named response_invariant while the supported row of the same role names response_differential, and one role writes one kind whichever way a reading goes, so the refuted row now names response_differential too. The stored-path reading keeps bb:effects read_only by parking before its write rather than performing it.
+bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_differential", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
 bb:references: ["lfi.md", "path-traversal-encoding-variants.md", "php-filter-chain-lfi-rce.md"]
 ---
 
 # Ask where the read landed
 
-Every route that serves a document by name resolves a string to a location.
-Normalising the string is not the check. The check is where the resolution
-landed, and a route that never asks is one that will read whatever the caller's
-string points at.
+Every route that serves a document by name resolves a string to a location. Normalising the string
+is not the check. The check is where the resolution landed, and a route that never asks will read
+whatever the caller's string points at.
 
-The subject is an authenticated read endpoint carrying a parameter a recon pass
-typed as a path. The question is whether that parameter resolves outside the
-directory the route serves, and the whole reading is six requests.
+The subject is an authenticated read endpoint carrying a parameter a recon pass typed as a path, and
+five readings ask five questions of it. Before the first arm, read the parameter through
+`mcp__rk2__get_attack_surface` and say what the route is meant to serve because "outside" is
+meaningless without it and a reading that cannot name the boundary is not reading this class.
 
-## 1. Name the parameter and the directory
+Every request goes out through `mcp__rk2__http_request` and every specification is proposed with
+`mcp__rk2__propose_test`; close_test_replay is the only writer of the transition a Finding needs
+and derives both the verdict and the Observation kind from a Test's own assertions.
 
-Read the parameter from the state view. Then say what the route is meant to
-serve, from what an ordinary request returns: an export directory, a template
-directory, a per-tenant bucket, a media store.
+**Every closing Test has the same shape.** Actions 1 and 2 carry role `baseline`: the route's ordinary
+request, sent twice unchanged, asserted `body_equals`. One or two carry role `control`, each asserted
+`body_equals` against the action it must match or named by no assertion at all. Two carry role `variant`,
+and the single `body_differs` names one against the other. Only variant actions are named by a differing
+assertion, which leaves every control a `response_invariant` and every variant a `response_differential`.
+A specification holds three to thirty-two actions and all three roles, or it is refused before it runs.
 
-Say it before sending anything, because "outside" is meaningless without it and
-because the verdict at the end is a claim about a boundary. A reading that cannot
-name the boundary is not reading this class.
+**One spelling wall decides where the traversal rides.** A specification url carries no path segment
+that is `.` or `..` and no `%2e` anywhere, query included, and the segment rule tests the path
+alone. So a traversal spelled with literal dots in the QUERY is closeable by a Test;
+percent-encoded, or moved into the path, it is not, and those two spellings are leads whose product
+is an agent-filed Observation. The arms then differ only in the query, which the runtime does not
+compare when it binds a Receipt to an action, so record each arm's Receipt immediately after its own
+send and never in a batch.
 
-Then declare the ceiling, before the first arm is composed, because every arm
-after this step asks the route to resolve a name the client chose:
+## 1. Ask where the read landed
 
-* **mutation** -- nothing this reading sends writes. Every request is the read
-  the route already offers, with one value changed.
-* **cleanup** -- there is nothing to clean up, because nothing is created. If the
-  route logs what it was asked for and that log is somebody's to clear, say so
-  here.
-* **execution** -- every value resolves to a file chosen for being dull. Nothing
-  chains a stream wrapper, builds a filter chain, reaches a log in order to
-  poison it, or turns a read into an execution.
+Send the request with the parameter naming a document the route is meant to serve, then send it
+again unchanged. Both go out as whichever Identity the Task was opened under: the step does not
+choose it and there is no argument for it. Those two sends are actions 1 and 2 of every
+specification below.
 
-If the ceiling cannot be met, stop here, record `inconclusive`, and route to an
-operator. Step 8 restates all three at the end.
+Then two requests leaving the directory and naming two DIFFERENT documents outside it:
+`/etc/hostname`, `/proc/version`, a framework `VERSION` file, the application's own `README`. Both
+ride the query, both spelled with literal dots. They are the two variant actions and the
+`body_differs` names one against the other: a single traversal that returns something has to be
+compared with something, and where the route resolved both, the answers differ as no refusal would.
+Both targets are dull on purpose.
 
-Complete this step with the endpoint, the one parameter, the directory and the
-ceiling.
+The first control CONTAINS a traversal and resolves back inside -- `notes/../report.txt`, where
+`report.txt` is the baseline's document -- asserted `body_equals` against action 1. A route that
+rejects it is matching the string's syntax rather than the resolution, and it stops the commonest
+false positive here, reporting the presence of `..` in an accepted value. The second control is a
+document outside the directory whose leaf exists nowhere, same shape and depth, and it settles what
+the arms cannot: an error page quoting the name, a router that mapped the string elsewhere, a cache
+that keyed on it. No assertion names it, because one would make it a `response_differential` and the
+bar wants the control invariant.
 
-## 2. Establish the baseline, twice
+Interleave with the baseline and send two rounds of the pair. Where an arm returns a document that is not
+the dull file it named -- a key, a `.env`, a session store, source code -- do not store a second copy and
+do not widen the read: call `mcp__rk2__park_for_human` with this run's own Task in `task_label` and
+`question_code` scope_ambiguous, naming the arm, the path and the Artifact id, because whether a reading
+continues against a target that has spilled credential material is a person's decision.
 
-Send the request through `mcp__rk2__http_request`, with the parameter naming a
-document the route is meant to serve. Then send it again, unchanged. Both go out
-as whichever Identity the Task was opened under: the step does not choose it and
-there is no argument for it.
+## 2. Ask where the route roots the path
 
-Two identical requests, for the reason every comparison in this corpus starts
-with two: a differential measured against a baseline nobody checked is noise with
-a verdict attached. If the two differ, run `compare-responses` and record what
-moved; the rest compares only what held still.
+Climb one segment at a time through `mcp__rk2__http_request` until the dull file answers, stopping
+at six depths or at a plausible filesystem root: a climb that never changes is a route that does not
+resolve, and further depth is a wordlist. The depth values live in the query, so every depth is
+expressible in a specification.
 
-## 3. Send the two arms
+One Test closes it. The two baseline sends are actions 1 and 2. The two variants are the winning
+depth and the same depth with a leaf that certainly does not exist, `body_differs` naming one
+against the other: that pair shows the answer tracks the filesystem rather than the segment count.
+The control is the identical climb preceded by the directory prefix the route publishes, which says
+whether a strip list or an anchored join is doing the work. `close_test_replay` writes the verdict
+and both Observations.
 
-Two more requests. Both leave the directory, and they name two *different*
-documents outside it:
+## 3. Ask whether the guard strips once or to a fixed point
 
-* the variant names a file that exists on essentially every host of that kind
-  and holds nothing sensitive -- `/etc/hostname`, `/proc/version`, a framework's
-  own `VERSION` file, the application's own `README`
-* the second arm names a second such file, equally dull and equally certain to
-  exist
+Only where the plain form was refused. The refusal is the precondition, not the obstacle: where
+`../` already resolves, section 1 is the reading and this one is not.
 
-Two arms rather than one, because a single traversal that returns something has
-to be compared with something. Two arms that leave the directory and land on
-different documents give the comparison its subject: if the route resolved them,
-the answers differ from each other, and no refusal explains that.
+The two variants are the plain `../<dull-file>`, which the route refuses, and `....//<dull-file>`,
+which a single non-recursive replacement of `../` turns into the plain form after the check has
+already run; the `body_differs` names one against the other, and that difference is the whole claim.
+`..././<dull-file>` is the same defect spelled the other way and gets its own specification. The
+control is `....X//<dull-file>` -- same length, same character classes, one byte no strip rule
+removes -- asserted `body_equals` against the plain refusal. Where it answers like the reassembling
+arm instead, the difference was length or shape.
 
-Choose targets that are boring on purpose. A reading whose evidence is
-`/etc/shadow`, a private key, a `.env`, a cloud credential file or a session
-store has read the target's secrets to prove it could read the target's secrets,
-and the report then contains the thing the report is about.
+These are query values, not path segments, so the specification's dot rule does not fire. Never
+re-spell this arm with `%2e`: the reassembly it asks about happens in the target's strip rule, and
+an encoding moves the question while making the Test unopenable. Halt at the accept/reject boundary
+-- no climbing, no added depth, no second file -- and record the boundary in the Task's own record.
+The guard and the resolver reading one string differently is `injection.parser_differential`, handed
+to `browser-script`, which emits that class since ticket 101; this reading claims `injection.path`.
 
-Interleave with the baseline, hold everything else constant, and send two rounds
-of the pair.
+## 4. Ask whether the resolved name reaches a stream API
 
-## 4. Send the arm that normalises back inside
+Only where a PHP runtime is already suggested by an error shape or a banner, and only as the
+acceptance question: this is the one place the ceiling below admits a wrapper, admitted because the
+arm discloses nothing the reading did not already hold. Name
+`php://filter/convert.base64-encode/resource=` with the route's OWN served document as the resource;
+if the wrapper is honoured the body is the base64 of the baseline body, this reading's own bytes in
+another encoding. That arm and the same wrapper naming a resource that does not exist are the two
+variants, `body_differs` naming one against the other. The control is `php://nonsuch`, a scheme PHP
+does not register, which must answer like a miss. The Test closes on the differing assertion and
+needs no decode.
 
-One more request, and it is the control this class needs most. The parameter
-carries a value that *contains* a traversal and resolves back inside the
-directory: `notes/../report.txt` where `report.txt` is the document step 2 used.
+Where the base64 is decoded for the report, `jq` cannot read it -- a filter and an input, no raw-input
+flag, and this body is not JSON -- so the reader is a browse run through `mcp__rk2__browse`, a tool run
+by foreign key, backing a content_match filed with the proposal through
+`mcp__rk2__submit_mission_result` and written by promote_proposal. That citation settles nothing.
 
-A well-built route answers that request normally. A route that rejects it is
-matching the syntax of the string rather than checking the resolution, which is
-worth saying in the observation and is not this Hypothesis.
+## 5. Ask whether a stored value becomes a later route's location
 
-This arm is also what stops the most common false positive in the class: a
-reading that reports the presence of `..` in an accepted value. `..` in the input
-is not a finding. A read that landed outside the directory is.
+Its trigger is not `path_valued_parameter`: no path in the request resolves, which is why
+single-request scanning misses it. It needs a persisted field, a second route that derives a
+filesystem location from it, and three accounts the Program controls. Account A stores an ordinary
+value, account B one that traverses out of the per-user directory to a dull file, account C one of
+the same length and shape that traverses and comes back.
 
-## 5. Difference the stored bytes
+**This section is a lead of this Playbook and grades nothing.** The store is a write and this Playbook is
+read_only, so do not send it here: call `mcp__rk2__park_for_human` with this Task in `task_label` and
+`question_code` destructive_action, naming the field, the three values and the route. Parking closes the
+run, so the write, the fetches below and the Test that closes them are graded elsewhere.
 
-Run `compare-responses` over the two out-of-directory arms, then over the
-normalising arm and the baseline. Cite what the script returns.
+Only the derived-asset fetches are Test actions, and the accounts' asset urls have to DIFFER,
+because that url difference is the whole request-line differential; where both read one url and only
+the Identity differs, a run holds one Identity for its length and the reading falls back to an
+agent-filed Observation. A's two fetches are the baseline pair; B's and C's are the two variants,
+`body_differs` naming one against the other; A's third fetch is the control, asserted `body_equals`
+against action 1. C answering like B says the route reacts to the shape of the stored string rather
+than resolving it. Restore every stored value through the application's own route and read it back
+before the reading is reported.
 
-Variant against variant is the differential: two names, two documents, and the
-route resolved both. Normalising arm against baseline is the corroboration that
-the route works and that the boundary is where step 1 said it was.
+## 6. State the claim, and state what would refute it
 
-A route that refuses both out-of-directory arms with the identical body is
-refuting the Hypothesis, and it refutes it whether the refusal is a 404, a 403 or
-a 200 carrying the default document -- what matters is that the two arms did not
-differ from each other.
+The Hypothesis is `injection.path` on the endpoint, proposed through `mcp__rk2__propose_finding`
+once close_test_replay has carried it to supported. It is supported when the two out-of-directory
+arms differ from each other in both rounds, the baseline was invariant, the normalising control
+answered like an ordinary request, and the nonexistent-leaf control did not reproduce the arms. It
+is refuted when the two arms are invariant against each other against a stable baseline: the
+resolution was checked and both names landed in one refusal, whether that refusal is a `404`, a
+`403` or a `200` carrying the default document. This section runs no Test and grades nothing.
 
-## 6. Rule out the two neighbours the arms cannot separate
+Three neighbours are close. Where the resolution happens in the browser, the class is
+`injection.client_path` and the Playbook is `client-side-path-traversal`. Where a document is
+published at a path nobody linked, it is `information_disclosure.artifact_exposure` and
+`attack-surface`. Where the caller's name decides how a stored document is later served, it is
+`injection.stored_file` and `file-upload`.
 
-A response that differs between the two arms could also come from a route that
-did not read a file at all: an error page that quotes the requested name, a
-router that mapped the string to a different handler, a cache that keyed on it.
+## 7. The ceiling, and the three readings this slug refuses
 
-One more request settles it. Name a document outside the directory that does not
-exist anywhere -- same shape, same depth, nonexistent leaf. If its answer matches
-the arms rather than the refusal, nothing was read and the difference was the
-string. If it answers like a miss, the arms read something.
+This Playbook is `read_only` and every value it sends resolves to a file chosen for being dull. It
+does not walk the filesystem, iterate a wordlist, or read a credential file, a key, a session store
+or source code. Section 4's single filter is the one wrapper admitted; the three attached references
+are almost entirely about what follows it, and each refusal below travels with its reason.
 
-## 7. State the claim, and state what would refute it
+Seeding a file the target writes -- a log through a recorded header, a session file through a
+persisted value -- and then including it is refused before the seeding request. The schema does not
+stop it, since a PHP tag passes the header value pattern, so this is a decision: the write has no
+undo, it corrupts the record the target's own incident response reads, and the session-store half
+rewrites other people's sessions to stay alive.
 
-The Hypothesis is `injection.path` on the endpoint. It is supported when the two
-out-of-directory arms differ from each other in both rounds, the baseline was
-invariant, the normalising arm answered like an ordinary request, and the
-nonexistent-leaf probe did not reproduce the arms. It is refuted when the two
-out-of-directory arms are invariant against each other against a stable baseline
--- the resolution was checked, and both names landed in the same refusal.
+The generated filter chain and the per-character error oracle are refused before the first request;
+the body limit is not the blocker and a reader must not conclude it is. The chain's precondition IS
+the finding section 4 establishes, so it adds an exploit rather than a fact, and the oracle exhausts
+the interpreter's memory once per request across hundreds.
 
-Anything else is inconclusive: an unstable baseline, a route behind a WAF that
-refuses every value containing a dot-dot, a route that answers 403 to everything
-including the baseline.
+Widening a proven read to the files that make the report severe -- `/proc/self/environ`, private
+keys, `.env`, cloud credential files, the session directory -- is refused at the line the card draws
+for cloud metadata credentials. One dull file settled the claim, and reading the process environment
+to decide whether it holds a credential is reading the credential.
 
-Three neighbours are close.
-
-* Where the resolution happens in the browser rather than on the server -- a
-  fetch built from a fragment, a router that reads a path out of the URL -- the
-  class is `injection.client_path` and the Playbook is
-  `client-side-path-traversal`.
-* Where the document is simply published at a path nobody linked, with no
-  parameter deciding anything, the class is
-  `information_disclosure.artifact_exposure` and the Playbook is
-  `attack-surface`.
-* Where the caller's name decides how a *stored* document is later served rather
-  than which document is read, the class is `injection.stored_file` and the
-  Playbook is `file-upload`.
-
-Cite the Artifacts and the difference the script returned.
-
-## 8. The ceiling, restated at the end
-
-This Playbook is `read_only` and its baseline is a session that stays stable. It
-sends six requests to the one endpoint the Task names, and every value it sends
-resolves to a file chosen for being dull.
-
-It does not walk the filesystem, iterate a wordlist of candidate paths, read a
-credential file, read a key, read a session store, read source code to look for
-secrets in it, chain a stream wrapper, build a filter chain, reach a log file in
-order to poison it, or turn a read into an execution. The three attached
-references are entirely about those techniques, and each says why it is out: the
-property is that the resolution left the directory, and one dull file already
-proves it.
-
-Nothing here writes and nothing here needs cleaning up. Where the response side
-has nothing to show -- a route that streams to a queue, discards the body, or
-answers from a cache -- the verdict is `inconclusive` and it routes to an
-operator rather than to a louder channel.
+Where the response side has nothing to show, the verdict is `inconclusive` and is recorded in the
+Task's own record. This section performs and grades nothing. 3 of 7 steps cannot be graded.

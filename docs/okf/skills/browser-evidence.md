@@ -33,9 +33,13 @@ bb:sha256: 2bd89d68d635be315c870de85e6a1007ec819c0ebcf38d7d3d1fbc07c138ea26
 
 ## Playbooks that load it
 
+- [browser-framing](/playbooks/browser-framing.md)
 - [browser-messaging](/playbooks/browser-messaging.md)
 - [browser-script](/playbooks/browser-script.md)
+- [browser-storage](/playbooks/browser-storage.md)
 - [client-side-path-traversal](/playbooks/client-side-path-traversal.md)
 - [cookies](/playbooks/cookies.md)
+- [file-upload](/playbooks/file-upload.md)
+- [kubernetes](/playbooks/kubernetes.md)
+- [logging](/playbooks/logging.md)
 - [oauth](/playbooks/oauth.md)
-- [realtime](/playbooks/realtime.md)

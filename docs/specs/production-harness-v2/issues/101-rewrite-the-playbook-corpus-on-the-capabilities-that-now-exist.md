@@ -6,9 +6,9 @@ techniques have no home in. This is the ticket the other seven exist for.
 
 **Blocked by:** 94 — Hand the response headers to the caller; 95 — A bounded string argument must say maxLength; 96 — Carry a request body; 97 — Settle what an Identity slot is; 98 — Let a playbook step reach the out-of-band channel; 99 — Let a playbook step drive the browser; 100 — Extend the vocabulary the corpus is missing; 109 — `compare_responses` differences two Artifacts where eleven Playbooks ask for more; 210 — The gate stops reading at the first semicolon it should have skipped; 211 — A Test action carries the header and the body it plans; 214 — A Receipt answers the arm it was planned for.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] **The rewrite uses the operator's pentest corpus and current external
+- [x] **The rewrite uses the operator's pentest corpus and current external
       research, with provenance.** The local source is
       `/home/majix/hacking-wiki`: its index currently carries 326 concept pages,
       including 131 Web, 30 Infrastructure/Network and 15 Windows/AD/Lateral
@@ -21,7 +21,7 @@ techniques have no home in. This is the ticket the other seven exist for.
       records source version/date, technique, Playbook destination, whether the
       harness can execute it, the permitted payload family and the evidence
       writer. A link list without that mapping does not satisfy this criterion.
-- [ ] **All fifty Playbooks, not only the five High-Yield pairs, carry an
+- [x] **All fifty Playbooks, not only the five High-Yield pairs, carry an
       executable testing shape.** Each one states prerequisites, attack
       hypothesis, baseline, variant, control, allowed payload family, branches,
       stop conditions and the evidence bar for both `supported` and `refuted`.
@@ -44,7 +44,7 @@ techniques have no home in. This is the ticket the other seven exist for.
       `/home/majix/hacking-wiki` is input, not proof of conformance: its shape is
       OKF-like, but its root currently lacks `okf_version` and many imported
       Notion pages lack `type` and the v0.2 trust/provenance families.
-- [ ] **Part of this work needed no new capability and is done first.** The
+- [x] **Part of this work needed no new capability and is done first.** The
       research names 11 techniques that are reachable today with `method`, `url`
       and `headers` alone or with the ten already-registered browser actions,
       and that no Playbook uses: double-decoding across a proxy hop (01 #2);
@@ -62,22 +62,22 @@ techniques have no home in. This is the ticket the other seven exist for.
       (07 #5). The preflight half of 02 #10 goes in beside them: `OPTIONS` has
       been in the method enum since the contract was written
       (`roster.py:743-747`) and no Playbook sends one.
-- [ ] The 29 Playbooks that name `identity_slot` say what ticket 97 settled
+- [x] The 29 Playbooks that name `identity_slot` say what ticket 97 settled
       instead, and the string `identity_slot` appears in no `playbook.md` in the
       corpus afterwards.
-- [ ] The Playbooks whose reading is a document -- GraphQL, gRPC, SOAP, SCIM,
+- [x] The Playbooks whose reading is a document -- GraphQL, gRPC, SOAP, SCIM,
       token endpoints, the injection corpus and all ten techniques of file 08 --
       carry a step that sends one, rather than prose describing one.
       `playbooks/graphql/playbook.md:42-43` and
       `playbooks/grpc/playbook.md:50` are the two the research quotes and there
       are more.
-- [ ] `authentication.recovery_flow` has an emitter. The class exists
+- [x] `authentication.recovery_flow` has an emitter. The class exists
       (`0018_vocabularies.sql:105-106`), the fixture that grades it exists
       (`20260915T000000Z…:92`), our own authentication Playbook names it in
       prose (`playbooks/authentication/playbook.md:101`), and no `bb:outputs`
       anywhere declares it -- so a fixture and a class have been sitting unused
       on either side of a gap no document crosses.
-- [ ] **The hard-coded catalogue lists are updated with every added or removed
+- [x] **The hard-coded catalogue lists are updated with every added or removed
       Playbook.** `tests/test_playbook.py:491-545` enumerates all fifty names in
       sorted order, and the v1 disposition rows resolve against that same list,
       so a Playbook without a row or a row without a Playbook fails one of the
@@ -89,7 +89,7 @@ techniques have no home in. This is the ticket the other seven exist for.
       playbooks that carry references"; that number does not check out --
       counted at this commit the map holds **31** entries and 31 Playbook
       directories have a `references/` directory, over 74 reference files.
-- [ ] Every new or rewritten Playbook satisfies the frontmatter rules section B
+- [x] Every new or rewritten Playbook satisfies the frontmatter rules section B
       of `00-todo-and-harness-gaps.md` records, each of which is a load rule
       rather than a style preference: 12 required `bb:` fields, 2 optional
       (`bb:triggers_any`, `bb:references`) and 7 forbidden
@@ -106,7 +106,7 @@ techniques have no home in. This is the ticket the other seven exist for.
       (`tests/test_playbook.py:461-471`); and `bb:references` naming only files
       that exist under the Playbook's own `references/`, with no symlinks and no
       undeclared file sitting there (`playbook.py:459-482`).
-- [ ] Nothing is added that the research says we should not build, and each
+- [x] Nothing is added that the research says we should not build, and each
       refusal keeps the reason the research gave, because a refusal without its
       reason gets re-proposed: the raw-framing and desync classes, which
       `0025_transport_claims.sql:222-233` records as `unmakeable` and an
@@ -124,12 +124,12 @@ techniques have no home in. This is the ticket the other seven exist for.
       want and which the browser lane does not do. Techniques whose
       cross-origin half needs a second origin go in with that half described and
       its preconditions checked, not executed.
-- [ ] The four techniques the matrix marks unmapped or out of scope stay out:
+- [x] The four techniques the matrix marks unmapped or out of scope stay out:
       07 #2, #4, #7 and the claiming half of #12, each because the subject is a
       source repository, a CI runner or a vendor's own API rather than an
       application the Program's scope covers, and no harness change makes it in
       scope.
-- [ ] Every Playbook this ticket touches still ships `draft`, and the corpus
+- [x] Every Playbook this ticket touches still ships `draft`, and the corpus
       statements that count the catalogue move together with it -- the
       enumerated corpus in `tests/test_database.py`, the binding totals `rk
       playbook cost` states, and whatever ticket 84's campaign was costed
@@ -152,6 +152,83 @@ of the catalogue". The first criterion above is the one exception the research
 itself carves out -- the section titled "What is already reachable and simply
 unused", which says of those eleven techniques that "nothing below needs a
 ticket; they need a playbook edit".
+
+## What was built
+
+All fifty `playbook.md` files, rewritten against a measured ledger rather than
+against the research prose: `50 files changed, 8437 insertions(+), 5706
+deletions(-)`. The ledger is `baseline/technique-ledger.jsonl` -- 378 records
+over 50 Playbooks, each carrying a `capability_state` (`reachable` 270,
+`blocked` 43, `refused` 55, `out_of_scope` 10), a `runtime_writer` naming the
+verb that files the Observation, and `external_sources` with a version or a
+date on every one of 809 references. `check_intake` reads it at `records 378
+playbooks 50 skills 6`, `sources 1524 local 715 external 804`.
+
+**The re-freeze migration.**
+`src/redkraken/migrations/20261219T000000Z__the_corpus_is_rewritten_and_refrozen.sql`,
+generated from `playbook.PLAYBOOKS` and never typed. It moves six columns on
+`playbooks` -- `source_sha256`, `version`, `risk`, `effects`, `specificity`,
+`provenance` -- and replaces four set-valued tables outright, each with its own
+`ROW_COUNT` assertion so a miscount raises rather than half-applying:
+
+```
+150  playbook_evidence      50  bodies re-registered
+ 58  playbook_outputs      119  playbook_skills      141  playbook_triggers
+```
+
+Every count is what `playbook.PLAYBOOKS` sums to today, checked against the
+compiled corpus rather than against the file.
+
+**The OKF correction, in three parts.** A flow indicator ends a scalar wherever
+it stands, not only where it opens, so `_flow_sequence` read `tags: [a[b]` and
+`tags: [a]b]` as one element each where a parser reads two. `FLOW_INDICATORS`
+and `_flow_plain` in `src/redkraken/okf.py` refuse all four characters anywhere
+in an unquoted element, and `tests/test_okf.py` carries the four counter-examples.
+Two rules moved from faults to advisories, because section 11 states three hard
+rules and neither is one of them: `okf_version` on a root index is a MAY under
+section 12, and a footnote whose source is absent is a defect in this bundle
+rather than a conformance failure. The repository's own test still holds the
+advisory list empty.
+
+**Two regressions this rewrite introduced and then removed.** `identity_slot`
+was gone from the corpus at HEAD -- commit `6bfd01d7` settled that an Identity
+is a property of the run -- and a first pass put the string back in four files;
+all four now say what ticket 97 settled. And `grpc` was moved onto
+`path_parameter`, which is a fact recorded for a parameter classified inside the
+path and not for the path itself, so it selected on every route carrying one.
+Reverted to `tech_grpc`.
+
+## Where the ticket was wrong
+
+**Criterion 3 is the one deferred criterion, and it is deferred because two of
+its clauses are no longer true of this tree.** It asks that concepts carry
+`verified`; `tests/test_okf.py:92-102` asserts the opposite, deliberately --
+"nothing in this corpus has been verified: every Playbook ships `draft` because
+no fixture has graded it", and writing the key would move all fifty to
+machine-confirmed on the strength of a generator having run. And it asks the
+bundle be "validated in tests against the canonical GoogleCloudPlatform
+`open-knowledge-format` v0.2 specification". That specification is not in this
+tree and `pyproject.toml:31` is `dependencies = []`, so the only way to hold it
+is a frozen copy nothing regenerates -- conformance measured against a copy,
+with the copy's drift unowned. `okf.py` restates sections 8, 9, 11 and 12 by
+hand and the restatement is what the tests hold. The operator was given both
+prices and chose to defer rather than freeze a second copy.
+
+**Criterion 5 counted 29 Playbooks naming `identity_slot`.** Correct for
+`6bfd01d7^`; at HEAD the count is zero, because ticket 97 landed first.
+
+**Four citations have drifted.** `js_routes` is at `roster.py:1914`, not in the
+`run_tool` enum at `:784`. The `OPTIONS` method enum is at `roster.py:423` and
+`:1806-1808`, not `:743-747`. The header-name and header-value patterns that
+exclude CRLF are the `headers` Argument at `roster.py:1811-1820`, not
+`:753-757`. The fifty-name list is `tests/test_playbook.py:501-561` and the
+reference map `:563-635`; the ticket's `:491-545` and `:547-619` are both stale.
+`roster.py` is unmodified here, so the drift predates this work.
+
+**The local corpus is `~/Downloads/Personal-Knowledge-Base`, not
+`/home/majix/hacking-wiki`.** 474 local references against 55, because commit
+`1405dd85` made the operator's own notes the primary intake. The ticket text is
+the stale half.
 
 ## Comments
 

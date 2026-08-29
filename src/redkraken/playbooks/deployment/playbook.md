@@ -1,5 +1,5 @@
 ---
-description: Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by requesting a path the front end refuses and then requesting the same path written a second way that resolves to it, and differencing the two answers against a path whose spelling nobody restricted.
+description: Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by asking one refused path again under a second spelling that resolves to the same route, under each method the tool contract offers, under a client address the caller writes, and under a path the router reads out of a header the authoriser never saw, each arm against a control on a path nobody restricted.
 bb:category: authorization
 bb:outputs: ["authorization.edge_rule"]
 bb:triggers_all: ["read_method", "tech_edge_proxy", "web_surface"]
@@ -9,148 +9,181 @@ bb:effects: read_only
 bb:baseline: none
 bb:status: draft
 bb:stale_after: 2027-05-15
-bb:provenance: Written for ticket 55 as the v2 replacement for v1's deployment pack against a new edge_rule leaf added by ticket 55; the pack's server pages are attached as maintainer references and their desync techniques, their TLS downgrade work and their default-credential lists are refused by step 7.
-bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_invariant", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
+bb:provenance: Written for ticket 55 as the v2 replacement for v1's deployment pack against a new edge_rule leaf added by ticket 55; the pack's server pages are attached as maintainer references and their desync techniques, their TLS downgrade work and their default-credential lists are refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries five readings, one lead and five refusals for this slug; three readings are new and two of them became closeable only when ticket 211 let a Test action state its headers. One key moved -- the refuted variant row now asks for the kind its own supported row asks for, because close_test_replay derives one kind per role from the specification and a refuted leg asking for a second kind is a leg nothing can write.
+bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_differential", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
 bb:references: ["apache-tomcat.md", "http-attacks-tls-attacks.md"]
 ---
 
 # Ask whether the front door's rule reaches the room behind it
 
-A deployment that refuses a path is two programs agreeing about what that path
-is. The front end matches the bytes it was handed; the application resolves them
-into a route. When the two normalise differently, the refusal is about a string
-and the serving is about a route, and a second spelling reaches what the first
-was refused.
+A deployment that refuses a path is two programs agreeing about what that path is. The
+front end matches the bytes it was handed; the application resolves them into a route, and
+takes the verb, the caller's address and the target itself from places the matcher never
+looked. Where they disagree, the refusal is about a string and the serving is about a
+route. Four shapes of that, one reading each, on a browser-rendered application with a
+terminating front end.
 
-The subject is a read on a browser-rendered application with a terminating front
-end in front of it. The question is whether a rule enforced out there is enforced
-in here, and the whole reading is eight requests.
+Every request goes through mcp__rk2__http_request. The run that settles a claim is a Test
+proposed with mcp__rk2__propose_test and closed by close_test_replay, the only writer of
+the transition a Finding needs, which derives the outcome and the Observation kind from
+the Test's own assertions. Every specification below carries the same four actions, never
+re-ordered, because the ordinal binds an action to its Receipt. Actions 1 and 2 carry the
+role baseline: that reading's plain request, twice unchanged, asserted body_equals. Action
+3 carries the role control, named by no differing assertion, which leaves it a
+response_invariant. Action 4 carries the role variant: the arm, asserted status_differs or
+body_differs against action 1, which makes it a response_differential whichever way the
+run comes out. Fewer than three actions, or a missing role, is refused at propose_test and
+never runs. Since ticket 211 an action states its own headers, which is what puts sections
+5 and 6 on the Finding path; a setup or a cleanup step still carries a method and a url
+and nothing else.
 
-## 1. Find one path the deployment refuses, and say who refused it
+## 1. Fix one refused path, establish it twice, and say who refused it
 
-Read the Surface for a path that answers `403` or `404` to a caller holding
-nothing, and take exactly one. Then say, from the answer itself rather than from
-a guess, which of the two programs produced it:
+Read the recorded surface with mcp__rk2__get_attack_surface for a path that answers 403 or
+404 to a caller holding nothing, and take exactly one. Send it twice unchanged through
+mcp__rk2__http_request; register_proxy_artifacts files the request and the response
+Artifact of each send against its Receipt, and the two sends are actions 1 and 2 of every
+specification below. body_equals and body_differs read the response body digest alone, so
+a varying Age or Date header never moves them and a refusal page that renders a request id
+or a timestamp INTO its body always does; a differential taken against an unchecked
+refusal is noise with a verdict attached.
 
-* the front end answered -- the body is a server's own page, the headers are not
-  the application's, no application cookie is set
-* the application answered -- the body is the application's own refusal, in its
-  own shape, beside the headers it sets on everything else
+Plan this reading, and every reading below it, without an Identity slot. The subject is
+what the deployment answers a caller holding nothing, and a leased Identity owns Cookie
+and every header it declares for the origin: it would put a session on both arms and
+quietly change what the refusal is a refusal of.
 
-Only the first is this reading's subject. A refusal the application produced is
-the application's own check, and asking whether a second spelling gets past it is
-`authorization.function_access`, which is a different Playbook and a different
-claim.
+Then say, from the answer rather than from a guess, which program refused. The front end's
+tell is a server's own error page beside a Server, Via, CF-Ray or X-Cache value the
+application's routes do not carry; the application's tell is its own refusal, in its own
+shape, beside the headers it sets on everything else. Read that off the non-cookie
+headers, because the wire response filter strips set-cookie, set-cookie2 and
+www-authenticate from the agent view on every path. Fix what the application's header set
+is from one unrestricted route that answers 200, or the attribution is an adjective, and
+file it as a header_policy_observed Observation through mcp__rk2__submit_mission_result,
+which promote_proposal writes. Only a front-end refusal is this Playbook's subject: a
+refusal the application produced is its own check, and asking whether a second spelling
+gets past it is authorization.function_access. This section establishes and attributes; it
+closes no Test and grades nothing.
 
-Complete this step with the path, the refusing status and which program refused.
+## 2. Ask whether the two programs normalise at different times
 
-## 2. Establish the baseline, twice
+One arm, one transformation, resolving to the same route: a doubled separator
+//admin/config, a trailing dot or an encoded trailing space on a segment, one
+percent-encoded separator /admin%2fconfig, or one matrix parameter /admin;x=1/config.
+Method and headers are byte-identical to the baseline, and an arm carrying two
+transformations at once cannot say which the front end missed. The control is that same
+single transformation applied to a path nobody restricted, the application's index or a
+route that answered 200 before this reading started, and its Receipt must show a 200.
+Where it comes back refused or mangled the deployment rejects that spelling everywhere,
+the arm proves nothing, and the reading moves on. Three spellings at most, one control
+each. Each arm goes out through mcp__rk2__http_request as action 4 of its own
+specification, proposed with mcp__rk2__propose_test, and close_test_replay writes the
+response_differential that settles it.
 
-Send the refused path twice, unchanged, with nothing presented.
+## 3. The spellings a Test cannot state
 
-Two identical requests, because everything below is measured against this one. A
-front end that carries a request id, a ray id or a varying `Age` in every answer
-is not byte-stable, and a differential taken against a refusal nobody checked is
-noise with a verdict attached.
+This step is a lead and nothing grades its outcome. The specification checker refuses any
+path segment that is `.` or `..`, and any `%2e` anywhere in a specification url, while the
+door normalises nothing and forwards all of them verbatim. So /admin/./config, the `..%2f`
+climb and the `..%252f` family are performable through mcp__rk2__http_request and
+unspellable in a Test. Send them once section 2's spellings are exhausted, file the
+difference as a response_differential Observation through mcp__rk2__submit_mission_result,
+which promote_proposal writes, and say which arm produced which. No Test closes on these,
+so they produce an Observation and an argument, never a settled claim.
 
-## 3. Send the second spelling
+## 4. Ask whether the rule names verbs rather than resources
 
-One request. The same path, written a second way that resolves to the same route,
-and it is one of these:
+The method enum is exactly GET, POST, PUT, PATCH, DELETE, HEAD and OPTIONS, so the survey
+is bounded by the tool contract and no eighth verb is spellable. Send the refused path
+under HEAD and under OPTIONS, one arm each; the method is one of the fields the replay
+lane binds a Receipt to its action by, so each arm is a Test action. The control is the
+same verb against an unrestricted path, which must be served or must 405 the way this
+deployment does everywhere, or a 200 on the arm is a deployment treating every unusual
+verb alike rather than a rule with a verb list. An Allow header worth recording is filed
+beside the Test as a header_policy_observed Observation through
+mcp__rk2__submit_mission_result. Do not send PUT, PATCH or DELETE. This Playbook is
+declared read_only, a 200 to a DELETE is a deletion, and a method outside the safe set
+raises the call to approval_required at the door in any case. Ask for this Task to be
+parked with mcp__rk2__park_for_human under `question_code` destructive_action, name this
+run's own Task in `task_label` and the three withheld verbs, and let a person decide.
 
-* a dot segment: `/admin/./config`
-* a doubled separator: `//admin/config`
-* a trailing dot or space on a segment
-* one percent-encoded separator: `/admin%2fconfig`
-* a matrix parameter on a segment: `/admin;x=1/config`
+## 5. Ask whether the decision is made on an address the caller writes
 
-One arm, one transformation. The variable under test is the spelling, and an arm
-carrying two transformations at once cannot say which of them the front end
-missed. Everything else -- method, headers, the absence of a session -- is
-exactly what step 2 sent.
+X-Forwarded-For, X-Real-IP, X-Client-IP and X-Custom-IP-Authorization are in neither the
+hop-by-hop set nor the internal prefix, so they reach the target as written, and a leased
+Identity does not own them either. A loopback literal is a header VALUE here and not a
+destination this harness dials, so the address refusal guarding our own url does not reach
+it.
 
-## 4. Send the control spelling
+The arm sets exactly one of those headers to a loopback or internal literal. The control
+sets the same header to an ordinary public address the deployment has no reason to trust,
+and its Receipt must still show the refusal: that is what separates a rule that trusts
+this header from an edge that any extra header confuses. Where the control is served too,
+stop, report inconclusive with the control's behaviour named, and do not sweep an address
+range through the header. The mechanism edge is a credential_effect filed through
+mcp__rk2__submit_mission_result, because a refusal becoming a 200 in answer to a trust
+header a caller wrote is a response to a presented credential. Stop when the four names
+are exhausted; they are also the only caller-writable input to a per-origin limit, which
+is rate_limiting.per_origin and another Playbook's.
 
-One request, and this is what keeps the reading honest: the same transformation,
-applied to a path nobody restricted -- the application's own index, or any route
-that answered `200` before this reading started.
+## 6. Ask whether the router reads a path the authoriser never saw
 
-If the control comes back `200`, the transformation is one the deployment serves
-normally, and a difference on the arm is about the rule rather than about the
-spelling. If the control comes back refused or mangled, the transformation is one
-this deployment rejects everywhere, the arm proves nothing, and the reading
-returns to step 3 with the next spelling on the list.
+X-Original-URL, X-Rewrite-URL, Request-Uri and x-middleware-subrequest match the served
+header-name pattern, none is hop-by-hop, and all four forward. The component that
+authorises reads the request line while the component that serves reads the header, so the
+path authorised and the path served are two paths. Here the plain request of actions 1 and
+2 is an ALLOWED path rather than the refused one. The arm is that allowed path with the
+refused path named in exactly one override header, asserted body_differs against action 1,
+one header name per arm and three arms at most. The control is the same allowed path with
+the same header naming a path that does not exist: where its Receipt shows the allowed
+path's own body the header is ignored and any difference on the arm was about something
+else, and where it shows a 404 for the named path the header reaches the router. Where the
+refused path's own content arrives under an allowed request line, file reflected_input
+beside the Test through mcp__rk2__submit_mission_result as the edge that names what came
+back, and do not fuzz header names: a name this family does not read answers nothing.
 
-Three spellings at most, one control each. With step 2's two baselines, that is
-the eight requests.
+## 7. State the claim, and state what would refute it
 
-## 5. Difference the answers
+The Hypothesis is authorization.edge_rule on the refused path, carried to a Finding with
+mcp__rk2__propose_finding once a Test has settled it. This section proposes no Test of its
+own and grades nothing. It is supported when one arm was served by the application, the
+plain spelling was refused by the front end, the two baseline reads were invariant, and
+that arm's own control behaved as its section requires. It is refuted when every arm comes
+back invariant against the baseline refusal, which is what a front end that normalises
+before it matches, lists no verbs and reads no caller header looks like. Then say which
+program answered the arm, by section 1's reading of its headers: the finding is that the
+application answered a request the front end was supposed to stop, and a report reading
+that off the status alone has published half a reading. Where the two cannot be told apart
+the verdict is inconclusive, and that halt is reported through this Task's own record,
+because no question code in the served set says a reading ran out of tells.
 
-Run `compare-responses` over the arm and the baseline refusal, then over the two
-baseline requests. Cite what the script returns.
+Two neighbours are close. Where the second door is a route the platform shipped rather
+than a second spelling of this one, the class is authorization.parallel_route and the
+Playbook is `cms`; where the front end serves one caller a response it stored for another,
+it is information_disclosure.cached_response and the Playbook is `web-cache`. Cite the
+Artifacts, the `compare-responses` result over each pair, and the attributing header.
 
-Arm against baseline is the differential that carries the claim. What counts is
-the arm being *served*: a status the baseline did not have, a body the
-application produced, a header the application sets. A `403` that changed its
-request id is not a difference and the script will say so.
+## 8. The ceiling, and the five readings this slug refuses
 
-Baseline against baseline says the refusal was stable, which is what makes the
-first comparison mean anything.
+This section performs and grades nothing. This Playbook is read_only, holds no session,
+and sends per reading two baselines and at most three arms with a control each, against
+one deployment. Five readings are refused rather than dropped, so none is re-proposed as
+cheap. The transport audit that is the whole of the attached
+`http-attacks-tls-attacks.md`: a differential across two handshakes is about the proxy's
+handshake, its scanners are scanners against a port, and the downgrade and memory-read
+attacks have no read_only version. Making an intermediary drop the header the decision
+rests on, by naming it in a Connection field or by sending one header name twice: the
+forwarding filter and an object-shaped header block refuse those between them. A
+caller-pinned Host, and with it the vhost and origin-behind-the-CDN family, because the
+wire headers are rebuilt as the url's authority plus what forwards, though
+X-Forwarded-Host, X-Host and X-Original-Host do forward and section 6 reads those. A
+listener that is not the scoped web ingress, an AJP connector or an origin address
+inferred from hosting history, where the scope grant is the rule and not the url pattern.
+And the management console of `apache-tomcat.md`, its shipped credentials and its archive
+upload: record that the console exists and present nothing to it, and where a credential
+is about to be presented ask for this Task to be parked with mcp__rk2__park_for_human
+instead, under `question_code` credential_needed and this Task's own label in
+`task_label`.
 
-Then say which program answered the arm, the same way step 1 did. The finding is
-that the application answered a request the front end was supposed to have
-stopped, and the answer's own shape is what says the application answered it.
-
-## 6. State the claim, and state what would refute it
-
-The Hypothesis is `authorization.edge_rule` on the refused path. It is supported
-when the second spelling was served by the application, the first spelling was
-refused by the front end, the two baseline requests were invariant, and the
-control spelling on an unrestricted path came back normally. It is refuted when
-every spelling tried comes back invariant against the baseline refusal -- which
-is what a front end that normalises before it matches looks like.
-
-Anything else is inconclusive: a deployment whose front end and application
-cannot be told apart from their answers, a path whose refusal turns out to be the
-application's own, a spelling the deployment rejects everywhere.
-
-Two neighbours are close.
-
-* Where the second door is a different route that the platform shipped rather
-  than a second spelling of this one, the class is
-  `authorization.parallel_route` and the Playbook is `cms`.
-* Where the front end serves one caller a response it stored for another, the
-  class is `information_disclosure.cached_response` and the Playbook is
-  `web-cache`.
-
-Cite the Artifacts and the difference the script returned. Quote the arm's status
-line and the header that says which program answered.
-
-## 7. The ceiling
-
-This Playbook is `read_only`, holds no session, and sends eight requests -- two
-baselines and at most three spellings with a control each -- to one
-deployment: two baselines, and at most four arms with a control each.
-
-It does not desynchronise anything. No request in it carries two length headers,
-a chunked body with a trailing length, a header the front end and the application
-would frame differently, or anything else whose effect lands on the next
-connection -- because the next connection belongs to somebody who is not part of
-this engagement, and a technique that poisons it has no bounded blast radius and
-no undo.
-
-It does not test the channel. It does not renegotiate, downgrade, offer a weaker
-cipher, or ask what the certificate says: 018 records that no transport claim can
-be settled through the scope proxy at all, so a reading that tried would be
-producing a receipt that cannot mean what it says.
-
-It does not go looking for the deployment. It does not scan a port, resolve a
-name to find an origin, request a path in order to identify a server, try a
-default credential, or send a request to anything other than the scoped ingress
-this Task names. Criterion 3 of the ticket that wrote this Playbook is the rule
-and it is short: web and API ingress that the Program put in scope, and nothing
-underneath it.
-
-Where the deployment refuses every spelling, the verdict is `refuted` and the
-reading is over. Where it cannot be told which program answered, the verdict is
-`inconclusive` and it routes to an operator.
+4 of 8 steps cannot be graded.

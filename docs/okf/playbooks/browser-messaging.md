@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "browser-messaging"
-description: "Ask whether a document something else embeds writes a value it never fetched into its own DOM as markup, by planting one registered probe in the page and showing that no request left the browser between the planting and the verdict."
+description: "Ask whether a document something else embeds turns a value it never fetched into its own markup, by inventorying what the page listens for and then planting one registered probe through a field, a fragment or a polluted property path while the Receipt list shows no request carried the value."
 resource: ../../../src/redkraken/playbooks/browser-messaging/playbook.md
 tags: [injection, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [browser-evidence]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: ccaa992bb13367824ee6f1b2d5719459d33807ae91539849db4f360d0fdb8b97
-bb:sha256: 292b877886d038ad7dabd5ff0deb1b0149b8bf4928f86f344573215327a60b97
+bb:version: d7b0e99ffdb7f789836b8d31445da1ea9c1012ade49a9a82d7f6805e3fafd6fb
+bb:sha256: bb7b5d293278c7629f889bfe56e50fe1e44a38427354d5d3d8f62b359b4fa308
 sources:
   - id: browser-messaging--dom-vulnerabilities
     resource: /references/browser-messaging--dom-vulnerabilities.md
@@ -27,7 +27,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a document something else embeds writes a value it never fetched into its own DOM as markup, by planting one registered probe in the page and showing that no request left the browser between the planting and the verdict.
+# Ask whether a document something else embeds turns a value it never fetched into its own markup, by inventorying what the page listens for and then planting one registered probe through a field, a fragment or a polluted property path while the Receipt list shows no request carried the value.
 
 ## What it concludes about
 
@@ -55,7 +55,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 52 as the v2 replacement for v1's dom-vulnerabilities and prototype-pollution pages, against a new client-channel leaf added by ticket 52; both v1 texts are attached as maintainer references and both describe sources step 3 names and cannot drive.
+Written for ticket 52 as the v2 replacement for v1's dom-vulnerabilities and prototype-pollution pages, against a new client-channel leaf added by ticket 52; both v1 texts are attached as maintainer references and both describe sources this Playbook now drives. Rewritten for ticket 101 against the merged ledger, which carries four readings and one refusal for this slug. No frontmatter key moved and the evidence bar is already reachable, because the refuted and supported legs of the variant role name one kind. Two shipped paragraphs were false rather than cautious and are replaced. The fragment refusal is lifted -- ticket 99 widened the navigate url pattern so a browser-local fragment is admissible -- and the claim that no action sends a cross-document message is superseded by the listener inventory and the registry-owned dispatch, whose boundary is that a dispatch is reported as dispatched and never as matched. The whole ceiling is now stated in the preamble rather than discovered after a mission.
 
 ## Maintainer references
 

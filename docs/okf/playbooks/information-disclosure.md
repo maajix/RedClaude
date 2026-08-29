@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "information-disclosure"
-description: "Ask whether a route returns fields its own published contract never declared, by storing the contract and the response as Artifacts and differencing the two sets of field names in both directions, so that the names found and the names missing are read at the same time."
+description: "Ask whether a route returns fields its own published contract never declared, by differencing the two sets of field names in both directions over stored Artifacts, and then whether the declared shape is only the narrowest thing the route will hand back, by widening the projection, naming a parameter the contract omits, asking the route for a second serialization of itself, and asking a server function to stringify its own argument."
 resource: ../../../src/redkraken/playbooks/information-disclosure/playbook.md
 tags: [information_disclosure, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -10,15 +10,15 @@ stale_after: 2027-04-15T00:00:00Z
 bb:category: information_disclosure
 bb:outputs: [information_disclosure.undeclared_field]
 bb:triggers_all: [authenticated_endpoint, read_method, tech_openapi]
-bb:skills: [compare-responses, handle-untrusted-content, use-identity]
+bb:skills: [compare-responses, enumerate-surface, handle-untrusted-content, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: b4e4ca78ea1a7e65baf3fa6c30f6526eb9d81f4a087fd31e85634d3a28e32b45
-bb:sha256: fd6c61f33029fd01f8f52cf9cef9fa9fbc4f073a8d3947743c4faf8a82bbf023
+bb:version: f27599a8a0848bab8efba55abcb34b07169804a02b08fd0209d90b657c1c04c0
+bb:sha256: 75bc55d4f4575b1e7e887c40fcf85b2b50366684348e1a0cca57b1f6f8bfcaad
 ---
 
-# Ask whether a route returns fields its own published contract never declared, by storing the contract and the response as Artifacts and differencing the two sets of field names in both directions, so that the names found and the names missing are read at the same time.
+# Ask whether a route returns fields its own published contract never declared, by differencing the two sets of field names in both directions over stored Artifacts, and then whether the declared shape is only the narrowest thing the route will hand back, by widening the projection, naming a parameter the contract omits, asking the route for a second serialization of itself, and asking a server function to stringify its own argument.
 
 ## What it concludes about
 
@@ -37,6 +37,7 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 ## Skills it loads
 
 - [compare-responses](/skills/compare-responses.md)
+- [enumerate-surface](/skills/enumerate-surface.md)
 - [handle-untrusted-content](/skills/handle-untrusted-content.md)
 - [use-identity](/skills/use-identity.md)
 
@@ -48,7 +49,7 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 
 ## Provenance
 
-Written for ticket 54 as the v2 replacement for v1's information-disclosure page against a new undeclared_field leaf added by ticket 54; the v1 page carried no attachments, and its advice to harvest whatever the extra fields contain is refused by step 7.
+Written for ticket 54 as the v2 replacement for v1's information-disclosure page against a new undeclared_field leaf added by ticket 54; the v1 page carried no attachments, and its advice to harvest whatever the extra fields contain is refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries five readings and one blocked family for this slug; four readings are new, one of them the second-serialization hand-off ticket 101 named as reachable and unused, and the shipped prose never named the tool run its own content_match bar requires. One key moved -- enumerate-surface is added, because section 3 harvests candidate names out of the served bundle with js_routes and js_parse.
 
 ## The authoritative document
 

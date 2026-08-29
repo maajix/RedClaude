@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "object-ownership"
-description: "Ask whether the object named in a request is checked against the caller, by sending one request twice under two leased Identities and differencing the two stored responses."
+description: "Ask whether the object named in a request is checked against the caller, by holding one Identity and moving the object identifier between two arms of one Test, and by asking the same question of an implied subject, a re-spelled identifier, a second lookup key, an obfuscated reference and one written property."
 resource: ../../../src/redkraken/playbooks/object-ownership/playbook.md
 tags: [authorization, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -15,8 +15,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: c8c808bc2dc083ec637ec7a2b90005072cf5e8db6ca8850229ad48d47bed99d5
-bb:sha256: c4fb1ec47b89e431a65a796e28b367a43705d8a9e2b3304e1d067ba95ae261bb
+bb:version: 37a57dbf195afc3a26aa9a92fdced2dee4b46bb7ac8de152cab3333375094d72
+bb:sha256: c178f9bbb80fc12b2c06044d6da62c07de9be612a40081f39e29b6677987d6a5
 sources:
   - id: object-ownership--why-two-identities
     resource: /references/object-ownership--why-two-identities.md
@@ -24,7 +24,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether the object named in a request is checked against the caller, by sending one request twice under two leased Identities and differencing the two stored responses.
+# Ask whether the object named in a request is checked against the caller, by holding one Identity and moving the object identifier between two arms of one Test, and by asking the same question of an implied subject, a re-spelled identifier, a second lookup key, an obfuscated reference and one written property.
 
 ## What it concludes about
 
@@ -58,7 +58,7 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 
 ## Provenance
 
-Written for ticket 45 against the object-ownership leaf of the ticket 18 vocabulary; no upstream card, no third-party list.
+Written for ticket 45 against the object-ownership leaf of the ticket 18 vocabulary; no upstream card, no third-party list. Rewritten for ticket 101 against the merged technique ledger, which holds six executable readings for this slug. Five of them read. The sixth writes one property of an object the caller does not own, and the class that reading produces is one the vocabulary shipped with no emitter. D3 places that emitter here, and this file does not take it -- the shipped test pins this Playbook's outputs, effects and triggers to what it already declares, so moving them is a code change under a different ticket rather than a rewrite. bb:outputs, bb:effects and bb:risk therefore stand, and the write leg is written the way a read_only Playbook may carry one -- it halts for a person before it sends, and what resumes runs under whatever Task that decision opens. Disagreement recorded per D3's own preamble.
 
 ## Maintainer references
 

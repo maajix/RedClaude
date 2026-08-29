@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "command-directory-injection"
-description: "Ask whether an uploaded file's name is concatenated into a command line, by sending a name carrying a bounded delay beside a name carrying the same characters inert and reporting the separation between two interleaved sets of samples."
+description: "Ask whether a value the caller supplies is concatenated into a command line, by sending one separator with a token that would print, then one payload from each of three interpreter grammars, then a bounded delay beside an inert twin, and by reading an arrival on a declared channel where nothing comes back at all."
 resource: ../../../src/redkraken/playbooks/command-directory-injection/playbook.md
 tags: [injection, approval_required, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: approval_required
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: 3f81fd1c364a806c69d7a63ef40c6093a3bd4f64b688873af1fc2de3aed1c071
-bb:sha256: 5ba5a003e06bf93efd4eccea582780d062f41867b4c45f050b0025e6274d0c8d
+bb:version: b8a64215c4246de48ee2a188dee830b59fa3bc33dd1065ffb880f1d4cdf28e4e
+bb:sha256: 6530ff50b09d8f2ba74bfed1831e01308d399b98ef6a225853be85a11c309edb
 sources:
   - id: command-directory-injection--command-injection-filter-bypass
     resource: /references/command-directory-injection--command-injection-filter-bypass.md
@@ -39,7 +39,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether an uploaded file's name is concatenated into a command line, by sending a name carrying a bounded delay beside a name carrying the same characters inert and reporting the separation between two interleaved sets of samples.
+# Ask whether a value the caller supplies is concatenated into a command line, by sending one separator with a token that would print, then one payload from each of three interpreter grammars, then a bounded delay beside an inert twin, and by reading an arrival on a declared channel where nothing comes back at all.
 
 ## What it concludes about
 
@@ -62,13 +62,13 @@ Risk `approval_required`, effects `read_only`, baseline `stable_session`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
-- to `supported`: at least 1 supports `timing_differential` observation(s) from a `variant`
+- to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 53 as the v2 replacement for v1's command-directory-injection pack against the command leaf of the ticket 18 vocabulary; the pack's five pages are attached as maintainer references, two of them (ldap-injections, xxe) describe classes graded by sql-injection and structured-injection respectively, and every escalation step in the other three is refused by step 7.
+Written for ticket 53 as the v2 replacement for v1's command-directory-injection pack against the command leaf of the ticket 18 vocabulary; the pack's five pages are attached as maintainer references, two describe classes graded elsewhere, and every escalation step in the other three is refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries six procedures, one refusal and one blocked reading. Two keys moved and the arrival reading stops at an Observation. The supported variant row leaves timing_differential for response_differential, because five of this slug's six executable readings close on an echo or a shape the Test's own assertions carry and only one is a timing pair, so the shipped bar made five of them unclosable; the refuted variant row follows it, because close_test_replay derives the kind from the specification and one role writes one kind whichever way the reading goes. The pre-211 sentence that a read_only selection sends no body is gone.
 
 ## Maintainer references
 

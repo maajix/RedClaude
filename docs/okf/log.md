@@ -1,8 +1,3 @@
----
-type: Log
-title: "redKraken corpus bundle history"
----
-
 # Bundle history
 
 ## 2026-08-28

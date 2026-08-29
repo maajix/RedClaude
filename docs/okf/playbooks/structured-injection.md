@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "structured-injection"
-description: "Ask whether a value in an XML body becomes structure rather than content, by sending one field carrying a structural character beside the same field carrying an inert character of the same length and reading the parser's own error."
+description: "Ask whether a value in a document the target assembles becomes structure rather than content, by sending one field carrying a structural character beside the same field carrying an inert character of the same length, by asking which parser the route hands the body to, and by asking on a declared channel whether the parser resolves an identifier it was handed."
 resource: ../../../src/redkraken/playbooks/structured-injection/playbook.md
 tags: [injection, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, handle-untrusted-content, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 12c672544ce12616af9122fa251031f10123dd8a9e89517e3cb1df38edaa821c
-bb:sha256: 19b07f9230d480fea28fadd645db8860c5dce6d852f0281625898e0a3101f817
+bb:version: 83691efa238328d5304ad65dc37fd36db2c886b13189b399dc2f6fba1788a9b8
+bb:sha256: 5ddf11651084ff8de95b6073356c32e09d45873aa304b003ecf01fa1b79a47db
 sources:
   - id: structured-injection--smtp-header-injection
     resource: /references/structured-injection--smtp-header-injection.md
@@ -27,7 +27,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a value in an XML body becomes structure rather than content, by sending one field carrying a structural character beside the same field carrying an inert character of the same length and reading the parser's own error.
+# Ask whether a value in a document the target assembles becomes structure rather than content, by sending one field carrying a structural character beside the same field carrying an inert character of the same length, by asking which parser the route hands the body to, and by asking on a declared channel whether the parser resolves an identifier it was handed.
 
 ## What it concludes about
 
@@ -51,13 +51,13 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `error_detail` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
 - to `supported`: at least 1 supports `error_detail` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 53 as the v2 replacement for v1's structured-injection pack against the document_parser leaf of the ticket 18 vocabulary; the pack's two pages are attached as maintainer references, and the XXE material the class also covers is attached to command-directory-injection because that is the v1 pack it shipped in.
+Written for ticket 53 as the v2 replacement for v1's structured-injection pack against the document_parser leaf of the ticket 18 vocabulary; the pack's two pages are attached as maintainer references. Rewritten for ticket 101 against the merged ledger, which carries nine readings and two blocks for this slug. One key moved. The refuted variant row leaves response_invariant for error_detail, the kind the supported row of that same role names, because close_test_replay derives the kind from the specification and one role writes one kind whichever way the reading goes. bb:triggers_all is left alone and the closing section names its gap instead, because four of the nine readings establish xml_request rather than requiring it, while widening the trigger to a body parameter on a state-changing route would make this Playbook match every write in the catalogue. The blanket refusal of every entity declaration is superseded there too. The two out-of-band readings merge into one section that stops at an arrival.
 
 ## Maintainer references
 

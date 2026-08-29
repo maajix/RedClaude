@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "browser-realtime"
-description: "Ask whether a socket handshake accepts a subscription to a channel the caller does not own, by naming a second Identity's channel in the handshake and comparing what the upgrade answers against the owner's own handshake for the same channel."
+description: "Ask whether a socket route reaches an authorization decision about a channel name before it reaches the protocol, and whether the ticket a realtime stack mints over ordinary https is scoped to the channel the caller asked for, by carrying a second Identity's channel name in the query of an ordinary GET and differencing the answer against a name nobody owns."
 resource: ../../../src/redkraken/playbooks/browser-realtime/playbook.md
 tags: [authorization, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: stable_session
-bb:version: 23c1a0f66654b4cb76e457c78ac9366c086c761c127c3dc8e13bb4e871d7def6
-bb:sha256: f491247c11bdde2b7efc9a7391253da724197814f114de0f661da9ad610707be
+bb:version: 3a8ea60a2625e66505abe11825e08691c8fb84f3fbedb14665574b698b4eb4c1
+bb:sha256: 5aca8628ad7ef84e1dfed4cff1a89f2be7c5e919284f9088b90111b406abdae8
 sources:
   - id: browser-realtime--websocket-attacks
     resource: /references/browser-realtime--websocket-attacks.md
@@ -23,7 +23,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a socket handshake accepts a subscription to a channel the caller does not own, by naming a second Identity's channel in the handshake and comparing what the upgrade answers against the owner's own handshake for the same channel.
+# Ask whether a socket route reaches an authorization decision about a channel name before it reaches the protocol, and whether the ticket a realtime stack mints over ordinary https is scoped to the channel the caller asked for, by carrying a second Identity's channel name in the query of an ordinary GET and differencing the answer against a name nobody owns.
 
 ## What it concludes about
 
@@ -46,13 +46,13 @@ Risk `constrained`, effects `read_only`, baseline `stable_session`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `credential_effect` observation(s) from a `variant`
 - to `supported`: at least 1 supports `credential_effect` observation(s) from a `control`
 - to `supported`: at least 1 supports `credential_effect` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 52 against a new channel-subscription leaf added by ticket 52; the v1 websocket text is attached as a maintainer reference and step 5's limit is where this Playbook and the v1 page part company.
+Written for ticket 52 against the channel-subscription leaf ticket 52 added, with the v1 websocket text attached as a maintainer reference. Rewritten for ticket 101 against the merged technique ledger, which holds two readings and two refusals for this slug. Every step of the shipped text was an upgrade handshake, and our own egress drops connection and upgrade before the wire, which is why this was the only Playbook of fifty with no executable reading. The two readings that replace them are ordinary GETs differing in the query, so bb:effects stays read_only and bb:risk stays constrained. The refuted leg moves from response_invariant to credential_effect, which is the kind its own role already asked for on the supported leg. Repaired again in review -- the caller's own channel is the baseline and the name nobody owns the control, which is the shape section 3 already had, and the second Task leaves through suggested_tasks rather than standing as a requirement with no verb.
 
 ## Maintainer references
 

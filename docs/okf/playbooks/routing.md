@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "routing"
-description: "Ask whether a step enforces the steps before it, by completing the flow once in order and then reaching the same step from a session that never took them, including where the step is spelled a different way."
+description: "Ask whether a step enforces the steps before it, by completing the flow once in order and then reaching the same step from a session that never took them -- spelled a different way, or entered from a second flow whose steps the step's own guard may be reading."
 resource: ../../../src/redkraken/playbooks/routing/playbook.md
 tags: [business_logic, constrained, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: mutates_object
 bb:baseline: pristine_surface
-bb:version: c4de9c1ba1721f073063f267a84f7ff2df1d868d3adf8638c313c34f072f5f8e
-bb:sha256: 2368d25030a3f5b4ab4bbe6118269fe8f1f3e62b43b938474398b705048b2d45
+bb:version: 46a4d7e055e554f8cc4bb43734dbf4a439842c328245c14be9234cfdef254ca7
+bb:sha256: 69a07b3fe2f7026ec39ea62edb8e0567bc24f39b37cb139f5a18831354e65d3e
 sources:
   - id: routing--http-attacks-verb-tampering
     resource: /references/routing--http-attacks-verb-tampering.md
@@ -27,7 +27,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a step enforces the steps before it, by completing the flow once in order and then reaching the same step from a session that never took them, including where the step is spelled a different way.
+# Ask whether a step enforces the steps before it, by completing the flow once in order and then reaching the same step from a session that never took them -- spelled a different way, or entered from a second flow whose steps the step's own guard may be reading.
 
 ## What it concludes about
 
@@ -49,13 +49,13 @@ Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
-- to `supported`: at least 1 supports `state_change` observation(s) from a `control`
-- to `supported`: at least 1 supports `state_change` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
+- to `supported`: at least 1 supports `response_differential` observation(s) from a `control`
+- to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 51 as the v2 replacement for v1's routing pack, against the workflow-order leaf of the ticket 18 vocabulary; two v1 texts are attached as maintainer references and both describe the spellings step 4 sends.
+Written for ticket 51 as the v2 replacement for v1's routing pack, against the workflow-order leaf of the ticket 18 vocabulary; two v1 texts are attached as maintainer references and both describe the spellings section 3 sends. Rewritten for ticket 101 against the merged ledger's six readings for this slug. Three close a Test, one is a selector that closes nothing, and two are named in the closing section, one as another Playbook's reading and one as blocked by the method enum; the dot-segment spelling is split off from the spellings Test as a lead of its own, because the specification checker refuses that path. The declared bar is response_differential in all three entries rather than state_change, because the outcome read that sees the effect is itself an action of the same Test and an evidence edge cannot be added once the claim is past proposed, so the kind the settling assertions derive is the only kind the bar can name.
 
 ## Maintainer references
 

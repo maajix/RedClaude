@@ -1,21 +1,21 @@
 ---
 type: Playbook
 title: "authentication"
-description: "Ask whether the server actually checks the secret it was sent, by presenting one credential three ways -- correct, wrong, and structurally absent -- and reading which of the three it answers as if it had verified something."
+description: "Ask whether the check happens rather than whether the secret is right, by presenting one credential in shapes the comparison was not written for, and by asking the same question of a recovery flow -- what its answer hands back, who addressed the link it built, whether the credential it minted is unique and single-use, and whether the step that completes the change compares anything at all."
 resource: ../../../src/redkraken/playbooks/authentication/playbook.md
-tags: [authentication, constrained, mutates_session]
+tags: [authentication, approval_required, mutates_account]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
 status: draft
 stale_after: 2027-03-15T00:00:00Z
 bb:category: authentication
-bb:outputs: [authentication.credential_verification]
+bb:outputs: [authentication.credential_verification, authentication.recovery_flow]
 bb:triggers_all: [email_valued_parameter, state_changing_method]
-bb:skills: [compare-responses, use-identity]
-bb:risk: constrained
-bb:effects: mutates_session
+bb:skills: [compare-responses, enumerate-surface, use-identity]
+bb:risk: approval_required
+bb:effects: mutates_account
 bb:baseline: none
-bb:version: 68ffc9b0ebfe543f9b8f0a8050f89906227d92001986fe40a995250872addff9
-bb:sha256: d6c57e8546481aa8881da71ea46f2dfbc4c2a7675b0319c42a00a366455043b6
+bb:version: 452e7796fefa3352142175ff0625d345aa4d97fee211c572830bdedad7080a07
+bb:sha256: 054b4f3cb96526a7ff8c940136978e2ad6b65db33d0d781ce69c088dd5525c11
 sources:
   - id: authentication--cloud-aws-cognito
     resource: /references/authentication--cloud-aws-cognito.md
@@ -35,11 +35,12 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether the server actually checks the secret it was sent, by presenting one credential three ways -- correct, wrong, and structurally absent -- and reading which of the three it answers as if it had verified something.
+# Ask whether the check happens rather than whether the secret is right, by presenting one credential in shapes the comparison was not written for, and by asking the same question of a recovery flow -- what its answer hands back, who addressed the link it built, whether the credential it minted is unique and single-use, and whether the step that completes the change compares anything at all.
 
 ## What it concludes about
 
 - `authentication.credential_verification`
+- `authentication.recovery_flow`
 
 ## When it is selected
 
@@ -48,22 +49,23 @@ A subject carrying every one of these facts:
 - `email_valued_parameter`
 - `state_changing_method`
 
-Risk `constrained`, effects `mutates_session`, baseline `none`.
+Risk `approval_required`, effects `mutates_account`, baseline `none`.
 
 ## Skills it loads
 
 - [compare-responses](/skills/compare-responses.md)
+- [enumerate-surface](/skills/enumerate-surface.md)
 - [use-identity](/skills/use-identity.md)
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `credential_effect` observation(s) from a `variant`
 - to `supported`: at least 1 supports `credential_effect` observation(s) from a `control`
 - to `supported`: at least 1 supports `credential_effect` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 50 as the v2 replacement for v1's authentication pack, against the credential-verification leaf of the ticket 18 vocabulary; four v1 texts are attached as maintainer references and the type-juggling one is the only one that named this defect.
+Written for ticket 50 as the v2 replacement for v1's authentication pack, against the credential-verification leaf of the ticket 18 vocabulary; four v1 texts are attached as maintainer references and the type-juggling one is the only one that named this defect. Rewritten for ticket 101 against the merged ledger, which carries eleven readings, three blocked and two refused for this slug. Four keys moved. bb:outputs gains authentication.recovery_flow, the emitter ticket 101 owes and the class ten of the sixteen rows read. bb:effects rises from mutates_session to mutates_account because section 5 completes a recovery on an account the Program designates, and bb:risk rises with it to approval_required, the floor that effect asks for. bb:skills gains enumerate-surface, already held by the role that executes this text. The refuted variant row moves from response_invariant to credential_effect, the kind the supported row of that same role names, because close_test_replay derives the kind from the specification.
 
 ## Maintainer references
 

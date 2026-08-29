@@ -17919,14 +17919,18 @@ class NegativeKnowledgeTest(DatabaseCase):
 #: that case places six refutations in an order its own assertions are about.
 RETEST_SLUG = "selftest-retest"
 
-#: The six Property classes this ticket deliberately leaves unmapped, and why
-#: each one is not a mapping question. Written here as the ticket writes them,
-#: so that a seventh arriving is a failure with a name rather than a count that
-#: moved.
+#: The Property classes left unmapped, and why each one is not a mapping
+#: question. Written here as the tickets write them, so that one more arriving
+#: is a failure with a name rather than a count that moved.
+#:
+#: Ticket 114 named six. Ticket 101's rewrite gave three of them an emitter and
+#: `20261220T000000Z__six_classes_the_rewrite_gave_an_emitter.sql` maps those
+#: three, which is what 114 meant by "101 owns the emitters". The two transport
+#: rows stay because `transport_makeability` declares them `unmakeable`, and
+#: the other two because no Playbook emits them -- `injection.unclaimed_reference`
+#: arrived from ticket 100's vocabulary with no emitter of its own.
 UNMAPPED = (
-    "authentication.recovery_flow",
-    "rate_limiting.per_origin",
-    "rate_limiting.resource_cost",
+    "injection.unclaimed_reference",
     "transport.certificate_trust",
     "transport.datagram_transport",
     "transport.request_framing",
@@ -41901,10 +41905,17 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     So the arrangement is one Program with one Surface per Playbook, each built
     to carry that Playbook's trigger facts and no other Playbook's. The
     assertion is then total in both directions: for every subject, the set of
-    Playbooks whose triggers it satisfies is exactly one, and it is the one the
-    subject was built for. Adding a Playbook whose triggers overlap an existing
-    one fails here, in the pair it collides with, rather than at the point some
-    Program in production selects two Playbooks and an operator wonders why.
+    Playbooks whose triggers it satisfies is the one the subject was built for,
+    plus whatever `CROSS_CUTTING` names and nothing else. Adding a Playbook
+    whose triggers overlap an existing one fails here, in the pair it collides
+    with, rather than at the point some Program in production selects two
+    Playbooks and an operator wonders why.
+
+    The exception list is named rather than waved through, and it holds two
+    entries. CSRF is the one topic here that is genuinely about a shape rather
+    than a technology -- a form-encoded write a session owns -- so `realtime`
+    and the two other Surfaces of that shape overlap for a real reason. A third
+    entry arriving is still a failure with a name.
 
     The surfaces are written out rather than derived from `playbook_triggers`.
     A Surface built by reading the same rows the selection reads would match
@@ -41916,6 +41927,15 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     """
 
     settings_for = "migrate"
+
+    #: The subjects `CROSS_CUTTER` reaches besides its own, measured rather than
+    #: assumed: these are the only two Surfaces here that are an authenticated
+    #: form-encoded write, which is what its five readings are about.
+    CROSS_CUTTING = ("browser-framing", "spreadsheet-injection")
+
+    #: The Playbook those two also match. One name, so a second cross-cutting
+    #: topic is a change to this class rather than a row quietly added above.
+    CROSS_CUTTER = "realtime"
 
     #: One Surface per Playbook. `spa` is the neutral Application kind: three
     #: Playbooks key on the kind and none of them keys on that one, so a Surface
@@ -42035,7 +42055,14 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                                      ("body", "number")),
         "race-conditions": Surface("spa", None, "POST", "/coupons/redeem", True,
                                    ("body", None), "application/json"),
-        "realtime": Surface("websocket", None, "GET", "/socket", True, None),
+        # Ticket 101's D1 moved this Playbook off the websocket handshake, which no
+        # lane in this harness can execute, and onto the five form-CSRF readings the
+        # ledger carries. The Surface follows the document, as every row here does: a
+        # form-encoded write the session owns. The Application kind is the neutral
+        # `spa` rather than `web`, because `web` is what the eight framing and script
+        # Surfaces key on and this reading is about none of them.
+        "realtime": Surface("spa", None, "POST", "/settings/email", True, ("body", None),
+                            "application/x-www-form-urlencoded"),
         # The one authenticated read carrying a header parameter.
         # `workload-identities` is the other header in this table and its
         # authentication is what nobody has established, which is the difference
@@ -42465,7 +42492,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "deployment": ["web_hunter"],
                 "deserialization": ["web_hunter"],
                 "exceptional-conditions": ["web_hunter"],
-                "external-resources": ["js_analyst"],
+                "external-resources": ["web_hunter"],
                 "file-resolution": ["web_hunter"],
                 "file-upload": ["web_hunter"],
                 "graphql": ["web_hunter"],
@@ -42509,10 +42536,10 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # whether one was given.
         for name in sorted(self.SURFACES):
             with self.subTest(playbook=name):
-                self.assertEqual(
-                    [(playbook.PLAYBOOKS[name].path, "1", "", "")],
-                    self.selection(name, self.loadable(name)[0]),
-                )
+                want = [(playbook.PLAYBOOKS[name].path, "1", "", "")]
+                if name in self.CROSS_CUTTING:
+                    want.append((playbook.PLAYBOOKS[self.CROSS_CUTTER].path, "2", "", ""))
+                self.assertEqual(want, self.selection(name, self.loadable(name)[0]))
 
     def test_a_playbook_that_needs_approval_is_parked_under_a_constrained_ceiling(self):
         # PH2-50 criterion 5: "risk effects correctly park credential-changing,
@@ -42525,18 +42552,24 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # Parked rather than absent is the point. The row still comes back,
         # carrying `risk_above_ceiling`, so an operator can see what a grant
         # would buy instead of wondering why a subject matched nothing.
+        def parked(name: str) -> list[tuple[str, str]]:
+            because = (
+                "risk_above_ceiling"
+                if playbook.PLAYBOOKS[name].risk == "approval_required"
+                else ""
+            )
+            rows = [(playbook.PLAYBOOKS[name].path, because)]
+            if name in self.CROSS_CUTTING:
+                # A row this ceiling admits outranks one it parks, so where the
+                # subject's own Playbook needs a grant this ceiling does not
+                # give, the cross-cutting one comes back above it. That is the
+                # ordering an operator reads, and it is the point of the park.
+                rows.insert(0 if because else 1,
+                            (playbook.PLAYBOOKS[self.CROSS_CUTTER].path, ""))
+            return rows
+
         self.assertEqual(
-            {
-                name: [
-                    (
-                        playbook.PLAYBOOKS[name].path,
-                        "risk_above_ceiling"
-                        if playbook.PLAYBOOKS[name].risk == "approval_required"
-                        else "",
-                    )
-                ]
-                for name in sorted(self.SURFACES)
-            },
+            {name: parked(name) for name in sorted(self.SURFACES)},
             {
                 name: [(path, because) for path, _, because, _ in
                        self.selection(name, self.loadable(name)[0], "constrained")]
@@ -42549,7 +42582,17 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # subject: the Playbook the Surface was built for matched, and nothing
         # else in the catalogue did.
         self.assertEqual(
-            {name: [playbook.PLAYBOOKS[name].path] for name in sorted(self.SURFACES)},
+            {
+                name: sorted(
+                    [playbook.PLAYBOOKS[name].path]
+                    + (
+                        [playbook.PLAYBOOKS[self.CROSS_CUTTER].path]
+                        if name in self.CROSS_CUTTING
+                        else []
+                    )
+                )
+                for name in sorted(self.SURFACES)
+            },
             {name: self.matched(name) for name in sorted(self.SURFACES)},
         )
 

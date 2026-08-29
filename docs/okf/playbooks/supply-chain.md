@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "supply-chain"
-description: "Ask whether the build published the application's dependency boundary alongside its bundles, by reading the shell for the bundles it actually loads, following each bundle's own source-map pointer, and sorting the manifest's names into the ones the public already has and the ones that only exist inside the organisation."
+description: "Ask whether the build published the application's dependency boundary alongside its bundles, by reading the shell for the bundles it actually loads, following each bundle's own source-map pointer, and sorting the manifest's names into the ones the public already has and the ones that exist only inside the organisation."
 resource: ../../../src/redkraken/playbooks/supply-chain/playbook.md
 tags: [information_disclosure, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [analyse-source, handle-untrusted-content]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: cc3283a12577532fe19ea6c1716d66839579f6c768ed40ab96e3efc303670255
-bb:sha256: 4e9ba193cb37e69f9bd5cc7b0768cc6f10542fc60e4f632654d071ee5d72eeca
+bb:version: d7540365eaa504272a1c506f23ce69323f6038144d4423f5188e828a6d45dff9
+bb:sha256: c8d5c69284f731bf9133b464f4a36237b627983266f04460c296dbf915368cc7
 ---
 
-# Ask whether the build published the application's dependency boundary alongside its bundles, by reading the shell for the bundles it actually loads, following each bundle's own source-map pointer, and sorting the manifest's names into the ones the public already has and the ones that only exist inside the organisation.
+# Ask whether the build published the application's dependency boundary alongside its bundles, by reading the shell for the bundles it actually loads, following each bundle's own source-map pointer, and sorting the manifest's names into the ones the public already has and the ones that exist only inside the organisation.
 
 ## What it concludes about
 
@@ -47,7 +47,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 55 as the v2 replacement for v1's supply-chain page against a new dependency_manifest leaf added by ticket 55; the v1 page carried no attachments, and its dependency-confusion publishing, its registry probing and its version-to-CVE tables are refused by step 6.
+Written for ticket 55 as the v2 replacement for v1's supply-chain page against a new dependency_manifest leaf added by ticket 55, and rewritten for ticket 101 against the merged ledger's three readings for this slug. The change of substance is that content_match now names the binary that produces it -- js_parse for a bundle's pointer, js_map for a manifest index, jq where the manifest is plain JSON, all with tool_run provenance. Repaired again in review, where the body named a fetch verb and a park verb the executing role does not hold -- analyse-source is granted to js_analyst alone, which holds state.read, state.propose and exec.tool_run and nothing else, so every byte read here is now an Artifact an earlier run stored, the one reading that needs a request is proposed as a Test the replay lane performs, and a halt is written into the Task's own record. The v1 page's dependency-confusion publishing, its registry probing and its version-to-CVE tables stay refused.
 
 ## The authoritative document
 

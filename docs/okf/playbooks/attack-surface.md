@@ -14,8 +14,8 @@ bb:skills: [enumerate-surface, handle-untrusted-content]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 91bb8210e0fd515aa69c9b6d75e46ccbda185ef6ff8960dc5b2b0897cb4f491a
-bb:sha256: db45360a47fa2aa22fb291664a94fadd9ec195eec3c6cb1414411e96498e819b
+bb:version: 996a2a777ec1be2b26b4fc8ce7efd2b5598861a6a67e76d3150482c547442878
+bb:sha256: 3dee75e495645aebef9ce68ed2b65263c3d2b815575ebd8cdd21ab6e12aa57a7
 sources:
   - id: attack-surface--auto-scanners
     resource: /references/attack-surface--auto-scanners.md
@@ -59,7 +59,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 49 as the v2 replacement for v1's attack-surface pack, against the artifact-exposure leaf of the ticket 18 vocabulary; the three v1 texts are attached as maintainer references and none of them is the source of this class.
+Written for ticket 49 as the v2 replacement for v1's attack-surface pack, against the artifact-exposure leaf of the ticket 18 vocabulary; the three v1 texts are attached as maintainer references and none of them is the source of this class. Rewritten for ticket 101 against the merged ledger, which carries eleven readings, one lead and seven refusals for this slug. No frontmatter key moved, because all three evidence rows already name response_differential and so the refuted row is reachable as written.
 
 ## Maintainer references
 

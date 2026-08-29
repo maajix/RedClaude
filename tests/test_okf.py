@@ -11,7 +11,9 @@ a provenance view that lies precisely where it claims to be trustworthy.
 The negative controls exist for `tests/test_database.py`'s reason, stated in its
 own docstring: a check nobody has seen fail is a check nobody knows is wired up.
 Every rule `okf.validate` enforces is broken here on purpose once, and the test
-asserts it is the rule that fires.
+asserts it is the rule that fires, and on which side of the split -- a rule that
+quietly moved from `faults` to `advisories` is a gate that quietly stopped
+refusing.
 """
 
 from __future__ import annotations
@@ -38,7 +40,29 @@ class BundleTest(unittest.TestCase):
         cls.files = okf.build(ROOT)
 
     def test_the_bundle_conforms(self):
-        self.assertEqual((), okf.validate(self.files))
+        self.assertEqual(((), ()), okf.validate(self.files))
+
+    def test_every_frontmatter_block_the_bundle_writes_is_inside_the_grammar(self):
+        # The positive corpus, and the reason `frontmatter_faults` is a
+        # grammar rather than a guess: a checker that has only ever been shown
+        # what it must refuse does not know what it must admit. The count is
+        # stated so a file that silently stops carrying a block is a failure
+        # here rather than a silent skip.
+        blocks = 0
+        for name, text in sorted(self.files.items()):
+            if not text.startswith("---\n"):
+                continue
+            blocks += 1
+            self.assertEqual((), okf.frontmatter_faults(name, text), name)
+        self.assertEqual(141, blocks)
+
+    def test_the_reserved_log_carries_no_frontmatter(self):
+        # Section 9: "Log files carry no frontmatter." The three section
+        # indexes carry none either, by section 8.
+        without = sorted(n for n, t in self.files.items() if not t.startswith("---\n"))
+        self.assertEqual(
+            ["log.md", "playbooks/index.md", "references/index.md", "skills/index.md"], without
+        )
 
     def test_every_playbook_skill_and_reference_is_a_concept(self):
         # The count is stated as three sums rather than as 145, so a failure
@@ -136,15 +160,28 @@ class NegativeControlTest(unittest.TestCase):
         cls.files = okf.build(ROOT)
 
     def broken(self, **changes: str) -> tuple[str, ...]:
-        return okf.validate({**self.files, **changes})
+        """The section 11 faults, which are the only ones a consumer may refuse over."""
+        return okf.validate({**self.files, **changes})[0]
 
-    def test_a_missing_root_index_is_named(self):
+    def advised(self, **changes: str) -> tuple[str, ...]:
+        """The soft rules, reported and never fatal."""
+        return okf.validate({**self.files, **changes})[1]
+
+    def test_a_missing_root_index_advises_rather_than_refuses(self):
+        # Section 8 spells it "MAY appear in any directory, including the
+        # bundle root". A bundle without one discloses less; it does not fail.
         without = {k: v for k, v in self.files.items() if k != "index.md"}
-        self.assertIn("the bundle has no root index.md", okf.validate(without))
+        faults, advisories = okf.validate(without)
+        self.assertEqual((), faults)
+        self.assertIn("the bundle has no root index.md", advisories)
 
-    def test_a_root_index_without_the_version_is_named(self):
-        faults = self.broken(**{"index.md": "# no frontmatter\n\n[a](/log.md)\n"})
-        self.assertTrue(any("okf_version" in fault for fault in faults), faults)
+    def test_a_root_index_without_the_version_is_advised(self):
+        # Section 12 lists the field among the ones a root index MAY carry, and
+        # section 11 does not ask for it at all. Reported, never fatal.
+        changed = {"index.md": "# no frontmatter\n\n[a](/log.md)\n"}
+        self.assertEqual((), self.broken(**changed))
+        advisories = self.advised(**changed)
+        self.assertTrue(any("okf_version" in one for one in advisories), advisories)
 
     def test_a_concept_without_frontmatter_is_named(self):
         faults = self.broken(**{"playbooks/cookies.md": "# just prose\n"})
@@ -156,9 +193,18 @@ class NegativeControlTest(unittest.TestCase):
             "playbooks/cookies.md: no non-empty type, which is the one required key", faults
         )
 
-    def test_a_log_that_lost_its_type_is_named(self):
-        faults = self.broken(**{"log.md": "---\ntitle: x\n---\n\nbody\n"})
-        self.assertIn("log.md: the reserved log carries no type: Log", faults)
+    def test_a_log_that_grew_frontmatter_is_named(self):
+        faults = self.broken(**{"log.md": "---\ntype: Log\n---\n\n## 2026-08-28\n"})
+        self.assertIn("log.md: the reserved log carries a frontmatter block", faults)
+
+    def test_a_log_without_a_date_heading_is_named(self):
+        faults = self.broken(**{"log.md": "# Bundle history\n\nsomething happened\n"})
+        self.assertIn("log.md: the reserved log carries no ISO 8601 date heading", faults)
+
+    def test_a_log_that_is_not_newest_first_is_named(self):
+        text = "# Bundle history\n\n## 2026-08-01\n\n- a\n\n## 2026-08-28\n\n- b\n"
+        faults = self.broken(**{"log.md": text})
+        self.assertIn("log.md: the reserved log is not newest first", faults)
 
     def test_a_non_root_index_carrying_frontmatter_is_named(self):
         faults = self.broken(**{"skills/index.md": "---\ntype: Skill\n---\n\n[a](/log.md)\n"})
@@ -168,50 +214,139 @@ class NegativeControlTest(unittest.TestCase):
         faults = self.broken(**{"skills/index.md": "# Skills\n\nnothing here\n"})
         self.assertIn("skills/index.md: an index with no links discloses nothing", faults)
 
-    def test_an_actor_outside_the_three_spellings_is_named(self):
+    def test_an_actor_outside_the_three_spellings_is_advised(self):
         text = self.files["skills/use-identity.md"].replace(
             "by: process:redkraken-okf", "by: whoever"
         )
-        faults = self.broken(**{"skills/use-identity.md": text})
+        faults = self.advised(**{"skills/use-identity.md": text})
         self.assertTrue(any("not an OKF actor spelling" in fault for fault in faults), faults)
 
-    def test_a_status_outside_the_lifecycle_family_is_named(self):
+    def test_a_status_outside_the_lifecycle_family_is_advised(self):
         text = self.files["skills/use-identity.md"].replace("\nstatus: stable\n", "\nstatus: fine\n")
-        faults = self.broken(**{"skills/use-identity.md": text})
+        faults = self.advised(**{"skills/use-identity.md": text})
         self.assertTrue(any("outside the lifecycle family" in fault for fault in faults), faults)
 
-    def test_a_stale_after_that_is_a_date_and_not_an_instant_is_named(self):
+    def test_a_stale_after_that_is_a_date_and_not_an_instant_is_advised(self):
         text = self.files["skills/use-identity.md"].replace(
             "\nstale_after: 2027-08-28T00:00:00Z\n", "\nstale_after: 2027-08-28\n"
         )
-        faults = self.broken(**{"skills/use-identity.md": text})
+        faults = self.advised(**{"skills/use-identity.md": text})
         self.assertTrue(any("not an absolute instant" in fault for fault in faults), faults)
 
-    def test_a_footnote_matching_no_source_is_named(self):
+    def test_a_footnote_matching_no_source_is_advised(self):
+        # A defect in this bundle and not one of section 11's three rules, so
+        # it is reported rather than refused. `test_the_bundle_conforms` still
+        # holds the advisory list empty, which is where this stays graded.
         text = self.files["playbooks/attack-surface.md"] + "\n\nA claim.[^invented]\n"
-        faults = self.broken(**{"playbooks/attack-surface.md": text})
+        changed = {"playbooks/attack-surface.md": text}
+        self.assertEqual((), self.broken(**changed))
         self.assertIn(
-            "playbooks/attack-surface.md: footnote [^invented] matches no sources[].id", faults
+            "playbooks/attack-surface.md: footnote [^invented] matches no sources[].id",
+            self.advised(**changed),
         )
 
-    def test_a_source_nobody_cites_is_named(self):
+    def test_a_source_nobody_cites_is_advised(self):
         text = self.files["playbooks/attack-surface.md"].replace(
             "[^attack-surface--cves]: Known vulnerabilities, versions, and what this corpus does with them\n",
             "",
         )
-        faults = self.broken(**{"playbooks/attack-surface.md": text})
+        changed = {"playbooks/attack-surface.md": text}
+        self.assertEqual((), self.broken(**changed))
         self.assertIn(
-            "playbooks/attack-surface.md: source id attack-surface--cves is declared and never cited",
-            faults,
+            "playbooks/attack-surface.md: source id attack-surface--cves is declared"
+            " and never cited",
+            self.advised(**changed),
         )
 
-    def test_a_link_to_nothing_is_named(self):
+    def test_a_link_to_nothing_is_advised(self):
         text = self.files["playbooks/cookies.md"] + "\n\n[gone](/skills/does-not-exist.md)\n"
-        faults = self.broken(**{"playbooks/cookies.md": text})
         self.assertIn(
             "playbooks/cookies.md: bundle-relative link /skills/does-not-exist.md resolves to nothing",
-            faults,
+            self.advised(**{"playbooks/cookies.md": text}),
         )
+
+
+class GrammarTest(unittest.TestCase):
+    """Every rule of `okf.frontmatter_faults`, broken once.
+
+    A table and not twenty methods, because these are twenty instances of one
+    question -- does this line leave the seven forms -- and twenty method names
+    restating the `want` column would be the same sentence written twice. The
+    positive half of the grammar is proved in `BundleTest` against the whole
+    emitted bundle, which is the half a negative corpus cannot prove.
+    """
+
+    #: `(what it breaks, the block, the phrase the fault must carry)`.
+    CASES = (
+        ("no block at all", "# just prose\n", "no frontmatter block opens the file"),
+        ("an unclosed block", "---\ntype: Log\n", "never closed"),
+        ("an empty block", "---\n---\n\nbody\n", "block is empty"),
+        ("a tab", "---\ntype: Log\n\tid: x\n---\n\nbody\n", "a tab is not indentation"),
+        ("a line that is no pair", "---\ntype Log\n---\n\nbody\n", "is not `key: value`"),
+        ("a blank line", "---\ntype: Log\n\n---\n\nbody\n", "is not `key: value`"),
+        ("an upper-case key", "---\nType: Log\n---\n\nbody\n", "'Type' is not a key"),
+        ("a twice-namespaced key", "---\na:b:c: x\n---\n\nbody\n", "is not a key"),
+        ("a key stated twice", "---\ntype: Log\ntype: Skill\n---\n\nbody\n", "is stated twice"),
+        ("a block scalar", "---\ntype: |\n---\n\nbody\n", "which YAML reads as structure"),
+        ("a folded scalar", "---\ntype: >\n---\n\nbody\n", "which YAML reads as structure"),
+        ("an anchor", "---\ntype: &a Log\n---\n\nbody\n", "which YAML reads as structure"),
+        ("an alias", "---\ntype: *a\n---\n\nbody\n", "which YAML reads as structure"),
+        ("a tag", "---\ntype: !!str Log\n---\n\nbody\n", "which YAML reads as structure"),
+        ("a merge key", "---\n<<: x\n---\n\nbody\n", "is not a key"),
+        ("a second colon", "---\ntype: a: b\n---\n\nbody\n", "a colon YAML would read"),
+        ("a comment introducer", "---\ntype: Log #c\n---\n\nbody\n", "comment introducer"),
+        ("an unclosed quote", '---\ntitle: "a\n---\n\nbody\n', "never closes"),
+        ("an undefined escape", '---\ntitle: "a\\qb"\n---\n\nbody\n', "YAML does not define"),
+        ("a quote that ends early", '---\ntitle: "a"b"\n---\n\nbody\n', "closes its quote early"),
+        ("an unclosed sequence", "---\ntags: [a, b\n---\n\nbody\n", "never closes"),
+        ("an empty element", "---\ntags: [a,,b]\n---\n\nbody\n", "an empty element"),
+        ("a trailing comma", "---\ntags: [a, b,]\n---\n\nbody\n", "an empty element"),
+        ("an empty sequence", "---\ntags: []\n---\n\nbody\n", "empty flow sequence"),
+        ("a missing space", "---\ntags: [a,b]\n---\n\nbody\n", "comma and a space"),
+        ("an unclosed mapping", "---\ngenerated: { by: x\n---\n\nbody\n", "never closes"),
+        ("a mapping with no pair", "---\ngenerated: { x }\n---\n\nbody\n", "not a `key: value`"),
+        ("an orphan indent", "---\ntype: Log\n  - id: x\n---\n\nbody\n", "under no block"),
+        ("an odd indent", "---\nsources:\n   id: x\n---\n\nbody\n", "indented 3 spaces"),
+        ("a two-space non-entry", "---\nsources:\n  id: x\n---\n\nbody\n", "opens no sequence"),
+        ("a four-space entry", "---\nsources:\n    - id: x\n---\n\nbody\n", "four spaces in"),
+        # A flow indicator ends the scalar wherever it stands, so each of these
+        # four is two elements to a parser and one to a leading-character check.
+        ("a bracket inside an element", "---\ntags: [a[b]\n---\n\nbody\n", "ends a scalar"),
+        ("a bracket that closes early", "---\ntags: [a]b]\n---\n\nbody\n", "ends a scalar"),
+        ("a brace inside an element", "---\ntags: [a{b}]\n---\n\nbody\n", "ends a scalar"),
+        ("a bracket inside a mapping", "---\ngenerated: { by: a[b }\n---\n\nbody\n",
+         "ends a scalar"),
+    )
+
+    def test_every_shape_outside_the_grammar_is_refused(self):
+        for what, block, want in self.CASES:
+            with self.subTest(what):
+                faults = okf.frontmatter_faults("x.md", block)
+                self.assertTrue(faults, f"{what} was admitted")
+                self.assertTrue(any(want in fault for fault in faults), (what, faults))
+
+    def test_the_seven_forms_are_admitted(self):
+        # One line per form, so a refusal here says which form the grammar lost
+        # rather than only that the bundle stopped conforming.
+        block = (
+            "---\n"
+            "type: Log\n"
+            "tags: [a, b, c]\n"
+            'okf_version: "0.2"\n'
+            "generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }\n"
+            "bb:category: injection\n"
+            "sources:\n"
+            "  - id: a--b\n"
+            "    resource: /references/a--b.md\n"
+            "---\n\nbody\n"
+        )
+        self.assertEqual((), okf.frontmatter_faults("x.md", block))
+
+    def test_a_key_is_split_at_the_first_colon_and_space_and_not_the_first_colon(self):
+        # The rule the first draft had backwards, and the reason `bb:category`
+        # is one key and `stale_after: 2027-02-15T00:00:00Z` is one scalar.
+        block = "---\nbb:category: injection\nstale_after: 2027-02-15T00:00:00Z\n---\n\nbody\n"
+        self.assertEqual((), okf.frontmatter_faults("x.md", block))
 
 
 class FreezeTest(unittest.TestCase):
@@ -220,8 +355,9 @@ class FreezeTest(unittest.TestCase):
     Committed rather than generated on demand for the reason every digest in
     this tree is written down: a view nobody can diff is a view nobody notices
     going wrong. The failure below names the file, and the fix is never to
-    relax the assertion -- it is `python -c "from redkraken import okf, pathlib;
-    okf.write(pathlib.Path('.'))"` and a reading of the diff.
+    relax the assertion -- it is `python -c "import pathlib; from redkraken import
+    okf; okf.write(pathlib.Path('.'), pathlib.Path('docs/okf'))"` and a reading
+    of the diff.
     """
 
     def test_the_committed_bundle_is_current(self):

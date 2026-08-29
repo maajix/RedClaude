@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "race-conditions"
-description: "Ask whether a single-use action stays single when two copies arrive together, by establishing sequentially that the second copy is refused and then reading the count the target keeps after a concurrent pair."
+description: "Ask whether a single-use action stays single, by reading the count a target keeps before anything is sent and then spending one value twice inside a Test whose own assertions difference that counter."
 resource: ../../../src/redkraken/playbooks/race-conditions/playbook.md
 tags: [business_logic, constrained, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: mutates_object
 bb:baseline: pristine_surface
-bb:version: d467ca2d636d688b2e661a1c281dcc7918a0371d242401ee238cb73917480446
-bb:sha256: aa118d25f5e6a6394f0d39a7802b1c2d86a3bda9cccbaf7bc3b57b03678a4771
+bb:version: 5853faca7edc920973cdfa1b12700152d8c338bd8a5fbc7e2ce901b7e6400f84
+bb:sha256: fd47c8dd7bf707139d6fd858d42b1e72ce9cad49fb5664860fcb93f9ef6ec5c4
 sources:
   - id: race-conditions--race-conditions-and-timing-attacks
     resource: /references/race-conditions--race-conditions-and-timing-attacks.md
@@ -23,7 +23,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a single-use action stays single when two copies arrive together, by establishing sequentially that the second copy is refused and then reading the count the target keeps after a concurrent pair.
+# Ask whether a single-use action stays single, by reading the count a target keeps before anything is sent and then spending one value twice inside a Test whose own assertions difference that counter.
 
 ## What it concludes about
 
@@ -46,13 +46,13 @@ Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
-- to `supported`: at least 1 supports `state_change` observation(s) from a `control`
-- to `supported`: at least 1 supports `state_change` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
+- to `supported`: at least 1 supports `response_differential` observation(s) from a `control`
+- to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 51 as the v2 replacement for v1's race-conditions pack, against the replay leaf of the ticket 18 vocabulary; the v1 race-conditions text is attached as a maintainer reference and is where the sequential control this Playbook insists on comes from.
+Written for ticket 51 as the v2 replacement for v1's race-conditions pack against the replay leaf of the ticket 18 vocabulary, and rewritten for ticket 101 against the merged ledger's four readings for this slug. Ticket 211 is what moved the sequential reading onto the Finding path, because a Test action now states the body it plans and the single-use value this Playbook's triggers declare rides one. All three evidence rows now name response_differential, because the counter reads are actions of the Test and close_test_replay writes their Observations from the specification, while an agent-filed state_change citing a counter read cannot be added once the first recorded action has moved the claim past proposed; the concurrent pair the shipped step 4 asked for is blocked and the single-packet forms are refused, and both are named at the end rather than dropped.
 
 ## Maintainer references
 

@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "payment-workflows"
-description: "Ask whether an amount the rules forbid is accepted, by stating the invariant and the pristine total first, sending one order with the quantity or price edited, and reading the total the target itself computes."
+description: "Ask which number the server believes, by stating the invariant the target itself publishes, reading the pristine total, sending one order with exactly one number edited, and differencing the total the target computes against the same order made legitimately."
 resource: ../../../src/redkraken/playbooks/payment-workflows/playbook.md
 tags: [business_logic, constrained, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: constrained
 bb:effects: mutates_object
 bb:baseline: pristine_surface
-bb:version: 494358c628fd4077226815d8419a471a1d22e0600361418d287b15f73094dbb3
-bb:sha256: ff2341884cfdf4ca0f3358d67fbb739a8c0503a3e6993ea90e130c440e3f9648
+bb:version: ed98dce721b99c50a7baf9c73e26e5bfd5fe7edeea8b447d88c7b8640308fbda
+bb:sha256: 39b7359c2735ff8c2bff4bf81194c7c02086fc231939fca8cae8c8c16f3e0a54
 ---
 
-# Ask whether an amount the rules forbid is accepted, by stating the invariant and the pristine total first, sending one order with the quantity or price edited, and reading the total the target itself computes.
+# Ask which number the server believes, by stating the invariant the target itself publishes, reading the pristine total, sending one order with exactly one number edited, and differencing the total the target computes against the same order made legitimately.
 
 ## What it concludes about
 
@@ -47,7 +47,7 @@ Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
 
 ## Provenance
 
-Written for ticket 51 as the v2 replacement for v1's payment-workflows pack, against the quantity-or-price leaf of the ticket 18 vocabulary; v1 shipped a README for this topic and no reference text, so nothing is attached.
+Written for ticket 51 as the v2 replacement for v1's payment-workflows pack, against the quantity-or-price leaf of the ticket 18 vocabulary; v1 shipped a README for this topic and no reference text, so nothing is attached. Rewritten for ticket 101 against the merged ledger, which carries four readings, one lead and two refusals for this slug. No frontmatter key moved, because all three evidence rows already name response_differential and the refuted row is reachable as written.
 
 ## The authoritative document
 

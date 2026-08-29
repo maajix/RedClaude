@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "spreadsheet-injection"
-description: "Ask whether a stored field is written into an exported spreadsheet without a leading apostrophe, by saving one record whose value begins with a formula character and one whose value does not and matching both inside the downloaded export."
+description: "Ask whether the export writer emits a caller-chosen value into a cell without the leading apostrophe that would make it text, by fetching the export before anything is written, storing one record whose value begins with a formula character and one whose value does not, fetching the export twice more, and differencing the files so both new rows come back whole with the character before each still attached."
 resource: ../../../src/redkraken/playbooks/spreadsheet-injection/playbook.md
 tags: [injection, approval_required, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [compare-responses, handle-untrusted-content, use-identity]
 bb:risk: approval_required
 bb:effects: mutates_object
 bb:baseline: stable_session
-bb:version: 17cb7128c9909a968f4d2cb1d86fef965a5615a67b5a6c64c5ee85da241710c8
-bb:sha256: d807336891d7ed9b51dbb3c18e4873cabad919350671548214da971a11a521ca
+bb:version: 0d427bbfbd8b2971ac34bdce34a7fa3642176b9669d5fd77049ae6eaf82ffa05
+bb:sha256: 5c820e1870f1186e4986f434b7ad8e15bd9535d2b71e10f939ce204e9248cd9d
 ---
 
-# Ask whether a stored field is written into an exported spreadsheet without a leading apostrophe, by saving one record whose value begins with a formula character and one whose value does not and matching both inside the downloaded export.
+# Ask whether the export writer emits a caller-chosen value into a cell without the leading apostrophe that would make it text, by fetching the export before anything is written, storing one record whose value begins with a formula character and one whose value does not, fetching the export twice more, and differencing the files so both new rows come back whole with the character before each still attached.
 
 ## What it concludes about
 
@@ -48,7 +48,7 @@ Risk `approval_required`, effects `mutates_object`, baseline `stable_session`.
 
 ## Provenance
 
-Written for ticket 53 as the v2 replacement for v1's spreadsheet-injection page, against a new formula leaf added by ticket 53 because the interpreter is the spreadsheet application on a reader's machine rather than anything the target runs; no upstream card.
+Written for ticket 53 as the v2 replacement for v1's spreadsheet-injection page, against a new formula leaf added by ticket 53 because the interpreter is the spreadsheet application on a reader's machine rather than anything the target runs; no upstream card. Rewritten for ticket 101 against the merged ledger, which carries one reading, one blocked container and one refusal for this slug and no row that reaches a Finding, which is why this document says so at the top. No mining shard targeted the slug, so the reading comes from this Playbook's own body and the OWASP page; a sweep of all 665 mined rows by text matched one, the OOXML importer, which is the blocked container named in the closing section. The shipped step 4 said the export is examined by a registered tool run and named none, and no registered tool matches a declared pattern inside one text Artifact, so the reading becomes a difference of two exports over compare-responses. Nothing in the frontmatter moved but the description and this line.
 
 ## The authoritative document
 

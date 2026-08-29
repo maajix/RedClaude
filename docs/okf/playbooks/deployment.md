@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "deployment"
-description: "Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by requesting a path the front end refuses and then requesting the same path written a second way that resolves to it, and differencing the two answers against a path whose spelling nobody restricted."
+description: "Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by asking one refused path again under a second spelling that resolves to the same route, under each method the tool contract offers, under a client address the caller writes, and under a path the router reads out of a header the authoriser never saw, each arm against a control on a path nobody restricted."
 resource: ../../../src/redkraken/playbooks/deployment/playbook.md
 tags: [authorization, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,8 +14,8 @@ bb:skills: [compare-responses]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: a93a8fdcf87aadb2906f83fbeb118b26bc90435c11758627554d75f81e86fee9
-bb:sha256: f7ca0232736223003db6a0fc1649745ba3467dd0df1cc8aa4e8a78d0cbd6cedd
+bb:version: 4dbb32fe88a2f9840757a8d1f3f5aa17bbea86afc1b23accad17895d3159bfed
+bb:sha256: 4109938d9072332e7fb152e1eaf94b68ae01fd9dc42fc08ef364424608874f8c
 sources:
   - id: deployment--apache-tomcat
     resource: /references/deployment--apache-tomcat.md
@@ -27,7 +27,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by requesting a path the front end refuses and then requesting the same path written a second way that resolves to it, and differencing the two answers against a path whose spelling nobody restricted.
+# Ask whether a rule the deployment enforces in front of the application is enforced by the application behind it, by asking one refused path again under a second spelling that resolves to the same route, under each method the tool contract offers, under a client address the caller writes, and under a path the router reads out of a header the authoriser never saw, each arm against a control on a path nobody restricted.
 
 ## What it concludes about
 
@@ -49,13 +49,13 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
 - to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 55 as the v2 replacement for v1's deployment pack against a new edge_rule leaf added by ticket 55; the pack's server pages are attached as maintainer references and their desync techniques, their TLS downgrade work and their default-credential lists are refused by step 7.
+Written for ticket 55 as the v2 replacement for v1's deployment pack against a new edge_rule leaf added by ticket 55; the pack's server pages are attached as maintainer references and their desync techniques, their TLS downgrade work and their default-credential lists are refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries five readings, one lead and five refusals for this slug; three readings are new and two of them became closeable only when ticket 211 let a Test action state its headers. One key moved -- the refuted variant row now asks for the kind its own supported row asks for, because close_test_replay derives one kind per role from the specification and a refuted leg asking for a second kind is a leg nothing can write.
 
 ## Maintainer references
 

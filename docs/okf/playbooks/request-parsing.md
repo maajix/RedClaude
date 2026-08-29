@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "request-parsing"
-description: "Ask whether two components that both act on one request resolve the same parameter name to different values, by sending the route's own request once with the name in one carrier and once with it in two, and comparing what the application said it accepted against what it actually produced."
+description: "Ask whether two components that both act on one request resolve one name, one grammar or one encoding the same way, by duplicating the name, re-declaring the representation, re-spelling the value or moving it into a carrier the method does not have, and closing each reading on a Test whose control is the same shape applied where it must not work."
 resource: ../../../src/redkraken/playbooks/request-parsing/playbook.md
 tags: [injection, constrained, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -10,12 +10,12 @@ stale_after: 2027-05-15T00:00:00Z
 bb:category: injection
 bb:outputs: [injection.parameter_precedence]
 bb:triggers_all: [repeated_parameter_name, state_changing_method, web_surface]
-bb:skills: [compare-responses]
+bb:skills: [compare-responses, enumerate-surface, use-identity]
 bb:risk: constrained
 bb:effects: mutates_object
 bb:baseline: pristine_surface
-bb:version: 1bd54787c410fd568677c21a085a8806bff891fbf01f6ac2fb24b279cd338a23
-bb:sha256: 491befb5f68018ecf7cd6e8c324c08aab640d0ff55e47cea7d85340da50b6078
+bb:version: b67bce15d2aabc1248e2d2ea3456237fca3128322015ad485251e56c8f6c1e5a
+bb:sha256: cf7e2a26087c73ba4de9b4c3c4334e6d482eda38a2d9effcd3fb3aaf9d485681
 sources:
   - id: request-parsing--http-attacks-crlf-injection-and-response-splitting
     resource: /references/request-parsing--http-attacks-crlf-injection-and-response-splitting.md
@@ -35,7 +35,7 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether two components that both act on one request resolve the same parameter name to different values, by sending the route's own request once with the name in one carrier and once with it in two, and comparing what the application said it accepted against what it actually produced.
+# Ask whether two components that both act on one request resolve one name, one grammar or one encoding the same way, by duplicating the name, re-declaring the representation, re-spelling the value or moving it into a carrier the method does not have, and closing each reading on a Test whose control is the same shape applied where it must not work.
 
 ## What it concludes about
 
@@ -54,16 +54,18 @@ Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
 ## Skills it loads
 
 - [compare-responses](/skills/compare-responses.md)
+- [enumerate-surface](/skills/enumerate-surface.md)
+- [use-identity](/skills/use-identity.md)
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `response_differential` observation(s) from a `variant`
 - to `supported`: at least 1 supports `response_invariant` observation(s) from a `control`
 - to `supported`: at least 1 supports `response_differential` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 56 as the v2 replacement for v1's request-parsing pack against a new parameter_precedence leaf added by ticket 56; the pack's four pages are attached as maintainer references, and its response-splitting payloads, its host-header rewrites and its filter-evasion catalogue are refused by step 7.
+Written for ticket 56 as the v2 replacement for v1's request-parsing pack against a new parameter_precedence leaf added by ticket 56; the pack's four pages are attached as maintainer references, and its response-splitting payloads, its host-header rewrites and its filter-evasion catalogue are refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries eleven readings that settle a claim and five refusals for this slug. Two keys moved. bb:skills gains enumerate-surface, which the route-suffix reading of section 4 needs, and use-identity, which the readings against an authenticated route need; both are already held by the role that executes this text. The refuted variant row moves from response_invariant to response_differential, the kind the supported row of that same role names, because close_test_replay derives the kind from the specification and one role writes one kind whichever way the reading goes.
 
 ## Maintainer references
 

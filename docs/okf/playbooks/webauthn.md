@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "webauthn"
-description: "Ask whether a step-up route enforces the factor it asks for or merely offers it, by completing the sensitive action while withholding, downgrading and replaying the second factor the client was told to present."
+description: "Ask whether a step-up route enforces the factor it asks for or merely offers it, by driving the action honestly once and then reaching it with the factor withheld, renamed, replayed, or its subject taken from a value the caller writes."
 resource: ../../../src/redkraken/playbooks/webauthn/playbook.md
 tags: [authentication, approval_required, mutates_account]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [compare-responses, use-identity]
 bb:risk: approval_required
 bb:effects: mutates_account
 bb:baseline: stable_session
-bb:version: 0522c44ac3bab244b81447660943e223808c16a2560737b52568df0dadb7e5c3
-bb:sha256: 5bc566683b6822c4cc73305484fcac13ded4091b6f6f0eae3569b3b054101748
+bb:version: 681c72cf2ce9de3a42f610513642e2a053ff6b6b59ed28d069d14738bad5e657
+bb:sha256: 0e145baf966155543d2a13ce81f765ee86be8af01fcf1f4df792065fa4417ced
 ---
 
-# Ask whether a step-up route enforces the factor it asks for or merely offers it, by completing the sensitive action while withholding, downgrading and replaying the second factor the client was told to present.
+# Ask whether a step-up route enforces the factor it asks for or merely offers it, by driving the action honestly once and then reaching it with the factor withheld, renamed, replayed, or its subject taken from a value the caller writes.
 
 ## What it concludes about
 
@@ -40,13 +40,13 @@ Risk `approval_required`, effects `mutates_account`, baseline `stable_session`.
 
 ## What it owes before a claim moves
 
-- to `refuted`: at least 1 refutes `response_invariant` observation(s) from a `variant`
+- to `refuted`: at least 1 refutes `state_change` observation(s) from a `variant`
 - to `supported`: at least 1 supports `credential_effect` observation(s) from a `control`
 - to `supported`: at least 1 supports `state_change` observation(s) from a `variant`
 
 ## Provenance
 
-Written for ticket 50 as the v2 replacement for v1's webauthn pack, against the factor-enforcement leaf of the ticket 18 vocabulary; v1 shipped a README for this topic and no reference text, so nothing is attached.
+Written for ticket 50 as the v2 replacement for v1's webauthn pack, against the factor-enforcement leaf of the ticket 18 vocabulary; v1 shipped a README for this topic and no reference text, so nothing is attached. Rewritten for ticket 101 against the merged ledger, which carries four readings and one refusal for this slug. One key moved. The refuted variant row moves from response_invariant to state_change, the kind the supported row of that same role names, because close_test_replay derives the kind from the specification and one role writes one kind whichever way the reading goes.
 
 ## The authoritative document
 

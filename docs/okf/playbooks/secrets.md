@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: "secrets"
-description: "Ask whether a string of credential shape in a served document is worth anything, by taking every candidate out of the stored document, presenting each once to the route it names, and comparing what the target said against what it says to a request carrying no credential at all."
+description: "Ask whether a string of credential shape in a served document is worth anything, by grounding the candidate list with an offline reader rather than by eye and then presenting each candidate once to the route the document itself names, paired against the identical request carrying no credential at all."
 resource: ../../../src/redkraken/playbooks/secrets/playbook.md
 tags: [information_disclosure, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
@@ -14,11 +14,11 @@ bb:skills: [compare-responses, handle-untrusted-content]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 7281778511516cdb2304881d23cdc85e27a0c5196d4a5e16c8ed3d425b9e976b
-bb:sha256: a9e423196f35f7e5f846baeaf1c4fc409b3edf5b5b843e4a25704f336f4c4820
+bb:version: 033edaf1132486dede4f6e205fda4d3437dc1371af42caee635f68ced2b394e3
+bb:sha256: a3b8760281a090648ca97f21341605ffa27f0c44609f81c1f2a90f83f02b5cac
 ---
 
-# Ask whether a string of credential shape in a served document is worth anything, by taking every candidate out of the stored document, presenting each once to the route it names, and comparing what the target said against what it says to a request carrying no credential at all.
+# Ask whether a string of credential shape in a served document is worth anything, by grounding the candidate list with an offline reader rather than by eye and then presenting each candidate once to the route the document itself names, paired against the identical request carrying no credential at all.
 
 ## What it concludes about
 
@@ -47,7 +47,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 54 as the v2 replacement for v1's secrets page against a new credential_material leaf added by ticket 54; the v1 page carried no attachments, and its advice to enumerate what a found key reaches is refused by step 6.
+Written for ticket 54 as the v2 replacement for v1's secrets page against a new credential_material leaf added by ticket 54; the v1 page carried no attachments, and its advice to enumerate what a found key reaches is refused by the closing section. Rewritten for ticket 101 against the merged ledger, which carries one procedure, one lead, one blocked half and two refusals for this slug. No frontmatter key moved and the evidence bar is reachable, because the refuted and supported legs of the variant role name one kind. Four things the shipped text left a hunter to discover are now written down. The grounding step names which binary produces the content_match its bar requires. The pair is planned without a leased Identity wherever the candidate is presented as an Authorization header, which a leased Identity owns and would replace. Each pair carries its own control action, a control drawn from another pair being an action of another Test. And the closing section carries every refusal with its reason.
 
 ## The authoritative document
 

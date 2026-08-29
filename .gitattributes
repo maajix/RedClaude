@@ -1,0 +1,10 @@
+# A tab-separated table's last column is data. `baseline/technique-sources.tsv`
+# puts `note` last, and 1523 of its 1524 rows carry none, so every one of them
+# ends in a tab -- the separator the format requires, not whitespace anyone
+# left behind. `git diff --check` is one of this repository's gates and reads
+# that tab as damage, which would refuse every future change to the table for a
+# character it cannot be written without.
+#
+# Scoped to the one file that has this shape. The other six tables under
+# `baseline/` end no row in a tab and are held to the ordinary rule.
+baseline/technique-sources.tsv -whitespace

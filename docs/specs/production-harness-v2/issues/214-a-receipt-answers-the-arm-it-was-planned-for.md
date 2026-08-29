@@ -6,7 +6,7 @@ keeps an empty body different from no body all the way to the target.
 
 **Blocked by:** 211 — A Test action carries the header and the body it plans.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 The implementation is in the working tree, uncommitted. Everything below was
 measured against it. The status stays `ready-for-agent` because `resolved` in

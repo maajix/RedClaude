@@ -1,21 +1,21 @@
 ---
 type: Playbook
 title: "browser-script"
-description: "Ask whether a parameter a recon pass saw reflected reaches the browser as markup the parser builds an element from, by planting one registered probe through a scripted browser mission and reading the verdict the probe returns."
+description: "Ask whether a reflected parameter reaches the browser as markup a parser builds an element from, and whether the filter and the parser agree about what they were handed, by naming the escaping context from two stored responses first and only then planting the one registered probe through a scripted browser mission."
 resource: ../../../src/redkraken/playbooks/browser-script/playbook.md
 tags: [injection, constrained, read_only]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
 status: draft
 stale_after: 2027-03-15T00:00:00Z
 bb:category: injection
-bb:outputs: [injection.markup]
+bb:outputs: [injection.markup, injection.parser_differential]
 bb:triggers_all: [query_parameter, reflected_parameter, web_surface]
-bb:skills: [browser-evidence]
+bb:skills: [browser-evidence, compare-responses]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 0dd9f3ece33a4ec11a831b7ee3644ca8b777c528a42151caebe15de92014b2e8
-bb:sha256: 3f4982af4dcf34a8875ae1912410da4888615f6bd2e467ee4a45d06af97ea2e0
+bb:version: 847a64a40212afb4d69ce8a696b147d04b54266a08485b68807a1d5ed63ec02a
+bb:sha256: c05fdbe32df2f01c9427f7f6bf588fae9b54b6eca2dd4aa45dd2847e5512da83
 sources:
   - id: browser-script--dangling-markup
     resource: /references/browser-script--dangling-markup.md
@@ -27,11 +27,12 @@ sources:
     author: human:maintainer
 ---
 
-# Ask whether a parameter a recon pass saw reflected reaches the browser as markup the parser builds an element from, by planting one registered probe through a scripted browser mission and reading the verdict the probe returns.
+# Ask whether a reflected parameter reaches the browser as markup a parser builds an element from, and whether the filter and the parser agree about what they were handed, by naming the escaping context from two stored responses first and only then planting the one registered probe through a scripted browser mission.
 
 ## What it concludes about
 
 - `injection.markup`
+- `injection.parser_differential`
 
 ## When it is selected
 
@@ -46,6 +47,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 ## Skills it loads
 
 - [browser-evidence](/skills/browser-evidence.md)
+- [compare-responses](/skills/compare-responses.md)
 
 ## What it owes before a claim moves
 
@@ -55,7 +57,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 52 as the v2 replacement for v1's xss and dangling-markup pages, against the markup leaf of the ticket 18 vocabulary; both v1 texts are attached as maintainer references and the second is where step 4's contexts come from.
+Written for ticket 52 as the v2 replacement for v1's xss and dangling-markup pages, against the markup leaf of the ticket 18 vocabulary; both v1 texts are attached as maintainer references. Rewritten for ticket 101 against the merged technique ledger, which holds nine executable readings, two capability asks and one refusal for this slug. Two of the nine ask whether a filter and a parser disagree about one normalisation, which is injection.parser_differential -- a class the vocabulary shipped with no emitter -- so bb:outputs gains it under D3. bb:skills gains compare-responses because two readings are ordinary response comparisons that need no browser at all. Repaired in review -- the file described Tests without naming mcp__rk2__propose_test, the only verb that files a specification, and section 5 named neither the verb that performs it nor the writer that records it. Recounted in round 3 -- the four browse-lane sections grade nothing, so the register reads 7 of 8 and not 3 of 8.
 
 ## Maintainer references
 

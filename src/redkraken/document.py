@@ -35,6 +35,11 @@ FENCE = "---"
 #: is allowed to have evidence for.
 KEY = re.compile(r"^[a-z][a-z0-9_]*(?:[-:][a-z0-9_]+)*$")
 
+#: The characters YAML reads as structure when a plain scalar opens with one.
+#: Named rather than inlined because `okf.frontmatter_faults` holds the same
+#: line to the same list, and two copies of an indicator set drift.
+INDICATORS = "-?:,[]{}#&*!|>'\"%@`"
+
 #: What a list entry has to be before anything more specific is asked of it: a
 #: non-empty string that neither begins nor is made of whitespace.
 ENTRY = re.compile(r"^\S.*$")
@@ -73,7 +78,7 @@ def scalar(fault: type[DocumentError], name: str, key: str, raw: str) -> str:
     """A plain value, restricted to what YAML and this parser must agree about."""
     if not raw:
         raise fault("frontmatter_malformed", name, f"{key} has no value")
-    if raw[0] in "-?:,[]{}#&*!|>'\"%@`":
+    if raw[0] in INDICATORS:
         raise fault(
             "frontmatter_malformed", name,
             f"{key} starts with {raw[0]!r}, which YAML reads as structure; quote it as JSON",
