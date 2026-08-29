@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from types import MappingProxyType
@@ -293,6 +293,50 @@ OBSERVATION_KINDS = {
     "timing_differential": ("receipt",),
     "transport_parameters_observed": ("receipt",),
 }
+
+def observation_provenance(kinds: Mapping[str, Iterable[str]] = OBSERVATION_KINDS) -> str:
+    """`allowed_provenance` as the one sentence a run is ever told it in.
+
+    Ticket 145 is the reason this is built rather than written. The sentence it
+    replaces named nine kinds and left the remaining seven as "the other seven
+    take either", and `rk2hunt6` lost two of fifteen elements to a
+    `content_match` citing a Receipt -- a set difference the reader had to
+    compute before it could obey. Every kind is named now, off the same rows
+    `tests/test_roster.py` already holds to the corpus, so the sentence cannot
+    say one thing while `allowed_provenance` says another.
+
+    A sentence and not a shape, and that is the decision the ticket asked for
+    rather than a shortfall. The rule holds between two fields of one element --
+    `kind`, and which of the two labels is set -- which the one-level subschema
+    `Argument.schema` renders cannot express and which the gate could express
+    only by refusing the call whole. The comment over
+    `mcp__rk2__submit_mission_result` is what settles which way that trades:
+    only what is *certainly* refused is refused there, "where it costs a retry
+    the model can actually make", and a denied submission costs every well
+    formed element sent beside the two bad ones. So the mismatch stays what it
+    already was, a `proposal_drops` row reading `incompatible_provenance`, and
+    what moves is the sentence that comes before the call -- because the drop
+    itself arrives after the run has ended, at nobody left to correct it.
+    """
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    for kind, allowed in sorted(kinds.items()):
+        grouped.setdefault(tuple(allowed), []).append(kind)
+    return (
+        "; ".join(
+            f"{_series(named)} {'takes' if len(named) == 1 else 'take'} "
+            f"{_series(allowed, 'or')}"
+            for allowed, named in sorted(grouped.items())
+        )
+        + "."
+    )
+
+
+def _series(words: Sequence[str], last: str = "and") -> str:
+    """A list of words as English, so a generated sentence reads like one."""
+    if len(words) == 1:
+        return words[0]
+    return f"{', '.join(words[:-1])} {last} {words[-1]}"
+
 
 #: `property_classes.id`, every row the corpus seeds. Written flat rather than
 #: as eight families, because the family is the part of the id before the dot
