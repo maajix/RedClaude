@@ -139,6 +139,23 @@ UNCLASSIFIED = "unrecorded"
 #: gets would be a renderer that dies mid-page for reasons no log explains.
 SCRATCH_MB = 256
 
+#: The syscall policy this one container runs under, and the reason it is not the
+#: engine's. Ticket 174: Chromium's own sandbox puts each renderer in a user
+#: namespace of its own and chroots it into an empty directory, which takes
+#: `clone` with three namespace flags, `unshare` and `chroot` -- and the engine's
+#: default profile allows all three only to a container holding `CAP_SYS_ADMIN`
+#: or `CAP_SYS_CHROOT`, which `isolation.hardened` drops and this ticket refuses
+#: to add back. So the container keeps every denial it had and changes the one
+#: layer that can change without granting anything: `chroot` from the container's
+#: own namespace is still refused, and the calls succeed only inside the
+#: namespace Chromium made for itself.
+#:
+#: Beside the driver rather than in the image for the same reason the driver is:
+#: the policy and the flags it is measured against are one version of one
+#: repository, and an image that carried its own would be a policy an operator's
+#: build decided.
+SECCOMP = "browser_seccomp.json"
+
 
 def run(
     runtime: pg.Settings,
@@ -553,6 +570,7 @@ def _perform(
         outputs=sorted(set(names.values())),
         network="proxy",
         scratch_mb=SCRATCH_MB,
+        seccomp=str(Path(__file__).parent / SECCOMP),
     )
 
 

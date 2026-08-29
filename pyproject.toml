@@ -46,6 +46,10 @@ include = ["redkraken*"]
 redkraken = [
     "migrations/*.sql",
     "migrations/README.md",
+    # The syscall policy the browser container runs under. A path the engine
+    # opens rather than a document this application reads, so it has to be a
+    # real file beside the module that names it in every installation.
+    "browser_seccomp.json",
     "measurements/*.json",
     "skills/*/SKILL.md",
     "skills/*/scripts/*",

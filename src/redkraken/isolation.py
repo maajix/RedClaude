@@ -732,6 +732,7 @@ def run_tool(
     network: str = "none",
     scratch_mb: int = 16,
     stdin: bytes | None = None,
+    seccomp: str | None = None,
 ) -> ToolProcess:
     """Run one registry-described tool, bounded, and read back what it produced.
 
@@ -754,6 +755,18 @@ def run_tool(
     made to address the filesystem.  What is written is closed afterwards, so a
     program that reads to end of file sees one.
 
+    ``seccomp`` is the one denial a caller may change, and only by naming a file
+    it ships.  The engine's own profile allows ``clone`` into a new namespace,
+    ``unshare`` and ``chroot`` only to a container holding ``CAP_SYS_ADMIN`` or
+    ``CAP_SYS_CHROOT``, and ``hardened`` drops both -- so a tool that builds its
+    own sandbox out of a user namespace cannot, and Chromium is one.  A profile
+    here replaces the engine's for this one container and nothing else; it does
+    not add a capability, and ticket 174 measured that it cannot: ``chroot``
+    from the container's own namespace is still ``EPERM`` under the profile
+    ``browser`` passes.  Absent by default, because every other tool this
+    registry starts wants the engine's own profile and would be weakened by a
+    hand-kept copy of it.
+
     Nothing about the result is decided after the fact.  Bytes past the output
     bound and time past the deadline both end the run where they happen, and
     both are reported, because a truncated stream that read like a complete one
@@ -772,6 +785,14 @@ def run_tool(
         raise Unavailable(f"an offline tool has no network or the proxy, not {network}")
     if not 1 <= scratch_mb <= 1024:
         raise Unavailable(f"a tool's scratch tmpfs is between 1MB and 1GB, not {scratch_mb}")
+    profile = None if seccomp is None else Path(seccomp).resolve()
+    if profile is not None and not profile.is_file():
+        # The engine refuses a profile it cannot open too, and refusing here
+        # first is what makes the refusal legible: the profile is package data,
+        # so the way this goes missing is a wheel built without it, and that is
+        # an installation fault rather than the mission failure the engine's own
+        # message would arrive as.
+        raise Unavailable(f"the seccomp profile is not a readable file: {profile}")
 
     engine = engine_for(container.engine)
     watched = sorted(
@@ -840,6 +861,12 @@ def run_tool(
             "--workdir",
             TOOL_WORKSPACE if workspace is not None else "/",
         ]
+        if profile is not None:
+            # After `hardened`, never instead of it. The engine takes one
+            # `--security-opt` per option, so this is a second flag beside the
+            # `no-new-privileges=true` that list already set rather than a
+            # replacement for it.
+            docker.extend(("--security-opt", f"seccomp={profile}"))
         if stdin is not None:
             docker.append("--interactive")
         for mount in mounts:
