@@ -48606,6 +48606,11 @@ class Contained:
         network: str = "none",
         scratch_mb: int = 16,
         stdin: bytes | None = None,
+        # Accepted and dropped. `run_tool` passes the profile to the engine and
+        # there is no engine here, so a double that refused the argument would
+        # be asserting that a campaign cannot start a browser -- which is the
+        # one thing this class exists to run either side of a stop.
+        seccomp: str | None = None,
     ) -> isolation.ToolProcess:
         command = tuple(str(item) for item in argv)
         self.calls.append(command)
