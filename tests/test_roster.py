@@ -5,7 +5,7 @@ import re
 import unittest
 from unittest import mock
 
-from redkraken import roster, skill
+from redkraken import _launch, roster, skill
 from tests import ROOT
 
 
@@ -1940,23 +1940,43 @@ class VocabularyAgreementTest(unittest.TestCase):
             set(roster.TASK_KINDS), {row[0] for row in self.seeded("task_kinds")}
         )
 
-    def test_every_observation_kind_carries_the_provenance_its_row_allows(self):
-        # Both halves of the row. The keys are what the schema serves as an
-        # enum; the values are what the description states in a sentence, and a
-        # sentence with nothing measuring it is how this vocabulary came to be
-        # wrong in prose in the first place.
+    @classmethod
+    def provenance(cls) -> dict[str, tuple[str, ...]]:
+        """`allowed_provenance` by kind, as the seeds in the corpus write it.
+
+        `'{receipt,tool_run}'` in most rows and `ARRAY['receipt']` in the one
+        0025 adds. Two spellings of one array, flattened to the words.
+        """
         seeded = {}
-        for row in self.seeded("observation_kinds"):
-            # `'{receipt,tool_run}'` in most rows and `ARRAY['receipt']` in the
-            # one 0025 adds. Two spellings of one array, flattened to the words.
+        for row in cls.seeded("observation_kinds"):
             seeded[row[0]] = tuple(
                 word
                 for literal in row[2:]
                 for word in literal.strip("{}").split(",")
                 if word
             )
+        return seeded
 
-        self.assertEqual(dict(roster.OBSERVATION_KINDS), seeded)
+    def test_every_observation_kind_carries_the_provenance_its_row_allows(self):
+        # Both halves of the row. The keys are what the schema serves as an
+        # enum; the values are what the description states in a sentence, and a
+        # sentence with nothing measuring it is how this vocabulary came to be
+        # wrong in prose in the first place.
+        self.assertEqual(dict(roster.OBSERVATION_KINDS), self.provenance())
+
+    def test_the_provenance_sentence_a_run_reads_is_the_one_the_corpus_seeds(self):
+        # Ticket 145's third criterion. Asserted against the corpus and not
+        # against `OBSERVATION_KINDS`, because the sentence is rendered from that
+        # constant and a check stopping there would be the generator agreeing
+        # with itself. This one fails from either end: a row whose
+        # `allowed_provenance` changed without the roster following leaves the
+        # only statement of the rule a run ever reads saying the old thing, and
+        # a description that stopped carrying the rendered sentence -- written
+        # back out by hand, or moved -- leaves nothing tying the two together.
+        self.assertIn(
+            roster.observation_provenance(self.provenance()),
+            _launch.DESCRIPTIONS["submit_mission_result"],
+        )
 
     def test_every_property_class_is_seeded_and_sits_in_a_seeded_family(self):
         seeded = {row[0]: row[1] for row in self.seeded("property_classes")}

@@ -1049,6 +1049,13 @@ DESCRIPTIONS = {
     # ordered pair a relationship type admits, and the provenance a kind admits.
     # A field name a child has to guess is a `malformed_field` drop with no way
     # for the model to learn the spelling, which is why the typed fields stay.
+    #
+    # The last of those four is the one clause here that is built rather than
+    # written. `roster.observation_provenance` renders it off the same
+    # `OBSERVATION_KINDS` values `tests/test_roster.py` holds to the corpus, so
+    # the only statement of the rule a run ever reads cannot drift from
+    # `observation_kinds.allowed_provenance` the way the hand-written one could.
+    # Ticket 145 has the measurement and the reason it stays a sentence.
     "submit_mission_result": (
         "Submit this run's one result: proposed Entities, Relationships, "
         "Observations, Hypotheses, evidence edges, suggested Tasks and a completion "
@@ -1096,12 +1103,14 @@ DESCRIPTIONS = {
         "kind, and its sentence in summary. One missing a subject or a kind is "
         "dropped whole, however good the sentence in it is, and one whose "
         "sentence is under any other name is stored empty. A kind admits only "
-        "some provenance. "
-        "content_match takes a Tool Run only; callback_interaction takes a "
-        "callback; credential_effect, identity_established, "
-        "response_differential, response_invariant, state_change, "
-        "timing_differential and transport_parameters_observed take a Receipt "
-        "only; the other seven take either. transport_parameters_observed has a "
+        "some provenance, named here as the record and not as the field: "
+        "receipt is receipt_label and tool_run is tool_run_label. A kind that "
+        "takes callback is not one you can file at all -- the runtime writes "
+        "that one out of an arrival it took itself -- and one citing the wrong "
+        "record is dropped after this run has ended, where nothing is left to "
+        "correct it. "
+        + roster.observation_provenance()
+        + " transport_parameters_observed has a "
         "second condition: this Program's egress is intercepted, so the TLS "
         "parameters on an ordinary Receipt are the fence's own and not the "
         "target's, and an observation asserting them is refused. Claim transport "
