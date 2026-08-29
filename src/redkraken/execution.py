@@ -112,7 +112,7 @@ MISSIONS = {
     "hunt": "Look for one exploitable weakness in this target.",
     "analyze": "Read what this target returned and say what it implies.",
     "perform": "Perform the Test that was written to settle this claim.",
-    "conclude": "Say what the claim this Test settled is a Finding of.",
+    "conclude": "Say what the claim this Test settled is a Finding of, and what it is worth.",
     "validate": "Decide whether what was claimed about this target holds.",
     "report": "Write up what has been established about this target.",
 }
@@ -1171,7 +1171,17 @@ class Claimed:
             f"would not, do not send it.{classes}\n\n"
             "The runtime answers created, merged or refused. Merged means a Finding "
             "is already open on this cell and your claim was added to it, which is a "
-            "result and not a rejection."
+            "result and not a rejection.\n\n"
+            "Then say what a created Finding is worth. It is born `info`, which is "
+            "this harness recording that nobody has judged it yet rather than a "
+            "judgement that it is harmless -- and nothing else in the run will "
+            "revisit that. Call mcp__rk2__state_severity once with the label the "
+            "runtime just answered, the band, the basis it rests on and the reasoning "
+            "a person will read. `info` is a real answer and the right one for a "
+            "Finding that shows a fact about a deployment and no way to use it; a "
+            "band you cannot write a sentence for is a band you did not choose. A "
+            "merged answer names a Finding somebody already judged, so leave that "
+            "one as it stands."
         )
 
     @staticmethod

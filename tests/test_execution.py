@@ -1228,6 +1228,20 @@ class FindingVocabularyTest(unittest.TestCase):
             with self.subTest(one):
                 self.assertIn(one, text)
 
+    def test_a_conclude_objective_asks_for_the_severity_too(self):
+        """Ticket 221. The verb is served; nothing sent a child to it.
+
+        `state_severity` is the only writer of `findings.severity` and four
+        days of hunting wrote zero `severity_statements`, because the objective
+        stopped at `propose_finding` and a Finding is born `info`.
+        """
+        text = self.concluding()
+        self.assertIn("mcp__rk2__state_severity", text)
+
+    def test_only_a_conclusion_is_asked_for_a_severity(self):
+        """A hunt files a claim, not a judgement of what one is worth."""
+        self.assertNotIn("mcp__rk2__state_severity", claimed(kind="hunt").objective(()))
+
     def test_the_vocabulary_the_child_reads_is_the_one_the_table_answered(self):
         # The list is not built here: the pass asks `vulnerability_classes` for
         # it and hands over what came back, which is what makes a class seeded

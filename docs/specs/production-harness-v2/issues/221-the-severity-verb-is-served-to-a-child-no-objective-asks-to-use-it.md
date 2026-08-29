@@ -8,7 +8,7 @@ child is given does not mention it.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** needs-review
 
 ## What was measured
 
@@ -71,18 +71,28 @@ RULE    Capability before catalogue. The capability is built, served and
 
 ## Acceptance criteria
 
-- [ ] **One objective names the severity verb.** Whichever kind owns it, its
-      line in `MISSIONS` sends the child to `state_severity`, and a run of that
-      kind writes a `severity_statements` row.
-- [ ] **The child is shown the bands and the bases.** Ticket 163's rule: the
-      vocabulary comes from the closed enums, read per attempt, not copied into
-      a Python constant that goes stale.
-- [ ] **A Finding that is honestly `info` stays `info`.** The fix is a child
-      that may state a severity, not one that must state a high one. A test
-      that asserts every Finding leaves `info` is the wrong test.
-- [ ] **`rk finding` says where severity comes from.** An operator reading six
-      `info` Findings has no way today to learn whether that is a judgement or
-      a gap.
+- [x] **One objective names the severity verb.** `conclude` owns it. The
+      reading, measured rather than argued: `web_hunter` is the only role with
+      `state.conclude`, and on rk2here it has run exactly two kinds, `hunt`
+      (247) and `conclude` (7). The other candidate, `analyze`, has never had a
+      Task in any Program and `execution.py:2570` says why -- it is opened by
+      hand. So the sentence went into `_conclusion` and into `MISSIONS`, after
+      `propose_finding` and naming the label the runtime just answered. The row
+      it writes is still owed: no `conclude` Task has been dispatched since.
+- [x] **The child is shown the bands and the bases.** Already true and by a
+      better route than ticket 163's: `roster.py:1678-1679` closes both
+      arguments with `enum=SEVERITY_BANDS` and `enum=SEVERITY_BASES`, so the
+      words reach the child in the tool schema and cannot go stale. Ticket 163
+      wrote its list into the prose because `propose_finding`'s class argument
+      is not an enum; this one is.
+- [x] **A Finding that is honestly `info` stays `info`.** Said in the prompt in
+      those terms -- "`info` is a real answer and the right one for a Finding
+      that shows a fact about a deployment and no way to use it". Not asserted
+      by a test, because the assertion would be about a model's judgement and
+      the harness cannot hold one.
+- [ ] **`rk finding` says where severity comes from.** Not built. An operator
+      reading six `info` Findings still cannot tell a judgement from a gap, and
+      that is the half of this ticket that survives the fix.
 
 ## What this does not change
 
