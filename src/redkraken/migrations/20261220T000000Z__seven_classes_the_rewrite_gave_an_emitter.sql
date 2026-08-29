@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- Six classes the rewrite gave an emitter                          (ticket 101)
+-- Seven classes the rewrite gave an emitter                          (ticket 101)
 --
 -- Ticket 114 mapped thirty-three Property classes onto the Surface deltas that
 -- put them back in question, and left six out with its reason stated at
@@ -20,9 +20,16 @@
 -- section to every class makes every delta invalidate every refutation, which
 -- is the same as having no mapping at all with more rows to read.
 --
--- `injection.unclaimed_reference` and `transport.certificate_trust` are not
--- here. Neither has an emitter, so a mapping row for either would be a rule
--- with no row to apply it to -- the same reason ticket 114 gave, still true.
+-- `transport.certificate_trust` is not here, and not for want of an emitter.
+-- `0025_transport_claims.sql:211` declares it `probe_only`: every certificate
+-- field an intercepted agent sees belongs to the run CA, so the class rests on
+-- a measurement receipt the Finding may not cite. That is ticket 116's subject,
+-- and a Playbook emitting a class no Finding can be built on is exactly the
+-- unreachable prose this ticket's second criterion refuses.
+--
+-- `injection.unclaimed_reference` IS here. It arrived from ticket 100 with no
+-- emitter; section 3 of `external-resources` is the reading it was spelled for
+-- and now declares it, which is the other half of "101 owns the emitters".
 -- ---------------------------------------------------------------------------
 
 INSERT INTO surface_delta_property_classes (kind, property_class_id, note)
@@ -41,6 +48,15 @@ SELECT k.kind, m.property_class_id, m.note
      'what a write accepts is settled per route, so a route that appeared or changed may accept a property its own form never offered'),
     ('parameter', 'authorization.object_property_write',
      'a parameter that appeared is a property a caller can now try to set'),
+
+    -- A reference the target publishes lives in the bytes a route serves, and
+    -- which third party it points at is settled by the stack that emits it.
+    -- Not `parameter`: the candidate list comes from the target's own served
+    -- artefacts and never from an input this reading chooses.
+    ('endpoint',  'injection.unclaimed_reference',
+     'a route that appeared serves bytes that may carry a reference to a provider slot nobody holds'),
+    ('technology', 'injection.unclaimed_reference',
+     'which third parties a page references is settled by the framework and the build that emits it, so a version that moved may have added or retired one'),
 
     -- Two readers of one document disagreeing is a property of the readers.
     -- The value they disagree about arrives as a parameter.

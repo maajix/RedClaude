@@ -17923,14 +17923,18 @@ RETEST_SLUG = "selftest-retest"
 #: question. Written here as the tickets write them, so that one more arriving
 #: is a failure with a name rather than a count that moved.
 #:
-#: Ticket 114 named six. Ticket 101's rewrite gave three of them an emitter and
-#: `20261220T000000Z__six_classes_the_rewrite_gave_an_emitter.sql` maps those
-#: three, which is what 114 meant by "101 owns the emitters". The two transport
-#: rows stay because `transport_makeability` declares them `unmakeable`, and
-#: the other two because no Playbook emits them -- `injection.unclaimed_reference`
-#: arrived from ticket 100's vocabulary with no emitter of its own.
+#: Ticket 114 named six. Ticket 101's rewrite gave three of them an emitter,
+#: ticket 100 added four more classes and 101 emits three of those, and
+#: `20261220T000000Z__seven_classes_the_rewrite_gave_an_emitter.sql` maps all
+#: seven -- which is what 114 meant by "101 owns the emitters".
+#:
+#: Three stay. `transport.datagram_transport` and `transport.request_framing`
+#: because `transport_makeability` declares them `unmakeable`, and
+#: `transport.certificate_trust` because the same table declares it
+#: `probe_only` (`0025_transport_claims.sql:211`): it rests on a measurement
+#: receipt no Finding may cite, which is ticket 116's subject rather than a
+#: missing emitter.
 UNMAPPED = (
-    "injection.unclaimed_reference",
     "transport.certificate_trust",
     "transport.datagram_transport",
     "transport.request_framing",

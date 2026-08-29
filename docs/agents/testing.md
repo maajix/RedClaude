@@ -118,7 +118,25 @@ On this machine, before any change:
 - `tests.test_cli.ContainmentTest.test_no_module_is_loaded_from_a_nonproduction_tree`,
   because the virtual environment sits inside the worktree root;
 - an order dependence: running `tests.test_roster` before `tests.test_execution`
-  breaks `ChoiceTest.test_every_kind_the_scheduler_can_claim_has_exactly_one_role`.
+  breaks `ChoiceTest.test_every_kind_the_scheduler_can_claim_has_exactly_one_role`;
+- `tests.test_database.CallbackAdmissionTest`
+  `.test_an_arrival_cannot_backdate_itself_into_a_dead_correlator`, which is
+  ticket 215: measured at a clean `8810e7c4`, it fails five times in six when
+  asked on its own and passes after its twenty-four neighbours. A single red
+  here is the flake, not your change -- re-run the whole class before believing
+  it.
+
+**`FORCE_COLOR` in the environment turns fifty-two `tests.test_cli` tests red.**
+Python 3.14 colours `argparse` help, and
+`OperatorSurfaceTest.test_every_command_has_a_handler_and_help_that_names_it`
+asserts `format_help().startswith("usage: rk <name>")` against plain text. It is
+one test with fifty-two subTests, so the count looks like a catastrophe and is
+one assertion. Some terminals and some agent harnesses export `FORCE_COLOR`
+without being asked. Run the suite with `NO_COLOR=1` and it is green:
+
+```
+NO_COLOR=1 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m unittest discover -s tests -t .
+```
 
 `tests.test_audit` freezes the spec report as a literal string, so it goes red
 whenever a ticket is resolved. It is refreshed by re-measuring, not by relaxing:

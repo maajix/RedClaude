@@ -205,3 +205,22 @@ things are owed:
   it. Removing the instance does not close it. Either this ticket also adds
   `guard_satisfiability` to `integrity.py`, or that check is cut into its own
   ticket and the register row is re-pointed at it.
+
+## This ticket also owns the W9 gap now (2026-08-29)
+
+Ticket 101's corpus rewrite delivered every emitter W9 had owed it, with one
+exception it declined to deliver, and `tools/check_wiring.py` now reads
+`"W9 transport.certificate_trust": "owed:116"` and
+`"W9 http-desync transport.certificate_trust": "owed:116"`.
+
+The reason it declined is this ticket's own subject. `0025_transport_claims.sql:211`
+declares the class `probe_only`, and its note says why: every certificate field
+an intercepted agent sees belongs to the run CA, so the class rests on a
+measurement Receipt. `reject_non_agent_citation` is what will not let a Finding
+cite that Receipt. A Playbook declaring `transport.certificate_trust` in
+`bb:outputs` today would produce a claim that can never close, which is exactly
+the unreachable prose ticket 101's second acceptance criterion refuses.
+
+So the emitter is not missing. The rule is. When the citation rule lands, the
+`bb:outputs` line is a one-word edit to `http-desync`, whose body already carries
+the reading and already says which class it is declining and why.

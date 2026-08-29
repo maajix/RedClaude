@@ -8,14 +8,14 @@ generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
 status: draft
 stale_after: 2027-03-15T00:00:00Z
 bb:category: injection
-bb:outputs: [injection.foreign_resource]
+bb:outputs: [injection.foreign_resource, injection.unclaimed_reference]
 bb:triggers_all: [read_method, url_valued_parameter, web_surface]
 bb:skills: [compare-responses, enumerate-surface, handle-untrusted-content]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 5bb9e9484d97971dd7346079f221890721b1012f760b5d27fe1b0e529c91998d
-bb:sha256: 56f0299cc44575d03aca2f1542a6dc2bf813c7ea08971ca3700313bacc6d1312
+bb:version: 856d6ca0a1cc422be97ec56e027c7f1c7c0606975a3f4c6bdb83d1b7e0f0a146
+bb:sha256: 5e98f93fb637cc3599537e5302b293e7952d4bc48d17ae4f5204f78a814fdfd2
 sources:
   - id: external-resources--broken-link-hijacking
     resource: /references/external-resources--broken-link-hijacking.md
@@ -28,6 +28,7 @@ sources:
 ## What it concludes about
 
 - `injection.foreign_resource`
+- `injection.unclaimed_reference`
 
 ## When it is selected
 

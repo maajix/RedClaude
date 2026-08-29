@@ -179,6 +179,29 @@ generated from `playbook.PLAYBOOKS` and never typed. It moves six columns on
 Every count is what `playbook.PLAYBOOKS` sums to today, checked against the
 compiled corpus rather than against the file.
 
+**The delta mapping the emitters made owed.**
+`20261220T000000Z__seven_classes_the_rewrite_gave_an_emitter.sql`. A Playbook
+declaring a Property class in `bb:outputs` is only half a lane:
+`rk2_negative_relevant_deltas` inner-joins `surface_delta_property_classes`, so
+a class with no row there is a refutation no Surface change can ever reopen --
+silently, because an empty join reads exactly like a Surface that never moved.
+Ticket 114 mapped thirty-three and left six out because nothing emitted them,
+writing down who would change that: "101 owns the emitters"
+(`20260927T010000Z...:46`). This rewrite gave three of those six an emitter and
+three of ticket 100's four new leaves as well, and `external-resources` section
+3 takes the seventh, `injection.unclaimed_reference` -- the reading ticket 100
+spelled the leaf for. Twelve rows, one per section that genuinely settles the
+class and never a cross product, each with the sentence saying why that section
+moving puts that class back in question.
+
+`transport.certificate_trust` is the one class this ticket declined to emit, and
+the reason is not a missing Playbook. `0025_transport_claims.sql:211` declares it
+`probe_only`: it rests on a measurement Receipt that `reject_non_agent_citation`
+will not let a Finding cite, so a `bb:outputs` line would produce a claim that
+can never close -- the unreachable prose criterion 2 refuses. Its two W9 register
+rows are re-pointed at ticket 116, which owns that rule, and 116 records the
+handover.
+
 **The OKF correction, in three parts.** A flow indicator ends a scalar wherever
 it stands, not only where it opens, so `_flow_sequence` read `tags: [a[b]` and
 `tags: [a]b]` as one element each where a parser reads two. `FLOW_INDICATORS`

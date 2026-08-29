@@ -511,8 +511,8 @@ BEGIN
              'constrained', 'read_only', 3,
              'Written for ticket 54 as the v2 replacement for v1''s exceptional-conditions page against the error_detail leaf of the ticket 18 vocabulary, and rewritten for ticket 101 against the merged ledger''s nine readings for this slug. The identifier_oracle leaf is added as a second output under operator decision D3, which puts the missing emitter inside this ticket; bb:triggers_all is unchanged, so the pre-auth readings are named for the surface they need rather than selected by it. Effects stay read_only and risk stays constrained, which is why the two readings that change the target are parked for a person before they run.'),
             ('playbooks/external-resources/playbook.md',
-             '56f0299cc44575d03aca2f1542a6dc2bf813c7ea08971ca3700313bacc6d1312',
-             '5bb9e9484d97971dd7346079f221890721b1012f760b5d27fe1b0e529c91998d',
+             '5e98f93fb637cc3599537e5302b293e7952d4bc48d17ae4f5204f78a814fdfd2',
+             '856d6ca0a1cc422be97ec56e027c7f1c7c0606975a3f4c6bdb83d1b7e0f0a146',
              'constrained', 'read_only', 3,
              'Written for ticket 52 as the v2 replacement for v1''s broken-link-hijacking page, against a new foreign-resource leaf added by ticket 52; the v1 text is attached as a maintainer reference and section 6''s refusal is where this Playbook and that page part company. Rewritten for ticket 101 against the merged technique ledger, which carries three readings and one standing refusal for this slug. One frontmatter key moves and it is a repair -- analyse-source is granted to js_analyst alone, js_analyst holds no request verb, and a Playbook naming that Skill is one no hunting role can be handed, so the three Skills web_hunter holds for this reading replace it and section 1 fetches its own bytes. The effects and the risk floor are the ones already declared, since the two readings added below are Tests this role proposes and the replay lane performs.'),
             ('playbooks/file-resolution/playbook.md',
@@ -774,6 +774,7 @@ BEGIN
             ('playbooks/exceptional-conditions/playbook.md', 'information_disclosure.error_detail'),
             ('playbooks/exceptional-conditions/playbook.md', 'information_disclosure.identifier_oracle'),
             ('playbooks/external-resources/playbook.md', 'injection.foreign_resource'),
+            ('playbooks/external-resources/playbook.md', 'injection.unclaimed_reference'),
             ('playbooks/file-resolution/playbook.md', 'injection.path'),
             ('playbooks/file-upload/playbook.md', 'injection.stored_file'),
             ('playbooks/graphql/playbook.md', 'information_disclosure.excess_field'),
@@ -810,12 +811,12 @@ BEGIN
            ) AS v(path, property_class)
         ON v.path = p.path;
     GET DIAGNOSTICS n = ROW_COUNT;
-    IF n <> 58 THEN
-        RAISE EXCEPTION 'ticket 101: wrote % playbook_outputs row(s) and meant 58', n;
+    IF n <> 59 THEN
+        RAISE EXCEPTION 'ticket 101: wrote % playbook_outputs row(s) and meant 59', n;
     END IF;
     SELECT count(*) INTO n FROM playbook_outputs;
-    IF n <> 58 THEN
-        RAISE EXCEPTION 'ticket 101: playbook_outputs holds % row(s) and the corpus declares 58', n;
+    IF n <> 59 THEN
+        RAISE EXCEPTION 'ticket 101: playbook_outputs holds % row(s) and the corpus declares 59', n;
     END IF;
 
     -- Every Skill a body now names, and no Skill it stopped naming.

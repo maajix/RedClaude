@@ -301,22 +301,24 @@ OWED_GAPS: dict[str, str] = {
     # W8. The declared write target with neither a writer nor a handler.
     "W8 report_queue": "owed:105",
 
-    # W9. Nine declared property classes nothing emits, and the four Playbook
-    # bodies that name one as though it did. Ticket 100 established that five of
-    # them exist and that the missing half is an emitter, and put that work on
-    # ticket 101. The other four are ticket 100's own: it added the leaves the
-    # vocabulary could not spell, each with the fixture that grades it, and left
-    # the emitter to the same ticket for the same reason -- a class shipped with
-    # a Playbook written against it in one step is a Playbook nothing graded.
-    "W9 injection.unclaimed_reference": "owed:101",
+    # W9. The declared property classes nothing emits, and the Playbook bodies
+    # that name one as though it did. Ticket 101 took the emitters and delivered
+    # them: `injection.unclaimed_reference` is now declared by section 3 of
+    # `external-resources`, which is the reading ticket 100 spelled the leaf for.
+    #
+    # `transport.certificate_trust` is the one that stays, and it is not an
+    # emitter that is missing. `0025_transport_claims.sql:211` declares the class
+    # `probe_only`: every certificate field an intercepted agent sees belongs to
+    # the run CA, so the class rests on a measurement Receipt that
+    # `reject_non_agent_citation` will not let a Finding cite. A Playbook
+    # declaring it would produce a claim that can never close. Ticket 116 is
+    # about exactly that rule, so the gap is owed there.
+    #
     # W9 fires twice for one absence: once for the class the catalogue declares
-    # and nothing emits, and once more for each body that names it in prose. The
-    # ticket 101 rewrite made the second fire, because a Playbook that will not
-    # produce a verdict now says which class it is declining and why. Both
-    # spellings are the same owed emitter.
-    "W9 attack-surface injection.unclaimed_reference": "owed:101",
-    "W9 transport.certificate_trust": "owed:101",
-    "W9 http-desync transport.certificate_trust": "owed:101",
+    # and nothing emits, and once more for each body that names it in prose. Both
+    # spellings are the same owed rule.
+    "W9 transport.certificate_trust": "owed:116",
+    "W9 http-desync transport.certificate_trust": "owed:116",
 
 
 

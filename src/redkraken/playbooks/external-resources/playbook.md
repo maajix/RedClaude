@@ -1,7 +1,7 @@
 ---
 description: Ask which origins a served document grants authority to run inside it, by listing every reference that carries executable authority out of the stored bytes, naming the ones the Program's scope does not claim, and differencing a candidate host against a label nobody holds to see whether the reference points at a resource that was let go.
 bb:category: injection
-bb:outputs: ["injection.foreign_resource"]
+bb:outputs: ["injection.foreign_resource", "injection.unclaimed_reference"]
 bb:triggers_all: ["read_method", "url_valued_parameter", "web_surface"]
 bb:skills: ["compare-responses", "enumerate-surface", "handle-untrusted-content"]
 bb:risk: constrained
