@@ -30151,6 +30151,7 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
         cls.refuse_a_replay_the_conditions_do_not_admit()
         cls.declare_whether_the_plan_carries_a_body()
         cls.refuse_a_receipt_that_answers_a_sibling_arm()
+        cls.refuse_a_receipt_the_running_door_wrote_no_digest_into()
         cls.open_a_replay_the_token_budget_cannot_fund()
         cls.ask_the_preview_about_the_playbook_bar()
         cls.problems = cls.connection.execute("SELECT * FROM check_test_replays()").rows
@@ -30856,6 +30857,76 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
                       (opened["tool_run_id"], "skipped", "abandoned"))
 
     @classmethod
+    def refuse_a_receipt_the_running_door_wrote_no_digest_into(cls):
+        """Ticket 220: a door older than the column, and the word it earns.
+
+        Not a swapped arm. The plan and the Receipt agree about everything, and
+        the Receipt simply holds no digest of what it sent -- which is the state
+        every Receipt on `rk2here` was in for three days, because `rk db migrate`
+        moved the reader and the door process kept the old writer. `IS DISTINCT
+        FROM` read that as "carries different headers", the operator read it as a
+        fact about headers, and the door ran unrestarted for 86 lap reports.
+
+        The digest is nulled after the Receipt is written rather than written
+        null, because `receipted` stands in for the door and a helper that could
+        write a Receipt the current door cannot write would be a second door.
+        Nulling it afterwards is the same row the old door left behind.
+
+        A claim each and a body on the second, because the body branch is only
+        reached by a plan that states one: a plan with no body and a Receipt with
+        no digest agree, and that is the case this must not start refusing.
+        """
+        cls.stale = {}
+        for axis, arm_one, arm_two, column in (
+            ("headers",
+             {"url": f"{BASE}/9", "headers": {"X-Arm": "one"}},
+             {"url": f"{BASE}/9", "headers": {"X-Arm": "two"}},
+             "request_headers_sha256"),
+            ("body",
+             {"url": f"{BASE}/9", "headers": {"Content-Type": "text/plain"},
+              "body": "one"},
+             {"url": f"{BASE}/9", "headers": {"Content-Type": "text/plain"},
+              "body": "two"},
+             "request_body_sha256"),
+        ):
+            hypothesis, _ = cls.claim_waiting(
+                f"the orders API is answered by a door that digests no {axis}"
+            )
+            stored = cls.stored(
+                hypothesis,
+                specification(
+                    [{"id": "one", "kind": "status_equals", "action": 1, "status": 200}],
+                    actions=[
+                        {"ordinal": 1, "role": "baseline", "kind": "request",
+                         "method": "POST"} | arm_one,
+                        {"ordinal": 2, "role": "variant", "kind": "request",
+                         "method": "POST"} | arm_two,
+                        {"ordinal": 3, "role": "control", "kind": "request",
+                         "method": "GET", "url": f"{BASE}/3"},
+                    ],
+                ),
+            )
+            opened = cls.called(cls.OPEN, (cls.replay_run(), stored, None))
+            answer = cls.receipted(
+                opened["tool_run_id"], 1,
+                method="POST",
+                path="/api/orders/9",
+                headers=json.dumps(arm_one["headers"]),
+                request_body=arm_one.get("body"),
+            )
+            committed(
+                cls.owner_as_runtime(),
+                f"UPDATE receipts SET {column} = NULL WHERE label = $1"
+                "   AND program_id = $2::uuid RETURNING label",
+                (answer, cls.program_id),
+            )
+            cls.stale[axis] = cls.refuse(
+                cls.RECORD, (opened["tool_run_id"], 1, answer)
+            )
+            committed(cls.connection, cls.CLOSE,
+                      (opened["tool_run_id"], "skipped", "abandoned"))
+
+    @classmethod
     def refuse_a_replay_the_conditions_do_not_admit(cls):
         # A url the current scope does not admit, refused before anything is sent.
         hypothesis, _ = cls.claim_waiting("the admin console is reachable")
@@ -31306,6 +31377,20 @@ class ReplayTestRunTest(ReplayFixture, DatabaseCase):
                       self.swapped["headers"])
         self.assertIn("carries a different body than action 2 states",
                       self.swapped["body"])
+
+    def test_a_receipt_with_no_digest_at_all_names_the_door_and_not_the_headers(self):
+        """Ticket 220. The other reading of the same `IS DISTINCT FROM`.
+
+        Two failures wore one word for three days. The message has to send the
+        operator to `docker restart`, so it says the door and it says restart --
+        and it must not say "different", which is what sent them to the headers.
+        """
+        for axis, word in (("headers", "header"), ("body", "body")):
+            with self.subTest(axis=axis):
+                self.assertIn(f"carries no {word} digest", self.stale[axis])
+                self.assertIn("predates the column", self.stale[axis])
+                self.assertIn("restart the door", self.stale[axis])
+                self.assertNotIn("different", self.stale[axis])
 
     def test_the_refused_rows_are_not_there(self):
         [[cited]] = self.rows(

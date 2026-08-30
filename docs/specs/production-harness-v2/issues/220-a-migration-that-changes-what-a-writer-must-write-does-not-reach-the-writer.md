@@ -7,7 +7,7 @@ stopped ran three days before anyone read the word.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## What happened
 
@@ -90,18 +90,18 @@ RULE    Capability before catalogue. Telling the two failures apart is the
 
 ## Acceptance criteria
 
-- [ ] **A receipt with no header digest raises a message naming the door.**
+- [x] **A receipt with no header digest raises a message naming the door.**
       Not "carries different headers". A test inserts a receipt with
       `request_headers_sha256 IS NULL` and asserts on the word.
-- [ ] **The same holds for the body digest.** `:284-288` is the identical
+- [x] **The same holds for the body digest.** `:284-288` is the identical
       comparison against `rk2_planned_body_sha256` and has the identical hole.
-- [ ] **The query digest is checked and left alone, or fixed with them.**
+- [x] **The query digest is checked and left alone, or fixed with them.**
       `:274-278` compares `query_sha256`, which the door has written since
       long before 214; if it can be `NULL` too, it belongs in the same branch.
-- [ ] **`rk doctor` reports a door older than the newest applied migration.**
+- [x] **`rk doctor` reports a door older than the newest applied migration.**
       Deferred to its own ticket if the handshake is the price; named here so
       the deferral is a decision and not an omission.
-- [ ] **The engagement runbook says to restart the door after `rk db
+- [x] **The engagement runbook says to restart the door after `rk db
       migrate`.** The operator-side half. Free, and it is what would have cost
       nothing on 2026-08-26.
 
@@ -110,3 +110,54 @@ RULE    Capability before catalogue. Telling the two failures apart is the
 The comparison itself. A receipt that answers a different arm than the action
 planned is a receipt that must not grade a test, and ticket 214 is right about
 that. This is about which of two failures the operator is told they have.
+
+## What was built, 2026-08-30
+
+`20261226T000000Z__a_receipt_with_no_digest_names_the_door.sql`. One
+`CREATE OR REPLACE FUNCTION record_test_action`, verbatim from
+`20261217T000000Z` except for two branches.
+
+**Headers.** `rk2_planned_headers_sha256` is never NULL and says so in its own
+comment, so a Receipt holding no header digest can only be a door that wrote the
+row without the column. The NULL is refused before the comparison, with
+`receipt % carries no header digest; the door that wrote it predates the column,
+so restart the door and replay`.
+
+**Body.** The same fault with one difference, and the difference is why the
+branch is nested rather than placed first: `rk2_planned_body_sha256` *is* NULL
+for a plan that states no body and the door writes NULL for a request that
+carried none, so NULL against NULL is a match and never reaches the branch at
+all. What reaches it is a plan that states a body against a Receipt with no
+digest of one, and that is the same old door.
+
+**Query, left alone, and that is criterion 3's answer.** `rk2_test_query`
+answers NULL for a url with no query, and `proxy.query_sha256` writes NULL for a
+request with none -- "absence stays absence", in its own words. NULL against
+NULL matches on both sides, so there is no third reading to separate. Measured
+on `rk2here`: 2681 Receipts, 68 with a query digest, and this comparison has
+never been the one that raised.
+
+A blocked Receipt already holds three nulls and is already refused one branch
+earlier, on `decision <> 'allowed'`, so nothing here changes what it says.
+
+**Criterion 4 is deferred, as a decision.** `rk doctor` still does not compare
+the door's version against the newest applied migration, because the door
+announces no version to anything (`door.py:574` is its only statement against
+the database). That is ticket 225, which names the two shapes and their prices.
+
+**Criterion 5 is done.** The engagement README gained an `## After
+`rk db migrate`` section: both commands, in order, with what the three days
+cost and a pointer to 225.
+
+## What was verified
+
+`tests/test_database.py::ReplayTestRunTest` gains
+`test_a_receipt_with_no_digest_at_all_names_the_door_and_not_the_headers` and
+the fixture behind it. The Receipt is written by the same helper every other
+case uses and the digest is nulled afterwards, because a helper that could write
+a Receipt the current door cannot write would be a second door. Both axes assert
+three words present -- the axis, `predates the column`, `restart the door` -- and
+one word absent: `different`, which is what sent the operator to the headers.
+
+57 tests in that class, all pass. `rk db migrate` on `rk2here` applied it with
+`violations: []`.
