@@ -409,9 +409,21 @@ def _assert_isolation(ledger: Ledger, environment: Mapping[str, str]) -> None:
             source=f"environment:{execution.NETWORK}",
         )
         return
+    # Ticket 219's fourth criterion: an operator asking whether a second worker
+    # can start should not have to read `isolation.py`. The claim is reported and
+    # not refused, because a machine with a hunt on it is a machine working --
+    # what the operator is owed is the fact, which is the whole answer to "can I
+    # start another one" and the whole reason the third worker died on lap 3.
+    taken = isolation.unclaimed(container.network)
     ledger.hold(
         "agent_boundary",
-        f"{container.network} is internal and holds {container.proxy_container} alone",
+        f"{container.network} is internal and holds {container.proxy_container} alone"
+        + (
+            ", and a launch on this machine already holds it, so a second"
+            " `rk run` against it would be refused"
+            if taken
+            else ", and no launch holds it, so one child may start on it"
+        ),
     )
 
 

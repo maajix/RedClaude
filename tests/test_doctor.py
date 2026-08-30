@@ -422,6 +422,38 @@ class SubjectTest(unittest.TestCase):
         self.assertEqual([("/usr/bin/docker", "rk-agent-net", "rk-proxy", "rk-proxy")], asked)
         self.assertIn("holds rk-proxy alone", detail(diagnosis, "agent_boundary"))
 
+    def test_a_boundary_a_launch_already_holds_is_named_rather_than_refused(self):
+        """Ticket 219's fourth criterion: the answer to "can I start another one".
+
+        Reported and not refused. A machine with a hunt on it is a machine
+        working, so `doctor` stays green -- what it owes the operator is the
+        fact, which is the whole reason the third worker died on lap 3 and the
+        only place this rule is written outside `isolation.py`.
+        """
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: None,
+            unclaimed=lambda network: f"another launch on this machine holds the Agent network: {network}",
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertTrue(diagnosis.ok)
+        said = detail(diagnosis, "agent_boundary")
+        self.assertIn("holds rk-proxy alone", said)
+        self.assertIn("already holds it", said)
+        self.assertIn("would be refused", said)
+
+    def test_a_boundary_nothing_holds_says_a_child_may_start_on_it(self):
+        with described(
+            engine_for=lambda name: f"/usr/bin/{name}",
+            one_peer=lambda *seen: None,
+            unclaimed=lambda network: None,
+        ) as environment:
+            diagnosis = doctor.diagnose(None, environment=environment)
+
+        self.assertTrue(diagnosis.ok)
+        self.assertIn("no launch holds it", detail(diagnosis, "agent_boundary"))
+
     def test_a_corpus_that_no_longer_compiles_is_refused_here_and_not_mid_run(self):
         def broken():
             raise playbook.PlaybookError("skill_unknown", "recon/dns", "names skill sweep")

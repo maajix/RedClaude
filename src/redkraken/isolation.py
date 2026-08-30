@@ -1413,6 +1413,28 @@ def held(network: str) -> Iterator[None]:
         os.close(handle)
 
 
+def unclaimed(network: str) -> str | None:
+    """Why a launch could not take this machine's claim on one network, or nothing.
+
+    `held` is taken deep inside `run`, after the Program is open, the decisions
+    are swept, the queue is ranked and a Task is claimed. On a machine that
+    already has a worker on this network every one of those steps is spent
+    before the refusal arrives, and the operator reads the streak rather than
+    the cause: three laps exiting non-zero, and nothing in the words saying that
+    the second worker was never going to start.
+
+    So the same claim is probed here, before any of it, and let go again at
+    once. A probe and not the guard -- the window between this answer and the
+    `held` inside the launch belongs to nobody, and it is `held` that closes it.
+    What this buys is the word, one lap earlier than the refusal that means it.
+    """
+    try:
+        with held(network):
+            return None
+    except Unavailable as error:
+        return str(error)
+
+
 @contextlib.contextmanager
 def own_home(template: Path | None) -> Iterator[Path | None]:
     """One run's own copy of the configured home, taken away when it ends.

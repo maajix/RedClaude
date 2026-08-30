@@ -88,6 +88,34 @@ except isolation.Unavailable as refusal:
         with isolation.held(network):
             pass
 
+    def test_the_probe_answers_what_the_next_launch_would_find(self):
+        """Ticket 219: the same claim, asked one lap earlier and let go again.
+
+        A process rather than a second call, for the reason above it: the case
+        is two `rk run` processes on one machine, and a flag in this
+        interpreter's memory would answer about the wrong thing. The probe has
+        to say the same word the launch would, because the word is all it is
+        for -- an operator who reads "3 laps in a row exited non-zero" has been
+        told the streak and not the cause.
+
+        And it has to let the claim go. A probe that kept it would refuse the
+        launch it was asked on behalf of, which is the one failure this cannot
+        have.
+        """
+        network = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+        self.assertIsNone(isolation.unclaimed(network))
+
+        first = self.claimant(network)
+        self.assertEqual({"held": True}, json.loads(first.stdout.readline()))
+        self.assertIn("holds the Agent network", isolation.unclaimed(network) or "")
+
+        first.stdin.write("\n")
+        first.stdin.flush()
+        self.assertEqual(0, first.wait(timeout=30))
+        self.assertIsNone(isolation.unclaimed(network))
+        with isolation.held(network):
+            pass
+
     def test_one_claim_is_per_network_rather_than_per_installation(self):
         """A claim on one network says nothing about another. `run_tool` builds
         a network per run for exactly this reason, and an installation that

@@ -2371,6 +2371,25 @@ def _slice(
     boundary = _boundary(ledger)
     if boundary is None:
         return None
+    # Ticket 219. Asked here rather than left to the launch, which asks it after
+    # the Program is open, the decisions are swept, the queue is ranked and a
+    # Task is claimed. Three workers were started against `rk2here` on
+    # 2026-08-29; two died on lap 3 and the operator's whole account of it was
+    # "3 laps in a row exited non-zero", which names the streak and not the
+    # cause. One `rk run` per Agent network is the isolation layer's rule and it
+    # is not going to change: a second child on an internal network is a child
+    # the first can address, which is the property the network exists to deny.
+    taken = isolation.unclaimed(boundary.network)
+    if taken:
+        ledger.fail(
+            "agent_network",
+            taken + ". One launch per Agent network, and no lap of this one would"
+            " have started: a second worker on this machine needs its own network,"
+            " its own door and its own host port",
+            code=INVALID_CONFIGURATION,
+            source=f"environment:{execution.NETWORK}",
+        )
+        return None
     agent = _url(ledger, AGENT, arguments.state_url, program.COMMAND)
     if agent is None:
         return None

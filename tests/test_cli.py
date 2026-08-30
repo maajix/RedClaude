@@ -5,11 +5,23 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+import uuid
 from pathlib import Path
+from unittest import mock
 
 import redkraken
-from redkraken import cli, evaluation, execution, migrate, operator, pg, verifier
+from redkraken import (
+    cli,
+    evaluation,
+    execution,
+    isolation,
+    migrate,
+    operator,
+    pg,
+    verifier,
+)
 from redkraken.outcome import (
     EXIT_DATABASE_UNREACHABLE,
     EXIT_INVALID_CONFIGURATION,
@@ -2091,6 +2103,75 @@ class PlaybookCostCommandTest(unittest.TestCase):
         self.assertEqual(
             ["environment:RK_AGENT_NETWORK"],
             [item["source"] for item in report["violations"]],
+        )
+
+
+class AgentNetworkClaimTest(unittest.TestCase):
+    """Ticket 219: one launch per Agent network, said before a lap is spent.
+
+    The claim is `isolation.held`, taken inside the launch -- after the Program
+    is open, the decisions are swept, the queue is ranked and a Task is claimed.
+    Three workers were started against `rk2here` on 2026-08-29; two died on lap
+    3 and the operator's whole account of it was "3 laps in a row exited
+    non-zero". `_slice` probes the same claim first, so the refusal names the
+    network instead of the streak.
+
+    A subprocess and a real `flock`, because the case is two `rk run` processes
+    on one machine. Both are pointed at one `XDG_RUNTIME_DIR`, since that is
+    where the claim lives and a test whose two halves looked in different
+    directories would pass whatever the code did.
+    """
+
+    def described(self, runtime: str) -> dict[str, str]:
+        return {
+            **environment(),
+            "XDG_RUNTIME_DIR": runtime,
+            execution.IMAGE: "rk2-agent:test",
+            execution.NETWORK: self.network,
+            execution.PROXY_CONTAINER: "rk2-door",
+            execution.PROXY_URL: "http://rk2-door:18082",
+            execution.CERTIFICATE: str(ROOT / "pyproject.toml"),
+        }
+
+    def refused(self, runtime: str) -> dict:
+        answer = subprocess.run(
+            [sys.executable, "-m", "redkraken", "run", "--config", "nowhere.toml"],
+            cwd=str(ROOT),
+            env=self.described(runtime),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, answer.returncode, answer.stderr)
+        return json.loads(answer.stdout)
+
+    def test_a_second_run_is_refused_by_name_before_any_lap_is_spent(self):
+        self.network = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+        with tempfile.TemporaryDirectory() as runtime:
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+                with isolation.held(self.network):
+                    report = self.refused(runtime)
+
+        self.assertEqual(
+            ["agent_network"], [item["name"] for item in report["assertions"]]
+        )
+        detail = report["violations"][0]["detail"]
+        self.assertIn(self.network, detail)
+        self.assertIn("holds the Agent network", detail)
+        # The remedy, because the refusal is the only place the operator meets
+        # this rule: a second worker is a second boundary, not a second process.
+        self.assertIn("its own network", detail)
+
+    def test_a_run_on_a_free_network_is_refused_for_its_own_reasons(self):
+        """And not for this one. The probe lets the claim go, so the command
+        goes on to the next thing wrong with it -- here a configuration file
+        that is not there, which is what `--config nowhere.toml` names."""
+        self.network = f"rk2-claim-{uuid.uuid4().hex[:12]}"
+        with tempfile.TemporaryDirectory() as runtime:
+            report = self.refused(runtime)
+
+        self.assertNotIn(
+            "agent_network", [item["name"] for item in report["assertions"]]
         )
 
 
