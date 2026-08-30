@@ -10733,11 +10733,31 @@ class ProxyEgressTest(DatabaseCase):
             )
 
     def surface(self, label: str) -> list[str]:
-        """What the standing check says about one question, and only that one."""
+        """What the standing check says about one question, and only that one.
+
+        Two shapes of `detail`, because ticket 228 wall 1 changed one of them.
+        Most arms still answer with the bare label; `decision_unannounced` now
+        answers with the label, the channel that failed and its complaint, so
+        this asks for the label or for anything that begins with it and a dash.
+        """
         return [
             str(row[0])
             for row in self.connection.execute(
-                "SELECT problem FROM check_control_surface() WHERE detail = $1", (label,)
+                "SELECT problem FROM check_control_surface()"
+                " WHERE detail = $1 OR detail LIKE $1 || ' -- %'",
+                (label,),
+            ).rows
+        ]
+
+    def refusal(self, label: str) -> list[str]:
+        """The whole sentence the surface hands an operator about one question."""
+        return [
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT detail FROM check_control_surface()"
+                " WHERE problem = 'decision_unannounced'"
+                "   AND (detail = $1 OR detail LIKE $1 || ' -- %')",
+                (label,),
             ).rows
         ]
 
@@ -10837,6 +10857,38 @@ class ProxyEgressTest(DatabaseCase):
 
         self.assertEqual([], self.surface(label))
 
+    def test_the_refusal_names_the_channel_that_failed_and_what_it_said(self):
+        # Ticket 228, wall 1. On 2026-08-30 the harness refused every `rk run`
+        # and every `rk db migrate` with `(decision_unannounced,D27)` -- the name
+        # of a question, when what was broken was a channel. `notify-send` needs
+        # a session bus, this host has none, and the sentence that ends the
+        # investigation was already on the row the arm joins. It is read now.
+        label, notification = self.question()
+        broke = "exit 1: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown"
+
+        decisions.sweep(self.harness.runtime, deliver=lambda command: (False, broke))
+        self.spend(notification)
+
+        self.assertEqual(
+            [f"{label} -- desktop: {broke}, 5/5 attempts"], self.refusal(label)
+        )
+
+    def test_a_question_no_channel_ever_carried_says_that_instead(self):
+        # The other half of the same arm, and the one a channel name cannot
+        # describe: a fan-out that reached nothing at all. Every channel was
+        # disabled when the question was filed, so there is no row to read a
+        # complaint off and the refusal has to say so in its own words.
+        label, _ = self.question()
+        self.owner(
+            "DELETE FROM decision_notifications n"
+            " USING pending_decisions d"
+            " WHERE d.id = n.pending_decision_id"
+            "   AND d.program_id = $1::uuid AND d.label = $2",
+            (self.identifiers["decision"], label),
+        )
+
+        self.assertEqual([f"{label} -- fanned out to no channel"], self.refusal(label))
+
     def test_a_question_that_dies_unannounced_is_reported_before_it_is_retired(self):
         # The order inside one pass, which is the whole of what the arm is worth.
         # `decision_unannounced` is a rule about a pending question, and this
@@ -10849,8 +10901,13 @@ class ProxyEgressTest(DatabaseCase):
         result = decisions.sweep(self.harness.runtime, deliver=lambda command: (True, ""))
 
         self.assertEqual(EXIT_INTEGRITY_FAILED, result.exit_code)
+        # Ticket 228 wall 1 reaches this sentence without a line of Python:
+        # `decisions.py` asks the standing check for the predicate and prints
+        # its `detail` verbatim, so widening the detail widens the refusal.
         self.assertEqual(
-            [(False, f"no channel will carry these questions again and no human has been told about them: {label}")],
+            [(False, "no channel will carry these questions again and no human"
+                     f" has been told about them: {label} -- desktop:"
+                     " no error recorded, 5/5 attempts")],
             [
                 (item.ok, item.detail)
                 for item in result.assertions
@@ -52734,6 +52791,384 @@ class FindingBandTest(ValidatedFindingFixture, DatabaseCase):
         self.assertEqual("medium", str(row["stated"]))
         self.assertEqual("constrained_inference", str(row["severity_basis"]))
 
+
+
+NOTIFY_SLUG = "selftest-finding-notify"
+
+
+class FindingNotificationTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 229: a Finding announces itself through the pipe a decision uses.
+
+    Measured on `rk2here`, 2026-08-30: `notified.txt` 0 lines and the notify log
+    empty. The only notifier a Finding had was `notify.sh` in an engagement
+    directory -- it queried the database itself, ran `curl` itself, deduped in
+    its own state file, and did not travel to a second engagement. Beside it sat
+    a pipe with an outbox, a retry, an attempt ceiling, a backoff, a delivered
+    stamp, a placeholder whitelist, a no-shell executor with a timeout and a
+    sweep running once per lap -- carrying exactly one subject.
+
+    This case is about the second subject. It is arranged the way 221's is,
+    because a validated Finding is what the fixture above produces and a band is
+    where this begins -- and it is arranged in `setUpClass` for 156's reason
+    twice over: every reading below is about the rows the step before it left,
+    and two of them are about a row a later step deliberately destroys.
+
+    The sweep is `decisions.sweep`, unchanged and untouched. Option (b) of the
+    ticket was chosen precisely so it stays that way: `git diff
+    src/redkraken/decisions.py` is empty for this whole build.
+    """
+
+    slug = NOTIFY_SLUG
+
+    #: The granted verb, called with a uuid, the way `FindingBandTest` calls it.
+    STATE_SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+    FLOOR = "UPDATE notification_channels SET min_severity = $1 WHERE channel = 'desktop'"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.banded = cls.validated("the orders API leaks a neighbour's order")
+        cls.quiet = cls.validated("the search endpoint echoes a header it was handed")
+
+        # 1. Below the floor. A `low` Finding is a real band and it is not the
+        #    thing anybody wants a phone call about, so nothing is written.
+        cls.called(
+            cls.STATE_SEVERITY,
+            (cls.quiet["finding"], "low", "constrained_inference",
+             "one header comes back the way it went in and nothing follows from it"),
+        )
+        cls.below = cls.outbox(cls.quiet["finding"])
+
+        # 2. At it. `medium` is SPEC condition 2's own word and the floor the
+        #    shell script kept in an environment variable.
+        cls.called(
+            cls.STATE_SEVERITY,
+            (cls.banded["finding"], "medium", "constrained_inference",
+             "a neighbour's order is served to a caller who owns no part of it"),
+        )
+        cls.at = cls.outbox(cls.banded["finding"])
+
+        # 3. A question of this Program's own, so that one call can be asked for
+        #    both subjects. Parked through the verb the door parks through.
+        cls.question = cls.parked_question()
+
+        # 4. The ticket's load-bearing claim, executed: one call, two subjects,
+        #    and the Finding carrying no deadline, because nothing retires a
+        #    Finding in silence if nobody answers.
+        cls.due = sorted(
+            (str(row["label"]), str(row["channel"]), row["deadline_at"] is None)
+            for row in cls.connection.execute(
+                "SELECT label, channel, deadline_at FROM due_notifications($1::uuid)",
+                (cls.program_id,),
+            ).dicts()
+        )
+
+        # 5. One attempt against the Finding's row, with the decision rows read
+        #    either side of it: `record_notification_attempt` names two tables
+        #    now, and exactly one of them may ever match an id.
+        cls.decisions_before = cls.decision_rows()
+        cls.attempt(cls.notification(cls.banded["finding"]), False, "exit 1: no session bus")
+        cls.after_attempt = cls.outbox(cls.banded["finding"])
+        cls.decisions_after = cls.decision_rows()
+        cls.held_back = cls.due_ids()
+
+        # 6. Every attempt spent. Nothing will carry it now, and the standing
+        #    check has to say so -- naming the channel and its complaint, which
+        #    is 228 wall 1's lesson applied here rather than repeated.
+        cls.as_owner(
+            "UPDATE finding_notifications n SET attempts = c.max_attempts"
+            "  FROM notification_channels c"
+            " WHERE c.channel = n.channel AND n.program_id = $1::uuid",
+            (cls.program_id,),
+        )
+        cls.stranded = cls.surface(cls.banded["finding"])
+
+        # 7. One delivery anywhere closes it. The rule is about a Finding nobody
+        #    was told about, not about a channel that failed.
+        cls.as_owner(
+            "UPDATE finding_notifications SET delivered_at = now()"
+            " WHERE program_id = $1::uuid",
+            (cls.program_id,),
+        )
+        cls.cleared = cls.surface(cls.banded["finding"])
+
+        # 8. The floor is the channel's, and it is a rank rather than a second
+        #    spelling of the five bands. Lowered, the same `low` Finding that
+        #    wrote nothing in step 1 writes a row on its next statement.
+        cls.as_owner(cls.FLOOR, ("low",))
+        cls.called(
+            cls.STATE_SEVERITY,
+            (cls.quiet["finding"], "low", "constrained_inference",
+             "restated at the same band, under a channel that now asks to hear it"),
+        )
+        cls.lowered = cls.outbox(cls.quiet["finding"])
+        cls.as_owner(cls.FLOOR, ("medium",))
+
+        # 9. And the sweep `hunt.sh:70` already runs once per lap carries it,
+        #    with no argv this repository wrote and no Python this ticket added.
+        cls.carried: list[list[str]] = []
+        cls.swept = decisions.sweep(cls.harness.runtime, deliver=cls.recorder(cls.carried))
+        cls.delivered = cls.outbox(cls.quiet["finding"])
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def outbox(cls, finding: str) -> list[tuple]:
+        """Every announcement written about one Finding, and where it stands."""
+        return [
+            (str(row["channel"]), int(row["attempts"]), bool(row["delivered"]),
+             str(row["last_error"] or ""), str(row["body"]))
+            for row in cls.connection.execute(
+                "SELECT channel, attempts, delivered_at IS NOT NULL AS delivered,"
+                "       last_error, body"
+                "  FROM finding_notifications WHERE finding_id = $1::uuid"
+                " ORDER BY channel",
+                (finding,),
+            ).dicts()
+        ]
+
+    @classmethod
+    def notification(cls, finding: str) -> str:
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM finding_notifications WHERE finding_id = $1::uuid",
+                (finding,),
+            ).scalar()
+        )
+
+    @classmethod
+    def label_of(cls, finding: str) -> str:
+        return str(
+            cls.connection.execute(
+                "SELECT label FROM findings WHERE id = $1::uuid", (finding,)
+            ).scalar()
+        )
+
+    @classmethod
+    def decision_rows(cls) -> list[tuple]:
+        """Every decision notification in the database, field for field."""
+        return [
+            tuple(str(value) for value in row)
+            for row in cls.connection.execute(
+                "SELECT id, attempts, delivered_at, last_error, next_attempt_at"
+                "  FROM decision_notifications ORDER BY id"
+            ).rows
+        ]
+
+    @classmethod
+    def due_ids(cls) -> list[str]:
+        return [
+            str(row[0])
+            for row in cls.connection.execute(
+                "SELECT notification_id::text FROM due_notifications($1::uuid)",
+                (cls.program_id,),
+            ).rows
+        ]
+
+    @classmethod
+    def attempt(cls, notification: str, ok: bool, error: str | None) -> None:
+        committed(
+            cls.connection,
+            "SELECT record_notification_attempt($1::uuid, $2::boolean, $3::text)",
+            (notification, ok, error),
+        )
+
+    @classmethod
+    def parked_question(cls) -> str:
+        """One filed question in this Program, through the verb the door uses.
+
+        The Tool run is written by hand and then parked, which is the shape this
+        module already uses for an agent-Lane Receipt. What is wanted is a
+        request the risk rules answer `ask` about, and a POST to a host this
+        Program's scope admits is one -- `park_for_human` refuses anything that
+        resolves to something else, so the arrangement cannot quietly become a
+        different question.
+        """
+        agent_run = cls.replay_run()
+        tool_run = committed(
+            cls.connection,
+            "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args, status,"
+            "                       transport)"
+            " SELECT ar.program_id, ar.id, ar.task_id, 'mcp__rk2__net_request',"
+            "        '{\"url\": \"https://app.example.com/api/orders/1\","
+            "          \"method\": \"POST\", \"identity_slot\": \"\"}'::jsonb,"
+            "        'running', 'runtime'"
+            "   FROM agent_runs ar WHERE ar.id = $2::uuid AND ar.program_id = $1::uuid"
+            " RETURNING id",
+            (cls.program_id, agent_run),
+        )
+        return committed(
+            cls.connection,
+            "SELECT park_for_human($1::uuid, interval '30 minutes')",
+            (tool_run,),
+        )
+
+    @classmethod
+    def surface(cls, finding: str) -> list[tuple[str, str]]:
+        """What the control surface says about one Finding, and only that one."""
+        label = cls.label_of(finding)
+        return [
+            (str(row[0]), str(row[1]))
+            for row in cls.connection.execute(
+                "SELECT problem, detail FROM check_control_surface()"
+                " WHERE detail = $1 OR detail LIKE $1 || ' -- %'",
+                (label,),
+            ).rows
+        ]
+
+    @staticmethod
+    def recorder(carried: list[list[str]]):
+        """A channel that always works, and keeps what it was handed."""
+
+        def deliver(command):
+            carried.append(list(command))
+            return True, ""
+
+        return deliver
+
+    # -- what the fan-out wrote ------------------------------------------------
+
+    def test_a_finding_below_the_floor_is_announced_to_nobody(self):
+        self.assertEqual([], self.below)
+
+    def test_a_banded_finding_writes_one_row_per_enabled_channel(self):
+        # One, because `desktop` is the only channel the seed leaves enabled:
+        # `push` ships with an empty argv on purpose, for an operator to fill in.
+        self.assertEqual(1, len(self.at), self.at)
+        channel, attempts, delivered, error, body = self.at[0]
+
+        self.assertEqual(("desktop", 0, False, ""), (channel, attempts, delivered, error))
+        # The body is what a human reads on a phone, so the band and the basis
+        # are in it beside the title: `medium` alone does not say what it rests on.
+        self.assertIn("is medium (constrained_inference)", body)
+        self.assertIn(self.TITLE, body)
+
+    def test_the_floor_is_the_channels_own_and_is_read_as_a_rank(self):
+        # The same Finding at the same band, either side of one UPDATE. A floor
+        # written into the trigger could not make this reading change, and a
+        # floor written as a second list of the five words could disagree with
+        # `rk2_severity_rank`. It is one column, ordered by that function.
+        self.assertEqual([], self.below)
+        self.assertEqual(1, len(self.lowered), self.lowered)
+        self.assertEqual("desktop", self.lowered[0][0])
+
+    # -- what the two verbs carry ----------------------------------------------
+
+    def test_one_call_returns_the_question_and_the_finding(self):
+        # The reason option (b) was chosen: the signature does not change, so
+        # `runtime_verb_surface` keeps `due_notifications(uuid)` and
+        # `decisions.py` keeps every line it has.
+        self.assertEqual(
+            [(str(self.question), "desktop", False),
+             (self.label_of(self.banded["finding"]), "desktop", True)],
+            self.due,
+        )
+
+    def test_an_attempt_marks_the_finding_row_and_no_decision_row(self):
+        self.assertEqual(
+            [("desktop", 1, False, "exit 1: no session bus")],
+            [row[:4] for row in self.after_attempt],
+        )
+        # And every decision notification in the database is unchanged. Two
+        # UPDATEs in one function is only safe because both tables key on a
+        # `uuidv7()` primary key, so at most one row anywhere can carry an id.
+        self.assertEqual(self.decisions_before, self.decisions_after)
+
+    def test_the_backoff_holds_a_failed_announcement_out_of_the_queue(self):
+        self.assertNotIn(self.notification(self.banded["finding"]), self.held_back)
+
+    # -- what the control surface says -----------------------------------------
+
+    def test_a_finding_no_channel_will_carry_again_names_the_channel(self):
+        label = self.label_of(self.banded["finding"])
+
+        self.assertEqual(
+            [("finding_unannounced",
+              f"{label} -- desktop: exit 1: no session bus, 5/5 attempts")],
+            self.stranded,
+        )
+
+    def test_one_delivery_anywhere_closes_it(self):
+        self.assertEqual([], self.cleared)
+
+    def test_the_arm_is_silent_about_a_finding_the_fan_out_never_reached(self):
+        # The half that makes this arm safe to apply to a live database. On
+        # 2026-08-30 `rk2here` held one validated Finding and zero rows in this
+        # table, and a standing check that returns rows refuses every pass -- so
+        # an arm reading "a validated Finding with no announcement" would have
+        # halted the harness on the lap after it applied, over a Finding that
+        # predates the mechanism. It is scoped to Findings the fan-out reached.
+        try:
+            with self.connection.transaction():
+                self.connection.execute(
+                    "DELETE FROM finding_notifications WHERE program_id = $1::uuid",
+                    (self.program_id,),
+                )
+                self.assertEqual(
+                    (),
+                    self.connection.execute(
+                        "SELECT detail FROM check_control_surface()"
+                        " WHERE problem = 'finding_unannounced'"
+                    ).rows,
+                )
+                raise Rollback
+        except Rollback:
+            pass
+
+    def test_the_wiring_arm_fires_when_the_fan_out_is_taken_away(self):
+        # And the other direction, which is what stops the arm above from
+        # reading green for the wrong reason. Scoped to Findings the fan-out
+        # reached, it would go silent the moment somebody removed the fan-out:
+        # no Finding would get a row, no row would be missing, and the check
+        # would agree. So the wiring is asserted separately, the way ticket 226
+        # asserted `rank_pass`'s text rather than the empty chain graph.
+        self.assertEqual(
+            (),
+            self.connection.execute(
+                "SELECT detail FROM check_control_surface()"
+                " WHERE problem = 'finding_notification_fan_out_is_unwired'"
+            ).rows,
+        )
+        try:
+            with self.owner_connection.transaction():
+                self.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+                self.owner_connection.execute(
+                    "DROP TRIGGER severity_statements_fan_out_notification"
+                    " ON severity_statements"
+                )
+                self.assertEqual(
+                    [("finding_notification_fan_out_is_unwired", "severity_statements")],
+                    [
+                        (str(row[0]), str(row[1]))
+                        for row in self.owner_connection.execute(
+                            "SELECT problem, detail FROM check_control_surface()"
+                            " WHERE problem = 'finding_notification_fan_out_is_unwired'"
+                        ).rows
+                    ],
+                )
+                raise Rollback
+        except Rollback:
+            pass
+
+    # -- and the sweep that already runs once per lap --------------------------
+
+    def test_the_sweep_carries_a_finding_announcement_to_its_channel(self):
+        # `hunt.sh:70` has run `rk decision sweep` once per lap since before this
+        # ticket. Nothing about it changed; what changed is what
+        # `due_notifications()` hands it.
+        label = self.label_of(self.quiet["finding"])
+
+        self.assertTrue(self.swept.ok, self.swept.violations)
+        self.assertIn(
+            f"{label} was carried to the desktop channel",
+            [item.detail for item in self.swept.assertions if item.name == "notification"],
+        )
+        sent = [command for command in self.carried if f"redKrakenV2 {label}" in command]
+        self.assertEqual(1, len(sent), self.carried)
+        self.assertEqual("notify-send", sent[0][0])
+        # Recorded, and gone from the queue: a delivery that is not written down
+        # is one the next lap makes again, for ever.
+        self.assertEqual([("desktop", 1, True, "")], [row[:4] for row in self.delivered])
 
 
 IMPACT_SLUG = "selftest-impact"

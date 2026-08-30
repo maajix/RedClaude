@@ -6,7 +6,10 @@ decision and is written down here so it can be made, not built.
 
 **Blocked by:** nothing.
 
-**Status:** in-progress -- wall 2 built and applied, wall 1 owed as `T228-01`
+**Status:** done -- both walls built and applied. Wall 1 shipped as `T228-01` in
+`20270106T000000Z__a_finding_announces_itself_through_the_pipe_a_decision_uses.sql`
+(`applied_seq 243`), together with ticket 229, because both rewrite
+`check_control_surface` and a migration replaces a function WHOLE.
 
 ## What was measured, 2026-08-30
 
@@ -152,8 +155,11 @@ POST, and the operator's own approval from an hour ago does not help.
 ## Acceptance
 
 1. A host with no session bus and a failing `desktop` channel produces a
-   refusal that names `desktop` and its last error. **Owed**, carried as
-   `T228-01`.
+   refusal that names `desktop` and its last error. **Done**, `T228-01`. The
+   arm returns
+   `D5 -- desktop: exit 1: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown, 5/5 attempts`,
+   a disabled channel is marked as such, and a decision fanned out to nothing
+   says `fanned out to no channel`. `ProxyEgressTest` holds both cases.
 2. Wall 2 is answered by the operator: **(b), on 2026-08-30.** Built as
    `20270102T000000Z__an_approved_route_stays_approved_until_it_expires.sql`,
    applied to `rk2here`, and driven end to end: `RG1` over
@@ -235,7 +241,6 @@ by driving the caller the runtime drives, not the function under test.
 
 ## Still owed
 
-* `T228-01` -- acceptance 1. Wall 1 itself, untouched by any of the above.
 * `T228-02` -- the Program-wide `EXISTS`, matched against the grant it returns
   instead. Until it lands, `rk2here` holds at most one live `route_grants` row.
 * `T228-03` -- two rough edges on the applied migration, which needs a follow-up
