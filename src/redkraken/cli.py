@@ -1307,11 +1307,13 @@ def build_parser() -> argparse.ArgumentParser:
     judging.add_argument(
         "--agent-run",
         dest="agent_run",
-        required=True,
         metavar="label",
         help=(
             "the agent run the reproducing replay is performed under, by its "
-            "label; the validator's own session is opened by the command"
+            "label; optional, and omitting it is the usual case -- the command "
+            "opens a run of its own, because a replay needs one that has not "
+            "ended and on a stopped Program every run has. The validator's own "
+            "session is opened by the command either way"
         ),
     )
     judging.add_argument(

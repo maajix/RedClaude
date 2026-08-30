@@ -33891,6 +33891,14 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
             execution.PROXY_CONTAINER: "rk2-proxy",
             execution.PROXY_URL: cls.proxy_url,
             execution.CERTIFICATE: "/run/root.pem",
+            # Both addresses of one door, because the command spends both:
+            # `$RK_AGENT_PROXY_URL` is what the validator's child is handed and
+            # `$RK_PROXY_URL` is where the reproducing replay, which runs in
+            # this process, may spend its capability. They are the same here and
+            # are not on a real installation -- ticket 222 -- and a fixture that
+            # stated only one is what let the command hand a child's address to
+            # a host-side replay for as long as it did.
+            proxy.PROXY_URL: cls.proxy_url,
         }
         cls.requests: list[agent.AgentRunRequest] = []
         cls.reads: list[dict] = []
@@ -33931,8 +33939,15 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
                 "finding": opened["finding"], "finding_id": opened["finding_id"]}
 
     @classmethod
-    def validated(cls, statement: str, launch) -> dict:
-        """One candidate, and one `rk finding validate` over it."""
+    def validated(cls, statement: str, launch, *, agent_run: str | None = None) -> dict:
+        """One candidate, and one `rk finding validate` over it.
+
+        No `--agent-run` by default, because that is the command an operator
+        runs. Ticket 222: a replay needs a run that has not ended, a run is open
+        only while a child is running, and on a stopped Program there is none --
+        so the command opens its own and this fixture exercises that. The named
+        path keeps one case of its own below.
+        """
         made = cls.candidate(statement)
         return {
             **made,
@@ -33940,7 +33955,7 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
                 cls.harness.runtime,
                 cls.configuration,
                 finding=made["finding"],
-                agent_run=cls.agent_run(),
+                agent_run=agent_run,
                 environment=cls.environment,
                 launch=launch,
             ),
@@ -34281,6 +34296,152 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
         problems = self.rows("SELECT * FROM check_validations()")
 
         self.assertEqual([], [tuple(str(field) for field in row) for row in problems])
+
+    # -- ticket 222: the run the reproduction is performed under ---------------
+
+    def test_the_reproduction_opens_and_closes_a_run_of_its_own(self):
+        """The command names no run, so the run it used is one it opened.
+
+        Asserted on the row rather than on the sentence: the reproduction is
+        performed under a run this command created, and that run is closed by
+        the time the command returns. An open run is one the next pass's
+        `reconcile_leases` closes as `error`, which is how a validation that
+        worked would show up in a hunt's reconciliation report.
+        """
+        label = self.confirmed["report"].facts["reproduction"]["agent_run"]
+
+        row = self.rows(
+            "SELECT model, task_id IS NULL, finished_at IS NOT NULL, stop_reason"
+            "  FROM agent_runs WHERE program_id = $1::uuid AND label = $2",
+            (self.program_id, label),
+        )
+
+        self.assertEqual([("operator", True, True, "completed")], [tuple(row[0])])
+
+    def test_a_run_the_operator_names_is_used_and_left_open(self):
+        """The named path still works, and does not end somebody else's run.
+
+        A run an operator names belongs to whatever opened it -- a hunt lap, in
+        the one case where an open one exists -- so this command performs under
+        it and leaves it exactly as it found it.
+        """
+        named = self.agent_run()
+
+        made = self.validated(
+            "the notes API hands over a neighbour's draft",
+            self.judges("confirmed"),
+            agent_run=named,
+        )
+
+        self.assertTrue(made["report"].ok, made["report"].violations)
+        self.assertEqual(named, made["report"].facts["reproduction"]["agent_run"])
+        self.assertEqual(
+            [(False,)],
+            [tuple(row) for row in self.rows(
+                "SELECT finished_at IS NOT NULL FROM agent_runs"
+                " WHERE program_id = $1::uuid AND label = $2",
+                (self.program_id, named),
+            )],
+        )
+
+    def test_a_run_that_has_ended_is_refused_before_the_claim_moves(self):
+        """Ticket 222's second half, and the reason the order changed.
+
+        `reopen_for_reproduction` moves the claim out of `supported` and no verb
+        moves it back without a Receipt, so a refusal that arrives after it has
+        run leaves a Finding on an unsupported claim. This asserts the refusal
+        arrives first: the claim is untouched and the queue is not left holding.
+        """
+        made = self.candidate("the notes API hands over a neighbour's ledger")
+        ended = self.agent_run()
+        committed(
+            self.runtime,
+            "UPDATE agent_runs SET finished_at = now(), stop_reason = 'completed'"
+            " WHERE program_id = $1::uuid AND label = $2 RETURNING label",
+            (self.program_id, ended),
+        )
+        before = self.claim_status(made["hypothesis"])
+
+        report = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding=made["finding"],
+            agent_run=ended,
+            environment=self.environment,
+            launch=self.judges("confirmed"),
+        )
+
+        self.assertFalse(report.ok)
+        self.assertIn(
+            f"agent run {ended} has already ended",
+            [violation.detail for violation in report.violations],
+        )
+        self.assertEqual(before, self.claim_status(made["hypothesis"]))
+
+    def test_a_validation_left_queued_is_continued_rather_than_refused(self):
+        """Ticket 222, criterion 4: a Program stopped by this is startable again.
+
+        The queue row is a state and not a log, so `queued` is this same ask
+        left by a run that never reached a verdict. Re-running the command
+        continues it; before this, `request_validation` refused the second ask
+        and the Finding could never be validated at all.
+        """
+        made = self.candidate("the notes API hands over a neighbour's summary")
+        committed(
+            self.runtime,
+            "SELECT request_validation($1::uuid, $2::uuid)",
+            (self.program_id, made["finding_id"]),
+        )
+
+        report = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding=made["finding"],
+            environment=self.environment,
+            launch=self.judges("confirmed"),
+        )
+
+        self.assertTrue(report.ok, report.violations)
+        self.assertIn(
+            f"{made['finding']} was already queued for validation and this run continues it",
+            [assertion.detail for assertion in report.assertions],
+        )
+
+    def test_a_machine_that_names_no_door_of_its_own_reproduces_nothing(self):
+        """The two addresses, and the one this command spends.
+
+        `$RK_AGENT_PROXY_URL` is the door's name on the internal network and is
+        what the validator's child is handed; the reproducing replay runs in
+        this process and needs `$RK_PROXY_URL`. Handing the first to the replay
+        is what produced "is not a loopback address" on a real installation, so
+        the absence is refused here by name rather than reaching the replay.
+        """
+        made = self.candidate("the notes API hands over a neighbour's archive")
+        environment = {
+            key: value
+            for key, value in self.environment.items()
+            if key != proxy.PROXY_URL
+        }
+
+        report = validation.run(
+            self.harness.runtime,
+            self.configuration,
+            finding=made["finding"],
+            environment=environment,
+            launch=self.judges("confirmed"),
+        )
+
+        self.assertFalse(report.ok)
+        self.assertEqual(
+            [f"environment:{proxy.PROXY_URL}"],
+            [violation.source for violation in report.violations],
+        )
+
+    def claim_status(self, hypothesis: str) -> str:
+        """What the claim under one Finding says it is."""
+        return str(self.rows(
+            "SELECT status FROM hypotheses WHERE id = $1::uuid", (hypothesis,)
+        )[0][0])
 
 
 IMPACT_SLUG = "selftest-impact"

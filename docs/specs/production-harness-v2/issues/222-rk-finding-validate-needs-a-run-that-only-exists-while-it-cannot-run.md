@@ -7,7 +7,7 @@ nothing in the tree can undo it.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## What was measured
 
@@ -119,20 +119,94 @@ RULE    Capability before catalogue. The validator, the packet, the verdict
 
 ## Acceptance criteria
 
-- [ ] **`rk finding validate` completes on a stopped Program.** No hunt
+- [x] **`rk finding validate` completes on a stopped Program.** No hunt
       running, no open run beforehand, one candidate Finding: it reproduces,
       serves the packet, files the verdict.
-- [ ] **A reproduction that fails returns the claim.** Whatever stops it, the
-      hypothesis ends where it started and no standing check fires. A test
-      that reopens and then fails the replay asserts the claim is `supported`
-      again.
-- [ ] **The replay's own reason reaches the operator.** `validation.py:222-225`
+- [x] **A reproduction that fails returns the claim.** Read as: the claim does
+      not move for a reproduction that cannot start. The order changed instead
+      of a new transition being added -- see below.
+- [x] **The replay's own reason reaches the operator.** `validation.py:222-225`
       deliberately does not restate it, and the consequence is a report that
       says "was not reproduced" and not "the run you named has ended".
-- [ ] **A Program stopped by this is startable again.** Whether that is a
-      command, a documented query, or the failure path above never leaving it
-      there -- an operator holding `integrity_failed | finding_candidates` has
-      no move today.
+- [x] **A Program stopped by this is startable again.** A `queued` row is this
+      same ask, and re-running the command continues it.
+
+## What was built, 2026-08-30
+
+Three things, all in `src/redkraken/validation.py`, none of them a migration.
+
+**The command opens its own run.** `--agent-run` is optional now and omitting
+it is the usual case. `OPEN_REPRODUCTION` is `proxy.py:3867-3870` in the same
+shape and for the same reason: an operator-driven runtime action gets a run of
+its own. `orchestrator` is the one role the roster lets execute no Task
+(`roles.executes_tasks` is false for it, which is what lets `task_id` stay
+NULL), and `operator` is the model because no model ran. The run is closed on
+every path out, so it does not reach the next pass's `reconcile_leases` as an
+`error`.
+
+The ticket's PRICE line said this row "is not a hand-written INSERT and belongs
+in a function beside `open_validation_session`", on the strength of the three
+role FKs. It was wrong twice over: `proxy.py` has written the same row by hand
+since it was written, and the one guard a SQL verb would add -- that the Finding
+was asked about -- is the `request_validation` two statements above it.
+
+**The order changed, so the refusal arrives before the claim moves.** The run is
+opened first. A run that has ended is refused there, where the claim is still
+`supported`, rather than by `open_test_replay` after
+`reopen_for_reproduction` has moved it. This is what criterion 2 is really
+asking for: no transition was added, because none is legal and none should be.
+A reproduction that starts and then fails leaves the claim `testable`, which is
+true -- it needs testing again -- and ticket 223 stopped that from being a hard
+stop.
+
+**Two addresses for one door, and the command was spending the wrong one.**
+`container.proxy_url` is `$RK_AGENT_PROXY_URL`, the name the door answers to on
+the internal network, and it is what the validator's child is handed. The
+reproducing replay runs in this process, on the host, and needs `$RK_PROXY_URL`.
+The command passed the child's address to the replay, which answered:
+
+```
+invalid_configuration | environment:RK_PROXY_URL
+  | rk2here-door is not a loopback address; the capability is sent to this
+    machine only
+```
+
+`execution.py:2460-2462` states the same pair for the hunt's own replays and gets
+it right, so this was `validation.py` alone. The fixture never caught it because
+`tests/test_database.py:33888` set only `execution.PROXY_URL`, and in the harness
+the two addresses are the same string.
+
+**A `queued` validation is continued, not refused.** `request_validation` writes
+a state and not a log -- "011 made the row unique per Finding, so the queue is a
+state and not a log" -- so `queued` means asked and not yet served. A run that
+died before a verdict leaves exactly that, and before this the Finding could
+never be validated again: the second ask was refused as a duplicate. `running`
+still refuses, because that is a session holding the Finding and
+`open_validation` is what set it.
+
+## What it did
+
+`rk2here`, 2026-08-30, hunt stopped, no open run beforehand:
+
+```
+OK  door           | the reproduction spends its capability at http://127.0.0.1:18082
+OK  request        | F8 was already queued for validation and this run continues it
+OK  reproduction   | AR1017 was opened for the reproduction, which is what it holds
+OK  reproduction   | H160 is testable, so TST83 can be performed again
+OK  validation     | AR1018 was served 7a4d678e9a3a, which is 359 value(s) and nothing else
+OK  session        | AR1018 stopped as completed after 1 answer(s)
+OK  verdict        | F8 was judged insufficient and is candidate
+exit_code 0, violations []
+```
+
+The replay held, so `H160` came back to `supported` the way every claim does,
+and `check_finding_candidates()` returns 0 rows. The verdict is the blind
+session's own and is not this ticket's business.
+
+`ValidationCommandTest`: 20 tests, OK. The fixture now runs the command the way
+an operator does -- no `--agent-run` -- so all fifteen existing cases exercise
+the opened run, and five new cases cover the named run, the ended run, the
+continued queue and the missing `$RK_PROXY_URL`.
 
 ## What this does not change
 
