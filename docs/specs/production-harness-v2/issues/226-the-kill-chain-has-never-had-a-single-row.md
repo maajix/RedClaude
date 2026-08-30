@@ -260,3 +260,13 @@ both callee names when `rank_pass` is stubbed inside a rolled-back transaction.
 their cleanup, and TWO stamped pivots before `build_kill_chain` will compose
 anything at all. That is a fixture on the scale of `ImpactRunFixture` plus
 `ChainFixture`, not something that falls out of a derivation test.
+
+**One wart, recorded rather than migrated away.** The `runtime_verb_surface`
+note for `derive_impact_specifications()` says the two `conclude` shapes are
+"told from it by the Finding's own `severity_basis`". That was the first
+design's rule, dropped for `rk2_task_proves_impact` because it silently changed
+ticket 221's answer, and the note kept the old sentence. The migration is
+applied and frozen, the corpus has never once amended a `runtime_verb_surface`
+note, and nothing reads the column as behaviour -- the authoritative sentence is
+`COMMENT ON FUNCTION derive_impact_specifications()`, which is correct. Left for
+whichever migration next touches this area; it is not worth a file of its own.
