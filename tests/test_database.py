@@ -25512,6 +25512,259 @@ def offline_reference(
     )
 
 
+ROUTE_SLUG = "selftest-route"
+
+
+class RouteGrantTest(SchedulerFixture, DatabaseCase):
+    """Ticket 228 wall 2: one approved question, standing for its whole route.
+
+    `rk2here` spent four operator approvals on one OAuth token endpoint in a
+    single day -- D25, D26, D27, D28 -- and halted between each pair. The four
+    are the same question. They differ by one field, because
+    `canonical_request` puts a nonce in the digest of any call opened
+    body-bearing: the bytes are chosen by the child after the row is written,
+    so the honest key for a call the digest cannot describe is a key that
+    matches nothing else, and `live_grant_for` matches on exactly that key.
+
+    So what is asserted here is a second, narrower thing rather than a wider
+    equivalence key. The exact lookup still answers first and still answers
+    only what it answered before; a route grant answers a call it never could.
+
+    Everything runs in `setUpClass` because all of it commits, and because each
+    step only means anything against the state the one before it left: a grant
+    that answers a second call is a claim about the first call having been
+    asked about at all.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: The route every call below is against, and the one an approval is taken
+    #: over. A path with no parameter in it, so `path_template` is the path and
+    #: a reader does not have to hold the canonicaliser in their head.
+    ROUTE = f"http://{HOST}/token"
+
+    GRANT = "SELECT grant_route($1, $2::numeric, $3)"
+    REVOKE = "SELECT revoke_route_grant($1, $2)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runtime = pg.connect(cls.harness.runtime)
+
+        opened = program.run(
+            cls.harness.runtime,
+            write(
+                SCOPED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                    'name = "matrix-web"', f'name = "{ROUTE_SLUG}"'
+                )
+            ),
+        )
+        assert opened.ok, opened.violations
+        cls.identifiers = {ROUTE_SLUG: opened.facts["program_id"]}
+        cls.tasks = cls.seed(ROUTE_SLUG, 2)
+        cls.bind(ROUTE_SLUG)
+
+        # The first call: asked about, answered, and the grant that answer
+        # carries. This is the state `rk2here` reached four times over.
+        run, task = cls.claim(cls.tasks[0])
+        cls.first_label = cls.park(cls.body_bearing_receipt(run, task))
+        cls.operator(
+            "SELECT answer_decision($1, 'approved', $2, interval '48 hours')",
+            (cls.first_label, "the endpoint is specified to take a POST"),
+            program=ROUTE_SLUG,
+        )
+
+        # The second call, on the same route and under its own Task, which is
+        # what makes it a second question at all. The nonce a body-bearing
+        # digest carries is the TASK's label, not the Tool run's -- ticket 96
+        # keyed it there so that a parked question survives the re-claim its own
+        # parking causes -- so a second receipt hung off the Task above would
+        # carry the digest above, and the approval above would answer it through
+        # the exact lookup. Read before the grant because every number below is
+        # about the difference between this reading and the one after it.
+        run, task = cls.claim(cls.tasks[1])
+        cls.second = cls.body_bearing_receipt(run, task)
+        cls.before = cls.gate(cls.second)
+
+        cls.granted = cls.operator(
+            cls.GRANT,
+            (cls.first_label, 48, "the hunt POSTs this token endpoint every lap"),
+            program=ROUTE_SLUG,
+        )
+        cls.after = cls.gate(cls.second)
+
+        # A third call the grant must not reach: same host, different path.
+        cls.elsewhere = cls.gate(
+            cls.body_bearing_receipt(run, task, url=f"http://{HOST}/admin")
+        )
+
+        cls.revoked = cls.operator(
+            cls.REVOKE,
+            (json.loads(str(cls.granted))["label"], "the campaign is over"),
+            program=ROUTE_SLUG,
+        )
+        cls.after_revocation = cls.gate(cls.second)
+
+        # And that same second call taken all the way to a filed question, which
+        # is what the last case below tries to widen: a yes nobody gave.
+        cls.unanswered = cls.park(cls.second)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.close()
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute("DELETE FROM programs WHERE slug = $1", (ROUTE_SLUG,))
+        super().tearDownClass()
+
+    # -- the moves --------------------------------------------------------------
+
+    @classmethod
+    def claim(cls, label: str) -> tuple[str, str]:
+        """One named Task claimed, and the run holding it that receipts hang from.
+
+        By label off a seed taken once, rather than a `seed()` per claim: `seed`
+        writes the application Entity every time it is called, so a second call
+        for one Program collides on `entities_program_id_type_dedup_key_key`.
+        Re-offered before each claim because a slate goes stale, which is what
+        every case here that claims twice already does between the two.
+        """
+        cls.offer()
+        run = str(cls.call("SELECT claim_task($1)", (label,)))
+        [row] = cls.as_owner(
+            "SELECT a.id::text, t.id::text FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            " WHERE a.program_id = $1::uuid AND a.label = $2",
+            (cls.identifiers[ROUTE_SLUG], run),
+        ).rows
+        return str(row[0]), str(row[1])
+
+    @classmethod
+    def body_bearing_receipt(cls, run: str, task: str, url: str | None = None) -> str:
+        """One open Tool run opened to carry a body, which is the whole point.
+
+        `body_allowed` is what puts the nonce in the digest -- it is the flag
+        `canonical_request` reads -- so a receipt without it would be a fixture
+        quietly testing the case that already worked.
+        """
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            return str(
+                cls.runtime.execute(
+                    "INSERT INTO tool_runs (program_id, agent_run_id, task_id, tool, args,"
+                    " status, transport) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb,"
+                    " 'running', 'runtime') RETURNING id::text",
+                    (
+                        cls.identifiers[ROUTE_SLUG],
+                        run,
+                        task,
+                        proxy.TOOL,
+                        json.dumps(
+                            {
+                                "url": url or cls.ROUTE,
+                                "method": "POST",
+                                "identity_slot": "",
+                                "body_allowed": True,
+                            }
+                        ),
+                    ),
+                ).scalar()
+            )
+
+    @classmethod
+    def park(cls, receipt: str) -> str:
+        """The gate's `ask`, taken all the way to a filed question."""
+        return str(
+            cls.call("SELECT park_for_human($1::uuid, interval '2 hours')", (receipt,))
+        )
+
+    @classmethod
+    def gate(cls, receipt: str) -> dict:
+        """What the gate says about one Tool run, as the orchestrator asks it."""
+        return json.loads(str(cls.call("SELECT gate_tool_call($1::uuid)", (receipt,))))
+
+    # -- what the nonce costs ---------------------------------------------------
+
+    def test_a_second_body_bearing_call_is_asked_about_all_over_again(self):
+        # The arrangement, asserted before anything counts it: a fixture whose
+        # second call was answered by the first approval would make every
+        # number below correct and meaningless. This is `rk2here`'s D27 arriving
+        # an hour after D25 was approved.
+        self.assertEqual("ask", self.before["decision"])
+        self.assertIsNone(self.before["approval"])
+
+    def test_the_two_calls_are_the_same_question_told_apart_by_a_nonce(self):
+        # Why the exact lookup cannot answer it, read off the digests rather
+        # than described: every field but one is equal.
+        first = self.owned(
+            "SELECT request_digest FROM pending_decisions WHERE label = $1",
+            (self.first_label,),
+        )
+        first_digest = json.loads(str(first))
+        second_digest = self.before["digest"]
+
+        self.assertNotEqual(first_digest["nonce"], second_digest["nonce"])
+        self.assertEqual(
+            {k: v for k, v in first_digest.items() if k != "nonce"},
+            {k: v for k, v in second_digest.items() if k != "nonce"},
+        )
+
+    # -- what the grant buys ----------------------------------------------------
+
+    def test_the_grant_widens_the_answer_the_operator_already_gave(self):
+        granted = json.loads(str(self.granted))
+
+        self.assertEqual(self.first_label, granted["granted_from"])
+        self.assertEqual("call_risk_rules:net_unsafe_method", granted["risk_rule"])
+        self.assertIn("/token", granted["route"])
+
+    def test_the_same_call_is_allowed_once_the_route_stands(self):
+        # The one assertion this whole ticket exists for, and it is the same
+        # receipt read twice: nothing about the call changed, only what the
+        # operator had said about its route.
+        self.assertEqual("allow", self.after["decision"])
+        self.assertEqual(json.loads(str(self.granted))["label"], self.after["approval"])
+
+    def test_a_different_path_on_the_same_host_is_still_asked_about(self):
+        # A grant is over a route and not over a host. Without this the verb
+        # would be an operator approving a target rather than a call, which is
+        # the widening the ticket priced and did not buy.
+        self.assertEqual("ask", self.elsewhere["decision"])
+        self.assertIsNone(self.elsewhere["approval"])
+
+    def test_a_revoked_grant_stops_answering_in_the_same_breath(self):
+        # The reason a grant may be left standing at all: an operator who
+        # changes their mind does not wait for an expiry.
+        self.assertEqual("ask", self.after_revocation["decision"])
+        self.assertIsNone(self.after_revocation["approval"])
+
+    # -- what it refuses --------------------------------------------------------
+
+    def test_an_unanswered_question_cannot_be_widened(self):
+        # The rule the verb exists to hold: an operator may widen a yes and may
+        # never manufacture one. Asked of a second question on the same route,
+        # so what refuses it is the status and not the shape.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.operator(
+                self.GRANT, (self.unanswered, 48, "no"), program=ROUTE_SLUG
+            )
+
+        self.assertIn("only an approved one", str(refused.exception))
+
+    def test_a_grant_with_no_life_left_in_it_cannot_be_written(self):
+        # An expiry is mandatory, and it is a CHECK rather than a convention:
+        # a grant that outlives the engagement must be unwritable and not
+        # merely unlikely.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.operator(
+                self.GRANT, (self.first_label, 0, "forever"), program=ROUTE_SLUG
+            )
+
+        self.assertIn("positive number of hours", str(refused.exception))
+
+
+
 class SkillScriptRegistryTest(DatabaseCase):
     """PH2-87 criteria 1 and 5: a Skill script is a registry row like any other.
 
