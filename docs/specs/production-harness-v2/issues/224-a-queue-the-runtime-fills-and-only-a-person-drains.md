@@ -70,7 +70,7 @@ producer removes the first half of that; this ticket is the second.
 
 ## Acceptance
 
-- [ ] The decision between shapes 1 and 2 is recorded in this file, with the
+- [x] The decision between shapes 1 and 2 is recorded in this file, with the
       price of the one not taken.
 - [ ] A Finding the orchestrator asked about is reproduced and judged with no
       operator command, measured on a live Program: `validation_queue` goes
@@ -82,3 +82,45 @@ producer removes the first half of that; this ticket is the second.
 - [ ] The standing family stays quiet across the whole window. 223 narrowed
       `check_finding_candidates` rule 3 for exactly this state; a drain that
       opens more than one window at a time is a case that rule has not seen.
+
+## The decision, taken 2026-08-30
+
+**Shape 1 now, shape 2 still owed.** `drain-validations.sh` lives in the
+engagement directory, is called by `hunt.sh` between laps, and drove `F9` from
+`queued` to `validated` on the live `rk2here` Program. It is fourteen lines of
+shell and it exists because the campaign was one step short of a validated
+Finding and the step was a person typing a command.
+
+Shape 2 is not withdrawn and this ticket stays open for it. What it costs, read
+this session rather than estimated:
+
+- A frontier and a derivation, the pair that
+  `20261021T000000Z__a_supported_claim_becomes_the_finding_it_earned.sql:495-565`
+  already spells for `conclude`: a `STABLE` function returning the queue rows
+  nothing has claimed, and a `derive_*` function that turns them into Tasks
+  under `max_conclusions_derived_per_pass`'s sibling ceiling.
+- `validate` already exists as a Task kind (`roster.py:79`) and the `validator`
+  Role already claims it (`roster.py:2301-2317`), so `task_kinds` and
+  `role_task_kinds` need no row. That is the half of shape 2 that is built.
+- `execution` learning to run a `validate` Task. This is the half that is not:
+  the `validator` Role is `runs_as=SESSION` and every kind `execution` runs
+  today is `SUBAGENT` or `RENDERER`. `rk finding validate` is the only caller
+  that starts a validator session, and shape 2 means that call moving out of
+  `cli.py` and into the lap.
+- The four rows in `runtime_table_surface` and the `runtime_verb_surface` row
+  the new verbs need, which is the bookkeeping every migration in this corpus
+  pays.
+
+## What shape 1 does not buy
+
+Named here so the gap is not read as closed:
+
+- **It is engagement-local.** The script is in
+  `/home/majix/engagements/here-technologies-2026-08-25`, which is not this
+  repository. A second engagement gets no drain until somebody copies a file.
+- **It is not crash-idempotent.** Acceptance criterion 3 asks for a row left
+  `running` by a killed process to be picked up again; this script reads only
+  `queued` rows and would walk past a stranded one. `abandon_validation` exists
+  and the script does not call it.
+- **It drains one row per lap.** A queue that fills faster than one per lap
+  grows, and nothing says so.

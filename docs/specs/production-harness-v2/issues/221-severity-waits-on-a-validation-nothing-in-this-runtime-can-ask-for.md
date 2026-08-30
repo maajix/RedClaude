@@ -123,3 +123,42 @@ Criterion 2's sentence still has no kind to move to. `state_severity` is held by
 creates a candidate Finding rather than meeting a validated one. Whichever shape
 224 takes has to say which run meets a validated Finding before that sentence has
 anywhere to go; a `validate` Task kind (224's shape 2) would be that run.
+
+## What the first validated Finding showed, 2026-08-30
+
+`F9` on `rk2here` is `validated` and still `info`, and this is the first time
+the gap this ticket names has been standing in front of a real row rather than
+a hypothetical one. Three facts, each read this session:
+
+**Nothing puts a run in front of a validated Finding.** `rk2_finding_frontier`
+(`20261021T000000Z__a_supported_claim_becomes_the_finding_it_earned.sql:495-518`)
+is the only producer of `conclude` Tasks, and its last two clauses are
+`NOT EXISTS (SELECT 1 FROM finding_hypotheses ...)` and `NOT EXISTS (SELECT 1
+FROM tasks ... kind = 'conclude' ...)`. A hypothesis that already carries a
+Finding is excluded, and so is one a `conclude` Task has already named in any
+status. `F9`'s hypothesis `H165` is both. So the frontier can never offer it
+again, and `state_severity` -- `roster.py:1678`, group `state.conclude`, held by
+`web_hunter` alone -- has no caller that could reach `F9`.
+
+**The roster already describes the shape that is missing.** `roster.py:2260`
+says a `conclude` Task "runs from a validated Finding to the impact
+specification, the severity band and the composed report". That is not what the
+frontier produces: it produces a Task that runs from a *supported hypothesis
+with no Finding*, and the child creates a candidate. The comment describes the
+second half of a walk nothing takes.
+
+**`info` was the right band here anyway.** `F9`'s test (`tests.spec` for the run
+in `findings.validated_by_test_run_id`) sends five credential-free requests and
+asserts only `status_differs`, `status_equals` and `body_differs` on a
+404-versus-404 comparison at `/`. No `Origin` header is sent and no
+`Access-Control-Allow-Origin` is read, so the CORS statement in `H165` is not
+what the run measured. The Finding the `conclude` child wrote --
+`error_disclosure`, a method-rejection body differential -- is the honest
+reading of that evidence, and `info` is its honest band.
+
+So criterion 2 is not blocked on a missing judgement. It is blocked on a missing
+Task kind, and the shape is the same one ticket 224 shape 2 needs: a frontier
+over rows that exist plus a derivation that turns them into Tasks. A
+`severity` frontier would select validated Findings whose `severity_basis` is
+still `undetermined`, which is the column that already distinguishes "nobody
+judged" from "judged harmless".
