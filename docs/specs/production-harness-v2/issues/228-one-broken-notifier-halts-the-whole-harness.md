@@ -196,20 +196,19 @@ unapproved_identity_slot set -> no match
   is not consent to demonstrate impact, and ticket 226's whole point is that a
   demonstration costs an operator answer. A `DO` block in the migration fails
   if either of them ever starts reading it.
-* The risk rule is matched, but only at Program granularity, and that is a hole
-  rather than a design. `live_route_grant_for` takes no rule argument at all;
-  `gate_tool_call` guards the call with
+* The risk rule is matched against the grant that answers. It was not at
+  first: `live_route_grant_for` took no rule argument and `gate_tool_call`
+  guarded the call with
   `EXISTS (SELECT 1 FROM route_grants g WHERE g.program_id = tr.program_id AND
   g.risk_rule = verdict ->> 'rule' ...)`, which asks whether the *Program* holds
   a grant under that rule and not whether *this* grant does. A Program holding a
-  grant on route A under rule R and a grant on route B under rule R2 would let a
-  call on route B firing rule R be answered by the route-B grant, because the
-  unrelated route-A grant satisfies the `EXISTS`. With exactly one live grant
-  the hole cannot fire -- the only row the `EXISTS` can match is the one
-  `live_route_grant_for` would return -- so `rk2here` holds at most one until
-  `T228-02` closes it. Closing it means giving `live_route_grant_for` a rule
-  argument, which changes its signature and therefore its
-  `runtime_verb_surface` row, so it is a migration and not an edit.
+  grant on route A under rule R and a grant on route B under rule R2 let a call
+  on route B firing rule R be answered by the route-B grant, because the
+  unrelated route-A grant satisfied the `EXISTS`. With exactly one live grant
+  the hole could not fire, so `rk2here` was held at one until `T228-02` closed
+  it. **Closed** in `20270107T000000Z`: the rule is an argument,
+  `live_route_grant_for(uuid, jsonb, text)`, so the row that answers is the row
+  that was checked, and the Program-wide `EXISTS` is gone.
 * `host_in_scope` and `unapproved_identity_slot` are read from the **live**
   digest at every lookup rather than stored at grant time, so a host leaving
   scope withdraws its grants in the same breath, with no sweep to run.
@@ -239,13 +238,36 @@ name came from; every other reader in the corpus uses `->> 'rule'`.
 The lesson is the one the file now carries as a comment: a SQL change is proven
 by driving the caller the runtime drives, not the function under test.
 
-## Still owed
+## The follow-ups, and what closed them
 
-* `T228-02` -- the Program-wide `EXISTS`, matched against the grant it returns
-  instead. Until it lands, `rk2here` holds at most one live `route_grants` row.
-* `T228-03` -- two rough edges on the applied migration, which needs a follow-up
-  migration because an applied one may never be edited. `grant_route` lets an
-  hours value that floors to zero fall through to a raw
-  `route_grants_expires_after_grant` violation rather than refusing it in its
-  own words, and the audit trigger calls every UPDATE on `route_grants`
-  `route_grant.revoked`, including one that revokes nothing.
+`T228-02` and `T228-03` shipped together as
+`20270107T000000Z__a_route_grant_answers_only_the_rule_it_was_granted_under.sql`
+-- one file, because all three defects rewrite `gate_tool_call` or `grant_route`
+and a migration replaces a function WHOLE, so two files would mean the later one
+silently discarding the earlier one's change.
+
+* `T228-02` -- the Program-wide `EXISTS` is gone and the rule is an argument.
+  `live_route_grant_for(uuid, jsonb, text)`, registered with a space after each
+  comma; the two-argument row was deleted in the same transaction. **The
+  one-grant ceiling on `rk2here` is lifted.** Proved on live inside a rolled-back
+  transaction: with a second grant added over the same route under
+  `net_borrowed_identity`, the old code admitted `TR792` under that grant and
+  named `D25` as its authority; the new code admits it under `RG1` and names
+  `D27`, which is what it answered before the second grant existed.
+* `T228-03(a)` -- `grant_route` computes its window once and refuses one that
+  rounds down to nothing in its own words, instead of letting `p_hours < 1/60`
+  fall through to a raw `route_grants_expires_after_grant` violation.
+* `T228-03(b)` -- `event_table_config` names one `updated_type` per table and
+  cannot say two things, so the single `route_grant.revoked` was made true rather
+  than weakened: `route_grants_revocation_only` refuses any UPDATE that is not
+  the revocation, the way `callback_channel_bindings` holds its own single
+  `callback.released`. It closes a second thing on the way -- an
+  `UPDATE route_grants SET expires_at = ...` would have extended a standing
+  egress grant without passing `grant_route`'s "widen a yes, never manufacture
+  one" gate, and the audit would have called that extension a revocation.
+* `T228-03(c)`, carried from an earlier handoff -- `grant_route` now requires
+  `grant_expires_at IS NOT NULL` on the decision it widens. `answer_decision`
+  writes `now() + p_grant`, so an approval given with no period lands NULL, and
+  since `20270103T000000Z` the gate resolves a grant back through `granted_from`
+  under arm (e)'s two conditions. A grant widened from such an approval was
+  written, audited, and unable to admit a single call.

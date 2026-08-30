@@ -25620,7 +25620,7 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
         )
         assert opened.ok, opened.violations
         cls.identifiers = {ROUTE_SLUG: opened.facts["program_id"]}
-        cls.tasks = cls.seed(ROUTE_SLUG, 2)
+        cls.tasks = cls.seed(ROUTE_SLUG, 3)
         cls.bind(ROUTE_SLUG)
 
         # The first call: asked about, answered, and the grant that answer
@@ -25670,6 +25670,34 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
             cls.body_bearing_receipt(run, task, url=f"http://{HOST}/admin")
         )
 
+        # T228-02. A SECOND grant, on the route the first one does not reach and
+        # under a rule this call never fires. Written directly rather than
+        # through `grant_route`, because the verb copies the rule off the
+        # decision and what has to be arranged here is the one thing it cannot:
+        # two grants disagreeing about the rule.
+        #
+        # Until this landed the guard in front of the lookup asked whether the
+        # PROGRAM held a grant under the call's rule, so the /token grant above
+        # satisfied it and this call was admitted by a grant that has nothing to
+        # do with it. That is why `rk2here` was held at one grant.
+        cls.other_route = str(
+            cls.as_owner(
+                "INSERT INTO route_grants (program_id, tool, method, scheme, host,"
+                "  port, path_template, identity_slot, risk_rule, granted_from,"
+                "  reason, granted_by, expires_at)"
+                " SELECT program_id, tool, method, scheme, host, port, '/admin',"
+                "        identity_slot, 'call_risk_rules:net_borrowed_identity',"
+                "        granted_from, 'a second route, under a rule of its own',"
+                "        granted_by, expires_at"
+                "   FROM route_grants WHERE program_id = $1::uuid"
+                "    AND path_template = '/token' RETURNING label",
+                (cls.identifiers[ROUTE_SLUG],),
+            ).scalar()
+        )
+        cls.wrong_rule = cls.gate(
+            cls.body_bearing_receipt(run, task, url=f"http://{HOST}/admin")
+        )
+
         cls.revoked = cls.operator(
             cls.REVOKE,
             (json.loads(str(cls.granted))["label"], "the campaign is over"),
@@ -25680,6 +25708,20 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
         # And that same second call taken all the way to a filed question, which
         # is what the last case below tries to widen: a yes nobody gave.
         cls.unanswered = cls.park(cls.second)
+
+        # T228-03. A third question, approved with NO grant window. Such a yes
+        # authorises its own call and nothing after it -- `live_grant_for` has
+        # always required `grant_expires_at IS NOT NULL`, and so does arm (e) of
+        # `check_receipt_integrity`, which is why the gate quotes it when it
+        # resolves a grant back to the decision it widens. A grant taken over
+        # one would be written, audited, and unable to admit anything.
+        run, task = cls.claim(cls.tasks[2])
+        cls.windowless = cls.park(cls.body_bearing_receipt(run, task))
+        cls.operator(
+            "SELECT answer_decision($1, 'approved', $2, NULL::interval)",
+            (cls.windowless, "yes, for this call and no further"),
+            program=ROUTE_SLUG,
+        )
 
         # Both read last, so that what they are read against is everything
         # above: a question asked and answered, a call a grant admitted, a call
@@ -25878,6 +25920,86 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
             )
 
         self.assertIn("positive number of hours", str(refused.exception))
+
+    def test_a_grant_under_another_rule_does_not_answer_this_calls_rule(self):
+        # T228-02, and the reason `rk2here` was held at one grant. Two live
+        # grants: `/token` under `net_unsafe_method`, `/admin` under
+        # `net_borrowed_identity`. This call is a POST to `/admin`, so the rule
+        # it fires is `net_unsafe_method` -- the one the OTHER grant carries.
+        #
+        # The lookup now takes the rule as an argument, so the grant that
+        # answers is the grant that was checked. The guard it replaces asked
+        # whether the Program held any grant under this rule, which the `/token`
+        # grant satisfied, and the call was admitted by a row nobody had matched
+        # against it.
+        self.assertNotEqual(
+            self.other_route, json.loads(str(self.granted))["label"]
+        )
+        self.assertEqual("call_risk_rules:net_unsafe_method", self.wrong_rule["rule"])
+        self.assertEqual("ask", self.wrong_rule["decision"])
+        self.assertIsNone(self.wrong_rule["approval"])
+        self.assertIsNone(self.wrong_rule["route_grant"])
+
+    def test_a_period_that_rounds_down_to_nothing_is_refused_in_the_verbs_words(self):
+        # T228-03. Below 1/60 both floors in `make_interval` are zero, so
+        # `expires_at` lands on `granted_at` and the operator used to be handed
+        # `route_grants_expires_after_grant` -- the name of a constraint, not of
+        # a mistake. The refusal has to be the verb's own or the operator is
+        # reading the schema to find out they asked for eighteen seconds.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.operator(
+                self.GRANT, (self.first_label, 0.005, "a blink"), program=ROUTE_SLUG
+            )
+
+        self.assertIn("rounds down to no window at all", str(refused.exception))
+        self.assertNotIn("route_grants_expires_after_grant", str(refused.exception))
+
+    def test_an_approval_with_no_grant_window_cannot_be_widened(self):
+        # T228-03. `answer_decision` writes `now() + p_grant`, so an approval
+        # answered with no period lands NULL -- and the gate resolves a grant
+        # back to its decision only for `approved` AND `grant_expires_at IS NOT
+        # NULL`, because those are arm (e)'s own two conditions. A grant widened
+        # from such a yes is dead on arrival: a row, an audit event saying a
+        # route was granted, and not one call it could ever admit.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.operator(
+                self.GRANT, (self.windowless, 48, "the same endpoint"), program=ROUTE_SLUG
+            )
+
+        self.assertIn("approved without a grant window", str(refused.exception))
+
+    def test_a_change_that_revokes_nothing_is_not_recorded_as_a_revocation(self):
+        # T228-03. `event_table_config` names ONE `updated_type` per table and
+        # for this one it is `route_grant.revoked`, so every UPDATE was audited
+        # as a withdrawal whatever it actually did -- including an extension of
+        # the expiry, which is the opposite. The registration cannot say two
+        # things, so the only update the table takes is the one the name is true
+        # of, which is how `callback_channel_bindings` holds its own single
+        # `callback.released`.
+        with self.assertRaises(pg.DatabaseError) as refused:
+            self.owner(
+                "UPDATE route_grants SET expires_at = now() + interval '99 days'"
+                " WHERE program_id = $1::uuid AND revoked_at IS NULL",
+                (self.identifiers[ROUTE_SLUG],),
+            )
+
+        self.assertIn(
+            "only change a route grant takes is its revocation", str(refused.exception)
+        )
+        # Two grants written, one of them revoked, and nothing else claiming to
+        # be a withdrawal.
+        self.assertEqual(
+            [("route_grant.granted", 2), ("route_grant.revoked", 1)],
+            [
+                (str(row[0]), int(row[1]))
+                for row in self.as_owner(
+                    "SELECT type, count(*) FROM events"
+                    " WHERE program_id = $1::uuid AND subject_table = 'route_grants'"
+                    " GROUP BY 1 ORDER BY 1",
+                    (self.identifiers[ROUTE_SLUG],),
+                ).rows
+            ],
+        )
 
 
 
