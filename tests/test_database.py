@@ -52661,18 +52661,25 @@ class FindingBandTest(ValidatedFindingFixture, DatabaseCase):
         try:
             with self.connection.transaction():
                 self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                # Ticket 226 added a third shape under this kind, so both
+                # halves say which row they mean: `rk2_task_proves_impact` is
+                # false for the Task this ticket derives and true for the one
+                # that follows it once the band is stated.
                 self.connection.execute(
                     "INSERT INTO tasks"
                     "       (program_id, kind, hypothesis_id, subject_entity_id)"
                     " SELECT program_id, kind, hypothesis_id, subject_entity_id"
                     "   FROM tasks"
                     "  WHERE program_id = $1::uuid AND kind = 'conclude'"
-                    "    AND finding_id IS NOT NULL",
+                    "    AND finding_id IS NOT NULL"
+                    "    AND NOT coalesce(rk2_task_proves_impact(tasks.*), false)",
                     (self.program_id,),
                 )
                 row = self.connection.execute(
                     "SELECT count(*) FILTER (WHERE finding_id IS NULL) AS naming,"
-                    "       count(*) FILTER (WHERE finding_id IS NOT NULL) AS banding"
+                    "       count(*) FILTER (WHERE finding_id IS NOT NULL"
+                    "         AND NOT coalesce(rk2_task_proves_impact(tasks.*), false))"
+                    "         AS banding"
                     "  FROM tasks"
                     " WHERE program_id = $1::uuid AND kind = 'conclude'",
                     (self.program_id,),
@@ -52698,7 +52705,17 @@ class FindingBandTest(ValidatedFindingFixture, DatabaseCase):
         # special case: `novelty_for` scores the Task 0 because
         # `findings.severity_basis` is no longer `undetermined`, and the general
         # rule in `cancel_reason_for` reads that as answered.
-        self.assertEqual([("F1", "abandoned", "ready", "answered")], self.after_third)
+        #
+        # The second row is ticket 226's, opened by the same pass that ended
+        # this one: a Finding somebody has banded is a Finding whose impact
+        # nobody has specified, and step (3g) runs after step (2). It is
+        # asserted here rather than filtered out, because a pass that ended
+        # 221's Task and opened nothing would mean the impact lane never starts.
+        self.assertEqual(
+            [("F1", "abandoned", "ready", "answered"),
+             ("F1", "pending", "ready", "alive")],
+            self.after_third,
+        )
 
     def test_the_band_the_verb_wrote_is_the_band_the_finding_carries(self):
         # `state_severity` writes the statement row and the cache in one
@@ -52915,6 +52932,289 @@ class ImpactPerformanceTest(ValidatedFindingFixture, DatabaseCase):
         # impact Task out of: `supported` is not `testable`.
         self.assertEqual("perform.claim_not_testable", str(answers["blocked"]))
 
+
+
+SPECIFICATION_SLUG = "selftest-impact-spec"
+
+
+class ImpactSpecificationTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 226 wall 1: the Task that asks a child to specify an impact.
+
+    `grep -n "open_impact_task" src/redkraken/execution.py` returned nothing.
+    The verb is granted, wrapped by ticket 103 as `propose_impact_task`, and
+    sits in `state.conclude`, which `web_hunter` holds alone -- and the two
+    objectives of that kind were ticket 156's, which names a Finding, and ticket
+    221's, which states a severity. Neither mentions impact, so no impact Test
+    was ever written, so wall 2's lane had nothing to run, so `pivot_stamps` and
+    `chains` held zero rows on a Program that had run 197 laps.
+
+    Two things are asserted and the second is why the first is safe. That the
+    Task is derived, offered once, and not abandoned by the pass after it. And
+    that ticket 221's lane is untouched: the band Task is derived first, states
+    its band, and is abandoned as `answered` exactly as 221 says -- because
+    `rk2_severity_frontier` refuses a Finding any `conclude` Task names in any
+    status, so an impact Task derived before the band would close that lane
+    permanently.
+
+    The arrangement is 38's for `FindingBandTest`'s reason: impact is proved on
+    a Finding somebody already validated, and banded on one somebody has
+    already put a number on.
+    """
+
+    slug = SPECIFICATION_SLUG
+
+    #: The two granted verbs, called with uuids. A child reaches the first
+    #: through `propose_severity` and the second through `propose_impact_task`;
+    #: this case wants the raise rather than the document.
+    STATE_SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+    OPEN_IMPACT = "SELECT open_impact_task($1::uuid, $2::jsonb)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.made = cls.validated(
+            "a neighbour's order note can be rewritten", cls.configured_application()
+        )
+
+        # Before the band. The frontier must name nothing, and that is the
+        # ordering rule rather than a detail: a Task here would be the row that
+        # stops `derive_finding_bands` from ever deriving one.
+        cls.before_band = cls.on_the_frontier()
+        cls.band_pass = cls.pass_over()
+
+        cls.banded = cls.called(
+            cls.STATE_SEVERITY,
+            (cls.made["finding"], "medium", "constrained_inference",
+             "a neighbour's order note is served to a caller who owns no part of it"),
+        )
+        # Still nothing, and for the second guard rather than the first: 221's
+        # Task is standing, and `tasks_live_dedup_idx` would refuse a second row
+        # on the same key -- inside a derivation, which would take the pass with
+        # it.
+        cls.after_band = cls.on_the_frontier()
+
+        cls.first_pass = cls.pass_over()
+        cls.after_first = cls.concludings()
+        cls.second_pass = cls.pass_over()
+        cls.after_second = cls.concludings()
+
+        # And then the one call the Task exists to produce, by the verb the
+        # child would have reached. The pass after it is the other half of the
+        # derivation being correct: the question is answered, so nothing new is
+        # derived and what is standing ends.
+        cls.opened = cls.called(cls.OPEN_IMPACT, (cls.made["finding"], PIVOTED))
+        cls.third_pass = cls.pass_over()
+        cls.after_third = cls.concludings()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def configured_application(cls) -> str:
+        """The subject the Program's own scope put on the Surface."""
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM entities"
+                " WHERE program_id = $1::uuid AND type = 'application'"
+                "   AND metadata ->> 'source' = 'program_scope'",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def pass_over(cls) -> dict:
+        """One ranking pass on this Program, as the runtime runs it."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(cls.connection.execute("SELECT rank_pass('runtime')").scalar())
+            )
+
+    @classmethod
+    def on_the_frontier(cls) -> list[str]:
+        """The Findings the impact frontier names, by label."""
+        rows = cls.connection.execute(
+            "SELECT f.label FROM rk2_impact_specification_frontier($1::uuid) fr"
+            "  JOIN findings f ON f.id = fr.finding_id"
+            " ORDER BY f.label",
+            (cls.program_id,),
+        ).dicts()
+        return [str(row["label"]) for row in rows]
+
+    @classmethod
+    def concludings(cls) -> list[tuple[bool, str, str, str]]:
+        """Every `conclude` Task naming a Finding, which job it is, and both questions.
+
+        Both questions for `FindingBandTest`'s reason: `ready_for` calling a
+        Task ready while `cancel_reason_for` abandons it is the pair ticket 152
+        shipped once already, and this ticket widens the same arm a third time.
+
+        The job comes off `rk2_task_proves_impact`, which is the function
+        `execution.py` reads to choose the objective -- so a row here that said
+        the wrong job would be a child told to do the wrong thing.
+        """
+        rows = cls.connection.execute(
+            "SELECT coalesce(rk2_task_proves_impact(t.*), false) AS proves, t.status,"
+            "       coalesce(ready_for(t.*), 'ready') AS blocked,"
+            "       coalesce(cancel_reason_for(t.*, w.*), 'alive') AS standing"
+            "  FROM tasks t"
+            "  CROSS JOIN scheduler_weights w"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'conclude'"
+            "   AND t.finding_id IS NOT NULL"
+            " ORDER BY t.created_at, t.id",
+            (cls.program_id,),
+        ).dicts()
+        return [
+            (bool(row["proves"]), str(row["status"]), str(row["blocked"]),
+             str(row["standing"]))
+            for row in rows
+        ]
+
+    # -- the order, which is the whole of why 221 still works -----------------
+
+    def test_a_finding_nobody_has_banded_is_not_on_this_frontier(self):
+        # The arrangement, asserted before anything counts it, and the ordering
+        # rule in one line. `rk2_severity_frontier` refuses a Finding that any
+        # `conclude` Task names in any status, so a specification Task derived
+        # here would mean this Finding is never banded at all.
+        self.assertEqual("validated", str(self.made["verdict"]["status"]))
+        self.assertEqual([], self.before_band)
+        self.assertEqual(1, self.band_pass["bands_derived"])
+        self.assertEqual(0, self.band_pass["impacts_derived"])
+
+    def test_the_band_task_still_ends_the_way_ticket_221_says_it_does(self):
+        # The half that must not move. `novelty_for` scores a Task opened before
+        # the band 0 once `severity_basis` is no longer `undetermined`, and the
+        # general rule in `cancel_reason_for` reads that as answered -- which is
+        # 221's own assertion, restated here because this ticket edits that arm.
+        self.assertEqual("medium", str(self.banded["severity"]))
+        self.assertIn((False, "abandoned", "ready", "answered"), self.after_first)
+
+    def test_a_standing_band_task_holds_this_frontier_off(self):
+        # Not a nicety. `tasks_live_dedup_idx` is UNIQUE over the live statuses
+        # on (program, kind, subject, hypothesis, finding, test, identity), and
+        # this row would repeat 221's key exactly -- so a frontier without this
+        # guard raises a unique violation inside `derive_impact_specifications`
+        # and takes the whole ranking pass with it.
+        self.assertEqual([], self.after_band)
+
+    # -- what the derivation opened -------------------------------------------
+
+    def test_a_banded_finding_becomes_exactly_one_specification_task(self):
+        self.assertEqual(1, self.first_pass["impacts_derived"])
+        self.assertEqual(0, self.first_pass["impacts_deferred"])
+        self.assertIn((True, "pending", "ready", "alive"), self.after_first)
+        self.assertEqual(
+            1, len([one for one in self.after_first if one[0]])
+        )
+
+    def test_the_pass_that_derived_it_does_not_end_it_in_the_same_breath(self):
+        # The acceptance line, and ticket 152's measurement in a third place.
+        # Without the `novelty_for` arm this file adds, the Task scores 0 --
+        # its Finding is banded, which is the reading 221 put there -- and
+        # `cancel_reason_for` abandons it as `answered` before it is offered
+        # once. Read off the second pass, because step (3g) opens these Tasks
+        # after step (2) has run.
+        self.assertIn((True, "pending", "ready", "alive"), self.after_second)
+        self.assertEqual(0, self.second_pass["impacts_derived"])
+        self.assertEqual(0, self.second_pass["impacts_deferred"])
+
+    def test_the_specification_the_verb_wrote_answers_the_task(self):
+        # The other end of the loop: `propose_impact_task` reaches
+        # `open_impact_task`, which writes the `tests` row carrying the class,
+        # and both the frontier and `novelty_for` read that row. So the question
+        # is answered by the row the answer produced, not by a status somebody
+        # set.
+        self.assertEqual("write_target_state", str(self.opened["impact_class"]))
+        self.assertEqual(0, self.third_pass["impacts_derived"])
+        self.assertEqual(0, self.third_pass["impacts_deferred"])
+        self.assertIn((True, "abandoned", "ready", "answered"), self.after_third)
+
+    def test_an_answered_finding_is_not_asked_again(self):
+        # The respawn guard, asked of the frontier rather than of a count: the
+        # Task ended, and 221's rule is that an ended one is not re-derived.
+        self.assertEqual([], self.on_the_frontier())
+
+    def test_the_impact_test_lands_in_the_lane_wall_2_built(self):
+        # The two halves of ticket 226 meeting, in one pass. This file writes
+        # the Test; wall 2's frontier is what performs it, and a Test that
+        # reached one and not the other would be the row nobody reads that wall
+        # 2's own header is about. Read off the same pass that abandoned the
+        # specification Task, because step (3d2) runs before step (3g) and both
+        # see the row the verb left.
+        self.assertEqual(1, self.third_pass["impact_runs_derived"])
+        named = self.connection.execute(
+            "SELECT ts.label FROM tasks t"
+            "  JOIN tests ts ON ts.id = t.test_id"
+            " WHERE t.program_id = $1::uuid AND t.kind = 'perform'"
+            "   AND ts.impact_class IS NOT NULL",
+            (self.program_id,),
+        ).scalar()
+        self.assertEqual(str(self.opened["test"]), str(named))
+
+    # -- the arm that stops the empty graph reading as green ------------------
+
+    def test_the_empty_graph_is_green_because_the_wiring_is_there(self):
+        # Ticket 226's fourth acceptance line. This Program is in exactly the
+        # state the arm is about -- a validated Finding and no chain -- so a
+        # silent check here is the arm's other half doing its job rather than
+        # the vacuous green the ticket measured.
+        chains = self.connection.execute(
+            "SELECT count(*) FROM chains WHERE program_id = $1::uuid",
+            (self.program_id,),
+        ).scalar()
+        self.assertEqual(0, int(chains))
+        self.assertEqual(
+            (), self.connection.execute("SELECT * FROM check_kill_chains()").rows
+        )
+
+    def test_a_runtime_that_stopped_deriving_impact_is_not_green(self):
+        # And the arm itself, driven the only way it can be: `rank_pass` is
+        # where the wiring lives, so the defect is a `rank_pass` without the
+        # call. Replaced inside a transaction that is rolled back, which is how
+        # `CONTROLS` proves every other check in this file.
+        #
+        # On a second connection because this case runs as the runtime, which
+        # holds no DDL on `public` and cannot become the owner. The owner is
+        # what a migration is, so a defect a migration could introduce is one
+        # only the owner can arrange.
+        owner = pg.connect(self.harness.migrate)
+        fired = ()
+        try:
+            with owner.transaction():
+                owner.execute("SET LOCAL ROLE rk2_owner")
+                owner.execute(
+                    "CREATE OR REPLACE FUNCTION public.rank_pass("
+                    "  p_trigger text DEFAULT 'timer') RETURNS jsonb"
+                    " LANGUAGE sql AS $$ SELECT '{}'::jsonb $$"
+                )
+                fired = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in owner.execute(
+                        "SELECT * FROM check_kill_chains()"
+                    ).rows
+                )
+                raise Rollback
+        except Rollback:
+            pass
+        finally:
+            owner.close()
+
+        finding = self.connection.execute(
+            "SELECT label FROM findings WHERE id = $1::uuid", (self.made["finding"],)
+        ).scalar()
+        self.assertEqual(
+            {"validated_finding_under_a_runtime_that_derives_no_impact"},
+            {problem for problem, _ in fired},
+        )
+        # Both callers, because either one missing is a chain that cannot be
+        # built: (3g) is what writes the impact Test and (3d2) is what runs it.
+        for callee in ("derive_impact_specifications", "derive_impact_performances"):
+            with self.subTest(callee):
+                self.assertIn(
+                    f"{finding}: rank_pass no longer calls {callee} and this Program"
+                    " holds no chain",
+                    [detail for _, detail in fired],
+                )
 
 
 class UnreadyTaskTest(ClaimFixture, SchedulerFixture, DatabaseCase):

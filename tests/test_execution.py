@@ -167,6 +167,7 @@ def started_row(**overrides) -> tuple:
         subject.identity_class,
         subject.finding_label,
         subject.impact_class,
+        subject.proves_impact,
     )
 
 
@@ -1371,6 +1372,118 @@ class BandingObjectiveTest(unittest.TestCase):
         short = started_row(kind="conclude", hypothesis_label="H165")[:18]
 
         self.assertIsNone(execution.Claimed.from_row(short).finding_label)
+
+
+class ImpactObjectiveTest(unittest.TestCase):
+    """Ticket 226 wall 1. The third shape of `conclude`, and what tells it apart.
+
+    `grep -n "open_impact_task" execution.py` returned nothing before this
+    ticket. The verb is granted through `state.conclude`, wrapped by ticket 103
+    and described in the roster, and no objective ever asked for it -- so no
+    impact Test was ever written, so the lane wall 2 built had nothing to run,
+    so `pivot_stamps` and `chains` held zero rows after 197 laps.
+
+    What says which of the kind's three jobs a Task is is not a column on the
+    Task. It is `rk2_task_proves_impact`, which asks whether the Task was opened
+    after the band was stated -- `rk2_severity_frontier` cannot open a band Task
+    once a statement exists, so the two never overlap. So what is asserted here
+    is that reading and the dispatch it drives.
+    """
+
+    def proving(self, **overrides) -> str:
+        subject = claimed(
+            kind="conclude",
+            role="web_hunter",
+            hypothesis_label="H165",
+            finding_label="F9",
+            proves_impact=True,
+            **overrides,
+        )
+        return subject.objective((), SEEDED_CLASSES)
+
+    def banding(self) -> str:
+        subject = claimed(
+            kind="conclude", role="web_hunter", hypothesis_label="H165",
+            finding_label="F9",
+        )
+        return subject.objective((), SEEDED_CLASSES)
+
+    def test_a_banded_finding_is_asked_for_the_impact_and_not_the_band_again(self):
+        text = self.proving()
+
+        self.assertIn(execution.PROVING, text)
+        self.assertIn("mcp__rk2__open_impact_task", text)
+        self.assertNotIn(execution.BANDING, text)
+        self.assertNotIn("mcp__rk2__propose_finding", text)
+
+    def test_a_finding_nobody_has_banded_keeps_the_objective_221_wrote(self):
+        # The half of the dispatch that must not move. The band comes first
+        # because `rk2_severity_frontier` refuses a Finding any `conclude` Task
+        # already names, so a run sent to prove impact before the band was
+        # stated would be the row that closes ticket 221's lane.
+        text = self.banding()
+
+        self.assertIn(execution.BANDING, text)
+        self.assertIn("mcp__rk2__state_severity", text)
+        self.assertNotIn(execution.PROVING, text)
+        self.assertNotIn("mcp__rk2__open_impact_task", text)
+
+    def test_only_the_classes_an_operator_may_authorize_are_offered(self):
+        # Ticket 163's lesson over a third vocabulary, and the extra rule this
+        # one carries: three of the six impact classes are `forbidden`, and
+        # `rk2_refuse_forbidden_impact` refuses them inside `open_impact_task`.
+        # A word shown here and refused there is the exact shape 163 measured.
+        text = self.proving()
+
+        for word in roster.IMPACT_CLASSES:
+            with self.subTest(word):
+                self.assertIn(word, text)
+        for word in ("degrade_availability", "pivot_out_of_scope", "reach_third_party"):
+            with self.subTest(word):
+                self.assertNotIn(word, text)
+
+    def test_the_child_is_told_not_to_run_what_it_writes(self):
+        # The one paragraph this objective could not do without. An impact run
+        # writes to a live system and `open_impact_replay` parks the Task and
+        # asks an operator before it happens; a child that demonstrated it
+        # itself would have performed the unauthorized half of the procedure
+        # this harness exists to ask permission for.
+        text = self.proving()
+
+        self.assertIn("YOU DO NOT RUN THIS TEST", text)
+        self.assertIn("Write the plan and stop", text)
+
+    def test_the_objective_says_what_to_do_when_no_class_fits(self):
+        # `_conclusion`'s rule over a third vocabulary. A child that cannot name
+        # the impact has an answer to give, and a specification written for a
+        # class the weakness does not have is a run against a live target for
+        # nothing.
+        text = self.proving()
+
+        self.assertIn("do not reach for the nearest one", text)
+        self.assertIn("no specification", text)
+
+    def test_the_basis_reaches_the_objective_through_the_row_the_query_returns(self):
+        # The dispatch is worth nothing if the column never arrives. This is the
+        # `STARTED` row read the way `from_row` reads it, one column longer than
+        # wall 2 left it.
+        subject = execution.Claimed.from_row(
+            started_row(kind="conclude", hypothesis_label="H165", finding_label="F9",
+                        proves_impact=True)
+        )
+
+        self.assertTrue(subject.proves_impact)
+        self.assertIn("mcp__rk2__open_impact_task", subject.objective(()))
+
+    def test_a_row_from_before_this_column_reads_as_a_finding_nobody_banded(self):
+        # A fixture one column short describes every `conclude` Task this
+        # harness derived before wall 1, which is the band and not the proof.
+        short = started_row(kind="conclude", hypothesis_label="H165",
+                            finding_label="F9")[:20]
+        subject = execution.Claimed.from_row(short)
+
+        self.assertFalse(subject.proves_impact)
+        self.assertIn(execution.BANDING, subject.objective(()))
 
 
 class ImpactReplayTest(unittest.TestCase):

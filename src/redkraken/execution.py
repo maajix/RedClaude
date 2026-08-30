@@ -123,6 +123,13 @@ MISSIONS = {
 #: at the mapping above and should find the exception beside it.
 BANDING = "Say what this validated Finding is worth."
 
+#: Ticket 226 wall 1's sentence, beside 221's for the same reason: the mapping
+#: above is keyed on kind and this kind has three jobs. The band came first
+#: because `rk2_severity_frontier` refuses a Finding any `conclude` Task
+#: already names, so this is the run that follows one -- what the band could
+#: not rest on, because there was nothing on file to rest it on.
+PROVING = "Specify the impact this validated Finding could be shown to have."
+
 #: How a child stopped, in the words `agent_runs.stop_reason` accepts. Two
 #: vocabularies because they have two authors: the column's is 0006's, extended
 #: by 0012, and the word the launcher reads off a `ResultMessage` is the API's
@@ -373,7 +380,15 @@ STARTED = (
     # and the column `rk2_test_performance_frontier` excludes on, so it is
     # already the line between the two kinds of Test this harness holds. NULL
     # for a detection Test, which is every Test written before ticket 226.
-    " ts.impact_class"
+    " ts.impact_class,"
+    # Ticket 226 wall 1. Which of `conclude`'s three jobs this Task was opened
+    # for, asked of the one function that decides it rather than reassembled
+    # here: a Task naming a Finding was opened to band it if it predates the
+    # band, and to prove its impact if it does not. `rk2_severity_frontier`
+    # cannot open a band Task after a statement exists, so the two never
+    # overlap. NULL where the Task names no Finding or the Finding has no
+    # statement, which `Claimed` reads as the band.
+    " coalesce(rk2_task_proves_impact(t.*), false)"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
@@ -1007,6 +1022,12 @@ class Claimed:
     #: None for a detection Test. `_replay` dispatches on it and nothing
     #: else does.
     impact_class: str | None = None
+    #: Ticket 226 wall 1: whether this `conclude` Task was opened to prove a
+    #: Finding's impact rather than to band it. False is the answer for a Task
+    #: naming no Finding and for one opened before its Finding was banded,
+    #: which is the same answer to both questions -- neither has been asked to
+    #: prove anything. `objective` dispatches on it and nothing else does.
+    proves_impact: bool = False
 
     @property
     def identity_slot(self) -> str:
@@ -1068,6 +1089,13 @@ class Claimed:
             # column short describes a Task performing a detection Test, which
             # is every `perform` Task this harness derived before 226.
             impact_class=(None if len(row) < 20 or row[19] is None else str(row[19])),
+            # Ticket 226 wall 1, defaulted for the reason above it is: a
+            # fixture one column short describes a Task in front of a Finding
+            # nobody has banded, which is every `conclude` Task this harness
+            # derived before 226.
+            proves_impact=(
+                False if len(row) < 21 or row[20] is None else bool(row[20])
+            ),
         )
 
     def objective(
@@ -1108,8 +1136,18 @@ class Claimed:
         # carries. Decided before the head is built because the head opens with
         # the mission sentence, and `MISSIONS["conclude"]` is the other job's.
         banding = self.kind == CONCLUDE and self.finding_label is not None
+        # Ticket 226 wall 1: three jobs, and the third is told from the second
+        # by when the Task was opened rather than by a column on it. A Task
+        # opened before its Finding was banded is asking for the band; one
+        # opened after is asking for the impact the band could not rest on.
+        # `rk2_task_proves_impact` is the one place that rule is written, and
+        # `novelty_for`'s `conclude` arm asks the same function -- so what the
+        # child is asked for and what the scheduler thinks is left to learn
+        # cannot disagree.
+        proving = banding and self.proves_impact
         mission = (
-            BANDING if banding
+            PROVING if proving
+            else BANDING if banding
             else MISSIONS.get(self.kind, f"Carry out this {self.kind} Task.")
         )
         head = (
@@ -1117,6 +1155,12 @@ class Claimed:
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
         )
+        if proving:
+            # Read before both siblings below, because it is the narrowest of
+            # the three readings and the other two are its prefixes.
+            return self._finishing(
+                self._selected(self._impact(head), playbooks), completion_only
+            )
         if banding:
             # Read before the sibling below because the two are one kind: a Task
             # carrying a Finding was opened to band that Finding, and one
@@ -1293,6 +1337,76 @@ class Claimed:
             "end with no statement: `info` is where the Finding already sits and "
             "it is this harness's word for unjudged. Do not reach for low to have "
             "said something."
+        )
+
+    def _impact(self, head: str) -> str:
+        """Ticket 226 wall 1. What a child is told after the band is stated.
+
+        `grep -n "open_impact_task" execution.py` returned nothing before this
+        method existed. The verb was granted through `state.conclude`, wrapped
+        by ticket 103 and described in the roster, and no objective in this
+        runtime had ever asked for it -- so no impact Test was ever written, so
+        the lane ticket 226 built to run one had nothing to run, so
+        `pivot_stamps` and `chains` held zero rows after 197 laps.
+
+        No request paragraph, for `_banding`'s two reasons and a third that
+        matters more than either. The two above are that the measuring is done
+        and the turns belong to the one call. The third is that the thing this
+        Task is about is the one thing a child must not go and do: an impact run
+        writes to somebody's live system, `open_impact_replay` parks it and asks
+        an operator before it happens, and a child that demonstrated the impact
+        itself would have performed the unauthorized half of exactly the
+        procedure this harness asks permission for. So the paragraph that would
+        normally say "send that one request" says the opposite here, in as many
+        words.
+
+        The classes come from `roster.IMPACT_CLASSES` rather than from the
+        database, which is the one place this file departs from ticket 163's
+        rule and departs from it for 163's own reason. That tuple is what the
+        served schema's enum is built from, so the words here and the words the
+        call will accept are one list; reading `impact_classes` instead would
+        offer the three `forbidden` ones as well, and a child that picked one
+        would be refused by `rk2_refuse_forbidden_impact` for a word this
+        objective had shown it.
+        """
+        classes = ", ".join(roster.IMPACT_CLASSES)
+        return (
+            f"{head}"
+            f"The Finding {self.finding_label} is validated and somebody has "
+            "already said what it is worth. Nothing further needs to be measured "
+            "about whether it holds, and nothing you send would change the "
+            "band.\n\n"
+            "What is missing is proof of what it is worth. A band on "
+            "constrained_inference is what somebody reasoned; a band on "
+            "demonstrated_impact is what a run showed, and mcp__rk2__state_severity "
+            "refuses that word while no demonstration is on file. This Task exists "
+            "to write the plan that would put one there.\n\n"
+            "Call mcp__rk2__open_impact_task once, naming "
+            f"{self.finding_label} and a Test that would demonstrate the impact: "
+            "actions with a baseline, a variant and a control, assertions naming "
+            "the actions they read, and an impact block carrying the class, the "
+            "effect in one sentence, the cleanup that puts the target back in one "
+            "sentence, and after_state -- the ordinal of the action that reads back "
+            "what the Test left behind. The cleanup sentence and the cleanup "
+            "requests are two different fields and both are read: one says what "
+            "undoing looks like and the other is the requests that do it.\n\n"
+            f"The impact classes are, and are only:\n{classes}.\n\n"
+            "Those three are the ones an operator may authorize. There are others "
+            "in this schema and they are forbidden outright, so they are not "
+            "offered here and naming one would be refused for being one.\n\n"
+            "YOU DO NOT RUN THIS TEST. Demonstrating impact is causing real effect "
+            "on somebody's live system, so the runtime performs it later under an "
+            "operator's explicit grant, and asks for that grant before the first "
+            "request goes out. Write the plan and stop. Do not send any part of it "
+            "with mcp__rk2__http_request, and do not send a smaller version of it "
+            "to check that it would work.\n\n"
+            "If none of those three classes is what this weakness leads to, do not "
+            "reach for the nearest one. Say so in mcp__rk2__submit_mission_result, "
+            "naming the classes you weighed, and let the run end with no "
+            "specification. A Finding whose worth was reasoned about and not shown "
+            "is a Finding this harness can report; a demonstration written for a "
+            "class the weakness does not have is a run against a live target for "
+            "nothing."
         )
 
     @staticmethod
