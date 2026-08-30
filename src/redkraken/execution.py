@@ -117,6 +117,12 @@ MISSIONS = {
     "report": "Write up what has been established about this target.",
 }
 
+#: Ticket 221's sentence, which `MISSIONS` cannot hold: that mapping is keyed on
+#: kind, and this kind has two jobs. Named here rather than inside the method
+#: that uses it, because a reader looking for what a child is told first looks
+#: at the mapping above and should find the exception beside it.
+BANDING = "Say what this validated Finding is worth."
+
 #: How a child stopped, in the words `agent_runs.stop_reason` accepts. Two
 #: vocabularies because they have two authors: the column's is 0006's, extended
 #: by 0012, and the word the launcher reads off a `ResultMessage` is the API's
@@ -354,7 +360,15 @@ STARTED = (
     # that decides whether it is opened under one at all. A LEFT JOIN because
     # the column is NOT NULL and a missing row would be a claim this runtime
     # could not describe rather than one it should refuse to describe.
-    " coalesce(i.slot_name, ''), coalesce(i.class, 'anonymous')"
+    " coalesce(i.slot_name, ''), coalesce(i.class, 'anonymous'),"
+    # Ticket 221. Present for the `conclude` Task that bands a Finding and
+    # absent for the one that names one, which is the whole of how the two
+    # shapes of that kind are told apart -- `derive_finding_bands` writes
+    # `tasks.finding_id` on every row it creates and `derive_finding_claims`
+    # writes none. The label and not the id, because the verb the child
+    # reaches speaks in labels: `propose_severity` resolves `F9`, and the
+    # granted verb behind it is the one that takes a uuid.
+    " fg.label"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
@@ -362,6 +376,7 @@ STARTED = (
     " LEFT JOIN endpoints ep ON ep.entity_id = e.id"
     " LEFT JOIN hypotheses h ON h.id = t.hypothesis_id AND h.program_id = t.program_id"
     " LEFT JOIN tests ts ON ts.id = t.test_id AND ts.program_id = t.program_id"
+    " LEFT JOIN findings fg ON fg.id = t.finding_id AND fg.program_id = t.program_id"
     " WHERE ar.label = $1 AND ar.program_id = $2::uuid"
 )
 
@@ -979,6 +994,10 @@ class Claimed:
     #: acts as nobody says so, rather than leaving the question open.
     identity_slot_name: str = ""
     identity_class: str = "anonymous"
+    #: Ticket 221: the Finding a `conclude` Task was opened to band, or None
+    #: for the `conclude` Task that was opened to name one. `objective`
+    #: dispatches on it and nothing else does.
+    finding_label: str | None = None
 
     @property
     def identity_slot(self) -> str:
@@ -1032,6 +1051,10 @@ class Claimed:
             identity_class=(
                 "anonymous" if len(row) < 18 or row[17] is None else str(row[17])
             ),
+            # Ticket 221, defaulted for the reason the two above are: a fixture
+            # one column short describes a Task that names no Finding, which is
+            # every kind but one shape of one.
+            finding_label=(None if len(row) < 19 or row[18] is None else str(row[18])),
         )
 
     def objective(
@@ -1068,12 +1091,28 @@ class Claimed:
         not a default for the same reason -- a caller that forgot it would
         produce exactly the prompt this method was written to stop producing.
         """
-        mission = MISSIONS.get(self.kind, f"Carry out this {self.kind} Task.")
+        # Ticket 221: one kind, two jobs, told apart by the Finding the Task
+        # carries. Decided before the head is built because the head opens with
+        # the mission sentence, and `MISSIONS["conclude"]` is the other job's.
+        banding = self.kind == CONCLUDE and self.finding_label is not None
+        mission = (
+            BANDING if banding
+            else MISSIONS.get(self.kind, f"Carry out this {self.kind} Task.")
+        )
         head = (
             f"{mission}\n\n"
             f"Subject: the {self.subject_type} {self.subject_label}.\n"
             f"Target: {self.method} {self.url}\n\n"
         )
+        if banding:
+            # Read before the sibling below because the two are one kind: a Task
+            # carrying a Finding was opened to band that Finding, and one
+            # carrying none was opened to name one. The vocabulary is not passed
+            # on -- the class was chosen when the Finding was created and this
+            # run is not choosing it again.
+            return self._finishing(
+                self._selected(self._banding(head), playbooks), completion_only
+            )
         if self.kind == CONCLUDE and self.hypothesis_label is not None:
             return self._finishing(
                 self._selected(self._conclusion(head, vocabulary), playbooks), completion_only
@@ -1189,6 +1228,58 @@ class Claimed:
             "The runtime answers created, merged or refused. Merged means a Finding "
             "is already open on this cell and your claim was added to it, which is a "
             "result and not a rejection."
+        )
+
+    def _banding(self, head: str) -> str:
+        """Ticket 221. What a child is told when the Finding is already proved.
+
+        The sibling above is asked to name a settled claim. This one is asked to
+        say what the named thing is worth, and the two are the same kind because
+        they need the same authority: `state.conclude`, which `web_hunter` holds
+        alone.
+
+        No request paragraph, for `_conclusion`'s reason and one more. A blind
+        validator has already reproduced this Finding against the live target
+        and the runtime recorded the verdict, so a child that went and looked
+        again would be re-measuring a settled row -- and would spend the turns
+        the one call it was opened for needs.
+
+        The three bases are written out rather than referred to, which is ticket
+        163's lesson applied to a second vocabulary: `state_severity` refuses
+        each of them for its own reason, and a child that learns those reasons
+        from three refusals has spent the attempt learning them. `program_context`
+        is named with its ceiling because that refusal is the one a run reaches
+        by choosing the modest word and then the strong band, which reads as
+        caution and is spent as a refusal.
+        """
+        return (
+            f"{head}"
+            f"The Finding {self.finding_label} is validated. A blind validator "
+            "reproduced it against the live target and the runtime recorded the "
+            "verdict, so nothing further needs to be measured and nothing you "
+            "send would change it.\n\n"
+            "What is missing is the band. Call mcp__rk2__state_severity once, "
+            f"naming {self.finding_label}, one of low, medium, high or critical, "
+            "the basis you are standing on, and a rationale a person will read.\n\n"
+            "Read the Finding and its evidence with the state tools before you "
+            "choose. The band is a claim about what this weakness is worth to "
+            "somebody who owns the target, and it is the one part of this a "
+            "person cannot correct later without reopening the Finding.\n\n"
+            "The basis is not a formality and the runtime refuses each one for "
+            "its own reason. demonstrated_impact needs an impact demonstration on "
+            "file and is refused when there is none. constrained_inference means "
+            "the behaviour was witnessed and what it is worth was reasoned about, "
+            "and is refused when a demonstration exists, because that is proof "
+            "rather than inference. program_context means nothing about worth was "
+            "witnessed and what is left is what this Program says it pays for; it "
+            "cannot carry high or critical, so a run that picks it and then "
+            "reaches for a strong band is refused for the pair rather than for "
+            "either half.\n\n"
+            "There is no band for `nothing`. If what this Finding showed is not "
+            "worth low, say so in mcp__rk2__submit_mission_result and let the run "
+            "end with no statement: `info` is where the Finding already sits and "
+            "it is this harness's word for unjudged. Do not reach for low to have "
+            "said something."
         )
 
     @staticmethod

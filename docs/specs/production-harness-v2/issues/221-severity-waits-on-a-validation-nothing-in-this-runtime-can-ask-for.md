@@ -4,10 +4,10 @@
 ticket 105 costs, taken by building the wrong fix first and watching it be
 refused. Close it when a Finding reaches `validated` with no operator command.
 
-**Blocked by:** 224. It was 105 until 2026-08-30; see "What 105 closed and what
-it did not" below.
+**Blocked by:** nothing. It was 105, then 224; both are recorded below and
+neither turned out to be the wall. See "What was built, 2026-08-30".
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## The chain, measured end to end
 
@@ -94,11 +94,16 @@ sentence is one line. It does not work, and the reason is one query away.
 
 ## Acceptance criteria
 
-- [ ] **A Finding reaches `validated` without an operator.** Ticket 105's, not
-      this one's.
-- [ ] **A validated Finding gets a band.** Once 105 lands, whichever run holds
-      a validated Finding asks for the severity -- and the objective sentence
-      reverted here is the one to restore, moved to that kind.
+- [x] **A Finding reaches `validated` without an operator.** Ticket 105's, not
+      this one's. Closed 2026-08-30 by 224 shape 1: `drain-validations.sh` runs
+      between laps from `hunt.sh` and drove `F9` to `validated` with nobody at a
+      keyboard. It is engagement-local rather than in this repository, which is
+      224's remaining half and is written down there.
+- [x] **A validated Finding gets a band.** Closed 2026-08-30. The kind it
+      moved to is `conclude`, which already held `state_severity` and already
+      had a second job the roster described and nothing derived. `F9` on
+      `rk2here` is `low` on basis `constrained_inference`, stated by a child
+      through `mcp__rk2__state_severity` with `actor_kind = runtime`.
 - [x] **`rk finding` says where severity comes from.** An operator reading
       eight `info` Findings cannot tell a judgement from a gap. Free, and true
       whether or not 105 lands. Done 2026-08-30: the `finding` parser gained a
@@ -162,3 +167,78 @@ over rows that exist plus a derivation that turns them into Tasks. A
 `severity` frontier would select validated Findings whose `severity_basis` is
 still `undetermined`, which is the column that already distinguishes "nobody
 judged" from "judged harmless".
+
+## What was built, 2026-08-30
+
+The sentence this ticket reverted was never the fix, and the kind it was looking
+for already existed. `roster.py:2260` says a `conclude` Task "runs from a
+validated Finding to the impact specification, the severity band and the
+composed report" -- which is not what `rk2_finding_frontier` produces. That
+frontier produces the Task that runs from a supported claim to a candidate
+Finding. The second half of the walk had a description and no derivation.
+
+So `conclude` has two shapes now, told apart by `tasks.finding_id` -- the column
+`validate` already reads for the same question, and one of the seven
+`tasks_live_dedup_idx` discriminates on, so two `conclude` Tasks stand on one
+claim without a new index.
+
+**`20261230T000000Z__a_validated_finding_gets_the_task_that_bands_it.sql`**
+
+- `rk2_severity_frontier(uuid)` -- validated Findings with
+  `severity_basis = 'undetermined'`, in scope, addressable, resting on a
+  supported claim, named by no `conclude` Task. Shaped after
+  `rk2_finding_frontier` clause for clause.
+- `derive_finding_bands()` -- one `conclude` Task per frontier row, carrying
+  `finding_id`. Shares `max_conclusions_derived_per_pass` with
+  `derive_finding_claims`, because both open the same kind.
+- `ready_for`, `novelty_for` and `rank_pass`, each replaced whole with one arm
+  changed. Without all three the Task is abandoned before it is offered once:
+  `ready_for` answers `conclude.already_found` because the Finding it was opened
+  about is the edge that answer reads, and `novelty_for` scores the same edge 0,
+  which `cancel_reason_for`'s general rule reads as nothing left to learn. That
+  is ticket 152's `perform` measurement in a new place.
+- Two `runtime_verb_surface` rows, which is ticket 66's rule.
+
+**`execution.py`** -- `STARTED` gained the Finding label through a LEFT JOIN,
+`Claimed` gained `finding_label`, and `objective` dispatches on it into a new
+`_banding`. The band objective writes the three bases out with the refusal
+waiting behind each, which is ticket 163's lesson applied to a second
+vocabulary, and it says there is no band meaning `nothing` so that a run does
+not reach for `low` to have said something.
+
+**Not built, deliberately:** a new Task kind. It would have cost a `task_kinds`
+row, a `role_task_kinds` row, cost and time priors, lane quota rows, a
+`MISSIONS` sentence and a `web_hunter.task_kinds` change -- and would still have
+needed the same three arms in `ready_for`, `novelty_for` and `rank_pass`. Also
+not built: the impact specification and the composed report. They are the other
+two verbs of `state.conclude` and they are their own tickets; a Task asked for
+three things it can only do one of is a Task that ends having done none.
+
+## What was verified
+
+Live on `rk2here`, in this order:
+
+1. `rk db migrate` applied clean, 237 migrations, 0 pending.
+2. `rk2_severity_frontier` named `F9` and nothing else.
+3. `derive_finding_bands()` answered
+   `{"ceiling": 3, "derived": 1, "deferred": 0, "candidates": 1}`.
+4. `T1152` read `ready_for = NULL`, `novelty_for = 1`,
+   `cancel_reason_for = NULL`, while the eight `conclude` Tasks of the other
+   shape still read `conclude.already_found` / `0` / `answered`.
+5. `T1152` appeared on a real Slate at ordinal 2, priority `1.436716`,
+   `entitled: true`.
+6. A `web_hunter` child claimed it and stated the band. `severity_statements`
+   holds one row: `F9`, `low`, `constrained_inference`, `actor_kind = runtime`,
+   with a rationale naming the endpoint and what it returns. `findings.severity`
+   and `findings.severity_basis` carry the same words.
+
+`low` is the honest band and this ticket's earlier note says why: `F9`'s test
+sends five credential-free requests and asserts only on 404-versus-404
+status and body differences. The child read that and did not reach higher.
+
+Offline: `tests.test_execution.BandingObjectiveTest` (7 cases, the dispatch and
+both objectives), `tests.test_database.FindingBandTest` (7 cases, the frontier,
+the derivation, both scheduler questions, the dedup index and the cache the
+frontier reads). `tests.test_execution` 210 pass; `FindingClaimTest` and
+`BlindValidationTest` 32 pass unchanged. `check_wiring`, `check_audit`,
+`check_baseline` and `check_coverage` all exit 0.

@@ -52175,6 +52175,229 @@ class FindingClaimTest(ReplayFixture, DatabaseCase):
 UNREADY_SLUG = "selftest-never-ready"
 
 
+BAND_SLUG = "selftest-band"
+
+
+class FindingBandTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 221: a validated Finding becomes the work that says what it is worth.
+
+    `F9` on `rk2here` reached `validated` on 2026-08-30 -- the first Finding
+    this harness has held there -- and stayed at `info`, because nothing put a
+    run in front of it. `state_severity` is the only writer of
+    `findings.severity`, `web_hunter` holds it alone through `state.conclude`,
+    and the only producer of `conclude` Tasks is `rk2_finding_frontier`, whose
+    last two clauses exclude a hypothesis that already carries a Finding and a
+    hypothesis a `conclude` Task has already named. A validated Finding's claim
+    is always both, so the verb was served, described, granted and unreachable.
+
+    The arrangement is 38's, because a validated Finding is exactly what that
+    fixture produces and this ticket begins where the judgement ends. Three
+    passes in `setUpClass` for ticket 156's reason: a pass only means anything
+    against the rows the pass before it left, and the pass that derives a Task
+    is not the pass that first offers it to the cancellation rules.
+    """
+
+    slug = BAND_SLUG
+
+    #: The granted verb, called with a uuid. A child reaches it through
+    #: `propose_severity`, which resolves a label and answers a refusal as a
+    #: document; this case wants the raise, so it calls the one underneath.
+    STATE_SEVERITY = "SELECT state_severity($1::uuid, $2, $3, $4)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # The Program's own configured Application, not the throwaway Entity
+        # `walked` makes when no subject is named. `rk2_severity_frontier` asks
+        # `e.in_scope` and `rk2_subject_addressable`, and both are false for an
+        # Entity the scope never admitted -- so a fixture that let the default
+        # stand would be testing an empty frontier and calling it a pass.
+        cls.made = cls.validated(
+            "the orders API leaks a neighbour's order", cls.configured_application()
+        )
+
+        # Before anything: the frontier must not name a Finding nobody has
+        # banded but that is also not this Program's to band twice. Read first
+        # because every count below is about a row this one says is there.
+        cls.frontier = cls.on_the_frontier()
+        cls.first_pass = cls.pass_over()
+        cls.after_first = cls.bandings()
+        cls.second_pass = cls.pass_over()
+        cls.after_second = cls.bandings()
+
+        # And then the band the Task exists to produce, stated by the verb the
+        # child would have called. The pass after it is the other half of the
+        # derivation being correct: there is nothing left to band, so nothing
+        # new is derived and what is standing is answered.
+        cls.banded = cls.called(
+            cls.STATE_SEVERITY,
+            (cls.made["finding"], "medium", "constrained_inference",
+             "a neighbour's order is served to a caller who owns no part of it"),
+        )
+        cls.third_pass = cls.pass_over()
+        cls.after_third = cls.bandings()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def configured_application(cls) -> str:
+        """The subject the Program's own scope put on the Surface."""
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM entities"
+                " WHERE program_id = $1::uuid AND type = 'application'"
+                "   AND metadata ->> 'source' = 'program_scope'",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def pass_over(cls) -> dict:
+        """One ranking pass on this Program, as the runtime runs it."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(cls.connection.execute("SELECT rank_pass('runtime')").scalar())
+            )
+
+    @classmethod
+    def on_the_frontier(cls) -> list[str]:
+        """The Findings the frontier names, by label."""
+        rows = cls.connection.execute(
+            "SELECT f.label FROM rk2_severity_frontier($1::uuid) fr"
+            "  JOIN findings f ON f.id = fr.finding_id"
+            " ORDER BY f.label",
+            (cls.program_id,),
+        ).dicts()
+        return [str(row["label"]) for row in rows]
+
+    @classmethod
+    def bandings(cls) -> list[tuple[str, str, str, str]]:
+        """Every `conclude` Task opened about a Finding, and both questions.
+
+        `ready_for` on its own would have called these Tasks ready while
+        `cancel_reason_for` was abandoning them, which is the pair 152 shipped
+        for `perform` and 156 nearly shipped again. This ticket widens a third
+        arm of both, so both are read.
+        """
+        rows = cls.connection.execute(
+            "SELECT f.label, t.status,"
+            "       coalesce(ready_for(t.*), 'ready') AS blocked,"
+            "       coalesce(cancel_reason_for(t.*, w.*), 'alive') AS standing"
+            "  FROM tasks t"
+            "  CROSS JOIN scheduler_weights w"
+            "  JOIN findings f ON f.id = t.finding_id"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'conclude'"
+            " ORDER BY t.created_at, t.id",
+            (cls.program_id,),
+        ).dicts()
+        return [
+            (str(row["label"]), str(row["status"]), str(row["blocked"]),
+             str(row["standing"]))
+            for row in rows
+        ]
+
+    # -- what the derivation opened -------------------------------------------
+
+    def test_the_frontier_names_the_validated_finding_nobody_has_banded(self):
+        # The arrangement, asserted before anything counts it: a fixture that
+        # quietly left the Finding a candidate would make every number below
+        # correct and meaningless.
+        self.assertEqual(["F1"], self.frontier)
+        self.assertEqual("validated", str(self.made["verdict"]["status"]))
+
+    def test_a_validated_finding_becomes_exactly_one_band_task(self):
+        self.assertEqual(1, self.first_pass["bands_derived"])
+        self.assertEqual(0, self.first_pass["bands_deferred"])
+        self.assertEqual([("F1", "pending", "ready", "alive")], self.after_first)
+
+    def test_the_pass_that_derived_it_does_not_end_it_in_the_same_breath(self):
+        # Ticket 156's worst case, in the place this ticket puts it. `ready_for`
+        # would have said `conclude.already_found`, because the Finding this
+        # Task was opened about is the edge that answer reads; `novelty_for`
+        # would have scored the same edge 0, and `cancel_reason_for`'s general
+        # rule reads a zero as nothing left to learn. Either alone abandons the
+        # Task before it is ever offered.
+        #
+        # Read off the second pass rather than the first: step (3f) opens these
+        # Tasks after step (2) has run, so a Task derived in one pass is first
+        # offered to the cancellation rules by the next one.
+        self.assertEqual([("F1", "pending", "ready", "alive")], self.after_second)
+        self.assertEqual(0, self.second_pass["bands_derived"])
+
+    def test_the_two_shapes_of_this_kind_are_two_rows_and_not_one(self):
+        # `tasks_live_dedup_idx` is UNIQUE on (program_id, kind,
+        # subject_entity_id, hypothesis_id, finding_id, test_id,
+        # selected_identity_entity_id) with NULLS NOT DISTINCT, over the live
+        # statuses. `finding_id` is in that key, which is what lets ticket 156's
+        # Task and this ticket's stand on one claim without a new index -- and
+        # it is why no new Task kind was minted for the band.
+        #
+        # Written as an insert rather than as a count because this fixture never
+        # derived 156's Task: `open_finding` is called directly, so no pass ever
+        # saw a settled claim with no Finding on it. The insert is the sibling
+        # row, and the index accepting it is the whole claim.
+        counted = None
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "INSERT INTO tasks"
+                    "       (program_id, kind, hypothesis_id, subject_entity_id)"
+                    " SELECT program_id, kind, hypothesis_id, subject_entity_id"
+                    "   FROM tasks"
+                    "  WHERE program_id = $1::uuid AND kind = 'conclude'"
+                    "    AND finding_id IS NOT NULL",
+                    (self.program_id,),
+                )
+                row = self.connection.execute(
+                    "SELECT count(*) FILTER (WHERE finding_id IS NULL) AS naming,"
+                    "       count(*) FILTER (WHERE finding_id IS NOT NULL) AS banding"
+                    "  FROM tasks"
+                    " WHERE program_id = $1::uuid AND kind = 'conclude'",
+                    (self.program_id,),
+                ).dicts()[0]
+                counted = (int(row["naming"]), int(row["banding"]))
+                raise Rollback
+        except Rollback:
+            pass
+
+        self.assertEqual((1, 1), counted)
+
+    def test_a_finding_somebody_has_banded_opens_no_second_task(self):
+        self.assertEqual("medium", str(self.banded["severity"]))
+        self.assertEqual(0, self.third_pass["bands_derived"])
+        # And nothing waiting behind the ceiling either: `deferred` is what a
+        # frontier row the pass could not afford looks like, so a zero is the
+        # difference between "off the frontier" and "on it and the pass was
+        # busy".
+        self.assertEqual(0, self.third_pass["bands_deferred"])
+
+    def test_the_standing_band_task_ends_once_the_band_exists(self):
+        # The other side of the same pass, and the ordinary path rather than a
+        # special case: `novelty_for` scores the Task 0 because
+        # `findings.severity_basis` is no longer `undetermined`, and the general
+        # rule in `cancel_reason_for` reads that as answered.
+        self.assertEqual([("F1", "abandoned", "ready", "answered")], self.after_third)
+
+    def test_the_band_the_verb_wrote_is_the_band_the_finding_carries(self):
+        # `state_severity` writes the statement row and the cache in one
+        # statement, and `rk2_severity_frontier` reads the cache. A schema where
+        # those could disagree is one where a banded Finding stays on the
+        # frontier forever.
+        row = self.connection.execute(
+            "SELECT f.severity, f.severity_basis, s.severity AS stated"
+            "  FROM findings f"
+            "  JOIN severity_statements s ON s.finding_id = f.id"
+            " WHERE f.id = $1::uuid",
+            (self.made["finding"],),
+        ).dicts()[0]
+
+        self.assertEqual("medium", str(row["severity"]))
+        self.assertEqual("medium", str(row["stated"]))
+        self.assertEqual("constrained_inference", str(row["severity_basis"]))
+
+
 class UnreadyTaskTest(ClaimFixture, SchedulerFixture, DatabaseCase):
     """Ticket 158: a Task the scheduler will never call ready must end.
 

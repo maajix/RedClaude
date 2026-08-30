@@ -164,6 +164,7 @@ def started_row(**overrides) -> tuple:
         subject.test_label,
         subject.identity_slot_name,
         subject.identity_class,
+        subject.finding_label,
     )
 
 
@@ -1277,6 +1278,97 @@ class FindingVocabularyTest(unittest.TestCase):
         self.assertEqual(
             [execution.INTEGRITY_FAILED], [one.code for one in self.ledger.violations]
         )
+
+
+class BandingObjectiveTest(unittest.TestCase):
+    """Ticket 221. The second shape of `conclude`, and what tells it from the first.
+
+    `F9` on `rk2here` was the first Finding this harness reached `validated` and
+    it sat at `info` afterwards, because nothing put a run in front of a
+    validated Finding. The kind that holds `state_severity` is this one, and the
+    column that says which of its two jobs a Task is is `tasks.finding_id`.
+
+    So what is asserted here is the dispatch and not the prose: a Task carrying
+    a Finding is told to band it, a Task carrying none is told to name one, and
+    neither objective leaks into the other.
+    """
+
+    def banding(self, **overrides) -> str:
+        subject = claimed(
+            kind="conclude",
+            role="web_hunter",
+            hypothesis_label="H165",
+            finding_label="F9",
+            **overrides,
+        )
+        return subject.objective((), SEEDED_CLASSES)
+
+    def naming(self) -> str:
+        subject = claimed(kind="conclude", role="web_hunter", hypothesis_label="H165")
+        return subject.objective((), SEEDED_CLASSES)
+
+    def test_a_task_that_names_a_finding_is_asked_for_the_band_and_not_the_class(self):
+        text = self.banding()
+
+        self.assertIn(execution.BANDING, text)
+        self.assertIn("The Finding F9 is validated", text)
+        self.assertIn("mcp__rk2__state_severity", text)
+        self.assertNotIn("mcp__rk2__propose_finding", text)
+
+    def test_a_task_that_names_none_keeps_the_objective_ticket_156_wrote(self):
+        # The other half of the dispatch, asserted because one kind now has two
+        # objectives and the failure that costs a run is the wrong one arriving.
+        text = self.naming()
+
+        self.assertIn("mcp__rk2__propose_finding", text)
+        self.assertNotIn("mcp__rk2__state_severity", text)
+        self.assertNotIn(execution.BANDING, text)
+
+    def test_the_vocabulary_is_not_spent_on_a_child_that_chooses_no_class(self):
+        # 37 words the banding child would never use. The class was chosen when
+        # the Finding was created and this run is not choosing it again.
+        text = self.banding()
+        for word in ("error_disclosure", "cleartext_transmission"):
+            with self.subTest(word):
+                self.assertNotIn(word, text)
+
+    def test_each_basis_is_named_with_the_refusal_that_waits_behind_it(self):
+        # Ticket 163's lesson over a second vocabulary: `state_severity` refuses
+        # each of the three for its own reason, and a child that learns those
+        # from three refusals has spent the attempt learning them.
+        text = self.banding()
+
+        self.assertIn("demonstrated_impact", text)
+        self.assertIn("constrained_inference", text)
+        self.assertIn("program_context", text)
+        self.assertIn("cannot carry high or critical", text)
+
+    def test_the_child_is_told_it_may_state_no_band_at_all(self):
+        # There are four bands and none of them means `nothing`, so a run that
+        # judges the Finding worthless has no word to say it in. Reaching for
+        # `low` to have said something is the failure this paragraph prevents.
+        text = self.banding()
+
+        self.assertIn("There is no band for `nothing`", text)
+        self.assertIn("Do not reach for low to have said something", text)
+
+    def test_the_finding_reaches_the_objective_through_the_row_the_query_returns(self):
+        # The dispatch is worth nothing if the column never arrives. This is the
+        # `STARTED` row read the way `from_row` reads it, one column longer than
+        # it was before this ticket.
+        subject = execution.Claimed.from_row(
+            started_row(kind="conclude", hypothesis_label="H165", finding_label="F9")
+        )
+
+        self.assertEqual("F9", subject.finding_label)
+        self.assertIn("The Finding F9 is validated", subject.objective(()))
+
+    def test_a_row_from_before_this_column_reads_as_a_task_naming_no_finding(self):
+        # Every kind but one shape of one carries no Finding, and a fixture one
+        # column short is describing exactly that rather than a broken row.
+        short = started_row(kind="conclude", hypothesis_label="H165")[:18]
+
+        self.assertIsNone(execution.Claimed.from_row(short).finding_label)
 
 
 class AttemptProfileTest(unittest.TestCase):
