@@ -34,6 +34,7 @@ from redkraken import (
     program,
     proposal,
     proxy,
+    replay,
     roster,
     store,
 )
@@ -165,6 +166,7 @@ def started_row(**overrides) -> tuple:
         subject.identity_slot_name,
         subject.identity_class,
         subject.finding_label,
+        subject.impact_class,
     )
 
 
@@ -1369,6 +1371,57 @@ class BandingObjectiveTest(unittest.TestCase):
         short = started_row(kind="conclude", hypothesis_label="H165")[:18]
 
         self.assertIsNone(execution.Claimed.from_row(short).finding_label)
+
+
+class ImpactReplayTest(unittest.TestCase):
+    """Ticket 226. Which replay a `perform` Task runs, and what decides it.
+
+    `replay.IMPACT` is the only verb set that calls `issue_pivot_stamp` and
+    `build_kill_chain`, and until this ticket it was selected in one place:
+    `rk test replay --impact`, an operator command. The runtime took the
+    `DETECTION` default on every Task it ever performed, which is why
+    `pivot_stamps` held zero rows on a Program that had run 197 laps.
+
+    What is asserted is the dispatch and the column that carries it, not the
+    replay itself -- `replay.run` has its own case, and a test that walked one
+    here would be testing the performer through the caller.
+    """
+
+    def test_a_task_whose_test_states_an_impact_takes_the_impact_verbs(self):
+        subject = claimed(kind="perform", test_label="TS3",
+                          impact_class="read_another_tenants_record")
+
+        self.assertIsNotNone(subject.impact_class)
+
+    def test_a_task_whose_test_states_none_is_a_detection_task(self):
+        # The other half of the dispatch. Every Test written before this ticket
+        # is this shape, so the default is the one that must not move.
+        self.assertIsNone(claimed(kind="perform", test_label="TS3").impact_class)
+
+    def test_the_class_reaches_the_claim_through_the_row_the_query_returns(self):
+        # The dispatch is worth nothing if the column never arrives. This is the
+        # `STARTED` row read the way `from_row` reads it, one column longer than
+        # ticket 221 left it.
+        subject = execution.Claimed.from_row(
+            started_row(kind="perform", test_label="TS3",
+                        impact_class="read_another_tenants_record")
+        )
+
+        self.assertEqual("read_another_tenants_record", subject.impact_class)
+
+    def test_a_row_from_before_this_column_reads_as_a_detection_task(self):
+        short = started_row(kind="perform", test_label="TS3")[:19]
+
+        self.assertIsNone(execution.Claimed.from_row(short).impact_class)
+
+    def test_the_two_verb_sets_are_not_the_same_object(self):
+        # The assertion the dispatch rests on, stated once here rather than
+        # implied at four call sites: `IMPACT` carries the two verbs that stamp
+        # a pivot and compose a chain, and `DETECTION` carries neither.
+        self.assertTrue(replay.IMPACT.stamp_sql)
+        self.assertTrue(replay.IMPACT.chain_sql)
+        self.assertFalse(replay.DETECTION.stamp_sql)
+        self.assertFalse(replay.DETECTION.chain_sql)
 
 
 class AttemptProfileTest(unittest.TestCase):

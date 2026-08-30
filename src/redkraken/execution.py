@@ -368,7 +368,12 @@ STARTED = (
     # writes none. The label and not the id, because the verb the child
     # reaches speaks in labels: `propose_severity` resolves `F9`, and the
     # granted verb behind it is the one that takes a uuid.
-    " fg.label"
+    " fg.label,"
+    # Ticket 226. The column `open_impact_replay` refuses a Test for lacking
+    # and the column `rk2_test_performance_frontier` excludes on, so it is
+    # already the line between the two kinds of Test this harness holds. NULL
+    # for a detection Test, which is every Test written before ticket 226.
+    " ts.impact_class"
     " FROM agent_runs ar"
     " JOIN tasks t ON t.id = ar.task_id AND t.program_id = ar.program_id"
     " JOIN entities e ON e.id = t.subject_entity_id"
@@ -998,6 +1003,10 @@ class Claimed:
     #: for the `conclude` Task that was opened to name one. `objective`
     #: dispatches on it and nothing else does.
     finding_label: str | None = None
+    #: Ticket 226: the impact class of the Test a `perform` Task names, or
+    #: None for a detection Test. `_replay` dispatches on it and nothing
+    #: else does.
+    impact_class: str | None = None
 
     @property
     def identity_slot(self) -> str:
@@ -1055,6 +1064,10 @@ class Claimed:
             # one column short describes a Task that names no Finding, which is
             # every kind but one shape of one.
             finding_label=(None if len(row) < 19 or row[18] is None else str(row[18])),
+            # Ticket 226, defaulted for the reason above it is: a fixture one
+            # column short describes a Task performing a detection Test, which
+            # is every `perform` Task this harness derived before 226.
+            impact_class=(None if len(row) < 20 or row[19] is None else str(row[19])),
         )
 
     def objective(
@@ -2586,6 +2599,16 @@ class Slice:
             identity_slot=claimed.identity_slot or None,
             proxy_url=self.proxy_url,
             ca_file=self.boundary.certificate,
+            # Ticket 226. The only place outside `rk test replay --impact` that
+            # reaches `replay.IMPACT`, and so the only path on which
+            # `issue_pivot_stamp` and `build_kill_chain` are ever called by a
+            # hunt. Dispatched on the Test's own class rather than on a flag
+            # this method was passed: which replay a Test needs is a fact about
+            # the Test, and `open_impact_replay` refuses a Test without a class
+            # anyway, so the two agree by construction.
+            verbs=(
+                replay_module.IMPACT if claimed.impact_class else replay_module.DETECTION
+            ),
         )
         facts["replay"] = performed.as_dict()
         # `test_run` is written by `close_test_replay` in the transaction that

@@ -52398,6 +52398,205 @@ class FindingBandTest(ValidatedFindingFixture, DatabaseCase):
         self.assertEqual("constrained_inference", str(row["severity_basis"]))
 
 
+
+IMPACT_SLUG = "selftest-impact"
+
+
+class ImpactPerformanceTest(ValidatedFindingFixture, DatabaseCase):
+    """Ticket 226: the impact Test written for a Finding reaches a run.
+
+    Measured on `rk2here` on 2026-08-30: `chains`, `chain_steps`, `chain_edges`
+    and `pivot_stamps` all held zero rows after 197 laps, and
+    `check_kill_chains()` returned nothing -- which reads as green and is not,
+    because all seven of its arms are `FROM chains` and an empty table passes
+    every one of them.
+
+    Two rows are why. `open_impact_task` writes a `tests` row with an
+    `impact_class` and a `hunt` Task naming the Finding, and that Task carries
+    no `test_id`, so nothing connects it to the Test. And
+    `rk2_test_performance_frontier` excludes `impact_class IS NOT NULL`, so the
+    lane that does perform Tests never sees one. The Test is written and no Task
+    ever performs it.
+
+    The arrangement is 38's for `FindingBandTest`'s reason: impact is proved on
+    a Finding somebody already validated, so that is where this begins.
+    """
+
+    slug = IMPACT_SLUG
+
+    #: The granted verb, called with a uuid. A child reaches it through
+    #: `propose_impact_task`, which resolves a label; this case wants the raise.
+    OPEN_IMPACT = "SELECT open_impact_task($1::uuid, $2::jsonb)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.made = cls.validated(
+            "a neighbour's order note can be rewritten", cls.configured_application()
+        )
+        # The Test and the `hunt` Task the served Contract writes, which is the
+        # whole of what exists before this ticket. Read before any pass, because
+        # every count below is about the rows this call left.
+        cls.opened = cls.called(cls.OPEN_IMPACT, (cls.made["finding"], PIVOTED))
+
+        cls.frontier = cls.on_the_impact_frontier()
+        cls.first_pass = cls.pass_over()
+        cls.after_first = cls.performances()
+        cls.second_pass = cls.pass_over()
+        cls.after_second = cls.performances()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def configured_application(cls) -> str:
+        """The subject the Program's own scope put on the Surface."""
+        return str(
+            cls.connection.execute(
+                "SELECT id::text FROM entities"
+                " WHERE program_id = $1::uuid AND type = 'application'"
+                "   AND metadata ->> 'source' = 'program_scope'",
+                (cls.program_id,),
+            ).scalar()
+        )
+
+    @classmethod
+    def pass_over(cls) -> dict:
+        """One ranking pass on this Program, as the runtime runs it."""
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            return json.loads(
+                str(cls.connection.execute("SELECT rank_pass('runtime')").scalar())
+            )
+
+    @classmethod
+    def on_the_impact_frontier(cls) -> list[str]:
+        """The Tests the impact frontier names, by label."""
+        rows = cls.connection.execute(
+            "SELECT ts.label FROM rk2_impact_performance_frontier($1::uuid) fr"
+            "  JOIN tests ts ON ts.id = fr.test_id"
+            " ORDER BY ts.label",
+            (cls.program_id,),
+        ).dicts()
+        return [str(row["label"]) for row in rows]
+
+    @classmethod
+    def performances(cls) -> list[tuple[str, str, str, str]]:
+        """Every `perform` Task, the Test it names, and both questions.
+
+        Both questions for `FindingBandTest`'s reason: `ready_for` calling a
+        Task ready while `cancel_reason_for` abandons it is the pair ticket 152
+        shipped for `perform` once already, and this ticket widens that same
+        arm.
+        """
+        rows = cls.connection.execute(
+            "SELECT ts.label, t.status,"
+            "       coalesce(ready_for(t.*), 'ready') AS blocked,"
+            "       coalesce(cancel_reason_for(t.*, w.*), 'alive') AS standing"
+            "  FROM tasks t"
+            "  CROSS JOIN scheduler_weights w"
+            "  JOIN tests ts ON ts.id = t.test_id"
+            " WHERE w.active AND t.program_id = $1::uuid AND t.kind = 'perform'"
+            " ORDER BY t.created_at, t.id",
+            (cls.program_id,),
+        ).dicts()
+        return [
+            (str(row["label"]), str(row["status"]), str(row["blocked"]),
+             str(row["standing"]))
+            for row in rows
+        ]
+
+    # -- what the derivation opened -------------------------------------------
+
+    def test_the_contract_writes_a_test_the_old_lane_cannot_see(self):
+        # The arrangement, asserted before anything counts it, and the shape of
+        # the gap in one line: the Test exists, and the frontier that performs
+        # Tests excludes it by class.
+        self.assertEqual("write_target_state", str(self.opened["impact_class"]))
+        empty = self.connection.execute(
+            "SELECT count(*) FROM rk2_test_performance_frontier($1::uuid) fr"
+            "  JOIN tests ts ON ts.id = fr.test_id"
+            " WHERE ts.impact_class IS NOT NULL",
+            (self.program_id,),
+        ).scalar()
+        self.assertEqual(0, int(empty))
+
+    def test_the_impact_frontier_names_the_test_nobody_has_performed(self):
+        self.assertEqual([str(self.opened["test"])], self.frontier)
+
+    def test_an_impact_test_becomes_exactly_one_perform_task(self):
+        self.assertEqual(1, self.first_pass["impact_runs_derived"])
+        self.assertEqual(0, self.first_pass["impact_runs_deferred"])
+        self.assertEqual(
+            [(str(self.opened["test"]), "pending", "ready", "alive")], self.after_first
+        )
+
+    def test_the_derived_task_carries_the_finding_the_replay_will_ask_for(self):
+        # The one column that makes the row work: `open_impact_replay` refuses a
+        # run whose Task names no Finding, so a `perform` Task derived without
+        # it would be a Task that reaches the verb and is turned away.
+        carried = self.connection.execute(
+            "SELECT f.label FROM tasks t"
+            "  JOIN findings f ON f.id = t.finding_id"
+            " WHERE t.program_id = $1::uuid AND t.kind = 'perform'"
+            "   AND t.test_id = (SELECT id FROM tests WHERE label = $2"
+            "                      AND program_id = $1::uuid)",
+            (self.program_id, str(self.opened["test"])),
+        ).scalar()
+        expected = self.connection.execute(
+            "SELECT label FROM findings WHERE id = $1::uuid", (self.made["finding"],)
+        ).scalar()
+        self.assertEqual(str(expected), str(carried))
+
+    def test_the_pass_that_derived_it_does_not_end_it_in_the_same_breath(self):
+        # Ticket 152's measurement, in the place this ticket puts it. Before
+        # this file `ready_for` answered `perform.claim_not_testable` for every
+        # impact Task: that arm asks the Test's claim to be `testable`, and an
+        # impact Test is written after the claim settled and can never satisfy
+        # it. Read off the second pass, because a Task derived in one pass is
+        # first offered to the cancellation rules by the next one.
+        self.assertEqual(
+            [(str(self.opened["test"]), "pending", "ready", "alive")], self.after_second
+        )
+        self.assertEqual(0, self.second_pass["impact_runs_derived"])
+
+    def test_a_detection_task_still_asks_its_claim_to_be_testable(self):
+        # The other half of the widened arm, and the one that must not move: the
+        # rule 152 wrote is still the rule for every Test written before this
+        # ticket. Asked of a row inserted and rolled back, because this fixture
+        # derives no detection `perform` Task -- 36 replays its Test directly --
+        # and a rule read off a Task that does not exist is a rule nobody
+        # checked.
+        answers = {}
+        try:
+            with self.connection.transaction():
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "INSERT INTO tasks (program_id, kind, test_id, hypothesis_id,"
+                    "                   subject_entity_id)"
+                    " SELECT $1::uuid, 'perform', ts.id, ts.hypothesis_id,"
+                    "        h.subject_entity_id"
+                    "   FROM tests ts JOIN hypotheses h ON h.id = ts.hypothesis_id"
+                    "  WHERE ts.program_id = $1::uuid AND ts.impact_class IS NULL"
+                    "  ORDER BY ts.created_at LIMIT 1",
+                    (self.program_id,),
+                )
+                answers["blocked"] = self.connection.execute(
+                    "SELECT ready_for(t.*) FROM tasks t"
+                    " WHERE t.program_id = $1::uuid AND t.kind = 'perform'"
+                    "   AND t.finding_id IS NULL LIMIT 1",
+                    (self.program_id,),
+                ).scalar()
+                raise Rollback
+        except Rollback:
+            pass
+
+        # The claim settled when the Finding was opened, so a detection Task on
+        # it is refused for exactly the reason this ticket had to carve an
+        # impact Task out of: `supported` is not `testable`.
+        self.assertEqual("perform.claim_not_testable", str(answers["blocked"]))
+
+
+
 class UnreadyTaskTest(ClaimFixture, SchedulerFixture, DatabaseCase):
     """Ticket 158: a Task the scheduler will never call ready must end.
 
