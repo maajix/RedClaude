@@ -227,6 +227,16 @@ CHOICE = "SELECT record_choice($1::uuid, $2, $3, $4)"
 #: and a document behind a tool call is a document a model can decline to read.
 #: Its Slate section is dropped on the way in -- `Capsule.brief` -- so the one
 #: copy of the entries is still the one `get_slate` serves.
+#:
+#: The last paragraph is ticket 105's, and it is here for ticket 221's reason: a
+#: served verb no objective mentions is never called. `mcp__rk2__request_validation`
+#: is the orchestrator's half of the hand-off `20260815T180000Z:632-634` describes,
+#: and without a sentence asking for it every Finding this campaign opens stops at
+#: `candidate` -- which is what nine of them did on `rk2here` before it was written.
+#: `get_evidence` is named because it is the only tool this role holds that carries
+#: a Finding label at all (`packet.py:588`); one ask per generation rather than one
+#: per Finding, because a second ask about the same Finding is refused and a role
+#: that asked nine times would spend eight calls learning that.
 PLANNING = (
     "Choose the Task this harness runs next.\n\n"
     "You are {session}, generation {generation} of this campaign. What the "
@@ -240,7 +250,14 @@ PLANNING = (
     "You are choosing, not running. Nothing you pick is executed by you, and the "
     "runtime re-checks the Task inside the transaction that claims it: a label this "
     "Slate no longer carries is refused rather than replaced. Name nothing and the "
-    "runtime claims the first entry that still holds."
+    "runtime claims the first entry that still holds.\n\n"
+    "This campaign's Findings are yours to move as well. Call "
+    "mcp__rk2__get_evidence with no arguments and read the finding_label on the "
+    "rows it answers with: each distinct label is a claim this Program believes "
+    "and has not proved. Pick the one whose evidence reads strongest and call "
+    "mcp__rk2__request_validation once with that label. A Finding somebody "
+    "already asked about answers with a refusal naming its state, which costs "
+    "one call and tells you to name a different one next generation."
 )
 
 #: What ends a worker run, said to the worker. Every one of them is a mechanism

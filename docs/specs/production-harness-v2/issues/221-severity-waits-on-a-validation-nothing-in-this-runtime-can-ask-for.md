@@ -2,9 +2,10 @@
 
 **What to build:** Nothing here. This ticket is the measurement that shows what
 ticket 105 costs, taken by building the wrong fix first and watching it be
-refused. Close it when 105 lands.
+refused. Close it when a Finding reaches `validated` with no operator command.
 
-**Blocked by:** 105.
+**Blocked by:** 224. It was 105 until 2026-08-30; see "What 105 closed and what
+it did not" below.
 
 **Status:** ready-for-agent
 
@@ -98,6 +99,27 @@ sentence is one line. It does not work, and the reason is one query away.
 - [ ] **A validated Finding gets a band.** Once 105 lands, whichever run holds
       a validated Finding asks for the severity -- and the objective sentence
       reverted here is the one to restore, moved to that kind.
-- [ ] **`rk finding` says where severity comes from.** An operator reading
+- [x] **`rk finding` says where severity comes from.** An operator reading
       eight `info` Findings cannot tell a judgement from a gap. Free, and true
-      whether or not 105 lands.
+      whether or not 105 lands. Done 2026-08-30: the `finding` parser gained a
+      `description` saying that `info` means unjudged rather than harmless, and
+      that the order is validate, then a band, then a report.
+
+## What 105 closed and what it did not, 2026-08-30
+
+105 landed. It built the producer this ticket said was missing:
+`propose_validation` is served, `orchestrator` holds
+`mcp__rk2__request_validation`, and `execution.PLANNING` now asks for one
+Finding per generation by name -- which is this ticket's own lesson applied,
+since a served verb no objective mentions is never called.
+
+The bracketed step in the chain above is still not taken automatically. The ask
+fills `validation_queue`; the queue's only drain is `rk finding validate`, run
+by a person. So criteria 1 and 2 are not 105's after all -- they are ticket
+224's, and this ticket is reblocked on it rather than closed.
+
+Criterion 2's sentence still has no kind to move to. `state_severity` is held by
+`web_hunter` alone, whose kinds are `hunt` and `conclude`, and a `conclude` child
+creates a candidate Finding rather than meeting a validated one. Whichever shape
+224 takes has to say which run meets a validated Finding before that sentence has
+anywhere to go; a `validate` Task kind (224's shape 2) would be that run.

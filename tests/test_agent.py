@@ -1016,27 +1016,19 @@ class ServedToolTest(unittest.TestCase):
 
         self.assertEqual(sorted(agent.BARE.values()), sorted(offered))
 
-    def test_the_contracts_no_launch_serves_are_the_two_the_runtime_answers_for(self):
-        """The declared surface is wider than the served one, and by how much.
+    def test_no_contract_is_declared_that_a_launch_does_not_serve(self):
+        """The declared surface and the served one, and the gap between them.
 
-        Two now -- `mcp__rk2__request_report` and `mcp__rk2__request_validation`
-        -- and both are ticket 105's: the runtime asks for a validation and files
-        a report on its own connection, so each model-facing contract is a name
-        the roster keeps for the risk rules and the allowlists until that ticket
-        decides between a handler and a deletion. The third that stood here is
-        ticket 104's, which serves parking a Tool run for a human like everything
-        else, and the two before that were ticket 87's, which asks a tool run of
-        the supervisor across the pipe the child was launched on. Pinned as a
-        list because a third entry appearing here is a tool some role holds and
-        no child can call.
+        Empty since ticket 105, which closed the last two: `request_validation`
+        is served like every other tool, and `request_report` is deleted from
+        `CONTRACTS` and recorded in `roster.RETIRED_CONTRACTS`, because moving a
+        Finding from validated to reported is a person's step. The two before
+        those were ticket 104's parking and ticket 87's supervisor ask, and each
+        was closed the same way. Pinned as an empty list because an entry
+        appearing here is a tool some role holds and no child can call, which is
+        a promise the roster makes and the launch does not keep.
         """
-        self.assertEqual(
-            [
-                "mcp__rk2__request_report",
-                "mcp__rk2__request_validation",
-            ],
-            sorted(set(roster.CONTRACTS) - set(agent.SERVED)),
-        )
+        self.assertEqual([], sorted(set(roster.CONTRACTS) - set(agent.SERVED)))
 
     def test_every_tool_is_offered_with_its_roster_schema_and_one_description(self):
         # The schema is the pair's promise and the gate is ours, so the served

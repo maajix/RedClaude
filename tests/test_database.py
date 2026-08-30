@@ -4964,7 +4964,7 @@ PACKET_BODY = b"the Program stored these bytes: "
 
 #: What the canonical half of the database is, in the terms criterion 4 is
 #: about. A Mission result that promoted anything, set a Task's lifecycle, or
-#: queued a report or a validation would move one of these numbers.
+#: queued a validation would move one of these numbers.
 CANONICAL_SNAPSHOT = """
 SELECT (SELECT count(*) FROM entities),
        (SELECT count(*) FROM hypotheses),
@@ -4974,7 +4974,6 @@ SELECT (SELECT count(*) FROM entities),
        (SELECT count(*) FROM tasks),
        (SELECT coalesce(md5(string_agg(t.status, '|' ORDER BY t.id)), '') FROM tasks t),
        (SELECT count(*) FROM validation_queue),
-       (SELECT count(*) FROM report_queue),
        (SELECT count(*) FROM verdicts)
 """
 
@@ -5556,7 +5555,7 @@ class MissionPacketTest(DatabaseCase):
         # no database at all; this is the third, independent statement of the
         # same thing, made where a bug in either of the other two would still be
         # caught.
-        for table in ("proposals", "proposal_drops", "entities", "tasks", "report_queue"):
+        for table in ("proposals", "proposal_drops", "entities", "tasks", "validation_queue"):
             with self.subTest(table=table):
                 self.assertFalse(
                     self.connection.execute(
@@ -52782,6 +52781,10 @@ class DownstreamVerbTest(ChainFixture, DatabaseCase):
     IMPACT_TASK = "SELECT propose_impact_task($1, $2::jsonb, $3::uuid)"
     SEVERITY = "SELECT propose_severity($1, $2, $3, $4)"
     REPORT = "SELECT propose_finding_report($1, $2::jsonb)"
+    #: Ticket 105's, and the one verb of this family the orchestrator holds
+    #: rather than the role that owns the Finding. One argument, because 011
+    #: built the queue with no column for a reason.
+    VALIDATION = "SELECT propose_validation($1)"
 
     #: Three claims on three subjects, for 40's reason: `finding_signature` is
     #: the class and the subject's dedup key, so two Findings of one class about
@@ -52850,6 +52853,14 @@ class DownstreamVerbTest(ChainFixture, DatabaseCase):
         cls.stated = cls.called(
             cls.SEVERITY, (cls.label, cls.BAND, "demonstrated_impact", cls.RATIONALE)
         )
+
+        # Last, because it is the only one of these verbs that leaves a row the
+        # others read past: `validation_queue` is a state and not a log, so an
+        # ask made earlier would be part of the arrangement every case above is
+        # asserted against rather than a thing this class does.
+        cls.asked = cls.called(cls.VALIDATION, (cls.label,))
+        cls.asked_twice = cls.called(cls.VALIDATION, (cls.label,))
+        cls.unheld_validation = cls.called(cls.VALIDATION, (cls.ABSENT,))
 
     # -- the arrangement -------------------------------------------------------
 
@@ -53177,6 +53188,31 @@ class DownstreamVerbTest(ChainFixture, DatabaseCase):
                          tuple(int(count) for count in after))
 
     # -- criterion 3: the word that was said ------------------------------------
+
+    # -- ticket 105: the ask the orchestrator makes ----------------------------
+
+    def test_a_finding_this_program_holds_is_queued_by_the_label_alone(self):
+        # `validated` and already once through the queue, which is the state the
+        # `ON CONFLICT ... WHERE state = 'done'` arm exists for: a second
+        # reproduction is asked for the same way the first one was.
+        self.assertEqual({"outcome": "queued", "finding": self.label}, self.asked)
+
+    def test_a_second_ask_about_one_finding_says_which_state_it_is_already_in(self):
+        # A refusal and not an error, because the orchestrator asks once per
+        # generation and has no way to read the queue: the answer is what tells
+        # it to name a different Finding next time.
+        self.assertEqual(
+            {"outcome": "refused", "finding": self.label,
+             "refusal": f"a validation of {self.label} is already queued"},
+            self.asked_twice,
+        )
+
+    def test_a_label_this_program_does_not_hold_is_refused_by_the_ask_as_well(self):
+        self.assertEqual(
+            {"outcome": "refused",
+             "refusal": f"{self.ABSENT} is not a Finding of this Program"},
+            self.unheld_validation,
+        )
 
     def test_a_label_this_program_does_not_hold_is_named_in_the_refusal(self):
         # The word rather than a uuid, because the word is what the run said and

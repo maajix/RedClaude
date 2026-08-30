@@ -1272,7 +1272,20 @@ def build_parser() -> argparse.ArgumentParser:
     replaying.set_defaults(run=_test_replay)
 
     findings = commands.add_parser(
-        "finding", help="what a candidate Finding has to survive to become a real one"
+        "finding",
+        help="what a candidate Finding has to survive to become a real one",
+        # Ticket 221. An operator reading a page of `info` Findings cannot tell a
+        # judgement from a gap, and both are spelled `info`. The order is a rule
+        # of this schema rather than a habit -- `state_severity` is the only
+        # writer of `findings.severity` and it refuses a Finding that is not
+        # validated -- so it is said here, where somebody meets the Findings.
+        description=(
+            "A Finding is born a candidate and severity `info`, and `info` here "
+            "means nobody has judged it rather than that somebody judged it "
+            "harmless. A band is stated about a validated Finding and about no "
+            "other kind, so the order is fixed: validate first, then a severity "
+            "can be stated, then the Finding can be reported."
+        ),
     )
     judgements = findings.add_subparsers(dest="operation", required=True, metavar="operation")
 

@@ -167,7 +167,7 @@ class WiringGateTest(unittest.TestCase):
         register = {
             key: owed
             for key, owed in check_wiring.OWED_GAPS.items()
-            if key not in ("W7 guard_satisfiability", "W8 report_queue")
+            if key not in ("W7 guard_satisfiability", "W6 artifacts_due_for_purge")
         }
         register["W1 mcp__rk2__nothing_declares_this"] = "owed:105"
         stderr = io.StringIO()
@@ -178,10 +178,9 @@ class WiringGateTest(unittest.TestCase):
 
         self.assertEqual(1, code)
         self.assertEqual(
-            "wiring failed: unregistered: no standing check named guard_satisfiability asserts"
+            "wiring failed: unregistered: nothing selects from artifacts_due_for_purge\n"
+            "unregistered: no standing check named guard_satisfiability asserts"
             " that no guard requires a row another guard refuses\n"
-            "unregistered: mcp__rk2__request_report writes report_queue and nothing ever inserts"
-            " into it\n"
             "register: W1 mcp__rk2__nothing_declares_this names owed:105 and this tree has no"
             " such gap; remove the row",
             stderr.getvalue().strip(),

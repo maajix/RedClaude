@@ -147,27 +147,31 @@ SERVER_VERSION = "0.1.0"
 #: Serving it widens nothing, because serving is not granting: `allowed_tools`
 #: intersects the roster's grants with this list, and `web_hunter` is the only
 #: role the roster grants the group to.
+#:
+#: `sched.pick` joined this list with ticket 105, which is the last group that
+#: was served in part. Its three members are the Slate the orchestrator is
+#: offered, the choice it makes on it, and the validation it asks for; the
+#: fourth member it used to have is retired rather than served, so the group has
+#: nothing withheld and is served whole. Serving it widens nothing for the same
+#: reason as `state.conclude`: `allowed_tools` intersects the roster's grants
+#: with this list, and `orchestrator` is the only role the roster grants it to.
 SERVED_GROUPS = (
     "state.read", "state.propose", "net.request", "validate.judge", "exec.tool_run",
-    "state.conclude", "exec.browser_run", "sched.park",
+    "state.conclude", "exec.browser_run", "sched.park", "sched.pick",
 )
 
-#: The one group served in part, and exactly which of its members. `sched.pick`
-#: is four tools built by three tickets: the two here are the Slate the
-#: orchestrator is offered and the choice it makes on it, and the other two --
-#: validation and a report -- are requests ticket 105 serves. Those two are the
-#: whole of what this tree declares and no launch serves. The ask that stops the
-#: work for a person used to be a third name here; ticket 101 moved it to
-#: `sched.park`, which has one member and is therefore served whole above. That
-#: move is exactly the case the check below exists for: naming the members is
-#: what keeps the difference visible, because a group is served whole unless
-#: there is a list saying which part, and the list is checked against the group
-#: it claims to be part of, so a tool that later moved to another authority
-#: class fails the compile here rather than arriving quietly on the
-#: orchestrator's allowlist.
-SERVED_MEMBERS = {
-    "sched.pick": ("mcp__rk2__get_slate", "mcp__rk2__pick_task")
-}
+#: Groups served in part, and exactly which of their members. Empty since ticket
+#: 105 and kept because the mechanism is what makes a withholding visible: a
+#: group is served whole unless there is a list saying which part, and the list
+#: is checked against the group it claims to be part of, so a tool that later
+#: moved to another authority class fails the compile here rather than arriving
+#: quietly on a role's allowlist.
+#:
+#: Two entries have passed through it and both left the same way. The ask that
+#: stops the work for a person was here until ticket 101 moved it to
+#: `sched.park`. `sched.pick` was here until ticket 105 served its third member
+#: and retired its fourth, which left it with nothing withheld.
+SERVED_MEMBERS: dict[str, tuple[str, ...]] = {}
 
 #: Everything this launch actually serves. The roster says what a role may
 #: call; this says what exists to be called, and the allowlist a launch carries
@@ -313,6 +317,12 @@ MINT_CALLBACK = "SELECT request_callback_correlator($1, $2, $3, $4::uuid)"
 IMPACT = "SELECT propose_impact_task($1, $2::jsonb, $3::uuid)"
 SEVERITY = "SELECT propose_severity($1, $2, $3, $4)"
 REPORT = "SELECT propose_finding_report($1, $2::jsonb)"
+
+#: Ticket 105's, and the wrapper for the same reason the three above are
+#: wrappers: `request_validation` takes two uuids and this surface speaks in
+#: labels. `propose_validation` resolves the one it is given against this
+#: Program's rows and answers the queue row or the refusal as a document.
+VALIDATION = "SELECT propose_validation($1)"
 
 #: Ticket 104's, and the one statement on this dispatch that resolves a label
 #: before it sends it. `park_task_for_human` takes the Task as a uuid and the
@@ -1489,6 +1499,7 @@ class _Tools:
             roster.STATE_SEVERITY,
             roster.COMPOSE_FINDING_REPORT,
             roster.PARK_FOR_HUMAN,
+            roster.REQUEST_VALIDATION,
             NAME_TRANSCRIPTS,
             BIND_SESSION,
         ):
@@ -1579,6 +1590,9 @@ class _Tools:
 
         if verb == roster.PARK_FOR_HUMAN:
             return self._park(connection, call)
+
+        if verb == roster.REQUEST_VALIDATION:
+            return self._validation(connection, call)
 
         if verb == roster.BROWSE:
             return self._browse(connection, call)
@@ -1887,6 +1901,24 @@ class _Tools:
                 str(arguments.get("basis") or ""),
                 str(arguments.get("rationale") or ""),
             ),
+        )
+
+    def _validation(
+        self, connection: pg.Connection, given: object
+    ) -> Mapping[str, object]:
+        """Carry one ask for a validation to the runtime and answer what it said.
+
+        The one declared argument and nothing else. There is no Agent run among
+        them and no Program either: the queue row is one per Finding and the
+        Program is bound on the connection, so what the orchestrator contributes
+        is which Finding it thinks is worth judging. What becomes of the ask is
+        `request_validation`'s and this side adds nothing to it -- a Finding
+        already queued comes back refused in the queue's own words, which is the
+        answer an orchestrator asking twice should get.
+        """
+        arguments = given if isinstance(given, Mapping) else {}
+        return self._carried(
+            connection, VALIDATION, (str(arguments.get("finding_label") or ""),)
         )
 
     def _report(

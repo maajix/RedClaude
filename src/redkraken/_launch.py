@@ -998,6 +998,16 @@ DESCRIPTIONS = {
         "re-checks the Task before it claims it and refuses a label this Slate no "
         "longer carries."
     ),
+    "request_validation": (
+        "Ask for one candidate Finding of this Program to be validated, by its label. "
+        "A validation reproduces the Test the Finding was born from and has a blind "
+        "session judge that reproduction alone; until one is asked for, a Finding "
+        "stays a candidate and can state no severity.\n\n"
+        "You are asking, not deciding. The runtime performs the reproduction and the "
+        "judgement, and neither is yours to see. A Finding already queued or already "
+        "being judged is refused in the queue's own words, which is the answer to "
+        "asking twice rather than something to correct and re-send."
+    ),
     "get_validation_packet": (
         "Fetch the one validation packet this session was started with: the Finding "
         "as facts, the claim it rests on, the Test's actions and assertions, both "
@@ -1425,6 +1435,13 @@ def server(
         "mint_callback": partial(_callback, surface, minting),
         "get_slate": partial(_slate, surface, picking),
         "pick_task": partial(_pick, surface, picking),
+        # `_carry` and not `_pick`, because the two members of `sched.pick` above
+        # are answered out of the Slate this process already holds and this one
+        # is a row on the other side of the pipe. Ticket 105.
+        "request_validation": partial(
+            _carry, surface, channel, "request_validation",
+            "this run was started with no supervisor to ask; nothing was queued",
+        ),
         "get_validation_packet": partial(_packet, surface, judging),
         "submit_verdict": partial(_judge, surface, judging),
     }
@@ -1564,20 +1581,20 @@ def _tool_run(surface: Surface, channel: Channel | None, name: str):
 def _carry(surface: Surface, channel: Channel | None, name: str, nothing: str):
     """One verb the supervisor runs against the database, carried and reported back.
 
-    Three tools are this function, for `_tool_run`'s reason and with one
-    difference from it: those two start a container and these three write a row,
+    Five tools are this function, for `_tool_run`'s reason and with one
+    difference from it: those two start a container and these five write a row,
     and neither can be answered on this side of the boundary, because this
     process has no container runtime and no database.  What crosses is the call
     the model made, unchanged; what comes back is what the verb said, including
     a refusal, which is reported as a refusal rather than as a tool that failed.
 
     Nothing is counted here, unlike `Specification` beside it.  Each of the
-    three reaches a verb that refuses by answering rather than by raising and
+    five reaches a verb that refuses by answering rather than by raising and
     writes nothing when it refuses, so a ceiling on this side would be a second
     opinion about a call the database has already decided for nothing.
 
     The sentence a run with no supervisor is told is a parameter because it is
-    the only thing that differs between the three, and it has to differ: a park
+    the only thing that differs between the five, and it has to differ: a park
     answered with "nothing was run" would be telling a model about a tool image
     it never asked about.
 

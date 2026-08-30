@@ -197,10 +197,11 @@ class Gap:
 #: before it was written down, which is the only way a register can be honest
 #: about what it excuses.
 OWED_GAPS: dict[str, str] = {
-    # W1. Two Contracts are declared and served by nothing. Ticket 105 decides
-    # whether the two queue requests get a handler or a deletion.
-    "W1 mcp__rk2__request_report": "owed:105",
-    "W1 mcp__rk2__request_validation": "owed:105",
+    # W1. Empty since ticket 105, which decided the two queue requests it named
+    # here and decided them differently: `request_validation` is served, and
+    # `request_report` is retired into `roster.RETIRED_CONTRACTS` because
+    # `validated -> reported` is a step reserved for a person. A declared
+    # Contract served by nothing is still what W1 finds; there is none today.
 
     # W3. The four evidence profiles dispatch off a Task column nothing writes,
     # which is the whole of ticket 120.
@@ -285,21 +286,26 @@ OWED_GAPS: dict[str, str] = {
     "W5 browser_step_result": "owed:129",
     "W5 tool_run_artifact": "owed:129",
 
-    # W6. Twelve tables nothing inserts into and three views nothing selects.
+    # W6. Eleven tables nothing inserts into and three views nothing selects.
     # `cross_program_exempt_fks`, `program_isolation_candidates` and `secret_dek`
     # are not among them: all three are read as harmless by the database audit
     # and excluded by name in `producer_gaps`, above `BY_DESIGN`, rather than
     # owed here.
+    #
+    # `report_queue` was the twelfth until ticket 105 dropped it
+    # (`20261224T000000Z`). It is not re-pointed and not moved to `BY_DESIGN`:
+    # the relation is gone, so the gap it named cannot be found again.
     "W6 artifacts_due_for_purge": "owed:122",
-    "W6 report_queue": "owed:105",
 
     # W7. The one open contradiction, and the standing check that would have to
     # find the next one. Ticket 116 narrows the two triggers that refuse the one
     # Receipt a probe-only transport claim is allowed to rest on.
     "W7 guard_satisfiability": "owed:116",
 
-    # W8. The declared write target with neither a writer nor a handler.
-    "W8 report_queue": "owed:105",
+    # W8. Empty since ticket 105, which was the ticket every row here owed to.
+    # `mcp__rk2__request_report` is retired into `roster.RETIRED_CONTRACTS` and
+    # `report_queue` is dropped, so there is no Contract left declaring a write
+    # target nothing writes.
 
     # W9. The declared property classes nothing emits, and the Playbook bodies
     # that name one as though it did. Ticket 101 took the emitters and delivered
@@ -1615,10 +1621,12 @@ def write_target_gaps(wiring: Wiring) -> list[Gap]:
     """W8: a Contract's declared write target is a real relation with a real writer.
 
     The place where the Python layer and the schema layer each declare half of a
-    feature and neither implements it. `mcp__rk2__request_report` names
-    `report_queue` as what it writes; the table exists, carries a CHECK, two row
-    policies and a program-scoping registration, and nothing has ever put a row
-    in it, because the tool that would has no handler.
+    feature and neither implements it. `mcp__rk2__request_report` named
+    `report_queue` as what it writes; the table existed, carried a CHECK, two row
+    policies and a program-scoping registration, and nothing ever put a row in
+    it, because the tool that would had no handler. Ticket 105 settled that pair
+    by retiring both, which is why this gate finds nothing today -- and it is
+    kept, because the shape it catches is one two layers can reach again.
     """
     catalogue = wiring.catalogue
     produced = (

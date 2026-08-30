@@ -1009,11 +1009,17 @@ TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     # is free to refuse. There is no `promote` here at all: promotion is the
     # runtime step that turns a raw result into canonical rows, and a model-
     # facing verb for it would be the agent promoting its own conclusions.
+    #
+    # Three members and not four since ticket 105. `request_report` is retired
+    # into `RETIRED_CONTRACTS` below, because the step it would have queued is
+    # the one step reserved for a person -- `cli.py:1327-1339`, "`validated ->
+    # reported` is reserved for a human actor" -- so a model asking to be
+    # reported would be asking for a transition its own runtime may not make on
+    # its behalf.
     "sched.pick": (
         "mcp__rk2__get_slate",
         "mcp__rk2__pick_task",
         "mcp__rk2__request_validation",
-        "mcp__rk2__request_report",
     ),
     # A GROUP OF ITS OWN AND NOT A FIFTH MEMBER OF `sched.pick`. Ticket 104
     # built this verb so that a run could ask for the Task it is running to
@@ -1794,14 +1800,6 @@ CONTRACTS: dict[str, Contract] = {
             "finding_label": Argument("string", required=True, pattern=_label("F"))
         },
     ),
-    # No arguments. `report_queue` is one row per Program with a state and a
-    # timestamp and nothing to narrow by, so an argument here would be a filter
-    # the table cannot honour.
-    "mcp__rk2__request_report": Contract(
-        "sched.pick",
-        REQUEST,
-        writes=("report_queue",),
-    ),
     "mcp__rk2__park_for_human": Contract(
         "sched.park",
         REQUEST,
@@ -2141,6 +2139,30 @@ COMPOSE_FINDING_REPORT = "mcp__rk2__compose_finding_report"
 #: the others because it is the same dispatch and the same rule about naming a
 #: verb twice.
 PARK_FOR_HUMAN = "mcp__rk2__park_for_human"
+
+#: Ticket 105's, spelled here for the same reason: the supervisor dispatches on
+#: the verb name. It reaches `propose_validation` and not `request_validation`,
+#: for the reason the three `state.conclude` names above reach wrappers -- the
+#: granted verb takes two uuids and this surface speaks in labels.
+REQUEST_VALIDATION = "mcp__rk2__request_validation"
+
+#: Contracts this roster declared and will not serve, each with the reason. The
+#: shape `FORBIDDEN_BUILTINS` proves works, applied one layer up: a declared name
+#: that is neither in a tool group nor named here is a name nobody has decided
+#: about, and the compile refuses rather than leaving it to be found by an audit.
+#:
+#: One entry, and it is ticket 105's second half. Its sibling `request_validation`
+#: went the other way in the same ticket, because the two are different asks: a
+#: validation is a hand-off between two runtime roles, and a report is a request
+#: to take a step no part of the runtime may take.
+RETIRED_CONTRACTS: dict[str, str] = {
+    "mcp__rk2__request_report": (
+        "`validated -> reported` is reserved for a human actor (`cli.py:1327-1339`), "
+        "so a model asking to be reported would be asking for a transition its own "
+        "runtime may not make on its behalf; `report_queue` had no producer, no "
+        "consumer and is dropped with it (ticket 105)"
+    ),
+}
 
 #: Ticket 99's, spelled here for the reason all of the above are: the supervisor
 #: dispatches on the verb name. It is also the one name in this list the
@@ -3103,6 +3125,19 @@ def _check_contracts() -> None:
     if set(members) != set(CONTRACTS):
         difference = sorted(set(members) ^ set(CONTRACTS))
         raise RosterError(f"groups and contracts disagree about: {difference}")
+
+    # Ticket 105. A retired Contract is a decision and not a deletion, so the
+    # name stays here with its reason and stays out of everything else. Both
+    # halves matter: a retired name still in a group is a tool the roster
+    # declares and no launch serves -- which is the state this register exists
+    # to end -- and a reason left empty is a deletion wearing a register's
+    # clothes.
+    retired = set(RETIRED_CONTRACTS)
+    still_declared = sorted(retired & (set(members) | set(CONTRACTS)))
+    if still_declared:
+        raise RosterError(f"retired and still declared: {still_declared}")
+    if not all(reason for reason in RETIRED_CONTRACTS.values()):
+        raise RosterError("every retired contract states why it was retired")
 
     for name, contract in CONTRACTS.items():
         if TOOL_GROUPS.get(contract.group) is None or name not in TOOL_GROUPS[contract.group]:

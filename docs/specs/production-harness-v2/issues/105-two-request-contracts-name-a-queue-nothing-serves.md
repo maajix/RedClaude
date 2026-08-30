@@ -7,9 +7,9 @@ Contract pointing at it.
 
 **Blocked by:** 102 — Nothing in this tree has ever created a Finding.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `report_queue` is settled first, because it is the cleaner case.
+- [x] `report_queue` is settled first, because it is the cleaner case.
       Declared at `0020_state_access.sql:134` with a state CHECK, an FK to
       `programs`, two RLS policies, a row in that migration's program-scoping
       registry at `:185` and a row in `0030_corpus_corrections.sql` classifying
@@ -18,26 +18,26 @@ Contract pointing at it.
       and no function, view or Python module reads it. The only thing in the
       tree that names it as a write target is
       `src/redkraken/roster.py:722-725`, `writes=("report_queue",)`.
-- [ ] Contrast the two siblings in the same tool group, which do have
+- [x] Contrast the two siblings in the same tool group, which do have
       producers, and let the contrast decide the shape: `validation_queue` is
       filled by `rk finding validate` (`src/redkraken/cli.py:1278`) and
       `pending_decisions` by `park_authorized_tool_run` and
       `rk2_ask_about_impact`. `report_queue` has neither, so a handler for
       `request_report` would be the first writer of a table nothing drains.
-- [ ] `request_validation` is the one of the three unserved Contracts with a
+- [x] `request_validation` is the one of the three unserved Contracts with a
       written reason:
       `docs/specs/production-harness-v2/issues/37-validate-finding-blindly.md:94-97`
       says the verb exists, the CLI calls it, and "the tool it makes that step
       through belongs to the orchestrator dispatch ticket". That ticket is 102.
       This ticket does not re-argue 37; it records whether 102's answer serves
       this Contract or retires it.
-- [ ] Whichever way each goes, the roster stops carrying an undecided one. A
+- [x] Whichever way each goes, the roster stops carrying an undecided one. A
       Contract that will not be served is deleted from `CONTRACTS` or moved into
       the explicit `name -> reason` register ticket 130 introduces, in the shape
       `roster.FORBIDDEN_BUILTINS` (`roster.py:902-931`) already proves works:
       every built-in a role does not hold states why, and the compile refuses an
       unclassified one.
-- [ ] The two decisions are allowed to differ, and the ticket says so. A report
+- [x] The two decisions are allowed to differ, and the ticket says so. A report
       is a projection of what holds and the last step of one is reserved for a
       human (`cli.py:1331-1332`, "`validated -> reported` is reserved for a
       human actor"), which is an argument for retiring `request_report`
@@ -182,3 +182,66 @@ the last unbuilt half of a shipped feature (`src/redkraken/agent.py:155-167`):
 Nothing in this measurement changes the decision taken 2026-08-22. It prices
 the delay: a hunt that cannot ask for validation is a hunt whose output an
 operator has to finish by hand, one Finding at a time.
+
+## What was built, 2026-08-30
+
+Both halves of the decision taken on 2026-08-22, in that order.
+
+**`request_validation` is served.** Four pieces and no new design.
+
+- `20261224T000000Z__the_orchestrator_asks_for_a_validation.sql` adds
+  `propose_validation(text)`, the label-taking wrapper `propose_severity` and
+  `propose_finding_report` already prove: it resolves the label through
+  `rk2_finding_for_label`, answers `rk2_no_such_finding(p_label)` when there is
+  none, and catches every refusal class so one refused ask does not abort the
+  transaction the supervisor holds open across a run.
+- `roster.py` moves `mcp__rk2__request_validation` into a three-member
+  `sched.pick`, so the orchestrator holds it.
+- `agent.py` dispatches it to `_validation`, one arm beside `_park`.
+- `_launch.py` builds the handler with `_carry`, the same partial the other four
+  carried verbs use, and gives it a description.
+
+**`request_report` is retired and `report_queue` is dropped.** The same
+migration deletes the table's `purge_cascade_edges` and `event_table_exempt`
+rows and drops it; `20261225T000000Z__the_two_surfaces_the_previous_file_left_behind.sql`
+finishes the pair of registers `check_runtime_privileges` reads, because the
+first file left four `runtime_table_surface` rows naming nothing and one granted
+verb with no `runtime_verb_surface` row. The Contract itself moves into
+`roster.RETIRED_CONTRACTS`, a `name -> reason` dict the compile checks against
+`CONTRACTS` and every tool group, so a retired name that came back would be
+refused rather than silently re-served.
+
+**The objective asks for it.** This is ticket 221's lesson applied before it
+could repeat: `state_severity` was served and never called because no objective
+mentioned it. `execution.PLANNING` now ends with a paragraph naming
+`mcp__rk2__get_evidence` -- the only tool this role holds that carries a Finding
+label at all (`packet.py:588`) -- and `mcp__rk2__request_validation`, and it asks
+for one Finding per generation rather than one per Finding, because a second ask
+about the same Finding is refused and a role that asked nine times would spend
+eight calls learning that.
+
+## What it cost, and what it did not buy
+
+`validation_queue` now has a producer the runtime can reach. It still has only
+one drain, and that drain is a person: `rk finding validate`
+(`src/redkraken/validation.py`), reached from a terminal. Nothing in `hunt.sh`
+or `supervise.sh` calls it, and `grep -rn "validation_queue" src/redkraken/*.py`
+returns two hits, both in `validation.py`.
+
+So the ask is a work list rather than a hand-off that completes itself. That is
+still worth serving, and it is not the defect this ticket was opened against:
+`report_queue` had no drain at all, which is why it was dropped rather than
+served. The automatic drain is ticket 224.
+
+## What was verified
+
+- `tests/test_database.py::DownstreamVerbTest` gains three cases: a Finding this
+  Program holds is queued by the label alone, a second ask says which state it
+  is already in, and a label the Program does not hold is refused rather than
+  raised. 20 tests, all pass.
+- `tests/test_agent.py::test_no_contract_is_declared_that_a_launch_does_not_serve`
+  is the old `..._are_the_two_the_runtime_answers_for` with an empty list: 23
+  Contracts, 23 served, nothing declared that no launch answers.
+- `tools/check_wiring.py` W1 has no `owed` rows left, and its register comment
+  records both decisions rather than the open question it used to hold. All four
+  gates exit 0.
