@@ -25595,6 +25595,19 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
         )
         cls.after = cls.gate(cls.second)
 
+        # A call the grant admits, taken through the verb the runtime actually
+        # drives. `gate_tool_call` answering `allow` is half the statement; the
+        # other half is the row `authorize_tool_run` writes under it, and that
+        # is the half `check_receipt_integrity` reads. The first call RG1 ever
+        # admitted on `rk2here` left a row that named nobody, and every lap
+        # after it refused.
+        #
+        # Its own Tool run rather than `cls.second`, because that one is parked
+        # at the end of this arrangement and parking rewrites the receipt it
+        # would be read from.
+        cls.admitted = cls.body_bearing_receipt(run, task)
+        cls.call("SELECT authorize_tool_run($1::uuid)", (cls.admitted,))
+
         # A third call the grant must not reach: same host, different path.
         cls.elsewhere = cls.gate(
             cls.body_bearing_receipt(run, task, url=f"http://{HOST}/admin")
@@ -25610,6 +25623,21 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
         # And that same second call taken all the way to a filed question, which
         # is what the last case below tries to widen: a yes nobody gave.
         cls.unanswered = cls.park(cls.second)
+
+        # Both read last, so that what they are read against is everything
+        # above: a question asked and answered, a call a grant admitted, a call
+        # the grant would not reach, and a question nobody has answered.
+        cls.receipt = cls.as_owner(
+            "SELECT t.decision, t.decision_reason, d.label"
+            "  FROM tool_runs t"
+            "  LEFT JOIN pending_decisions d ON d.id = t.pending_decision_id"
+            " WHERE t.id = $1::uuid",
+            (cls.admitted,),
+        ).rows[0]
+        cls.integrity = cls.as_owner(
+            "SELECT * FROM check_receipt_integrity($1::uuid)",
+            (cls.identifiers[ROUTE_SLUG],),
+        ).rows
 
     @classmethod
     def tearDownClass(cls):
@@ -25723,8 +25751,39 @@ class RouteGrantTest(SchedulerFixture, DatabaseCase):
         # The one assertion this whole ticket exists for, and it is the same
         # receipt read twice: nothing about the call changed, only what the
         # operator had said about its route.
+        #
+        # `approval` is the DECISION and not the grant. It is the key
+        # `authorize_tool_run` resolves against `pending_decisions` to stamp
+        # `pending_decision_id`, so a grant label in it named no row and left a
+        # call allowed with no authority on it. The grant is not lost: it
+        # travels beside it, which is what tells this call apart from one the
+        # exact lookup answered.
         self.assertEqual("allow", self.after["decision"])
-        self.assertEqual(json.loads(str(self.granted))["label"], self.after["approval"])
+        self.assertEqual(self.first_label, self.after["approval"])
+        self.assertEqual(json.loads(str(self.granted))["label"], self.after["route_grant"])
+
+    def test_a_call_the_grant_admits_names_the_decision_it_was_widened_from(self):
+        # The receipt, not the verdict. A grant is a widening of one approved
+        # decision -- `grant_route` refuses to write one from anything else --
+        # so the decision it widens is the authority behind every call it
+        # admits, and `decision_reason` says which grant reached it.
+        decision, reason, named = self.receipt
+
+        self.assertEqual("allow", decision)
+        self.assertEqual(self.first_label, named)
+        self.assertEqual(
+            "call_risk_rules:net_unsafe_method via "
+            + json.loads(str(self.granted))["label"],
+            reason,
+        )
+
+    def test_the_receipt_a_grant_admits_is_one_the_standing_check_accepts(self):
+        # `standing:receipt_integrity` arm (e) refuses a call on a class whose
+        # policy is to ask that was allowed while naming no human decision, and
+        # a lap that fails it exits 9. Read over the whole Program rather than
+        # over the one row, because the arm the grant has to satisfy is the same
+        # arm parking has to satisfy and both are arranged above.
+        self.assertEqual((), self.integrity)
 
     def test_a_different_path_on_the_same_host_is_still_asked_about(self):
         # A grant is over a route and not over a host. Without this the verb
