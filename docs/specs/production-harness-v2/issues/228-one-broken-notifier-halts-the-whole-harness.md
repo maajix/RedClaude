@@ -6,7 +6,7 @@ decision and is written down here so it can be made, not built.
 
 **Blocked by:** nothing.
 
-**Status:** proposed
+**Status:** in-progress -- wall 2 built and applied, wall 1 owed as `T228-01`
 
 ## What was measured, 2026-08-30
 
@@ -152,5 +152,95 @@ POST, and the operator's own approval from an hour ago does not help.
 ## Acceptance
 
 1. A host with no session bus and a failing `desktop` channel produces a
-   refusal that names `desktop` and its last error.
-2. Wall 2 is answered by the operator: (a), (b), or neither, recorded here.
+   refusal that names `desktop` and its last error. **Owed**, carried as
+   `T228-01`.
+2. Wall 2 is answered by the operator: **(b), on 2026-08-30.** Built as
+   `20270102T000000Z__an_approved_route_stays_approved_until_it_expires.sql`,
+   applied to `rk2here`, and driven end to end: `RG1` over
+   `POST st.p.account.here.com/token` answers a second body-bearing call
+   without opening a question. Two follow-ups are owed and are named below.
+
+## What (b) shipped as
+
+`route_grants`, one row per standing statement, plus `live_route_grant_for`,
+`grant_route`, `revoke_route_grant`, and `rk decision grant-route` /
+`revoke-route`. `tests.test_database.RouteGrantTest` holds the database's half
+of it and `tests.test_operator.RouteGrantTest` holds the console's.
+
+The verb takes a decision **label**, not a route, and that is the safety
+property rather than a convenience: the route, the port, the path template,
+the identity slot and the risk rule all come from the digest the runtime
+built, so an operator can widen a question they answered yes to and cannot
+manufacture one they were never asked. A decision that is not `approved` is
+refused by name.
+
+Five lookups against the live `rk2here` digests, inside a rolled-back
+transaction. One matches and four deliberately do not:
+
+```
+D27 itself (same route)      -> RG1
+D28 (different identity)     -> no match
+D21 (different route)        -> no match
+host_in_scope false          -> no match
+unapproved_identity_slot set -> no match
+```
+
+* Only `gate_tool_call` reads it. `open_impact_replay` and `rk2_pivot_refusal`
+  reach `live_grant_for` too and keep asking: a grant to POST a token endpoint
+  is not consent to demonstrate impact, and ticket 226's whole point is that a
+  demonstration costs an operator answer. A `DO` block in the migration fails
+  if either of them ever starts reading it.
+* The risk rule is matched, but only at Program granularity, and that is a hole
+  rather than a design. `live_route_grant_for` takes no rule argument at all;
+  `gate_tool_call` guards the call with
+  `EXISTS (SELECT 1 FROM route_grants g WHERE g.program_id = tr.program_id AND
+  g.risk_rule = verdict ->> 'rule' ...)`, which asks whether the *Program* holds
+  a grant under that rule and not whether *this* grant does. A Program holding a
+  grant on route A under rule R and a grant on route B under rule R2 would let a
+  call on route B firing rule R be answered by the route-B grant, because the
+  unrelated route-A grant satisfies the `EXISTS`. With exactly one live grant
+  the hole cannot fire -- the only row the `EXISTS` can match is the one
+  `live_route_grant_for` would return -- so `rk2here` holds at most one until
+  `T228-02` closes it. Closing it means giving `live_route_grant_for` a rule
+  argument, which changes its signature and therefore its
+  `runtime_verb_surface` row, so it is a migration and not an edit.
+* `host_in_scope` and `unapproved_identity_slot` are read from the **live**
+  digest at every lookup rather than stored at grant time, so a host leaving
+  scope withdraws its grants in the same breath, with no sweep to run.
+* An expiry is mandatory and is a CHECK.
+* `live_grant_for` is untouched, asserted against its own text, so no approval
+  that exists today means anything different tomorrow.
+
+A `pending_decisions` row was tried first and refused by the schema, which was
+right to: `pending_decisions_key_matches_digest` requires the key to be
+`sha256(request_digest)`, and `pending_decisions_names_one_subject` requires
+every row to name an agent run, a tool run or a test. A standing grant names
+none of them, because it is not about a run.
+
+## What the dry run did not catch, and could not
+
+Those five lookups called `live_route_grant_for` directly, so not one of them
+went through the guard in front of it -- and the guard was wrong. The first
+build of `gate_tool_call`'s route-grant branch read `verdict ->> 'risk_rule'`.
+`assess_call_risk` returns
+`jsonb_build_object('risk_class', base, 'rule', rule, 'question_code', qc)`
+(`0026_human_control.sql:310`), so that key was NULL on every call, the `EXISTS`
+never held, and the whole branch was dead: the table would have been filled,
+audited and never read. `risk_rule` is the `pending_decisions` COLUMN the value
+lands in once `park_for_human` has written it down, which is where the wrong
+name came from; every other reader in the corpus uses `->> 'rule'`.
+
+The lesson is the one the file now carries as a comment: a SQL change is proven
+by driving the caller the runtime drives, not the function under test.
+
+## Still owed
+
+* `T228-01` -- acceptance 1. Wall 1 itself, untouched by any of the above.
+* `T228-02` -- the Program-wide `EXISTS`, matched against the grant it returns
+  instead. Until it lands, `rk2here` holds at most one live `route_grants` row.
+* `T228-03` -- two rough edges on the applied migration, which needs a follow-up
+  migration because an applied one may never be edited. `grant_route` lets an
+  hours value that floors to zero fall through to a raw
+  `route_grants_expires_after_grant` violation rather than refusing it in its
+  own words, and the audit trigger calls every UPDATE on `route_grants`
+  `route_grant.revoked`, including one that revokes nothing.

@@ -1926,6 +1926,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     withdrawing.set_defaults(run=_decision_supersede)
 
+    widening = tending.add_parser(
+        "grant-route",
+        help=f"let one approved question stand for its whole route (${HUMAN_URL})",
+    )
+    _add_url(widening, CONSOLE)
+    _add_program(widening)
+    widening.add_argument(
+        "label",
+        metavar="label",
+        help="the approved question to widen, as `rk decision list` cites it",
+    )
+    widening.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help="why this route may stand, in the operator's own words",
+    )
+    widening.add_argument(
+        "--hours",
+        type=float,
+        default=operator.DEFAULT_GRANT_HOURS,
+        metavar="hours",
+        help=(
+            "how long the route stays granted "
+            f"(default: {operator.DEFAULT_GRANT_HOURS:g})"
+        ),
+    )
+    widening.set_defaults(run=_decision_grant_route)
+
+    revoking = tending.add_parser(
+        "revoke-route",
+        help=f"withdraw a route grant before it expires (${HUMAN_URL})",
+    )
+    _add_url(revoking, CONSOLE)
+    _add_program(revoking)
+    revoking.add_argument("label", metavar="label", help="the route grant to withdraw")
+    revoking.add_argument(
+        "--reason",
+        required=True,
+        metavar="text",
+        help="why it is being withdrawn rather than left to expire",
+    )
+    revoking.set_defaults(run=_decision_revoke_route)
+
     halting = commands.add_parser(
         "halt",
         help=f"Halt a Program: no egress and no new work until it is lifted (${HUMAN_URL})",
@@ -3311,6 +3355,30 @@ def _decision_supersede(arguments: argparse.Namespace) -> int:
         arguments,
         operator.SUPERSEDE,
         lambda console: operator.supersede(
+            console, arguments.program, arguments.label, reason=arguments.reason
+        ),
+    )
+
+
+def _decision_grant_route(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.GRANT_ROUTE,
+        lambda console: operator.grant_route(
+            console,
+            arguments.program,
+            arguments.label,
+            reason=arguments.reason,
+            hours=arguments.hours,
+        ),
+    )
+
+
+def _decision_revoke_route(arguments: argparse.Namespace) -> int:
+    return _with_settings(
+        arguments,
+        operator.REVOKE_ROUTE,
+        lambda console: operator.revoke_route(
             console, arguments.program, arguments.label, reason=arguments.reason
         ),
     )

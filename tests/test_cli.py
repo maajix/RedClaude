@@ -772,9 +772,9 @@ class DecisionCommandTest(unittest.TestCase):
 
 
 class OperatorCommandTest(unittest.TestCase):
-    """The five commands a person runs, up to the point where a database is needed.
+    """The seven commands a person runs, up to the point where a database is needed.
 
-    All five read `RK_HUMAN_URL` and nothing else. That is the ticket's fourth
+    All seven read `RK_HUMAN_URL` and nothing else. That is the ticket's fourth
     criterion as an operator meets it: the connection that answers a question or
     lifts a Halt is a role the runtime cannot become, so exporting the runtime's
     URL has to be a refusal naming the variable this one wanted rather than a
@@ -786,6 +786,8 @@ class OperatorCommandTest(unittest.TestCase):
             ("decision", "list"): (),
             ("decision", "answer"): ("--program", "p", "D1", "--approve", "--reason", "x"),
             ("decision", "supersede"): ("--program", "p", "D1", "--reason", "x"),
+            ("decision", "grant-route"): ("--program", "p", "D1", "--reason", "x"),
+            ("decision", "revoke-route"): ("--program", "p", "RG1", "--reason", "x"),
             ("halt",): ("--program", "p", "--reason", "x"),
             ("resume",): ("--program", "p", "--reason", "x"),
         }
@@ -799,6 +801,8 @@ class OperatorCommandTest(unittest.TestCase):
                 "decision list": "environment:RK_HUMAN_URL",
                 "decision answer": "environment:RK_HUMAN_URL",
                 "decision supersede": "environment:RK_HUMAN_URL",
+                "decision grant-route": "environment:RK_HUMAN_URL",
+                "decision revoke-route": "environment:RK_HUMAN_URL",
                 "halt": "environment:RK_HUMAN_URL",
                 "resume": "environment:RK_HUMAN_URL",
             },
@@ -826,6 +830,8 @@ class OperatorCommandTest(unittest.TestCase):
         for command in (
             ("decision", "answer", "--program", "p", "D1", "--deny"),
             ("decision", "supersede", "--program", "p", "D1"),
+            ("decision", "grant-route", "--program", "p", "D1"),
+            ("decision", "revoke-route", "--program", "p", "RG1"),
             ("halt", "--program", "p"),
             ("resume", "--program", "p"),
         ):
@@ -2282,6 +2288,7 @@ class OperatorSurfaceTest(unittest.TestCase):
         "Halt/clear": ("halt", "resume"),
         "pending decisions": (
             "decision sweep", "decision list", "decision answer", "decision supersede",
+            "decision grant-route", "decision revoke-route",
         ),
         "integrity": ("db verify", "artifact audit", "evidence verify"),
         "import": ("import",),
@@ -2314,7 +2321,7 @@ class OperatorSurfaceTest(unittest.TestCase):
         "--content-sha256", "--content-type", "--correlator", "--database", "--deny",
         "--discovery", "--egress", "--every", "--finding", "--fixture", "--for",
         "--from", "--gate", "--grant-hours", "--header", "--help", "--host",
-        "--identity", "--image", "--impact", "--into", "--key", "--kind", "--label",
+        "--hours", "--identity", "--image", "--impact", "--into", "--key", "--kind", "--label",
         "--limit", "--method", "--narrative", "--offset", "--out", "--panel", "--path",
         "--peer", "--plan", "--playbook", "--port", "--program", "--proxy", "--reason",
         "--record", "--redacted", "--rendering", "--state-url", "--subject",
@@ -2327,6 +2334,7 @@ class OperatorSurfaceTest(unittest.TestCase):
         cls.commands = leaves()
         cls.operator_verbs = {
             operator.LIST, operator.ANSWER, operator.SUPERSEDE,
+            operator.GRANT_ROUTE, operator.REVOKE_ROUTE,
             operator.HALT, operator.RESUME, operator.REPORT, operator.CLEAR,
         }
 
@@ -2340,7 +2348,7 @@ class OperatorSurfaceTest(unittest.TestCase):
 
         `rk2_human` is the only role the control verbs are granted to, so a verb
         wired to any other connection string is a verb that cannot work -- and a
-        verb on that connection that is not one of the seven would be a route to
+        verb on that connection that is not one of the nine would be a route to
         the operator's role from something that is not the operator's console.
         """
         self.assertEqual(
@@ -2353,7 +2361,7 @@ class OperatorSurfaceTest(unittest.TestCase):
         )
 
         # And the one command that holds the operator's connection without
-        # being one of the verbs. 60's console renders those same seven as
+        # being one of the verbs. 60's console renders seven of those nine as
         # forms and calls the same functions, so it is given the connection they
         # run on -- under a flag of its own, because its reads are the
         # runtime's and a single URL doing both would run them as the operator.
@@ -2401,7 +2409,7 @@ class OperatorSurfaceTest(unittest.TestCase):
     def test_every_operator_mutation_carries_the_sentence_behind_it(self):
         """Criterion 3 where the risk is a decision rather than a resource.
 
-        The reason is required and not defaulted, because these six are the
+        The reason is required and not defaulted, because these eight are the
         writes an audit reads afterwards, and a reason argparse supplied would be
         a record of nobody's judgement.
         """

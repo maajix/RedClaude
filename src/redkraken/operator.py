@@ -31,6 +31,8 @@ from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, report
 LIST = "decision list"
 ANSWER = "decision answer"
 SUPERSEDE = "decision supersede"
+GRANT_ROUTE = "decision grant-route"
+REVOKE_ROUTE = "decision revoke-route"
 HALT = "halt"
 RESUME = "resume"
 REPORT = "finding report"
@@ -66,6 +68,8 @@ QUEUE = (
 BIND = "SELECT set_config('rk2.program_id', $1, false)"
 ANSWER_DECISION = "SELECT answer_decision($1, $2, $3, $4::interval)"
 SUPERSEDE_DECISION = "SELECT supersede_decision($1, $2)"
+GRANT_ROUTE_SQL = "SELECT grant_route($1, $2::numeric, $3)"
+REVOKE_ROUTE_SQL = "SELECT revoke_route_grant($1, $2)"
 HALT_PROGRAM = "SELECT halt_program($1::uuid, $2)"
 CLEAR_HALT = "SELECT clear_program_halt($1::uuid, $2)"
 REPORT_FINDING = "SELECT report_finding($1, $2::uuid, $3, $4)"
@@ -151,6 +155,58 @@ def supersede(human: pg.Settings | None, slug: str, label: str, *, reason: str) 
         lambda connection, _: connection.execute(SUPERSEDE_DECISION, (label, reason)),
         held=f"{label} was withdrawn",
         refused=f"{label} was not withdrawn",
+        label=label,
+    )
+
+
+def grant_route(
+    human: pg.Settings | None,
+    slug: str,
+    label: str,
+    *,
+    reason: str,
+    hours: float,
+) -> Report:
+    """Widen one approved decision into a standing grant over its route.
+
+    The verb to reach for when the same question keeps arriving. A call opened
+    body-bearing carries a nonce in its digest -- the bytes are chosen after the
+    row is written -- so its equivalence key matches nothing and the approval
+    given an hour ago cannot answer it. Four approvals went on one OAuth token
+    endpoint on `rk2here` in a single day, each one halting the campaign.
+
+    A label rather than a route, and that is the safety property: the route, the
+    rule and the identity all come from the digest the runtime built, so an
+    operator can widen a question they answered yes to and cannot manufacture
+    one they were never asked.
+    """
+    return _verb(
+        GRANT_ROUTE,
+        human,
+        slug,
+        lambda connection, _: connection.execute(
+            GRANT_ROUTE_SQL, (label, hours, reason)
+        ),
+        held=f"{label} was widened into a route grant",
+        refused=f"{label} was not widened",
+        label=label,
+        hours=hours,
+    )
+
+
+def revoke_route(human: pg.Settings | None, slug: str, label: str, *, reason: str) -> Report:
+    """Withdraw a standing route grant before it expires.
+
+    The other direction, and the reason a grant may be left standing at all: an
+    operator who changes their mind does not have to wait for an expiry.
+    """
+    return _verb(
+        REVOKE_ROUTE,
+        human,
+        slug,
+        lambda connection, _: connection.execute(REVOKE_ROUTE_SQL, (label, reason)),
+        held=f"{label} was revoked",
+        refused=f"{label} was not revoked",
         label=label,
     )
 

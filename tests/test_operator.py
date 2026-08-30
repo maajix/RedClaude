@@ -32,6 +32,18 @@ ANSWERED = json.dumps(
     }
 )
 
+GRANTED = json.dumps(
+    {
+        "label": "RG1",
+        "granted_from": "D7",
+        "route": "POST https://app.example.com:443/token",
+        "identity_slot": "here-secondary",
+        "risk_rule": "net_unsafe_method",
+        "expires_at": "2026-09-06T00:00:00+00:00",
+        "granted_by": "rk2_human",
+    }
+)
+
 QUESTION = (
     "acme-web",
     "D7",
@@ -292,6 +304,102 @@ class SupersedeTest(ConsoleCase):
         self.assertEqual(EXIT_OK, report.exit_code)
         self.assertEqual(("D7", "the policy changed"), connection.parameters[-1])
         self.assertEqual("superseded", report.facts["result"]["status"])
+
+
+class RouteGrantTest(ConsoleCase):
+    """`rk decision grant-route` and `rk decision revoke-route` -- one yes, widened.
+
+    The database's half is `tests/test_database.RouteGrantTest`: that a decision
+    which was never approved may not be widened, that the guards are read off the
+    live digest, that an expiry is mandatory. This half is the three values that
+    leave the console, because `grant_route(label, hours, reason)` and
+    `answer_decision(label, verdict, reason, interval)` both open with a label and
+    both carry a sentence, and a sentence sent where a number belongs is a widening
+    that either fails at the cast or succeeds against the wrong route.
+    """
+
+    def test_the_label_the_hours_and_the_reason_go_out_in_that_order(self):
+        connection = FakeConnection(answer=GRANTED)
+
+        report = self.run_with(
+            connection,
+            lambda s: operator.grant_route(
+                s, "acme-web", "D7", reason="the token endpoint is the campaign", hours=168.0
+            ),
+        )
+
+        self.assertEqual(EXIT_OK, report.exit_code)
+        self.assertEqual(
+            ("D7", 168.0, "the token endpoint is the campaign"), connection.parameters[-1]
+        )
+        self.assertEqual("RG1", report.facts["result"]["label"])
+
+    def test_the_hours_are_sent_as_a_number_the_database_makes_the_interval_from(self):
+        # `answer_decision` takes `$4::interval` and is handed "24.0 hours".
+        # `grant_route` takes `$2::numeric` and does its own `make_interval`, so
+        # the spelling that works for the sibling is a cast error here.
+        connection = FakeConnection(answer=GRANTED)
+
+        self.run_with(
+            connection,
+            lambda s: operator.grant_route(s, "acme-web", "D7", reason="once", hours=1.5),
+        )
+
+        self.assertEqual(1.5, connection.parameters[-1][1])
+
+    def test_the_program_is_resolved_and_bound_before_the_label_is_named(self):
+        # As for `answer`: `grant_route` looks the label up in the session's
+        # Program, so a binding that arrived afterwards would resolve nothing.
+        connection = FakeConnection(answer=GRANTED)
+
+        self.run_with(
+            connection,
+            lambda s: operator.grant_route(s, "acme-web", "D7", reason="x", hours=24.0),
+        )
+
+        sent = connection.statements
+        self.assertLess(
+            next(i for i, sql in enumerate(sent) if "set_config" in sql),
+            next(i for i, sql in enumerate(sent) if "grant_route" in sql),
+        )
+
+    def test_a_decision_nobody_approved_is_a_refusal_carrying_what_the_database_said(self):
+        # The one rule the verb exists to hold, and the operator has to be able
+        # to read why they were refused: widening a `pending` question is the
+        # mistake this catches, and "not widened" alone does not say which yes
+        # was missing.
+        connection = FakeConnection(
+            error=refused(
+                "decision D7 is pending, and only an approved one may be widened "
+                "into a route grant"
+            )
+        )
+
+        report = self.run_with(
+            connection,
+            lambda s: operator.grant_route(s, "acme-web", "D7", reason="x", hours=24.0),
+        )
+
+        self.assertEqual(EXIT_INVALID_CONFIGURATION, report.exit_code)
+        self.assertIn("D7 was not widened", report.violations[0].detail)
+        self.assertIn("only an approved one may be widened", report.violations[0].detail)
+        self.assertIsNone(report.facts["result"])
+
+    def test_revoking_sends_the_label_and_the_reason_and_no_hours(self):
+        # The other direction takes no period: a grant withdrawn early is
+        # withdrawn now, and an interval here would be a second expiry to
+        # disagree with the one already on the row.
+        connection = FakeConnection(answer=json.dumps({"label": "RG1", "status": "revoked"}))
+
+        report = self.run_with(
+            connection,
+            lambda s: operator.revoke_route(s, "acme-web", "RG1", reason="the campaign moved on"),
+        )
+
+        self.assertEqual(EXIT_OK, report.exit_code)
+        self.assertEqual(("RG1", "the campaign moved on"), connection.parameters[-1])
+        self.assertIn("revoke_route_grant", " ".join(connection.statements))
+        self.assertEqual("revoked", report.facts["result"]["status"])
 
 
 class HaltTest(ConsoleCase):
