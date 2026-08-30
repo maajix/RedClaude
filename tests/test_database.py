@@ -37265,11 +37265,19 @@ class ChainUnlockTest(ChainFixture, DatabaseCase):
     PIVOT_WORTH = "0.20"
     ISOLATED_WORTH = "0.30"
 
-    #: What `value_for` answers for a hunt Task nobody has estimated. Ticket 196
-    #: (`20261129T000000Z`) sets `gain_prior` and `impact_prior` for `hunt` to
-    #: 0.70 apiece, and `w_gain + w_impact = 1` is a CHECK -- so the weighting
-    #: cannot move it and the one number stands for both halves.
-    HUNT_PRIOR = 0.7
+    #: What `value_for` answers for a hunt Task nobody has estimated. Two priors
+    #: rather than one since ticket 227 (`20270101T000000Z`), and they are read
+    #: from different keys. `gain_prior` is still per kind and gives `hunt`
+    #: 0.70; impact is per property class now, and every hypothesis this fixture
+    #: writes takes `property_classes ORDER BY id LIMIT 1`, which is
+    #: `authentication.credential_verification` at 0.90. Under the shipped
+    #: `w_gain 0.4 / w_impact 0.6` that is 0.4 * 0.70 + 0.6 * 0.90.
+    #:
+    #: The 0.70 this was before 227 was the per-kind impact prior standing in
+    #: for a claim nobody had priced, which is exactly what that ticket removed:
+    #: a credential-verification bypass and a TLS header ranked alike, and
+    #: `rk2here` spent five days proving it would report the header.
+    HUNT_PRIOR = 0.82
 
     @classmethod
     def setUpClass(cls):
