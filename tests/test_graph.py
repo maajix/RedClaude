@@ -190,6 +190,93 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(405, answer.status)
 
 
+class FindingTest(unittest.TestCase):
+    """The nine nodes a campaign is for, and whether they can be found.
+
+    Asked of the shipped script rather than of a browser, for the reason the
+    size rule above is: the rules are JavaScript in a string, and a picture
+    nobody compared with its own description is how this surface came to draw
+    the Findings at the size of a leaf with no name on any of them.
+
+    The numbers each one names are measured on the `rk2here` campaign: 1884
+    nodes served, 1484 drawn with Observations folded away, 570 left after the
+    zoom band at `fit`, and nine Findings among them.
+    """
+
+    def test_a_finding_is_drawn_over_whatever_the_terrain_reached(self):
+        # Size on this page is the edge count, a Finding has exactly one edge --
+        # the Entity it was filed against -- and the terrain has hubs. Measured
+        # before this: 317 of the 570 nodes in the fitted frame were drawn at
+        # least as large as the largest of the nine Findings, and the nine were
+        # 0.4% of the ink. So the lift is against the tallest node actually
+        # drawn rather than against a number tuned to one campaign's busiest
+        # Domain, and the lead is over that rather than level with it.
+        lead = re.search(r"const FINDING_LEAD = ([\d.]+);", graph.SCRIPT)
+        self.assertIsNotNone(lead)
+        self.assertGreater(float(lead.group(1)), 1.0)
+
+        # Measured off `live`, so it follows what the filters left rather than
+        # the whole campaign, and it excludes the Findings themselves or the
+        # first one lifted would be the thing the rest are lifted over.
+        self.assertIn(
+            '(high, n) => n.kind === "finding" ? high : Math.max(high, n.r), 0)',
+            graph.SCRIPT,
+        )
+        self.assertIn(
+            'if(n.kind === "finding") n.r = Math.max(n.r, tallest * FINDING_LEAD);',
+            graph.SCRIPT,
+        )
+
+    def test_the_disc_that_is_clicked_is_the_disc_that_was_drawn(self):
+        # `radius(n)` is no longer what a Finding is drawn at, so hit testing
+        # and framing read `n.r` -- the size `filter` settled -- instead of
+        # calling the rule again. A hit box that disagreed with the disc would
+        # be a badge an operator can read and cannot open.
+        self.assertIn("if(d < n.r+6 && d < bd){ bd=d; best=n; }", graph.SCRIPT)
+        self.assertIn("const r = n.r+24;", graph.SCRIPT)
+        self.assertNotIn("radius(n)+6", graph.SCRIPT)
+        self.assertNotIn("radius(n)+24", graph.SCRIPT)
+
+    def test_a_finding_carries_its_name_with_nothing_hovering(self):
+        # Every other name follows the hand, because a chip on every named node
+        # is sixteen hundred chips. That left a picture nobody is touching with
+        # no text on it at all -- the opening frame here drew 570 discs and zero
+        # words -- so the only way to tell which disc was a Finding was to hover
+        # discs until one said so. Nine chips is not a wall of text.
+        self.assertIn('const marked = n.kind === "finding";', graph.SCRIPT)
+        self.assertIn("if(!marked && (!near || !near.has(n.id))) continue;", graph.SCRIPT)
+        # `must`, so nine badges cannot take turns hiding each other, and in the
+        # Finding's own severity so the badge is the name and the level at once.
+        self.assertIn(
+            'if(marked) chip(x + r + 6, y, (n.ref ? n.ref + "  " : "") + n.label,\n'
+            '                    "#0b0f14", tone(n), true);',
+            graph.SCRIPT,
+        )
+
+    def test_the_finding_trail_is_off_until_the_operator_asks_for_it(self):
+        # The whole surface is what this command opens on. A picture that
+        # quietly held back nineteen nodes in twenty would be answering a
+        # different question than the one it was opened to ask, so the cut is a
+        # chip in the legend and the default is unchanged.
+        self.assertIn("let TRAIL = false;", graph.SCRIPT)
+        self.assertIn('id="trail"', graph.SCRIPT)
+
+        hops = re.search(r"const TRAIL_HOPS = (\d+);", graph.SCRIPT)
+        self.assertIsNotNone(hops)
+        # One hop is each Finding and the single Entity it names, which is a
+        # list rather than a picture -- 17 nodes here against 81 at two.
+        self.assertGreaterEqual(int(hops.group(1)), 2)
+
+    def test_a_picture_holding_nodes_back_says_how_many(self):
+        # The zoom band used to be the only thing that dropped a node and the
+        # readout was guarded on it. The trail drops far more of them at any
+        # zoom, so the guard is gone and the number is the difference between
+        # what the kind chips say is on and what is actually drawn.
+        self.assertNotIn("if(!lod) return 0;", graph.SCRIPT)
+        self.assertIn("return Math.max(n - live.length, 0);", graph.SCRIPT)
+        self.assertIn("held back <b>", graph.SCRIPT)
+
+
 class NodeTest(unittest.TestCase):
     """What is refused before a statement is built, which is where it matters."""
 

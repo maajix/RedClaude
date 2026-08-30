@@ -857,6 +857,20 @@ function tone(n){
 const SHOW = {entity:true, address:true, hypothesis:true, finding:true,
               observation:false};
 const ORDER = {finding:0, hypothesis:1, entity:2, address:2, observation:3};
+
+// The Findings and the ground they were found on, and nothing else. Off, so the
+// whole surface is still what this command opens on: a picture that quietly
+// held back nineteen nodes in twenty would be answering a different question
+// than the one the operator opened it to ask, and the HUD says how many it set
+// aside for as long as this is on.
+//
+// Two hops rather than one or three, measured on the here engagement's 1484
+// visible nodes: one hop is 17 nodes -- each Finding and the single Entity it
+// was filed against, which is a list and not a picture -- and three is 166 and
+// climbing back towards the cloud. Two is 81 nodes and 93 edges: the Finding,
+// what it is about, and what that thing is attached to.
+let TRAIL = false;
+const TRAIL_HOPS = 2;
 const RING = {
   application:"#4aa3ff", endpoint:"#38d6c4", host:"#6f7dff", domain:"#6f7dff",
   parameter:"#38d6c4", identity:"#c792ea", technology:"#5f6b7a", service:"#6f7dff",
@@ -951,7 +965,7 @@ function merge(data){
 }
 
 function filter(){
-  const shown = [...nodes.values()].filter(n => SHOW[n.kind]);
+  const shown = trail([...nodes.values()].filter(n => SHOW[n.kind]));
   const on = new Set(shown.map(n => n.id));
   degree = new Map();
   for(const l of allLinks) if(on.has(l.a) && on.has(l.b)){
@@ -968,9 +982,54 @@ function filter(){
   // twice per node pair -- n^2 times a frame -- and this order was a full sort
   // of every node, every frame, for a list that only moves when a filter does.
   for(const n of live) n.r = radius(n);
+  // And then the Findings are lifted over whatever the terrain reached. Size on
+  // this page means edge count, a Finding has exactly one edge -- the Entity it
+  // was filed against -- and the terrain has hubs, so the same rule drew the
+  // thing the campaign is for at the size of a leaf. Measured on the here
+  // engagement: 429 of the 1484 nodes on screen came out at least as large as
+  // the largest of the nine Findings, and the nine were 0.4% of the ink. That
+  // is the search the operator was doing.
+  //
+  // Against the tallest node actually drawn rather than against a number, so
+  // this holds on a campaign whose busiest Domain is twice this one's. A
+  // Finding still grows with its own edges; it just never falls below the top.
+  const tallest = live.reduce(
+    (high, n) => n.kind === "finding" ? high : Math.max(high, n.r), 0);
+  for(const n of live)
+    if(n.kind === "finding") n.r = Math.max(n.r, tallest * FINDING_LEAD);
   islands();
   named = live.filter(n => n.label).sort((a,b) =>
     (ORDER[a.kind]-ORDER[b.kind]) || ((degree.get(b.id)||0)-(degree.get(a.id)||0)));
+}
+
+// What is left when the picture is cut back to its Findings: the Findings
+// themselves and everything within TRAIL_HOPS edges of one. The whole list back
+// unchanged when the trail is off, so this is one call in `filter` rather than
+// a branch around it.
+//
+// Breadth-first over the edges of the kinds that are already showing, so
+// turning Observations on widens the trail rather than being ignored by it. A
+// Finding with no subject Entity survives on its own -- it is still a Finding,
+// and dropping it here would be this rail hiding the thing it exists to find.
+function trail(shown){
+  if(!TRAIL) return shown;
+  const on = new Set(shown.map(n => n.id));
+  const near = new Map();
+  const join = (a, b) => {
+    let list = near.get(a);
+    if(!list) near.set(a, list = []);
+    list.push(b);
+  };
+  for(const l of allLinks) if(on.has(l.a) && on.has(l.b)){ join(l.a, l.b); join(l.b, l.a); }
+  const reached = new Set(shown.filter(n => n.kind === "finding").map(n => n.id));
+  let edge = [...reached];
+  for(let hop = 0; hop < TRAIL_HOPS && edge.length; hop++){
+    const next = [];
+    for(const id of edge) for(const other of near.get(id) || [])
+      if(!reached.has(other)){ reached.add(other); next.push(other); }
+    edge = next;
+  }
+  return shown.filter(n => reached.has(n.id));
 }
 
 // Which island each node is on: the connected component of the visible graph,
@@ -1035,12 +1094,15 @@ addEventListener("keydown", ev => {
 panel(innerWidth > 900);
 side.addEventListener("wheel", ev => ev.stopPropagation());
 
-// How many nodes the legend would show that the zoom band is dropping.
+// How many nodes the legend would show that something is holding back. The zoom
+// band was the only thing that did, and the finding trail holds back far more of
+// them at any zoom -- so the `lod` guard is gone and this is the difference
+// between what the kind chips say is on and what is actually drawn, whichever
+// of the two took it out.
 function hidden(){
-  if(!lod) return 0;
   let n = 0;
   for(const x of nodes.values()) if(SHOW[x.kind]) n++;
-  return n - live.length;
+  return Math.max(n - live.length, 0);
 }
 
 function hud(){
@@ -1052,7 +1114,7 @@ function hud(){
   document.getElementById("counts").innerHTML =
     order.map(k => '<span>'+k.replace("_"," ")+' <b>'+(stats[k]??0)+'</b></span>').join("")
     + (omitted ? '<span class="omitted">not drawn <b>'+omitted+'</b></span>' : "")
-    + (hidden() ? '<span class="omitted">zoomed past <b>'+hidden()+'</b></span>' : "");
+    + (hidden() ? '<span class="omitted">held back <b>'+hidden()+'</b></span>' : "");
 }
 
 // Written once, outside `hud()`, because it never changes: the Program this
@@ -1089,6 +1151,8 @@ function legend(){
         + ' aria-pressed="'+(SHOW[k]?"true":"false")+'">'
         + '<i style="background:'+v+'"></i>'+k+'</button>').join("")
     + '<span class="sep"></span>'
+    + '<button type="button" class="chip'+(TRAIL?'':' off')+'" id="trail"'
+    + ' aria-pressed="'+(TRAIL?"true":"false")+'">finding trail</button>'
     + '<button type="button" class="chip'+(ICONS?'':' off')+'" id="glyphs"'
     + ' aria-pressed="'+(ICONS?"true":"false")+'">icons</button>'
     + '<button type="button" class="chip" id="fitall">fit</button>';
@@ -1096,6 +1160,14 @@ function legend(){
     SHOW[el.dataset.kind] = !SHOW[el.dataset.kind];
     hover = null; tip.style.opacity = 0;
     filter(); legend();
+  };
+  // The trail frames what it left as well as cutting to it. Turning it on and
+  // leaving the view where it was is the same search over a smaller graph,
+  // which is the complaint rather than the answer to it.
+  box.querySelector("#trail").onclick = () => {
+    TRAIL = !TRAIL;
+    hover = null; tip.style.opacity = 0;
+    filter(); legend(); hud(); fit();
   };
   box.querySelector("#glyphs").onclick = () => {
     ICONS = !ICONS;
@@ -1133,6 +1205,12 @@ const GROWTH_SPREAD = 0.85;
 // floor the curve goes negative at degree 0.
 const MIN_SHRINK = 0.6;
 const PIVOT = 1;
+
+// How far a Finding stands over the tallest thing beside it, applied in
+// `filter` once the terrain has been measured. 1.15 rather than 1.0: level with
+// the busiest Domain is level, and a Finding that ties for largest is still a
+// Finding somebody has to compare sizes to find.
+const FINDING_LEAD = 1.15;
 
 // The zoom bands and the edge count a node needs to survive each. Read
 // low-to-high and the last match wins, so 0.30 is stricter than 0.55.
@@ -1394,11 +1472,29 @@ function draw(){
   // named node is sixteen hundred chips: a wall of text with a graph behind it,
   // and the node sizes underneath it invisible. `near` already holds the hover
   // and its neighbours, so the names follow the hand.
+  //
+  // The Findings are the exception, and they are nine chips rather than sixteen
+  // hundred. Every name here followed the hand, which means a picture nobody is
+  // touching carries no text at all -- measured on the here engagement, the
+  // opening frame drew 570 discs and zero words -- so the only way to tell
+  // which disc was a Finding was to hover discs until one said so. They are
+  // drawn in their own severity and with the `ref` the report cites them by, so
+  // the badge is the label, the level and the F-number in one, and `must`
+  // because nine badges that take turns hiding each other are nine badges that
+  // flicker.
+  //
+  // What bounds this is the viewport cull below rather than a count: a campaign
+  // that files fifty Findings draws fifty badges, and the ones off the edge cost
+  // nothing. If a screenful of them ever reads as a wall the answer is the
+  // finding trail, which is the control that already exists for it.
   for(const n of named){
-    if(!near || !near.has(n.id)) continue;
+    const marked = n.kind === "finding";
+    if(!marked && (!near || !near.has(n.id))) continue;
     const x = sx(n), y = sy(n), r = n.r*view.k;
     if(x < -200 || x > W+200 || y < -60 || y > H+60) continue;
-    chip(x + r + 6, y, n.label, "#e6edf3", "#111a24e6", n===hover);
+    if(marked) chip(x + r + 6, y, (n.ref ? n.ref + "  " : "") + n.label,
+                    "#0b0f14", tone(n), true);
+    else chip(x + r + 6, y, n.label, "#e6edf3", "#111a24e6", n===hover);
   }
   if(view.k > 1.0) for(const l of vlinks){
     if(!l.label) continue;
@@ -1413,9 +1509,12 @@ function loop(){ step(); draw(); requestAnimationFrame(loop); }
 function at(ev){
   const x=(ev.clientX-W/2-view.x)/view.k, y=(ev.clientY-H/2-view.y)/view.k;
   let best=null, bd=1e9;
+  // `n.r` and not `radius(n)`: a Finding is drawn over the terrain rather than
+  // at what the size rule alone returns, and a hit box that disagreed with the
+  // disc would be a badge you can read and cannot click.
   for(const n of live){
     const d=Math.hypot(n.x-x, n.y-y);
-    if(d < radius(n)+6 && d < bd){ bd=d; best=n; }
+    if(d < n.r+6 && d < bd){ bd=d; best=n; }
   }
   return best;
 }
@@ -1441,7 +1540,10 @@ function fit(){
   if(!live.length) return;
   let x0=1e9, y0=1e9, x1=-1e9, y1=-1e9;
   for(const n of live){
-    const r = radius(n)+24;
+    // The drawn radius, for the reason `at` uses it: a Finding stands over the
+    // terrain, and a frame measured on the size rule alone would cut the
+    // biggest thing on the picture off at the edge.
+    const r = n.r+24;
     x0=Math.min(x0,n.x-r); y0=Math.min(y0,n.y-r);
     x1=Math.max(x1,n.x+r); y1=Math.max(y1,n.y+r);
   }
