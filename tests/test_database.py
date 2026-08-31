@@ -52671,6 +52671,145 @@ class FindingClaimTest(ReplayFixture, DatabaseCase):
                 )
 
 
+REOPEN_SLUG = "selftest-retest-reopen"
+
+
+class RetestReopenTest(FindingClaimTest):
+    """Ticket 230: a retest reopens a claim, and something closes it again.
+
+    `FindingClaimTest`'s arrangement is exactly the state this ticket is about
+    and is reused whole: a claim carried to `supported` by a real replay, and a
+    `candidate` Finding opened on it. What is added is the move nothing in the
+    corpus made until now -- the watch lane firing because the Application's
+    fingerprint moved -- and the four questions that follow it.
+
+    The watch row is written by hand, as 034's own case writes one, because
+    `arm_retest_watches` stamps the current fingerprint and a watch already
+    holding it never fires. It is fired by `refresh_negative_knowledge()` rather
+    than stamped: what this case is about is the state that function leaves, and
+    a `fired_at` set by the fixture would be a test of the fixture.
+
+    The close at the end is the second replay of the same Test, not a
+    transition written here, for the same reason. It is also the point of the
+    ticket: before this migration nothing derived that replay, so the window
+    could not close at all.
+    """
+
+    slug = REOPEN_SLUG
+
+    ARM = (
+        "INSERT INTO hypothesis_retest_triggers (hypothesis_id, kind,"
+        " watched_entity_id, fingerprint)"
+        " VALUES ($1::uuid, 'response_fingerprint_changed', $2::uuid, $3)"
+    )
+
+    REOPENED_AT = "SELECT rk2_retest_reopened_at($1::uuid, $2::uuid)"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.claim = cls.held["hypothesis"]
+
+        # Before anything: the claim is supported so rule 3 is silent, and the
+        # Test has been replayed so the frontier is empty. Both are what this
+        # ticket changes and neither is asserted from memory.
+        cls.settled_before = cls.status_of(cls.claim)
+        cls.arm_before = cls.claim_problems()
+        cls.frontier_before = cls.frontier()
+
+        # The Surface the watch compares against, and a watch holding a value
+        # that is not it.
+        cls.connection.execute(
+            "SELECT compute_surface_fingerprint($1::uuid)", (cls.subject,)
+        )
+        cls.as_owner(cls.ARM, (cls.claim, cls.subject, "a fingerprint this Surface never had"))
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.refreshed = json.loads(
+                str(cls.connection.execute("SELECT refresh_negative_knowledge()").scalar())
+            )
+
+        cls.reopened = cls.status_of(cls.claim)
+        cls.window_open = cls.reopened_at()
+        cls.arm_open = cls.claim_problems()
+        cls.frontier_open = cls.frontier()
+
+        # And the replay the frontier exists to make derivable, run the way 037
+        # runs a reproduction: the same stored Test, a second time.
+        cls.again = cls.performed(cls.held["test"], answers=cls.ANSWERS)
+        cls.settled = cls.status_of(cls.claim)
+        cls.window_after = cls.reopened_at()
+        cls.arm_after = cls.claim_problems()
+        cls.frontier_after = cls.frontier()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def claim_problems(cls) -> list[tuple[str, str]]:
+        """Rule 3 alone, because the other eight arms are not this ticket's."""
+        return [
+            (str(row[1]), str(row[2]))
+            for row in cls.rows_of("SELECT * FROM check_finding_candidates()")
+            if str(row[0]) == "finding_claim_not_supported"
+        ]
+
+    @classmethod
+    def frontier(cls) -> list[str]:
+        return [
+            str(row[0])
+            for row in cls.rows_of(
+                "SELECT test_id::text FROM rk2_test_performance_frontier($1::uuid)",
+                (cls.program_id,),
+            )
+        ]
+
+    @classmethod
+    def reopened_at(cls):
+        return cls.connection.execute(cls.REOPENED_AT, (cls.claim, cls.program_id)).scalar()
+
+    @classmethod
+    def status_of(cls, hypothesis: str) -> str:
+        return str(
+            cls.connection.execute(
+                "SELECT status FROM hypotheses WHERE id = $1::uuid", (hypothesis,)
+            ).scalar()
+        )
+
+    # -- what the watch did ----------------------------------------------------
+
+    def test_the_watch_fired_and_put_the_settled_claim_back_in_question(self):
+        # The arrangement, before anything reads it. A fixture whose watch never
+        # fired would pass every assertion below by having nothing to exclude.
+        self.assertEqual("supported", self.settled_before)
+        self.assertEqual(1, int(self.refreshed["watches_fired"]))
+        self.assertEqual(1, int(self.refreshed["reopened"]))
+        self.assertEqual("testable", self.reopened)
+        self.assertIsNotNone(self.window_open)
+
+    def test_rule_three_is_silent_while_the_retest_window_is_open(self):
+        # The deadlock this ticket is about: one row here refuses every pass in
+        # the database, because `standing_checks.program_scoped` is false.
+        self.assertEqual([], self.arm_before)
+        self.assertEqual([], self.arm_open)
+
+    def test_the_reopened_test_comes_back_onto_the_performance_frontier(self):
+        # And the half that makes the silence honest. Without this the claim
+        # stays `testable` for good and the Finding is hidden rather than
+        # waiting.
+        self.assertEqual([], self.frontier_before)
+        self.assertEqual([self.held["test"]], self.frontier_open)
+
+    def test_the_window_lapses_when_the_replay_settles_the_claim(self):
+        # `fired_at` is never cleared by anything, so the predicate has to close
+        # on the settling transition instead. This is that, measured rather than
+        # reasoned about.
+        self.assertEqual("supported", self.settled)
+        self.assertIsNone(self.window_after)
+        self.assertEqual([], self.arm_after)
+        self.assertEqual([], self.frontier_after)
+
+
+
 UNREADY_SLUG = "selftest-never-ready"
 
 
