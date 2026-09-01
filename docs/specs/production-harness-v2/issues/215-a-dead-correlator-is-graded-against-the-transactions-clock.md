@@ -7,7 +7,7 @@ stops depending on how many round trips happened before it.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## What was measured
 
@@ -95,13 +95,29 @@ disagreeing with the three statements next to it.
 
 ## Acceptance criteria
 
-- [ ] **The one test passes six times in a row in one process.** The command in
+- [x] **The one test passes six times in a row in one process.** The command in
       "What was measured", unchanged, with no extra statement added to the test
       to buy it time.
-- [ ] **`CallbackAdmissionTest` still passes whole.** 25 tests, no new skips.
-- [ ] **The two clocks are named where the fix is.** Which arm reads which, and
+- [x] **`CallbackAdmissionTest` still passes whole.** 26 tests, no new skips.
+- [x] **The two clocks are named where the fix is.** Which arm reads which, and
       why the arm that grades an arrival is not the arm that stamps `issued_at`
       -- not "flaky timing".
-- [ ] **The long-transaction case is asserted.** A correlator that expires while
+- [x] **The long-transaction case is asserted.** A correlator that expires while
       the reading transaction is open is refused. Without it the fix is graded
       only by the race it removes, and the gap it closes goes unrecorded.
+
+## Resolution
+
+Built as
+`20270109T000000Z__a_dead_correlator_is_graded_against_the_clock.sql`.
+`enforce_callback_attribution` now grades the correlator's current liveness
+against `clock_timestamp()`, the same wall clock used to mint and resolve it.
+The separate claimed-arrival window keeps `now()`: that arm compares the
+listener-stated `received_at` with the accepting transaction, while the expiry
+arm asks whether the correlator is live when the guarded statement runs.
+
+The deterministic regression mints a correlator and lets it expire inside one
+open transaction. Before the migration the INSERT was admitted; after it the
+guard refuses with `23514`. `CleanCreationTest`, the original expiry test six
+times, and all of `CallbackAdmissionTest` ran together: 41 tests, OK. The six
+cluster-global role passwords were restored immediately afterwards.

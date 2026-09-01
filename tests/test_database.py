@@ -6556,6 +6556,70 @@ class CallbackAdmissionTest(DatabaseCase):
         self.assertIn("was not live", str(refused))
         self.assertEqual(before, self.counts())
 
+    def test_a_correlator_expiring_inside_an_open_transaction_is_refused(self):
+        # The expiry arm answers whether the correlator is live when this
+        # statement runs. `now()` cannot answer that question: PostgreSQL fixes
+        # it at the transaction's first statement, before this correlator is
+        # even minted. `clock_timestamp()` advances while the transaction is
+        # open, which is the clock `resolve_callback_correlator` reads too.
+        correlator = secrets.token_hex(16)
+        subject = self.subject("a")
+        before = self.counts()
+
+        try:
+            with self.connection.transaction():
+                self.connection.execute(
+                    "SELECT set_config('rk2.program_id', $1, true)",
+                    (self.identifiers["a"],),
+                )
+                self.connection.execute("SELECT set_actor('runtime', 'selftest')")
+                self.connection.execute(
+                    "SELECT mint_callback_correlator($1, $2, $3::uuid,"
+                    "        make_interval(secs => 0.05))",
+                    ("oob-dns", correlator, subject),
+                )
+                self.assertTrue(
+                    self.connection.execute(
+                        "SELECT now() < t.expires_at"
+                        "  FROM callback_correlators t"
+                        " WHERE t.correlator_sha256 = $1",
+                        (artifact.digest(correlator.encode()),),
+                    ).scalar(),
+                    "the transaction must begin while the correlator is live",
+                )
+                self.connection.execute("SELECT pg_sleep(0.1)")
+                self.assertTrue(
+                    self.connection.execute(
+                        "SELECT clock_timestamp() >= t.expires_at"
+                        "  FROM callback_correlators t"
+                        " WHERE t.correlator_sha256 = $1",
+                        (artifact.digest(correlator.encode()),),
+                    ).scalar(),
+                    "the wall clock must pass the expiry inside the transaction",
+                )
+                self.connection.execute(
+                    "INSERT INTO callback_interactions"
+                    "     (program_id, correlator_id, channel_name, arrival_kind,"
+                    "      observed_host, received_at, body_sha256, byte_size)"
+                    " SELECT $1::uuid, t.id, 'oob-dns', 'dns', $2, t.issued_at,"
+                    "        $3, $4::bigint"
+                    "  FROM callback_correlators t"
+                    " WHERE t.correlator_sha256 = $5",
+                    (
+                        self.identifiers["a"],
+                        f"{correlator}.dns.example.org",
+                        artifact.digest(ARRIVAL),
+                        str(len(ARRIVAL)),
+                        artifact.digest(correlator.encode()),
+                    ),
+                )
+                self.fail("an expired correlator was admitted by an old transaction")
+        except pg.DatabaseError as refused:
+            self.assertEqual("23514", refused.sqlstate)
+            self.assertIn("was not live", str(refused))
+
+        self.assertEqual(before, self.counts())
+
     def test_a_correlator_that_could_never_arrive_is_not_minted(self):
         # A correlator is one DNS label or it is a canary nothing can query, and
         # the admission trigger compares the digest of the label a name carries:
