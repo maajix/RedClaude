@@ -288,6 +288,31 @@ class SubjectTest(unittest.TestCase):
             next(item.detail for item in ledger.assertions if item.name == "door_preflight"),
         )
 
+    def test_the_doctor_names_an_old_door_and_the_restart_remedy(self):
+        ledger = Ledger()
+        connection = mock.Mock()
+        connection.execute.return_value.rows = [("00000000-0000-4000-8000-1",)]
+        opened = mock.MagicMock()
+        opened.__enter__.return_value = connection
+        refusal = isolation.Unavailable(
+            "Door rk2-door runs corpus 0228, older than newest applied migration 0229; "
+            "restart the Door before starting a child"
+        )
+        with described() as environment, \
+             mock.patch.object(doctor.pg, "connect", return_value=opened), \
+             mock.patch.object(doctor.door, "preflight", side_effect=refusal):
+            doctor._assert_door_program(
+                ledger,
+                environment,
+                "postgresql://runtime@db/rk2hunt21",
+                {"program_name": "rk2hunt21"},
+            )
+
+        self.assertEqual(["door"], [item.source for item in ledger.violations])
+        said = next(item.detail for item in ledger.assertions if item.name == "door_preflight")
+        self.assertIn("Door rk2-door", said)
+        self.assertIn("restart", said)
+
     def test_the_doctor_refuses_a_program_absent_from_the_runtime_database(self):
         ledger = Ledger()
         connection = mock.Mock()

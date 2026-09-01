@@ -6,7 +6,7 @@ Test that grades nothing.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Where this came from
 
@@ -48,14 +48,44 @@ asks for a decision before code.
 Shape 2 is the smaller diff. Shape 1 is the one that cannot lie about a
 different process than the one doing the writing.
 
+## Decision
+
+Take shape 2, but carry the answer on the Door's existing readiness
+announcement instead of adding an HTTP health route. `rk doctor` already reads
+that announcement from the exact named container after proving that container
+is the Agent network's Door. The process records the highest migration in the
+corpus it loaded at startup; the Doctor compares that value with the newest row
+in `rk2_meta.schema_migrations`. This works before the first Receipt and adds no
+unauthenticated route to the capability boundary.
+
+The rejected Receipt column would preserve which writer opened each exchange,
+including after that writer disappeared, but it adds a column and a write to
+the hot table and cannot diagnose a fresh Door before its first Receipt. The
+chosen process answer instead describes only the container the Doctor contacted;
+the topology and exact-container checks are therefore part of the assertion,
+not an assumption.
+
 ## Acceptance criteria
 
-- [ ] The decision between the two shapes is recorded in this file, with the
+- [x] The decision between the two shapes is recorded in this file, with the
       price of the one not taken.
-- [ ] `rk doctor` fails, with a message naming the door and the word `restart`,
+- [x] `rk doctor` fails, with a message naming the door and the word `restart`,
       when the door process is older than the newest applied migration.
-- [ ] `rk doctor` passes when they match, and says which version it compared.
-- [ ] A door that is not running is a different message from a door that is old.
+- [x] `rk doctor` passes when they match, and says which version it compared.
+- [x] A door that is not running is a different message from a door that is old.
       An operator who reads "restart the door" about a door that was never
       started has been sent to the wrong command, which is 220's whole fault
       repeated one level up.
+
+## Resolution
+
+The Door now loads the migration corpus before listening and includes its
+highest migration identity in the readiness announcement. The existing Doctor
+preflight reads the newest applied migration by application sequence and
+compares the two only after proving the Program, exact database identity and
+Door topology match. A missing or older announced version names the Door and
+the restart remedy; a Door ahead of the database instead names `rk db migrate`.
+
+The Door and Doctor suites cover a matching version, the pre-handshake Door,
+an older Door, exact-database mismatch and a Door that is not running. The
+latter message contains no restart instruction.

@@ -39,8 +39,15 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from redkraken import execution, isolation, pg, proxy, seal, store, tls
-from redkraken.outcome import INVALID_CONFIGURATION, Ledger, Report, render, report
+from redkraken import execution, isolation, migrate, pg, proxy, seal, store, tls
+from redkraken.outcome import (
+    INVALID_CONFIGURATION,
+    INVALID_CORPUS,
+    Ledger,
+    Report,
+    render,
+    report,
+)
 
 
 COMMAND = f"{proxy.COMMAND} door"
@@ -68,8 +75,15 @@ READY = "rk2-door listening on "
 #: would refuse the arrangement that is working.
 SERVING = " serving "
 IDENTITY = " identity "
+CORPUS = " corpus "
 
 PROGRAM_VISIBLE = "SELECT EXISTS (SELECT 1 FROM programs WHERE id = $1::uuid)"
+NEWEST_APPLIED = f"""
+SELECT id
+FROM {migrate.META_SCHEMA}.schema_migrations
+ORDER BY applied_seq DESC
+LIMIT 1
+"""
 
 #: Where `start` puts what the door needs, inside the container.  Fixed paths for
 #: the reason `isolation` gives for its own: a path that means one thing inside
@@ -159,6 +173,24 @@ def main() -> int:
         ledger.fail("boundary", str(error), code=INVALID_CONFIGURATION, source="environment")
         return render(report(COMMAND, ledger))
 
+    migrations, refusals = migrate.load()
+    if refusals:
+        ledger.refuse(
+            "migration_corpus",
+            "the Door cannot name a version from a migration corpus that does not compile",
+            refusals,
+        )
+        return render(report(COMMAND, ledger))
+    if not migrations:
+        ledger.fail(
+            "migration_corpus",
+            "the Door cannot name a version because its migration corpus is empty",
+            code=INVALID_CORPUS,
+            source=str(migrate.CORPUS),
+        )
+        return render(report(COMMAND, ledger))
+    corpus_version = migrations[-1].identity
+
     authority = environment.get(proxy.AUTHORITY_VARIABLE)
     key = environment.get(seal.KEY_VARIABLE)
     return render(
@@ -174,7 +206,8 @@ def main() -> int:
             key=Path(key) if key else None,
             contained=True,
             announce_identity=lambda endpoint, identity: print(
-                f"{READY}{endpoint}{SERVING}{settings.database}{IDENTITY}{identity}",
+                f"{READY}{endpoint}{SERVING}{settings.database}{IDENTITY}{identity}"
+                f"{CORPUS}{corpus_version}",
                 flush=True,
             ),
         )
@@ -253,7 +286,7 @@ def start(
             fence=environment.get(proxy.DATABASE_VARIABLE, ""),
             host_environment=host_environment,
         )
-        bound, serving, served_identity = _listening(
+        bound, serving, served_identity, served_corpus = _listening(
             engine, container.proxy_container, host_environment, timeout
         )
         wanted = pg.settings_from_url(environment[proxy.DATABASE_VARIABLE]).database
@@ -265,6 +298,10 @@ def start(
                 "reads its connection string once "
                 "at startup and outlives the command that started it, so it is still "
                 "the one a previous engagement began. Remove it and start it again."
+            )
+        if not served_corpus:
+            raise isolation.Unavailable(
+                "the Door announced no migration corpus version. Remove it and start it again."
             )
         isolation.join(
             engine, container.network, container.proxy_container, proxy_host, host_environment
@@ -278,7 +315,10 @@ def start(
         ledger.fail("listener", str(refusal), code=INVALID_CONFIGURATION, source="environment")
         return report(COMMAND, ledger)
 
-    ledger.hold("listener", f"bound {bound}; children reach it at {container.proxy_url}")
+    ledger.hold(
+        "listener",
+        f"bound {bound}; children reach it at {container.proxy_url}; corpus {served_corpus}",
+    )
     ledger.hold(
         "topology",
         f"{container.network} is internal and its only peer is {proxy_host}; "
@@ -291,6 +331,7 @@ def start(
         container=container.proxy_container,
         endpoint=container.proxy_url,
         bound=bound,
+        corpus=served_corpus,
         certificate=str(certificate),
         networks=[container.network, egress],
     )
@@ -534,17 +575,19 @@ def _run(
 
 def _listening(
     engine: str, name: str, host_environment: Mapping[str, str], timeout: float
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str]:
     """Wait for the door to say it is serving, or say what it said instead.
 
-    Answers where it is bound and which database it opened. The refusal carries
-    the door's own last line rather than a bare timeout, because the usual
-    reason a door never listens is a fence URL it could not open, and that
-    sentence is already written in the report it printed.
+    Answers where it is bound, which database it opened, its exact database
+    identity and the newest migration in the corpus it loaded at startup. The
+    refusal carries the door's own last line rather than a bare timeout, because
+    the usual reason a door never listens is a fence URL it could not open, and
+    that sentence is already written in the report it printed.
 
     A door that announces no database is one from a build before ticket 149, and
-    an empty name is returned rather than guessed at: the caller refuses it, and
-    a door too old to say is exactly the stale door this question is asked about.
+    empty names are returned rather than guessed at: the caller refuses them,
+    and a door too old to say is exactly the stale door this question is asked
+    about.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -554,8 +597,9 @@ def _listening(
             if line.startswith(READY):
                 said = line[len(READY) :].strip()
                 bound, _, served = said.partition(SERVING.strip())
-                serving, _, identity = served.partition(IDENTITY.strip())
-                return bound.strip(), serving.strip(), identity.strip()
+                serving, _, identified = served.partition(IDENTITY.strip())
+                identity, _, corpus = identified.partition(CORPUS.strip())
+                return bound.strip(), serving.strip(), identity.strip(), corpus.strip()
         if time.monotonic() >= deadline:
             said = written.strip().splitlines()
             raise isolation.Unavailable(
@@ -578,7 +622,7 @@ def preflight(
     expected = pg.database_identity(connection)
     engine = isolation.engine_for(container.engine)
     isolation.peered(engine, container)
-    _, serving, actual = _listening(
+    _, serving, actual, door_version = _listening(
         engine,
         container.proxy_container,
         {"PATH": os.environ.get("PATH", "")},
@@ -591,7 +635,30 @@ def preflight(
             f"serves {wanted}; their exact database identities do not match. "
             "Restart the Door against this Program's database before starting a child."
         )
-    return f"{container.proxy_container} and the runtime both serve {wanted} and Program {program_id}"
+    applied_version = connection.execute(NEWEST_APPLIED).scalar()
+    if not applied_version:
+        raise isolation.Unavailable(
+            "the runtime database has no applied migration version to compare with the Door"
+        )
+    if not door_version:
+        raise isolation.Unavailable(
+            f"Door {container.proxy_container} announces no migration corpus version; "
+            "restart the Door before starting a child"
+        )
+    if door_version < applied_version:
+        raise isolation.Unavailable(
+            f"Door {container.proxy_container} runs corpus {door_version}, older than newest "
+            f"applied migration {applied_version}; restart the Door before starting a child"
+        )
+    if door_version > applied_version:
+        raise isolation.Unavailable(
+            f"Door {container.proxy_container} runs corpus {door_version}, newer than newest "
+            f"applied migration {applied_version}; run `rk db migrate` before starting a child"
+        )
+    return (
+        f"{container.proxy_container} and the runtime both serve {wanted} and Program "
+        f"{program_id}; Door and database version {applied_version}"
+    )
 
 
 def _ask(

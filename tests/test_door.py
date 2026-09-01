@@ -23,6 +23,10 @@ CONTAINER = isolation.AgentContainer(
     certificate=Path("/tmp/ca.pem"),
 )
 
+VERSION = "20270109T000000Z__a_dead_correlator_is_graded_against_the_clock"
+OLDER_VERSION = "20261003T000000Z__server_baseline"
+NEWER_VERSION = "20270110T000000Z__a_future_migration"
+
 
 def started(**overrides) -> list[str]:
     """The engine arguments `_run` would have spent, without spending them."""
@@ -108,10 +112,15 @@ class ServingTest(unittest.TestCase):
     def test_the_door_answers_where_it_is_bound_and_what_it_serves(self):
         with self.logs(
             f"{door.READY}0.0.0.0:18080{door.SERVING}rk2hunt21"
-            f"{door.IDENTITY}rk2hunt21:16422:2026-08-23\n"
+            f"{door.IDENTITY}rk2hunt21:16422:2026-08-23{door.CORPUS}{VERSION}\n"
         ):
             self.assertEqual(
-                ("0.0.0.0:18080", "rk2hunt21", "rk2hunt21:16422:2026-08-23"),
+                (
+                    "0.0.0.0:18080",
+                    "rk2hunt21",
+                    "rk2hunt21:16422:2026-08-23",
+                    VERSION,
+                ),
                 door._listening("docker", "rk2-door", {}, 1.0),
             )
 
@@ -121,7 +130,17 @@ class ServingTest(unittest.TestCase):
         # is exactly the stale door the question is asked about.
         with self.logs(f"{door.READY}0.0.0.0:18080\n"):
             self.assertEqual(
-                ("0.0.0.0:18080", "", ""),
+                ("0.0.0.0:18080", "", "", ""),
+                door._listening("docker", "rk2-door", {}, 1.0),
+            )
+
+    def test_a_door_from_before_the_version_handshake_names_no_corpus(self):
+        with self.logs(
+            f"{door.READY}0.0.0.0:18080{door.SERVING}rk2hunt21"
+            f"{door.IDENTITY}rk2hunt21:16422:2026-08-23\n"
+        ):
+            self.assertEqual(
+                ("0.0.0.0:18080", "rk2hunt21", "rk2hunt21:16422:2026-08-23", ""),
                 door._listening("docker", "rk2-door", {}, 1.0),
             )
 
@@ -130,6 +149,9 @@ class ServingTest(unittest.TestCase):
         # database would leave `start` comparing against nothing at all.
         self.assertIn("{settings.database}", self.announcement())
 
+    def test_the_announcement_carries_the_corpus_the_process_started_with(self):
+        self.assertIn("{corpus_version}", self.announcement())
+
     def announcement(self) -> str:
         source = Path(door.__file__).read_text(encoding="utf-8")
         opening = source.index("announce_identity=lambda endpoint, identity:")
@@ -137,10 +159,14 @@ class ServingTest(unittest.TestCase):
 
 
 class PreflightTest(unittest.TestCase):
-    def connection(self, visible: bool = True):
+    def connection(self, visible: bool = True, applied: str = VERSION):
         connection = mock.Mock()
         connection.settings = pg.Settings("db", "rk2hunt21", "runtime")
-        connection.execute.return_value.scalar.return_value = visible
+        visible_result = mock.Mock()
+        visible_result.scalar.return_value = visible
+        applied_result = mock.Mock()
+        applied_result.scalar.return_value = applied
+        connection.execute.side_effect = (visible_result, applied_result)
         return connection
 
     def test_the_runtime_program_and_the_doors_exact_database_match(self):
@@ -149,11 +175,14 @@ class PreflightTest(unittest.TestCase):
              mock.patch.object(isolation, "engine_for", return_value="docker"), \
              mock.patch.object(isolation, "peered"), \
              mock.patch.object(
-                 door, "_listening", return_value=("0.0.0.0:18080", "rk2hunt21", "identity")
+                 door,
+                 "_listening",
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "identity", VERSION),
              ):
             detail = door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
 
         self.assertIn("rk2hunt21", detail)
+        self.assertIn(VERSION, detail)
 
     def test_the_same_database_name_on_another_cluster_is_refused(self):
         connection = self.connection()
@@ -163,7 +192,7 @@ class PreflightTest(unittest.TestCase):
              mock.patch.object(
                  door,
                  "_listening",
-                 return_value=("0.0.0.0:18080", "rk2hunt21", "door-identity"),
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "door-identity", VERSION),
              ):
             with self.assertRaisesRegex(isolation.Unavailable, "exact database identities"):
                 door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
@@ -177,3 +206,60 @@ class PreflightTest(unittest.TestCase):
                     "00000000-0000-4000-8000-1",
                 )
         engine.assert_not_called()
+
+    def test_a_door_older_than_the_database_is_refused_with_the_remedy(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(isolation, "peered"), \
+             mock.patch.object(
+                 door,
+                 "_listening",
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "identity", OLDER_VERSION),
+             ):
+            with self.assertRaisesRegex(
+                isolation.Unavailable, rf"Door.*{OLDER_VERSION}.*{VERSION}.*restart"
+            ):
+                door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+    def test_a_door_with_no_version_is_old_and_names_the_same_remedy(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(isolation, "peered"), \
+             mock.patch.object(
+                 door,
+                 "_listening",
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "identity", ""),
+             ):
+            with self.assertRaisesRegex(isolation.Unavailable, r"Door.*no.*version.*restart"):
+                door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+    def test_a_database_behind_its_door_names_migrate_not_restart(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(isolation, "peered"), \
+             mock.patch.object(
+                 door,
+                 "_listening",
+                 return_value=("0.0.0.0:18080", "rk2hunt21", "identity", NEWER_VERSION),
+             ):
+            with self.assertRaisesRegex(isolation.Unavailable, r"rk db migrate") as refusal:
+                door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+        self.assertNotIn("restart", str(refusal.exception).lower())
+
+    def test_a_door_that_is_not_running_does_not_claim_to_be_old(self):
+        connection = self.connection()
+        with mock.patch.object(pg, "database_identity", return_value="identity"), \
+             mock.patch.object(isolation, "engine_for", return_value="docker"), \
+             mock.patch.object(
+                 isolation,
+                 "peered",
+                 side_effect=isolation.Unavailable("Door rk2-door is not running"),
+             ):
+            with self.assertRaisesRegex(isolation.Unavailable, "not running") as refusal:
+                door.preflight(CONTAINER, connection, "00000000-0000-4000-8000-1")
+
+        self.assertNotIn("restart", str(refusal.exception).lower())
