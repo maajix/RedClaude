@@ -544,10 +544,14 @@ class VerticalRunTest(ChainFixture, DatabaseCase):
         fail with a message about a new fact rather than about the edit that
         caused it. In labels, because that is what the Contract sends.
 
-        The witnesses are the three the replay filed and not everything the
-        Finding carries: the Playbook's `control` row above is evidence of the
-        claim and is cited as such, but it stands on the lap's Receipt rather
-        than on an action of the run this report reproduces.
+        The witnesses are the three the replay filed. The join through
+        `test_run_receipts` is what selects them: it admits only an Observation
+        standing on a Receipt this test run produced, so a supporting row
+        resting on the recon lap's Receipt would not appear here. Until ticket
+        166 the walk arranged exactly such a row and this filter excluded it,
+        four candidates down to three; the walk no longer files one, so the
+        filter currently has nothing to exclude and the count below rests on
+        the replay having filed exactly three.
         """
         cls.witness = [
             str(row[0])

@@ -27,7 +27,7 @@ Baseline ist `main@402b8bd`:
 Aktuelle Bewertung: **Freigabe A und Freigabe B sind am 23.08.2026 erreicht.**
 Begrenzte, beaufsichtigte, anonyme Read-only-Hunts sind vertretbar, und mit dem
 Abschluss von Arbeitsblock 1 auch ein beaufsichtigter Hunt mit reproduzierbarem
-Finding und Report. Die beiden Vorbehalte stehen bei Freigabe B.
+Finding und Report. Der verbliebene Vorbehalt steht bei Freigabe B.
 
 ## Aktuelle Ticket-Reihenfolge — 27.08.2026
 
@@ -298,7 +298,8 @@ Gemessen am Tag der Freigabe:
   **66** Zeilen, zwei davon neu: `agent_asks` aus Ticket 104 und
   `receipt_topology` aus Ticket 159.
 
-Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:
+Ein Vorbehalt, ausdrücklich und nicht stillschweigend; (a) ist am 02.09.2026
+erledigt und bleibt als datierte Korrektur stehen:
 
 - **(a) Der vertikale Lauf hat keine arrangierte Zeile mehr.**
   Bis Ticket 166 schrieb `tests/test_vertical.py` in
@@ -307,7 +308,7 @@ Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:
   haben sie erledigt: `20261107T000000Z` setzte die Latte von
   `playbooks/object-ownership/playbook.md` auf `response_differential`, was der
   Replay selbst schreibt, und Ticket 166 wies nach, dass eine Evidenzkante mit
-  dem Vorschlag gefilt wird, während der Claim noch `proposed` ist, und beim
+  dem Vorschlag eingereicht wird, während der Claim noch `proposed` ist, und beim
   Übergang auf `supported` mitzählt. Die Methode ist entfernt; der Lauf ist von
   der Recon-Runde bis zum Report vollständig verdient.
 - **(b) Der eine rote Test ist lastabhängig.**

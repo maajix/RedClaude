@@ -118,9 +118,12 @@ met and the gate is passed.
       first case and every reason is readable in the file. Its three
       `bb:evidence` rows (`:13`) ask only for `response_invariant` and
       `response_differential`, which per ticket 166 are the only two kinds any
-      replay can write, so it is one of the thirteen Playbooks 166 lists as
-      satisfiable today and is **not** one of the thirty-three that gate
-      `supported` on a kind no verb can write. It names `mcp__rk2__http_request`
+      replay can *derive*, so the replay alone can meet its bar without an
+      agent filing an edge. 166's own "thirty-three that gate `supported` on a
+      kind no verb can write" is retired: re-measured on 2026-09-02 the count
+      is 26 of 51, and those 26 are reachable through a proposal-filed edge
+      rather than unreachable. This Playbook is picked because it needs no such
+      edge, not because the others are walled off. It names `mcp__rk2__http_request`
       in its prose (`:58`), which only 23 of the 50 do. It uses the words
       "baseline", "variant" and "control" the way `TEST_ACTION_ROLES`
       (`roster.py:399`) uses them. It states its ceiling as six requests
@@ -362,7 +365,8 @@ prototype's measurement is evidence for.
   `roster.py:1424-1426` cites "playbook_selections has never held a row in this
   tree" as the reason a Playbook-derived Test specification "is not available";
   164 is what retired that reason.
-- **166 is the stage after this one, and it turned out not to be a wall.** 166
+- **166 (`resolved`) is the stage after this one, and it turned out not to be
+  a wall.** 166
   is the evidence bar. It was written as "33 of 50 Playbooks gate `supported` on
   an Observation kind no verb can write"; re-measured on 2026-09-02 it is 26 of
   51, and the reachability half is false. An evidence edge filed with the

@@ -448,10 +448,13 @@ class Corpus(unittest.TestCase):
         # above pins only the roles. It pinned `credential_effect` on the
         # control until 2026-08-24 -- a refusal under the second Identity is
         # evidence of a boundary only if that session was working, and that kind
-        # is the observation which says it was. The reading was right and the
-        # row was unreachable: ticket 166 measured that no runtime verb writes
-        # that kind, `enforce_playbook_evidence` raises on the transition, and
-        # so this Playbook could never reach `supported` at all.
+        # is the observation which says it was. The reading was right, and what
+        # was wrong was the writer rather than the reachability: no *replay*
+        # derives that kind, because `close_test_replay` reads the kind off the
+        # Test specification. Ticket 166 established that an agent filing the
+        # edge with the proposal that mints the claim reaches the same bar, so
+        # the narrowing here bought a bar the replay alone can meet, not the
+        # only bar that was meetable.
         #
         # So the bar is the strongest one a verb can meet, and the kind is the
         # same on both legs. `close_test_replay` reads the kind off the Test
@@ -460,10 +463,11 @@ class Corpus(unittest.TestCase):
         # -- is `response_differential`, and a comparison names both of its
         # legs. So a Playbook whose whole method is a comparison writes that one
         # kind for the control as well. What is lost is that the bar no longer
-        # distinguishes "the session worked" from "this leg was compared";
-        # ticket 166 owns putting that distinction back, either by teaching the
-        # replay to class a control leg or by writing the kind from somewhere
-        # else.
+        # distinguishes "the session worked" from "this leg was compared". The
+        # way back to it is an agent filing a `credential_effect` edge with the
+        # proposal, which ticket 166 measured as counting at this bar; whether
+        # this Playbook's text should ask for that again is a corpus decision
+        # and not this test's.
         supported = {(row.role, row.kind) for row in self.one.evidence
                      if row.to_status == "supported"}
         self.assertIn(("control", "response_differential"), supported)

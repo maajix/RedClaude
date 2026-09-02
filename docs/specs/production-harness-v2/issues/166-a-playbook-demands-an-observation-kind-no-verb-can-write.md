@@ -1,14 +1,18 @@
 # 166 — A Playbook demands an Observation kind no verb can write
 
-**What to build:** Nothing yet. This ticket records a gap the synthetic vertical
-run exposed and does not fix it. Thirty-three of the fifty Playbooks in the
-corpus gate `supported` on an Observation kind that no runtime writer can put on
-a hypothesis, so those Playbooks cannot be satisfied by any sequence of verbs
-this tree serves.
+**What to build:** Nothing yet -- as cut, and **superseded 2026-09-02; read
+`## Resolution` first.** The gap this ticket was opened on does not exist in the
+form stated here. The corpus does not hold thirty-three of fifty Playbooks
+gating `supported` on an Observation kind no runtime writer can put on a
+hypothesis: re-measured it is 26 of 51 naming a kind `close_test_replay` cannot
+*derive*, and each of those is reachable through an evidence edge an agent files
+with the proposal that mints the claim. Exactly one bar in the corpus is
+genuinely unreachable, for a reason unrelated to the writer, and it is now
+ticket 233.
 
 **Blocked by:** nothing.
 
-**Status:** claimed
+**Status:** resolved
 
 **Touches:** `tests/test_database.py`, `tests/test_vertical.py`,
 `docs/specs/production-harness-v2/TASKS.md`,
@@ -26,7 +30,11 @@ of a `mcp__rk2__submit_mission_result` payload while the claim is still
 `he.role` and `o.kind`, called by the trigger `a_playbook_evidence_guard`
 (`:547-549`) on `INSERT INTO hypothesis_transitions`.
 
-**CONSUMES:** `playbook_evidence` rows, written by the corpus migrations.
+**CONSUMES:** `playbook_evidence` rows for
+`playbooks/authentication/playbook.md`, written by
+`src/redkraken/migrations/20261219T000000Z__the_corpus_is_rewritten_and_refrozen.sql:123-128`
+(deleted at `:39`, re-inserted at `:94`), which is the last writer of that
+path's rows and so the definition the trigger reads today.
 
 - [x] **The bar is real and it is enforced.** `enforce_playbook_evidence()`
       (`src/redkraken/migrations/0032_playbooks.sql:529`) fires
@@ -139,7 +147,13 @@ its `allowed_provenance` does not admit. Every kind named here is in the
 vocabulary and has an `allowed_provenance` some writer could satisfy
 (`0018_vocabularies.sql:219-236`, and `content_match` takes `{tool_run}` rather
 than a Receipt); what is missing is a verb that writes the row and its evidence
-edge, not a provenance the row could carry.
+edge, not a provenance the row could carry. One correction from the review
+pass: that range does not contain `callback_interaction`, which is added at
+`20260812T040000Z__a_callback_arrives_on_a_declared_channel.sql:349` with
+`{callback}` alone, and the migration's own comment says the point is "so an
+agent cannot file a Receipt under it and inherit the weight of an out-of-band
+confirmation". For that one kind the sentence above is false, and the `## Build
+findings` entry below is where it is worked out.
 
 ## Comments
 
@@ -290,27 +304,78 @@ claim.
 (`0032_playbooks.sql:509`) returns the empty set for that claim under
 `playbooks/authentication/playbook.md`, whose bar names `credential_effect` for
 both roles. That is the function the trigger `a_playbook_evidence_guard`
-(`:547-549`) calls before it admits the transition, so the empty set is the
-transition being admitted.
+(`:547-549`) calls before it admits the transition.
 
-**Far end, read for real** -- `tests.test_vertical` walks one Program from a
-recon Receipt to a composed report and asserts the `supported` transition at
-`:685`. It now does that with **no arranged row at all**: the owner-written
-`credential_effect` Observation and its `control` edge are removed, and
-`20261107T000000Z` had already moved `object-ownership`'s bar onto
-`response_differential`, which the replay writes for both legs of a comparison.
-`Ran 3 tests / OK`.
+**Corrected by the review pass, 2026-09-02.** "So the empty set is the
+transition being admitted" was inference across a hop, and it is now run.
+`playbook_evidence_unmet` has a second on-path reader,
+`hypothesis_transition_refusal`
+(`20261112T000000Z__the_refusal_preview_asks_both_halves_of_the_bar.sql:104`),
+which is the function `close_test_replay` asks *instead of* attempting the
+transition and which ticket 182 made ask the Playbook conjunct first. That is
+the skipped grep hit this report should have recorded.
+`test_the_gate_the_runtime_is_handed_does_not_name_the_playbook` now reads it
+for the agent-filed claim and gets back
+`transition testing -> supported requires a tool receipt` -- the *base* rule,
+named, with no Playbook in the sentence. So the Playbook half admits these
+edges at the real gate. The whole `supported` insert is still not reachable in
+this fixture, and deliberately: `transition_rules`
+(`0007_epistemics.sql:126`) wants a test-linked receipt and two rows in roles
+`baseline,variant`, and this payload files one `variant`. The bar is a
+conjunction of two triggers and only one of them was ever this ticket's
+subject.
+
+**Far end, read for real** -- the far end of *this* seam is
+`enforce_playbook_evidence` admitting the insert, and it is read by the gate
+test named above. `tests.test_vertical` is a second, weaker reading and the
+review pass corrected the claim that it stood in for the first: it walks one
+Program from a recon Receipt to a composed report and asserts the `supported`
+transition at `:685`, but that transition is met by the `response_differential`
+rows the replay writes, with no agent-filed edge and no `credential_effect`
+anywhere in the walk. What it demonstrates is that the deletion below was safe,
+not that an agent-filed kind counts. It now runs with **no arranged row at
+all**: the owner-written `credential_effect` Observation and its `control` edge
+are removed, and `object-ownership`'s bar had already moved onto
+`response_differential` -- by `20261107T000000Z`, then deleted and re-inserted
+with every other Playbook's rows by
+`20261219T000000Z__the_corpus_is_rewritten_and_refrozen.sql:285-290`, which is
+the writer the trigger reads today. `Ran 3 tests / OK`.
 
 No `NOBODY`. Both ends are in this repository and both are named above.
 
 **Redemption grep** --
 `grep -rn 'ticket 166' docs/specs/production-harness-v2/` returns no hit in a
-seam-field head. The live prose hits were two and both are corrected in this
-commit: `TASKS.md` caveat (a), which described the arranged row this ticket
-removed, and ticket 169's forward note, which carried the stale 33-of-50 count
-into a `ready-for-agent` criterion set. Hits in `101` are inside a resolved
-ticket's history and stay. Hits in `20261106T000000Z` and `20261107T000000Z`
-are inside applied migrations and are immutable.
+seam-field head, so bar line 3 passes. **Re-walked by the review pass**, because
+the narrative first written here did not match the grep: it returns seven hits,
+not two live ones, and the walk was also scoped to `docs/` when this ticket's
+forward references had been written into source.
+
+- `TASKS.md` caveat (a) -- described the arranged row this ticket removed.
+  Corrected in the build commit, and the caveat count above it corrected by the
+  review.
+- `169:181` -- still true as written; left.
+- `169:120-123` -- carried the stale 33-of-50 count and the "thirteen
+  satisfiable" set into an **unticked criterion** of a `ready-for-agent` ticket.
+  The build corrected only 169's `## How this relates` section and reported the
+  criterion as corrected too; the review corrected the criterion.
+- `175:44` -- cites this ticket only as the shape a bug was found in. Still
+  true; left. Not mentioned by the build at all.
+- `101:30` and `101:293` -- a criteria line and a `## Comments` line, both
+  stating the retired claim. Reported by the build as "inside a resolved
+  ticket's history"; they are not, by the bar's own list of dated `##` blocks.
+  Left in place and declined by the review, with the reason recorded in the
+  findings block: 101 is `resolved`, editing its criteria list to chase a stale
+  count would be a REOPEN of settled work, and `101:30` being unticked at all
+  is a pre-existing defect of 101's own bar rather than this ticket's.
+- `tests/test_playbook.py:452-454` and `:464` -- source, therefore invisible to
+  both the build's grep and bar line 3, which are scoped to
+  `docs/specs/production-harness-v2/`. The first stated the retired claim as
+  measured fact; the second assigned standing ownership of unfinished work to
+  this ticket. Both corrected by the review, which is why
+  "Forward references left standing: none" was wrong as first written.
+- `20261106T000000Z` and `20261107T000000Z` -- inside applied migrations,
+  immutable, and `103`'s hit is inside a dated block of a resolved ticket.
+  Left.
 
 ## Build findings, 2026-09-02
 
@@ -335,11 +400,17 @@ are inside applied migrations and are immutable.
   Recorded as owed below rather than fixed, because proving it needs a callback
   channel fixture that lives in `CallbackPublisherTest`, not in this seam.
 
-- [x] **A callback arrival can be cited as evidence, read but not run.** The
-      mechanism is the finding above and its evidence is source. The run that
-      would close it is one edge citing a `record_callback_interaction`
-      Observation by label, and it belongs in a callback fixture. Ticked
-      because the CRITERION verdict is the record, not a promise.
+- [x] **A callback arrival can be cited as evidence, read but not run --
+      deferred to ticket 84.** The mechanism is the finding above and its
+      evidence is source. The run that would close it is one edge citing a
+      `record_callback_interaction` Observation by label, and it belongs in a
+      callback fixture rather than in this seam. 84 grades every in-scope
+      Playbook at its shipped text through the door, `webhooks` among them, so
+      84's campaign is the run that settles it. Written ticked with its ticket
+      named, which is the one form `standing-bar.md` line 1 admits for work
+      that is owed -- the review pass corrected this, because the criterion as
+      built named no ticket and was therefore invisible to both the line-1 and
+      the line-3 grep.
 
 ## Resolution, 2026-09-02
 
@@ -352,15 +423,44 @@ nothing in the corpus deletes from `hypothesis_evidence`. The ticket read
 "the other writer is shut by then" as shutting the kind out; it shuts out only
 *nachreichen*, an edge added after the claim moves. `mcp__rk2__submit_mission_result`
 (`roster.py:1478-1500`) serves the whole `OBSERVATION_KINDS` enum and an
-`evidence` list in one payload, so every kind in the vocabulary is reachable
-and only the writer differs.
+`evidence` list in one payload, so **every kind a proposal can mint** is
+reachable and only the writer differs.
 
-The seam is guarded by
-`tests.test_database.HypothesisPromotionTest.test_an_agent_filed_kind_counts_towards_the_playbook_bar`,
-which puts one claim carrying two `credential_effect` edges under
-`playbooks/authentication/playbook.md` and asserts the unmet set is empty, and
-by `test_the_edge_the_bar_counted_is_the_one_the_promotion_wrote`, which reads
-the producer's two rows back with their `proposal_id`. The fixture opens a
+That sentence read "every kind in the vocabulary" until the review pass, and
+the wider form is false in three places, all of which the review made explicit:
+
+- `promote_proposal` drops an element whose kind's `allowed_provenance` the
+  payload cannot satisfy, as `incompatible_provenance`
+  (`20261008T000000Z__a_suggested_task_becomes_a_task_or_a_drop.sql:1101-1103`).
+  The enum is *offered* whole; it is not reachable whole through this writer.
+- `callback_interaction` takes `{callback}` alone and no proposal supplies it.
+  It is reachable only by an edge citing an Observation
+  `record_callback_interaction` already wrote, which is the `## Build findings`
+  entry below and is deferred to ticket 84.
+- `transport_parameters_observed` needs a `transport_citable` Receipt, and the
+  inverse case is worse: `transport_evidence_guard`
+  (`0025_transport_claims.sql:361-394`) refuses a `supports` edge on a
+  `probe_only` Property class unless the Observation is exactly that kind. So
+  for such a claim the reachable set is one kind and every other is refused, no
+  matter who writes it. `http-desync` gates `supported` on two kinds that
+  trigger forbids, which is one genuinely unreachable bar in the corpus and is
+  now ticket 233. This ticket's sweep asked which writer could produce a kind
+  and never asked which kinds a claim's own Property class admits.
+
+The seam is guarded by three tests in
+`tests.test_database.HypothesisPromotionTest`.
+`test_an_agent_filed_kind_counts_towards_the_playbook_bar` puts one claim
+carrying two `credential_effect` edges under
+`playbooks/authentication/playbook.md` and asserts the unmet set is empty, the
+selection it is reached through exists, and the Playbook declares two
+`supported` rows -- the last of those added by the review, because an empty
+unmet set alone cannot tell "bar met" from "this Playbook asks for nothing".
+`test_the_edge_the_bar_counted_is_the_one_the_promotion_wrote` reads the
+producer's two rows back with their `proposal_id`.
+`test_the_gate_the_runtime_is_handed_does_not_name_the_playbook`, added by the
+review, reads the same bar through `hypothesis_transition_refusal` -- the
+function `close_test_replay` actually asks, and the one ticket 182 made ask the
+Playbook conjunct first -- and pins the sentence it returns. The fixture opens a
 fourth Program for it, the way ticket 155 has its own.
 
 What this changes in the tree is one deletion: `tests/test_vertical.py`'s
@@ -377,14 +477,41 @@ recorded as results before it ran.
 **Mutated:** `CREDENTIAL_PLAYBOOK` from `playbooks/authentication/playbook.md`
 to `playbooks/logging/playbook.md`, whose bar names `content_match` ->
 `AssertionError: Lists differ: [] != [('control', 'content_match', 1, 0), ('variant', 'content_match', 1, 0)]`
-**Forward references left standing:** none.
+**Forward references left standing:** ticket 84, named on the callback
+criterion above, and ticket 233, cut by the review pass for the one bar that is
+genuinely unreachable. This line read "none" as built; the review pass found
+two live forward references in `tests/test_playbook.py` that the redemption
+grep could not see, because both it and bar line 3 are scoped to
+`docs/specs/production-harness-v2/`. Both are corrected in the review commit
+and the walk is recorded in `## Seam check`.
 
-**Wrong in the ticket, named:** the fourth measured line ("The other writer is
+**Wrong in the ticket, named.** The fourth measured line ("The other writer is
 shut by then") is false as a reachability claim. The fifth ("33 of 50 ...
 37 of 50") is stale: 26 of 51 name a kind the replay does not derive, and that
 is now a statement about which writer files the row rather than about whether
 one exists. The seventh ("Two candidate fixes, neither chosen here") is
 answered by taking neither.
+
+Four more, added by the review pass because the build's list stopped at the
+lines it had measured and left the ones it had invalidated:
+
+- **The opening paragraph.** It still asserted the thirty-three-of-fifty wall a
+  frontier scan and the close walk read first. Corrected in place, with a
+  pointer to this block.
+- **The second measured line.** It quotes `object-ownership/playbook.md:14` as
+  carrying `credential_effect` on the `control` role. Line 14 carries
+  `response_differential` on all three legs, as this ticket's own
+  `20261107T000000Z` made it and `20261219T000000Z:285-290` re-froze it. The
+  `20260823T000000Z:623` half of that criterion is still true of an immutable
+  migration; the `:14` half is not.
+- **The sixth measured line.** It says in the present tense that the walk "has
+  exactly one arranged row" written by `the_control_the_playbook_asks_for()`
+  at `:272-302`. This commit deletes that method, so the claim is false and the
+  line range points at unrelated code.
+- **The fourth measured line's scope, once more.** It is false as a
+  *reachability* claim and true as written about `nachreichen`. It is also not
+  the whole story, because reachability turns on the Property class as well as
+  the writer -- see the third bullet of the correction above and ticket 233.
 
 
 ## Bar, 2026-09-02
@@ -472,3 +599,197 @@ wall says why.
 **Judgement, no injected double.** None was injected. The fixture drives
 `proposal.stage` and `promote_proposal` against a real PostgreSQL 18
 database.
+
+### Re-run by the review pass, 2026-09-02
+
+Under the existing heading, not a new dated one: this is a review's NOW repair
+re-running the machine lines, per `hold-the-line` verdict 1. Nine NOW repairs
+touched test code (`tests/test_database.py`, `tests/test_playbook.py`,
+`tests/test_vertical.py`); the rest were prose.
+
+Line 1 -- every criterion ticked, and the count the line above does not print:
+
+```
+$ grep -c '^- \[ \]' <this ticket>
+0
+$ grep -c '^- \[[ x]\]' <this ticket>
+8
+```
+
+Eight against `hold-the-line`'s ceiling of six. Declined in the findings block
+with the reason, and the review added none of them.
+
+Line 2 -- the seam test read by name. Two of the three tests below are the
+review's; `CleanCreationTest` is in the invocation because
+`docs/agents/testing.md` tier 1 says it belongs in every database run, which
+the build's paste omitted:
+
+```
+$ RK_TEST_SUPERUSER_URL=... RK_TEST_DATABASE=rk2_rev166e \
+    uv run python -m unittest -v tests.test_database.CleanCreationTest \
+                                tests.test_database.HypothesisPromotionTest
+test_an_agent_filed_kind_counts_towards_the_playbook_bar ... ok
+test_the_edge_the_bar_counted_is_the_one_the_promotion_wrote ... ok
+test_the_gate_the_runtime_is_handed_does_not_name_the_playbook ... ok
+… (48 further test lines, all ok)
+Ran 51 tests in 38.049s
+OK
+```
+
+Line 3 -- forward references. The filtered form, and then the plain form the
+line actually specifies, which the build did not read hit by hit:
+
+```
+$ grep -rn 'ticket 166' docs/specs/production-harness-v2/ \
+    | grep -cE '\*\*CONSUMED BY:\*\*|\*\*CONSUMES:\*\*|deferred to'
+0
+$ grep -rn 'ticket 166' docs/specs/production-harness-v2/ | wc -l
+7
+$ grep -rn 'ticket 166' --include=*.py --include=*.sql . | wc -l
+9
+```
+
+Seven and nine, not two. Every hit is walked in `## Seam check` with what
+happened to it. The two in `tests/test_playbook.py` are why this ticket's
+`Forward references left standing` line was wrong as built.
+
+Line 4 -- existing tests still pass; and what the deletion cost, stated:
+
+```
+$ uv run python -m unittest tests.test_vertical tests.test_playbook
+Ran 65 tests in 26.782s
+OK
+```
+
+Two commands rather than one, and that is the substitution the priced wall
+allows rather than a single verify command: `docs/agents/testing.md` tier 1
+covers the modules touched, and the modules touched here span the database
+suite and the two behaviour suites.
+
+**The deletion did cost coverage, and the build's line 4 did not say so.**
+"It asserted nothing and its return value was read by nothing" is true of
+`cls.control` and false of the rows the method wrote. `propose_finding` copies
+every `polarity='supports'` edge into `finding_evidence`, so the arranged
+`credential_effect` Observation was a `finding_evidence` row, and
+`read_what_the_finding_cites`'s `JOIN test_run_receipts` (`:555-558`) was what
+excluded it -- four candidates down to three. With the row gone the filter has
+nothing to exclude, so `assert len(cls.witness) == 3` still passes but no
+longer discriminates a non-test-run-receipt Observation from a replay one. Not
+lowering-move 2 by the letter -- no `.skip`, no deleted file, no removed
+assertion -- but a weaker assertion by its spirit, and the honest fix is to say
+so rather than to re-arrange the row this ticket removed. The docstring that
+explained the filter by that row is corrected in the review commit.
+
+Line 5 -- the diff is what the ticket asked for. Corrected arithmetic: the
+build's paste said "Four files. Two are the ticket's corrected `Touches`", but
+the corrected `Touches` names all four non-ticket files.
+
+```
+$ git status --short --untracked-files=all
+ M docs/specs/production-harness-v2/TASKS.md
+ M docs/specs/production-harness-v2/issues/166-...md
+ M docs/specs/production-harness-v2/issues/169-...md
+ M docs/specs/production-harness-v2/issues/84-grade-the-shipped-playbook-corpus.md
+ M tests/test_database.py
+ M tests/test_playbook.py
+ M tests/test_vertical.py
+?? docs/specs/production-harness-v2/issues/233-...md
+```
+
+Eight paths at review time. Four are the build's, all on the corrected
+`Touches`; `84` and `233` are the TICKET verdict's edge and the ticket it
+points at; `tests/test_playbook.py` is a NOW repair on a forward reference in
+source; this ticket file carries the findings. `hold-the-line` expects a review
+commit to hold exactly this set.
+
+Line 6 -- resolution, bar, no handoff. All three greps this time; the build
+pasted two:
+
+```
+$ grep -c '^## Resolution' <this ticket>
+1
+$ grep -c '^## Bar' <this ticket>
+1
+$ grep -c '^## Handoff' <this ticket>
+0
+```
+
+Effort-wide pending sentinel, which is the close walk's line and is what the
+findings block below had to clear:
+
+```
+$ grep -rn '— verdict pending' docs/specs/production-harness-v2/ | wc -l
+1
+$ grep -rn '^- \[[a-z]*\] .*— verdict pending' docs/specs/production-harness-v2/ | wc -l
+0
+```
+
+One hit and no entry lines. The one hit is the first command of this very
+paste, which `standing-bar.md` rules history by its own words -- "a hit that
+only quotes the marker inside a paste is history, and a cycle line says
+`undecided` and cannot match". The second grep is the one that decides the
+line, and it prints `0`.
+
+**Judgement, red and mutated.** Unchanged and still standing: born green, with
+the reason on the `Red:` line, and `build-slice` §2 grants that form to a
+criterion asserting behaviour that is already correct, which is this ticket's
+whole subject. The review's own repairs added no production code, so
+`hold-the-line` verdict 1 owes them no red test; the three test additions are
+themselves the check.
+
+**Judgement, no unexplained NOBODY.** Both ends named, and the review added the
+second on-path reader (`hypothesis_transition_refusal`) the report had skipped.
+
+**Judgement, the live run reached this ticket's case.** It does now, at the gate
+rather than at the predicate. The build asserted `playbook_evidence_unmet`
+directly and inferred the transition; the review reads the same bar through the
+function `close_test_replay` asks and pins the sentence, which names the base
+rule and not the Playbook.
+
+**Judgement, no injected double.** None was injected, and the arrangement that
+*is* there is now named rather than passed over: `put_the_claim_under_a_playbook_bar`
+hand-writes the `tasks` row and the `playbook_selections` row the bar is read
+through, bypassing the selection verb, exactly as
+`ask_the_preview_about_the_playbook_bar` does. The fixture drives
+`proposal.stage` and `promote_proposal` against a real PostgreSQL 18 database.
+
+## Review findings, 2026-09-02 — cycle 1
+
+Fixed point `1ba74ee9`, the parent of this ticket's first and only build commit
+`766b21e1`. 204 changed code lines and 260 changed doc lines: one logical
+change, reviewable in one sitting. Four axes read in parallel, apart.
+
+- [ticket] **`http-desync`'s `supported` bar is unreachable, and the gate is a per-property-class trigger no measurement in this ticket opened.** `transport_evidence_guard` (`0025_transport_claims.sql:361-394`, `ENABLE ALWAYS`) refuses any `polarity='supports'` edge on a claim whose `property_class` is `probe_only` unless the Observation kind is `transport_parameters_observed`. `http-desync` declares `transport.tls_configuration` in `bb:outputs` (`:4`), which is `probe_only` (`0025:204`), and its bar (`:13`) asks `response_invariant` for `control` and `response_differential` for `variant`, both `supports`. Neither edge can be inserted by any writer. The Resolution's "every kind in the vocabulary is reachable and only the writer differs" is false, and the block is neither provenance nor the replay's kind derivation. — blocker — NOW. The Resolution now says "every kind a proposal can mint" and names this trigger, the Property-class question the sweep never asked, and ticket 233. No production code changed, so no red test is owed; the corpus work is the next entry.
+- [ticket] **The corpus defect behind that bar, which ticket 101's rewrite introduced.** `http-desync`'s own `bb:provenance` (`:12`) says the rewrite moved its evidence rows "off `transport_parameters_observed`, which the ledger established has no agent-reachable writer by any path" — onto the two kinds `transport_evidence_guard` forbids for exactly this class. The rewrite inverted reachability rather than restoring it, and nothing records that. — required — TICKET 233. Blocks 84 -- grading `http-desync` at its shipped text would return `fail` and measure this trigger rather than the Playbook, which is what ticket 166's own 2026-08-24 comment recorded happening to five Playbooks at 330 million budget units. 233 is on 84's `Blocked by` line in this commit.
+- [seam] **The far end was never run.** Both new tests stop at `playbook_evidence_unmet`; no test inserts a `hypothesis_transitions` row for the `barred` claim, so `enforce_playbook_evidence` (`0032:529`) and `a_playbook_evidence_guard` (`:547-549`) never fire on the agent-filed case. `## Seam check`'s "the empty set is the transition being admitted" is inference across a hop. `tests/test_vertical.py:685` does not stand in: that transition is met by replay-written `response_differential` under `object-ownership`, with no agent-filed edge anywhere in the walk. — required — NOW. `test_the_gate_the_runtime_is_handed_does_not_name_the_playbook` reads the bar through `hypothesis_transition_refusal`, the function `close_test_replay` asks and the one ticket 182 made ask the Playbook conjunct first, and pins the returned sentence: `transition testing -> supported requires a tool receipt`. The base rule, named, with no Playbook in it. The Playbook half admits these edges at the real gate.
+- [ticket] **Converged with the seam axis, from the ticket's own promise.** "The first thing this ticket builds is the test that runs it ... if `enforce_playbook_evidence` raises, the wall is real, its message is the `Red:` line." What shipped asserts the predicate, not the transition. A whole transition is in fact unreachable in this fixture: `transition_rules` `testing -> supported` (`0007_epistemics.sql:126`) wants `min_supporting_evidence` 2 counted over roles `baseline,variant` and a test-linked receipt (`0015:195`), and the payload files one `variant`. — required — NOW. Same repair. The seam report now states plainly that the whole `supported` insert is unreachable in this fixture by design -- `transition_rules` wants two `baseline,variant` rows and a test-linked receipt, and the payload files one `variant` -- so the conjunction is described as a conjunction.
+- [ticket] **A ticked criterion whose work is owed to nobody.** "- [x] A callback arrival can be cited as evidence, read but not run ... Ticked because the CRITERION verdict is the record, not a promise." `standing-bar.md` line 1 admits exactly one ticked-but-undone form, `- [x] … deferred to ticket NN`, "because the redemption grep below guards it". This carries no ticket number, so it is invisible to the line-1 grep and to the line-3 redemption grep alike. — blocker — NOW. Rewritten as `- [x] ... deferred to ticket 84`, which is the one ticked-but-undone form `standing-bar.md` line 1 admits, and 84's door campaign grades `webhooks` and so is the run that settles it. The debt is now visible to both the line-1 and the line-3 grep.
+- [seam] **`tests/test_playbook.py` still states the refuted claim as measured fact and names this ticket as its owner.** `:452-454` "ticket 166 measured that no runtime verb writes that kind, `enforce_playbook_evidence` raises on the transition, and so this Playbook could never reach `supported` at all"; `:464` "ticket 166 owns putting that distinction back". Both the §5 redemption grep and Bar line 3 are scoped to `docs/specs/production-harness-v2/`, so neither can see a source comment, and "Forward references left standing: none" is unproven. — required — NOW. Both comments corrected: `:452-454` no longer states the retired claim as measured fact, and `:464` no longer assigns standing ownership to this ticket. The redemption walk in `## Seam check` now records that it was scoped to `docs/` and says so.
+- [seam] **"Every kind in the vocabulary is reachable" is a non-sequitur for the one callback bar.** `webhooks` `supported`/`variant` names `callback_interaction`, whose `allowed_provenance` is `{callback}` (`20260812T040000Z:349`), with the migration's own comment saying the point is "so an agent cannot file a Receipt under it". No proposal-minted Observation can carry it; the mechanism that would reach it is a different one, which this ticket files as read-not-run and then ticks. — required — NOW. Folded into the same scoping. `callback_interaction` is named as one of the three exceptions, with the migration comment that makes it deliberate, and the run is deferred to ticket 84 on the criterion above.
+- [ticket] **Converged with the seam axis: reachability is attributed to the wrong mechanism.** `promote_proposal` drops any element whose kind's `allowed_provenance` the payload cannot satisfy — `incompatible_provenance` (`20261008T000000Z:1101-1103`). The enum is *offered* whole by `mcp__rk2__submit_mission_result`; it is not *reachable* whole through that writer. `transport_parameters_observed` is a second exception, needing a `transport_citable` receipt. — required — NOW. Same repair; `incompatible_provenance` is cited and the offered-versus-reachable distinction is drawn in the Resolution.
+- [bar] **The `tests/test_vertical.py` deletion cost coverage, and Bar line 4's defence does not cover it.** "It asserted nothing and its return value was read by nothing" is true of `cls.control` and false of the rows the method wrote. `propose_finding` copies every `supports` edge into `finding_evidence`, so the arranged `credential_effect` Observation was a `finding_evidence` row, and `read_what_the_finding_cites`'s `JOIN test_run_receipts` (`:555-558`) existed to filter it out. With the row gone the filter filters nothing, and the surviving `assert len(cls.witness) == 3` (`:571`) no longer discriminates a non-test-run-receipt Observation from a replay one. — required — NOW, as honesty rather than restoration. Bar line 4 below now records the coverage the deletion cost, and the docstring is corrected. Re-arranging a row purely to keep the filter meaningful would put back the one arranged row this ticket removed, which is the wrong fix; what the count now rests on is stated instead.
+- [craft] **Converged with the bar axis: the docstring explaining that filter names a row this diff deleted.** `tests/test_vertical.py:548-550` still reads "the Playbook's `control` row above is evidence of the claim and is cited as such, but it stands on the lap's Receipt rather than on an action of the run this report reproduces." There is no such row above any more, and it is the only explanation a reader gets for a filter that no longer filters. — required — NOW. Same edit as the entry above.
+- [bar] **Ticket 169's stale count survives in an unticked criterion.** `## Seam check` says 169's forward note "carried the stale 33-of-50 count into a `ready-for-agent` criterion set" and was "corrected in this commit". The edit landed only in `## How this relates`; the phase-zero criterion at `169:120-123` still reads "one of the thirteen Playbooks 166 lists as satisfiable today and is **not** one of the thirty-three that gate `supported` on a kind no verb can write". — required — NOW. `169:120-123` corrected: it no longer claims a thirteen-satisfiable set or a thirty-three-unreachable set, and it says why `file-resolution` is still the right phase-zero pick -- it needs no agent-filed edge. The bullet's `(resolved)` annotation is restored to match its three siblings.
+- [bar] **The redemption-grep narrative does not match the grep.** The plain `grep -rn 'ticket 166' docs/specs/production-harness-v2/` the bar specifies returns 7 hits, not "two live prose hits". `101:30` sits in a criteria list and `101:293` under `## Comments` — neither is a dated `##` block, so "hits in 101 are inside a resolved ticket's history and stay" does not hold by the bar's own list. `175:44` is not mentioned. The filtered form still prints `0`, so line 3 passes; the record of it does not. — required — NOW. The paragraph is replaced by the seven hits, each with its real location and what happened to it. The two `101` hits are left in place and declined there in writing: 101 is `resolved`, editing its criteria list to chase a stale count would reopen settled work, and `101:30` being unticked is a pre-existing defect of 101's own bar.
+- [craft] **The head still asserts the wall the Resolution says never existed.** "**What to build:** Nothing yet ... Thirty-three of the fifty Playbooks in the corpus gate `supported` on an Observation kind that no runtime writer can put on a hypothesis" — the first thing a frontier scan and the close walk read, and the one paragraph "Wrong in the ticket, named" omits. — required — NOW. Corrected in place and marked superseded with a pointer to `## Resolution`, and added to `Wrong in the ticket, named`.
+- [bar] **Criterion 6 is ticked, present tense, and false by this commit's own action.** "`tests/test_vertical.py`'s walk has exactly one arranged row. `the_control_the_playbook_asks_for()` (`:272-302`) writes the `credential_effect` Observation ... as owner." The method is deleted in this diff and the line range now points at unrelated code. — required — NOW. Added to `Wrong in the ticket, named`, with the deletion and the dead line range called out.
+- [ticket] **Criterion 2 cites a line that now says the opposite.** It quotes `object-ownership/playbook.md:14` as carrying `credential_effect` on `control`; line 14 carries `response_differential` on all three legs, as this ticket's own `## Seam check` says `20261107T000000Z` made it. — required — NOW. Added to `Wrong in the ticket, named`, separating the still-true `20260823T000000Z:623` half from the false `:14` half.
+- [bar] **Eight criteria against a ceiling of six.** `grep -c '^- \[[ x]\]'` prints `8`. `hold-the-line` "Watch the criteria": more than six "has stopped satisfying `cut-slices` Rule 4. Split it. Rule 4 has no enforcement point after cutting, so this is it." Seven were cut with the ticket; the build's own CRITERION verdict added the eighth, which is the growth path that rule guards. — required — DECLINED. The eight checkboxes on this ticket are recorded measurements on an investigation ticket whose `What to build` is "Nothing yet"; `cut-slices` Rule 4 counts work spanning seams, and splitting a ticket whose deliverable is one measurement would split the measurement rather than the work. The review added none of them and put its own two repairs on a new ticket and on 84 instead, which is the behaviour the rule exists to produce. Recorded here rather than acted on.
+- [seam] **An empty unmet set is ambiguous and the fixture does not close the ambiguity.** `read_the_playbook_bar` guards the selection-to-Task half with `barred_selections` but never asserts the Playbook declares `supported` rows at all, so an empty result means "bar met" only by reading the corpus. True today, latently vacuous after any corpus rewrite — which is the failure mode this ticket exists to document. — required — NOW. `barred_declared` counts the Playbook's `supported` rows in the same fixture and the test asserts `2`, so an empty unmet set can no longer be read as "this Playbook asks for nothing".
+- [bar] **Bar line 6 omits one of its three greps.** The paste carries `grep -c '^## Resolution'` and `grep -c '^## Handoff'` but not `grep -c '^## Bar'`, the one whose heading the block itself creates. Re-run it prints `1`, so nothing fails; a third of the line's evidence is simply absent. — required — NOW. The third grep is run and pasted under the existing `## Bar` heading.
+- [craft] **`read_the_playbook_bar` is three responsibilities under a name that says one.** It writes the Task and the selection, publishes `cls.barred_hypothesis` and `cls.barred_selections` as side effects, and returns a third value. Every sibling fixture classmethod in the class is single-mode, and the precedent its docstring cites, `ask_the_preview_about_the_playbook_bar`, assigns and returns nothing. — required — NOW. Renamed to `put_the_claim_under_a_playbook_bar`, returns `None`, and assigns every reading to `cls.*` inside -- which is what `ask_the_preview_about_the_playbook_bar`, the precedent its own docstring cites, does.
+- [craft] **`gefilt` is not a German word.** `TASKS.md` caveat (a): "dass eine Evidenzkante mit dem Vorschlag gefilt wird". The nearest real word, `gefüllt`, changes the meaning, and the rest of the paragraph keeps proper register. — required — NOW. `gefilt` to `eingereicht`.
+- [craft] **TASKS.md still counts two caveats where one remains.** `:301` "Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:" and `:30` "Die beiden Vorbehalte stehen bei Freigabe B." (a) is now a resolved history note; only (b) is live. — required — NOW. `:301` now reads one caveat with (a) filed as a dated correction, and `:30` matches it.
+- [seam] **Two dead fixture assignments.** `cls.filed, cls.agent_kinds = cls.promote("barred", cls.agent_filed())` binds two names no test or fixture reads, and `cls.filed` shadows an attribute four other classes use for something else. Raised by three axes. — nit — NOW. Dropped; the promotion result is discarded the way four sibling calls in the same fixture already discard it.
+- [craft] **`SELECT *` then positional indexing.** `read_the_playbook_bar` reads a six-column `RETURNS TABLE` and indexes `row[1], row[2], row[4], row[5]`; the order lives in `0032_playbooks.sql:509-510` and a re-created function reorders it silently. The sibling test added in the same commit names its columns. — nit — NOW. Columns named -- `SELECT req_role, req_kind, need, have` -- with the reason in a comment.
+- [seam] **The seam report records no skipped hit and misattributes the live bar writer.** `hypothesis_transition_refusal` (`20261112T000000Z:104`) is a second on-path reader of `playbook_evidence_unmet` and is what `close_test_replay` asks before attempting a transition; it is unrecorded. The far-end bar is attributed to `20261107T000000Z`, but `20261219T000000Z` deleted and re-inserted every Playbook's evidence rows and is the current writer. — nit — NOW. `hypothesis_transition_refusal` is recorded as the skipped hit, and the live writer of the bar the walk reads is corrected from `20261107T000000Z` to `20261219T000000Z:285-290`.
+- [ticket] **Three thin citations.** `0018_vocabularies.sql:219-236` is offered for "every kind named here" but does not contain `callback_interaction`; the `CONSUMES` head names no file or line; Bar line 5's "Four files. Two are the ticket's corrected `Touches`" contradicts the `Touches` line, which names all four. — nit — NOW. `0018_vocabularies.sql:219-236` now carries the `20260812T040000Z:349` companion citation for the kind it does not contain; the `CONSUMES` head cites `20261219T000000Z:123-128`; Bar line 5's arithmetic is corrected below.
+- [bar] **Two Bar-block bookkeeping slips.** The substituted verify command differs between line 2 (one class, no `CleanCreationTest`) and line 4 (a different module), so "the same verify command, read whole" is not what ran; and "Judgement, no injected double — none was injected" does not name the hand-inserted `tasks` and `playbook_selections` rows the bar is read through. — nit — NOW. Bar line 4 now names both commands and why two were needed, and the injected-double judgement names the hand-written `tasks` and `playbook_selections` rows.
+- [craft] **Three taste calls on the new fixture and the Bar block.** `CREDENTIAL_PLAYBOOK` is a single-use constant 400 lines from its use; `agent_filed`/`read_the_playbook_bar` import a sentence-style naming register the class does not use; the `## Bar` block restates the three sections above it. — nit — DECLINED. `CREDENTIAL_PLAYBOOK` is named because the `Mutated:` line's evidence is the result of swapping exactly that constant, so the name is what made the mutation legible; the sentence-style register matches the replay fixture the new code sits beside; and the `## Bar` block's restatement is what `standing-bar.md` mandates as the ticket's evidence, not duplication to clean up.
+
+Tickets minted by this cycle: 1 (233). Criteria added to this ticket: 0 --
+the ticket is already at eight against a ceiling of six, so no verdict was
+allowed to land here. Criteria added to any other ticket: 0; the TICKET
+verdict wrote a `Blocked by` edge on 84 and left its six criteria alone.
+
+Review cycle 1 of 3 — undecided: none

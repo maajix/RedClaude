@@ -13727,8 +13727,8 @@ class HypothesisPromotionTest(DatabaseCase):
         # Ticket 166, in the fourth: one claim standing on two Observations of a
         # kind no replay derives, both filed with the proposal, then put under
         # the shipped Playbook whose bar asks for exactly that kind.
-        cls.filed, cls.agent_kinds = cls.promote("barred", cls.agent_filed())
-        cls.barred_unmet = cls.read_the_playbook_bar()
+        cls.promote("barred", cls.agent_filed())
+        cls.put_the_claim_under_a_playbook_bar()
         cls.lifted_drops = {
             str(row[0]): (str(row[1]), str(row[2]))
             for row in cls.connection.execute(
@@ -13961,7 +13961,7 @@ class HypothesisPromotionTest(DatabaseCase):
         }
 
     @classmethod
-    def read_the_playbook_bar(cls) -> list:
+    def put_the_claim_under_a_playbook_bar(cls) -> None:
         """The claim above, put under a shipped Playbook, and its bar asked.
 
         `playbook_evidence_unmet` reaches a Playbook through a Task, so the
@@ -13969,6 +13969,13 @@ class HypothesisPromotionTest(DatabaseCase):
         about. Both are written here rather than earned, the way
         `ask_the_preview_about_the_playbook_bar` writes them: what this reading
         is about is whether the edge counts, not how the Playbook was chosen.
+
+        Four things are read, because an empty unmet set on its own says less
+        than it looks like it says: the selection the bar is reached through,
+        the number of `supported` rows the Playbook declares -- without which
+        "unmet is empty" could mean "this Playbook asks for nothing" -- the
+        unmet set itself, and the sentence the runtime is actually handed,
+        which is the gate rather than the predicate behind it.
         """
         program_id = cls.identifiers["barred"]
         hypothesis = str(
@@ -14008,13 +14015,39 @@ class HypothesisPromotionTest(DatabaseCase):
                 (hypothesis,),
             ).scalar()
         )
-        return [
-            (str(row[1]), str(row[2]), int(row[4]), int(row[5]))
+        # Counted rather than read off the corpus: a rewrite that dropped this
+        # Playbook's `supported` rows would leave every assertion below green
+        # and meaning nothing, which is the failure this ticket is about.
+        cls.barred_declared = int(
+            cls.connection.execute(
+                "SELECT count(*) FROM playbook_evidence e JOIN playbooks p"
+                "    ON p.id = e.playbook_id"
+                " WHERE p.path = $1 AND e.to_status = 'supported'",
+                (CREDENTIAL_PLAYBOOK,),
+            ).scalar()
+        )
+        # Named columns rather than `SELECT *`: the order lives in the function
+        # signature (`0032_playbooks.sql:509-510`) and a re-created function
+        # would reorder it silently.
+        cls.barred_unmet = [
+            (str(row[0]), str(row[1]), int(row[2]), int(row[3]))
             for row in cls.connection.execute(
-                "SELECT * FROM playbook_evidence_unmet($1::uuid, 'supported')",
+                "SELECT req_role, req_kind, need, have"
+                "  FROM playbook_evidence_unmet($1::uuid, 'supported')",
                 (hypothesis,),
             ).rows
         ]
+        # The gate, not the predicate behind it. `close_test_replay` asks this
+        # function instead of attempting the transition, and ticket 182 put the
+        # Playbook conjunct first in its body
+        # (`20261112T000000Z...:104`). So a sentence that does not name a
+        # Playbook is `enforce_playbook_evidence`'s half admitting the
+        # agent-filed edges, read through the caller that really consults it.
+        cls.barred_refusal = cls.connection.execute(
+            "SELECT hypothesis_transition_refusal("
+            "  $1::uuid, 'testing', 'supported', 'runtime', NULL, NULL)",
+            (hypothesis,),
+        ).scalar()
 
     @classmethod
     def nested(cls) -> dict:
@@ -14850,9 +14883,28 @@ class HypothesisPromotionTest(DatabaseCase):
         the proposal that minted the claim.
         """
         # The bar exists to be met: one undropped selection reachable through
-        # the claim's Task, so an empty unmet set is an answer and not silence.
+        # the claim's Task, and two `supported` rows on the Playbook itself, so
+        # an empty unmet set is an answer and not silence.
         self.assertEqual(1, self.barred_selections)
+        self.assertEqual(2, self.barred_declared)
         self.assertEqual([], self.barred_unmet)
+
+    def test_the_gate_the_runtime_is_handed_does_not_name_the_playbook(self):
+        """The same bar, read through the caller that really consults it.
+
+        The test above reads `playbook_evidence_unmet` directly, which is the
+        predicate; this reads `hypothesis_transition_refusal`, which is what
+        `close_test_replay` asks before it attempts a transition and which
+        since ticket 182 asks the Playbook conjunct first. The sentence that
+        comes back names the *base* rule -- `testing -> supported` wants a
+        test-linked receipt and two rows in roles `baseline,variant`, and this
+        fixture files one `variant` -- and naming it is the point: the Playbook
+        half is no longer what stands between this claim and `supported`.
+        """
+        self.assertEqual(
+            "transition testing -> supported requires a tool receipt",
+            self.barred_refusal,
+        )
 
     def test_the_edge_the_bar_counted_is_the_one_the_promotion_wrote(self):
         """The producer's half, read back where the consumer reads it.
