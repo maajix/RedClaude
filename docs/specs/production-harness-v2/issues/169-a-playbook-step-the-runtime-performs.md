@@ -362,15 +362,17 @@ prototype's measurement is evidence for.
   `roster.py:1424-1426` cites "playbook_selections has never held a row in this
   tree" as the reason a Playbook-derived Test specification "is not available";
   164 is what retired that reason.
-- **166 (`ready-for-agent`) is the stage after this one and it is not fixed
-  here.** 166 is the evidence bar: 33 of 50 Playbooks gate `supported` on an
-  Observation kind no verb can write, 37 if the test widens to kinds the replay
-  path cannot write. Phase zero deliberately picks `file-resolution`, one of the
-  thirteen 166 lists as satisfiable, precisely so the prototype is not blocked
-  on 166's decision and a negative result means something about steps rather
-  than about evidence kinds. If 166 is fixed first, the number of Playbooks this
-  design can carry grows; if it is not, thirteen is enough to prove a shape.
-  Neither ticket needs the other to land.
+- **166 is the stage after this one, and it turned out not to be a wall.** 166
+  is the evidence bar. It was written as "33 of 50 Playbooks gate `supported` on
+  an Observation kind no verb can write"; re-measured on 2026-09-02 it is 26 of
+  51, and the reachability half is false. An evidence edge filed with the
+  proposal, while the claim is still `proposed`, is counted by
+  `playbook_evidence_unmet` at the `supported` transition, so every kind in the
+  vocabulary is reachable and only the writer differs. Phase zero still picks
+  `file-resolution` -- the kinds `close_test_replay` derives are still exactly
+  `response_invariant` and `response_differential`, which is what this ticket's
+  criteria rest on -- but it is not picked to dodge a wall any more. Neither
+  ticket needs the other to land.
 - **98 (`resolved`) and 99 (`ready-for-agent`) are the two other step kinds.**
   98 shipped `mcp__rk2__mint_callback` into `state.propose`
   (`roster.py:902-907`), which is a step reaching the out-of-band channel. 99

@@ -13614,6 +13614,19 @@ NESTED_NAMED = "authorization.tenant_isolation"
 DIFFERENTIAL = "response_differential"
 INVARIANT = "response_invariant"
 
+#: Ticket 166: an evidential kind `close_test_replay` cannot derive. The replay
+#: reads the assertions that name an action and answers `response_differential`
+#: or `response_invariant` and nothing else, so a Playbook bar naming this kind
+#: can only ever be met by a row an agent filed with its proposal. It takes
+#: `{receipt}` provenance, which is what the fixture's Receipt is for.
+CREDENTIAL = "credential_effect"
+
+#: The shipped Playbook whose bar asks for that kind on both roles it names.
+#: Its `bb:evidence` line carries `credential_effect` for `control` and for
+#: `variant` on `supported`, so one payload either meets the whole bar or meets
+#: none of it, and the unmet set is the assertion rather than a subset of it.
+CREDENTIAL_PLAYBOOK = "playbooks/authentication/playbook.md"
+
 
 def rationale(mechanism: str = "the object id is not checked against the caller") -> dict:
     """A complete rationale, which is the only kind promotion admits."""
@@ -13657,7 +13670,7 @@ class HypothesisPromotionTest(DatabaseCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.identifiers = {}
-        for name in ("main", "other", "nested"):
+        for name in ("main", "other", "nested", "barred"):
             # `UNSEEDED` rather than `SCOPED`: `labels` below reads the Entities
             # this Program holds one of per type, and an Application the
             # configuration recorded when it opened would hide the one this
@@ -13670,7 +13683,8 @@ class HypothesisPromotionTest(DatabaseCase):
             assert opened.ok, (name, opened.violations)
             cls.identifiers[name] = opened.facts["program_id"]
         cls.seeded = {
-            name: cls._populate(name) for name in ("main", "other", "nested")
+            name: cls._populate(name)
+            for name in ("main", "other", "nested", "barred")
         }
 
         # The Surface and the evidence, in the state a recon run and a first
@@ -13680,7 +13694,12 @@ class HypothesisPromotionTest(DatabaseCase):
         cls.promote("main", cls.recon("main"))
         cls.promote("other", cls.recon("other"))
         cls.promote("nested", cls.recon("nested"))
+        cls.promote("barred", cls.recon("barred"))
         cls.held = cls.labels("main")
+        # Ticket 166's own Program, for the same reason 155 has one: the reading
+        # below is of a Program whose single claim stands under a Playbook bar,
+        # and filing it into `main` would make `labels` there answer for three.
+        cls.barred_held = cls.labels("barred")
         # Ticket 155's own Program and its own Surface. Separate because
         # `labels` reads the Hypothesis of a Program that holds exactly one,
         # and the two claims below would make `main` a Program holding three.
@@ -13705,6 +13724,11 @@ class HypothesisPromotionTest(DatabaseCase):
         cls.refusals, cls.refused = cls.promote("main", cls.wrong())
         # Ticket 155, in the third Program.
         cls.inside, cls.lifted = cls.promote("nested", cls.nested())
+        # Ticket 166, in the fourth: one claim standing on two Observations of a
+        # kind no replay derives, both filed with the proposal, then put under
+        # the shipped Playbook whose bar asks for exactly that kind.
+        cls.filed, cls.agent_kinds = cls.promote("barred", cls.agent_filed())
+        cls.barred_unmet = cls.read_the_playbook_bar()
         cls.lifted_drops = {
             str(row[0]): (str(row[1]), str(row[2]))
             for row in cls.connection.execute(
@@ -13892,6 +13916,105 @@ class HypothesisPromotionTest(DatabaseCase):
             ],
             "completion_claim": {"status": "partial"},
         }
+
+    @classmethod
+    def agent_filed(cls) -> dict:
+        """Ticket 166: one claim whose whole bar is a kind no replay can write.
+
+        `close_test_replay` derives an Observation's kind from the assertions
+        that name the action, so `response_invariant` and
+        `response_differential` are the only two it ever attaches to a claim.
+        Every other evidential kind has to arrive the way this payload sends
+        it -- named by the agent in `submit_mission_result` and written by
+        `rk2_promote_hypotheses` in the same promotion that mints the claim,
+        while the claim is still `proposed` and the refusal at
+        `claim_past_proposed` therefore does not apply.
+
+        Both roles the Playbook names are filed here, because the bar is a
+        conjunction and half of it met is the same refusal as none of it.
+        """
+        return {
+            "observations": [
+                {"ref": "worked", "kind": CREDENTIAL,
+                 "subject_label": cls.barred_held["endpoint"],
+                 "summary": "the second session was answered rather than refused",
+                 "receipt_label": cls.seeded["barred"]["receipt"]},
+                {"ref": "crossed", "kind": CREDENTIAL,
+                 "subject_label": cls.barred_held["endpoint"],
+                 "summary": "the same note answered for a member who does not own it",
+                 "receipt_label": cls.seeded["barred"]["receipt"]},
+            ],
+            "hypotheses": [
+                {"ref": "own", "subject_label": cls.barred_held["endpoint"],
+                 "property_class": OWNERSHIP,
+                 "identity_a_label": cls.barred_held["identity_member"],
+                 "statement": "the note id is honoured for a member who does not own it",
+                 "rationale": rationale()},
+            ],
+            "evidence": [
+                {"hypothesis_ref": "own", "observation_ref": "worked",
+                 "polarity": "supports", "role": "control"},
+                {"hypothesis_ref": "own", "observation_ref": "crossed",
+                 "polarity": "supports", "role": "variant"},
+            ],
+            "completion_claim": {"status": "partial"},
+        }
+
+    @classmethod
+    def read_the_playbook_bar(cls) -> list:
+        """The claim above, put under a shipped Playbook, and its bar asked.
+
+        `playbook_evidence_unmet` reaches a Playbook through a Task, so the
+        Task and the selection have to exist before there is a bar to ask
+        about. Both are written here rather than earned, the way
+        `ask_the_preview_about_the_playbook_bar` writes them: what this reading
+        is about is whether the edge counts, not how the Playbook was chosen.
+        """
+        program_id = cls.identifiers["barred"]
+        hypothesis = str(
+            cls.connection.execute(
+                "SELECT id::text FROM hypotheses WHERE program_id = $1::uuid",
+                (program_id,),
+            ).scalar()
+        )
+        with cls.connection.transaction():
+            cls.connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.connection.execute(
+                "INSERT INTO tasks (program_id, kind, status, hypothesis_id,"
+                " subject_entity_id)"
+                " SELECT h.program_id, 'hunt', 'pending', h.id, h.subject_entity_id"
+                "   FROM hypotheses h WHERE h.id = $1::uuid",
+                (hypothesis,),
+            )
+            cls.connection.execute(
+                "INSERT INTO playbook_selections"
+                " (program_id, task_id, subject_entity_id, playbook_id,"
+                "  playbook_sha256, rank)"
+                " SELECT t.program_id, t.id, t.subject_entity_id, p.id,"
+                "        p.source_sha256, 1"
+                "   FROM tasks t, playbooks p"
+                "  WHERE t.hypothesis_id = $1::uuid AND p.path = $2",
+                (hypothesis, CREDENTIAL_PLAYBOOK),
+            )
+        cls.barred_hypothesis = hypothesis
+        # The chain, asserted rather than assumed: a selection that reached no
+        # Task would leave the bar with nothing to read, and an empty unmet set
+        # would then mean "no Playbook" rather than "the bar is met".
+        cls.barred_selections = int(
+            cls.connection.execute(
+                "SELECT count(*) FROM playbook_selections s JOIN tasks t"
+                "    ON t.id = s.task_id"
+                " WHERE t.hypothesis_id = $1::uuid AND s.dropped_because IS NULL",
+                (hypothesis,),
+            ).scalar()
+        )
+        return [
+            (str(row[1]), str(row[2]), int(row[4]), int(row[5]))
+            for row in cls.connection.execute(
+                "SELECT * FROM playbook_evidence_unmet($1::uuid, 'supported')",
+                (hypothesis,),
+            ).rows
+        ]
 
     @classmethod
     def nested(cls) -> dict:
@@ -14713,6 +14836,43 @@ class HypothesisPromotionTest(DatabaseCase):
         self.assertEqual("no_such_label", reason)
         self.assertEqual("n_absent", cited)
         self.assertNotIn("evidence[0]", self.lifted_drops)
+
+    # -- ticket 166: a bar met by a kind the replay cannot write --------------
+
+    def test_an_agent_filed_kind_counts_towards_the_playbook_bar(self):
+        """The seam: what `rk2_promote_hypotheses` wrote is what the bar reads.
+
+        `playbook_evidence_unmet` joins `hypothesis_evidence` to `observations`
+        and compares `o.kind` and `he.role` against the Playbook's own rows. An
+        empty result is the bar met, and it is what `enforce_playbook_evidence`
+        checks before it admits the `supported` transition. This claim earned
+        that with two Observations of a kind no replay derives, both filed with
+        the proposal that minted the claim.
+        """
+        # The bar exists to be met: one undropped selection reachable through
+        # the claim's Task, so an empty unmet set is an answer and not silence.
+        self.assertEqual(1, self.barred_selections)
+        self.assertEqual([], self.barred_unmet)
+
+    def test_the_edge_the_bar_counted_is_the_one_the_promotion_wrote(self):
+        """The producer's half, read back where the consumer reads it.
+
+        Two edges, both `supports`, one per role the Playbook names, and both
+        carrying a `proposal_id` -- which is what says the promotion wrote them
+        rather than a replay or this test.
+        """
+        self.assertEqual(
+            [("control", CREDENTIAL, "supports", True),
+             ("variant", CREDENTIAL, "supports", True)],
+            [(str(row[0]), str(row[1]), str(row[2]), row[3] is not None)
+             for row in self.connection.execute(
+                 "SELECT he.role, o.kind, he.polarity, he.proposal_id"
+                 "  FROM hypothesis_evidence he JOIN observations o"
+                 "    ON o.id = he.observation_id"
+                 " WHERE he.hypothesis_id = $1::uuid ORDER BY he.role",
+                 (self.barred_hypothesis,),
+             ).rows],
+        )
 
     def claim_class(self, label: str) -> str:
         """The Property class of one promoted claim of the third Program."""

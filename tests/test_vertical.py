@@ -266,46 +266,6 @@ class VerticalRunTest(ChainFixture, DatabaseCase):
         cls.task = cls.hunt_task()
         cls.kept = int(committed(cls.connection, cls.SELECTION, (cls.task, cls.subject)))
         cls.hunt_run = cls.claimed_by_a_hunter()
-        cls.control = cls.the_control_the_playbook_asks_for()
-
-    @classmethod
-    def the_control_the_playbook_asks_for(cls) -> str:
-        """The Observation the reading wants, which no replay can file.
-
-        `close_test_replay` derives the kind of every Observation it writes from
-        the assertions that name the action, so the only two it can ever produce
-        are `response_invariant` and `response_differential`.
-        `object-ownership` asked for one `credential_effect` in the `control`
-        role before `enforce_playbook_evidence` would admit `supported` -- the
-        row that says the Identity the control ran under was working at the time
-        -- and 155 admits a proposed evidence edge only while the claim is still
-        `proposed`, which a claim with a Test running is not. So this row is
-        arranged here rather than earned, out of the Receipt the lap already
-        filed, the way every other case in this tree arranges the evidence it
-        did not come to prove. It is the only row in the walk that is.
-
-        Ticket 166 narrowed that bar on 2026-08-24, because a row no verb can
-        write is a Playbook that can never be graded rather than a strict one.
-        The bar now names `response_differential`, which the walk's own control
-        leg earns. This row stays because the reading it stands for is still the
-        right one and ticket 166 still owes the verb that would write it.
-        """
-        observation = committed(
-            cls.owner_as_runtime(),
-            "INSERT INTO observations (program_id, agent_run_id, subject_entity_id, kind,"
-            "                          summary, provenance_kind, receipt_id)"
-            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'credential_effect',"
-            "         'the exchange the lap made was answered rather than refused',"
-            "         'receipt', $4::uuid) RETURNING id",
-            (cls.program_id, cls.hunt_run, cls.subject, cls.reached),
-        )
-        cls.as_owner(
-            "INSERT INTO hypothesis_evidence (program_id, hypothesis_id, observation_id,"
-            "                                 polarity, role)"
-            " VALUES ($1::uuid, $2::uuid, $3::uuid, 'supports', 'control')",
-            (cls.program_id, cls.hypothesis, observation),
-        )
-        return observation
 
     @classmethod
     def the_endpoint_under_it(cls):

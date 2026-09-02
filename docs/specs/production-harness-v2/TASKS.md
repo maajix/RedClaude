@@ -300,18 +300,16 @@ Gemessen am Tag der Freigabe:
 
 Zwei Vorbehalte, ausdrücklich und nicht stillschweigend:
 
-- **(a) Der vertikale Lauf hat genau eine arrangierte Zeile.**
-  `tests/test_vertical.py` schreibt in `the_control_the_playbook_asks_for()`
-  die eine `credential_effect`-Observation samt `control`-Evidenzkante, die
-  `playbooks/object-ownership/playbook.md` für `supported` verlangt, als Owner
-  und nicht über ein Verb. Sie ist im echten Receipt der Recon-Runde verankert,
-  aber sie ist nicht verdient: `close_test_replay` kann ausschließlich
-  `response_invariant` und `response_differential` schreiben, und der
-  Proposal-Pfad verweigert eine Evidenzkante, sobald der Claim über `proposed`
-  hinaus ist. Alles unterhalb dieser Zeile -- Test, Replay, `supported`
-  Hypothesis, Finding, Impact, Severity, Pivot stamp, Kill chain, Report -- ist
-  verdient. Ticket 166 besitzt die Lücke und misst sie: 33 der 50 Playbooks
-  verlangen eine Observation-Art, die kein Runtime-Writer erzeugen kann.
+- **(a) Der vertikale Lauf hat keine arrangierte Zeile mehr.**
+  Bis Ticket 166 schrieb `tests/test_vertical.py` in
+  `the_control_the_playbook_asks_for()` eine `credential_effect`-Observation
+  samt `control`-Evidenzkante als Owner und nicht über ein Verb. Zwei Dinge
+  haben sie erledigt: `20261107T000000Z` setzte die Latte von
+  `playbooks/object-ownership/playbook.md` auf `response_differential`, was der
+  Replay selbst schreibt, und Ticket 166 wies nach, dass eine Evidenzkante mit
+  dem Vorschlag gefilt wird, während der Claim noch `proposed` ist, und beim
+  Übergang auf `supported` mitzählt. Die Methode ist entfernt; der Lauf ist von
+  der Recon-Runde bis zum Report vollständig verdient.
 - **(b) Der eine rote Test ist lastabhängig.**
   `SurfaceBenchmarkTest.test_slate_computation_is_within_budget` ist der
   dokumentierte Last-Flake aus `docs/agents/testing.md`, Abschnitt "Known
