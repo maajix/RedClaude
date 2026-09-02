@@ -8,7 +8,7 @@ into a hunt.
 
 **Blocked by:** nothing.
 
-**Status:** done
+**Status:** resolved
 
 ## What was measured
 

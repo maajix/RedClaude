@@ -7,7 +7,7 @@ violation. Built and applied on 2026-08-30 as
 
 **Blocked by:** nothing.
 
-**Status:** done
+**Status:** resolved
 
 ## What was measured
 

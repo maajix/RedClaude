@@ -8,7 +8,7 @@ therefore carries the same value.
 **Blocked by:** nothing. `20261129T000000Z` built the prior mechanism, the
 coalesce chain and the closure check this ticket extends by one link.
 
-**Status:** in-progress
+**Status:** resolved
 
 ## What was measured, 2026-08-30
 
@@ -176,3 +176,15 @@ closing it means reopening the design 127 and 196 settled, and the 24 Tasks
 it leaves in front are themselves high-value ones that should run. Worth its
 own ticket if the ordering is still wrong after a campaign under these
 numbers.
+
+## Verification, 2026-09-02
+
+The migration applies from an empty database in `CleanCreationTest`. Its
+apply-time assertions confirm that all 61 property classes have an impact
+prior, `value_for` reads `class_impact_prior`, and an authorization claim
+cannot remain valued below `transport.header_policy` when both exist. The
+complete DB module subsequently ran 1542 tests; its four remaining errors are
+the unrelated order-dependent cases recorded in research section D, not the
+scheduler migration. Together with the live `rk2here` measurement already
+recorded above (428 Tasks ahead reduced to 24, with no transport Task among
+them), all three acceptance criteria are satisfied.

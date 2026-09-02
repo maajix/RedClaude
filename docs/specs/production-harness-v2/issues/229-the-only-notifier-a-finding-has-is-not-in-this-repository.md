@@ -9,7 +9,9 @@ fills in, and its URL and topic never enter this repository.
 **Blocked by:** nothing. 228 wall 2 is built and the `push` channel is live and
 delivering; this ticket is about the second subject the pipe cannot carry.
 
-**Status:** done -- option (b), shipped as
+**Status:** resolved
+
+Option (b) shipped as
 `20270106T000000Z__a_finding_announces_itself_through_the_pipe_a_decision_uses.sql`
 (`applied_seq 243`), in one file with ticket 228 wall 1 because both rewrite
 `check_control_surface`. `tests.test_database.FindingNotificationTest` holds it.

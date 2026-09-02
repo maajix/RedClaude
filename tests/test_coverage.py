@@ -43,10 +43,11 @@ class CoverageGateTest(unittest.TestCase):
             "  playbook_topic 10  operator_reference 39\n"
             # `catalogue` counts what this checkout ships, which is the
             # forty-nine replacements plus whatever v2 authored for itself --
-            # `object-ownership` and the one reference hanging off it, which is
-            # why the reference count is one above the ledger's eighty-three
+            # `object-ownership` and `payment-webhooks`. Their two references,
+            # plus the payment-process contract added to a migrated Playbook,
+            # put the reference count three above the ledger's eighty-three
             # claims.
-            "  catalogue               50   skills 6  references 84\n"
+            "  catalogue               51   skills 6  references 86\n"
             "  census                 223   reconciled",
             self.report,
         )

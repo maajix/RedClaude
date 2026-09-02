@@ -108,20 +108,29 @@ it needed.
 
 ## D. Test-suite state at the time of this research
 
-`python -m unittest discover -s tests -t .` ran 3479 tests in 1546 s and
-finished with 5 failures and 1 error. Two of them are named:
-`ProxyEgressTest.test_an_identity_client_certificate_hash_is_persisted_in_its_receipt`
-and `ExchangeTest.test_an_identity_client_certificate_reaches_only_the_https_connector`.
-Both are about the leased client certificate, and the second one was re-run
-against an unmodified checkout of `HEAD` and fails there too, so it is not from
-ticket 93. The refusal is `identity slot refused`, raised when installing the
-leased client certificate throws `identity.Invalid` (`proxy.py:2530`).
+Re-counted on 2026-09-02 against PostgreSQL 18 and the current working tree,
+with the DB portion holding the suite's exclusive `/tmp/rk2-db.lock`:
 
-A first run of the same suite appeared to pass with exit code 0. It did not:
-the command was piped into `tail`, so the exit code was `tail`'s.
+- `tests.test_database` ran 1542 tests in 1580.667 seconds and finished with
+  four errors and 69 skips. The errors are
+  `NegativeKnowledgeTest.setUpClass` (a duplicate live `perform` Task),
+  `RetestWatchTest.test_both_views_name_their_program_by_its_slug` (two rows
+  where one was expected), and two `SurfaceFingerprintTest` cases
+  (`test_a_changed_route_is_one_delta_carrying_both_sides` and
+  `test_a_version_bump_is_one_technology_change`, again extra rows).
+- The exact nine-class reproduction from ticket 213 ran 231 tests with its
+  existing 20 container skips and no failure; its two-class control ran 77
+  tests with no skips and no failure. The original client-certificate failures
+  are gone.
+- Discovery without DB credentials ran the remaining 2808 tests in 341.859
+  seconds. Its audit snapshot was updated after that run; the four other
+  defects all belong to the concurrently added `payment-webhooks` corpus:
+  no technique-ledger row, two stale OKF counts, and three missing files in the
+  frozen OKF bundle (reported by one freeze assertion).
 
-TODO: identify the remaining four, and decide whether the client-certificate
-failure is an environment artefact or a real regression on `main`.
+The former TODO is therefore closed as a census: four DB order/interference
+errors remain, plus four independently identified Payment-corpus gate defects.
+They are not ticket 213's two Door-class failure.
 
 ## E. Ordered TODO
 

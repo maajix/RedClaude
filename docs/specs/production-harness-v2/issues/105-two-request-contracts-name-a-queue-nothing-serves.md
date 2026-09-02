@@ -7,7 +7,7 @@ Contract pointing at it.
 
 **Blocked by:** 102 — Nothing in this tree has ever created a Finding.
 
-**Status:** done
+**Status:** resolved
 
 - [x] `report_queue` is settled first, because it is the cleaner case.
       Declared at `0020_state_access.sql:134` with a state CHECK, an FK to

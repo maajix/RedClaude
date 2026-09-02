@@ -7,7 +7,7 @@ nothing in the tree can undo it.
 
 **Blocked by:** nothing.
 
-**Status:** done
+**Status:** resolved
 
 ## What was measured
 

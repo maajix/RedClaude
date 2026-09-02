@@ -6,7 +6,9 @@ decision and is written down here so it can be made, not built.
 
 **Blocked by:** nothing.
 
-**Status:** done -- both walls built and applied. Wall 1 shipped as `T228-01` in
+**Status:** resolved
+
+Both walls were built and applied. Wall 1 shipped as `T228-01` in
 `20270106T000000Z__a_finding_announces_itself_through_the_pipe_a_decision_uses.sql`
 (`applied_seq 243`), together with ticket 229, because both rewrite
 `check_control_surface` and a migration replaces a function WHOLE.

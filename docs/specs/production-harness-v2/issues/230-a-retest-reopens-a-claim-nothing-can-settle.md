@@ -10,7 +10,7 @@ Built and applied on 2026-08-31 as
 **Blocked by:** nothing. 223 narrowed the same rule for the validation lane and
 named this shape as the one it was leaving out.
 
-**Status:** done
+**Status:** resolved
 
 ## What was measured, 2026-08-31
 

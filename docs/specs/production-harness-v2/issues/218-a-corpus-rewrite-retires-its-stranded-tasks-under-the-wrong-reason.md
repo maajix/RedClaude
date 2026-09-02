@@ -7,7 +7,7 @@ for what actually happened rather than spending three passes to call it
 
 **Blocked by:** nothing.
 
-**Status:** needs-review
+**Status:** resolved
 
 ## What was measured
 
@@ -130,14 +130,11 @@ willing to do.
       where the corpus really moved.
 - [x] **A finished Task keeps its frozen digest.** The audit reading of a
       completed run is what the freeze is for.
-- [ ] **The refusal at `execution.py:2800-2812` still fires** for an active
+- [x] **The refusal at `execution.py:2800-2812` still fires** for an active
       stale selection that reached execution anyway. This ticket widens no door.
-      Left open, and the reason is that nothing tested it before this ticket
-      either: `grep -rn 'at the digest the selection froze' tests/` finds only
-      the case written here, against `cancel_reason_for` rather than against
-      `_perform`. Nothing on that path was edited, so the refusal is unchanged
-      by inspection -- but unchanged by inspection is not the same claim as
-      covered, and writing the missing case is its own ticket.
+      `PlaybookSelectionTest` drives `_perform` once with a stale document
+      digest and once with a stale projection version; both are refused before
+      a child can spend the capability.
 - [x] **`hunt.sh`'s exception can come out.** The engagement script carries a
       `STRANDED` counter today; when the scheduler cancels these at ranking
       time, no lap refuses and the exception is dead code. Removing it is how
@@ -149,3 +146,12 @@ willing to do.
 selection, and `reject_mutation_unless_purging` keeping those rows immutable.
 Both are what make an old hunt result readable at all, and this ticket depends
 on them.
+
+## Verification, 2026-09-02
+
+The execution-path coverage already exists in
+`tests.test_execution.PlaybookSelectionTest`: one case freezes a stale
+`playbook_sha256`, and a second freezes a stale `playbook_version`. Both call
+the attempt path and assert `integrity_failed`; the missing-path case also
+asserts that no child is launched and no Tool run opens. Running the complete
+class produced `Ran 15 tests` / `OK`. No duplicate test was added.

@@ -6,7 +6,7 @@ classes, rather than only in a run of their own.
 
 **Blocked by:** nothing.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## What was measured
 
@@ -68,14 +68,14 @@ change. Both readings are wrong in a way that is easy to act on.
 
 ## Acceptance criteria
 
-- [ ] **The nine-class command above passes.** Same classes, same order, one
+- [x] **The nine-class command above passes.** Same classes, same order, one
       database, no errors and no new skips.
-- [ ] **The two-class command still passes.** Whatever isolates them must not
+- [x] **The two-class command still passes.** Whatever isolates them must not
       work only in company.
-- [ ] **The mechanism is named in the fix.** Which class writes the conflicting
+- [x] **The mechanism is named in the fix.** Which class writes the conflicting
       root check, and why the two later classes read it, stated where the fix
       is -- not "flushed state" or "ordering".
-- [ ] **The remaining full-suite failures are counted again.** Section D of
+- [x] **The remaining full-suite failures are counted again.** Section D of
       `00-todo-and-harness-gaps.md` is updated with what is left after this,
       because a TODO that names four unknown failures and is never re-counted is
       a TODO nobody can close.
@@ -85,3 +85,26 @@ change. Both readings are wrong in a way that is easy to act on.
 Ticket 211 stays as landed. Its own coverage is proved by
 `ReplayTestRunTest` (54 tests, including the eleven refusals it adds) and by the
 two door classes run alone (74 tests), both green.
+
+## Verification, 2026-09-02
+
+The mechanism fixed in `tests/test_database.py` is the installation-wide
+`secret_kek` generation: `ReplayTestRunTest` and `EvidenceBundleTest` could
+establish generation 1 with filler `root_check` bytes no `seal.Root` could
+derive. `ReplayCommandTest` and `ProxyEgressTest` then read that generation and
+correctly refused it as belonging to another installation. `ESTABLISH_KEK` now
+derives the check from `seal.Root('selftest', SECRET)` at the salt it records,
+so all four classes describe the same key material.
+
+Against PostgreSQL 18 on the isolated `rk2-test-pg` instance, with the suite's
+own exclusive `/tmp/rk2-db.lock`:
+
+- the nine named classes ran 231 tests in 109.535 seconds: `OK`, with the same
+  20 container-only skips;
+- `ReplayCommandTest` plus `ProxyEgressTest` ran 77 tests in 83.668 seconds:
+  `OK`, with no skips;
+- the complete DB module ran 1542 tests in 1580.667 seconds and left four
+  errors, none in either class above. Section D records their names.
+
+The old 149/74 counts grew because the same classes acquired tests after this
+ticket was written; the class sets and their order did not change.

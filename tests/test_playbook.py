@@ -499,11 +499,10 @@ class Corpus(unittest.TestCase):
                 )
 
     def test_the_catalogue_is_the_topics_that_have_been_migrated_so_far(self):
-        # The list the v1 disposition rows resolve against: each name here is a
-        # `rewritten -> playbook:<name>` row whose proof is this file, and a row
-        # naming something absent is what `check_dispositions` refuses. Adding a
-        # Playbook without a row, or a row without a Playbook, fails one of the
-        # two, which is the point of writing the set down in both places.
+        # The migrated v1 topics plus Playbooks authored for v2 itself. The v1
+        # subset is also resolved by `check_dispositions`; writing the complete
+        # shipping set here keeps a new native Playbook from arriving only on
+        # disk and never becoming part of the measured catalogue.
         self.assertEqual(
             [
                 "agentic-ai",
@@ -539,6 +538,7 @@ class Corpus(unittest.TestCase):
                 "oauth",
                 "object-ownership",
                 "orm",
+                "payment-webhooks",
                 "payment-workflows",
                 "race-conditions",
                 "realtime",
@@ -561,10 +561,9 @@ class Corpus(unittest.TestCase):
         )
 
     def test_every_reference_is_attached_to_the_one_playbook_that_absorbed_it(self):
-        # The other half of the disposition rows: `absorbed -> reference:<path>`
-        # is a claim that a v1 page became material hanging off one Playbook
-        # rather than text every Agent loads. What makes that checkable is the
-        # attachment, so the pairing is bound rather than the count.
+        # This includes both `absorbed -> reference:<path>` disposition rows and
+        # v2-native maintainer contracts. What makes either kind checkable is
+        # the attachment, so the pairing is bound rather than only the count.
         self.assertEqual(
             {
                 "agentic-ai": ("llm.md",),
@@ -603,6 +602,8 @@ class Corpus(unittest.TestCase):
                 "jwt-jose": ("jwt.md",),
                 "oauth": ("oauth2-attack-via-google-oauth2-playground.md", "oauth2.md"),
                 "object-ownership": ("why-two-identities.md",),
+                "payment-webhooks": ("provider-webhook-contracts.md",),
+                "payment-workflows": ("payment-process-contracts.md",),
                 "race-conditions": ("race-conditions-and-timing-attacks.md",),
                 "request-integrity": ("cors.md", "csrf.md"),
                 "request-parsing": ("http-attacks-crlf-injection-and-response-splitting.md",
@@ -674,6 +675,55 @@ class Corpus(unittest.TestCase):
                     if len(stripped) > 40:
                         with self.subTest(playbook=name, line=stripped[:40]):
                             self.assertNotIn(stripped, canonical)
+
+
+class PaymentMethodTest(unittest.TestCase):
+    """Ticket 231: payment coverage is procedure, not a topic list."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.corpus = playbook.compile_corpus(playbook.CORPUS)
+        cls.process = cls.corpus["payment-workflows"]
+        cls.webhook = cls.corpus["payment-webhooks"]
+
+    def test_the_process_playbook_can_settle_each_business_logic_class_it_teaches(self):
+        self.assertEqual(
+            (
+                "business_logic.quantity_or_price",
+                "business_logic.replay",
+                "business_logic.workflow_order",
+            ),
+            self.process.property_classes,
+        )
+
+    def test_the_incoming_webhook_is_authentication_not_outbound_request_forgery(self):
+        self.assertEqual(
+            ("authentication.credential_verification",),
+            self.webhook.property_classes,
+        )
+        self.assertNotIn("injection.request_forgery", self.webhook.property_classes)
+
+    def test_the_payment_methods_name_the_state_that_grades_them(self):
+        instructions = self.process.projection.instructions.lower()
+        for method in (
+            "discount, credit and coupon composition",
+            "currency, minor units and rounding",
+            "capture, cancel and refund order",
+            "idempotency keys",
+            "reconcile five views",
+        ):
+            with self.subTest(method=method):
+                self.assertIn(method, instructions)
+        self.assertIn("authoritative", instructions)
+
+    def test_each_provider_contract_is_in_the_executable_webhook_method(self):
+        instructions = self.webhook.projection.instructions.lower()
+        for provider in ("stripe", "adyen", "paypal"):
+            with self.subTest(provider=provider):
+                self.assertIn(provider, instructions)
+        for property_ in ("raw body", "freshness", "duplicate", "authoritative state"):
+            with self.subTest(property_=property_):
+                self.assertIn(property_, instructions)
 
 
 class AgainstTheRoster(unittest.TestCase):

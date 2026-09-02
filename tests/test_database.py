@@ -42767,7 +42767,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
     matching is exactly what a trigger list is for.
 
     A fourth reading comes off the same arrangement for free, and it is 050's
-    criterion 5: the same fifty subjects at a `constrained` ceiling, where
+    criterion 5: the same catalogue subjects at a `constrained` ceiling, where
     every Playbook that asks for approval has to come back parked rather than
     selected or missing.
 
@@ -42920,6 +42920,8 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # The three writes with a body, which nothing above tells apart. The
         # value class does it for the first, the content type for the second,
         # and the redirect arranged below for the third.
+        "payment-webhooks": Surface("spa", None, "POST", "/providers/payment-events",
+                                    False, ("body", None), "application/json"),
         "payment-workflows": Surface("spa", None, "POST", "/cart/items", True,
                                      ("body", "number")),
         "race-conditions": Surface("spa", None, "POST", "/coupons/redeem", True,
@@ -43377,6 +43379,7 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
                 "oauth": ["web_hunter"],
                 "object-ownership": ["web_hunter"],
                 "orm": ["web_hunter"],
+                "payment-webhooks": ["web_hunter"],
                 "payment-workflows": ["web_hunter"],
                 "race-conditions": ["web_hunter"],
                 "realtime": ["web_hunter"],
@@ -43470,6 +43473,104 @@ class PlaybookCorpusSelectionTest(DatabaseCase):
         # without a Surface here would be tested by nothing above and would
         # leave the three claims true of everything they were asked about.
         self.assertEqual(sorted(playbook.PLAYBOOKS), sorted(self.SURFACES))
+
+    def test_the_payment_catalogue_is_the_pair_the_compiler_compiled(self):
+        """Ticket 231: both documents and every catalogue projection agree."""
+        for name in ("payment-webhooks", "payment-workflows"):
+            compiled = playbook.PLAYBOOKS[name]
+            with self.subTest(playbook=name):
+                rows = self.connection.execute(
+                    "SELECT id::text, path, source_sha256, version, category, status,"
+                    " stale_after, risk, effects, baseline, specificity, provenance"
+                    " FROM playbooks WHERE path = $1",
+                    (compiled.path,),
+                ).rows
+                self.assertEqual(1, len(rows))
+                identifier, path, source_sha256, version, category, status, stale_after, \
+                    risk, effects, baseline, specificity, provenance = (
+                        str(field) for field in rows[0]
+                    )
+                self.assertEqual(
+                    (
+                        compiled.path,
+                        compiled.sha256,
+                        compiled.version,
+                        compiled.category,
+                        compiled.status,
+                        compiled.risk,
+                        compiled.effects,
+                        compiled.baseline,
+                        str(compiled.specificity),
+                        compiled.provenance,
+                    ),
+                    (
+                        path,
+                        source_sha256,
+                        version,
+                        category,
+                        status,
+                        risk,
+                        effects,
+                        baseline,
+                        specificity,
+                        provenance,
+                    ),
+                )
+                self.assertEqual(str(compiled.stale_after), stale_after[:10])
+
+                def column(sql: str) -> list[str]:
+                    return [
+                        str(row[0])
+                        for row in self.connection.execute(sql, (identifier,)).rows
+                    ]
+
+                self.assertEqual(
+                    sorted(compiled.triggers_all),
+                    column("SELECT fact FROM playbook_triggers WHERE playbook_id = $1::uuid"
+                           " AND mode = 'all' ORDER BY fact"),
+                )
+                self.assertEqual(
+                    sorted(compiled.triggers_any),
+                    column("SELECT fact FROM playbook_triggers WHERE playbook_id = $1::uuid"
+                           " AND mode = 'any' ORDER BY fact"),
+                )
+                self.assertEqual(
+                    sorted(compiled.property_classes),
+                    column("SELECT property_class FROM playbook_outputs"
+                           " WHERE playbook_id = $1::uuid ORDER BY property_class"),
+                )
+                self.assertEqual(
+                    sorted(compiled.skills),
+                    column("SELECT skill_name FROM playbook_skills"
+                           " WHERE playbook_id = $1::uuid ORDER BY skill_name"),
+                )
+                self.assertEqual(
+                    [
+                        (item.to_status, item.role, item.kind, item.polarity,
+                         str(item.min_count))
+                        for item in compiled.evidence
+                    ],
+                    [
+                        tuple(str(field) for field in row)
+                        for row in self.connection.execute(
+                            "SELECT to_status, role, observation_kind, polarity, min_count"
+                            " FROM playbook_evidence WHERE playbook_id = $1::uuid"
+                            " ORDER BY to_status, role, observation_kind",
+                            (identifier,),
+                        ).rows
+                    ],
+                )
+                self.assertEqual(
+                    [(item.name, item.path, item.sha256) for item in compiled.references],
+                    [
+                        tuple(str(field) for field in row)
+                        for row in self.connection.execute(
+                            "SELECT name, path, sha256 FROM playbook_references"
+                            " WHERE playbook_id = $1::uuid ORDER BY name",
+                            (identifier,),
+                        ).rows
+                    ],
+                )
 
 
 APPLICATION_SUBJECT_SLUG = "selftest-application-subject"

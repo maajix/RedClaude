@@ -7,7 +7,7 @@ refused. Close it when a Finding reaches `validated` with no operator command.
 **Blocked by:** nothing. It was 105, then 224; both are recorded below and
 neither turned out to be the wall. See "What was built, 2026-08-30".
 
-**Status:** done
+**Status:** resolved
 
 ## The chain, measured end to end
 
