@@ -119,6 +119,10 @@ satisfied.
   as soon as ticket 134's review has committed the file. `Touches` above is
   corrected to name it.
 
+**Paid, 2026-09-02.** Ticket 134's review committed as `9378a597`, which left
+the worktree clean, and the line landed in this ticket's second build commit
+with nothing else in it. `check_audit` rc=0 after it.
+
 **A second, dated instance of the same defect is left standing on purpose.**
 `TASKS.md:337` records a measurement from 24.08.2026 -- "Vollständige Suite:
 3996 Tests, OK, 101 übersprungen (`unittest discover`, unter `flock -w 3600

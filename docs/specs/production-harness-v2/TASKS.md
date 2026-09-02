@@ -390,7 +390,7 @@ Code-Dauer: **5–8 Arbeitstage**, anschließend **2–6 Kalendertage** Grading.
   - `check_wiring.py`
   - `check_baseline.py`
   - `check_coverage.py`
-- [x] Jede Datenbankausführung enthält `CleanCreationTest`, läuft unter `flock -w 3600 /tmp/rk2-db.lock` und niemals parallel zu einem Live-Hunt.
+- [x] Jede Datenbankausführung enthält `CleanCreationTest`, läuft unter `/tmp/rk2-db.lock` -- den `setUpModule` selbst nimmt, ohne äußeres `flock` (Ticket 236) -- und niemals parallel zu einem Live-Hunt.
 - [x] Die vollständige Suite nur nach breiter Migration, vor Live-Canary und vor Release Candidate ausführen.
 - [x] Nach jedem Integrationsblock `git diff --check`, die aktuell 96 Integritätsprüfungen -- die Assertion-Zahl, die `rk db verify` meldet -- und den jeweiligen vertikalen Smoke ausführen.
 
