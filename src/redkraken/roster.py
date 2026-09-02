@@ -1815,6 +1815,14 @@ CONTRACTS: dict[str, Contract] = {
                     "third_party_impact",
                     "credential_needed",
                     "policy_unclear",
+                    # Ticket 216. The five above are risks this harness detected
+                    # before a call; this one is the Playbook's own stop
+                    # condition, reached by the run performing it.
+                    # `impact_unauthorized` is a row in the same table and
+                    # stays out of here: it is the runtime's question about a
+                    # grant, and a model that could claim it could ask for an
+                    # impact replay by asking to be parked.
+                    "playbook_halt",
                 ),
             ),
             "question": Argument("string", free_text=True),

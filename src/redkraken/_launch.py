@@ -1298,9 +1298,14 @@ DESCRIPTIONS = {
     ),
     "park_for_human": (
         "Stop the Task you are running and ask a person the question you cannot "
-        "answer yourself. Name that Task, one of the five question codes -- "
-        "scope_ambiguous, destructive_action, third_party_impact, credential_needed, "
-        "policy_unclear -- and the question in your own words.\n\n"
+        "answer yourself. Name that Task, one of the question codes -- "
+        # Rendered off the served enum, for ticket 145's reason one line up:
+        # this sentence counted five codes by hand and was wrong the day a sixth
+        # was seeded, and a run that is told five of six never names the sixth.
+        + ", ".join(
+            roster.CONTRACTS[roster.PARK_FOR_HUMAN].arguments["question_code"].enum
+        )
+        + " -- and the question in your own words.\n\n"
         "Asking is not failing. The Task parks with no attempt charged against it and "
         "is as ready as it was, your identity leases go back, and only an operator "
         "releases it. Nothing waits here for the answer: your run ends with this "

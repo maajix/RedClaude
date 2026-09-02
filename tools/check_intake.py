@@ -59,7 +59,7 @@ from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
-from redkraken import fixture, playbook, skill
+from redkraken import fixture, playbook, roster, skill
 
 from tools.check_baseline import BASELINE, CHECKOUT, BaselineError, read_table
 from tools.check_dispositions import (
@@ -273,6 +273,16 @@ UNRUNNABLE = re.compile(
 #: list rather than one prefix because a corpus mined on a second machine would
 #: leak a different one, and a rule that only knew this machine's would pass it.
 HOME = re.compile(r"/home/|/Users/|/root/|[A-Za-z]:\\Users\\")
+
+#: The tool a halt tells the operator through, and the words it may file that
+#: halt under. Read off the served enum rather than restated here, so that a
+#: record is graded against the vocabulary the model is actually offered:
+#: `park_task_for_human` refuses a code that is not a row, and a record naming
+#: one the enum lost would be a step no run can perform.
+PARK = roster.PARK_FOR_HUMAN
+QUESTION_CODES = (
+    roster.CONTRACTS[PARK].arguments["question_code"].enum
+)
 
 
 class IntakeError(Exception):
@@ -587,6 +597,14 @@ def record_error(record: dict, books: frozenset[str], skills: frozenset[str]) ->
     for field in PHRASED:
         if thin(record[field], PHRASE) and not UNRUNNABLE.match(record[field].strip()):
             return f"{named}: {field} is too short to name anything"
+    # Ticket 216. A halt that names who is told and not what it is filed under
+    # is a step an Agent cannot perform: the tool takes a `question_code` and
+    # refuses the call without one. The rule is here and not in the corpus gate
+    # because the ledger is where the halt is written down first.
+    if PARK in record["stop_conditions"] and not any(
+        code in record["stop_conditions"] for code in QUESTION_CODES
+    ):
+        return f"{named}: a halt told through {PARK} names the question code it parks under"
     if record["capability_state"] != CAPABILITY[record["finding_path"]]:
         return (
             f"{named}: {record['finding_path']} means the harness is"

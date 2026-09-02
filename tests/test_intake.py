@@ -628,6 +628,22 @@ class LedgerRecordTest(unittest.TestCase):
             self.error(id="exceptional-conditions/two"),
         )
 
+    def test_a_halt_told_through_park_for_human_names_the_code_it_parks_under(self):
+        # Ticket 216. The tool refuses a call carrying no `question_code`, so a
+        # halt that says who is told and not what it is filed under is a step no
+        # Agent can perform as written. Read off the shipped record with the
+        # code taken back out, rather than from a sentence written here, because
+        # what this rule has to catch is a record that stopped carrying one.
+        self.assertEqual(
+            "exceptional-conditions/02: a halt told through"
+            " mcp__rk2__park_for_human names the question code it parks under",
+            self.error(
+                stop_conditions=self.accepted["stop_conditions"].replace(
+                    " under question code playbook_halt", ""
+                )
+            ),
+        )
+
     def test_a_record_naming_no_shipped_playbook_is_refused(self):
         self.assertEqual(
             "no-such-book/02: no playbook named no-such-book",

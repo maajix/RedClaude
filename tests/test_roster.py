@@ -1940,6 +1940,38 @@ class VocabularyAgreementTest(unittest.TestCase):
             set(roster.TASK_KINDS), {row[0] for row in self.seeded("task_kinds")}
         )
 
+    def test_the_codes_a_model_may_park_under_are_codes_the_corpus_files(self):
+        """Ticket 216: the enum, the reference table and the sentence agree.
+
+        Three statements of one vocabulary, and each of them is load-bearing on
+        its own. `park_task_for_human` refuses a code that is not a row, so an
+        enum member the corpus does not seed is a refusal a model cannot see
+        coming. The description is the only place a run is ever told which words
+        exist, so one that names five of six serves a vocabulary a sixth of
+        which nothing will ever use.
+
+        A subset and not an equality, for the reason the identity classes above
+        are: `impact_unauthorized` is a row and deliberately not an enum member,
+        because it is the runtime's own question about a grant it went looking
+        for, and a model that could claim it could ask for an impact replay by
+        asking to be parked.
+        """
+        served = roster.CONTRACTS[roster.PARK_FOR_HUMAN].arguments["question_code"].enum
+        filed = {row[0] for row in self.seeded("decision_question_codes")}
+        told = _launch.DESCRIPTIONS["park_for_human"]
+
+        self.assertTrue(filed)
+        self.assertLessEqual(set(served), filed)
+        # The code a Playbook's own stop condition parks under, which is what
+        # the eighty-one ledger records naming `park_for_human` mean.
+        self.assertIn("playbook_halt", served)
+        for code in served:
+            with self.subTest(question_code=code):
+                self.assertIn(code, told)
+        # Counted by hand once, and wrong the day a sixth arrived. The sentence
+        # is rendered from the enum now, so there is no number left to go stale.
+        self.assertNotIn("five", told)
+
     @classmethod
     def provenance(cls) -> dict[str, tuple[str, ...]]:
         """`allowed_provenance` by kind, as the seeds in the corpus write it.
