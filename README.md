@@ -252,9 +252,11 @@ A scope entry names a hostname, an address, an address range in CIDR
 notation such as `93.184.216.0/24`, or a wildcard such as
 `*.example.com`. A range must be globally routable, the same rule a bare
 address is held to. An inclusion's wildcard must name at least two labels of its
-own, so `*.com` is refused. That is a floor, not a public-suffix rule: `*.co.uk`
-passes it, and how wide an inclusion may be remains the operator's judgement
-against the Program. An exclusion has no floor, because breadth there withdraws
+own, so `*.com` is refused, and an inclusion's range must be at least a `/16` in
+IPv4 or a `/32` in IPv6, so `1.0.0.0/8` and `2000::/3` are refused. Those are
+floors, not a public-suffix rule and not a width judgement: `*.co.uk` and a
+`/16` both pass, a registry's block does not, and how wide an inclusion may be
+under the floor remains the operator's judgement against the Program. An exclusion has no floor, because breadth there withdraws
 authority rather than claiming it. Hosts are compared in one spelling —
 lowercased, without a trailing root dot, addresses in canonical form — so two
 ways of writing the same Program produce the same hash, and a repeated rule

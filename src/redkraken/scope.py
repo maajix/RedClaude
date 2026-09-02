@@ -1032,6 +1032,14 @@ def compile_policy(
                 )
             )
             return
+        if effect != EXCLUDE and (detail := _too_broad(pattern)) is not None:
+            # The floor, under the same guard as the routability rule above and
+            # for the same reason: an exclusion naming a whole registry
+            # withdraws authority over it, which is the operator's to do. Asked
+            # second, so a private range keeps the sharper of the two answers --
+            # `10.0.0.0/8` is the harness's own infrastructure before it is wide.
+            refusals.append(_refusal(f"{source}.host", detail))
+            return
         # The stored prefix is canonicalised the same way a request's path is,
         # because the two are compared. Left verbatim, an exclusion written
         # `/adm%69n/` would fire on nothing an operator can type, and an
@@ -1213,6 +1221,17 @@ def _refusal(source: str, detail: str) -> Violation:
     return Violation(code=INVALID_CONFIGURATION, source=f"scope:{source}", detail=detail)
 
 
+#: The narrowest prefix an authorising range may name, by address family.
+#: Ticket 134: the address form of the wildcard floor, and picked the same way.
+#: IANA hands an RIR an IPv4 /8 and an IPv6 /12; an RIR hands an ISP down to /24
+#: in IPv4 and /32 in IPv6, and a site gets /48. So a /16 is the widest block one
+#: organisation ordinarily holds and a /32 is the smallest an ISP is given, and
+#: anything wider than either is somebody's registry rather than somebody's
+#: network. How wide an inclusion may be under the floor stays the operator's
+#: judgement against the Program, exactly as README says of `*.co.uk`.
+BREADTH_FLOOR = {4: 16, 6: 32}
+
+
 def _unroutable(pattern: Pattern) -> bool:
     """Whether an authorising pattern names address space the door would refuse.
 
@@ -1242,6 +1261,34 @@ def _unroutable(pattern: Pattern) -> bool:
     except ValueError:
         return False
     return address_refusal(pattern.text) is not None
+
+
+def _too_broad(pattern: Pattern) -> str | None:
+    """Why an authorising range names more than one allocation, or nothing.
+
+    Beside `_unroutable` and asked at the same point, because the two are one
+    question in two halves. That one refuses a range whose *edges* the door
+    would refuse; this one refuses a range whose edges are fine and whose middle
+    is sixteen million addresses belonging to other people.
+
+    What breadth buys is worth stating, because it is not a first Task: a range
+    mints no configured subject at all -- `record_configured_subjects` filters
+    `pattern_kind = 'exact'` -- and a request naming a host is not admitted by
+    the range its address falls in, because the door decides before it resolves.
+    So what a wide inclusion actually authorises is an Entity discovered by
+    address being graded `target`, and the door admitting a literal address
+    inside the block. Ticket 134 carries the measurement.
+    """
+    if pattern.kind != "cidr":
+        return None
+    network = parse_network(pattern.text)
+    floor = BREADTH_FLOOR[network.version]
+    if network.prefixlen >= floor:
+        return None
+    return (
+        f"{pattern.text} is wider than /{floor}, which is registry space rather "
+        "than one allocation; an inclusion may not name one"
+    )
 
 
 # ---------------------------------------------------------------------------

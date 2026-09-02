@@ -317,6 +317,52 @@ class CompilationTest(unittest.TestCase):
 
                 self.assertEqual(("scope:scope.include[1].host",), refused(text))
 
+    def test_an_inclusion_may_not_name_more_than_one_allocation(self):
+        """Ticket 134: the range half of README's floor sentence.
+
+        The wildcard floor refuses `*.com` because one label is a whole
+        registry. These are the address form of the same thing: `1.0.0.0/8` is
+        an RIR's block and `2000::/3` is the whole of global unicast, and both
+        pass `_unroutable` at their edges, so nothing else in this module was
+        going to stop them.
+        """
+        for network in ("1.0.0.0/8", "2000::/3", "2a00::/12", "2600::/16"):
+            with self.subTest(network=network):
+                text = SCOPED.replace('host = "api.example.net"', f'host = "{network}"')
+
+                self.assertEqual(("scope:scope.include[1].host",), refused(text))
+
+    def test_the_breadth_refusal_names_the_floor_it_is_under(self):
+        # The number, in the refusal, because /8 and /28 are one keystroke apart
+        # and an operator reading "too wide" cannot tell which they wrote.
+        configuration, _ = config.load(
+            write(SCOPED.replace('host = "api.example.net"', 'host = "1.0.0.0/8"'))
+        )
+        _, refusals = scope.compile_policy(configuration)
+
+        self.assertEqual(1, len(refusals))
+        self.assertIn("/16", refusals[0].detail)
+
+    def test_a_range_at_the_floor_and_under_it_compiles(self):
+        # The other side of the floor, so this is a floor and not a ban on
+        # ranges. One at the floor and one well under it, per family.
+        for network in ("93.184.0.0/16", "93.184.216.0/24", "2606:4700::/32",
+                        "2606:4700::/48"):
+            with self.subTest(network=network):
+                text = SCOPED.replace('host = "api.example.net"', f'host = "{network}"')
+
+                self.assertIn(
+                    network, {rule.pattern.text for rule in compiled(text).rules}
+                )
+
+    def test_an_exclusion_has_no_breadth_floor_either(self):
+        # `broad` lifts the wildcard floor on the exclusion side and this floor
+        # is lifted the same way, by the guard rather than by a flag: breadth
+        # that withdraws authority is the operator's business.
+        text = SCOPED.replace('host = "admin.example.com"', 'host = "1.0.0.0/8"')
+
+        self.assertIn("1.0.0.0/8", {rule.pattern.text for rule in compiled(text).rules})
+
     def test_an_exclusion_may_name_a_private_range(self):
         # Breadth withdraws authority here, so the asymmetry runs the same way
         # it does for a single private address.
