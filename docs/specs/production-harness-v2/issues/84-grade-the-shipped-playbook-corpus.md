@@ -2,7 +2,7 @@
 
 **What to build:** The graded runs the corpus migrations deferred: every in-scope Playbook hash evaluated against its bound fixtures through the door route, with the verdicts filed and whatever passes promoted at the text it ships.
 
-**Blocked by:** 78 — Grade a Playbook with a real Agent behind the door; 233 — A probe-only Playbook bar asks for two kinds its own trigger refuses (`http-desync` cannot be graded at its shipped text until that is decided; raised by ticket 166's review pass, 2026-09-02).
+**Blocked by:** 78 — Grade a Playbook with a real Agent behind the door; 233 — A probe-only Playbook bar asks for two kinds its own trigger refuses (`http-desync` cannot be graded at its shipped text until that is decided; raised by ticket 166's review pass).
 
 **Status:** ready-for-human
 

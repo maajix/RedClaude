@@ -42,6 +42,23 @@ refuses before it grades anything else.
 `payment-webhooks` ships as a Playbook. The ledger was last written by
 `61e3dd7a`, and the Playbook arrived after it.
 
+Three more tests fail for the same reason, found on 2026-09-02 by running every
+module except `tests/test_database.py`. All four reds are one Playbook arriving
+without the bookkeeping that follows a Playbook:
+
+```
+tests.test_okf.BundleTest.test_every_playbook_skill_and_reference_is_a_concept
+  AssertionError: 50 != 51                       (playbook.PLAYBOOKS is pinned at 50)
+tests.test_okf.BundleTest.test_every_frontmatter_block_the_bundle_writes_is_inside_the_grammar
+  AssertionError: 141 != 144                     (three more frontmatter blocks)
+tests.test_okf.FreezeTest.test_the_committed_bundle_is_current
+  the committed bundle holds different files     (playbooks/payment-webhooks.md is not in it)
+```
+
+Two of those are pinned counts and one is the frozen OKF bundle, so the repair
+is the same shape in all three: the bundle is rebuilt and the numbers are
+re-measured, in the change that adds the ledger records.
+
 ## Acceptance criteria
 
 - [ ] **The gate passes.** `tests.test_intake.LedgerCorpusTest` runs its tests
@@ -49,6 +66,9 @@ refuses before it grades anything else.
 - [ ] **What was decided is written down.** Either the records exist and cite
       real sources the way every other record does, or the gate states in one
       sentence which Playbooks it does not require a record for and why.
+- [ ] **The bundle and the counts follow the corpus.** `tests.test_okf` is
+      green: the frozen bundle holds `playbooks/payment-webhooks.md`, and the
+      two pinned numbers are the tree's own.
 - [ ] **The next Playbook cannot arrive the same way.** Whatever ships a
       Playbook is held to the rule, so a corpus addition that skips the ledger
       fails at the time it is made rather than on somebody else's test run.
