@@ -8,6 +8,19 @@ without them. The corpus gate refuses the tree as it stands.
 
 **Status:** ready-for-agent
 
+**PRODUCES:** new -- either `payment-webhooks` records in the technique ledger,
+or a written rule admitting a Playbook that has none.
+
+**CONSUMED BY:** `tools/check_intake.py::check_techniques`, reading
+`no ledger record is about playbook`; `tests.test_intake.LedgerCorpusTest`,
+which is red on this account today.
+
+**CONSUMES:** `baseline/technique-ledger.jsonl`,
+`src/redkraken/playbooks/payment-webhooks/playbook.md` (shipped by ticket 231).
+
+**Touches:** `baseline/technique-ledger.jsonl`, `tools/check_intake.py`.
+
+
 ## What was measured
 
 Measured on 2026-09-02 on commit `1ba74ee9` with every other change stashed, so

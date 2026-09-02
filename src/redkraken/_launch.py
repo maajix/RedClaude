@@ -1299,7 +1299,7 @@ DESCRIPTIONS = {
     "park_for_human": (
         "Stop the Task you are running and ask a person the question you cannot "
         "answer yourself. Name that Task, one of the question codes -- "
-        # Rendered off the served enum, for ticket 145's reason one line up:
+        # Rendered off the served enum, for ticket 145's reason at :1063-1068:
         # this sentence counted five codes by hand and was wrong the day a sixth
         # was seeded, and a run that is told five of six never names the sixth.
         + ", ".join(

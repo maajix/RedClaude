@@ -7,6 +7,20 @@ whatever makes the trap loud rather than silent.
 
 **Status:** ready-for-agent
 
+**PRODUCES:** changed contract -- the documented database test command, and a
+loud refusal in place of a silent skip when `/tmp/rk2-db.lock` is already held.
+
+**CONSUMED BY:** `operator, via uv run python -m unittest
+tests.test_database.<Class>`; every session that follows
+`docs/agents/testing.md`.
+
+**CONSUMES:** `tests/test_database.py::setUpModule`, which takes
+`/tmp/rk2-db.lock` itself and raises `unittest.SkipTest`;
+`docs/agents/testing.md`.
+
+**Touches:** `docs/agents/testing.md`, `tests/test_database.py`.
+
+
 ## What was measured
 
 Measured on 2026-09-02. The command the page gives, run exactly as written:
