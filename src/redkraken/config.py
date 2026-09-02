@@ -145,7 +145,9 @@ _HOSTNAME = re.compile(rf"({_LABEL}\.)+{_TOP_LABEL}")
 
 #: An inclusion's wildcard must name at least two labels of its own. It is a
 #: floor, not a public-suffix rule: `*.co.uk` still passes, and how wide an
-#: inclusion may be remains the operator's judgement against the Program.
+#: inclusion may be under the floor remains the operator's judgement against
+#: the Program. A range carries the same asymmetry in address form, as a
+#: minimum prefix length per family (`scope.BREADTH_FLOOR`).
 _WILDCARD = re.compile(rf"\*\.({_LABEL}\.)+{_TOP_LABEL}")
 
 #: An exclusion may be as wide as the operator likes, down to a single label.
@@ -160,7 +162,10 @@ _HOST_SHAPE = "must be a hostname, a wildcard such as *.example.com, or an addre
 #: expressible at all. The example is a globally routable block on purpose: a
 #: documentation range such as `203.0.113.0/24` parses and is then refused by
 #: `scope._unroutable`, so quoting one here would hand the reader a spelling
-#: that never compiles as an inclusion. It is admitted here and nowhere else because a range is
+#: that never compiles as an inclusion. Shape is not the whole gate either way
+#: -- since ticket 134 an inclusion's range must also be at least a /16 in IPv4
+#: or a /32 in IPv6 (`scope.BREADTH_FLOOR`), which the /24 above clears.
+#: It is admitted here and nowhere else because a range is
 #: a statement about authority over address space, and a callback names one
 #: endpoint the harness itself operates.
 _RANGE_SHAPE = (

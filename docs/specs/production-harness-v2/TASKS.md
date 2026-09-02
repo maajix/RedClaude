@@ -434,7 +434,7 @@ Nicht erforderlich für den ersten autonomen Web-Meilenstein:
 - Ticket 120
 - Tickets 122 und 124
 - Rest von Ticket 129
-- Tickets 134, 135 und 137
+- Tickets 135 und 137
 - Tickets 145, 160 und 162
 - vollständiges Ticket 101 und vollständiges Ticket 84
 - Ticket 65 als gesamter Release-Proof

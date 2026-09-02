@@ -1242,10 +1242,13 @@ def _unroutable(pattern: Pattern) -> bool:
     `10.0.0.0/8`, `192.168.0.0/16`, `0.0.0.0/0`, `::/0`.
 
     What both ends do not catch is a globally routable block that contains a
-    private one, `172.0.0.0/8` being the case: private space is itself carved
-    into CIDR blocks, so a wider block can straddle one with global addresses on
-    either side. That range compiles, and every private address inside it is
-    still refused at the door -- `proxy.unroutable` denies by default and
+    private one: private space is itself carved into CIDR blocks, so a wider
+    block can straddle one with global addresses on either side. Since ticket
+    134 the breadth floor takes the widest of these -- `172.0.0.0/8` is refused
+    for its width before this rule is asked -- so the gap survives only at or
+    under the floor, `203.0.112.0/22` around `203.0.113.0/24` being the case.
+    Such a range compiles, and every private address inside it is still refused
+    at the door -- `proxy.unroutable` denies by default and
     `authorize_egress_address` re-decides the literal address the proxy pinned.
     Closing it here would mean restating the door's block list in this module,
     which is the duplication `address_refusal` exists to prevent.
@@ -1286,8 +1289,8 @@ def _too_broad(pattern: Pattern) -> str | None:
     if network.prefixlen >= floor:
         return None
     return (
-        f"{pattern.text} is wider than /{floor}, which is registry space rather "
-        "than one allocation; an inclusion may not name one"
+        f"{pattern.text} is wider than /{floor}, which is more than one "
+        "allocation; an inclusion may not name one"
     )
 
 

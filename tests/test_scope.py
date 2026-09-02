@@ -342,6 +342,9 @@ class CompilationTest(unittest.TestCase):
 
         self.assertEqual(1, len(refusals))
         self.assertIn("/16", refusals[0].detail)
+        # The reason has to hold for every prefix the rule can refuse, not just
+        # the registry blocks that motivated it: `1.0.0.0/15` is two /16s.
+        self.assertIn("more than one allocation", refusals[0].detail)
 
     def test_a_range_at_the_floor_and_under_it_compiles(self):
         # The other side of the floor, so this is a floor and not a ban on
@@ -362,6 +365,20 @@ class CompilationTest(unittest.TestCase):
         text = SCOPED.replace('host = "admin.example.com"', 'host = "1.0.0.0/8"')
 
         self.assertIn("1.0.0.0/8", {rule.pattern.text for rule in compiled(text).rules})
+
+    def test_an_unroutable_range_keeps_the_routability_answer(self):
+        # `10.0.0.0/8` fails both rules. `_unroutable` is asked first, so the
+        # operator is told it is the harness's own infrastructure rather than
+        # that it is wide -- the sharper of the two answers. Asserted on the
+        # detail because `refused` compares sources and both rules emit
+        # `scope:scope.include[1].host`, so nothing else holds the order.
+        configuration, _ = config.load(
+            write(SCOPED.replace('host = "api.example.net"', 'host = "10.0.0.0/8"'))
+        )
+        _, refusals = scope.compile_policy(configuration)
+
+        self.assertEqual(1, len(refusals))
+        self.assertIn("not a globally routable address range", refusals[0].detail)
 
     def test_an_exclusion_may_name_a_private_range(self):
         # Breadth withdraws authority here, so the asymmetry runs the same way
