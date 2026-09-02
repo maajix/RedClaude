@@ -1031,8 +1031,8 @@ class LedgerCorpusTest(unittest.TestCase):
         self.assertEqual(
             "technique ledger\n"
             "  records                  382   playbooks 51  skills 6  path notes 105\n"
-            "  sources                 1535   local 715  external 814  absent 6"
-            "  digested 1528\n"
+            "  sources                 1536   local 715  external 815  absent 6"
+            "  digested 1522\n"
             # The five paths are listed in full rather than only the ones with
             # rows, because a path that fell to zero is the change worth seeing.
             "  reaches                  249\n"

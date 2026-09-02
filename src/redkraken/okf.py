@@ -399,6 +399,10 @@ def build(
     the failure names the file rather than a diff of a tree. `write` is the
     thin half that puts it on disk.
     """
+    # Once, here, because this is the only door `_corpus_path` is reached
+    # through and `relative_to` is lexical: `Path('.')` names the repository
+    # root and is not a prefix of any resolved path under it.
+    root = root.resolve()
     playbooks = playbook.PLAYBOOKS if playbooks is None else playbooks
     skills = skill.SKILLS if skills is None else skills
     files: dict[str, str] = {}

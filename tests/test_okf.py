@@ -139,6 +139,15 @@ class BundleTest(unittest.TestCase):
         # clock, and `BUILT_AT` is the constant that keeps it that way.
         self.assertEqual(self.files, okf.build(ROOT))
 
+    def test_the_root_is_normalised_before_it_is_used_as_a_prefix(self):
+        # Ticket 235, review cycle 1. `_corpus_path` asks `relative_to` for the
+        # link, and `relative_to` is lexical: an unresolved root spelled with a
+        # `.` or a `..` segment is not a prefix of the resolved corpus path even
+        # when it names the same directory. The docstring in `FreezeTest` hands
+        # a caller `pathlib.Path('.')`, so the spelling below is the documented
+        # one, not a contrived one.
+        self.assertEqual(self.files, okf.build(ROOT / "src" / ".."))
+
     def test_a_source_id_collision_is_refused_rather_than_overwritten(self):
         # Two references sharing an id would silently drop one concept and
         # leave a footnote pointing at whichever survived. The corpus has no
@@ -355,9 +364,9 @@ class FreezeTest(unittest.TestCase):
     Committed rather than generated on demand for the reason every digest in
     this tree is written down: a view nobody can diff is a view nobody notices
     going wrong. The failure below names the file, and the fix is never to
-    relax the assertion -- it is `python -c "import pathlib; from redkraken import
-    okf; okf.write(pathlib.Path('.').resolve(), pathlib.Path('docs/okf'))"` and a reading
-    of the diff.
+    relax the assertion -- it is `python -c "import pathlib; from redkraken
+    import okf; okf.write(pathlib.Path('.'), pathlib.Path('docs/okf'))"` and a
+    reading of the diff.
     """
 
     def test_the_committed_bundle_is_current(self):
