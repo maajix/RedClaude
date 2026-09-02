@@ -57,6 +57,8 @@ Maintainer material held by a Playbook or a Skill. None of it reaches a model. E
 * [oauth--oauth2](oauth--oauth2.md) - held by the playbook oauth
 * [oauth--oauth2-attack-via-google-oauth2-playground](oauth--oauth2-attack-via-google-oauth2-playground.md) - held by the playbook oauth
 * [object-ownership--why-two-identities](object-ownership--why-two-identities.md) - held by the playbook object-ownership
+* [payment-webhooks--provider-webhook-contracts](payment-webhooks--provider-webhook-contracts.md) - held by the playbook payment-webhooks
+* [payment-workflows--payment-process-contracts](payment-workflows--payment-process-contracts.md) - held by the playbook payment-workflows
 * [race-conditions--race-conditions-and-timing-attacks](race-conditions--race-conditions-and-timing-attacks.md) - held by the playbook race-conditions
 * [request-integrity--cors](request-integrity--cors.md) - held by the playbook request-integrity
 * [request-integrity--csrf](request-integrity--csrf.md) - held by the playbook request-integrity

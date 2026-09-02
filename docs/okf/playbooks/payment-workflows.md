@@ -1,28 +1,35 @@
 ---
 type: Playbook
 title: "payment-workflows"
-description: "Ask which number the server believes, by stating the invariant the target itself publishes, reading the pristine total, sending one order with exactly one number edited, and differencing the total the target computes against the same order made legitimately."
+description: "Ask whether a payment conserves the amount and state the target publishes, by changing one price, discount, credit, currency, idempotency key or transition at a time and comparing the target's authoritative order, provider and ledger views with a legitimate control."
 resource: ../../../src/redkraken/playbooks/payment-workflows/playbook.md
-tags: [business_logic, constrained, mutates_object]
+tags: [business_logic, approval_required, mutates_object]
 generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
 status: draft
-stale_after: 2027-03-15T00:00:00Z
+stale_after: 2027-09-01T00:00:00Z
 bb:category: business_logic
-bb:outputs: [business_logic.quantity_or_price]
+bb:outputs: [business_logic.quantity_or_price, business_logic.replay, business_logic.workflow_order]
 bb:triggers_all: [authenticated_endpoint, quantity_valued_parameter, state_changing_method]
 bb:skills: [compare-responses, use-identity]
-bb:risk: constrained
+bb:risk: approval_required
 bb:effects: mutates_object
 bb:baseline: pristine_surface
-bb:version: ed98dce721b99c50a7baf9c73e26e5bfd5fe7edeea8b447d88c7b8640308fbda
-bb:sha256: 39b7359c2735ff8c2bff4bf81194c7c02086fc231939fca8cae8c8c16f3e0a54
+bb:version: 7dacc053a4995e4c4cb9109da8edab59270995f351b1805e0c5d82492d8a7204
+bb:sha256: f7a7ec6e71b3f8bb26f74cd51325d75c951ff0076c22c6ca1696b208e0f9046e
+sources:
+  - id: payment-workflows--payment-process-contracts
+    resource: /references/payment-workflows--payment-process-contracts.md
+    title: "Payment process contracts"
+    author: human:maintainer
 ---
 
-# Ask which number the server believes, by stating the invariant the target itself publishes, reading the pristine total, sending one order with exactly one number edited, and differencing the total the target computes against the same order made legitimately.
+# Ask whether a payment conserves the amount and state the target publishes, by changing one price, discount, credit, currency, idempotency key or transition at a time and comparing the target's authoritative order, provider and ledger views with a legitimate control.
 
 ## What it concludes about
 
 - `business_logic.quantity_or_price`
+- `business_logic.replay`
+- `business_logic.workflow_order`
 
 ## When it is selected
 
@@ -32,7 +39,7 @@ A subject carrying every one of these facts:
 - `quantity_valued_parameter`
 - `state_changing_method`
 
-Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
+Risk `approval_required`, effects `mutates_object`, baseline `pristine_surface`.
 
 ## Skills it loads
 
@@ -47,7 +54,13 @@ Risk `constrained`, effects `mutates_object`, baseline `pristine_surface`.
 
 ## Provenance
 
-Written for ticket 51 as the v2 replacement for v1's payment-workflows pack, against the quantity-or-price leaf of the ticket 18 vocabulary; v1 shipped a README for this topic and no reference text, so nothing is attached. Rewritten for ticket 101 against the merged ledger, which carries four readings, one lead and two refusals for this slug. No frontmatter key moved, because all three evidence rows already name response_differential and the refuted row is reachable as written.
+Written for ticket 51 as the v2 replacement for v1's payment-workflows pack and rewritten for ticket 101 against the mined ledger. Ticket 231 turns the amount-only reading into a quality and integrity method for amount authority, discounts, credits, refunds, currency arithmetic, idempotency and reconciliation; workflow_order and replay are declared because those procedures settle those existing business-logic classes rather than relabelling every payment defect as quantity_or_price.
+
+## Maintainer references
+
+- [payment-process-contracts.md](/references/payment-workflows--payment-process-contracts.md)[^payment-workflows--payment-process-contracts]
+
+[^payment-workflows--payment-process-contracts]: Payment process contracts
 
 ## The authoritative document
 

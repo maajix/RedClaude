@@ -58,6 +58,7 @@ bb:sha256: 5f0b023bd866c91f580d0db1ca6107abc0f5e41a9d1502d65020ef1ad47f1429
 - [oauth](/playbooks/oauth.md)
 - [object-ownership](/playbooks/object-ownership.md)
 - [orm](/playbooks/orm.md)
+- [payment-webhooks](/playbooks/payment-webhooks.md)
 - [payment-workflows](/playbooks/payment-workflows.md)
 - [race-conditions](/playbooks/race-conditions.md)
 - [realtime](/playbooks/realtime.md)

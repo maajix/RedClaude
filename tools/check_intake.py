@@ -227,8 +227,8 @@ SOURCE_ID = re.compile(r"^S[0-9]{4}\Z")
 #: How many records the reviewed corpus holds. Pinned because the run of
 #: ordinals cannot see a tail cut -- a file with the last record of every
 #: Playbook removed is still numbered from one with no gap -- and because
-#: coverage cannot either: one record per Playbook still covers all fifty.
-RECORDS = 378
+#: coverage cannot either: one record per Playbook still covers all fifty-one.
+RECORDS = 382
 
 #: The floor under a field that is meant to be a restatement. It is far below
 #: what the corpus actually holds -- the shortest technique is fifty-six

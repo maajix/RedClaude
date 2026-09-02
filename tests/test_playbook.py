@@ -19,7 +19,7 @@ from pathlib import Path
 from redkraken import playbook, roster, skill
 from redkraken.document import FENCE
 from tests.fixtures import frontmatter, scratch
-from tools import check_dispositions
+from tools import check_dispositions, check_intake
 
 
 #: The smallest Playbook that compiles. Every negative below is this document
@@ -428,6 +428,23 @@ class Corpus(unittest.TestCase):
                                     for row in one.property_classes))
                 self.assertTrue(one.projection.instructions.strip())
                 self.assertTrue(one.projection.canonical().strip())
+
+    def test_every_shipped_playbook_has_a_ledger_record_behind_it(self):
+        # Ticket 235. `check_techniques` already refuses a Playbook with no
+        # record behind it, and it did refuse this tree -- but it is read by
+        # `tests.test_intake`, which is not the module somebody adding a
+        # Playbook runs. So a Playbook shipped with no reading behind it, and
+        # the corpus gate went red for everyone else. The same rule is asserted
+        # here, beside the corpus it is about, where the author of the next
+        # Playbook will see it.
+        written = {record["playbook"] for record in check_intake.read_records()}
+        missing = sorted(set(self.corpus) - written)
+        self.assertEqual(
+            [], missing,
+            f"{', '.join(missing)} ships with no record in"
+            f" {check_intake.TECHNIQUES.name}: a Playbook is written from the"
+            f" ledger, so the records go in with it",
+        )
 
     def test_every_playbook_requires_a_control_before_it_may_claim_anything(self):
         # The one rule these Playbooks exist for, and the reason it is asserted

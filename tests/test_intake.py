@@ -1030,13 +1030,13 @@ class LedgerCorpusTest(unittest.TestCase):
     def test_the_corpus_resolves_and_the_counts_are_the_ones_reviewed(self):
         self.assertEqual(
             "technique ledger\n"
-            "  records                  378   playbooks 50  skills 6  path notes 102\n"
-            "  sources                 1524   local 715  external 804  absent 5"
-            "  digested 1518\n"
+            "  records                  382   playbooks 51  skills 6  path notes 105\n"
+            "  sources                 1535   local 715  external 814  absent 6"
+            "  digested 1528\n"
             # The five paths are listed in full rather than only the ones with
             # rows, because a path that fell to zero is the change worth seeing.
-            "  reaches                  248\n"
-            "  observation_only          22\n"
+            "  reaches                  249\n"
+            "  observation_only          25\n"
             "  blocked                   43\n"
             "  refused                   55\n"
             "  out_of_scope              10",
@@ -1074,12 +1074,12 @@ class LedgerCorpusTest(unittest.TestCase):
     def test_a_corpus_with_records_cut_off_the_end_is_refused(self):
         # The run of ordinals cannot see this one: a file with the last record
         # of every Playbook removed is still numbered from one with no gap, and
-        # it still covers all fifty Playbooks.
+        # it still covers all fifty-one Playbooks.
         records = technique_records()
         last = {one["playbook"]: one["id"] for one in records}
         kept = [one for one in records if one["id"] not in set(last.values())]
         self.assertIn(
-            "the reviewed corpus holds 378 records, and this one holds 328",
+            "the reviewed corpus holds 382 records, and this one holds 331",
             self.refusal(kept, source_rows()),
         )
 

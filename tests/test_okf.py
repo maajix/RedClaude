@@ -54,7 +54,7 @@ class BundleTest(unittest.TestCase):
                 continue
             blocks += 1
             self.assertEqual((), okf.frontmatter_faults(name, text), name)
-        self.assertEqual(141, blocks)
+        self.assertEqual(144, blocks)
 
     def test_the_reserved_log_carries_no_frontmatter(self):
         # Section 9: "Log files carry no frontmatter." The three section
@@ -65,13 +65,13 @@ class BundleTest(unittest.TestCase):
         )
 
     def test_every_playbook_skill_and_reference_is_a_concept(self):
-        # The count is stated as three sums rather than as 145, so a failure
+        # The count is stated as three sums rather than as 148, so a failure
         # says which corpus moved.
         references = sum(len(one.references) for one in playbook.PLAYBOOKS.values())
         references += sum(len(one.references) for one in skill.SKILLS.values())
-        self.assertEqual(50, len(playbook.PLAYBOOKS))
+        self.assertEqual(51, len(playbook.PLAYBOOKS))
         self.assertEqual(6, len(skill.SKILLS))
-        self.assertEqual(84, references)
+        self.assertEqual(86, references)
         for name in playbook.PLAYBOOKS:
             self.assertIn(f"playbooks/{name}.md", self.files)
         for name in skill.SKILLS:
@@ -356,7 +356,7 @@ class FreezeTest(unittest.TestCase):
     this tree is written down: a view nobody can diff is a view nobody notices
     going wrong. The failure below names the file, and the fix is never to
     relax the assertion -- it is `python -c "import pathlib; from redkraken import
-    okf; okf.write(pathlib.Path('.'), pathlib.Path('docs/okf'))"` and a reading
+    okf; okf.write(pathlib.Path('.').resolve(), pathlib.Path('docs/okf'))"` and a reading
     of the diff.
     """
 

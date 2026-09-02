@@ -34,6 +34,7 @@ bb:sha256: ab704d79e98737d52bd01ea6256af7daa2e7db3e318119aed5c88d73686955e5
 - [identity-parsing](/playbooks/identity-parsing.md)
 - [information-disclosure](/playbooks/information-disclosure.md)
 - [kubernetes](/playbooks/kubernetes.md)
+- [payment-webhooks](/playbooks/payment-webhooks.md)
 - [secrets](/playbooks/secrets.md)
 - [spreadsheet-injection](/playbooks/spreadsheet-injection.md)
 - [ssrf-url-routing](/playbooks/ssrf-url-routing.md)
