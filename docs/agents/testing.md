@@ -42,14 +42,20 @@ uv run python -m unittest tests.test_config tests.test_scope -q
 Measured: 126 tests, 0.146s.
 
 If the change touches schema, verbs or grants, add the covering
-`tests/test_database.py` classes to the same command, under the lock:
+`tests/test_database.py` classes to the same command:
 
 ```
 export RK_TEST_SUPERUSER_URL="postgres://postgres:...@127.0.0.1:5432/postgres"
 export RK_TEST_DATABASE=<a name nobody else is using>
-flock -w 3600 /tmp/rk2-db.lock uv run python -m unittest \
+uv run python -m unittest \
   tests.test_database.CleanCreationTest tests.test_database.<YourClass> -q
 ```
+
+**No `flock` on that command.** `tests/test_database.py::setUpModule` takes
+`/tmp/rk2-db.lock` itself, so an outer wrapper is the "another session" the
+module then declines to run beside. That wrapper was documented here until
+ticket 236, and what it produced was `Ran 0 tests` / `OK` / exit 0 -- a green
+schema run that never happened.
 
 `CleanCreationTest` belongs in every database invocation: it is the one that
 proves the corpus still applies from empty, which is what a new migration most
@@ -103,10 +109,18 @@ other with:
 28P01: password authentication failed for user "rk2_migrate"
 ```
 
-So every database invocation takes `flock -w 3600 /tmp/rk2-db.lock`, no
-exceptions, not even a one-off probe. This also means database runs do not
+So every database invocation runs under `/tmp/rk2-db.lock`, no exceptions, not
+even a one-off probe -- and the suite takes that lock itself, in
+`setUpModule`. Do not add a wrapper. This also means database runs do not
 parallelise: when several agents work at once, the server is the bottleneck and
 tier 1 above is what keeps them out of each other's way.
+
+When the lock is already held, the run stops with a non-zero status and
+`RuntimeError: another session holds /tmp/rk2-db.lock`, not with a skip. A skip
+exits 0 and prints `OK`, which is indistinguishable from a pass to a reader and
+to a CI step, so a run that never reached the schema now says so. Either wait
+for the other session, or point `RK_TEST_CLUSTER_LOCK` at a path of your own if
+this server is not the one the hunt is on.
 
 ## Known failures that are not yours
 

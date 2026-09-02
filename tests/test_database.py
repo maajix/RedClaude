@@ -175,8 +175,17 @@ REASON = "set RK_TEST_SUPERUSER_URL to a disposable PostgreSQL 18 superuser conn
 #: mid-lap leaves a Tool run open against a third-party target, which is the one
 #: state worth a whole lock to avoid -- and the hunt loop has taken this lock
 #: since it was written, against a suite that never took the other side of it.
+#:
+#: `setUpModule` takes this lock itself, so a caller must NOT wrap the command
+#: in `flock` on the same path: the module would decline to run beside its own
+#: wrapper. That is ticket 236, and the reason the reason below says so.
 LOCK_PATH = os.environ.get("RK_TEST_CLUSTER_LOCK", "/tmp/rk2-db.lock")
-LOCK_REASON = f"another session holds {LOCK_PATH}; a hunt is running on this cluster"
+LOCK_REASON = (
+    f"another session holds {LOCK_PATH}; a hunt is running on this cluster."
+    " Wait for it to finish, or set RK_TEST_CLUSTER_LOCK to a path of your own"
+    " if this server is not the one the hunt is on. Do not wrap the command in"
+    " flock: this module takes the lock itself."
+)
 LOCK: int | None = None
 
 #: Deleting the bytes a purged Program's rows named, without taking the purge
@@ -338,7 +347,11 @@ def setUpModule() -> None:
     except OSError:
         os.close(LOCK)
         LOCK = None
-        raise unittest.SkipTest(LOCK_REASON)
+        # Not a `SkipTest`. A skip exits 0 and prints `OK`, so a run that never
+        # reached the schema read as a run that passed -- which is how the
+        # documented `flock` wrapper survived (ticket 236). The lock still stops
+        # the run; what changed is that the run now says it was stopped.
+        raise RuntimeError(LOCK_REASON)
     HARNESS = _build()
 
 
@@ -619,6 +632,53 @@ class ExclusiveRunTest(DatabaseCase):
         ).scalar()
 
         self.assertEqual(0, outstanding)
+
+
+class ClusterLockTest(unittest.TestCase):
+    """A run that could not take the cluster lock is an error, not a skip.
+
+    Ticket 236. `setUpModule` takes `LOCK_PATH` itself, and the documented
+    command wrapped the run in `flock` on the same path -- so the module
+    declined to run beside its own wrapper and reported `Ran 0 tests`, `OK`,
+    exit 0. A reader and a CI step both saw a green schema run that never
+    happened.
+
+    Asserted in a child process, because the state under test is `setUpModule`
+    refusing and this module's own has already run by the time a test can look.
+    The child needs no database: the refusal happens before `_build`, so a
+    non-empty `RK_TEST_SUPERUSER_URL` is enough to get it past the early
+    return, and the lock it finds held stops it there.
+
+    Not a `DatabaseCase` for the same reason -- this is the one class in the
+    file that says something about the file rather than about the schema.
+    """
+
+    def test_a_run_that_could_not_take_the_cluster_lock_is_not_green(self):
+        held = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            with contextlib.suppress(OSError):
+                # Already held where `setUpModule` took it, which is the state
+                # under test either way; taken here when this class is run on
+                # its own with no superuser URL set.
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ran = subprocess.run(
+                [sys.executable, "-m", "unittest", f"{__name__}.ClusterLockTest", "-v"],
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).resolve().parent.parent,
+                env=dict(
+                    os.environ,
+                    NO_COLOR="1",
+                    RK_TEST_SUPERUSER_URL="postgres://nobody@127.0.0.1:1/postgres",
+                ),
+            )
+            told = ran.stdout + ran.stderr
+            self.assertNotEqual(0, ran.returncode, told)
+            self.assertIn(LOCK_REASON, told)
+            self.assertNotIn("skipped", told)
+            self.assertNotIn("\nOK", told)
+        finally:
+            os.close(held)
 
 
 class ConnectionGuardTest(DatabaseCase):
