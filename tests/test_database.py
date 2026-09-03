@@ -32699,6 +32699,31 @@ class LiveDoorFixture:
         return self.connection.execute(sql, parameters).rows
 
     @classmethod
+    def called(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One verb of this Program's, committed, as the runtime.
+
+        Here rather than in each subclass, for the reason this fixture is
+        shared: `ReplayFixture` has the same three helpers over `cls.connection`
+        and this branch's connection is `cls.runtime`, so what differed between
+        the copies was the connection's name and nothing else.
+        """
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            answered = cls.runtime.execute(sql, parameters).scalar()
+        return json.loads(str(answered))
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()) -> None:
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute(sql, parameters)
+
+    @classmethod
+    def rows_of(cls, sql: str, parameters: tuple = ()) -> tuple:
+        return cls.runtime.execute(sql, parameters).rows
+
+    @classmethod
     def claimed(cls, statement: str) -> str:
         """One claim of this Program's, waiting to be tested."""
         subject = offline_entity(cls.runtime, cls.program_id)
@@ -34938,14 +34963,6 @@ class ValidationCommandTest(LiveDoorFixture, DatabaseCase):
             verdict=judgement.answer,
             verdict_attempts=judgement.attempts,
         )
-
-    @classmethod
-    def called(cls, sql: str, parameters: tuple) -> dict:
-        """One verb of this Program's, committed, as the runtime."""
-        with cls.runtime.transaction():
-            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
-            answered = cls.runtime.execute(sql, parameters).scalar()
-        return json.loads(str(answered))
 
     def facts(self, arrangement: dict) -> dict:
         return arrangement["report"].facts
@@ -54758,26 +54775,34 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
     stamp. The second stamps the pivot that requires what the first provides,
     and the chain composes.
 
-    Nothing here is `rk test replay --impact`. `verbs=replay.IMPACT` is passed
-    the way `execution.py::_replay` passes it -- off the Test's own
-    `impact_class` -- so what is exercised is the harness's path and not the
-    operator's.
+    Nothing here is `rk test replay --impact`. The verbs `_replay` selects are
+    the verbs `attempt` below passes, so what is exercised is the harness's path
+    and not the operator's. Which of the two `_replay` selects is asserted where
+    that selection lives, in `tests.test_execution.ImpactReplayTest`, over the
+    call kwargs it hands the performer.
 
     This case commits, and `LiveDoorFixture` purges what it wrote at the end.
     """
 
     slug = RUNTIME_CHAIN_SLUG
     TARGET = WritingTarget
-    SOURCE = SCOPED + (
-        f'\n[[identity]]\nname = "{SLOT}"\nslot_ref = "slot://identity/{SLOT}"\n'
-    )
+
+    #: `SCOPED` declares no `[[identity]]` and every pivot below runs as one, so
+    #: the block is appended. `DECLARED` rather than a sixth hand-spelling of it
+    #: in this module, and it names `member`, which is what `SLOT` is.
+    SOURCE = SCOPED + DECLARED
 
     #: The claim the member Finding is validated on, and the routes it is
     #: validated over -- `LiveDoorFixture.URLS`, which is `/notes/1..3`. Every
     #: pivot below walks its own route instead, because 39 refuses a transition
     #: on a request the member Finding was itself validated on.
     CLAIM = "the notes API hands a stranger a neighbour's note"
-    TITLE = "a neighbour's note comes back and I would report this one as high"
+
+    #: The title the hunter gave the member Finding. The other live-door case's
+    #: own, because it is a sentence about a neighbour's note and this Program
+    #: serves the same routes; a second spelling of it would be a second
+    #: sentence to keep in step with nothing asking for one.
+    TITLE = ValidationCommandTest.TITLE
 
     #: The detection Test, in assertions a counting target can satisfy. Both are
     #: about the status: two GETs of one route never answer the same bytes here,
@@ -54824,7 +54849,9 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
     )
 
     #: What the operator says when the impact question is put to them.
-    GRANTED = "the write is reversible and I want it proved before we report it"
+    #: `ImpactRunFixture.REASON` is that sentence and this case answers the same
+    #: question, so it is referenced rather than spelled a second time.
+    GRANTED = ImpactRunFixture.REASON
 
     @classmethod
     def setUpClass(cls):
@@ -54850,35 +54877,6 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
             raise
 
     # -- the arrangement -------------------------------------------------------
-
-    @classmethod
-    def called(cls, sql: str, parameters: tuple = ()) -> dict:
-        """One verb of this Program's, committed, as the runtime."""
-        with cls.runtime.transaction():
-            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
-            answered = cls.runtime.execute(sql, parameters).scalar()
-        return json.loads(str(answered))
-
-    @classmethod
-    def rows_of(cls, sql: str, parameters: tuple = ()) -> tuple:
-        return cls.runtime.execute(sql, parameters).rows
-
-    @classmethod
-    def as_owner(cls, sql: str, parameters: tuple = ()) -> None:
-        with cls.owner_connection.transaction():
-            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
-            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
-            cls.owner_connection.execute(sql, parameters)
-
-    @classmethod
-    def id_of(cls, table: str, label: str) -> str:
-        """The id behind a label, because the verbs answer in one and take the other."""
-        return str(
-            cls.runtime.execute(
-                f"SELECT id FROM {table} WHERE program_id = $1::uuid AND label = $2",
-                (cls.program_id, label),
-            ).scalar()
-        )
 
     @classmethod
     def provisioned(cls) -> str:
@@ -54924,21 +54922,45 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         cls.as_owner("SELECT * FROM refresh_scope_projection($1::uuid)", (cls.program_id,))
 
     @classmethod
-    def replayed(cls, test: str) -> Report:
-        """One `rk test replay` of that Test, through the door, and it held.
+    def replayed(
+        cls,
+        test: str,
+        *,
+        agent_run: str | None = None,
+        identity_slot: str | None = None,
+        **verbs,
+    ) -> Report:
+        """One `rk test replay` of that Test, through the door.
 
         `ValidatedFindingFixture` writes its Receipts by hand; this is the same
         route with the door in it, which is what makes the member Finding a
         Finding whose validating requests the pivot refusal can compare against.
+
+        The one `replay.run` call site of this class, so that `attempt` below is
+        a slot and a verb set rather than a third spelling of the same six
+        keyword arguments. A caller that already claimed a run of its own hands
+        it in; the detection replays take a fresh one, because the machine
+        admits one replay of a claim in flight at a time.
         """
-        performed = replay.run(
+        return replay.run(
             cls.harness.runtime,
             cls.configuration,
-            agent_run=cls.agent_run(),
+            agent_run=agent_run or cls.agent_run(),
             test=test,
-            identity_slot=None,
+            identity_slot=identity_slot,
             proxy_url=cls.proxy_url,
+            **verbs,
         )
+
+    @classmethod
+    def must_hold(cls, test: str) -> Report:
+        """One detection replay the arrangement needs to have held.
+
+        The member Finding is opened on the run this returns, so a replay that
+        refuted or died is an arrangement that cannot reach impact at all --
+        checked here rather than left to fail later as a missing Finding.
+        """
+        performed = cls.replayed(test)
         assert performed.ok, performed.violations
         assert performed.facts["test_run"]["outcome"] == "holds", performed.facts
         return performed
@@ -54951,43 +54973,39 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         replays this fixture's door performed rather than replays written by
         hand. It is not that fixture: this branch of the tree descends from
         `LiveDoorFixture`, whose Program, connections and teardown are different
-        ones, and inheriting both would open two Programs.
+        ones, and inheriting both would open two Programs. What is taken from it
+        is the six statements, by name: the route is that fixture's route, so a
+        change to how a Finding gets validated has to reach this case too.
         """
+        validating = ValidatedFindingFixture
         hypothesis = cls.claimed(cls.CLAIM)
         test = cls.stored(hypothesis, cls.HELD, cls.URLS)
-        born = cls.replayed(test)
+        born = cls.must_hold(test)
         opened = cls.called(
-            "SELECT open_finding($1::uuid, $2::uuid, $3, $4)",
+            validating.OPEN_FINDING,
             (hypothesis, born.facts["test_run"]["id"], cls.klass, cls.TITLE),
         )
         assert opened["outcome"] == "created", opened
 
-        asked = cls.called(
-            "SELECT request_validation($1::uuid, $2::uuid)",
-            (cls.program_id, opened["finding_id"]),
-        )
+        asked = cls.called(validating.REQUEST, (cls.program_id, opened["finding_id"]))
         assert asked["outcome"] == "queued", asked
         reopened = cls.called(
-            "SELECT reopen_for_reproduction($1::uuid, $2::uuid)",
-            (cls.program_id, opened["finding_id"]),
+            validating.REOPEN, (cls.program_id, opened["finding_id"])
         )
         assert reopened["outcome"] == "reopened", reopened
-        again = cls.replayed(test)
+        again = cls.must_hold(test)
 
         session = cls.called(
-            "SELECT open_validation_session($1::uuid, $2::uuid, $3::uuid)",
+            validating.SESSION,
             (cls.program_id, opened["finding_id"], again.facts["test_run"]["id"]),
         )
         assert session["outcome"] == "opened", session
         verdict = cls.called(
-            "SELECT record_verdict($1::uuid, $2::uuid, $3, $4::text[])",
+            validating.VERDICT,
             (cls.program_id, opened["finding_id"], "confirmed", "{}"),
         )
         assert verdict["status"] == "validated", verdict
-        cls.called(
-            "SELECT finish_task_attempt($1::uuid, $2)",
-            (session["agent_run_id"], "completed"),
-        )
+        cls.called(validating.FINISH, (session["agent_run_id"], "completed"))
         return {"finding": opened["finding"], "finding_id": opened["finding_id"],
                 "test": test}
 
@@ -55022,43 +55040,37 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
             "SELECT open_impact_task($1::uuid, $2::jsonb)",
             (cls.member["finding_id"], cls.pivot_spec(route, provides, requires)),
         )
-        test = cls.id_of("tests", opened["test"])
 
-        parked = cls.attempt(opened["task"], test)
+        parked = cls.attempt(opened["task"], opened["test"])
         assert parked.facts["decision"] is not None, parked.facts
         assert parked.facts["tool_run"] is None, parked.facts
         answered = cls.approve(parked.facts["decision"]["label"])
         assert answered["status"] == "approved", answered
 
-        performed = cls.attempt(opened["task"], test)
+        performed = cls.attempt(opened["task"], opened["test"])
         cls.settle(opened["task"])
         return {"opened": opened, "parked": parked, "performed": performed}
 
     @classmethod
     def attempt(cls, task: str, test: str) -> Report:
-        """One `replay.run` under `replay.IMPACT`, dispatched as the runtime does.
+        """One `replay.run` under `replay.IMPACT`, on that impact Test.
 
-        `verbs=` is passed off the Test's own impact class, which is what
-        `execution.py::_replay` does with `claimed.impact_class`. Read here
-        rather than assumed: a Test this fixture wrote without one would take
-        `DETECTION` and stamp nothing, and the assertion would then be about the
-        fixture.
+        `verbs=replay.IMPACT` flatly, rather than the selection
+        `execution.py::_replay` makes off `claimed.impact_class`. That rule has
+        its reader in `tests.test_execution.ImpactReplayTest`, over the call
+        kwargs `_replay` passes; a second spelling of it here would be a third
+        reader of a one-line rule with nothing binding it to the first two.
+        `open_impact_replay` refuses a Test carrying no class, so a Test this
+        fixture wrote without one is refused rather than quietly detected.
+
+        The Test is named by its label, which is what `open_impact_task`
+        answers with and what `replay.run` takes.
         """
-        impact_class = cls.runtime.execute(
-            "SELECT impact_class FROM tests WHERE id = $1::uuid", (test,)
-        ).scalar()
-        assert impact_class is not None, test
-        run = cls.open_run(task)
-        return replay.run(
-            cls.harness.runtime,
-            cls.configuration,
-            agent_run=run,
-            test=cls.runtime.execute(
-                "SELECT label FROM tests WHERE id = $1::uuid", (test,)
-            ).scalar(),
+        return cls.replayed(
+            test,
+            agent_run=cls.open_run(task),
             identity_slot=SLOT,
-            proxy_url=cls.proxy_url,
-            verbs=replay.IMPACT if impact_class else replay.DETECTION,
+            verbs=replay.IMPACT,
         )
 
     @classmethod

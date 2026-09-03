@@ -1536,6 +1536,55 @@ class ImpactReplayTest(unittest.TestCase):
         self.assertFalse(replay.DETECTION.stamp_sql)
         self.assertFalse(replay.DETECTION.chain_sql)
 
+    def replay_called(self, **overrides) -> mock.Mock:
+        """One `perform` attempt, and the `replay.run` the runtime called.
+
+        The whole harness for it is `PerformTest.performing`, 1600 lines below,
+        and what is needed here is its mock rather than its five return values.
+        `PerformTest.SETTLED` and `PerformTest.DOOR` are referenced instead of
+        respelled: the first is what a settled replay answers with, and the
+        second is the runtime's own address for the door, which `_replay`
+        refuses to run without.
+        """
+        connection = Recorder(
+            started=(
+                started_row(
+                    kind="perform", role="performer", test_label="TS3", **overrides
+                ),
+            )
+        )
+        performed = outcome_module.Report(
+            "test replay", facts=dict(PerformTest.SETTLED)
+        )
+        with compiled():
+            with mock.patch.object(
+                execution.replay_module, "run", return_value=performed
+            ) as run:
+                attempt(
+                    connection,
+                    configuration=Path("/tmp/program.toml"),
+                    proxy_url=PerformTest.DOOR,
+                )
+        return run
+
+    def test_the_runtime_hands_the_performer_the_impact_verbs(self):
+        # Ticket 226 cycle 1's finding, and the one thing the four tests above
+        # do not reach: `Claimed.impact_class` arriving is worth nothing unless
+        # `_replay` spends it, and nothing read the call it makes. Narrowing
+        # `execution.py`'s selection to a flat `DETECTION` left the whole tree
+        # green; it turns this test red.
+        run = self.replay_called(impact_class="read_another_tenants_record")
+
+        self.assertIs(replay.IMPACT, run.call_args.kwargs["verbs"])
+
+    def test_a_task_whose_test_states_no_impact_is_handed_the_detection_verbs(self):
+        # The other half, at the same seam. Every Test written before this
+        # ticket is this shape, so a selection that sent `IMPACT` to all of them
+        # would stamp a pivot off runs that claim none.
+        run = self.replay_called()
+
+        self.assertIs(replay.DETECTION, run.call_args.kwargs["verbs"])
+
 
 class AttemptProfileTest(unittest.TestCase):
     """Ticket 165. What makes two attempts the same attempt, and what follows.
