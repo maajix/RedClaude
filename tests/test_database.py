@@ -32566,16 +32566,25 @@ class LiveDoorFixture:
     #: The three destinations a Test reaches unless an arm asks for others.
     URLS = (f"{NOTES}/1", f"{NOTES}/2", f"{NOTES}/3")
 
+    #: The document this Program is opened from. `SCOPED` declares no
+    #: `[[identity]]`, and a subclass whose subject needs a slot names one here
+    #: rather than opening the Program a second time: 012 projects the identity
+    #: blocks onto `identities` when a Program is opened, so a slot added after
+    #: the fact is a slot added by `accept_change`.
+    SOURCE = SCOPED
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.runtime = pg.connect(cls.harness.runtime)
         cls.root = scratch() / "replay-store"
         # One installation has one root, and this is the one `ProxyEgressTest`
-        # establishes the key generation under.
-        root_secret = seal.Root("live-proxy-selftest-root", SECRET)
+        # establishes the key generation under. On the class, because a subclass
+        # sealing material of its own has to seal it under the root the door
+        # below was started with.
+        cls.root_secret = seal.Root("live-proxy-selftest-root", SECRET)
 
-        source = SCOPED.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
+        source = cls.SOURCE.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
         cls.configuration = write(
             source.replace('name = "matrix-web"', f'name = "{cls.slug}"')
         )
@@ -32593,7 +32602,7 @@ class LiveDoorFixture:
             cls.configuration,
             "X-Bounty-Id",
             value,
-            root_secret=root_secret,
+            root_secret=cls.root_secret,
         )
         assert sealed.ok, sealed.violations
 
@@ -32605,7 +32614,7 @@ class LiveDoorFixture:
             store=Store(cls.root),
             connector=cls.dial,
             resolver=cls.look_up,
-            root_secret=root_secret,
+            root_secret=cls.root_secret,
         )
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.proxy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -54688,6 +54697,543 @@ class ImpactSpecificationTest(ValidatedFindingFixture, DatabaseCase):
                     " holds no chain",
                     [detail for _, detail in fired],
                 )
+
+
+RUNTIME_CHAIN_SLUG = "selftest-runtime-chain"
+
+#: The Identity slot every pivot below runs as. `rk2_pivot_problem` requires a
+#: pivot to name one and `rk2_pivot_refusal` reads it back off the Receipt the
+#: door wrote, so a run that sent as nobody could never be stamped.
+WEARER = "member"
+
+
+class WritingTarget(LiveTarget):
+    """The live target with a state a POST moves, and a PUT it answers.
+
+    Two things `Target` cannot do, and a pivot Test needs both. Its impact block
+    names the action that reads the state it left behind, so `body_differs`
+    between the baseline GET and that one has to be true -- against a target
+    answering one body for ever it is false, the run refutes rather than holds,
+    and `rk2_pivot_refusal` stops at "a pivot is stamped from a run that held".
+    And its cleanup is a PUT, which `BaseHTTPRequestHandler` answers 501 to, so
+    the undo would come back through the door as a cleanup that failed.
+
+    A counter rather than a flag, because every GET of one route has to differ
+    from every other one: the baseline and the after-state of the second pivot
+    run are two requests to the same url, and the two pivot runs are four.
+    """
+
+    served = 0
+
+    def do_GET(self) -> None:
+        WritingTarget.served += 1
+        self.answer = b'{"note":"the order as of exchange %d"}' % WritingTarget.served
+        super().do_GET()
+
+    do_POST = do_GET
+    do_PUT = do_GET
+    do_HEAD = do_GET
+
+
+class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
+    """Ticket 226 acceptance 3: the runtime reaches a chain with nobody typing.
+
+    Walls 1 and 2 were each proved against the rows they write --
+    `ImpactPerformanceTest` asks whether the lanes derive and whether the
+    dispatch carries the class, and both read state. Neither runs a replay. So
+    the only caller of `issue_pivot_stamp` and `build_kill_chain` outside
+    `rk test replay --impact`, which is `replay._downstream`, had never been
+    executed by anything, and `pivot_stamps` had never held a row that a run
+    put there.
+
+    This is that run, twice, end to end: a claim tested through a real door, a
+    Finding validated on it, two impact Tests written by `open_impact_task`,
+    each parked for want of a grant, each approved by the operator's own
+    connection, and each then replayed by `replay.run` under `replay.IMPACT`.
+    The first stamps a pivot and is refused a chain, because one stamp is a
+    stamp. The second stamps the pivot that requires what the first provides,
+    and the chain composes.
+
+    Nothing here is `rk test replay --impact`. `verbs=replay.IMPACT` is passed
+    the way `execution.py::_replay` passes it -- off the Test's own
+    `impact_class` -- so what is exercised is the harness's path and not the
+    operator's.
+
+    This case commits, and `LiveDoorFixture` purges what it wrote at the end.
+    """
+
+    slug = RUNTIME_CHAIN_SLUG
+    TARGET = WritingTarget
+    SOURCE = SCOPED + (
+        f'\n[[identity]]\nname = "{WEARER}"\nslot_ref = "slot://identity/{WEARER}"\n'
+    )
+
+    #: The claim the member Finding is validated on, and the routes it is
+    #: validated over -- `LiveDoorFixture.URLS`, which is `/notes/1..3`. Every
+    #: pivot below walks its own route instead, because 39 refuses a transition
+    #: on a request the member Finding was itself validated on.
+    CLAIM = "the notes API hands a stranger a neighbour's note"
+    TITLE = "a neighbour's note comes back and I would report this one as high"
+
+    #: The detection Test, in assertions a counting target can satisfy. Both are
+    #: about the status: two GETs of one route never answer the same bytes here,
+    #: so a `body_equals` would refute and there would be no Finding to prove
+    #: impact on.
+    HELD = [
+        {"id": "the-variant-is-served", "kind": "status_equals",
+         "action": 2, "status": 200},
+        {"id": "the-control-answers-too", "kind": "status_equals",
+         "action": 3, "status": 200},
+    ]
+
+    #: The three requests a pivot Test makes: read the state, move it, read it
+    #: again. The url is filled in per pivot.
+    ACTIONS = (
+        {"ordinal": 1, "role": "baseline", "kind": "request", "method": "GET"},
+        {"ordinal": 2, "role": "variant", "kind": "request", "method": "POST"},
+        {"ordinal": 3, "role": "control", "kind": "request", "method": "GET"},
+    )
+    SHOWN = [
+        {"id": "the-transition-happened", "kind": "status_equals",
+         "action": 2, "status": 200},
+        {"id": "the-state-changed", "kind": "body_differs", "action": 3, "against": 1},
+    ]
+    IMPACT = {
+        "class": "write_target_state",
+        "effect": "a stranger writes on a neighbour's note and the write stays written",
+        "cleanup": "the note is PUT back to what the baseline read",
+        "after_state": 3,
+    }
+    CONDITIONS = [
+        {"kind": "scope_holds",
+         "detail": "the neighbour's note is inside the scope document"},
+        {"kind": "identity_leased", "detail": "the member slot is the one held"},
+    ]
+
+    #: `(route, provides, requires)`. The second requires what the first
+    #: provides, because that one edge is what makes two stamps a chain rather
+    #: than two components -- `build_kill_chain` refuses a graph that is not one
+    #: connected component, and it refuses fewer than two members at all.
+    PIVOTS = (
+        ("7/note", "other_account_data", ["authenticated_session"]),
+        ("8/token", "credential_material", ["other_account_data"]),
+    )
+
+    #: What the operator says when the impact question is put to them.
+    GRANTED = "the write is reversible and I want it proved before we report it"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            cls.klass = str(
+                cls.connection.execute(
+                    "SELECT id FROM vulnerability_classes ORDER BY id LIMIT 1"
+                ).scalar()
+            )
+            cls.identity_entity = cls.provisioned()
+            cls.member = cls.validated_finding()
+            # The subject is `offline_entity`'s row and 021 leaves a new entity
+            # under the deny-by-default placeholder until something projects over
+            # it. `rk2_chain_unsoundness` reads the scope class of every step's
+            # subject, so a chain over a subject nobody ever classified is a
+            # chain built on a placeholder.
+            cls.project_the_scope()
+            cls.proved = [cls.prove(*pivot) for pivot in cls.PIVOTS]
+            cls.problems = cls.rows_of("SELECT * FROM check_kill_chains()")
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def called(cls, sql: str, parameters: tuple = ()) -> dict:
+        """One verb of this Program's, committed, as the runtime."""
+        with cls.runtime.transaction():
+            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+            answered = cls.runtime.execute(sql, parameters).scalar()
+        return json.loads(str(answered))
+
+    @classmethod
+    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
+        return cls.runtime.execute(sql, parameters).rows
+
+    @classmethod
+    def as_owner(cls, sql: str, parameters: tuple = ()) -> None:
+        with cls.owner_connection.transaction():
+            cls.owner_connection.execute("SET LOCAL ROLE rk2_owner")
+            cls.owner_connection.execute("SELECT set_actor('runtime', 'selftest')")
+            cls.owner_connection.execute(sql, parameters)
+
+    @classmethod
+    def id_of(cls, table: str, label: str) -> str:
+        """The id behind a label, because the verbs answer in one and take the other."""
+        return str(
+            cls.runtime.execute(
+                f"SELECT id FROM {table} WHERE program_id = $1::uuid AND label = $2",
+                (cls.program_id, label),
+            ).scalar()
+        )
+
+    @classmethod
+    def provisioned(cls) -> str:
+        """The one Identity slot, with material sealed into it.
+
+        Through the real adapter and under `LiveDoorFixture`'s root, because the
+        door opens the ciphertext with the root it was started with: a slot
+        sealed under any other is a slot the proxy cannot read.
+
+        The origin is `http` on the host the scope document includes, which is
+        the scheme every request below goes out under. A slot whose origins
+        matched nothing this Test reaches would carry no header, and what the
+        pivot needs off the Receipt is the Identity rather than the header.
+        """
+        material = scratch() / f"{cls.slug}-{WEARER}.json"
+        material.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "origins": [{
+                    "url": "http://app.example.com/",
+                    "headers": [{"name": "Authorization", "value": f"Bearer rk2-{WEARER}"}],
+                    "cookies": [],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        provisioned = identity.provision(
+            cls.harness.runtime, cls.configuration, WEARER, material,
+            root_secret=cls.root_secret,
+        )
+        assert provisioned.ok, provisioned.violations
+        return str(
+            cls.runtime.execute(
+                "SELECT entity_id FROM identities"
+                " WHERE program_id = $1::uuid AND slot_name = $2",
+                (cls.program_id, WEARER),
+            ).scalar()
+        )
+
+    @classmethod
+    def project_the_scope(cls) -> None:
+        """The scope policy, decided over this Program's entities once more."""
+        cls.as_owner("SELECT * FROM refresh_scope_projection($1::uuid)", (cls.program_id,))
+
+    @classmethod
+    def replayed(cls, test: str) -> Report:
+        """One `rk test replay` of that Test, through the door, and it held.
+
+        `ValidatedFindingFixture` writes its Receipts by hand; this is the same
+        route with the door in it, which is what makes the member Finding a
+        Finding whose validating requests the pivot refusal can compare against.
+        """
+        performed = replay.run(
+            cls.harness.runtime,
+            cls.configuration,
+            agent_run=cls.agent_run(),
+            test=test,
+            identity_slot=None,
+            proxy_url=cls.proxy_url,
+        )
+        assert performed.ok, performed.violations
+        assert performed.facts["test_run"]["outcome"] == "holds", performed.facts
+        return performed
+
+    @classmethod
+    def validated_finding(cls) -> dict:
+        """One claim carried to a validated Finding, which is where impact starts.
+
+        `ValidatedFindingFixture`'s five verbs in the order it calls them, over
+        replays this fixture's door performed rather than replays written by
+        hand. It is not that fixture: this branch of the tree descends from
+        `LiveDoorFixture`, whose Program, connections and teardown are different
+        ones, and inheriting both would open two Programs.
+        """
+        hypothesis = cls.claimed(cls.CLAIM)
+        test = cls.stored(hypothesis, cls.HELD, cls.URLS)
+        born = cls.replayed(test)
+        opened = cls.called(
+            "SELECT open_finding($1::uuid, $2::uuid, $3, $4)",
+            (hypothesis, born.facts["test_run"]["id"], cls.klass, cls.TITLE),
+        )
+        assert opened["outcome"] == "created", opened
+
+        asked = cls.called(
+            "SELECT request_validation($1::uuid, $2::uuid)",
+            (cls.program_id, opened["finding_id"]),
+        )
+        assert asked["outcome"] == "queued", asked
+        reopened = cls.called(
+            "SELECT reopen_for_reproduction($1::uuid, $2::uuid)",
+            (cls.program_id, opened["finding_id"]),
+        )
+        assert reopened["outcome"] == "reopened", reopened
+        again = cls.replayed(test)
+
+        session = cls.called(
+            "SELECT open_validation_session($1::uuid, $2::uuid, $3::uuid)",
+            (cls.program_id, opened["finding_id"], again.facts["test_run"]["id"]),
+        )
+        assert session["outcome"] == "opened", session
+        verdict = cls.called(
+            "SELECT record_verdict($1::uuid, $2::uuid, $3, $4::text[])",
+            (cls.program_id, opened["finding_id"], "confirmed", "{}"),
+        )
+        assert verdict["status"] == "validated", verdict
+        cls.called(
+            "SELECT finish_task_attempt($1::uuid, $2)",
+            (session["agent_run_id"], "completed"),
+        )
+        return {"finding": opened["finding"], "finding_id": opened["finding_id"],
+                "test": test}
+
+    @classmethod
+    def pivot_spec(cls, route: str, provides: str, requires: list[str]) -> str:
+        """One impact Test that claims a pivot, on a route of its own."""
+        actions = [action | {"url": f"{NOTES}/{route}"} for action in cls.ACTIONS]
+        stated = json.loads(specification(
+            cls.SHOWN, actions=actions,
+            cleanup=[{"method": "PUT", "url": f"{NOTES}/{route}"}],
+            impact=cls.IMPACT,
+        ))
+        return json.dumps(stated | {"pivot": {
+            "provides": provides,
+            "requires": requires,
+            "identity": WEARER,
+            "transition": cls.SHOWN[0]["id"],
+            "conditions": cls.CONDITIONS,
+        }})
+
+    @classmethod
+    def prove(cls, route: str, provides: str, requires: list[str]) -> dict:
+        """One pivot, from the verb that writes the Test to the run that stamps it.
+
+        Three attempts' worth of state in five statements, and the shape is 38's:
+        the first replay finds no grant, parks the Task and sends nothing; the
+        operator answers; the second replay runs. The Task is then settled,
+        because 012 allows a Finding one live Task at a time and the next pivot
+        needs one of its own.
+        """
+        opened = cls.called(
+            "SELECT open_impact_task($1::uuid, $2::jsonb)",
+            (cls.member["finding_id"], cls.pivot_spec(route, provides, requires)),
+        )
+        test = cls.id_of("tests", opened["test"])
+
+        parked = cls.attempt(opened["task"], test)
+        assert parked.facts["decision"] is not None, parked.facts
+        assert parked.facts["tool_run"] is None, parked.facts
+        answered = cls.approve(parked.facts["decision"]["label"])
+        assert answered["status"] == "approved", answered
+
+        performed = cls.attempt(opened["task"], test)
+        cls.settle(opened["task"])
+        return {"opened": opened, "parked": parked, "performed": performed}
+
+    @classmethod
+    def attempt(cls, task: str, test: str) -> Report:
+        """One `replay.run` under `replay.IMPACT`, dispatched as the runtime does.
+
+        `verbs=` is passed off the Test's own impact class, which is what
+        `execution.py::_replay` does with `claimed.impact_class`. Read here
+        rather than assumed: a Test this fixture wrote without one would take
+        `DETECTION` and stamp nothing, and the assertion would then be about the
+        fixture.
+        """
+        impact_class = cls.runtime.execute(
+            "SELECT impact_class FROM tests WHERE id = $1::uuid", (test,)
+        ).scalar()
+        assert impact_class is not None, test
+        run = cls.open_run(task)
+        return replay.run(
+            cls.harness.runtime,
+            cls.configuration,
+            agent_run=run,
+            test=cls.runtime.execute(
+                "SELECT label FROM tests WHERE id = $1::uuid", (test,)
+            ).scalar(),
+            identity_slot=WEARER,
+            proxy_url=cls.proxy_url,
+            verbs=replay.IMPACT if impact_class else replay.DETECTION,
+        )
+
+    @classmethod
+    def open_run(cls, task: str) -> str:
+        """The impact Task claimed again, and one run of it holding the slot.
+
+        `ImpactRunFixture.run_on` and `PivotStampFixture.leased` in one, for the
+        reasons those two give: the Task is claimed by the owner because
+        `claim_task` needs a live offer on a slate nothing here runs, and
+        `authorize_tool_run` refuses a run whose Task is not claimed; and the
+        Identity is leased by the owner because `rk2_replay_plan` refuses a run
+        holding a slot it does not lease.
+
+        Called twice per pivot. The first call's run is the one
+        `open_impact_replay` finished when it parked the Task, so the second is
+        a fresh claim over a parked row -- which is what an approved question
+        leaves behind.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'claimed', claimed_at = now(),"
+            "                 lease_expires_at = now() + interval '30 minutes',"
+            "                 finished_at = NULL, abandoned_reason = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+        run = committed(
+            cls.runtime,
+            "INSERT INTO agent_runs (program_id, task_id, role, model, effort,"
+            "                        mission_packet)"
+            " SELECT $1::uuid, t.id, 'web_hunter', 'operator', 'low', '{}'::jsonb"
+            "   FROM tasks t WHERE t.program_id = $1::uuid AND t.label = $2"
+            " RETURNING id",
+            (cls.program_id, task),
+        )
+        cls.as_owner(
+            "INSERT INTO identity_leases (program_id, identity_entity_id,"
+            "                             holder_agent_run_id, expires_at)"
+            " SELECT $1::uuid, $3::uuid, $2::uuid, t.lease_expires_at"
+            "   FROM agent_runs a JOIN tasks t ON t.id = a.task_id"
+            "  WHERE a.id = $2::uuid AND a.program_id = $1::uuid"
+            " ON CONFLICT DO NOTHING",
+            (cls.program_id, run, cls.identity_entity),
+        )
+        return str(
+            cls.runtime.execute(
+                "SELECT label FROM agent_runs WHERE id = $1::uuid", (run,)
+            ).scalar()
+        )
+
+    @classmethod
+    def approve(cls, label: str) -> dict:
+        """The operator's answer, on the operator's own connection.
+
+        `answer_decision` is granted to `rk2_human` and to nothing else, so
+        asking it as the runtime would be exercising a path no operator has --
+        which is the path 38's criterion 2 exists to close.
+        """
+        connection = pg.connect(cls.harness.human)
+        try:
+            connection.execute(operator.BIND, (cls.program_id,))
+            with connection.transaction():
+                answered = connection.execute(
+                    operator.ANSWER_DECISION,
+                    (label, "approved", cls.GRANTED, "30 minutes"),
+                ).scalar()
+        finally:
+            connection.close()
+        return json.loads(str(answered))
+
+    @classmethod
+    def settle(cls, task: str) -> None:
+        """One impact Task ended, so the next pivot of this Finding can have one.
+
+        `PivotStampFixture.settled`'s two statements and its reasons: settling is
+        the scheduler's move and this is not that, so the status is written
+        rather than derived, and the runs holding it are then closed through the
+        real verb -- 023 reads an open run on a settled Task as a problem of the
+        whole corpus rather than of this Program.
+        """
+        cls.as_owner(
+            "UPDATE tasks SET status = 'abandoned', abandoned_reason = 'answered',"
+            "                 finished_at = now(), priority = NULL,"
+            "                 claimed_at = NULL, lease_expires_at = NULL"
+            " WHERE program_id = $1::uuid AND label = $2",
+            (cls.program_id, task),
+        )
+        for row in cls.rows_of(
+            "SELECT ar.id FROM agent_runs ar JOIN tasks t ON t.id = ar.task_id"
+            " WHERE t.program_id = $1::uuid AND t.label = $2 AND ar.finished_at IS NULL"
+            " ORDER BY ar.label",
+            (cls.program_id, task),
+        ):
+            committed(
+                cls.runtime,
+                "SELECT finish_task_attempt($1::uuid, 'completed')",
+                (str(row[0]),),
+            )
+
+    # -- what the runtime reached ---------------------------------------------
+
+    def held(self, report: Report, name: str) -> list[str]:
+        """What the replay's own ledger said under one name."""
+        return [item.detail for item in report.assertions if item.name == name]
+
+    def test_each_impact_run_was_parked_for_a_person_before_it_ran(self):
+        # 38's gate, and the reason acceptance 3 costs an operator answer: the
+        # first attempt at every pivot sends nothing at all.
+        for index, proved in enumerate(self.proved):
+            with self.subTest(index):
+                self.assertIsNone(proved["parked"].facts["tool_run"])
+                self.assertEqual(
+                    "impact_unauthorized",
+                    self.rows(
+                        "SELECT question_code FROM pending_decisions"
+                        " WHERE program_id = $1::uuid AND label = $2",
+                        (self.program_id, proved["parked"].facts["decision"]["label"]),
+                    )[0][0],
+                )
+
+    def test_the_runtime_stamped_a_pivot_off_each_run_it_performed(self):
+        # The row this ticket was filed over. Two stamps, both written by
+        # `replay._downstream` inside the transaction that closed the run, and
+        # neither by an operator command.
+        stamped = self.rows(
+            "SELECT ps.provides, ts.label FROM pivot_stamps ps"
+            "  JOIN tests ts ON ts.id = ps.test_id"
+            " WHERE ps.program_id = $1::uuid ORDER BY ps.issued_at, ps.label",
+            (self.program_id,),
+        )
+
+        self.assertEqual(
+            [provides for _, provides, _ in self.PIVOTS],
+            [str(row[0]) for row in stamped],
+        )
+        self.assertEqual(
+            [proved["opened"]["test"] for proved in self.proved],
+            [str(row[1]) for row in stamped],
+        )
+
+    def test_the_first_run_is_refused_a_chain_and_the_second_composes_one(self):
+        # `build_kill_chain` refuses fewer than two members, so the refusal on
+        # the first run is the design and not a failure -- and the second run is
+        # the one that had two stamps to offer.
+        self.assertEqual(
+            ["these stamps compose no chain: one stamp is a stamp, and a chain"
+             " composes at least two"],
+            self.held(self.proved[0]["performed"], "chain"),
+        )
+        self.assertEqual(1, len(self.held(self.proved[1]["performed"], "chain")))
+        self.assertIn(
+            "composes 2 step(s) over 1 edge(s)",
+            self.held(self.proved[1]["performed"], "chain")[0],
+        )
+
+    def test_the_chain_the_runtime_built_holds_both_stamps_in_order(self):
+        chains = self.rows(
+            "SELECT c.label, count(cs.*), count(DISTINCT ce.*) FROM chains c"
+            "  LEFT JOIN chain_steps cs ON cs.chain_id = c.id"
+            "  LEFT JOIN chain_edges ce ON ce.chain_id = c.id"
+            " WHERE c.program_id = $1::uuid GROUP BY c.label",
+            (self.program_id,),
+        )
+
+        self.assertEqual(1, len(chains), chains)
+        self.assertEqual((2, 1), (int(chains[0][1]), int(chains[0][2])))
+
+    def test_the_standing_check_is_green_over_a_program_that_holds_a_chain(self):
+        # Acceptance 3's own words. The check being quiet is worth nothing on an
+        # empty table -- that is the vacuous green this ticket measured -- so the
+        # count is asserted beside it: this Program holds a chain, and the check
+        # read it and said nothing.
+        held = self.rows(
+            "SELECT (SELECT count(*) FROM chains WHERE program_id = $1::uuid),"
+            "       (SELECT count(*) FROM pivot_stamps WHERE program_id = $1::uuid)",
+            (self.program_id,),
+        )[0]
+
+        self.assertEqual((1, 2), (int(held[0]), int(held[1])))
+        self.assertEqual((), self.problems)
 
 
 class UnreadyTaskTest(ClaimFixture, SchedulerFixture, DatabaseCase):
