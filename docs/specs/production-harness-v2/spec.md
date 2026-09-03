@@ -828,6 +828,35 @@ and ordinary resume all reconcile from current rows.
   performs operator UAT through CLI and UI, then runs independent Standards and
   Spec review against the production diff.
 
+## Verify command
+
+The two halves of this effort's suite, and each prints the name of every test
+it ran. Written at ticket 197 rather than at the walking skeleton, which is why
+no ticket before it could paste one; `docs/agents/testing.md` owns the tiering
+and the cluster lock rules these obey.
+
+Without a server -- 60 modules, everything except what needs PostgreSQL:
+
+```
+NO_COLOR=1 PYTHONPATH=$PWD:$PWD/src python -m unittest discover -s tests -t . -v
+```
+
+With one, adding the covering `tests/test_database.py` classes. Never wrapped
+in `flock`: `setUpModule` takes `/tmp/rk2-db.lock` itself.
+
+```
+export RK_TEST_SUPERUSER_URL="postgres://postgres:...@127.0.0.1:5432/postgres"
+export RK_TEST_DATABASE=<a name nobody else is using>
+NO_COLOR=1 python -m unittest \
+  tests.test_database.CleanCreationTest tests.test_database.<YourClass> -v
+```
+
+`PYTHONPATH` is what the `tools/check_*` subprocesses read; `tests/__init__.py`
+puts `src` on the parent's `sys.path` but a child spawned by
+`tests/test_coverage.py` or `tests/test_dispositions.py` inherits the variable,
+not the list, and fails `ModuleNotFoundError: No module named 'redkraken'`
+without it.
+
 ## Out of Scope
 
 - Android application, device, APK, ADB and mobile-network testing are outside

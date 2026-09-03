@@ -110,10 +110,10 @@ other with:
 ```
 
 So everything that touches this cluster runs under `/tmp/rk2-db.lock`, no
-exceptions, not even a one-off `psql`. The suite is the one thing that already
-takes that lock itself, in `setUpModule`, so do not wrap
-`tests/test_database.py`; anything else still needs its own
-`flock /tmp/rk2-db.lock`. This also means database runs do not
+exceptions, not even a one-off `psql`. Two things already take that lock
+themselves and must not be wrapped: the suite, in `setUpModule`, and
+`tools/hunt-loop.sh`, which holds it for the whole hunt. Anything else still
+needs its own `flock /tmp/rk2-db.lock`. This also means database runs do not
 parallelise: when several agents work at once, the server is the bottleneck and
 tier 1 above is what keeps them out of each other's way.
 

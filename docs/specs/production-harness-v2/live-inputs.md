@@ -21,3 +21,20 @@ FAR END         `pivot_stamps` = 2 and `chains` = 1 on a Program that held
                 repository.
 STATUS          promoted to tests.test_database.RuntimeChainTest
 REPLAYS         0 ()
+
+## 197
+INPUT           `tools/hunt-loop.sh /tmp/nope.toml` on the default
+                `/tmp/rk2-db.lock`, with a `sleep 30` stub on `PATH` as `rk` so
+                the loop is still inside its first lap, then
+                `python -m unittest tests.test_database.ClusterLockTest` with
+                `RK_TEST_SUPERUSER_URL=postgres://nobody@127.0.0.1:1/postgres`.
+                No cluster: the refusal happens before `_build`, so the seam is
+                reached without one.
+FAR END         `flock -n /tmp/rk2-db.lock` refused while the loop ran, and the
+                suite stopped at `RuntimeError: another session holds
+                /tmp/rk2-db.lock; a hunt is running on this cluster.` with
+                `Ran 0 tests` / `FAILED (errors=1)`. The mirror run, loop
+                started while the lock was held: `another session holds
+                /tmp/rk2-db.lock; not starting` / `loop exit 5`.
+STATUS          promoted to tests.test_database.ClusterLockTest.test_the_hunt_loop_this_repository_ships_takes_the_other_side
+REPLAYS         0 ()

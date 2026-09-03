@@ -114,12 +114,18 @@ NOTES = 6
 #: state requirements, `Further Notes` states release conditions, and the first
 #: two are the argument for all of them. A requirement nobody audits because it
 #: arrived under a heading nobody parsed is the failure this list exists for.
+#:
+#: `Verify command` is the one entry that states no requirement. It holds the
+#: command every ticket's bar is read against, and it is listed here rather than
+#: nested under `Testing Decisions` so that a reader looking for it finds a
+#: top-level heading (ticket 197).
 SECTIONS = (
     "Problem Statement",
     "Solution",
     "User Stories",
     "Implementation Decisions",
     "Testing Decisions",
+    "Verify command",
     "Out of Scope",
     "Further Notes",
 )

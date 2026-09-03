@@ -248,6 +248,10 @@ Its body.
 - One obligation,
   continued.
 
+## Verify command
+
+The one section that states no requirement, so it holds no bullet to count.
+
 ## Out of Scope
 
 - One constraint.

@@ -170,13 +170,18 @@ RESTORED = f"{DATABASE}_restored"
 
 REASON = "set RK_TEST_SUPERUSER_URL to a disposable PostgreSQL 18 superuser connection string"
 
-#: The cluster lock, which is `hunt.sh`'s. The six `rk2_*` roles are
-#: cluster-global and `_build` re-provisions every one of them with a password
-#: it generated for the run, so this module rotates the credentials of every
-#: other database on the same server. A live engagement that loses its login
-#: mid-lap leaves a Tool run open against a third-party target, which is the one
-#: state worth a whole lock to avoid -- and the hunt loop has taken this lock
-#: since it was written, against a suite that never took the other side of it.
+#: The cluster lock, which the hunt drivers take too. The six login roles in
+#: `migrate.ROLES` are cluster-global and `_build` re-provisions every one of
+#: them with a password it generated for the run, so this module rotates the
+#: credentials of every other database on the same server. A live engagement
+#: that loses its login mid-lap leaves a Tool run open against a third-party
+#: target, which is the one state worth a whole lock to avoid.
+#:
+#: Both sides now exist, and both resolve this same path: `tools/hunt-loop.sh`
+#: is the hunt driver this repository ships and takes `flock -w 60` on it for
+#: the whole hunt (ticket 197), and `hunt.sh` is the out-of-repo operator script
+#: quoted in that ticket. A driver locking a path this module does not read for
+#: is not a lock at all, which is why the override below is read by both.
 #:
 #: `setUpModule` takes this lock itself, so a caller must NOT wrap the command
 #: in `flock` on the same path: the module would decline to run beside its own
@@ -685,6 +690,62 @@ class ClusterLockTest(unittest.TestCase):
             self.assertNotIn("BlockingIOError", told)
         finally:
             os.close(held)
+
+    def test_the_hunt_loop_this_repository_ships_takes_the_other_side(self):
+        """One side of a lock is not a lock -- ticket 197.
+
+        `hunt.sh` is an operator script quoted in that ticket and not in this
+        tree; `tools/hunt-loop.sh` is the one hunt driver that ships here, and
+        it is the one whose lock this module's refusal can be read against. The
+        literal crossing the seam is the lock path: the loop must hold the path
+        `RK_TEST_CLUSTER_LOCK` names, because that is the path `setUpModule`
+        reads for.
+
+        Driven with a stub `rk` on `PATH`, because the subject is the lock the
+        loop holds around its laps and not what a lap does. The stub starts the
+        suite on its first call, so the loop is holding the lock at the moment
+        `setUpModule` reaches for it, and answers the second call with the stop
+        word that ends the loop after one lap. A path of this run's own, so the
+        case can never wedge a real hunt on `/tmp/rk2-db.lock`.
+        """
+        work = scratch()
+        lock = work / "cluster.lock"
+        told = work / "suite.txt"
+        stub = work / "rk"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$1 $2" in\n'
+            '  "decision sweep")\n'
+            f'    "{sys.executable}" -m unittest'
+            f' {__name__}.ClusterLockTest -v > "{told}" 2>&1\n'
+            f'    printf "suite exit %d\\n" "$?" >> "{told}" ;;\n'
+            '  *) echo \'"stop_reason": "nothing_to_execute"\' ;;\n'
+            "esac\n"
+        )
+        stub.chmod(0o755)
+        loop = subprocess.run(
+            ["bash", str(ROOT / "tools" / "hunt-loop.sh"), "program.toml", str(work / "hunt.log")],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            env=dict(
+                os.environ,
+                NO_COLOR="1",
+                PATH=f"{work}{os.pathsep}{os.environ['PATH']}",
+                RK_TEST_CLUSTER_LOCK=str(lock),
+                RK_TEST_SUPERUSER_URL="postgres://nobody@127.0.0.1:1/postgres",
+            ),
+        )
+        record = loop.stdout + loop.stderr
+        self.assertEqual(0, loop.returncode, record)
+        self.assertTrue(told.exists(), record)
+        suite = told.read_text()
+        # The loop held the path the suite reads for, so the suite stopped and
+        # said which path stopped it. A loop that took no lock, or took a
+        # hard-coded one, leaves this path free and the suite runs.
+        self.assertIn(f"another session holds {lock}", suite)
+        self.assertNotIn("suite exit 0\n", suite)
+        self.assertNotIn("\nOK", suite)
 
 
 class ConnectionGuardTest(DatabaseCase):
