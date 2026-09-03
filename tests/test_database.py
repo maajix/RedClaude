@@ -39286,6 +39286,316 @@ class HypothesisHuntTest(ClaimFixture, SchedulerFixture, DatabaseCase):
         )
 
 
+#: The Program ticket 233's reading is arranged in. One, because what is read is
+#: one Playbook's bar against two claims, and a second Program would be a second
+#: copy of the same arrangement rather than a second question.
+TRANSPORT_BAR_SLUG = "selftest-transport-bar"
+
+#: The Playbook whose bar this is, by the path the catalogue holds it under.
+DESYNC_PLAYBOOK = "playbooks/http-desync/playbook.md"
+
+
+class TransportBarTest(ClaimFixture, SchedulerFixture, DatabaseCase):
+    """Ticket 233: a Playbook's evidence bar is read against every class it emits.
+
+    A `playbook_evidence` row is `{to_status, role, kind, polarity, min_count}`
+    and carries no Property class, so one bar is read against every class the
+    Playbook declares in `bb:outputs`. `transport_evidence_guard`
+    (`0025_transport_claims.sql:361`) is the other half of the pair: for a claim
+    whose class is `probe_only` in `transport_makeability`, every
+    `polarity = 'supports'` edge must cite a `transport_parameters_observed`
+    Observation, and the trigger is `ENABLE ALWAYS`, so a replication stream and
+    a restore meet it too.
+
+    A Playbook that declares a `probe_only` class and a bar naming any other
+    kind is therefore one whose `probe_only` half can never reach `supported`.
+    Neither end is wrong by itself -- the guard is the reason the class is
+    `probe_only` at all, and the bar is the reading the Playbook really
+    performs -- which is why ticket 166's sweep over writers did not find it:
+    it asked which verb could write a kind, not which kinds a claim's own class
+    admits.
+
+    Two claims of one Program, one per class `http-desync` declared before this
+    ticket: the `agent_ok` one, whose edges meet the bar, and the `probe_only`
+    one, whose edges are refused where they are written. The corpus reading is
+    the total one, over every Playbook and every `probe_only` class rather than
+    over this pair.
+
+    This case commits, and purges what it wrote at the end.
+    """
+
+    settings_for = "migrate"
+
+    #: The two `supported` rows this Playbook declares, as the bar reads them:
+    #: one kind per role, both `supports`, and neither of them the one kind a
+    #: `probe_only` claim admits.
+    BAR = (("control", "response_invariant"), ("variant", "response_differential"))
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # `UNSEEDED` for the reason the two cases above give: 083 opens a recon
+        # Task against every exact inclusion, and a seeded scope would make the
+        # Tasks below something other than the ones this case wrote.
+        path = write(
+            UNSEEDED.replace(SCOPED_BUDGETS, AFFORDABLE).replace(
+                'name = "matrix-web"', f'name = "{TRANSPORT_BAR_SLUG}"'
+            )
+        )
+        opened = program.run(cls.harness.runtime, path)
+        assert opened.ok, opened.violations
+        cls.identifiers = {"bar": opened.facts["program_id"]}
+        cls.subject, cls.receipt = cls.grounds("bar")
+        cls.agent_ok = cls.stage(
+            "transport.header_policy", "the advertisement is the deployment's"
+        )
+        cls.probe_only = cls.stage(
+            "transport.tls_configuration", "the handshake is the deployment's"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.connection.transaction():
+            cls.connection.execute("SET LOCAL app.purging = 'on'")
+            cls.connection.execute(
+                "DELETE FROM programs WHERE slug = $1", (TRANSPORT_BAR_SLUG,)
+            )
+        super().tearDownClass()
+
+    # -- the arrangement -------------------------------------------------------
+
+    @classmethod
+    def stage(cls, property_class: str, label: str) -> dict:
+        """One claim of that class under this Playbook's bar, and what it met.
+
+        The Task and the selection are written rather than earned, the way
+        `HypothesisPromotionTest.put_the_claim_under_a_playbook_bar` writes
+        them: `playbook_evidence_unmet` reaches a Playbook through a Task, and
+        what is asked here is whether the bar can be met at all, not how the
+        Playbook was chosen. Writing the selection by hand is also the only way
+        the second half of this case can be asked after this ticket, because
+        `playbooks_by_metadata` filters on `playbook_outputs` and this Playbook
+        no longer names the `probe_only` class -- so the runtime cannot reach
+        the arrangement, and the trigger that would refuse it is still there.
+        """
+        hypothesis = cls.claim(
+            "bar", cls.subject, cls.receipt, label, property_class, supported=False
+        )
+        cls.as_owner(
+            "INSERT INTO tasks (program_id, kind, status, hypothesis_id,"
+            " subject_entity_id)"
+            " SELECT h.program_id, 'hunt', 'pending', h.id, h.subject_entity_id"
+            "   FROM hypotheses h WHERE h.id = $1::uuid",
+            (hypothesis,),
+        )
+        cls.as_owner(
+            "INSERT INTO playbook_selections"
+            " (program_id, task_id, subject_entity_id, playbook_id,"
+            "  playbook_sha256, rank)"
+            " SELECT t.program_id, t.id, t.subject_entity_id, p.id,"
+            "        p.source_sha256, 1"
+            "   FROM tasks t, playbooks p"
+            "  WHERE t.hypothesis_id = $1::uuid AND p.path = $2",
+            (hypothesis, DESYNC_PLAYBOOK),
+        )
+        refused: dict[str, str] = {}
+        for role, kind in cls.BAR:
+            observation = str(
+                cls.scalar(
+                    "INSERT INTO observations (program_id, subject_entity_id, kind,"
+                    " summary, provenance_kind, receipt_id)"
+                    " VALUES ($1::uuid, $2::uuid, $3, $4, 'receipt', $5::uuid)"
+                    " RETURNING id::text",
+                    (
+                        cls.identifiers["bar"],
+                        cls.subject,
+                        kind,
+                        f"what the {role} arm answered",
+                        cls.receipt,
+                    ),
+                )
+            )
+            try:
+                cls.as_owner(
+                    "INSERT INTO hypothesis_evidence (hypothesis_id, observation_id,"
+                    " polarity, role) VALUES ($1::uuid, $2::uuid, 'supports', $3)",
+                    (hypothesis, observation, role),
+                )
+            except pg.DatabaseError as refusal:
+                refused[role] = str(refusal)
+        return {
+            "hypothesis": hypothesis,
+            "refused": refused,
+            # Named columns rather than `SELECT *`: the order lives in the
+            # function signature (`0032_playbooks.sql:509-510`).
+            "unmet": [
+                (str(row[0]), str(row[1]), int(row[2]), int(row[3]))
+                for row in cls.as_owner(
+                    "SELECT req_role, req_kind, need, have"
+                    "  FROM playbook_evidence_unmet($1::uuid, 'supported')"
+                    " ORDER BY req_role",
+                    (hypothesis,),
+                ).rows
+            ],
+            # The gate rather than the predicate behind it: `close_test_replay`
+            # asks this function instead of attempting the transition, and since
+            # ticket 182 it asks the Playbook conjunct first.
+            "refusal": str(
+                cls.scalar(
+                    "SELECT hypothesis_transition_refusal("
+                    "  $1::uuid, 'testing', 'supported', 'runtime', NULL, NULL)",
+                    (hypothesis,),
+                )
+            ),
+        }
+
+    # -- the corpus, over every Playbook --------------------------------------
+
+    def test_no_playbook_declares_a_probe_only_class_its_own_bar_cannot_support(self):
+        """The seam: what `bb:outputs` declares against what the guard admits.
+
+        Total over the catalogue rather than over `http-desync`, because the bar
+        is Playbook-wide and the register seeds five classes: a second Playbook
+        naming `transport.tls_configuration` or `transport.certificate_trust`
+        would fail here rather than be found by the campaign that graded it.
+        """
+        self.assertEqual(
+            [],
+            [
+                tuple(str(field) for field in row)
+                for row in self.connection.execute(
+                    "SELECT p.path, o.property_class, e.role, e.observation_kind"
+                    "  FROM playbook_outputs o"
+                    "  JOIN playbooks p ON p.id = o.playbook_id"
+                    "  JOIN transport_makeability m"
+                    "    ON m.property_class = o.property_class"
+                    "  JOIN playbook_evidence e ON e.playbook_id = p.id"
+                    " WHERE m.makeability = 'probe_only'"
+                    "   AND e.polarity = 'supports'"
+                    "   AND e.observation_kind <> 'transport_parameters_observed'"
+                    " ORDER BY p.path, o.property_class, e.role"
+                ).rows
+            ],
+        )
+
+    def test_the_probe_only_classes_are_declared_by_no_playbook_at_all(self):
+        # The other side of the reading above, and what it costs: after this
+        # ticket both `probe_only` classes are emitted by nobody, which is the
+        # gap `tools/check_wiring.py`'s W9 register carries as `owed:237`.
+        self.assertEqual(
+            ["transport.certificate_trust", "transport.tls_configuration"],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT m.property_class FROM transport_makeability m"
+                    " WHERE m.makeability = 'probe_only'"
+                    "   AND NOT EXISTS (SELECT 1 FROM playbook_outputs o"
+                    "                    WHERE o.property_class = m.property_class)"
+                    " ORDER BY m.property_class"
+                ).rows
+            ],
+        )
+
+    def test_the_fixture_the_removed_class_declared_now_grades_nobody(self):
+        """What the removal costs, as rows rather than as a sentence.
+
+        `playbook_fixture_binding` (`0036_playbook_tests.sql:117`) is derived
+        from `playbook_outputs` against `fixture_classes` and is total, so
+        ticket 88's `tls-configuration-pair` -- the one fixture in the corpus
+        whose ground truth is its handshake -- is now `out` for every Playbook
+        and grades none. It still measures specificity from the `out` side,
+        which is why this is a cost and not a regression, and ticket 237 is
+        where the class gets a step that can support it again.
+
+        The other half is what stops it being a regression: `http-desync` still
+        binds an `in`-side own pair, so `playbook_test_verdict` does not go back
+        to the `untested` clause ticket 88 was opened on.
+        """
+        self.assertEqual(
+            ["header-policy-pair"],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT b.fixture_id FROM playbooks p"
+                    "  CROSS JOIN LATERAL playbook_fixture_binding(p.id) b"
+                    " WHERE p.path = $1 AND b.side = 'in' AND b.kind = 'own_pair'"
+                    " ORDER BY b.fixture_id",
+                    (DESYNC_PLAYBOOK,),
+                ).rows
+            ],
+        )
+        self.assertEqual(
+            [],
+            [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT p.path FROM playbooks p"
+                    "  CROSS JOIN LATERAL playbook_fixture_binding(p.id) b"
+                    " WHERE b.fixture_id = 'tls-configuration-pair'"
+                    "   AND b.side = 'in'"
+                    " ORDER BY p.path"
+                ).rows
+            ],
+        )
+
+    # -- the two claims, through the bar the Playbook still declares ----------
+
+    def test_the_bar_is_met_for_the_class_this_playbook_emits(self):
+        """The `agent_ok` half, end to end: both edges land and the bar empties.
+
+        `transport.header_policy` is `agent_ok` (`0025:216`), so
+        `transport_evidence_guard` returns at its first test and the two kinds
+        the bar asks for are the two kinds this Playbook's reading writes.
+        """
+        self.assertEqual({}, self.agent_ok["refused"])
+        self.assertEqual([], self.agent_ok["unmet"])
+
+    def test_the_gate_the_runtime_is_handed_no_longer_names_the_playbook(self):
+        # The same bar read through the caller that consults it. What comes back
+        # names the base rule -- `testing -> supported` wants a test-linked
+        # receipt -- and naming it is the point: the Playbook half is not what
+        # stands between this claim and `supported`.
+        self.assertEqual(
+            "transition testing -> supported requires a tool receipt",
+            self.agent_ok["refusal"],
+        )
+
+    def test_a_probe_only_claim_cannot_carry_either_kind_its_bar_asks_for(self):
+        """The `probe_only` half: both edges refused where they are written.
+
+        Both, and by name, because the bar declares one row per role and the
+        guard refuses each of them for the same reason. A ticket that repaired
+        only the role it was reported on would leave the other half standing.
+        """
+        self.assertEqual(["control", "variant"], sorted(self.probe_only["refused"]))
+        for role, kind in self.BAR:
+            with self.subTest(role=role):
+                self.assertIn(
+                    "transport evidence refused: transport.tls_configuration needs"
+                    f" a transport_parameters_observed observation, got {kind}.",
+                    self.probe_only["refused"][role],
+                )
+
+    def test_the_bar_stays_unmet_for_a_probe_only_claim_and_the_gate_says_so(self):
+        # The whole path rather than the trigger: no edge could be written, so
+        # `playbook_evidence_unmet` keeps both rows at `have = 0` and the
+        # sentence a writer is handed names the Playbook. This is the state
+        # `http-desync` shipped in until this ticket, and the reason the class
+        # came off `bb:outputs` rather than the bar being rewritten: an evidence
+        # row carries no Property class, so a bar asking for the one kind this
+        # claim admits would ask for it on the `agent_ok` claim too.
+        self.assertEqual(
+            [("control", "response_invariant", 1, 0),
+             ("variant", "response_differential", 1, 0)],
+            self.probe_only["unmet"],
+        )
+        self.assertEqual(
+            "playbook playbooks/http-desync/playbook.md requires 1 x"
+            " (role=control, kind=response_invariant) for supported, found 0",
+            self.probe_only["refusal"],
+        )
+
+
 IDENTITY_SUBJECT_SLUG = "selftest-chain-identity"
 
 

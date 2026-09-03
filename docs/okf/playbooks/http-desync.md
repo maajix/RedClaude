@@ -8,14 +8,14 @@ generated: { by: process:redkraken-okf, at: 2026-08-28T00:00:00Z }
 status: draft
 stale_after: 2027-05-15T00:00:00Z
 bb:category: transport
-bb:outputs: [transport.header_policy, transport.tls_configuration]
+bb:outputs: [transport.header_policy]
 bb:triggers_all: [read_method, spa_surface, tech_edge_proxy]
 bb:skills: [compare-responses]
 bb:risk: constrained
 bb:effects: read_only
 bb:baseline: none
-bb:version: 654d8598e80b7b5e5fe1fc9526b1daaf06dfc05b9a6da61a0a4341c3520c0c15
-bb:sha256: 60b1df9528d191bc601b20221f2fad3e82fcaa9f503cb559c0b9af1db270aeff
+bb:version: aa8147bb07ad841e5fba1bfb4e51198996aba3f749c6c3f850f6ab94fffbdf74
+bb:sha256: e80023c5beabddf9b8129ee5c927baa4747fe533368dc20ae92e26eb58dc6ba1
 sources:
   - id: http-desync--http-attacks-http-2-downgrading
     resource: /references/http-desync--http-attacks-http-2-downgrading.md
@@ -36,7 +36,6 @@ sources:
 ## What it concludes about
 
 - `transport.header_policy`
-- `transport.tls_configuration`
 
 ## When it is selected
 
@@ -60,7 +59,7 @@ Risk `constrained`, effects `read_only`, baseline `none`.
 
 ## Provenance
 
-Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by the last section, because 025 records request framing as unmakeable behind the interception proxy and enforces that refusal in a trigger. Rewritten for ticket 101 against the merged technique ledger, which holds one executable reading, two blocked ones and two refusals for this slug. The one that executes is a header-policy reading, and bb:outputs gains transport.header_policy under D3 so that this Playbook has a step its own harness can perform -- the alternative leaves it describing only readings the harness refuses. The evidence rows move off transport_parameters_observed, which the ledger established has no agent-reachable writer by any path. The repair swapped the roles -- the identical repeat is the control, the differing sibling the variant.
+Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by section 4, because 025 records request framing as unmakeable and enforces that in a trigger. Rewritten for ticket 101 against the merged ledger; the one reading that executes is a header-policy reading, so bb:outputs gained transport.header_policy, the evidence rows moved off transport_parameters_observed and the roles swapped -- the repeat is the control, the sibling the variant. That move was right about the writer and wrong about the class -- on a probe_only claim transport_evidence_guard admits that kind and no other, so the tls_configuration half was unsatisfiable. Ticket 233 took transport.tls_configuration off bb:outputs instead, because one bar is read against every class a Playbook names; the reading that would support it is owed to 237.
 
 ## Maintainer references
 

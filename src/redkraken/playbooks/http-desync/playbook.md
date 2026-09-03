@@ -1,7 +1,7 @@
 ---
 description: Ask what a deployment advertises about its own transport and whether the advertisement is the deployment's policy or one fleet member's, by reading the subject twice unchanged and differencing the pair against a route on the same origin the front end serves differently.
 bb:category: transport
-bb:outputs: ["transport.header_policy", "transport.tls_configuration"]
+bb:outputs: ["transport.header_policy"]
 bb:triggers_all: ["read_method", "spa_surface", "tech_edge_proxy"]
 bb:skills: ["compare-responses"]
 bb:risk: constrained
@@ -9,7 +9,7 @@ bb:effects: read_only
 bb:baseline: none
 bb:status: draft
 bb:stale_after: 2027-05-15
-bb:provenance: Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by the last section, because 025 records request framing as unmakeable behind the interception proxy and enforces that refusal in a trigger. Rewritten for ticket 101 against the merged technique ledger, which holds one executable reading, two blocked ones and two refusals for this slug. The one that executes is a header-policy reading, and bb:outputs gains transport.header_policy under D3 so that this Playbook has a step its own harness can perform -- the alternative leaves it describing only readings the harness refuses. The evidence rows move off transport_parameters_observed, which the ledger established has no agent-reachable writer by any path. The repair swapped the roles -- the identical repeat is the control, the differing sibling the variant.
+bb:provenance: Written for ticket 56 as the v2 replacement for v1's http-desync pack against the tls_configuration leaf 018 already named; the pack's three pages are attached as maintainer references and its smuggling, desync, coalescing and tunnelling techniques are refused by section 4, because 025 records request framing as unmakeable and enforces that in a trigger. Rewritten for ticket 101 against the merged ledger; the one reading that executes is a header-policy reading, so bb:outputs gained transport.header_policy, the evidence rows moved off transport_parameters_observed and the roles swapped -- the repeat is the control, the sibling the variant. That move was right about the writer and wrong about the class -- on a probe_only claim transport_evidence_guard admits that kind and no other, so the tls_configuration half was unsatisfiable. Ticket 233 took transport.tls_configuration off bb:outputs instead, because one bar is read against every class a Playbook names; the reading that would support it is owed to 237.
 bb:evidence: [{"to_status": "refuted", "role": "variant", "kind": "response_differential", "polarity": "refutes", "min_count": 1}, {"to_status": "supported", "role": "control", "kind": "response_invariant", "polarity": "supports", "min_count": 1}, {"to_status": "supported", "role": "variant", "kind": "response_differential", "polarity": "supports", "min_count": 1}]
 bb:references: ["http-attacks-http-2-downgrading.md", "http-attacks-request-smuggling-and-http-desync.md", "proxy-tunnels.md"]
 ---
@@ -74,12 +74,15 @@ and `promote_proposal` writes that one from the read's own Receipt.
 
 ## 2. State the claim, and state what would refute it
 
-The Hypothesis is `transport.header_policy` on the subject, and it has to be
-that one. A supporting edge filed on this Playbook's other declared class is
-refused where it is written, because that class is probe-only and admits one
-Observation kind that nothing on the agent's side can produce -- so even the
-invariant the Test just wrote would be rejected at insert. Section 3 is where
-that wall is set out.
+The Hypothesis is `transport.header_policy` on the subject, and it is the only
+class this Playbook declares. The measurement leaf the slug is named for was
+declared here too until ticket 233. It is not any more, and the reason is worth
+the sentence: that class is probe-only and admits one Observation kind nothing
+on the agent's side can produce, so a supporting edge on it is refused where it
+is written -- even the invariant the Test just wrote -- and an evidence row
+carries no class, so one bar is read against every class a Playbook declares.
+Naming that kind here would have asked for a measurement Receipt on the reading
+below as well. Section 3 is where the wall itself is set out.
 
 It is supported when the two identical reads are byte-identical and the sibling
 route differed from them, which is what both assertions state and all that they

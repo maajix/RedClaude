@@ -326,6 +326,24 @@ OWED_GAPS: dict[str, str] = {
     "W9 transport.certificate_trust": "owed:116",
     "W9 http-desync transport.certificate_trust": "owed:116",
 
+    # And its neighbour, since ticket 233. `transport.tls_configuration` is the
+    # other `probe_only` class (`0025_transport_claims.sql:204`), and it was
+    # emitted -- by `http-desync`, whose `bb:evidence` asked two kinds
+    # `transport_evidence_guard` refuses on a claim of that class, so the half of
+    # that Playbook which declared it could never reach `supported`. 233 took the
+    # class off `bb:outputs` rather than moving the bar onto the one admissible
+    # kind, because an evidence row carries no Property class and that bar is
+    # also read against the `agent_ok` class the Playbook really reads. So the
+    # class is now declared, gradeable by the register and emitted by nobody --
+    # the same state its neighbour has been in since ticket 101, and owed to the
+    # same kind of work. Ticket 237 is that work, and it is not 116: 116 widens
+    # `reject_non_agent_evidence` and `reject_non_agent_citation` so a
+    # `probe_only` claim may reach a Finding, and leaves the evidence guard
+    # alone, so after 116 the class still has no step that files the Observation
+    # the guard demands. One spelling only, because no Playbook body names this
+    # class in prose.
+    "W9 transport.tls_configuration": "owed:237",
+
 
 
 
