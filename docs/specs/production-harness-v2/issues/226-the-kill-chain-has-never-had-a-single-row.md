@@ -7,7 +7,7 @@ with a full function corpus above them.
 **Blocked by:** nothing. 103 built the three MCP wrappers; 221 built the first
 `conclude` Task that reaches a validated Finding at all.
 
-**Status:** claimed
+**Status:** resolved
 
 **PRODUCES:** new -- the first `pivot_stamps` row and the first `chains` row
 this harness has ever reached without an operator typing
@@ -173,11 +173,18 @@ That is not a blocker for a medium finding. It is the blocker for a proven one.
       inherit one copy; `ImpactRunFixture.REASON`,
       `ValidationCommandTest.TITLE`, `ValidatedFindingFixture`'s six statement
       constants and `DECLARED` referenced rather than re-spelled; `id_of` and
-      the third `replay.run` spelling dropped with them; only the door-shaped
-      members kept local.
+      the third `replay.run` spelling dropped with them. `settle` and `approve`
+      were kept local as well, which cycle 2 found this line claiming away:
+      each re-spells a fixture that lives over `cls.connection` --
+      `PivotStampFixture.settled` and `ImpactRunFixture.as_operator` -- which is
+      the branch reason `ReplayFixture`'s own copies were kept for, and neither
+      is door-shaped. Named here rather than done, per cycle 2's verdict.
 
-**Which commit each criterion landed in, recorded by cycle 1.** Criterion 3 is
-the only one inside this ticket's reviewed diff. Criteria 1, 2 and 4 landed in
+**Which commit each criterion landed in, recorded by cycle 1 and corrected by
+cycle 2.** Criterion 3 is the only one inside **cycle 1's** diff, and criteria 5
+and 6 are the whole of cycle 2's: they landed in `f1f1c0bd`, which carries the
+`(ticket 226)` marker. So three of the six have been pinned as a diff and three
+have not. Criteria 1, 2 and 4 landed in
 `685d860f` and `cf1b75fa`, and neither subject carries a `(ticket 226)` marker,
 so this flow's fixed-point procedure cannot see them and no cycle has ever
 pinned them as a diff. `tools/check_audit.py` does not enforce the marker
@@ -426,11 +433,18 @@ the door's own `write_allowed_receipt` rather than by the case. The far end
 read was `check_kill_chains()` over a Program holding one chain: no rows, with
 `chains = 1` and `pivot_stamps = 2` beside it.
 
-**There is no `live-inputs.md` in this effort**, which ticket 236 measured one
-day earlier and recorded rather than created. Recorded again rather than
-minted: the file's own rule is that the walking skeleton's session creates it,
-this effort is 236 tickets past that, and a file starting at ticket 226 would
-carry one block and read as though the 225 before it had no live inputs.
+**There was no `live-inputs.md` in this effort when this pass ran**, which
+ticket 236 measured one day earlier and recorded rather than created. Recorded
+again rather than minted: the file's own rule is that the walking skeleton's
+session creates it, this effort is 236 tickets past that, and a file starting at
+ticket 226 would carry one block and read as though the 225 before it had no
+live inputs. **Superseded.** Cycle 1's [seam] finding took the other side of
+that judgement and its NOW verdict minted
+`docs/specs/production-harness-v2/live-inputs.md` with one block for 226 and a
+header saying why the file starts 225 tickets in. The second pass below reads
+that block. This paragraph is kept as the reading it was, and marked by cycle 2,
+because for one cycle the two passes under this heading contradicted each other
+in the present tense.
 
 **Rule 3b.** No double was injected. The one thing this case fakes is the
 address -- `LiveDoorFixture.dial` puts every authorised name on the loopback
@@ -454,8 +468,8 @@ WROTE  tests.test_execution::ImpactReplayTest.replay_called, and its two tests
                 name in the paste under `## Bar`
 WROTE  tests.test_database::LiveDoorFixture.called
        READ BY  tests.test_database::ValidationCommandTest.candidate, reading
-                cls.called at test_database.py:34879 -- the copy this criterion
-                deleted from that class; and
+                cls.called -- the copy this criterion deleted from that class;
+                and
                 tests.test_database::RuntimeChainTest.validated_finding and
                 .prove, seven call sites between them. Both subclasses were
                 watched red under the mutation below, which is what makes this
@@ -495,7 +509,11 @@ READ   tests.test_database::ValidationCommandTest.TITLE
                    sentence in the module was written by this ticket's own
                    eea3f05d and is what this criterion deletes
 READ   tests.test_database::ImpactRunFixture.REASON
-       WRITTEN BY  ticket 38, commit 3f2d4921
+       WRITTEN BY  ticket 39, commit 37d99d6b, corrected by cycle 2. This head
+                   read `ticket 38, commit 3f2d4921`, and that commit holds no
+                   `class ImpactRunFixture`: `git log -S 'class
+                   ImpactRunFixture'` returns 37d99d6b alone, and `git blame`
+                   puts the attribute there
 READ   tests.test_database::DECLARED
        WRITTEN BY  PH2-21's Surface promotion, commit 7ee327ed. It names
                    `member`, which is what RUNTIME_CHAIN_SLUG's SLOT is, so
@@ -506,13 +524,17 @@ READ   tests.test_database::DECLARED
 No `NOBODY`.
 
 **The greps, and what was skipped.** `grep -c 'cls\.called'
-tests/test_database.py` prints `136`, and all but eight belong to a different
-branch: `ReplayFixture` declares its own `called` over `cls.connection` and
-every hit under that class is reading it. The eight that reach the hoisted copy
-are `ValidationCommandTest.candidate`'s one and `RuntimeChainTest`'s seven, and
+tests/test_database.py` prints `136`, and all but eight resolve to a declaration
+in a different branch -- three declarations, not one, which cycle 2 measured by
+resolving each reading class through its bases: 110 to `ReplayFixture.called`,
+14 to `BrowserMissionTest.called` and 4 to `OfflineToolRunTest.called`, each
+over its own `cls.connection`. The eight that reach the hoisted copy are
+`ValidationCommandTest.candidate`'s one and `RuntimeChainTest`'s seven, and
 those are the two `setUpClass` paths the mutation below killed. `grep -c 'id_of'`
 prints `18`, none of them inside `RuntimeChainTest` any more;
-`ImpactRunFixture.id_of` and `ReplayFixture`'s are pre-existing and untouched.
+`ImpactRunFixture.id_of` is pre-existing and untouched, and it is the only other
+declaration in the module -- `grep 'def id_of'` returns two lines at the fixed
+point, that one and the one this criterion deletes.
 `replay.run(` has one call site inside `RuntimeChainTest`, down from two, so the
 hierarchy holds two spellings rather than three.
 
@@ -543,9 +565,15 @@ purpose and watched:
    `Ran 0 tests`, `FAILED (errors=2)` -- one error per class, both through
    `LiveDoorFixture.called`.
 
-**Rule 3b.** Unchanged by this pass. No double was injected and none was
-removed; the four substitutions the first pass and cycle 1 recorded are the
-same four, in the same places.
+**Rule 3b.** One double was injected, which this line denied until cycle 2 read
+it: `ImpactReplayTest.replay_called` adds `mock.patch.object(
+execution.replay_module, "run", ...)`, and criterion 5's only assertion reads
+`run.call_args.kwargs["verbs"]` off that mock rather than off the real
+`replay.run`. The real thing is checked in this same ticket -- `attempt` hands
+`verbs=replay.IMPACT` to the real `replay.run` and reaches both stamps -- so
+the substitution is checked, not deferred. The four the first pass and cycle 1
+recorded are otherwise the same four, in the same places, and none was
+removed.
 
 ## Build findings, 2026-09-03
 
@@ -730,6 +758,17 @@ without the assertions, so the assertions moved to `must_hold`, which
 `validated_finding` calls twice. That is one method where cycle 1 counted nine
 copies, and it is door-shaped: the assertions are about this fixture's own door
 replay holding.
+
+**A third departure, found by cycle 2 rather than written here.** `settle` and
+`approve` are two of the nine members cycle 1 counted, they touch no door, and
+no hunk of this diff touched either: `settle` still holds
+`PivotStampFixture.settled`'s two statements and `approve` still re-spells
+`ImpactRunFixture.as_operator`'s connect, BIND and close. The reason is the one
+this block already gives for `ReplayFixture`'s copies -- both originals live on
+fixtures over `cls.connection`, a different branch of the tree -- but criterion
+6's summary said "only the door-shaped members kept local" instead of saying
+that, so the departure was silent until the review read it. Two axes read it
+independently. The criterion now names both members and this reason.
 
 ## Bar, 2026-09-03
 
@@ -1148,7 +1187,235 @@ file has a `STATUS` beginning `live`, so nothing was owed a hand replay and
 listed -- the dialled address, the counterparty's state transition, `claim_task`
 and the scheduler's settle with its lease -- are the same four, in the same
 places, each still reasoned where it sits and each still checked in the real by a
-named existing class. This diff injects no double and removes none.
+named existing class. One double **was** injected, which cycle 2 found this
+sentence denying, so it is a fifth substitution rather than a correction:
+`tests/test_execution.py`'s `ImpactReplayTest.replay_called` stubs
+`execution.replay_module.run` with `mock.patch.object`, and criterion 5's two
+assertions read `verbs` off that mock. What checks the real thing is
+`RuntimeChainTest` in this same ticket, which hands `verbs=replay.IMPACT` to
+the real `replay.run` and reaches both stamps through a real door -- so nothing
+is deferred. The stub is the point of that test rather than a shortcut in it:
+the seam under assertion is which verb set `_replay` passes, and a test that
+performed the replay would be asserting the performer instead.
+
+**Cycle 2's NOW repairs, re-run under this heading rather than under a new
+dated one** -- a dated heading is a build's, and this is a review's repair
+(`hold-the-line` verdict 1). No production file was touched: the repairs are
+five edits to `tests/`, ten to this ticket's prose, and one frozen count. So no
+red test is owed, and what follows is the machine lines re-read.
+
+1. **Every acceptance criterion is ticked.**
+
+   ```
+   grep -c '^- \[ \]' <ticket>
+     0
+   grep -c '^- \[[ x]\]' <ticket>
+     6
+   ```
+
+   Still six. Cycle 2 added no criterion, which is why this pass writes
+   `resolved`.
+2. **The seam test passes, read by name.** Criterion 5's tests, with the
+   renamed one among them:
+
+   ```
+   NO_COLOR=1 uv run python -m unittest tests.test_execution.ImpactReplayTest -v
+     test_a_row_from_before_this_column_reads_as_a_detection_task ... ok
+     test_a_task_whose_test_states_an_impact_carries_the_impact_class ... ok
+     test_a_task_whose_test_states_no_impact_is_handed_the_detection_verbs ... ok
+     test_a_task_whose_test_states_none_is_a_detection_task ... ok
+     test_the_class_reaches_the_claim_through_the_row_the_query_returns ... ok
+     test_the_runtime_hands_the_performer_the_impact_verbs ... ok
+     test_the_two_verb_sets_are_not_the_same_object ... ok
+     Ran 7 tests in 0.007s
+     OK
+   ```
+
+   Criterion 6's guard is the live-door branch, and this pass edited the base
+   class twice -- `called` onto `committed`, a docstring on `rows_of` -- so all
+   three subclasses were run, inside the eight-class batch of line 4:
+
+   ```
+   export RK_TEST_SUPERUSER_URL="postgres://postgres:...@127.0.0.1:55433/postgres"
+   export RK_TEST_DATABASE=rk2_t226c2b
+   NO_COLOR=1 uv run python -m unittest tests.test_database.CleanCreationTest \
+     tests.test_database.RuntimeChainTest tests.test_database.ImpactPerformanceTest \
+     tests.test_database.KillChainTest tests.test_database.PivotStampTest \
+     tests.test_database.ImpactProofTest tests.test_database.ReplayCommandTest \
+     tests.test_database.ValidationCommandTest -v
+     test_each_impact_run_was_parked_for_a_person_before_it_ran ... ok
+     test_the_chain_the_runtime_built_holds_both_stamps_in_order ... ok
+     test_the_first_run_is_refused_a_chain_and_the_second_composes_one ... ok
+     test_the_runtime_stamped_a_pivot_off_each_run_it_performed ... ok
+     test_the_standing_check_is_green_over_a_program_that_holds_a_chain ... ok
+     … (132 lines, the other seven classes' tests, each `... ok`)
+     Ran 137 tests in 92.533s
+     OK
+   ```
+
+   The five quoted are `RuntimeChainTest`'s, filtered out of that run's verbose
+   output by class name rather than re-run on their own.
+3. **Forward references redeemed.** Nothing is owed to this ticket and this
+   pass wrote none. Cycle 2's [bar] finding was that the paste above is not what
+   the command prints, so here it is whole, with full paths:
+
+   ```
+   grep -rn 'ticket 226\|Ticket 226' docs/specs/production-harness-v2/ | wc -l
+     29
+   grep -rn 'ticket 226\|Ticket 226' docs/specs/production-harness-v2/
+     docs/specs/production-harness-v2/live-inputs.md:3:Minted at ticket 226 by that ticket's review cycle 1, not by the walking
+     docs/specs/production-harness-v2/issues/228-one-broken-notifier-halts-the-whole-harness.md:198:  is not consent to demonstrate impact, and ticket 226's whole point is that a
+     … (26 lines, all inside this ticket's own dated blocks: history, and 23 of
+        them written by cycle 2 itself, including this very paste)
+     docs/specs/production-harness-v2/issues/229-the-only-notifier-a-finding-has-is-not-in-this-repository.md:124:this corpus can see -- the same vacuous-green failure ticket 226 names for the
+   ```
+
+   29 hits, 26 of them this ticket's own, run after this paste landed so that
+   the paste's own lines are inside the elided 26. **The order is not stable and
+   no reader should pin it.** Cycle 2's [bar] finding said 228 and 229 came out
+   in the reverse of the order the command emits; re-run after this file was
+   rewritten, 228 is hit 2 and 229 is hit 29, where in the earlier run they were
+   24 and 25. `grep -r` walks the directory in `readdir` order, which moves when
+   a file in it is rewritten. So the three non-self hits are quoted whole and the
+   self-hits are elided by count, which is what the standing bar asks for and what
+   cycle 1's own repair carried. All three are prose -- no `CONSUMED BY`, no
+   `CONSUMES`, no `deferred to` -- and cycle 2 read the other 26 as well.
+4. **Existing tests still pass, and nothing was skipped, deleted or weakened.**
+   The `skipped=3` is `tests.test_audit.RunnableProbe`'s three deliberate
+   probes, pre-existing and untouched.
+
+   ```
+   NO_COLOR=1 uv run python -m unittest tests.test_execution -q
+     Ran 224 tests in 0.582s
+     OK
+
+   NO_COLOR=1 uv run python -m unittest <the eight classes of line 2> -q
+     Ran 137 tests in 92.533s
+     OK
+
+   NO_COLOR=1 uv run python -m unittest tests.test_audit tests.test_coverage -q
+     Ran 107 tests in 59.217s
+     OK (skipped=3)
+   ```
+
+   The three counts are the same 224, 137 and 107 the criterion pass measured:
+   this pass renames one test and freezes one number, and adds none. Every
+   deleted line, read whole rather than counted:
+
+   ```
+   git diff -U0 -- tests/ | grep '^-' | grep -v '^---'
+     -            "  tickets                236   resolved 204  audited 63  deferred criteria 11\n"
+     -        the copies was the connection's name and nothing else.
+     -        with cls.runtime.transaction():
+     -            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
+     -            answered = cls.runtime.execute(sql, parameters).scalar()
+     -        return json.loads(str(answered))
+     -        **verbs,
+     -            **verbs,
+     -    def test_a_task_whose_test_states_an_impact_takes_the_impact_verbs(self):
+   ```
+
+   Nine lines: the frozen count, the four-line `called` body and one docstring
+   sentence that `committed` replaces, the two `**verbs` spellings the named
+   keyword replaces, and the old name of a test whose new name is added in the
+   same hunk. No `.skip`, no ignore pragma, no deleted test file, no removed
+   assertion, no removed test method.
+
+   The four gates, as `docs/agents/testing.md` tier 2 spells them -- which is
+   cycle 2's other [bar] finding, because `.venv/bin/python tools/check_audit.py`
+   exits 1 with `ModuleNotFoundError: No module named 'tools'`:
+
+   ```
+   PYTHONPATH=$PWD python3 -s tools/check_audit.py
+     tickets                236   resolved 205  audited 63  deferred criteria 11
+     rc=0
+   PYTHONPATH=$PWD python3 -s tools/check_wiring.py
+     register                    42 rows   tickets 6  findings 42  distinct 42
+     rc=0
+   PYTHONPATH=$PWD python3 -s tools/check_baseline.py
+     baseline ok: classifications=10 regressions=7 adapters=11 artifacts=223 frozen
+     rc=0
+   PYTHONPATH=$PWD/src:$PWD python3 -s tools/check_coverage.py
+     catalogue               51   skills 6  references 86
+     rc=0
+   ```
+
+   `resolved 205` is this pass writing `resolved`, and it is the reason
+   `tests/test_audit.py` is in the diff: cycle 1's audit verdict put the frozen
+   `resolved 204` in the commit that finally writes the status, which is this
+   one. `audited 63` did not move, exactly as cycle 1 predicted it would not.
+5. **The diff is what the review asked for.**
+
+   ```
+   git status --short --untracked-files=all
+     M docs/specs/production-harness-v2/issues/226-the-kill-chain-has-never-had-a-single-row.md
+     M tests/test_audit.py
+     M tests/test_database.py
+     M tests/test_execution.py
+
+   git diff --numstat
+     313  23  docs/specs/.../226-the-kill-chain-has-never-had-a-single-row.md
+     1    1   tests/test_audit.py
+     21   7   tests/test_database.py
+     1    1   tests/test_execution.py
+   ```
+
+   The three code rows are final. The first row is the one number a paste inside
+   the file it measures cannot state about itself -- it grows by however many
+   lines the paste of it adds -- so it is measured immediately before the commit
+   and `git show --numstat` on this cycle's review commit is the authority over
+   it. Cycle 1 took a [ticket] finding for a `numstat` row measured mid-write,
+   and this is the form that stops that repeating rather than repeating it
+   quietly. Four paths, no untracked file. All four are on the `Touches` line as this
+   ticket carries it -- both test files from the build, `tests/test_audit.py`
+   named there by the build findings' NOW repair -- and this ticket's own file is
+   this flow's. No other ticket file: cycle 2 raised no CRITERION, REOPEN or
+   TICKET verdict, so nothing was written outside this ticket.
+6. **The blocks.**
+
+   ```
+   grep -c '^## Resolution' <ticket>
+     2
+   grep -c '^## Bar' <ticket>
+     2
+   grep -c '^## Handoff' <ticket>
+     0
+   ```
+
+   Unchanged: this pass appended under the second `## Bar` heading rather than
+   opening a third, and added a paragraph to the second `## Resolution` rather
+   than dating a new one.
+
+**Judgement, red and mutated, cycle 2.** Not owed and not claimed. Every repair
+in this pass is a rename, a collapse onto an existing helper, a named keyword, an
+import-time assert, a docstring, a frozen count and ten prose corrections -- no
+production file is in the diff, which is the one case `hold-the-line` verdict 1
+lets a NOW repair skip a red test for. The two mutations that prove this
+ticket's seams are cycle 1's, quoted in `## Resolution, 2026-09-03 — cycle 1's
+two criteria`, and they still hold: the `verbs=` selection is read by two tests
+in `ImpactReplayTest`, and both live-door subclasses still die in `setUpClass`
+if the hoisted members are pointed at the wrong connection.
+
+**Judgement, no unexplained NOBODY.** Unchanged, and one head corrected rather
+than added: `ImpactRunFixture.REASON`'s writer is ticket 39's `37d99d6b`, not
+ticket 38's `3f2d4921`. No `NOBODY` anywhere in either pass.
+
+**Judgement, the live run reached this ticket's case.** It did, a third time, on
+`rk2-test-pg` at `127.0.0.1:55433` with `RK_TEST_DATABASE=rk2_t226c2b`: the same
+two impact replays through a real `proxy.listen` door under a leased Identity,
+two operator answers on the `rk2_human` connection, and
+`test_the_standing_check_is_green_over_a_program_that_holds_a_chain` green over
+the result. `live-inputs.md`'s one block still reads
+`STATUS promoted to tests.test_database.RuntimeChainTest` and `REPLAYS 0 ()`; no
+block in the file begins `live`, so no hand replay was owed and this pass moved
+`REPLAYS` for nothing.
+
+**Judgement, Rule 3b.** Five substitutions, not four -- see the correction under
+this heading above and in `## Seam check`'s second pass. The fifth is
+`ImpactReplayTest.replay_called`'s stub of `execution.replay_module.run`, and
+what checks the real thing is `RuntimeChainTest`, which hands the real
+`replay.run` a real door in this same ticket. Nothing is deferred to another
+ticket.
 
 ## Review findings, 2026-09-03 — cycle 1
 
@@ -1196,3 +1463,32 @@ nobody was told about; it is an analogy in that ticket's own prose, not
 ownership of this arm.
 
 Review cycle 1 of 3 — undecided: none
+
+## Review findings, 2026-09-03 — cycle 2
+
+Fixed point `172633bf`, cycle 1's review commit. The diff is one build commit,
+`f1f1c0bd`, the repair of cycle 1's two criteria: 3 files, 558 insertions and 97
+deletions, of which 405 insertions are this ticket's own file. Four readers, run
+apart, reported 18 findings; the axis tag on each entry is the reader that
+raised it. Three convergences are noted in the entries that share them.
+
+- [ticket] **Criterion 6 is ticked over a claim source refuses. It says "the nine members that touch neither a Receipt nor a door are not this case's work" and "only the door-shaped members kept local", and two of cycle 1's nine were left local while being door-shaped in neither sense: `settle` (`test_database.py:55142`) still holds `PivotStampFixture.settled`'s two statements, differing in the single token `cls.connection`/`cls.runtime` that the other three were hoisted for, and `approve` (`:55123`) still re-spells `ImpactRunFixture.as_operator`'s connect/BIND/close ceremony plus its docstring sentence. The criterion's own enumeration silently drops both from the nine, no hunk in the diff touches either, and `## Resolution — cycle 1's two criteria` records two smaller departures under the sentence "Nothing in either criterion turned out wrong". Converges with the [craft] entry below.** — required —NOW. Criterion 6's last clause rewritten to name `settle` and `approve` and the branch reason they were kept for, and a third departure paragraph added to `## Resolution, 2026-09-03 — cycle 1's two criteria` beside the two it already recorded. The duplication is not removed: `PivotStampFixture.settled` and `ImpactRunFixture.as_operator` live on a different branch of the fixture tree, which is the reason this pass already accepted for `ReplayFixture`'s three copies, and no criterion in this effort asks for the module-wide de-duplication that would remove it. What was wrong was the silence.
+- [craft] **Same two members, from the other side: criterion 6's summary "only the door-shaped members kept local" is false of `settle` and `approve`, and the technique this diff already proved on `ValidatedFindingFixture`'s six statement constants was not applied to either. Converges with the [ticket] entry above.** — required —NOW. Same rewrite, recorded once. Converged with the [ticket] entry above, which is what gives it its weight: two readers who could not see each other both opened criterion 6's summary against source.
+- [craft] **`LiveDoorFixture.called` is a fourth hand-rolled copy of the module-level `committed()` (`test_database.py:25738`) — transaction, `set_actor`, `scalar` — while the three sibling `called` members (`OfflineToolRunTest:26504`, `BrowserMissionTest:28759`, `ReplayFixture:30703`) are each the one-liner `return json.loads(committed(cls.connection, sql, parameters))`, and `LiveDoorFixture.claimed` five lines below calls `committed(cls.runtime, ...)` itself. The de-dup criterion moved the copy up a class instead of collapsing it onto the helper that already exists, and the new docstring's own reason — "what differed between the copies was the connection's name and nothing else" — is precisely the argument for passing the connection in.** — required —NOW. `return json.loads(committed(cls.runtime, sql, parameters))`, matching the three siblings, with the docstring's second paragraph saying why the connection is handed in rather than the transaction spelled a fourth time. Ten lines to one.
+- [bar] **The Rule 3b judgement rests on "This diff injects no double and removes none", which is false of its own diff: `tests/test_execution.py:1560` adds `mock.patch.object(execution.replay_module, "run", return_value=performed)`, a stub of the exact function whose `verbs=` kwarg criterion 5 asserts, so the ticket's headline new test is built on an injected double the Rule 3b enumeration does not list. Converges with the [seam] entry below.** — required —NOW. A fifth substitution added to the bar's Rule 3b judgement, naming the `execution.replay_module.run` stub, the class that checks the real thing -- `RuntimeChainTest`, live through a real door in this same ticket -- and why the stub is the point of that test rather than a shortcut in it. Nothing deferred; only the enumeration was wrong.
+- [seam] **`## Seam check`'s second pass says "No double was injected and none was removed; the four substitutions the first pass and cycle 1 recorded are the same four", and `ImpactReplayTest.replay_called` adds a fifth: `mock.patch.object(execution.replay_module, "run", ...)`, off which criterion 5's only assertion reads `run.call_args.kwargs["verbs"]` rather than off the real `replay.run`. Converges with the [bar] entry above.** — required —NOW. The same correction in `## Seam check`'s second pass, which is where the sentence was written. Converged with the [bar] entry above.
+- [seam] **`## Seam check`'s writer head for `READ tests.test_database::ImpactRunFixture.REASON` says `ticket 38, commit 3f2d4921`, and `git show 3f2d4921:tests/test_database.py` contains no `class ImpactRunFixture`; `git log -S 'class ImpactRunFixture'` and `git blame` both put the attribute at `37d99d6b`, ticket 39's `FEAT: stamp a pivot from the run that showed it`. A third instance of the writer-head defect cycle 1 corrected twice, inside the pass written to repair cycle 1.** — required —NOW. Rewritten to `ticket 39, commit 37d99d6b`, with the two commands that settle it and what the head used to read. Settled before writing: `git log -S 'class ImpactRunFixture' -- tests/test_database.py` returns `37d99d6b` alone, `git blame` puts `REASON` there, and `39-stamp-demonstrated-pivot.md` is that commit's ticket.
+- [seam] **`## Seam check`'s first pass still reads, in bold, "**There is no `live-inputs.md` in this effort**" (line 429), while line 526 under the same `## Seam check, 2026-09-03` heading says "`live-inputs.md`'s only block is `promoted to tests.test_database.RuntimeChainTest`". Cycle 1's NOW verdict minted the file. Both passes carry the same date, both read present-tense, and nothing marks the first as superseded — at the one address `/plumbline:prove` and the next cycle's Seam axis read.** — required —NOW. The first pass's sentence put in the past tense and marked **Superseded**, naming cycle 1's finding, the mint and the second pass that reads the block. Kept as the reading it was rather than deleted, so the judgement ticket 236 measured stays legible.
+- [craft] **`ImpactReplayTest.test_a_task_whose_test_states_an_impact_takes_the_impact_verbs` (`test_execution.py:1503`) promises the verbs and asserts `assertIsNotNone(subject.impact_class)` — the column only. That false name is what let cycle 1's gap sit invisible for a cycle, and this diff added the honest reader directly beneath it, so the class now carries two names claiming the impact verbs and one asserts nothing about them.** — required —NOW. Renamed to `test_a_task_whose_test_states_an_impact_carries_the_impact_class`, matching its honest sibling `test_a_task_whose_test_states_none_is_a_detection_task`. Nothing outside this ticket's own `## Bar` paste referenced the old name, and that paste is history.
+- [craft] **`LiveDoorFixture.as_owner` (`test_database.py:32716`) is byte-for-byte identical to `ReplayFixture.as_owner` (`:30708`) — same signature, same `-> None`, same five lines, same `cls.owner_connection`, not one token different — so the module's count of that body is unchanged and only its owner moved. It touches neither `cls.runtime` nor `cls.connection`, so the hoist's stated reason does not apply to it at all, and cycle 1 named this exact twin.** — required —DECLINED. The module holds seven `as_owner` declarations over three different connections, four of them without the return annotation, plus `DatabaseCase.owner` and `_set_analyser` as the same ceremony spelled per purpose. Collapsing the twin means a module-wide refactor of that idiom, which no criterion in this effort asks for and which would put a 57k-line test file into a review commit. Criterion 6 asked for the hoist and the hoist landed; what stands is the module's pre-existing pattern, written down here so the next reader of `LiveDoorFixture.as_owner` does not raise it again.
+- [craft] **The hoist put `rows_of` over `cls.runtime` (`test_database.py:32723`) 25 lines below the pre-existing instance method `rows` over `self.connection`, and `LiveDoorFixture` keeps `settings_for = "migrate"`, so the base class now exposes two same-signature row readers over two different roles with names that say which for neither: reaching for `rows` reads as the owner and passes, silently bypassing the RLS these cases exist to exercise. The build's own mutation proves only the loud direction (`42501`). The two-role pair already existed inside `RuntimeChainTest`; what the hoist changed is that all three `LiveDoorFixture` subclasses now inherit it.** — required —NOW. A docstring on the hoisted `rows_of` naming both roles and what `rows` will do if a case reaches for it, matching the four comment lines cycle 1 put on `SOURCE`'s two anchors. Not renamed: `rows`/`rows_of` is this module's own convention at roughly two hundred call sites, so a rename here would trade a silent role difference for a silent convention break.
+- [bar] **Bar item 3's pasted grep is not what the command prints and the block asserts "Three hits": run verbatim, `grep -rn 'ticket 226\|Ticket 226' docs/specs/production-harness-v2/` prints 22 lines, 19 of them this ticket's own, elided with no `… (N lines)` marker, filenames cut to basenames, and 228/229 in the reverse of the order the command emits. This is the defect cycle 1 raised as a [bar] nit against item 3 and NOW-repaired, and whose repair paste at line 914 does carry `… (14 lines, all inside this ticket's own dated blocks: history)` — so the second block drops a marker the previous cycle put in. The substance survives: none of the 22 is a `CONSUMED BY`/`CONSUMES` seam head or a criterion `deferred to`.** — required —NOW. Re-run and re-pasted whole under the existing `## Bar` heading, with full paths and an explicit marker over this ticket's own history lines.
+- [ticket] **`## Acceptance`'s "Which commit each criterion landed in" says "Criterion 3 is the only one inside this ticket's reviewed diff", now false: criteria 5 and 6 landed in `f1f1c0bd`, which carries the `(ticket 226)` marker and is this cycle's entire diff. A reader of that paragraph concludes five of six criteria have never been pinned when the true figure is three — 1, 2 and 4.** — nit —NOW. Rewritten to say that three of the six criteria have been pinned as a diff and which cycle pinned which.
+- [seam] **`## Seam check`'s "The greps, and what was skipped" says of the 128 `cls.called` hits that do not reach the hoisted copy that "all but eight belong to a different branch: `ReplayFixture` declares its own `called`", naming one declaration where source has three: resolving each reading class through its bases gives 110 to `ReplayFixture.called`, 14 to `BrowserMissionTest.called` (`test_database.py:28759`) and 4 to `OfflineToolRunTest.called` (`:26504`). The eight that reach the hoisted copy is right. Converges with the [ticket] entry below.** — nit —NOW. Rewritten to three declarations with each one's count -- 110, 14 and 4 -- and how the readers were resolved.
+- [ticket] **Same census, plus one citation that has never existed: "`ImpactRunFixture.id_of` and `ReplayFixture`'s are pre-existing" cites a `ReplayFixture.id_of` that source does not hold — at the fixed point `grep 'def id_of'` returns exactly two lines, `:35399` (`ImpactRunFixture`) and `:54874`, the one this diff deletes. Converges with the [seam] entry above.** — nit —NOW. Same rewrite; the `ReplayFixture.id_of` half of the sentence dropped, with `grep 'def id_of'`'s two lines at the fixed point given instead. Converged with the [seam] entry above.
+- [seam] **`## Seam check`'s second-pass `READ BY` for `LiveDoorFixture.called` cites the reader as `cls.called at test_database.py:34879`, and `seam-check` §3 says record the symbol, not the line number (`cut-slices` Rule 2). This ticket already took a cycle-1 nit for citations that stopped resolving.** — nit —NOW. The line number dropped. `ValidationCommandTest.candidate` is the address.
+- [bar] **Bar item 4's four tier-2 gates are recorded as `check_audit rc=0 / check_wiring rc=0 / check_baseline rc=0 / check_coverage rc=0` with no command and no output, which is characterizing where the standing bar says quote verbatim, and "each under `.venv/bin/python`" is not runnable as written: `.venv/bin/python tools/check_audit.py` exits 1 with `ModuleNotFoundError: No module named 'tools'`. Only `-m tools.check_audit` or `docs/agents/testing.md` tier 2's `PYTHONPATH=$PWD python3 -s tools/check_audit.py` works. Ticket 235's cycle required this once already.** — nit —NOW. The four gates re-run as `docs/agents/testing.md` tier 2 spells them, pasted with each one's decisive line under the existing `## Bar` heading. `.venv/bin/python tools/check_audit.py` really does die with `ModuleNotFoundError: No module named 'tools'`, so the three words that stood there cannot have been the command that ran.
+- [craft] **`RuntimeChainTest.replayed`'s `**verbs` is a plural-named catch-all carrying exactly one optional keyword — `attempt` is its sole caller and passes `verbs=replay.IMPACT` — so the signature stops stating what it takes and a mistyped keyword travels to `replay.run` before it fails.** — nit —NOW. `verbs=replay.DETECTION` as a named keyword, passed through as `verbs=verbs`. `attempt` is unchanged and still hands `verbs=replay.IMPACT`.
+- [craft] **`RuntimeChainTest.SOURCE = SCOPED + DECLARED` is byte-identical to the f-string it replaces, but the substitution drops the only code-level tie between the document's identity name and the `SLOT` `attempt` leases under, leaving it in a comment 42,000 lines away.** — nit —NOW. `assert f'name = "{SLOT}"' in DECLARED` beside `SLOT`, with the reason, so an edit to either one is refused at import instead of surfacing as a lease the door has no material for.
+
+Review cycle 2 of 3 — undecided: none

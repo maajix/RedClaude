@@ -1500,7 +1500,7 @@ class ImpactReplayTest(unittest.TestCase):
     here would be testing the performer through the caller.
     """
 
-    def test_a_task_whose_test_states_an_impact_takes_the_impact_verbs(self):
+    def test_a_task_whose_test_states_an_impact_carries_the_impact_class(self):
         subject = claimed(kind="perform", test_label="TS3",
                           impact_class="read_another_tenants_record")
 

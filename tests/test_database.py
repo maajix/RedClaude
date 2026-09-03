@@ -32705,12 +32705,12 @@ class LiveDoorFixture:
         Here rather than in each subclass, for the reason this fixture is
         shared: `ReplayFixture` has the same three helpers over `cls.connection`
         and this branch's connection is `cls.runtime`, so what differed between
-        the copies was the connection's name and nothing else.
+        the copies was the connection's name and nothing else. Which is why the
+        body hands the connection to `committed` rather than spelling the
+        transaction a fourth time: the three sibling `called` members in this
+        module are the same one line over their own.
         """
-        with cls.runtime.transaction():
-            cls.runtime.execute("SELECT set_actor('runtime', 'selftest')")
-            answered = cls.runtime.execute(sql, parameters).scalar()
-        return json.loads(str(answered))
+        return json.loads(committed(cls.runtime, sql, parameters))
 
     @classmethod
     def as_owner(cls, sql: str, parameters: tuple = ()) -> None:
@@ -32721,6 +32721,14 @@ class LiveDoorFixture:
 
     @classmethod
     def rows_of(cls, sql: str, parameters: tuple = ()) -> tuple:
+        """A read as the runtime, under this Program's own RLS.
+
+        The `rows` above reads as `settings_for`'s role, which this fixture
+        leaves at `migrate` and which sees every Program's rows. So the two are
+        not interchangeable here as they are on `ReplayFixture`, where both are
+        one connection: a case that means "what the runtime can see" has to say
+        `rows_of`, because `rows` will answer it and pass.
+        """
         return cls.runtime.execute(sql, parameters).rows
 
     @classmethod
@@ -54727,6 +54735,12 @@ RUNTIME_CHAIN_SLUG = "selftest-runtime-chain"
 #: door wrote, so a run that sent as nobody could never be stamped.
 SLOT = "member"
 
+# `RuntimeChainTest.SOURCE` is `SCOPED + DECLARED` because `DECLARED`'s
+# `[[identity]]` block names this slot. Asserted rather than left to the comment
+# on `SOURCE`, so an edit to either one is refused here instead of surfacing as
+# a lease the door has no material for.
+assert f'name = "{SLOT}"' in DECLARED
+
 
 class WritingTarget(LiveTarget):
     """The live target with a state a POST moves, and a PUT it answers.
@@ -54928,7 +54942,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         *,
         agent_run: str | None = None,
         identity_slot: str | None = None,
-        **verbs,
+        verbs=replay.DETECTION,
     ) -> Report:
         """One `rk test replay` of that Test, through the door.
 
@@ -54949,7 +54963,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
             test=test,
             identity_slot=identity_slot,
             proxy_url=cls.proxy_url,
-            **verbs,
+            verbs=verbs,
         )
 
     @classmethod
