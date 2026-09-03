@@ -20,8 +20,10 @@ an empty table.
 
 **CONSUMES:** `redkraken.replay::_downstream`, which is the only caller of
 `issue_pivot_stamp` and `build_kill_chain` on a hunt's path;
-`redkraken.replay::run`'s `verbs=` parameter, written by wall 2;
-`open_impact_task`, written by wall 1.
+`redkraken.replay::run`'s `verbs=` parameter and `redkraken.replay::IMPACT`,
+written by ticket 38 and ticket 103 -- what wall 2 wrote is the *selection* of
+`IMPACT` in `execution.py::_replay`; `open_impact_task`, written by ticket 38's
+impact migration -- what wall 1 wrote is the *objective* that names it.
 
 **Touches:** `tests/test_database.py`. No source file joined it: running walls
 1 and 2 together for the first time found nothing wrong with either. Two more
@@ -52,6 +54,10 @@ The campaign has run 197 laps and the corpus has never been told a chain is
 missing, because a missing chain is not a shape that check can see.
 
 ## The three walls, in the order a run hits them
+
+*Read from source on 2026-08-30, and cited by the line numbers of that day.
+Two have since moved: `cli.py:2904` is now `cli.py:2948`, and
+`execution.py:2577` is now `execution.py:2640`.*
 
 ### Wall 1 — no objective ever names `open_impact_task`
 
@@ -142,8 +148,43 @@ That is not a blocker for a medium finding. It is the blocker for a proven one.
       `chains` row that `check_kill_chains()` passes non-vacuously.
       `tests.test_database.RuntimeChainTest`; see below.
 - [x] `check_kill_chains()` gains an arm that fires when a Program holds a
-      validated Finding and no chain, so the empty case stops reading as green.
-      Built with the grace the honest version needs; see below.
+      validated Finding and no chain **and** the derivation wiring that would
+      close it has gone from `rank_pass`. The pair, not the state alone: a
+      standing check that returns rows refuses every pass, so a state-only arm
+      would halt the campaign rather than report on it. See "the grace it was
+      given" below. The empty case with the wiring intact still reads green,
+      which cycle 1 declined closing, in writing.
+- [ ] The runtime's own `verbs=` selection is asserted where it lives.
+      `execution.py:2724` is the only runtime site and nothing reads it: added
+      by cycle 1 for the [ticket] finding that narrowing it to `DETECTION`
+      leaves the whole tree green. One assertion over `_replay`'s call kwargs
+      in `tests.test_execution.ImpactReplayTest`, watched failing under that
+      narrowing first, and `RuntimeChainTest.attempt`'s hand-copy of the
+      expression dropped to `verbs=replay.IMPACT` so the rule has two readers
+      rather than three spellings.
+- [ ] `RuntimeChainTest` inherits or references what it copied.
+      Added by cycle 1 for the [craft] finding: the nine members that touch
+      neither a Receipt nor a door are not this case's work. `called`,
+      `as_owner` and `rows_of` hoisted onto `LiveDoorFixture` with
+      `ValidationCommandTest.called` deleted so both live-door subclasses
+      inherit one copy; `ImpactRunFixture.REASON`,
+      `ValidationCommandTest.TITLE`, `ValidatedFindingFixture`'s six statement
+      constants and `DECLARED` referenced rather than re-spelled; `id_of` and
+      the third `replay.run` spelling dropped with them; only the door-shaped
+      members kept local.
+
+**Which commit each criterion landed in, recorded by cycle 1.** Criterion 3 is
+the only one inside this ticket's reviewed diff. Criteria 1, 2 and 4 landed in
+`685d860f` and `cf1b75fa`, and neither subject carries a `(ticket 226)` marker,
+so this flow's fixed-point procedure cannot see them and no cycle has ever
+pinned them as a diff. `tools/check_audit.py` does not enforce the marker
+either, so the gap is invisible to the gate that counts this ticket audited.
+Cycle 1 read their substance anyway -- four of its findings are about that
+work, two of them on criterion 2 and criterion 4 themselves -- so what is
+unreviewed is the diff, not the behaviour. Any later re-read of walls 1 and 2
+pins those two commits one at a time; growing a cycle's diff to reach them
+would swallow the seven other tickets that carry a marker in that range --
+134, 166, 216, 231, 233, 235 and 236 -- each reviewed by its own cycle.
 
 ## What was built for wall 2, 2026-08-30
 
@@ -275,7 +316,8 @@ both callee names when `rank_pass` is stubbed inside a rolled-back transaction.
    `demonstrated_impact` road to high and critical therefore still needs one more
    caller. That is a ticket, not a defect in this one.
 
-**Acceptance 3 was not built.** An end-to-end fixture reaching a non-empty
+**Acceptance 3 was not built by this wall**, and was built on 2026-09-03; see
+`## Resolution` below. An end-to-end fixture reaching a non-empty
 `pivot_stamps` needs an answered operator decision inside the fixture (
 `open_impact_replay` parks otherwise), a live door for the impact actions and
 their cleanup, and TWO stamped pivots before `build_kill_chain` will compose
@@ -313,9 +355,25 @@ WROTE  tests.test_database::LiveDoorFixture.root_secret
                 cls.root_secret at header.provision and proxy.listen; and
                 tests.test_database::RuntimeChainTest.provisioned
 WROTE  the pivot_stamps and chains rows the two impact runs left
-       READ BY  check_kill_chains() arm (h), reading FROM chains -- run in this
-                pass over a Program that holds one; and
-                rk2_chain_unlock_frontier, reading FROM chains
+       READ BY  check_kill_chains() arms (a)-(g), reading FROM chains,
+                chain_steps and chain_edges -- the first pass in which they
+                evaluate over rows rather than over an empty table, which is
+                the non-vacuous green criterion 3 asks for; and
+                build_kill_chain, reading
+                ARRAY(SELECT id FROM pivot_stamps WHERE program_id = $1) on
+                the second run, which is the first run's stamp
+                -- corrected by cycle 1. Arm (h) was recorded here and does
+                not discriminate: its second half wants a rank_pass that no
+                longer calls the two derive functions, and the deployed one
+                calls both, so it is quiet with the chain and without it. Its
+                own proof was taken in cf1b75fa, against a stubbed rank_pass
+                inside a rolled-back transaction. rk2_chain_unlock_frontier
+                was recorded here and reads nothing either: its gap CTE wants
+                a stamp that is not already a chain_step, and both of these
+                are steps of the chain they composed, so wall 3's
+                chain_unlock_for(t) is still a constant zero after this pass.
+                Wall 3 is therefore reachable and still unmeasured; a third
+                stamp would measure it.
 WROTE  65-prove-first-hunt-release-candidate.md's Blocked by entry for 233
        READ BY  tools/check_audit.py, reading the release-outcome closure over
                 RELEASE_OUTCOME = 65
@@ -325,7 +383,14 @@ WROTE  tests/test_audit.py's frozen report line
 READ   redkraken.replay::_downstream
        WRITTEN BY  ticket 103, status resolved
 READ   redkraken.replay::run's verbs= parameter, and redkraken.replay::IMPACT
-       WRITTEN BY  ticket 226 wall 2, commit 685d860f
+       WRITTEN BY  ticket 38, commit 3f2d4921, for the parameter and IMPACT's
+                   open and close; ticket 103, commit 77bcfecd, for IMPACT's
+                   two stamp statements -- corrected by cycle 1, which found
+                   685d860f touches no file under src/redkraken/replay.py.
+                   What wall 2 wrote is the selection at execution.py:2724,
+                   and RuntimeChainTest.attempt hand-copies that expression
+                   rather than calling _replay, so wall 2's own line has no
+                   reader in this case
 READ   open_impact_task, and the conclude objective that names it
        WRITTEN BY  ticket 38's migration; the objective by ticket 226 wall 1,
                    commit cf1b75fa
@@ -499,7 +564,10 @@ walls, and its own pricing of acceptance 3 was accurate down to the two stamps.
 
    Both are prose inside those tickets' own bodies. No `CONSUMED BY`,
    `CONSUMES` or `deferred to` on either.
-4. **Existing tests still pass, none skipped, deleted or weakened.**
+4. **Existing tests still pass, none skipped, deleted or weakened.** The
+   `skipped=3` below is `tests.test_audit.RunnableProbe`'s three deliberate
+   probes, pre-existing and untouched by this diff, which changes one literal
+   line of that file -- noted by cycle 1.
 
    ```
    NO_COLOR=1 uv run python -m unittest tests.test_database.CleanCreationTest \
@@ -596,6 +664,135 @@ Identity, twice, after two real operator answers. `chains = 1` and
 `pivot_stamps = 2` on a Program that held neither an hour ago. There is no
 `live-inputs.md` in this effort to replay, which `## Seam check` records.
 
-**Judgement, Rule 3b.** No double was injected; `## Seam check` says what the
-one faked value is -- the dialled address -- and why faking it is not faking the
-decision.
+**Judgement, Rule 3b, as cycle 1 corrected it.** No double stands in for a
+door, an Identity or a Receipt: the run is real ciphertext through a real
+`proxy.listen` to a real socket, and the Receipts are the door's own. Four
+things are substituted, each reasoned where it sits in `tests/test_database.py`
+and none of them named here before the review:
+
+1. **The dialled address.** `LiveDoorFixture.dial` puts every authorised name
+   on the loopback port, for `ProxyEgressTest`'s reason that `127.0.0.1` can
+   never be a Program's scope. What is faked is where the socket goes, not the
+   decision that authorised it.
+2. **The counterparty's state transition.** `WritingTarget.served` increments
+   on every request, so the `body_differs` of the reading action against the
+   baseline holds whether or not the POST wrote anything, and the pivot's
+   held-rather-than-refuted verdict rests on a comparison that cannot fail.
+   The counter is needed because four GETs of one url must all differ; the
+   consequence is that this case proves the run reached the target, not that
+   the target changed. `rk2_pivot_refusal`'s own rule is checked by
+   `PivotStampTest`, over rows written by hand.
+3. **`claim_task`.** `UPDATE tasks SET status = 'claimed'` in its place.
+   `claim_task`'s own behaviour is checked by the scheduler's classes.
+4. **The scheduler's settle, and the lease.**
+   `UPDATE tasks SET status = 'abandoned'` in place of the settle, and a direct
+   `INSERT INTO identity_leases`. Both are arrangement, and both verbs are
+   checked where they are owned.
+
+None is deferred, because in each case the real thing is checked by a named
+existing class rather than by this one.
+
+**Re-measured by review cycle 1, 2026-09-03, under this same heading.** Two
+criteria were added by this cycle's verdicts, so line 1 no longer prints `0`
+and this ticket is mid-flight rather than finished. The two `unittest`
+invocations behind lines 2 and 4 need the live cluster and were not available
+to this pass; what could be re-run was.
+
+```
+1.  grep -c '^- \[ \]'   <ticket>
+      2                       # the two criteria this cycle added, both open
+    grep -c '^- \[[ x]\]' <ticket>
+      6                       # four ticked from the build, two open
+
+2.  not re-run: needs the PostgreSQL cluster. The build's paste stands, and
+    the seam report is unchanged by this cycle except in what it names as the
+    readers of rows already written.
+
+3.  grep -rn 'ticket 226\|Ticket 226' docs/specs/production-harness-v2/
+      live-inputs.md:3          # minted by this cycle; prose
+      228-...md:198             # prose in that ticket's own body
+      229-...md:124             # prose in that ticket's own body
+      … (14 lines, all inside this ticket's own dated blocks: history)
+    No CONSUMED BY, CONSUMES or deferred to on any of them.
+
+4.  not re-run for tests.test_database: needs the cluster. Re-run here:
+      NO_COLOR=1 .venv/bin/python -m unittest tests.test_audit tests.test_coverage -q
+        Ran 107 tests in 58.878s
+        OK (skipped=3)
+      and the four gates as programs, each under .venv/bin/python:
+        check_audit rc=0
+        check_wiring rc=0
+        check_baseline rc=0
+        check_coverage rc=0
+    This cycle's repairs add no .skip, delete no test and remove no assertion:
+      git diff -U0 -- tests/test_database.py | grep '^-' | grep -v '^---'
+        -    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
+        -WEARER = "member"
+        … (7 lines, each the WEARER spelling replaced by SLOT on the line below)
+
+5.  git status --short --untracked-files=all
+      M .../226-the-kill-chain-has-never-had-a-single-row.md
+      M .../65-prove-first-hunt-release-candidate.md
+      M tests/test_database.py
+      ?? docs/specs/production-harness-v2/live-inputs.md
+    git diff --numstat
+      210  13  .../226-the-kill-chain-has-never-had-a-single-row.md
+      1    1   .../65-prove-first-hunt-release-candidate.md
+      13   9   tests/test_database.py
+    Four paths. This ticket's own file and 65's are this flow's; the three
+    edits to tests/test_database.py are three NOW repairs; and live-inputs.md
+    is the effort artifact one NOW repair minted. tests/test_audit.py is NOT
+    in this list, and that is the point of the audit finding's verdict: the
+    frozen literal moves in the commit that writes `resolved`, not in this one.
+
+6.  grep -c '^## Resolution' <ticket>   1
+    grep -c '^## Bar'        <ticket>   1
+    grep -c '^## Handoff'    <ticket>   0
+```
+
+## Review findings, 2026-09-03 — cycle 1
+
+Fixed point `7cfabf29`, the parent of this ticket's only `(ticket 226)` build
+commit. Four readers, run apart, reported 25 findings; the axis tag on each
+entry is the reader that raised it. Three convergences are noted in the entries
+that share them.
+
+- [ticket] **Criterion 2 is ticked over a line nothing asserts. `verbs=` at `execution.py:2723-2725` is the only runtime site; `ImpactReplayTest`'s five tests assert `Claimed.impact_class` and the two `stamp_sql` values, never the call kwargs; and `RuntimeChainTest.attempt` re-spells the expression at `test_database.py:55057` instead of calling `_replay`. Narrowing `execution.py:2724` to `DETECTION` leaves the whole tree green.** — required — CRITERION on ticket 226. The criterion added above: one assertion over `_replay`'s call kwargs in `ImpactReplayTest`, watched failing under the narrowing first.
+- [bar] **Both audit gates go red on the edit that resolves this ticket: `check_audit` computes the release-outcome closure over ticket 65's `Blocked by` and 226 is not on it, so `resolved` yields `ticket 226: resolved, and no path reaches ticket 65 from it`; and `test_audit.py:76`'s frozen `resolved 204` becomes 205. This is the same defect `## Build findings` repaired for 233 and did not apply to 226 itself.** — required — NOW. `226 — The kill chain analysis has never held a single row` added to ticket 65's `Blocked by`, in the position the list puts a ticket as it lands. `check_audit` rc=0 after it and the report is unchanged, because 226 is still `claimed`; `tests/test_audit.py`'s frozen `resolved 204` is therefore untouched and moves to 205 in the commit that finally writes `resolved`. No production code, so no red test is owed.
+- [seam] **The record's reader for the rows this ticket wrote cannot falsify. Arm (h)'s second half requires a `rank_pass` whose comment-stripped `prosrc` no longer matches `derive_impact_specifications` or `derive_impact_performances`, and the deployed `rank_pass` calls both in code, so arm (h) is quiet whether `chains` holds a row or not. Converges with the [ticket] entry below.** — required — NOW. `## Seam check`'s `READ BY` for those rows rewritten: arms (a)-(g) and `build_kill_chain`'s own `SELECT id FROM pivot_stamps` named as the readers that evaluate over the rows, and arm (h) recorded as the non-discriminating far end it is, with its real proof placed where it was taken.
+- [ticket] **Neither far end named for "the pivot_stamps and chains rows the two impact runs left" reads them. Arm (h) reads `chains` only through `NOT EXISTS`, and `rk2_chain_unlock_frontier` gates its `gap` CTE on a stamp that is not already a step, so two stamps both consumed by the composed chain yield no frontier row and wall 3's `chain_unlock_for(t)` is still zero here. Converges with the [seam] entry above.** — required — NOW. Same rewrite: `rk2_chain_unlock_frontier` recorded as reading nothing here, with the gap CTE's condition given, and wall 3 written down as reachable and still unmeasured. Going and measuring it is not asked for by any criterion; a third stamp is the lead a later session needs.
+- [craft] **Nine members of `RuntimeChainTest` were copied from fixtures they touch no Receipt and no door to justify: `as_owner` byte-identical to `ReplayFixture.as_owner`; `rows_of` and `id_of` differing from theirs in the single token `cls.connection`/`cls.runtime`; `settle` re-spelling `PivotStampFixture.settled`; `called` re-spelling `ValidationCommandTest.called`; `approve` re-spelling `ImpactRunFixture.as_operator` plus `approve` over two attributes `LiveDoorFixture` already holds; `GRANTED` and `TITLE` re-spelling `ImpactRunFixture.REASON` and `ValidationCommandTest.TITLE` character for character; and `validated_finding` re-spelling as inline literals the six connection-free constants `ValidatedFindingFixture` names. What blocked reuse is the connection's name, not the hand-written Receipts the ticket cites, and three fixture docstrings in this same file set the opposite standard.** — required — CRITERION on ticket 226. The criterion added above, naming each member and its original. The session that returns has the cluster the refactor needs; this one does not.
+- [seam] **`READ redkraken.replay::run's verbs= parameter, and redkraken.replay::IMPACT` is recorded as `WRITTEN BY ticket 226 wall 2, commit 685d860f`, and that commit touches no file under `src/redkraken/replay.py`. `git blame` puts `verbs: _Verbs = DETECTION` and `IMPACT`'s open and close at `3f2d4921`, and `IMPACT`'s two stamp statements at `77bcfecd`. The ticket's own wall-2 section says as much, so the file contradicts itself. Converges with the [ticket] entry below.** — required — NOW. Rewritten to ticket 38 for the parameter and `IMPACT`'s open and close, ticket 103 for the two stamp statements, with what wall 2 actually wrote named beside it.
+- [ticket] **Two of the three `CONSUMES` writer heads name a commit that does not contain the cited symbol: `replay::run`'s `verbs=` and `replay.IMPACT` were written by ticket 38, and `open_impact_task` is created in ticket 38's impact migration, not by wall 1 — which this ticket's own `## Seam check` already states for `open_impact_task`. Converges with the [seam] entry above.** — required — NOW. Both heads rewritten to ticket 38, keeping wall 2 as the writer of the selection and wall 1 as the writer of the objective.
+- [ticket] **Criterion 4's text promises "so the empty case stops reading as green", and the shipped arm (h) fires only on a pair whose second half is a stubbed `rank_pass`, so with the wiring intact the empty case still reads green. The ticket concedes it twice and names its own test for it.** — required — NOW. The criterion rewritten to the pair the arm asserts, with the reason a state-only arm cannot be built, and the residual named as declined below.
+- [seam] **This pass wrote a live far end nothing following it can read. There is no `docs/specs/production-harness-v2/live-inputs.md`, so the next ticket's §5 and `close-effort` walk 4 have no block for the first execution of `replay._downstream` in this repository. Ticket 166's wall is cited as covering it, but that wall's PRICE is the 231-file layout move and never prices this one file at this repository's own path, and 226 is the first ticket in the effort with a live far end worth recording — a fact 166 did not have.** — required — NOW. `docs/specs/production-harness-v2/live-inputs.md` minted with one block for 226 at `STATUS promoted to tests.test_database.RuntimeChainTest`, `REPLAYS 0 ()`, and a header saying why the file starts 225 tickets in. `promoted to` because the case is the assertion, so no following ticket owes a hand replay -- what `close-effort` walk 4 gets is a block it can read rather than nothing.
+- [bar] **The Rule 3b judgement names the dialled address as the one faked value, and the fixture also hand-writes three pieces of state the runtime's own verbs own: `UPDATE tasks SET status = 'claimed'` in place of `claim_task`, `UPDATE tasks SET status = 'abandoned'` in place of the scheduler's settle, and a direct `INSERT INTO identity_leases`. Each is reasoned in its own docstring and none is visible to a reader of the ticket. Converges with the [ticket] entry below.** — required — NOW. The judgement rewritten to four numbered substitutions, each naming the class that checks the real verb, so none is deferred.
+- [ticket] **The Rule 3b judgement also omits that the counterparty's state transition is faked: `WritingTarget.served` increments on every request, so the `body_differs` of action 3 against action 1 holds whether or not the POST wrote anything, and the pivot the case celebrates rests on a comparison that cannot fail. The class docstring is honest about the counter; the judgement is not. Converges with the [bar] entry above.** — nit — NOW. Substitution 2 of that rewrite, which states plainly that this case proves the run reached the target and not that the target changed.
+- [ticket] **Criteria 1, 2 and 4 were built in commits `685d860f` and `cf1b75fa`, neither of whose subjects carries a `(ticket 226)` marker, so this flow's fixed-point procedure reaches criterion 3 alone and no review cycle has ever pinned the other three. Nothing in `tools/check_audit.py` enforces the marker, so the gap is invisible to the gate that counts this ticket as audited.** — required — NOW. Recorded under `## Acceptance` by commit, with what cycle 1 did and did not reach, and the rule that a later re-read pins those two commits one at a time rather than growing a cycle's diff over the fifteen tickets between them.
+- [seam] **The record folds two written kinds into one `WROTE` line and cites only `FROM chains` readers, so `pivot_stamps` has no named reader — although the case proved one live, the second run's `build_kill_chain(ARRAY(SELECT id FROM pivot_stamps ...))` reading the first run's stamp.** — nit — NOW. `build_kill_chain`'s read of the first run's stamp named in the same rewrite.
+- [bar] **Bar item 3's pasted command does not print its pasted output: run verbatim it prints seven hits, five of them this ticket's own lines, the two quoted lines have truncated filenames and mid-line elisions, and the five dropped lines carry no `… (N lines)` marker the standing bar requires.** — nit — NOW. Re-run and re-pasted whole under the existing `## Bar` heading, seven hits and no elision.
+- [ticket] **Bar item 4's pasted `git diff --numstat` shows `21 2` for this ticket's own file where the pinned diff is `331 2`; the other three rows match exactly, so the row was measured mid-write.** — nit — NOW. Re-measured in the same append.
+- [bar] **Bar item 4's heading reads "none skipped, deleted or weakened" and the paste four lines below it reads `OK (skipped=3)` with nothing reconciling them. The three are `test_audit.RunnableProbe`'s deliberate probes and are pre-existing.** — nit — NOW. The clause naming `RunnableProbe`'s three probes added to the heading.
+- [bar] **`**Acceptance 3 was not built.**` still stands as a bald sentence while criterion 3 is now ticked; only a reader who tracks the dated headings can resolve the contradiction.** — nit — NOW. Rewritten to `was not built by this wall`, pointing at `## Resolution`.
+- [ticket] **Two of the three citations in `## The three walls` no longer resolve: `cli.py:2904` is now `cli.py:2948`, and `execution.py:2577` lands in `_child`'s heartbeat block rather than `_replay`, which is at `execution.py:2640`.** — nit — NOW. The section dated as a 2026-08-30 reading, with both moved lines given their current numbers. Dating it beats re-citing three lines that will move again.
+- [ticket] **`RuntimeChainTest.rows_of` is annotated `-> list` while `.rows` answers a tuple — the defect `## Build findings` measured and then fixed at the call site rather than at the accessor.** — nit — NOW. `-> tuple`. The two other `-> list` spellings of `rows_of` in this module are pre-existing and were left alone.
+- [craft] **`LiveDoorFixture.SOURCE` is now an extension point with an unstated contract: `setUpClass` still does `.replace(SCOPED_BUDGETS, WIDE_ENOUGH)` and `.replace('name = "matrix-web"', ...)`, and both silently no-op for a subclass whose document is not `SCOPED`-derived, surfacing as unexplained budget refusals rather than as an error. The in-place change itself pushes nothing onto the two existing subclasses.** — nit — NOW. Four comment lines above the `replace`, naming both anchors and what a missing one looks like.
+- [craft] **`WEARER` invents a word for the concept `CONTEXT.md` names Identity and this module spells `slot` everywhere else — `identity_slot=`, `slot_name`, `provisioned_identity(slot)`, `PivotStampFixture.configured(slots=...)`. `docs/agents/domain.md` requires the glossary's term over a synonym.** — nit — NOW. Renamed to `SLOT`, nine occurrences, matching the value and the spelling `ImpactRunFixture.SLOT` already uses.
+- [bar] **`RuntimeChainTest.attempt` hand-copies `verbs=replay.IMPACT if impact_class else replay.DETECTION` from `execution.py:2724`, and its own `assert impact_class is not None` two lines up makes the `DETECTION` branch dead — a third reader of a one-line rule with nothing binding it to the first two, which is the drift this ticket's wall-1 section cites ticket 157 about.** — nit — ALREADY OWNED by cycle 1's `verbs=` criterion on this ticket, which names this hand-copy as half of its work. The nit row would say DECLINE; the work is owned, not declined, so the departure is written here rather than left silent.
+- [craft] **`replay.run(...)` with the same six keyword arguments is now spelled three times inside one hierarchy — `LiveDoorFixture.walk`, `RuntimeChainTest.replayed` and `RuntimeChainTest.attempt` — differing only in `test`, `identity_slot` and `verbs`.** — nit — ALREADY OWNED by cycle 1's inherit-or-reference criterion on this ticket, which names the third spelling. Same departure from the nit row as above.
+- [craft] **`RuntimeChainTest.id_of` exists only to make a round trip that ends where it started: `prove` already holds `opened["test"]`, `id_of` turns that label into an id, and `attempt` then selects the same label back out plus a second query for `impact_class`.** — nit — ALREADY OWNED by cycle 1's inherit-or-reference criterion, which names `id_of`. Same departure.
+- [craft] **The `[[identity]]` block in `RuntimeChainTest.SOURCE` is hand-spelled for the sixth time in this module when `DECLARED` already holds that string.** — nit — ALREADY OWNED by cycle 1's inherit-or-reference criterion, which names `DECLARED`. Same departure.
+
+**Declined in writing, so it is not the next review's finding.** Closing the
+gap criterion 4 used to promise -- a `check_kill_chains()` arm that fires on a
+Program holding a validated Finding and no chain, with the wiring intact --
+will not be done. `check_kill_chains()` is a gate: a standing check that
+returns rows refuses every pass, so such an arm would halt the campaign over a
+Program that is merely early, which is D-11's mechanism and the shape live
+`rk2here` holds today. Reporting vacuous green without gating on it is a
+different mechanism than this corpus offers, and no criterion in this effort
+asks for one. Ticket 229 names the same vacuous-green failure for Findings
+nobody was told about; it is an analogy in that ticket's own prose, not
+ownership of this arm.
+
+Review cycle 1 of 3 — undecided: none

@@ -32584,6 +32584,10 @@ class LiveDoorFixture:
         # below was started with.
         cls.root_secret = seal.Root("live-proxy-selftest-root", SECRET)
 
+        # A subclass overriding `SOURCE` must keep both anchors: the
+        # `SCOPED_BUDGETS` block and the `name = "matrix-web"` line. Either one
+        # missing makes its `replace` a silent no-op, which surfaces later as a
+        # budget refusal rather than as an error here.
         source = cls.SOURCE.replace(SCOPED_BUDGETS, WIDE_ENOUGH)
         cls.configuration = write(
             source.replace('name = "matrix-web"', f'name = "{cls.slug}"')
@@ -54704,7 +54708,7 @@ RUNTIME_CHAIN_SLUG = "selftest-runtime-chain"
 #: The Identity slot every pivot below runs as. `rk2_pivot_problem` requires a
 #: pivot to name one and `rk2_pivot_refusal` reads it back off the Receipt the
 #: door wrote, so a run that sent as nobody could never be stamped.
-WEARER = "member"
+SLOT = "member"
 
 
 class WritingTarget(LiveTarget):
@@ -54765,7 +54769,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
     slug = RUNTIME_CHAIN_SLUG
     TARGET = WritingTarget
     SOURCE = SCOPED + (
-        f'\n[[identity]]\nname = "{WEARER}"\nslot_ref = "slot://identity/{WEARER}"\n'
+        f'\n[[identity]]\nname = "{SLOT}"\nslot_ref = "slot://identity/{SLOT}"\n'
     )
 
     #: The claim the member Finding is validated on, and the routes it is
@@ -54856,7 +54860,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         return json.loads(str(answered))
 
     @classmethod
-    def rows_of(cls, sql: str, parameters: tuple = ()) -> list:
+    def rows_of(cls, sql: str, parameters: tuple = ()) -> tuple:
         return cls.runtime.execute(sql, parameters).rows
 
     @classmethod
@@ -54889,20 +54893,20 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         matched nothing this Test reaches would carry no header, and what the
         pivot needs off the Receipt is the Identity rather than the header.
         """
-        material = scratch() / f"{cls.slug}-{WEARER}.json"
+        material = scratch() / f"{cls.slug}-{SLOT}.json"
         material.write_text(
             json.dumps({
                 "schema_version": 1,
                 "origins": [{
                     "url": "http://app.example.com/",
-                    "headers": [{"name": "Authorization", "value": f"Bearer rk2-{WEARER}"}],
+                    "headers": [{"name": "Authorization", "value": f"Bearer rk2-{SLOT}"}],
                     "cookies": [],
                 }],
             }),
             encoding="utf-8",
         )
         provisioned = identity.provision(
-            cls.harness.runtime, cls.configuration, WEARER, material,
+            cls.harness.runtime, cls.configuration, SLOT, material,
             root_secret=cls.root_secret,
         )
         assert provisioned.ok, provisioned.violations
@@ -54910,7 +54914,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
             cls.runtime.execute(
                 "SELECT entity_id FROM identities"
                 " WHERE program_id = $1::uuid AND slot_name = $2",
-                (cls.program_id, WEARER),
+                (cls.program_id, SLOT),
             ).scalar()
         )
 
@@ -54999,7 +55003,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
         return json.dumps(stated | {"pivot": {
             "provides": provides,
             "requires": requires,
-            "identity": WEARER,
+            "identity": SLOT,
             "transition": cls.SHOWN[0]["id"],
             "conditions": cls.CONDITIONS,
         }})
@@ -55052,7 +55056,7 @@ class RuntimeChainTest(LiveDoorFixture, DatabaseCase):
             test=cls.runtime.execute(
                 "SELECT label FROM tests WHERE id = $1::uuid", (test,)
             ).scalar(),
-            identity_slot=WEARER,
+            identity_slot=SLOT,
             proxy_url=cls.proxy_url,
             verbs=replay.IMPACT if impact_class else replay.DETECTION,
         )
