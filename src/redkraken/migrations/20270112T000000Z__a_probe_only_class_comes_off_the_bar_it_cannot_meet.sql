@@ -34,11 +34,11 @@
 -- origin by coincidence and ALPN did not. A `transport.tls_configuration`
 -- Finding filed off this Playbook's reading would have described the proxy.
 --
--- What it costs elsewhere, measured. `playbook_fixture_binding` (`0036:117`) is
+-- What it costs elsewhere, measured. `playbook_fixture_binding` (`0036:122`) is
 -- derived from `playbook_outputs` against `fixture_classes`, so ticket 88's
 -- `tls-configuration-pair` -- the one fixture in the corpus whose ground truth
 -- is its handshake -- becomes `out` for every Playbook and grades none. It is
--- still an `out`-side fixture for all fifty, so it still measures specificity,
+-- still an `out`-side fixture for all 51, so it still measures specificity,
 -- and `http-desync` itself stays bound and gradeable through
 -- `header-policy-pair`, which is what the second and third assertions below
 -- check. Ticket 88's own purpose is not undone: it opened a binding for a
@@ -91,7 +91,10 @@ BEGIN
 
     -- And the fixture side of that, because the whole point of ticket 88 was a
     -- Playbook whose verdict stopped at `untested` for want of an `in`-side own
-    -- pair. `playbook_test_verdict` counts own pairs on the `in` side and
+    -- pair. Deliberately the same reading as
+    -- `TransportBarTest.test_the_fixture_the_removed_class_declared_now_grades_nobody`:
+    -- asserted here so a corpus applied without the test suite still refuses the
+    -- shape, not because there is a second reader. `playbook_test_verdict` counts own pairs on the `in` side and
     -- nothing else, so this is the assertion that says the removal did not put
     -- this Playbook back where 88 found it.
     SELECT count(*) INTO n FROM playbook_fixture_binding(v_playbook) b
@@ -124,6 +127,13 @@ BEGIN
     -- catalogue rather than over this Playbook: the register seeds two
     -- `probe_only` classes, and a second Playbook declaring either of them would
     -- ship the same unsatisfiable bar. Zero rows is the claim.
+    --
+    -- Scope, stated rather than assumed: this block runs once, at this file's
+    -- place in apply order, so what it guards is the corpus as of this file. A
+    -- later migration that reintroduced the shape would apply afterwards and
+    -- never be seen. The standing form of this invariant is W7
+    -- `guard_satisfiability` -- "no guard requires a row another guard refuses"
+    -- -- which `tools/check_wiring.py:303` carries as `owed:116`.
     SELECT count(*) INTO n
       FROM playbook_outputs o
       JOIN transport_makeability m ON m.property_class = o.property_class

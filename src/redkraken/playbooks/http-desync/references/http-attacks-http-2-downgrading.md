@@ -31,7 +31,11 @@ downgrading front end would mishandle is not framing this harness can produce.
 
 ## What the Playbook kept
 
-The second claim, in full, and it is what the Playbook under this name now is.
+The second claim, in full, and it is what the Playbook under this name was until
+ticket 233. That ticket took `transport.tls_configuration` off `bb:outputs` on
+2026-09-03; what the page keeps recording is why the claim was worth wanting, and
+ticket 237 owns the step that could file it again. Everything below is read in
+that past tense.
 
 "Which protocol does this deployment actually negotiate" is a question with an
 admissible answer, and 025 is the reason: `transport.tls_configuration` is
@@ -44,15 +48,18 @@ cell by coincidence, and ALPN did not, because an unpinned proxy told a client
 told and what the origin does is precisely this page's second claim, and it is
 measurable.
 
-So the Playbook's steps are: write down what the deployment advertises from an
-ordinary read, take a measurement on the lane whose receipt is citable, take it
-twice so a negotiation becomes a property, and compare. The finding is a
-disagreement between the advertisement and the wire.
+So the Playbook's steps were to be: write down what the deployment advertises
+from an ordinary read, take a measurement on the lane whose receipt is citable,
+take it twice so a negotiation becomes a property, and compare. The finding is a
+disagreement between the advertisement and the wire. The measurement step was
+never written, which is the whole of why ticket 233 had to choose: the bar named
+two agent-lane kinds and `transport_evidence_guard` admits neither on a
+`probe_only` claim. Ticket 237 is that missing step.
 
 ## What is worth remembering about the downgrade itself
 
-A supported `transport.tls_configuration` on a downgrading front end is worth
-writing up as what it is -- an inconsistency between what callers are offered and
+A supported `transport.tls_configuration` on a downgrading front end would be
+worth writing up as what it is -- an inconsistency between what callers are offered and
 what the origin speaks -- and worth not writing up as what it is not. A downgrade
 is a precondition for the desync family and never evidence of it. The finding
 says the two hops speak different protocols; it does not say a message crossed

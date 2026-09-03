@@ -52,7 +52,16 @@ The framing question, moved one layer down to where it is answerable. The one
 thing about the front end that is measurable without composing bytes is what it
 negotiated: version, cipher, protocol. That is `transport.tls_configuration`, it
 comes from the measurement lane rather than from the proxy path, and it is what
-the Playbook under this name now asks.
+the Playbook under this name asked until ticket 233.
+
+Ticket 233 took that class off `bb:outputs` on 2026-09-03. An evidence row
+carries no Property class, so one `bb:evidence` bar is read against every class
+a Playbook names, and `transport.tls_configuration` is `probe_only`, whose
+`transport_evidence_guard` admits only a `transport_parameters_observed`
+Observation -- a kind this Playbook's agent-lane reading cannot file. The bar
+that remains is correct for `transport.header_policy`, which is what the
+Playbook now asks. Ticket 237 owns the step that would file the measurement
+Receipt and let the class come back.
 
 The rest is the ceiling, and step 6 states it in the negative because that is the
 form a reading can check itself against: no second length header, no chunked body

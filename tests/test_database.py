@@ -39423,9 +39423,23 @@ class TransportBarTest(ClaimFixture, SchedulerFixture, DatabaseCase):
                 )
             except pg.DatabaseError as refusal:
                 refused[role] = str(refusal)
+        # The chain, asserted rather than assumed, the way
+        # `HypothesisPromotionTest.put_the_claim_under_a_playbook_bar` and
+        # `ask_the_preview_about_the_playbook_bar` both do it: a selection that
+        # reached no Task would leave the bar with nothing to read, and an empty
+        # unmet set would then mean "no Playbook" rather than "the bar is met".
+        selections = int(
+            cls.as_owner(
+                "SELECT count(*) FROM playbook_selections s JOIN tasks t"
+                "    ON t.id = s.task_id"
+                " WHERE t.hypothesis_id = $1::uuid AND s.dropped_because IS NULL",
+                (hypothesis,),
+            ).scalar()
+        )
         return {
             "hypothesis": hypothesis,
             "refused": refused,
+            "selections": selections,
             # Named columns rather than `SELECT *`: the order lives in the
             # function signature (`0032_playbooks.sql:509-510`).
             "unmet": [
@@ -39458,6 +39472,14 @@ class TransportBarTest(ClaimFixture, SchedulerFixture, DatabaseCase):
         is Playbook-wide and the register seeds five classes: a second Playbook
         naming `transport.tls_configuration` or `transport.certificate_trust`
         would fail here rather than be found by the campaign that graded it.
+
+        This is the durable half of the pair. While
+        `test_the_probe_only_classes_are_declared_by_no_playbook_at_all` holds,
+        the join below has no rows to reach the polarity filter with, so this
+        test cannot go red before its sibling does. That sibling is a snapshot
+        and dies when ticket 237 gives the class a step; this one outlives it,
+        because it asks what a bar may ask of a class rather than which classes
+        are currently emitted. Delete the sibling, never this.
         """
         self.assertEqual(
             [],
@@ -39499,7 +39521,7 @@ class TransportBarTest(ClaimFixture, SchedulerFixture, DatabaseCase):
     def test_the_fixture_the_removed_class_declared_now_grades_nobody(self):
         """What the removal costs, as rows rather than as a sentence.
 
-        `playbook_fixture_binding` (`0036_playbook_tests.sql:117`) is derived
+        `playbook_fixture_binding` (`0036_playbook_tests.sql:122`) is derived
         from `playbook_outputs` against `fixture_classes` and is total, so
         ticket 88's `tls-configuration-pair` -- the one fixture in the corpus
         whose ground truth is its handshake -- is now `out` for every Playbook
@@ -39543,18 +39565,26 @@ class TransportBarTest(ClaimFixture, SchedulerFixture, DatabaseCase):
     def test_the_bar_is_met_for_the_class_this_playbook_emits(self):
         """The `agent_ok` half, end to end: both edges land and the bar empties.
 
-        `transport.header_policy` is `agent_ok` (`0025:216`), so
+        `transport.header_policy` is `agent_ok` (`0025:217`), so
         `transport_evidence_guard` returns at its first test and the two kinds
         the bar asks for are the two kinds this Playbook's reading writes.
         """
+        self.assertEqual(1, self.agent_ok["selections"])
         self.assertEqual({}, self.agent_ok["refused"])
         self.assertEqual([], self.agent_ok["unmet"])
 
-    def test_the_gate_the_runtime_is_handed_no_longer_names_the_playbook(self):
+    def test_the_gate_the_runtime_is_handed_names_only_the_base_rule(self):
         # The same bar read through the caller that consults it. What comes back
         # names the base rule -- `testing -> supported` wants a test-linked
         # receipt -- and naming it is the point: the Playbook half is not what
         # stands between this claim and `supported`.
+        #
+        # Not named for a change this ticket made. `playbook_evidence_unmet`
+        # (`0032_playbooks.sql:509-526`) never reads `playbook_outputs`, and
+        # `transport_evidence_guard` returns at `0025:370` for any class that is
+        # not `probe_only`, so this refusal read the same before the removal as
+        # after. What it pins is that the removal did not put a Playbook
+        # conjunct in front of the class that remains.
         self.assertEqual(
             "transition testing -> supported requires a tool receipt",
             self.agent_ok["refusal"],
