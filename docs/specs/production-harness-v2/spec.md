@@ -833,7 +833,11 @@ and ordinary resume all reconcile from current rows.
 The two halves of this effort's suite, and each prints the name of every test
 it ran. Written at ticket 197 rather than at the walking skeleton, which is why
 no ticket before it could paste one; `docs/agents/testing.md` owns the tiering
-and the cluster lock rules these obey.
+and the cluster lock rules these obey. Both use a bare `python`, not
+`docs/agents/testing.md`'s `uv run` / `.venv/bin/python`, because `uv` cannot
+build a venv on this working tree (ticket 197's `## Build findings`); `-v`
+stays on both, unlike testing.md's `-q` loop form, because printing every
+test's name is this command's job.
 
 Without a server -- 60 modules, everything except what needs PostgreSQL:
 

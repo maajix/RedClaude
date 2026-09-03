@@ -108,6 +108,19 @@ spec section it does not audit, so the heading costs one entry in its
       which drives the real script and the real `setUpModule` and asserts the
       refusal names the lock path.
 
+- [ ] **The loop's own refusal branch gets a test, or the promoted block says
+      which direction it covers.** `docs/specs/production-harness-v2/live-inputs.md`'s
+      `## 197` block records two directions -- the loop holds and the suite
+      is refused, and the mirror, the suite holds first and `tools/hunt-loop.sh`
+      exits 5 -- under one `STATUS: promoted to
+      tests.test_database.ClusterLockTest.test_the_hunt_loop_this_repository_ships_takes_the_other_side`,
+      but that test drives only the first direction. Once a block promotes it
+      is not replayed by hand again, so the mirror keeps exactly one proof,
+      taken once, forever. Add a test that starts the loop against a path
+      `RK_TEST_CLUSTER_LOCK` already holds and asserts exit 5 and `not
+      starting`, or split the mirror into its own block kept at `live` until
+      one exists.
+
 ## Reopened, 2026-09-03
 
 Ticket 236's review cycle 1 raised this on two axes. This ticket's own `## Why`
@@ -461,3 +474,67 @@ $ grep -c '^## Resolution' <ticket>; grep -c '^## Bar' <ticket>; grep -c '^## Ha
   `tools/hunt-loop.sh` takes the lock before it ever resolves `rk` on `PATH`,
   so the stub replaces what runs *inside* the lock and never the lock itself.
   No deferral ticket, because there is no real-`rk` assertion this seam wants.
+
+**Review correction, 2026-09-03 (cycle 1).** §3 and §4 above grep this ticket
+file too, so re-running either against the merged diff self-matches their own
+pasted command text instead of reproducing the claimed counts -- ticket 236's
+equivalent checks exclude themselves for the same reason. Re-run excluding
+this file:
+
+```
+$ grep -rn 'ticket 197' docs/specs/production-harness-v2/ | grep -v '^docs/specs/production-harness-v2/issues/197-the-suite-rotates-a-live-hunts-password.md' | grep -E 'CONSUMED BY|CONSUMES|deferred to' | wc -l
+0
+$ git diff c52d0b8f...HEAD -- . ':(exclude)docs/specs/production-harness-v2/issues/197-the-suite-rotates-a-live-hunts-password.md' | grep -cE '^\+.*(\.skip|skipTest|@unittest\.skip|type: ignore|noqa|TODO)'
+0
+```
+
+Both lines hold at `0`. §3's prose also undercounted: excluding this ticket's
+own file, `ticket 197` gets six hits, not five -- five inside dated `##`
+blocks in ticket 236 (its `## Bar` §4 and two `## Review findings` entries)
+and one in `spec.md:834`, inside `## Verify command`'s own prose ("Written at
+ticket 197..."), which is not a dated block. None of the six is `CONSUMED
+BY`/`CONSUMES`/`deferred to`, so the redemption count was never wrong, only
+the sentence describing where the other hits live.
+
+## Review findings, 2026-09-03 — cycle 1
+
+- [seam] **`docs/specs/production-harness-v2/live-inputs.md::## 197`: FAR END
+  records two directions -- loop-holds/suite-refuses and the mirror,
+  suite-holds/loop-refuses -- but `STATUS` reads `promoted to
+  tests.test_database.ClusterLockTest.test_the_hunt_loop_this_repository_ships_takes_the_other_side`,
+  and that test drives only the first direction; once promoted the mirror is
+  never replayed by hand again.** — required — CRITERION on ticket 197. Added
+  above as a new acceptance criterion.
+- [ticket] **`## Bar` §3 and §4 grep this ticket's own file, so re-running
+  either against the merged diff self-matches the pasted command text instead
+  of reproducing the claimed `0`.** — nit — NOW. Corrected above, excluding
+  the ticket file, matching ticket 236's convention.
+- [bar] **`## Bar` §3's prose says "the five other `ticket 197` hits"; the
+  count excluding this file is six, one of them in `spec.md:834`, which is
+  neither in ticket 236 nor in a dated block.** — nit — NOW. Recounted and
+  named above. Converged with [ticket] above.
+- [bar] **`## Bar` §4's pasted `git diff | grep -c ...` -> `0` does not
+  reproduce against the merged diff; it prints 3, all self-matches inside
+  §4's own prose.** — nit — NOW. Same repair as the two entries above.
+  Converged with [ticket] above.
+- [craft] **`tools/hunt-loop.sh`'s lock comment restated
+  `tests/test_database.py::LOCK_PATH`'s rationale paragraph almost verbatim
+  instead of pointing at it -- this diff already had to fix the "six roles"
+  fact in both copies once.** — required — NOW. Trimmed to the mechanical
+  facts plus a pointer to `LOCK_PATH`.
+- [craft] **`spec.md`'s `## Verify command` said `docs/agents/testing.md`
+  "owns the tiering and the cluster lock rules these obey" but pasted
+  commands that already differ from testing.md's (`python` vs `uv run
+  python`/`.venv/bin/python`; always `-v` vs testing.md's `-q`) with no note
+  that the difference is deliberate.** — required — NOW. One sentence added
+  explaining both: bare `python` because `uv` cannot build a venv on this
+  working tree (`## Build findings`), `-v` because printing every test's name
+  is this command's job.
+- [craft] **`tools/check_audit.py::SECTIONS`'s new `"Verify command"` entry is
+  sentence-case where every sibling is Title Case.** — nit — DECLINED.
+  Cosmetic only; a three-file rename (`spec.md`, `check_audit.py`,
+  `tests/test_audit.py`'s `SMALL` fixture) for a casing preference is not
+  worth the risk to an exact-match audit gate, and the string is used
+  consistently everywhere it currently appears.
+
+Review cycle 1 of 3 — undecided: none

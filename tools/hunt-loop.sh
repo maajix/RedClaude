@@ -21,15 +21,9 @@ CONFIG="${1:?usage: hunt-loop.sh <config.toml> [logfile]}"
 LOG="${2:-hunt.log}"
 MAX_CONSECUTIVE_FAULTS=3
 
-# The whole hunt runs under the database lock, not each lap. The six login roles
-# in `migrate.ROLES` are cluster-global and `tests.test_database` rotates every
-# one of their passwords in `_build`; a hunt that loses its connection halfway
-# leaves Tool runs open against a live third-party target, which is the one
-# state worth a whole lock to avoid. `tests/test_database.py::setUpModule` takes
-# this same path with LOCK_EX|LOCK_NB and refuses rather than waits, so this is
-# the other side of that lock. It reads the same $RK_TEST_CLUSTER_LOCK override,
-# because a loop locking a path the suite does not read for is not a lock at all
-# (ticket 197).
+# The whole hunt runs under the database lock, not each lap. See
+# tests/test_database.py::LOCK_PATH for why the lock exists; this is its other
+# side, reading the same $RK_TEST_CLUSTER_LOCK override (ticket 197).
 #
 # Blocking with a timeout, unlike the suite's side: a suite run is minutes and
 # worth waiting out, where a hunt is a whole sitting and not worth a suite
