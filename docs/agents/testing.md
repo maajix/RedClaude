@@ -1,6 +1,6 @@
 # Which tests to run, and when
 
-The suite is 3659 tests across 53 modules. Running all of them for every change
+The suite is 4359 tests across 60 modules. Running all of them for every change
 is not a safety habit, it is a way of not measuring anything, because a run that
 takes long enough gets skipped or read at the tail. This page says what to run
 instead, and the numbers it rests on are measured on this repository rather than
@@ -8,13 +8,13 @@ estimated.
 
 ## The one shape that matters
 
-`tests/test_database.py` is 47170 lines, 81 classes and **1359 tests** -- 37% of
+`tests/test_database.py` is 56920 lines, 92 classes and **1592 tests** -- 37% of
 the suite in one file. It is also the **only** module that needs a PostgreSQL
-server. The other 52 modules, 2300 tests between them, run against nothing.
+server. The other 59 modules, 2767 tests between them, run against nothing.
 
 That split is the whole optimisation. A change that touches no schema, no verb
 and no grant does not need the server at all, and a change that does need it
-needs a handful of the 81 classes, not all of them.
+needs a handful of the 92 classes, not all of them.
 
 ## The fixed cost of a database run
 
@@ -101,7 +101,7 @@ been affected by the diff.
 ## The trap that makes concurrency expensive
 
 The seven roles in `migrate.ROLES` are **cluster-global**. `tests/test_database.py`
-rotates their passwords on every run (`:313`), and `RK_TEST_DATABASE` isolates
+rotates their passwords on every run (`_build`), and `RK_TEST_DATABASE` isolates
 the database but **not** the roles. Two concurrent database runs poison each
 other with:
 
@@ -109,18 +109,26 @@ other with:
 28P01: password authentication failed for user "rk2_migrate"
 ```
 
-So every database invocation runs under `/tmp/rk2-db.lock`, no exceptions, not
-even a one-off probe -- and the suite takes that lock itself, in
-`setUpModule`. Do not add a wrapper. This also means database runs do not
+So everything that touches this cluster runs under `/tmp/rk2-db.lock`, no
+exceptions, not even a one-off `psql`. The suite is the one thing that already
+takes that lock itself, in `setUpModule`, so do not wrap
+`tests/test_database.py`; anything else still needs its own
+`flock /tmp/rk2-db.lock`. This also means database runs do not
 parallelise: when several agents work at once, the server is the bottleneck and
 tier 1 above is what keeps them out of each other's way.
 
 When the lock is already held, the run stops with a non-zero status and
 `RuntimeError: another session holds /tmp/rk2-db.lock`, not with a skip. A skip
 exits 0 and prints `OK`, which is indistinguishable from a pass to a reader and
-to a CI step, so a run that never reached the schema now says so. Either wait
-for the other session, or point `RK_TEST_CLUSTER_LOCK` at a path of your own if
-this server is not the one the hunt is on.
+to a CI step, so a run stopped by the lock now says so. Either wait for the
+other session, or point `RK_TEST_CLUSTER_LOCK` at a path of your own if this
+server is not the one the hunt is on.
+
+One door is still silent on purpose: with `RK_TEST_SUPERUSER_URL` unset,
+`setUpModule` returns early and the run prints `Ran 0 tests` / `OK` / exit 0.
+That skip is what lets the other 59 modules be discovered and run on a machine
+with no server, so it stays. It means an exported-and-typoed variable reads as
+a pass -- check that the run reports the class's tests, not `Ran 0 tests`.
 
 ## Known failures that are not yours
 

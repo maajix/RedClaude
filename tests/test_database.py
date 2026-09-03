@@ -1,7 +1,9 @@
 """What only a real server can answer.
 
 Everything here needs PostgreSQL 18 with pgvector, so the module skips itself
-unless `RK_TEST_SUPERUSER_URL` names one. The server it names is treated as
+unless `RK_TEST_SUPERUSER_URL` names one -- with one exception, `ClusterLockTest`,
+which asserts what `setUpModule` does before it ever reaches a server and so
+runs with the variable unset. The server it names is treated as
 disposable: this module drops and recreates its two databases and re-provisions
 the seven roles with passwords it generates for the run. Point it at a
 container, never at anything you would miss.
@@ -351,7 +353,7 @@ def setUpModule() -> None:
         # reached the schema read as a run that passed -- which is how the
         # documented `flock` wrapper survived (ticket 236). The lock still stops
         # the run; what changed is that the run now says it was stopped.
-        raise RuntimeError(LOCK_REASON)
+        raise RuntimeError(LOCK_REASON) from None
     HARNESS = _build()
 
 
@@ -677,6 +679,10 @@ class ClusterLockTest(unittest.TestCase):
             self.assertIn(LOCK_REASON, told)
             self.assertNotIn("skipped", told)
             self.assertNotIn("\nOK", told)
+            # The reason is what the operator has to read. Raising inside the
+            # `except OSError` without `from None` prints it under a chained
+            # `BlockingIOError` traceback, which buries it.
+            self.assertNotIn("BlockingIOError", told)
         finally:
             os.close(held)
 

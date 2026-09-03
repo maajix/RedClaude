@@ -4,7 +4,7 @@
 
 **Blocked by:** nothing.
 
-**Status:** resolved
+**Status:** claimed
 
 - [x] **What happened.** 2026-08-26 06:20 UTC, sitting 02 of the here
       engagement, laps 65 to 67:
@@ -63,6 +63,29 @@
       passwords from `RK_PASSWORD_RK2_*`; `rk db verify` then answered
       `"violations": []`. No rows were touched and the door held its own
       connection throughout.
+
+- [ ] **The in-repo hunt loop takes the lock too.** `tools/hunt-loop.sh` calls
+      itself a hunt in its own header -- "`rk run` works one Task per
+      invocation, so a hunt is this loop" -- and takes no lock:
+      `grep -n 'flock\|lock' tools/hunt-loop.sh` prints nothing across its 76
+      lines. `hunt.sh` is the operator-side script this ticket quoted, and it is
+      not in this repository, so an operator driving a hunt with the loop that
+      *is* leaves the suite's non-blocking `flock` finding the path free and
+      rotating the six cluster-global passwords underneath it. That is the
+      incident at the top of this file, reproduced through the one hunt driver
+      the repository ships. Either `tools/hunt-loop.sh` grows the same
+      `exec 9>/tmp/rk2-db.lock` / `flock` pair `hunt.sh` carries, or it says in
+      its header that it does not take the lock and must not run beside the
+      suite.
+
+## Reopened, 2026-09-03
+
+Ticket 236's review cycle 1 raised this on two axes. This ticket's own `## Why`
+is the argument for it -- "One side of a lock is not a lock" -- and
+`tools/hunt-loop.sh` landed in the same commit as this ticket's fix without
+taking a side. `tests/test_database.py:171-177` still tells a source reader
+"the hunt loop has taken this lock since it was written", which is true of
+`hunt.sh` and false of the loop in `tools/`.
 
 ## Why
 
