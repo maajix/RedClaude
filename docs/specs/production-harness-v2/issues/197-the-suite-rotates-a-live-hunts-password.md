@@ -108,7 +108,7 @@ spec section it does not audit, so the heading costs one entry in its
       which drives the real script and the real `setUpModule` and asserts the
       refusal names the lock path.
 
-- [ ] **The loop's own refusal branch gets a test, or the promoted block says
+- [x] **The loop's own refusal branch gets a test, or the promoted block says
       which direction it covers.** `docs/specs/production-harness-v2/live-inputs.md`'s
       `## 197` block records two directions -- the loop holds and the suite
       is refused, and the mirror, the suite holds first and `tools/hunt-loop.sh`
@@ -538,3 +538,170 @@ the sentence describing where the other hits live.
   consistently everywhere it currently appears.
 
 Review cycle 1 of 3 — undecided: none
+
+## Build findings, 2026-09-04
+
+- [build] **`tests.test_database.ClusterLockTest` child processes re-enabled
+  the user site and imported `tools` from
+  `/home/majix/.local/lib/python3.12/site-packages`, although the documented
+  outer runner used `python3 -s`. The two existing lock tests therefore
+  failed before reaching their assertions on this host.** — required — NOW.
+  Added `-s` to both child Python invocations. The observed red was
+  `ImportError: cannot import name 'check_secrets' from 'tools'`; the full
+  three-test class now passes.
+
+Build session 2026-09-04 — undecided: none
+
+## Seam check, 2026-09-04
+
+Cold read: 6 claims found, 0 unsettled. The literal, round-trip, on-path reader,
+section-consistency and double checks all reached current source and the real
+process boundary.
+
+```
+WROTE  the held flock on RK_TEST_CLUSTER_LOCK
+       READ BY     tools/hunt-loop.sh, reading fd 9 through the real flock
+WROTE  exit 5 and "another session holds <path>; not starting"
+       READ BY     tests.test_database.ClusterLockTest::test_the_hunt_loop_refuses_when_the_suite_holds_the_lock
+WROTE  the refusal to the hunt log
+       READ BY     tests.test_database.ClusterLockTest::test_the_hunt_loop_refuses_when_the_suite_holds_the_lock
+READ   RK_TEST_CLUSTER_LOCK
+       WRITTEN BY  operator, by hand at the hunt environment; the test writes
+                   a run-private path
+READ   the lock already held on that path
+       WRITTEN BY  tests.test_database.ClusterLockTest::test_the_hunt_loop_refuses_when_the_suite_holds_the_lock
+```
+
+No unexplained `NOBODY`. The path was run through the real
+`tools/hunt-loop.sh`: while the test held its run-private lock, the loop
+returned 5, printed and logged the refusal, and never opened lap 1.
+
+**Double injected.** A PATH-local `flock` wrapper changes only
+`-w 60` to `-n`, then execs the real system `flock` on fd 9. It keeps the
+production wait out of the suite while preserving the kernel lock and the
+driver's refusal branch. The real unwrapped production invocation remains
+covered by
+`test_the_hunt_loop_this_repository_ships_takes_the_other_side`, which proves
+that `flock -w 60 9` holds the same path while the suite reaches for it.
+
+The only live-input block for this seam was already promoted. Its status now
+names `tests.test_database.ClusterLockTest`, whose two directional tests cover
+both far ends recorded by the block; no block with a `live` status remained
+to replay.
+
+### Findings
+
+- [seam] clean — nothing raised
+
+## Resolution, 2026-09-04
+
+The mirror side of the cluster lock is now guarded by
+`tests.test_database.ClusterLockTest.test_the_hunt_loop_refuses_when_the_suite_holds_the_lock`.
+The test holds the exact path written through `RK_TEST_CLUSTER_LOCK`, runs the
+real hunt loop, and reads exit 5, the operator refusal, the hunt log and the
+absence of a first lap. Together with
+`test_the_hunt_loop_this_repository_ships_takes_the_other_side`, the promoted
+live-input block now has a test for each direction.
+
+**Red:** none — born green
+**Mutated:** expected exit `5` -> `6` ->
+`AssertionError: 6 != 5 : another session holds
+/tmp/redkraken-tests-_hz7rezj/tmpnrak43ey/cluster.lock; not starting`
+**Forward references left standing:** none.
+
+## Bar, 2026-09-04
+
+
+**1. Every acceptance criterion is ticked.**
+
+```
+$ grep -c '^- \[ \]' <ticket>
+0
+```
+
+**2. The seam test passes, read by name in the effort verify command.**
+
+The command from `spec.md::Verify command` ran with the project's `.venv`
+first on `PATH`, so its bare `python` resolved to Python 3.14.5:
+
+```
+$ NO_COLOR=1 PYTHONPATH=$PWD:$PWD/src python -m unittest discover -s tests -t . -v
+test_the_hunt_loop_refuses_when_the_suite_holds_the_lock (tests.test_database.ClusterLockTest.test_the_hunt_loop_refuses_when_the_suite_holds_the_lock)
+The lock's mirror side stops before the first hunt lap. ... ok
+… (2835 other test lines)
+Ran 2836 tests in 308.091s
+
+OK (skipped=222)
+```
+
+The earlier `/usr/bin/python3` 3.12 run was a rejected measurement: `python`
+was not on the non-login SSH `PATH`, and substituting the system interpreter
+lost the project environment. It was rerun rather than treated as evidence.
+
+**3. Forward references this ticket redeemed.**
+
+```
+$ grep -rn 'ticket 197' docs/specs/production-harness-v2 | grep -v '^<ticket>' | grep -E 'CONSUMED BY|CONSUMES|deferred to' | wc -l
+0
+```
+
+**4. Existing tests still pass; none was skipped, deleted or weakened.**
+
+The verify command above is green. This diff adds one named test; the prior
+bar recorded 2835 and this run records 2836.
+
+```
+$ git diff --unified=0 -- tests/test_database.py | grep -E '^-[^-].*(assert|def test_)' | wc -l
+0
+$ git diff --unified=0 -- . ':(exclude)<ticket>' | grep -E '^\+[^+].*(\.skip|skipTest|@unittest\.skip|type: ignore|noqa|TODO)' | wc -l
+0
+$ git diff --name-status | grep -E '^D.*test' | wc -l
+0
+```
+
+**5. The diff contains only what this ticket asks for.**
+
+```
+$ git status --short --untracked-files=all
+ M docs/specs/production-harness-v2/issues/197-the-suite-rotates-a-live-hunts-password.md
+ M docs/specs/production-harness-v2/live-inputs.md
+ M tests/test_database.py
+```
+
+`tests/test_database.py` is the criterion test and the two child-runner
+repairs from the NOW verdict. The ticket and `live-inputs.md` are the
+Plumbline flow's state. No production file or build artifact changed.
+
+**6. Resolution and bar are present; no handoff or pending verdict remains.**
+
+```
+$ grep -c '^## Resolution' <ticket>; grep -c '^## Bar' <ticket>; grep -c '^## Handoff' <ticket>
+2
+2
+0
+$ grep -R '— verdict pending' docs/specs/production-harness-v2/issues | grep -c '^-'
+0
+$ git diff --check
+```
+
+**Repository gates.**
+
+```
+check_audit rc=0
+check_wiring rc=0
+check_baseline rc=0
+check_coverage rc=0
+```
+
+### By reading
+
+- **Judgement — born green and broken once.** `## Resolution, 2026-09-04`
+  records `Red: none — born green` and the observed `6 != 5` mutation.
+- **Judgement — no unexplained `NOBODY`.** The current seam report names a
+  producer and reader for the lock path, refusal, exit and log.
+- **Judgement — the run reached this ticket's case.** The real hunt loop met a
+  held run-private lock, returned 5, printed and logged the refusal, and did
+  not enter lap 1. No `live` block remained to replay.
+- **Judgement — doubles have real coverage.** The timing wrapper still execs
+  the real system `flock`; the existing opposite-direction test runs the
+  production `flock -w 60 9` invocation without that wrapper.

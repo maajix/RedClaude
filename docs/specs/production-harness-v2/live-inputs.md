@@ -36,5 +36,5 @@ FAR END         `flock -n /tmp/rk2-db.lock` refused while the loop ran, and the
                 `Ran 0 tests` / `FAILED (errors=1)`. The mirror run, loop
                 started while the lock was held: `another session holds
                 /tmp/rk2-db.lock; not starting` / `loop exit 5`.
-STATUS          promoted to tests.test_database.ClusterLockTest.test_the_hunt_loop_this_repository_ships_takes_the_other_side
+STATUS          promoted to tests.test_database.ClusterLockTest
 REPLAYS         0 ()

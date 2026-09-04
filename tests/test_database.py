@@ -669,7 +669,7 @@ class ClusterLockTest(unittest.TestCase):
                 # its own with no superuser URL set.
                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             ran = subprocess.run(
-                [sys.executable, "-m", "unittest", f"{__name__}.ClusterLockTest", "-v"],
+                [sys.executable, "-s", "-m", "unittest", f"{__name__}.ClusterLockTest", "-v"],
                 capture_output=True,
                 text=True,
                 cwd=Path(__file__).resolve().parent.parent,
@@ -716,7 +716,7 @@ class ClusterLockTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$1 $2" in\n'
             '  "decision sweep")\n'
-            f'    "{sys.executable}" -m unittest'
+            f'    "{sys.executable}" -s -m unittest'
             f' {__name__}.ClusterLockTest -v > "{told}" 2>&1\n'
             f'    printf "suite exit %d\\n" "$?" >> "{told}" ;;\n'
             '  *) echo \'"stop_reason": "nothing_to_execute"\' ;;\n'
@@ -746,6 +746,49 @@ class ClusterLockTest(unittest.TestCase):
         self.assertIn(f"another session holds {lock}", suite)
         self.assertNotIn("suite exit 0\n", suite)
         self.assertNotIn("\nOK", suite)
+
+    def test_the_hunt_loop_refuses_when_the_suite_holds_the_lock(self):
+        """The lock's mirror side stops before the first hunt lap."""
+        work = scratch()
+        lock = work / "cluster.lock"
+        log = work / "hunt.log"
+        real_flock = shutil.which("flock")
+        self.assertIsNotNone(real_flock)
+
+        # Keep the production driver's sixty-second patience without charging it
+        # to every test run. This wrapper changes only the wait to non-blocking;
+        # the real flock still reads fd 9 for the path held below.
+        flock = work / "flock"
+        flock.write_text(
+            "#!/usr/bin/env bash\n"
+            "shift 2\n"
+            f'exec "{real_flock}" -n "$@"\n'
+        )
+        flock.chmod(0o755)
+
+        held = os.open(lock, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            loop = subprocess.run(
+                ["bash", str(ROOT / "tools" / "hunt-loop.sh"), "program.toml", str(log)],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+                env=dict(
+                    os.environ,
+                    PATH=f"{work}{os.pathsep}{os.environ['PATH']}",
+                    RK_TEST_CLUSTER_LOCK=str(lock),
+                ),
+            )
+        finally:
+            os.close(held)
+
+        told = loop.stdout + loop.stderr
+        refusal = f"another session holds {lock}; not starting"
+        self.assertEqual(5, loop.returncode, told)
+        self.assertIn(refusal, told)
+        self.assertIn(refusal, log.read_text())
+        self.assertNotIn("=== lap", told)
 
 
 class ConnectionGuardTest(DatabaseCase):
